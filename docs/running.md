@@ -148,6 +148,11 @@ defaults:
   - `retry`：不换 Agent，重试用完后 Run 结束、标为失败。
   - `human`：重试用完后 Run 卡住，等人重试（可以换 Agent）或终止。没人在场时 Run 会一直停在那里，加载模板时会提示改成 `switch_agent`。
 - Run 因此失败时，`error` 里写明最后是哪个 Agent 出了什么错、试过哪些 Agent。工作目录和分支保留，Master 接着做别的；issue 按 `max_run_attempts` 自动重做（见上面的「Run 失败后自动重做」），重做时这个错误会交给新 Run 的 Agent。
+- Agent 不可用（`agents.yaml` 里改了名、删掉、设了 `enabled: false` 或校验失败被停用，没有对应的 Adapter，或者需求评估阶段它的 CLI 不支持只读）时，Agent 根本没法启动，所以不重试、不消耗重试次数，直接按 `on_agent_error` 处理：
+  - `switch_agent`（默认）：按上面同样的规则换一个可用的 Agent 接着做，需求评估阶段只换到支持只读的；事件列表里记一条 `task.agent_switched`（数据里 `reason` 为 `unavailable`）。原来的 Agent 已不在 `agents.yaml` 里时，不看档次，直接挑成本低的。没有可换的 Agent 时，Run 结束、标为失败。
+  - `retry`：用同一个 Agent 重试也不会成功，Run 直接结束、标为失败。
+  - `human`：Run 卡住（Agent 不可用），等人确认 Agent 可用或换一个 Agent 后重试。
+  - Run 因此失败时，`error` 里写明是哪个 Task、哪个 Agent、为什么不可用，以及按哪种 `on_agent_error` 结束；还没开始执行，工作目录不回滚，和分支一起保留。issue 同样按 `max_run_attempts` 自动重做。
 - 人在看板上重试卡住的 Run 后，返工次数和出错重试次数都重新计算。
 - 额度用尽或被限流（目前能识别 Claude Code 的限流事件）不算出错：不消耗重试次数，不换 Agent，也不卡住等人。Run 回到队首排队并让出执行位，别的 Run 照常执行；CLI 给了额度重置时间就等到那时再多等 1 分钟，没给就按连续被限流的次数等 5、10、20、40 分钟，之后每次 1 小时。到时间后从同一个 Task 接着做（返工意见不变）。等待期间 Run 详情页和事件列表会写明「额度用尽或被限流，预计 HH:mm 继续」。这个时间只记在内存里，Master 重启后 Run 会直接再试一次；想马上再试，可以暂停后再恢复。
 
@@ -188,12 +193,12 @@ Run 卡住（`blocked`）、已暂停或等审批时会让出执行位，排队�
 - 审批：模板里设了 `gate` 的阶段（从 issue 来的 Run 打开 `auto_merge` 时，合并不等审批）。
 - 需求评估有疑问，等你回复，最多等 `reply_timeout_hours`（到时间评估自己决定，所以这种 Run 算作会自己往下走；设为 `null` 时一直等，算作只等人）；issue 作者不是仓库成员，等你确认需求。
 - 超出预算（`on_budget_exceeded: pause`，默认）。
-- 合并冲突但没有 Agent 阶段能解决（见上面的「合并冲突」）、工作目录与记录不一致、Agent 不可用。
-- 配置为等人时：`on_agent_error: human`、`on_exhausted: human`。
+- 合并冲突但没有 Agent 阶段能解决（见上面的「合并冲突」）、工作目录与记录不一致。
+- 配置为等人时：`on_agent_error: human`（包括 Agent 不可用时）、`on_exhausted: human`。
 
 目标分支有未提交的改动时，Run 也会卡住（`target_dirty`），但不用你做任何决定：合并阶段要快进目标分支，而目标分支在某个目录里检出、且有已跟踪文件的改动没提交（未跟踪的文件不算），快进会动到这些改动，所以先停下，并照常发「Run 卡住了」的通知。之后 Master 大约每分钟复查一次，你提交或丢弃这些改动后，Run 会自己回到队首接着合并：重新同步目标分支，有新提交时重跑检查，再快进。不用去看板点重试（点了也行，会立刻继续）。改动还在时复查什么都不改，也不会重复通知；工作开关关着时不会自动继续，打开时马上查一次。自举时 Master 正是往开发仓库的 `main` 合并，在那里随手改了文件，处理掉就行。这种 Run 算作会自己往下走，不计入 `scout.max_proposals`。
 
-Agent 出错且重试、换 Agent 都用完，返工或回退用完，超出预算且配置为 `on_budget_exceeded: abort`，准备命令失败，Master 内部错误时，Run 不等人，直接结束、标为失败。工作目录和分支保留，Master 接着做别的；从 issue 来的 Run 按 `max_run_attempts` 自动重做（见上面的「Run 失败后自动重做」），重做时失败原因会交给新 Run 的 Agent。
+Agent 出错且重试、换 Agent 都用完，Agent 不可用且没有可换的 Agent（或配置为 `on_agent_error: retry`），返工或回退用完，超出预算且配置为 `on_budget_exceeded: abort`，准备命令失败，Master 内部错误时，Run 不等人，直接结束、标为失败。工作目录和分支保留，Master 接着做别的；从 issue 来的 Run 按 `max_run_attempts` 自动重做（见上面的「Run 失败后自动重做」），重做时失败原因会交给新 Run 的 Agent。
 
 - 准备命令失败：`error` 里写明是哪条准备命令、退出码或超时，以及输出的末尾。准备命令失败多半是偶发的或者和环境有关（依赖源连不上、安装中途出错等），重做时会在新的工作目录里重新运行。
 - Master 内部错误：Master 自己执行 Run 时出了异常（git 锁、磁盘满、命令起不来等）。`error` 以「Master 内部错误：」开头（英文为 `Master internal error:`），后面是原因。正在执行的 Agent 会被结束，这次执行记为中断（`interrupted`），没做完的 Task 标为已取消；工作目录保持出错时的样子，不回滚，方便查看。

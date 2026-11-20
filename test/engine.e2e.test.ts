@@ -998,6 +998,244 @@ agents:
   });
 });
 
+describe('engine: unavailable agents', () => {
+  const eventData = (runId: string, type: string) =>
+    (h as Harness).master.store
+      .listEvents(runId)
+      .filter((e) => e.type === type)
+      .map((e) => e.data);
+  /** Coding, review, then merging without approval: a Run that gets through completes. */
+  const WORKFLOW = `
+id: dev
+defaults:
+  escalate: { max_retries: 2, on_agent_error: switch_agent }
+stages:
+  - id: implement
+    agent: coder
+  - id: review
+    kind: review
+    agent: reviewer
+    inputs: [diff]
+    on_fail: implement
+  - id: merge
+    kind: merge
+`;
+  const AGENTS = `
+agents:
+  coder: { cli: fake, model: coder }
+  reviewer: { cli: fake, model: reviewer }
+  reviewer2: { cli: fake, model: reviewer2, cost: low }
+`;
+  /** agents.yaml once the reviewer is disabled, as when its entry fails validation. */
+  const REVIEWER_DISABLED = AGENTS.replace(
+    'model: reviewer }',
+    'model: reviewer, enabled: false }',
+  );
+  /** agents.yaml once the reviewer is gone, as after a rename. */
+  const REVIEWER_REMOVED = AGENTS.replace('  reviewer: { cli: fake, model: reviewer }\n', '');
+  const scripts = (): Record<string, Script> => ({
+    coder: (ctx) => {
+      writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+      return done();
+    },
+    reviewer: () => review(),
+    reviewer2: () => review(),
+  });
+  /**
+   * agents.yaml becomes `agents` while the coder works, so the review stage that comes next,
+   * already part of the Run, finds its agent changed.
+   */
+  const coderChangesAgents = (t: Harness, agents: string) => {
+    t.scripts.coder = (ctx) => {
+      writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+      writeFile(join(t.home, 'agents.yaml'), agents);
+      t.master.configWatcher.reload();
+      return done();
+    };
+  };
+  const reviewTask = (runId: string) =>
+    (h as Harness).master.store.listRunTasks(runId).find((t) => t.title === 'review') as Task;
+
+  it.each([
+    ['disabled', REVIEWER_DISABLED],
+    ['gone from agents.yaml', REVIEWER_REMOVED],
+  ])('switches to an available agent when the agent is %s, and completes', async (_, agents) => {
+    h = await harness({ agents: AGENTS, workflow: WORKFLOW, scripts: scripts() });
+    coderChangesAgents(h, agents);
+    const run = h.run();
+    const completed = await h.waitStatus(run.id, 'completed');
+    // The unavailable reviewer never ran; the cheaper of the others took over.
+    expect(h.fake.calls.map((c) => c.model)).toEqual(['coder', 'reviewer2']);
+    const task = reviewTask(run.id);
+    expect(task.agentId).toBe('reviewer2');
+    expect(eventData(run.id, 'task.agent_switched')).toEqual([
+      {
+        taskId: task.id,
+        from: 'reviewer',
+        to: 'reviewer2',
+        reason: 'unavailable',
+        unavailable: 'missing',
+        error: 'Agent reviewer 不存在、未启用或没有对应的 Adapter',
+      },
+    ]);
+    // Nothing was executed for it: no retry used up, no error counted.
+    expect(task.retries).toBe(0);
+    expect(eventData(run.id, 'task.retry_after_error')).toEqual([]);
+    expect(h.master.store.listAttempts(task.id).map((a) => [a.agentId, a.outcome])).toEqual([
+      ['reviewer2', 'passed'],
+    ]);
+    expect(completed.blocked).toBeNull();
+  });
+
+  it('ends the Run as failed, not blocked, when no agent can take over', async () => {
+    h = await harness({
+      agents: AGENTS.replace('  reviewer2: { cli: fake, model: reviewer2, cost: low }\n', ''),
+      workflow: WORKFLOW,
+      scripts: scripts(),
+    });
+    // The coder is disabled too, so nobody is left for the review.
+    coderChangesAgents(h, 'agents:\n  coder: { cli: fake, model: coder, enabled: false }\n');
+    const run = h.run();
+    const failed = await h.waitStatus(run.id, 'failed');
+    expect(failed.blocked).toBeNull();
+    expect(failed.finishedAt).toBeTruthy();
+    expect(failed.error).toBe(
+      'Task「review」无法执行：Agent reviewer 不存在、未启用或没有对应的 Adapter。没有别的可用 Agent 能接手，Run 结束（on_agent_error: switch_agent），工作目录和分支已保留。',
+    );
+    expect(h.fake.calls.map((c) => c.model)).toEqual(['coder']);
+    expect(eventData(run.id, 'task.agent_switched')).toEqual([]);
+    expect(eventData(run.id, 'run.blocked')).toEqual([]);
+    expect(h.master.store.listRunTasks(run.id).map((t) => t.status)).toEqual([
+      'passed',
+      'cancelled',
+    ]);
+    expect(h.master.store.listAttempts(reviewTask(run.id).id)).toEqual([]);
+    // The worktree keeps the coder's work and the branch stays, for inspection.
+    const worktree = failed.worktreePath as string;
+    expect(readFileSync(join(worktree, 'feature.txt'), 'utf8')).toBe('ok\n');
+    expect(git(h.repoDir, 'branch', '--list', failed.branch as string)).not.toBe('');
+    await expect(h.master.engine.retry(run.id)).rejects.toThrow(/blocked/);
+  });
+
+  it('with on_agent_error: retry, ends the Run at once instead of switching', async () => {
+    h = await harness({ agents: AGENTS, workflow: WORKFLOW, scripts: scripts() });
+    coderChangesAgents(h, REVIEWER_DISABLED);
+    const run = h.run('添加 feature.txt', {
+      stages: { review: { escalate: { on_agent_error: 'retry' } } },
+    });
+    const failed = await h.waitStatus(run.id, 'failed');
+    expect(failed.blocked).toBeNull();
+    expect(failed.error).toContain('Agent reviewer 不存在、未启用或没有对应的 Adapter');
+    expect(failed.error).toContain('Run 结束（on_agent_error: retry），工作目录和分支已保留');
+    expect(h.fake.calls.map((c) => c.model)).toEqual(['coder']);
+    expect(eventData(run.id, 'task.agent_switched')).toEqual([]);
+  });
+
+  it('with on_agent_error: human, still waits for a human, who can switch the agent', async () => {
+    h = await harness({ agents: AGENTS, workflow: WORKFLOW, scripts: scripts() });
+    coderChangesAgents(h, REVIEWER_DISABLED);
+    const run = h.run('添加 feature.txt', {
+      stages: { review: { escalate: { on_agent_error: 'human' } } },
+    });
+    const blocked = await h.waitStatus(run.id, 'blocked');
+    const task = reviewTask(run.id);
+    expect(blocked.blocked).toEqual({
+      kind: 'agent_unavailable',
+      message: 'Agent reviewer 不存在、未启用或没有对应的 Adapter',
+      taskId: task.id,
+    });
+    expect(h.fake.calls.map((c) => c.model)).toEqual(['coder']);
+    expect(eventData(run.id, 'task.agent_switched')).toEqual([]);
+    await h.master.engine.retry(run.id, { agentId: 'reviewer2' });
+    await h.waitStatus(run.id, 'completed');
+    expect(h.fake.calls.map((c) => c.model)).toEqual(['coder', 'reviewer2']);
+  });
+
+  it('switches an assessment that cannot run read-only only to an agent that can', async () => {
+    const scripts: Record<string, Script> = {
+      assessor: () => assessment('ask', { questions: ['要兼容旧格式吗？'] }),
+      writer: () => assessment('go'),
+      backup: () => assessment('go'),
+      coder: (ctx) => {
+        writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+        return done();
+      },
+      reviewer: () => review(),
+    };
+    const fake = new FakeAdapter((ctx) => (scripts[ctx.input.model] as Script)(ctx));
+    // A CLI that cannot run an agent read-only.
+    const writeOnly: AgentAdapter = { cli: 'fake-rw', start: (input) => fake.start(input) };
+    const agents = (assessorCli: string) => `
+agents:
+  assessor: { cli: ${assessorCli}, model: assessor, tier: high }
+  writer: { cli: fake-rw, model: writer, tier: high, cost: low }
+  backup: { cli: fake, model: backup, tier: high }
+  coder: { cli: fake, model: coder }
+  reviewer: { cli: fake, model: reviewer }
+`;
+    h = await harness({
+      agents: agents('fake'),
+      workflow: ASSESS_WORKFLOW_YAML,
+      scripts,
+      master: { adapters: [fake, writeOnly] },
+    });
+    const run = h.run();
+    await h.waitStatus(run.id, 'blocked');
+    // While the Run waits for a reply, the assessor moves to a CLI that cannot run read-only.
+    writeFile(join(h.home, 'agents.yaml'), agents('fake-rw'));
+    h.master.configWatcher.reload();
+    h.master.engine.reply(run.id, ['要兼容'], 'dashboard');
+    await h.waitStatus(run.id, 'completed');
+    // The cheaper writer cannot run read-only, so the backup takes over.
+    expect(fake.calls.map((c) => c.model)).toEqual(['assessor', 'backup', 'coder', 'reviewer']);
+    expect(eventData(run.id, 'task.agent_switched')).toEqual([
+      {
+        taskId: expect.any(String),
+        from: 'assessor',
+        to: 'backup',
+        reason: 'unavailable',
+        unavailable: 'read_only_unsupported',
+        error: '需求评估要以只读方式运行，Agent assessor 的 CLI fake-rw 不支持',
+      },
+    ]);
+  });
+
+  describe('in English', () => {
+    afterEach(() => setLang('zh'));
+
+    it('says why the Run ended without Chinese', async () => {
+      h = await harness({
+        config: 'language: en\n',
+        agents: AGENTS.replace('  reviewer2: { cli: fake, model: reviewer2, cost: low }\n', ''),
+        workflow: WORKFLOW,
+        scripts: scripts(),
+      });
+      coderChangesAgents(h, 'agents:\n  coder: { cli: fake, model: coder, enabled: false }\n');
+      const failed = await h.waitStatus(h.run('Add feature.txt').id, 'failed');
+      expect(failed.error).toBe(
+        'Task "review" cannot run. Agent reviewer does not exist, is disabled or has no adapter. No other agent can take over, so the Run ended (on_agent_error: switch_agent); the working directory and branch are kept.',
+      );
+      expect(failed.error).not.toMatch(/[一-鿿]/);
+    });
+
+    it('says why the Run ended with on_agent_error: retry without Chinese', async () => {
+      h = await harness({
+        config: 'language: en\n',
+        agents: AGENTS,
+        workflow: WORKFLOW,
+        scripts: scripts(),
+      });
+      coderChangesAgents(h, REVIEWER_REMOVED);
+      const run = h.run('Add feature.txt', {
+        stages: { review: { escalate: { on_agent_error: 'retry' } } },
+      });
+      const failed = await h.waitStatus(run.id, 'failed');
+      expect(failed.error).toContain('Retrying the same agent cannot succeed');
+      expect(failed.error).not.toMatch(/[一-鿿]/);
+    });
+  });
+});
+
 describe('engine: reworks and rollbacks used up', () => {
   const eventTypes = (runId: string) =>
     (h as Harness).master.store.listEvents(runId).map((e) => e.type);

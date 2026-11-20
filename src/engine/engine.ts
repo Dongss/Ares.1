@@ -160,9 +160,10 @@ export function rateLimitDelayMs(
 const LEVEL_RANK = { low: 0, mid: 1, high: 2 } as const;
 
 /**
- * The agent to switch a task to after its agent kept erroring (`on_agent_error: switch_agent`):
- * one the task has not tried yet that can run the stage, those of the current agent's tier or
- * higher first, then the cheaper first; agents.yaml's order decides the rest. Undefined when
+ * The agent to switch a task to after its agent kept erroring or could not run at all
+ * (`on_agent_error: switch_agent`): one the task has not tried yet that can run the stage, those
+ * of the current agent's tier or higher first (any tier when the current agent is gone from
+ * agents.yaml), then the cheaper first; agents.yaml's order decides the rest. Undefined when
  * there is none. `agents` holds only enabled agents.
  */
 export function switchCandidate(
@@ -1374,17 +1375,7 @@ export class Engine {
     }
     const agent = this.cfg.agents.get(task.agentId);
     const adapter = agent && this.deps.adapters.get(agent.cli);
-    if (!agent || !adapter) {
-      this.block(run.id, {
-        kind: 'agent_unavailable',
-        message: t({
-          zh: `Agent ${task.agentId} 不存在、未启用或没有对应的 Adapter`,
-          en: `Agent ${task.agentId} does not exist, is disabled or has no adapter`,
-        }),
-        taskId: task.id,
-      });
-      return;
-    }
+    if (!agent || !adapter) return this.agentUnavailable(run, eff, task, 'missing');
     // Soft budget: checked before each new agent execution, so the one that crossed the
     // budget still gets its checks and commit.
     const budget = effectiveBudget(run.template, run.overrides);
@@ -1395,19 +1386,86 @@ export class Engine {
       return this.runReviewTask(run, sr, eff, task, agent, adapter, signal);
     if (eff.def.kind === 'assess') {
       if (!adapter.supportsReadOnly) {
-        this.block(run.id, {
-          kind: 'agent_unavailable',
-          message: t({
-            zh: `需求评估要以只读方式运行，Agent ${agent.id} 的 CLI ${agent.cli} 不支持，请换用支持只读的 Agent（如 claude-code）`,
-            en: `The requirement assessment runs read-only, which the CLI ${agent.cli} of agent ${agent.id} does not support; use an agent that supports read-only (such as claude-code)`,
-          }),
-          taskId: task.id,
-        });
-        return;
+        return this.agentUnavailable(run, eff, task, 'read_only_unsupported');
       }
       return this.runAssessTask(run, sr, eff, task, agent, adapter, signal);
     }
     return this.runAgentTask(run, sr, eff, task, agent, adapter, signal);
+  }
+
+  /**
+   * The task's agent cannot run at all: it is not in agents.yaml (any more), is disabled or
+   * invalid, has no adapter (`missing`), or cannot run read-only as an assessment needs
+   * (`read_only_unsupported`). Nothing was executed, so no retry is used up and the worktree is
+   * left as it is. By `on_agent_error`: `switch_agent` hands the task to another agent that can
+   * run the stage; `human` blocks the Run for a human; otherwise the Run ends as failed instead
+   * of waiting, so a Run from an issue is redone: nobody is left to switch to, or `retry`, where
+   * retrying the same agent could never succeed.
+   */
+  private agentUnavailable(
+    run: Run,
+    eff: EffectiveStage,
+    task: Task,
+    reason: 'missing' | 'read_only_unsupported',
+  ): void {
+    const cli = this.cfg.agents.get(task.agentId)?.cli;
+    const why =
+      reason === 'missing' || cli === undefined
+        ? t({
+            zh: `Agent ${task.agentId} 不存在、未启用或没有对应的 Adapter`,
+            en: `Agent ${task.agentId} does not exist, is disabled or has no adapter`,
+          })
+        : t({
+            zh: `需求评估要以只读方式运行，Agent ${task.agentId} 的 CLI ${cli} 不支持`,
+            en: `The requirement assessment runs read-only, which the CLI ${cli} of agent ${task.agentId} does not support`,
+          });
+    const mode = eff.escalate.on_agent_error;
+    if (mode === 'human') {
+      const advice =
+        reason === 'read_only_unsupported'
+          ? t({
+              zh: '，请换用支持只读的 Agent（如 claude-code）',
+              en: '; use an agent that supports read-only (such as claude-code)',
+            })
+          : '';
+      this.block(run.id, { kind: 'agent_unavailable', message: why + advice, taskId: task.id });
+      return;
+    }
+    if (mode === 'switch_agent') {
+      const next = this.switchTarget(eff, task, this.triedAgents(task));
+      if (next) {
+        this.store.tx(() => {
+          this.store.updateTask(task.id, {
+            status: 'pending',
+            agentId: next.id,
+            // Another agent cannot resume this one's session.
+            sessionId: null,
+            sessionAgentId: null,
+          });
+          this.store.event(run.id, 'task.agent_switched', {
+            taskId: task.id,
+            from: task.agentId,
+            to: next.id,
+            reason: 'unavailable',
+            unavailable: reason,
+            error: why,
+          });
+        });
+        return;
+      }
+    }
+    this.failRun(
+      run.id,
+      mode === 'switch_agent'
+        ? t({
+            zh: `Task「${task.title}」无法执行：${why}。没有别的可用 Agent 能接手，Run 结束（on_agent_error: switch_agent），工作目录和分支已保留。`,
+            en: `Task "${task.title}" cannot run. ${why}. No other agent can take over, so the Run ended (on_agent_error: switch_agent); the working directory and branch are kept.`,
+          })
+        : t({
+            zh: `Task「${task.title}」无法执行：${why}。用同一个 Agent 重试也不会成功，Run 结束（on_agent_error: retry），工作目录和分支已保留。`,
+            en: `Task "${task.title}" cannot run. ${why}. Retrying the same agent cannot succeed, so the Run ended (on_agent_error: retry); the working directory and branch are kept.`,
+          }),
+    );
   }
 
   /** The Run has spent its budget: wait for a human, or end it (`on_budget_exceeded`). */
@@ -2293,7 +2351,9 @@ export class Engine {
     return [...new Set([...this.store.listAttempts(task.id).map((a) => a.agentId), task.agentId])];
   }
 
-  /** Who takes over a task whose agent kept erroring; undefined when nobody is left. */
+  /**
+   * Who takes over a task whose agent kept erroring or cannot run; undefined when nobody is left.
+   */
   private switchTarget(
     eff: EffectiveStage,
     task: Task,
