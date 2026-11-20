@@ -2567,43 +2567,143 @@ describe('engine: restart', () => {
 });
 
 describe('engine: workspace consistency', () => {
-  it('blocks when the worktree is gone; a retry brings it back from the branch', async () => {
+  const eventsOf = (runId: string, type: string) =>
+    (h as Harness).master.store.listEvents(runId).filter((e) => e.type === type);
+  /** The Run waits for its merge approval; it is checked when the approval gives it the slot. */
+  const waitingForMerge = async () => {
+    const harnessed = h as Harness;
+    const run = harnessed.run();
+    const waiting = await harnessed.waitStatus(run.id, 'waiting_approval');
+    return { run, worktree: waiting.worktreePath as string, branch: waiting.branch as string };
+  };
+  /** Ended as failed without waiting for a human: the next Run starts. */
+  const expectNothingWaits = async (runId: string) => {
+    const harnessed = h as Harness;
+    expect(eventsOf(runId, 'run.blocked')).toEqual([]);
+    await harnessed.waitStatus(harnessed.run('下一个').id, 'waiting_approval');
+  };
+  /**
+   * A Run an older Master blocked on its worktree, as it did whenever the check failed: approved
+   * for merging, then blocked before it went on.
+   */
+  const blockedOnWorkspace = async () => {
+    const { engine, store } = (h as Harness).master;
+    const ready = await waitingForMerge();
+    store.setWorking(false);
+    engine.approve(ready.run.id);
+    store.updateRun(ready.run.id, {
+      status: 'blocked',
+      queuePos: null,
+      blocked: {
+        kind: 'workspace',
+        message: '工作目录不存在了。重试会以工作目录当前的提交为准继续',
+      },
+    });
+    store.setWorking(true);
+    return ready;
+  };
+
+  it('brings a deleted worktree back from the branch and goes on, waiting for nobody', async () => {
     h = await harness();
-    const run = h.run();
-    const waiting = await h.waitStatus(run.id, 'waiting_approval');
-    rmSync(waiting.worktreePath as string, { recursive: true, force: true });
+    const { run, worktree, branch } = await waitingForMerge();
+    const head = h.master.store.getRun(run.id).headCommit;
+    rmSync(worktree, { recursive: true, force: true });
     h.master.engine.approve(run.id);
-    const blocked = await h.waitStatus(run.id, 'blocked');
-    expect(blocked.blocked?.kind).toBe('workspace');
-    expect(blocked.blocked?.message).toMatch(/不存在/);
-    await h.master.engine.retry(run.id);
-    await h.waitStatus(run.id, 'completed');
+    const done = await h.waitStatus(run.id, 'completed');
+    expect(eventsOf(run.id, 'run.workspace_restored').map((e) => e.data)).toEqual([
+      { path: worktree, branch },
+    ]);
+    expect(eventsOf(run.id, 'run.blocked')).toEqual([]);
+    expect(h.master.store.listEvents(run.id).some((e) => e.data.status === 'blocked')).toBe(false);
+    // The records stay: the branch holds every commit the Master accepted.
+    expect(done.headCommit).toBe(head);
     expect(git(h.repoDir, 'show', 'main:feature.txt')).toBe('ok');
   });
 
-  it('blocks when the history was reset by hand; a retry continues from it', async () => {
+  it('ends the Run as failed when the history was reset by hand', async () => {
     h = await harness();
-    const run = h.run();
-    const waiting = await h.waitStatus(run.id, 'waiting_approval');
-    const worktree = waiting.worktreePath as string;
-    git(worktree, 'reset', '-q', '--hard', waiting.baseCommit as string);
+    const { run, worktree } = await waitingForMerge();
+    const before = h.master.store.getRun(run.id);
+    git(worktree, 'reset', '-q', '--hard', before.baseCommit as string);
     h.master.engine.approve(run.id);
-    const blocked = await h.waitStatus(run.id, 'blocked');
-    expect(blocked.blocked?.kind).toBe('workspace');
-    expect(blocked.blocked?.message).toMatch(/不一致/);
+    const failed = await h.waitStatus(run.id, 'failed');
+    expect(failed.blocked).toBeNull();
+    expect(failed.finishedAt).toBeTruthy();
+    expect(failed.error).toBe(
+      `工作目录的提交历史和记录不一致：Master 记录的最新提交 ${(before.headCommit as string).slice(0, 8)} 已不在当前分支上（可能被手动重置或改写过）\nRun 结束，工作目录和分支已保留。`,
+    );
+    // Nothing was merged, and the worktree is left as it was found.
+    expect(failed.headCommit).toBe(before.headCommit);
+    expect(git(worktree, 'rev-parse', 'HEAD')).toBe(before.baseCommit);
+    expect(git(h.repoDir, 'rev-parse', 'main')).toBe(before.baseCommit);
+    expect(eventsOf(run.id, 'run.workspace_restored')).toEqual([]);
+    await expectNothingWaits(run.id);
+  });
+
+  it('ends the Run as failed when the worktree is on another branch', async () => {
+    h = await harness();
+    const { run, worktree, branch } = await waitingForMerge();
+    git(worktree, 'checkout', '-q', '-b', 'elsewhere');
+    h.master.engine.approve(run.id);
+    const failed = await h.waitStatus(run.id, 'failed');
+    expect(failed.error).toBe(
+      `工作目录当前不在 Run 的分支 ${branch} 上（现在是 elsewhere）\nRun 结束，工作目录和分支已保留。`,
+    );
+    await expectNothingWaits(run.id);
+  });
+
+  it('ends the Run as failed when the branch is gone with the worktree', async () => {
+    h = await harness();
+    const { run, worktree, branch } = await waitingForMerge();
+    rmSync(worktree, { recursive: true, force: true });
+    git(h.repoDir, 'worktree', 'prune');
+    git(h.repoDir, 'branch', '-q', '-D', branch);
+    h.master.engine.approve(run.id);
+    const failed = await h.waitStatus(run.id, 'failed');
+    expect(failed.error).toBe(
+      `工作目录 ${worktree} 不存在了，Run 的分支 ${branch} 也不在了，无法恢复\nRun 结束。`,
+    );
+    expect(existsSync(worktree)).toBe(false);
+    await expectNothingWaits(run.id);
+  });
+
+  it('ends the Run as failed when the worktree cannot be restored, keeping the branch', async () => {
+    h = await harness();
+    const { run, worktree, branch } = await waitingForMerge();
+    rmSync(worktree, { recursive: true, force: true });
+    git(h.repoDir, 'worktree', 'prune');
+    // Checked out somewhere else, the branch cannot be checked out again where it was.
+    const elsewhere = join(tmpDir(), 'elsewhere');
+    git(h.repoDir, 'worktree', 'add', '-q', elsewhere, branch);
+    h.master.engine.approve(run.id);
+    const failed = await h.waitStatus(run.id, 'failed');
+    const error = failed.error as string;
+    expect(error.slice(0, error.indexOf('：') + 1)).toBe(
+      `工作目录 ${worktree} 不存在了，从分支 ${branch} 恢复失败：`,
+    );
+    expect(error).toMatch(/恢复失败：git .*worktree add/);
+    expect(error.slice(error.lastIndexOf('\n'))).toBe(`\nRun 结束，分支 ${branch} 已保留。`);
+    expect(eventsOf(run.id, 'run.workspace_restored')).toEqual([]);
+    await expectNothingWaits(run.id);
+  });
+
+  it('still retries a Run an older Master blocked on its worktree', async () => {
+    h = await harness();
+    const { run, worktree } = await blockedOnWorkspace();
+    rmSync(worktree, { recursive: true, force: true });
     await h.master.engine.retry(run.id);
-    const done = await h.waitStatus(run.id, 'completed');
-    expect(done.headCommit).toBe(waiting.baseCommit);
+    // The retry itself brought the worktree back.
+    expect(existsSync(worktree)).toBe(true);
+    await h.waitStatus(run.id, 'completed');
+    expect(eventsOf(run.id, 'run.retry').map((e) => e.data.kind)).toEqual(['workspace']);
+    expect(git(h.repoDir, 'show', 'main:feature.txt')).toBe('ok');
   });
 
   it('a retry does nothing when the Run is cancelled while it restores the worktree', async () => {
     h = await harness();
     const { engine, store } = h.master;
-    const run = h.run();
-    const waiting = await h.waitStatus(run.id, 'waiting_approval');
-    rmSync(waiting.worktreePath as string, { recursive: true, force: true });
-    engine.approve(run.id);
-    await h.waitStatus(run.id, 'blocked');
+    const { run, worktree } = await blockedOnWorkspace();
+    rmSync(worktree, { recursive: true, force: true });
     const calls = h.fake.calls.length;
     const attempts = store.listRunAttempts(run.id).length;
 
@@ -2627,11 +2727,9 @@ describe('engine: workspace consistency', () => {
   it('only one of two concurrent retries of the same Run takes effect', async () => {
     h = await harness();
     const { engine, store } = h.master;
-    const run = h.run();
-    const waiting = await h.waitStatus(run.id, 'waiting_approval');
-    git(waiting.worktreePath as string, 'reset', '-q', '--hard', waiting.baseCommit as string);
-    engine.approve(run.id);
-    await h.waitStatus(run.id, 'blocked');
+    const { run, worktree } = await blockedOnWorkspace();
+    const base = store.getRun(run.id).baseCommit as string;
+    git(worktree, 'reset', '-q', '--hard', base);
 
     const results = await Promise.allSettled([engine.retry(run.id), engine.retry(run.id)]);
     expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
@@ -2640,7 +2738,9 @@ describe('engine: workspace consistency', () => {
     expect(rejected[0]?.reason).toBeInstanceOf(InvalidStateError);
     expect(String(rejected[0]?.reason)).toMatch(/这次重试没有生效/);
 
-    await h.waitStatus(run.id, 'completed');
+    // The human chose to continue from the worktree's current commit.
+    const done = await h.waitStatus(run.id, 'completed');
+    expect(done.headCommit).toBe(base);
     const retries = store.listEvents(run.id).filter((e) => e.type === 'run.retry');
     expect(retries).toHaveLength(1);
   });
@@ -2670,5 +2770,42 @@ describe('engine: workspace consistency', () => {
     const checks = store.listChecks(run.id).filter((c) => c.stageRunId === mergeStage?.id);
     expect(checks.filter((c) => c.kind === 'command').map((c) => c.passed)).toEqual([true]);
     expect(git(h.repoDir, 'show', 'main:extra.txt')).toBe('by hand');
+  });
+
+  describe('in English', () => {
+    afterEach(() => setLang('zh'));
+
+    it('says why the worktree cannot be trusted without Chinese', async () => {
+      h = await harness({ config: 'language: en\n' });
+      const reset = await waitingForMerge();
+      const before = h.master.store.getRun(reset.run.id);
+      git(reset.worktree, 'reset', '-q', '--hard', before.baseCommit as string);
+      h.master.engine.approve(reset.run.id);
+      const diverged = await h.waitStatus(reset.run.id, 'failed');
+      expect(diverged.error).toBe(
+        `The working directory's history does not match the records: the latest commit the Master recorded, ${(before.headCommit as string).slice(0, 8)}, is no longer on the branch (it may have been reset or rewritten by hand)\nThe Run ended; the working directory and branch are kept.`,
+      );
+
+      const moved = await waitingForMerge();
+      git(moved.worktree, 'checkout', '-q', '--detach');
+      h.master.engine.approve(moved.run.id);
+      const detached = await h.waitStatus(moved.run.id, 'failed');
+      expect(detached.error).toBe(
+        `The working directory is not on the Run's branch ${moved.branch} (it is on a detached HEAD)\nThe Run ended; the working directory and branch are kept.`,
+      );
+
+      const gone = await waitingForMerge();
+      rmSync(gone.worktree, { recursive: true, force: true });
+      git(h.repoDir, 'worktree', 'prune');
+      git(h.repoDir, 'branch', '-q', '-D', gone.branch);
+      h.master.engine.approve(gone.run.id);
+      const missing = await h.waitStatus(gone.run.id, 'failed');
+      expect(missing.error).toBe(
+        `The working directory ${gone.worktree} is gone, and so is the Run's branch ${gone.branch}; it cannot be restored\nThe Run ended.`,
+      );
+      for (const error of [diverged.error, detached.error, missing.error]) {
+        expect(error).not.toMatch(/[一-鿿]/);
+      }
+    });
   });
 });

@@ -1889,6 +1889,52 @@ stages:
     expect(gh.get(1)).toMatchObject({ state: 'closed', stateReason: 'completed' });
   });
 
+  it('redoes a Run whose worktree no longer matches the records, in a fresh worktree', async () => {
+    // The merge waits for approval, so the worktree can be changed before the Run goes on.
+    const gated = REDO_WORKFLOW.replace('kind: merge\n', 'kind: merge\n    gate: true\n');
+    const t = await start(config(), gated);
+    t.scripts.assessor = () => assessment('go');
+    t.scripts.coder = (ctx) => {
+      writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+      return done('写了 feature.txt');
+    };
+    gh.add({ title: '加 feature', body: '写 feature.txt', labels: [LABELS.ready] });
+    await t.master.issues.poll();
+
+    // Reset by hand: the Run fails instead of waiting for a human, and is redone.
+    const first = nth(t, 0);
+    const waiting = await t.waitStatus(first.id, 'waiting_approval');
+    const worktree = waiting.worktreePath as string;
+    git(worktree, 'reset', '-q', '--hard', waiting.baseCommit as string);
+    t.master.engine.approve(first.id);
+    const failed = await t.waitStatus(first.id, 'failed');
+    expect(failed.blocked).toBeNull();
+    expect(failed.error).toContain('工作目录的提交历史和记录不一致');
+    await t.master.issues.sync();
+    expect(gh.get(1).comments.find((c) => c.includes('Run 失败了'))).toContain('第 1/3 次尝试');
+    expect(gh.get(1).labels).toEqual([LABELS.running]);
+    const second = nth(t, 1);
+    expect(second.issue?.attempt).toBe(2);
+    expect(second.issue?.earlier).toEqual([
+      {
+        runId: first.id,
+        attempt: 1,
+        stage: '合并',
+        error: expect.stringContaining('工作目录的提交历史和记录不一致'),
+      },
+    ]);
+
+    const again = await t.waitStatus(second.id, 'waiting_approval');
+    expect(again.worktreePath).not.toBe(worktree);
+    // The failed Run's worktree is left as it was found.
+    expect(git(worktree, 'rev-parse', 'HEAD')).toBe(waiting.baseCommit);
+    t.master.engine.approve(second.id);
+    await t.waitStatus(second.id, 'completed');
+    expect(git(t.repoDir, 'show', 'main:feature.txt')).toBe('ok');
+    await t.master.issues.sync();
+    expect(gh.get(1)).toMatchObject({ state: 'closed', stateReason: 'completed' });
+  });
+
   it('waits for the next day when the automatic spending is at its limit, costing no attempt', async () => {
     const t = await startRedo(config({ budget: 1 }), [1]);
     const spent = spendToday(t);

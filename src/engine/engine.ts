@@ -262,6 +262,13 @@ interface ConflictMerge extends MergeInProgress {
   started: boolean;
 }
 
+/** Why a Run's worktree no longer matches the records (`workspaceProblem`). */
+interface WorkspaceProblem {
+  /** Deleted; on another branch or a detached HEAD; or without the last accepted commit. */
+  reason: 'missing' | 'wrong_branch' | 'diverged';
+  message: string;
+}
+
 /** Thrown inside a drive loop when the Run is being paused / cancelled / shut down. */
 class Aborted extends Error {}
 
@@ -908,7 +915,9 @@ export class Engine {
 
   /**
    * Retry after a failed consistency check: bring back a deleted worktree from the Run's branch
-   * and return the commit to continue from (whatever the worktree has now).
+   * and return the commit to continue from (whatever the worktree has now). Such a check now
+   * restores the worktree or ends the Run by itself (`checkWorkspace`); Runs blocked on it by an
+   * older Master can still be retried.
    */
   private async restoreWorkspace(run: Run): Promise<string> {
     const { worktreePath: path, branch } = run;
@@ -949,29 +958,126 @@ export class Engine {
    * is gone, is on another branch, or no longer contains the last accepted commit (e.g. reset
    * by hand). Commits added on top are fine; the next checks cover them.
    */
-  private async workspaceProblem(run: Run): Promise<string | null> {
+  private async workspaceProblem(run: Run): Promise<WorkspaceProblem | null> {
     const { worktreePath: path, headCommit } = run;
     if (!path || !headCommit) return null;
     if (!existsSync(path)) {
-      return t({
-        zh: `工作目录 ${path} 不存在了`,
-        en: `The working directory ${path} is gone`,
-      });
+      return {
+        reason: 'missing',
+        message: t({
+          zh: `工作目录 ${path} 不存在了`,
+          en: `The working directory ${path} is gone`,
+        }),
+      };
     }
     const branch = await currentBranch(path).catch(() => null);
     if (branch !== run.branch) {
-      return t({
-        zh: `工作目录当前不在 Run 的分支 ${run.branch} 上（现在是 ${branch ?? '游离的 HEAD'}）`,
-        en: `The working directory is not on the Run's branch ${run.branch} (it is on ${branch ?? 'a detached HEAD'})`,
-      });
+      return {
+        reason: 'wrong_branch',
+        message: t({
+          zh: `工作目录当前不在 Run 的分支 ${run.branch} 上（现在是 ${branch ?? '游离的 HEAD'}）`,
+          en: `The working directory is not on the Run's branch ${run.branch} (it is on ${branch ?? 'a detached HEAD'})`,
+        }),
+      };
     }
     const head = await revParse(path, 'HEAD').catch(() => null);
     if (!head || !(await isAncestor(path, headCommit, head))) {
+      return {
+        reason: 'diverged',
+        message: t({
+          zh: `工作目录的提交历史和记录不一致：Master 记录的最新提交 ${headCommit.slice(0, 8)} 已不在当前分支上（可能被手动重置或改写过）`,
+          en: `The working directory's history does not match the records: the latest commit the Master recorded, ${headCommit.slice(0, 8)}, is no longer on the branch (it may have been reset or rewritten by hand)`,
+        }),
+      };
+    }
+    return null;
+  }
+
+  /**
+   * Every time a Run gets the execution slot (also after a Master restart), make sure its
+   * worktree is still what the Master left there; returns whether the Run goes on. A worktree
+   * that was only deleted (cleaning up the disk, say) comes back from the Run's branch, as a
+   * human's retry would bring it back. Otherwise the worktree can no longer be trusted (history
+   * rewritten, another branch checked out, the branch gone too): the Run ends as failed instead
+   * of waiting for a human, and a Run from an issue is redone in a fresh worktree.
+   */
+  private async checkWorkspace(runId: string, signal: AbortSignal): Promise<boolean> {
+    const run = this.store.getRun(runId);
+    const problem = await this.workspaceProblem(run);
+    this.checkAbort(signal);
+    if (!problem) return true;
+    const why =
+      problem.reason === 'missing'
+        ? await this.restoreMissingWorkspace(run, problem, signal)
+        : problem.message;
+    if (why === null) return true;
+    const state = await this.inspectWorkspace(run);
+    this.checkAbort(signal);
+    const kept =
+      state.worktreeExists && state.branchExists
+        ? t({
+            zh: 'Run 结束，工作目录和分支已保留。',
+            en: 'The Run ended; the working directory and branch are kept.',
+          })
+        : state.branchExists
+          ? t({
+              zh: `Run 结束，分支 ${state.workspace.branch} 已保留。`,
+              en: `The Run ended; branch ${state.workspace.branch} is kept.`,
+            })
+          : state.worktreeExists
+            ? t({
+                zh: 'Run 结束，工作目录已保留。',
+                en: 'The Run ended; the working directory is kept.',
+              })
+            : t({ zh: 'Run 结束。', en: 'The Run ended.' });
+    this.failRun(runId, `${why}\n${kept}`);
+    return false;
+  }
+
+  /**
+   * Check the Run's branch out again where its deleted worktree was. Returns null when the
+   * worktree is back and consistent with the records (which stay as they are: the branch holds
+   * every commit the Master accepted), else why the Run cannot go on.
+   */
+  private async restoreMissingWorkspace(
+    run: Run,
+    problem: WorkspaceProblem,
+    signal: AbortSignal,
+  ): Promise<string | null> {
+    const { worktreePath: path, branch } = run;
+    if (!path || !branch) return problem.message;
+    const repo = this.store.getRepo(run.repoId);
+    const exists = await branchExists(repo.path, branch);
+    this.checkAbort(signal);
+    if (!exists) {
       return t({
-        zh: `工作目录的提交历史和记录不一致：Master 记录的最新提交 ${headCommit.slice(0, 8)} 已不在当前分支上（可能被手动重置或改写过）`,
-        en: `The working directory's history does not match the records: the latest commit the Master recorded, ${headCommit.slice(0, 8)}, is no longer on the branch (it may have been reset or rewritten by hand)`,
+        zh: `${problem.message}，Run 的分支 ${branch} 也不在了，无法恢复`,
+        en: `${problem.message}, and so is the Run's branch ${branch}; it cannot be restored`,
       });
     }
+    try {
+      await addExistingWorktree(repo.path, path, branch);
+    } catch (err) {
+      // E.g. the branch is checked out somewhere else.
+      this.checkAbort(signal);
+      const reason = errorMessage(err).trim();
+      return t({
+        zh: `${problem.message}，从分支 ${branch} 恢复失败：${reason}`,
+        en: `${problem.message}, and restoring it from branch ${branch} failed: ${reason}`,
+      });
+    }
+    this.checkAbort(signal);
+    const again = await this.workspaceProblem(run);
+    this.checkAbort(signal);
+    if (again) {
+      return t({
+        zh: `${problem.message}，从分支 ${branch} 恢复后仍和记录不一致：${again.message}`,
+        en: `${problem.message}, and once restored from branch ${branch} it still does not match the records: ${again.message}`,
+      });
+    }
+    this.store.tx(() => {
+      this.store.event(run.id, 'run.workspace_restored', { path, branch });
+    });
     return null;
   }
 
@@ -1150,20 +1256,7 @@ export class Engine {
 
   private async drive(runId: string, signal: AbortSignal): Promise<void> {
     try {
-      // Every time a Run gets the execution slot (also after a Master restart), make sure its
-      // worktree is still what the Master left there.
-      const problem = await this.workspaceProblem(this.store.getRun(runId));
-      this.checkAbort(signal);
-      if (problem) {
-        this.block(runId, {
-          kind: 'workspace',
-          message: t({
-            zh: `${problem}。重试会以工作目录当前的提交为准继续；也可以终止这个 Run。`,
-            en: `${problem}. A retry continues from the working directory's current commit; or cancel the Run.`,
-          }),
-        });
-        return;
-      }
+      if (!(await this.checkWorkspace(runId, signal))) return;
       while (!signal.aborted) {
         const run = this.store.getRun(runId);
         if (run.status !== 'running') return;
