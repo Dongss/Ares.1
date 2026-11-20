@@ -1,0 +1,969 @@
+import { readdirSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import type { AgentAdapter, AgentExecution } from '../adapters/types.js';
+import type { GitHubRepoStatus, GitHubStatus } from '../api/types.js';
+import { brandName } from '../brand.js';
+import { issueRunOverrides } from '../config/flow.js';
+import { githubConfigKey, type HomePaths, type LoadedConfig } from '../config/load.js';
+import type { GitHubRepoConfig } from '../config/schema.js';
+import { type Engine, estimateCost, InvalidStateError } from '../engine/engine.js';
+import { storedRunTimes } from '../engine/times.js';
+import { t } from '../i18n.js';
+import { NotFoundError, type Store } from '../store/store.js';
+import {
+  type EventRow,
+  FINISHED_RUN_STATUSES,
+  type Repo,
+  type Run,
+  type RunIssue,
+  type Scout,
+  type ScoutProposal,
+} from '../store/types.js';
+import { errorMessage, nowIso } from '../util.js';
+import {
+  addDetachedWorktree,
+  dropWorktree,
+  pruneWorktrees,
+  revParse,
+  git as runGit,
+} from '../workspace/git.js';
+import { GhCli, type GitHub } from './client.js';
+import {
+  autoAcceptedComment,
+  discussionComment,
+  goalFromIssue,
+  isAutoAcceptable,
+  issueUpdate,
+  LABELS,
+  labelDefs,
+  markComment,
+  proposalBody,
+  repliesAfterMaster,
+  withStatusLabel,
+} from './issues.js';
+import {
+  issueDigest,
+  parseScoutReport,
+  runDigest,
+  scoutPrompt,
+  scoutReportJsonSchema,
+  untriaged,
+} from './scout.js';
+
+/** Error of a scout cut short by the Master stopping. */
+const stoppedWhileScouting = () =>
+  t({ zh: 'Master 在侦察过程中停止了', en: 'The Master stopped during the scout' });
+
+const notRegistered = (name: string) =>
+  t({
+    zh: `仓库 ${name} 没有在看板上登记`,
+    en: `Repo ${name} is not registered on the dashboard`,
+  });
+
+/** A scout in progress: its agent once started, and the whole scout including the cleanup. */
+interface ScoutEntry {
+  scoutId: string;
+  exec?: AgentExecution;
+  done?: Promise<void>;
+}
+
+/** Why an automatic scout does not start now; `until`: it may start after that time. */
+export interface ScoutWait {
+  reason: string;
+  until?: string;
+}
+
+export interface BridgeDeps {
+  store: Store;
+  engine: Engine;
+  paths: HomePaths;
+  config: () => LoadedConfig;
+  adapters: Map<string, AgentAdapter>;
+  /** Tests pass a fake; otherwise gh, as the configured account. */
+  github?: GitHub;
+}
+
+/** Start of the current day in the Master's local time, as ISO. */
+export function startOfToday(now = new Date()): string {
+  const d = new Date(now);
+  d.setHours(0, 0, 0, 0);
+  return d.toISOString();
+}
+
+/**
+ * GitHub Issues as the backlog:
+ * - intake: an open issue labeled ares1:ready becomes a Run;
+ * - sync: the Run's progress shows on the issue (labels, comments, closed when merged);
+ * - stop: a human closing the issue terminates its unfinished Run, and the issue is left alone;
+ * - discussion: the requirement assessment's questions and conclusion are posted on the issue,
+ *   and a human's replies there go back to the Run;
+ * - scout: an AI reads the repo and its Run history and proposes issues, on demand or by itself
+ *   whenever the repo is idle; proposals up to the configured risk are accepted without a human.
+ * Intake, auto-accept and automatic scouts only happen while the work switch is on.
+ * GitHub is only a mirror: failures are reported and retried on the next poll, never block Runs.
+ */
+export class IssueBridge {
+  private pollTimer: ReturnType<typeof setTimeout> | undefined;
+  private syncTimer: ReturnType<typeof setTimeout> | undefined;
+  private chain: Promise<void> = Promise.resolve();
+  private client: { key: string; gh: GitHub } | undefined;
+  private readonly labelsReady = new Set<string>();
+  private readonly resolved = new Map<string, string>();
+  private readonly scouting = new Map<string, ScoutEntry>();
+  /** Why no automatic scout started at the last poll, per repo name. */
+  private readonly scoutWaiting = new Map<string, ScoutWait | null>();
+  private lastPollAt: string | null = null;
+  /** Target branch commit last pushed, per repo path. */
+  private readonly pushed = new Map<string, string>();
+  private lastError: { message: string; at: string } | null = null;
+  private stopping = false;
+  private readonly onEvent = (e: EventRow) => {
+    // An assessment's result changes the discussion, not always the Run status (go keeps running).
+    if (e.type === 'run.status' || e.type === 'assess.result' || e.type === 'discussion.replied') {
+      this.scheduleSync();
+    }
+    if (e.type === 'master.working' && e.data.on === true) void this.poll();
+  };
+
+  constructor(private readonly deps: BridgeDeps) {}
+
+  private get cfg() {
+    return this.deps.config();
+  }
+
+  private gh(): GitHub {
+    if (this.deps.github) return this.deps.github;
+    const bin = this.cfg.master.bins.gh ?? 'gh';
+    const account = this.cfg.master.github?.account;
+    const key = `${bin}|${account ?? ''}`;
+    if (this.client?.key !== key) this.client = { key, gh: new GhCli(bin, account) };
+    return this.client.gh;
+  }
+
+  // ---- lifecycle -------------------------------------------------------------
+
+  async start(opts: { poll: boolean } = { poll: true }): Promise<void> {
+    for (const s of this.deps.store.listScouts({ limit: 1000 })) {
+      if (s.status === 'running') {
+        this.deps.store.updateScout(s.id, {
+          status: 'interrupted',
+          error: stoppedWhileScouting(),
+          endedAt: nowIso(),
+        });
+      }
+    }
+    await this.removeLeftoverScoutDirs();
+    this.deps.store.bus.on('event', this.onEvent);
+    if (opts.poll) this.schedulePoll(2_000);
+  }
+
+  async stop(): Promise<void> {
+    this.stopping = true;
+    this.deps.store.bus.off('event', this.onEvent);
+    clearTimeout(this.pollTimer);
+    clearTimeout(this.syncTimer);
+    // Wait for the scouts to record the interruption and delete their temporary worktrees.
+    await Promise.all(
+      [...this.scouting.values()].map(async (s) => {
+        await s.exec?.stop();
+        await s.done;
+      }),
+    );
+    await this.chain;
+  }
+
+  /** Where a scout reads the repo: a temporary worktree, deleted when the scout ends. */
+  private scoutDir(scoutId: string): string {
+    return join(this.deps.paths.worktreesDir, 'scouts', scoutId);
+  }
+
+  /** Temporary worktrees of scouts that a previous Master did not get to delete. */
+  private async removeLeftoverScoutDirs(): Promise<void> {
+    let ids: string[];
+    try {
+      ids = readdirSync(join(this.deps.paths.worktreesDir, 'scouts'));
+    } catch {
+      return; // no scout has run yet
+    }
+    const repos = new Set<string>();
+    for (const id of ids) {
+      try {
+        rmSync(this.scoutDir(id), { recursive: true, force: true });
+      } catch {
+        continue; // tried again at the next start
+      }
+      const repo = this.scoutRepo(id);
+      // Without the scout's record the worktree may belong to any repo.
+      const paths = repo ? [repo.path] : this.deps.store.listRepos().map((r) => r.path);
+      for (const p of paths) repos.add(p);
+    }
+    // Git forgets the worktrees whose directory is gone.
+    for (const repo of repos) await pruneWorktrees(repo);
+  }
+
+  private scoutRepo(scoutId: string): Repo | undefined {
+    try {
+      return this.deps.store.findRepo(this.deps.store.getScout(scoutId).repoId);
+    } catch (err) {
+      if (err instanceof NotFoundError) return undefined;
+      throw err;
+    }
+  }
+
+  private schedulePoll(delayMs: number): void {
+    clearTimeout(this.pollTimer);
+    if (this.stopping) return;
+    this.pollTimer = setTimeout(() => {
+      void this.poll().finally(() => {
+        const minutes = this.cfg.master.github?.poll_minutes ?? 5;
+        this.schedulePoll(minutes * 60_000);
+      });
+    }, delayMs);
+  }
+
+  private scheduleSync(): void {
+    clearTimeout(this.syncTimer);
+    if (this.stopping) return;
+    this.syncTimer = setTimeout(() => void this.sync(), 1_000);
+  }
+
+  /** Run `fn` after everything queued before it; GitHub calls never overlap. */
+  private serial(fn: () => Promise<void>): Promise<void> {
+    const next = this.chain.then(fn, fn);
+    this.chain = next.catch(() => {});
+    return next;
+  }
+
+  /** Every comment of the Master carries the marker that tells it from a human's. */
+  private comment(repo: string, number: number, body: string): Promise<void> {
+    return this.gh().comment(repo, number, markComment(body));
+  }
+
+  private report(err: unknown): void {
+    const message = errorMessage(err);
+    if (this.lastError?.message !== message) {
+      this.deps.store.event(null, 'github.error', { message });
+    }
+    this.lastError = { message, at: nowIso() };
+  }
+
+  // ---- poll: intake, sync, scheduled scouts ----------------------------------
+
+  /**
+   * One round: accept proposals the settings allow, start Runs for ready issues, terminate Runs
+   * whose issue a human closed, catch issues up, pass on replies to the assessments' questions,
+   * start a scout where the repo is idle. With the work switch off only the terminating and the
+   * catching up happen: neither starts new work.
+   */
+  poll(): Promise<void> {
+    return this.serial(async () => {
+      const github = this.cfg.master.github;
+      if (!github || this.stopping) return;
+      const working = this.deps.store.working;
+      let failed = false;
+      const each = async (step: (name: string) => Promise<void>) => {
+        for (const name of Object.keys(github.repos)) {
+          try {
+            await step(name);
+          } catch (err) {
+            failed = true;
+            this.report(err);
+          }
+        }
+      };
+      if (working) {
+        await each((name) => this.acceptBacklog(name));
+        await each((name) => this.intake(name));
+      }
+      if (!(await this.cancelClosedIssueRuns())) failed = true;
+      if (!(await this.syncRuns())) failed = true;
+      if (working) await each((name) => this.collectReplies(name));
+      await each((name) => this.pushTarget(name));
+      if (working) await each((name) => this.maybeAutoScout(name));
+      else {
+        for (const name of Object.keys(github.repos)) {
+          this.scoutWaiting.set(name, {
+            reason: t({ zh: '工作开关已关闭', en: 'The work switch is off' }),
+          });
+        }
+      }
+      this.lastPollAt = nowIso();
+      if (!failed) this.lastError = null;
+    });
+  }
+
+  /** Catch issues up with their Runs now. */
+  sync(): Promise<void> {
+    return this.serial(async () => {
+      if (!this.cfg.master.github || this.stopping) return;
+      await this.syncRuns();
+    });
+  }
+
+  private repoSetup(name: string): { repo: Repo; cfg: GitHubRepoConfig } {
+    const cfg = this.cfg.master.github?.repos[name];
+    if (!cfg) {
+      throw new NotFoundError(
+        t({
+          zh: `config.yaml 的 github.repos 里没有 ${name}`,
+          en: `${name} is not in github.repos of config.yaml`,
+        }),
+      );
+    }
+    const problems = this.cfg.errors[githubConfigKey(name)];
+    if (problems) {
+      throw new InvalidStateError(
+        t({
+          zh: `github.repos.${name} 配置有误：${problems.join('；')}`,
+          en: `github.repos.${name} is misconfigured: ${problems.join('; ')}`,
+        }),
+      );
+    }
+    const repo = this.deps.store.findRepo(name);
+    if (!repo) throw new NotFoundError(notRegistered(name));
+    return { repo, cfg };
+  }
+
+  private async issuesRepo(repo: Repo, cfg: GitHubRepoConfig): Promise<string> {
+    if (cfg.issues_repo) return cfg.issues_repo;
+    let full = this.resolved.get(repo.path);
+    if (!full) {
+      full = await this.gh().resolveRepo(repo.path);
+      this.resolved.set(repo.path, full);
+    }
+    return full;
+  }
+
+  private async ensureLabels(full: string): Promise<void> {
+    if (this.labelsReady.has(full)) return;
+    await this.gh().ensureLabels(full, labelDefs());
+    this.labelsReady.add(full);
+  }
+
+  private async intake(name: string): Promise<void> {
+    const { repo, cfg } = this.repoSetup(name);
+    const full = await this.issuesRepo(repo, cfg);
+    await this.ensureLabels(full);
+    const gh = this.gh();
+    const ready = await gh.listIssues(full, { state: 'open', label: LABELS.ready, limit: 50 });
+    for (const issue of ready.sort((a, b) => a.number - b.number)) {
+      if (this.stopping) return;
+      let run = this.deps.store.unfinishedRunForIssue(full, issue.number);
+      if (!run) {
+        const template = this.cfg.templates.get(cfg.template);
+        // L2: no approval before merging; other gates of the template stay.
+        const overrides = issueRunOverrides(template, cfg.auto_merge);
+        run = this.deps.engine.createRun({
+          repo: repo.name,
+          template: cfg.template,
+          goal: goalFromIssue(issue),
+          overrides,
+          issue: {
+            repo: full,
+            number: issue.number,
+            url: issue.url,
+            auto: issue.labels.includes(LABELS.auto),
+          },
+        });
+        const templateName = template?.name ?? cfg.template;
+        const runUrl = `${this.dashboardUrl()}/#/runs/${run.id}`;
+        await this.comment(
+          full,
+          issue.number,
+          t({
+            zh: `${brandName()}开始处理：Run \`${run.id}\`（模板「${templateName}」）。\n\n看板：${runUrl}`,
+            en: `${brandName()} started on it: Run \`${run.id}\` (template "${templateName}").\n\nDashboard: ${runUrl}`,
+          }),
+        );
+      }
+      // The Run may have moved on already; the next sync reports where it is.
+      await gh.setLabels(full, issue.number, withStatusLabel(issue.labels, LABELS.running));
+      this.deps.store.setIssueSynced(run.id, 'queued');
+    }
+  }
+
+  /**
+   * Accept proposals still waiting for a human that the auto-accept settings now allow, e.g. after
+   * the settings were loosened. Uses the risk and size the scout gave them.
+   */
+  private async acceptBacklog(name: string): Promise<void> {
+    const { repo, cfg } = this.repoSetup(name);
+    if (cfg.auto_accept.max_risk === 'none') return;
+    const full = await this.issuesRepo(repo, cfg);
+    const open = await this.gh().listIssues(full, {
+      state: 'open',
+      label: LABELS.proposal,
+      limit: 100,
+    });
+    const scouts = this.deps.store.listScouts({ repoId: repo.id, limit: 200 });
+    for (const issue of untriaged(open).sort((a, b) => a.number - b.number)) {
+      if (!this.mayAutoAccept(repo, cfg)) return;
+      const scout = scouts.find((s) => s.proposals.some((p) => p.issue?.number === issue.number));
+      const proposal = scout?.proposals.find((p) => p.issue?.number === issue.number);
+      if (!scout || !proposal?.issue || !isAutoAcceptable(proposal, cfg.auto_accept.max_risk)) {
+        continue;
+      }
+      await this.gh().setLabels(full, issue.number, [
+        ...withStatusLabel(issue.labels, LABELS.ready),
+        LABELS.auto,
+      ]);
+      await this.comment(full, issue.number, autoAcceptedComment());
+      proposal.issue.auto = true;
+      this.deps.store.tx(() => {
+        this.deps.store.updateScout(scout.id, { proposals: scout.proposals });
+        this.deps.store.event(null, 'issue.auto_accepted', { repo: name, issue: issue.number });
+      });
+    }
+  }
+
+  /** Push the target branch to GitHub when it moved since the last push. */
+  private async pushTarget(name: string): Promise<void> {
+    const { repo, cfg } = this.repoSetup(name);
+    if (!cfg.push) return;
+    const head = await revParse(repo.path, repo.targetBranch);
+    if (this.pushed.get(repo.path) === head) return;
+    const full = await this.issuesRepo(repo, cfg);
+    await this.gh().push(repo.path, full, repo.targetBranch);
+    this.pushed.set(repo.path, head);
+    this.deps.store.event(null, 'github.pushed', { repo: name, branch: repo.targetBranch, head });
+    // Keep `git status` in the clone honest when its origin is that GitHub repo.
+    try {
+      const url = (await runGit(repo.path, ['remote', 'get-url', 'origin'])).replace(/\.git$/, '');
+      if (url.endsWith(`github.com:${full}`) || url.endsWith(`github.com/${full}`)) {
+        await runGit(repo.path, ['update-ref', `refs/remotes/origin/${repo.targetBranch}`, head]);
+      }
+    } catch {
+      // no origin: nothing to keep in step
+    }
+  }
+
+  private dashboardUrl(): string {
+    return `http://127.0.0.1:${this.cfg.master.port}`;
+  }
+
+  /**
+   * A human closed the issue (completed or not planned): nobody wants the work any more, so its
+   * unfinished Run is terminated. Returns false when some issue could not be read or its Run not
+   * terminated (retried on the next poll); the Run stays as it is then.
+   */
+  private async cancelClosedIssueRuns(): Promise<boolean> {
+    let ok = true;
+    const unfinished = this.deps.store
+      .listRuns()
+      .filter((r) => r.issue && !FINISHED_RUN_STATUSES.includes(r.status));
+    for (const run of unfinished) {
+      if (this.stopping) break;
+      const issue = run.issue;
+      if (!issue) continue;
+      try {
+        const { state, stateReason } = await this.gh().getIssue(issue.repo, issue.number);
+        if (state === 'closed') await this.cancelForClosedIssue(run.id, issue, stateReason);
+      } catch (err) {
+        ok = false;
+        this.report(err);
+      }
+    }
+    return ok;
+  }
+
+  /**
+   * The issue stays as the human left it: no label change, no comment, not closed again, so their
+   * closing comment is still the last one (the scout reads it as the reason not to do it).
+   */
+  private async cancelForClosedIssue(
+    runId: string,
+    issue: RunIssue,
+    stateReason: string | null,
+  ): Promise<void> {
+    try {
+      await this.deps.engine.cancel(runId);
+    } catch (err) {
+      // It finished meanwhile; it is caught up on the issue as usual.
+      if (err instanceof InvalidStateError) return;
+      throw err;
+    }
+    const store = this.deps.store;
+    store.tx(() => {
+      const run = store.getRun(runId);
+      store.setIssueSynced(runId, run.status);
+      store.setIssueDiscussionSynced(runId, run.discussion.length);
+      store.event(runId, 'run.issue_closed', {
+        repo: issue.repo,
+        issue: issue.number,
+        stateReason,
+      });
+    });
+  }
+
+  /** Returns false when some issue could not be updated (retried on the next poll). */
+  private async syncRuns(): Promise<boolean> {
+    let ok = true;
+    for (const run of this.deps.store.runsWithIssueBehind()) {
+      if (this.stopping) break;
+      try {
+        await this.syncRun(run);
+      } catch (err) {
+        ok = false;
+        this.report(err);
+      }
+    }
+    return ok;
+  }
+
+  private async syncRun(run: Run): Promise<void> {
+    const issue = run.issue;
+    if (!issue) return;
+    // The discussion first, so a conclusion is on the issue before it closes.
+    await this.syncDiscussion(run, issue);
+    if (run.issueSynced === run.status) return;
+    const repo = this.deps.store.getRepo(run.repoId);
+    let stageName: string | undefined;
+    if (run.currentStageRunId) {
+      const sr = this.deps.store.getStageRun(run.currentStageRunId);
+      stageName = run.template.stages.find((s) => s.id === sr.stageId)?.name ?? sr.stageId;
+    }
+    // The issue closes once the code is on GitHub; a failed push is retried on the next poll.
+    let pushed = false;
+    if (run.status === 'completed') {
+      const name = repo.name;
+      if (this.cfg.master.github?.repos[name]?.push) {
+        await this.pushTarget(name);
+        pushed = true;
+      }
+    }
+    const update = issueUpdate(run, {
+      dashboardUrl: this.dashboardUrl(),
+      targetBranch: repo.targetBranch,
+      stageName,
+      pushed,
+      times: run.status === 'completed' ? storedRunTimes(this.deps.store, run) : undefined,
+    });
+    const gh = this.gh();
+    const current = await gh.getLabels(issue.repo, issue.number);
+    const wanted = withStatusLabel(current, update.label);
+    if (wanted.length !== current.length || wanted.some((l) => !current.includes(l))) {
+      await gh.setLabels(issue.repo, issue.number, wanted);
+    }
+    if (update.comment) await this.comment(issue.repo, issue.number, update.comment);
+    if (update.close) await gh.close(issue.repo, issue.number, update.close);
+    this.deps.store.setIssueSynced(run.id, run.status);
+  }
+
+  /** Post the discussion entries the issue does not have yet, one comment each, in order. */
+  private async syncDiscussion(run: Run, issue: RunIssue): Promise<void> {
+    const ctx = {
+      dashboardUrl: this.dashboardUrl(),
+      runId: run.id,
+      pollMinutes: this.cfg.master.github?.poll_minutes ?? 5,
+    };
+    for (let i = run.issueDiscussionSynced; i < run.discussion.length; i++) {
+      if (this.stopping) return;
+      const entry = run.discussion[i];
+      const body = entry ? discussionComment(entry, ctx) : null;
+      if (body) await this.comment(issue.repo, issue.number, body);
+      this.deps.store.setIssueDiscussionSynced(run.id, i + 1);
+    }
+  }
+
+  /**
+   * Replies on the issue to the assessment's questions: comments without the Master's marker
+   * after its last comment. Only once the latest questions are on the issue, so earlier comments
+   * are never taken for answers to them. The Run is assessed again with the replies.
+   */
+  private async collectReplies(name: string): Promise<void> {
+    const { repo } = this.repoSetup(name);
+    const waiting = this.deps.store
+      .listRuns({ status: 'blocked', repoId: repo.id })
+      .filter((r) => r.issue && r.blocked?.kind === 'discussion');
+    for (const run of waiting) {
+      if (this.stopping) return;
+      const issue = run.issue;
+      if (!issue || run.issueDiscussionSynced < run.discussion.length) continue;
+      const replies = repliesAfterMaster(await this.gh().listComments(issue.repo, issue.number));
+      // Someone may have replied on the dashboard meanwhile; the next questions come first then.
+      const now = this.deps.store.getRun(run.id);
+      const still =
+        now.blocked?.kind === 'discussion' && now.discussion.length === run.discussion.length;
+      if (replies.length === 0 || now.status !== 'blocked' || !still) continue;
+      const replied = this.deps.engine.reply(run.id, replies, 'issue');
+      // The replies came from the issue: nothing to post for them.
+      this.deps.store.setIssueDiscussionSynced(run.id, replied.discussion.length);
+    }
+  }
+
+  // ---- guardrails --------------------------------------------------------
+
+  /** Spend of today on this repo's scouts and auto-accepted Runs. */
+  spentToday(repoId: string): number {
+    const since = startOfToday();
+    const scouts = this.deps.store
+      .listScouts({ repoId, since, limit: 1000 })
+      .reduce((sum, s) => sum + (s.costUsd ?? 0), 0);
+    const runs = this.deps.store
+      .issueRunsSince(since)
+      .filter((r) => r.repoId === repoId && r.issue?.auto)
+      .reduce((sum, r) => sum + r.costUsd, 0);
+    return scouts + runs;
+  }
+
+  autoAcceptedToday(repoName: string): number {
+    return this.deps.store
+      .listEventsOfType('issue.auto_accepted', startOfToday())
+      .filter((e) => e.data.repo === repoName).length;
+  }
+
+  /** Today's spend reached the configured limit (none = never). */
+  private overBudget(repo: Repo, cfg: GitHubRepoConfig): boolean {
+    return cfg.daily_budget_usd !== undefined && this.spentToday(repo.id) >= cfg.daily_budget_usd;
+  }
+
+  /** Within today's auto-accept count and spend. */
+  private mayAutoAccept(repo: Repo, cfg: GitHubRepoConfig): boolean {
+    const max = cfg.auto_accept.max_per_day;
+    if (max !== undefined && this.autoAcceptedToday(repo.name) >= max) return false;
+    return !this.overBudget(repo, cfg);
+  }
+
+  /**
+   * Scout by itself when there is nothing to do: the repo has no unfinished Run, few
+   * proposals wait for a human, the day's budget is not spent, and the configured interval since
+   * the last scout has passed (no extra wait after a scout that failed or found nothing).
+   * Records why it waits, for the dashboard.
+   */
+  private async maybeAutoScout(name: string): Promise<void> {
+    const { repo, cfg } = this.repoSetup(name);
+    const waiting = await this.autoScoutWaiting(repo, cfg);
+    this.scoutWaiting.set(name, waiting);
+    if (waiting === null) await this.startScout(name, 'auto');
+  }
+
+  private async autoScoutWaiting(repo: Repo, cfg: GitHubRepoConfig): Promise<ScoutWait | null> {
+    const scout = cfg.scout;
+    if (!scout?.auto) {
+      return {
+        reason: t({ zh: '只在看板上手动触发', en: 'Only started from the dashboard' }),
+      };
+    }
+    if (this.scouting.has(repo.id)) return { reason: t({ zh: '正在侦察', en: 'Scouting' }) };
+    const busy = this.deps.store
+      .listRuns({ repoId: repo.id })
+      .filter((r) => !FINISHED_RUN_STATUSES.includes(r.status));
+    if (busy.length > 0) {
+      return {
+        reason: t({
+          zh: `等 ${busy.length} 个未结束的 Run 做完`,
+          en: `Waiting for ${busy.length} unfinished Run${busy.length === 1 ? '' : 's'} to finish`,
+        }),
+      };
+    }
+    if (this.deps.engine.held) {
+      return { reason: t({ zh: '等 Master 升级', en: 'Waiting for the Master to upgrade' }) };
+    }
+    if (this.overBudget(repo, cfg)) {
+      return {
+        reason: t({
+          zh: '今天的自动花费已达上限',
+          en: "Today's automatic spending reached its limit",
+        }),
+      };
+    }
+    const last = this.deps.store.listScouts({ repoId: repo.id, limit: 1 })[0];
+    if (last && scout.interval_hours > 0) {
+      const next = Date.parse(last.startedAt) + scout.interval_hours * 3_600_000;
+      if (next > Date.now()) {
+        return {
+          reason: t({
+            zh: '离上次侦察不到设定的间隔',
+            en: 'Less than the set interval since the last scout',
+          }),
+          until: new Date(next).toISOString(),
+        };
+      }
+    }
+    // Do not pile up proposals nobody has looked at.
+    const full = await this.issuesRepo(repo, cfg);
+    const open = await this.gh().listIssues(full, {
+      state: 'open',
+      label: LABELS.proposal,
+      limit: 100,
+    });
+    const pending = untriaged(open).length;
+    if (pending >= scout.max_proposals) {
+      return {
+        reason: t({
+          zh: `有 ${pending} 条提案等你处理`,
+          en: `${pending} proposal${pending === 1 ? '' : 's'} waiting for you`,
+        }),
+      };
+    }
+    return null;
+  }
+
+  // ---- scouting ------------------------------------------------------------
+
+  /** Some repo is being scouted (an upgrade waits for it). */
+  get scoutRunning(): boolean {
+    return this.scouting.size > 0;
+  }
+
+  /** Start a scout; it runs in the background. */
+  async startScout(name: string, trigger: Scout['trigger']): Promise<Scout> {
+    const { repo, cfg } = this.repoSetup(name);
+    const scoutCfg = cfg.scout;
+    if (!scoutCfg) {
+      throw new InvalidStateError(
+        t({
+          zh: `仓库 ${name} 没有配置侦察（github.repos.${name}.scout）`,
+          en: `Repo ${name} has no scout configured (github.repos.${name}.scout)`,
+        }),
+      );
+    }
+    if (this.scouting.has(repo.id)) {
+      throw new InvalidStateError(
+        t({ zh: `仓库 ${name} 正在侦察`, en: `Repo ${name} is being scouted already` }),
+      );
+    }
+    const agent = this.cfg.agents.get(scoutCfg.agent);
+    if (!agent) {
+      throw new InvalidStateError(
+        t({
+          zh: `侦察用的 Agent ${scoutCfg.agent} 不存在或未启用`,
+          en: `The scout's agent ${scoutCfg.agent} does not exist or is disabled`,
+        }),
+      );
+    }
+    const adapter = this.deps.adapters.get(agent.cli);
+    if (!adapter?.supportsReadOnly) {
+      throw new InvalidStateError(
+        t({
+          zh: `侦察要以只读方式运行，${agent.cli} 不支持，请换用 claude-code 的 Agent`,
+          en: `The scout runs read-only, which ${agent.cli} does not support; use a claude-code agent`,
+        }),
+      );
+    }
+    this.scouting.set(repo.id, { scoutId: '' });
+    try {
+      const full = await this.issuesRepo(repo, cfg);
+      await this.ensureLabels(full);
+      const scout = this.deps.store.tx(() => {
+        const s = this.deps.store.createScout({
+          repoId: repo.id,
+          issuesRepo: full,
+          trigger,
+          agentId: agent.id,
+          model: agent.model,
+          logPath: '',
+        });
+        const logPath = join(this.deps.paths.logsDir, 'scouts', `${s.id}.jsonl`);
+        this.deps.store.event(null, 'scout.started', { scoutId: s.id, repo: name, trigger });
+        return this.deps.store.updateScout(s.id, { logPath });
+      });
+      const entry: ScoutEntry = { scoutId: scout.id };
+      this.scouting.set(repo.id, entry);
+      entry.done = this.runScout(scout, repo, cfg, adapter, entry).finally(() => {
+        this.scouting.delete(repo.id);
+      });
+      return scout;
+    } catch (err) {
+      this.scouting.delete(repo.id);
+      throw err;
+    }
+  }
+
+  private async runScout(
+    scout: Scout,
+    repo: Repo,
+    cfg: GitHubRepoConfig,
+    adapter: AgentAdapter,
+    entry: ScoutEntry,
+  ): Promise<void> {
+    const store = this.deps.store;
+    const scoutCfg = cfg.scout;
+    const agent = scoutCfg ? this.cfg.agents.get(scoutCfg.agent) : undefined;
+    let cost: number | null = null;
+    let workdir: string | undefined;
+    try {
+      if (!scoutCfg || !agent) {
+        throw new Error(
+          t({
+            zh: '侦察配置在启动后被移除了',
+            en: 'The scout configuration was removed after the scout started',
+          }),
+        );
+      }
+      const gh = this.gh();
+      const [open, closed] = await Promise.all([
+        gh.listIssues(scout.issuesRepo, { state: 'open', limit: 100 }),
+        gh.listIssues(scout.issuesRepo, { state: 'closed', limit: 30, comments: true }),
+      ]);
+      const prompt = scoutPrompt({
+        repoName: repo.name,
+        max: scoutCfg.max_proposals,
+        runs: runDigest(store, repo.id),
+        issues: issueDigest(open, closed),
+      });
+      // Read the target branch as committed, like a Run does, not whatever the main worktree has
+      // checked out or left uncommitted. A detached worktree creates no branch.
+      workdir = this.scoutDir(scout.id);
+      try {
+        const base = await revParse(repo.path, repo.targetBranch);
+        await addDetachedWorktree(repo.path, workdir, base);
+      } catch (err) {
+        throw new Error(
+          t({
+            zh: `在目标分支 ${repo.targetBranch} 上建侦察的临时工作目录失败：${errorMessage(err)}`,
+            en: `Creating the scout's temporary workspace on the target branch ${repo.targetBranch} failed: ${errorMessage(err)}`,
+          }),
+        );
+      }
+      if (this.stopping) throw new Interrupted();
+      const exec = adapter.start({
+        workdir,
+        prompt,
+        model: agent.model,
+        effort: agent.effort,
+        permission: 'safe',
+        readOnly: true,
+        outputSchema: scoutReportJsonSchema(),
+        timeoutMs: (agent.timeout_minutes ?? this.cfg.master.defaults.timeout_minutes) * 60_000,
+        extraArgs: agent.args,
+        logPath: scout.logPath,
+      });
+      entry.exec = exec;
+      const result = await exec.result;
+      cost = result.costUsd ?? estimateCost(agent, result.usage) ?? null;
+      store.updateScout(scout.id, { costUsd: cost });
+      if (this.stopping) throw new Interrupted();
+      if (result.status !== 'completed') {
+        throw new Error(
+          result.error ??
+            t({
+              zh: `侦察没有正常结束（${result.status}）`,
+              en: `The scout did not end normally (${result.status})`,
+            }),
+        );
+      }
+      const proposals = parseScoutReport(result.structured, result.finalMessage).slice(
+        0,
+        scoutCfg.max_proposals,
+      );
+      const created = await this.fileProposals(scout, repo, cfg, proposals);
+      store.tx(() => {
+        store.updateScout(scout.id, { status: 'completed', proposals, endedAt: nowIso() });
+        store.event(null, 'scout.completed', {
+          scoutId: scout.id,
+          repo: repo.name,
+          created: created.filter((p) => p.issue).length,
+          auto: created.filter((p) => p.issue?.auto).length,
+          /** Issues that wait for a human. */
+          pending: created.filter((p) => p.issue && !p.issue.auto).length,
+        });
+      });
+      if (created.some((p) => p.issue?.auto)) void this.poll();
+    } catch (err) {
+      const interrupted = err instanceof Interrupted || this.stopping;
+      store.tx(() => {
+        store.updateScout(scout.id, {
+          status: interrupted ? 'interrupted' : 'failed',
+          error: interrupted ? stoppedWhileScouting() : errorMessage(err),
+          costUsd: cost,
+          endedAt: nowIso(),
+        });
+        store.event(null, 'scout.failed', {
+          scoutId: scout.id,
+          repo: repo.name,
+          message: errorMessage(err),
+        });
+      });
+    } finally {
+      if (workdir) await dropWorktree(repo.path, workdir);
+    }
+  }
+
+  /** Create an issue per proposal; low-risk ones are auto-accepted within today's limits. */
+  private async fileProposals(
+    scout: Scout,
+    repo: Repo,
+    cfg: GitHubRepoConfig,
+    proposals: ScoutProposal[],
+  ): Promise<ScoutProposal[]> {
+    for (const p of proposals) {
+      const auto = isAutoAcceptable(p, cfg.auto_accept.max_risk) && this.mayAutoAccept(repo, cfg);
+      const labels: string[] = [LABELS.proposal];
+      if (auto) labels.push(LABELS.ready, LABELS.auto);
+      try {
+        const issue = await this.gh().createIssue(scout.issuesRepo, {
+          title: p.title,
+          body: proposalBody(p, scout.id, auto),
+          labels,
+        });
+        p.issue = { ...issue, auto };
+        if (auto) {
+          this.deps.store.event(null, 'issue.auto_accepted', {
+            repo: repo.name,
+            issue: issue.number,
+          });
+        }
+      } catch (err) {
+        p.error = errorMessage(err);
+        this.report(err);
+      }
+      // Keep what was created so far even if the Master stops halfway.
+      this.deps.store.updateScout(scout.id, { proposals });
+    }
+    return proposals;
+  }
+
+  // ---- status ----------------------------------------------------------------------
+
+  status(): GitHubStatus {
+    const github = this.cfg.master.github;
+    const repos: GitHubRepoStatus[] = Object.entries(github?.repos ?? {}).map(([name, cfg]) => {
+      const repo = this.deps.store.findRepo(name);
+      const problems = [...(this.cfg.errors[githubConfigKey(name)] ?? [])];
+      if (!repo) problems.push(notRegistered(name));
+      const last = repo ? this.deps.store.listScouts({ repoId: repo.id, limit: 1 })[0] : undefined;
+      const spent = repo ? this.spentToday(repo.id) : 0;
+      const running = repo ? this.scouting.has(repo.id) : false;
+      return {
+        name,
+        issuesRepo: cfg.issues_repo ?? (repo ? (this.resolved.get(repo.path) ?? null) : null),
+        template: cfg.template,
+        problems,
+        scout: cfg.scout
+          ? {
+              agent: cfg.scout.agent,
+              auto: cfg.scout.auto,
+              intervalHours: cfg.scout.interval_hours,
+              maxProposals: cfg.scout.max_proposals,
+              running,
+              lastAt: last?.startedAt ?? null,
+              waiting: running ? null : (this.scoutWaiting.get(name) ?? null),
+            }
+          : null,
+        autoAccept: {
+          maxRisk: cfg.auto_accept.max_risk,
+          maxPerDay: cfg.auto_accept.max_per_day ?? null,
+          usedToday: this.autoAcceptedToday(name),
+        },
+        autoMerge: cfg.auto_merge,
+        budget: {
+          dailyUsd: cfg.daily_budget_usd ?? null,
+          spentToday: spent,
+          reached: cfg.daily_budget_usd !== undefined && spent >= cfg.daily_budget_usd,
+        },
+        push: cfg.push,
+      };
+    });
+    return {
+      enabled: github !== undefined,
+      account: github?.account ?? null,
+      pollMinutes: github?.poll_minutes ?? 5,
+      lastPollAt: this.lastPollAt,
+      lastError: this.lastError,
+      repos,
+    };
+  }
+}
+
+class Interrupted extends Error {}

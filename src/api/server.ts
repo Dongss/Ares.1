@@ -1,0 +1,437 @@
+import { existsSync, readFileSync } from 'node:fs';
+import { isAbsolute, resolve } from 'node:path';
+import { Hono } from 'hono';
+import { streamSSE } from 'hono/streaming';
+import { z } from 'zod';
+import type { LoadedConfig } from '../config/load.js';
+import type { ConfigStatus } from '../config/watch.js';
+import { type Engine, InvalidStateError, readAttemptEvents } from '../engine/engine.js';
+import { storedRunTimes } from '../engine/times.js';
+import type { IssueBridge } from '../github/bridge.js';
+import { t } from '../i18n.js';
+import { ConflictError, NotFoundError, type Store } from '../store/store.js';
+import type { EventRow, RunStatus } from '../store/types.js';
+import type { Upgrader } from '../upgrade/upgrader.js';
+import { branchExists, currentBranch, isGitRepo } from '../workspace/git.js';
+import { agentSummaries } from './agents.js';
+import { isCostUnknown } from './cost.js';
+import { diffView, runDiffRange } from './diff.js';
+import { mountDashboard } from './static.js';
+import { collectStats, STATS_RANGES } from './stats.js';
+import type {
+  AgentSummary,
+  ConfigView,
+  GitHubStatus,
+  HealthView,
+  KeptWorkspace,
+  LiveAgentEvent,
+  RunDetail,
+  RunSummary,
+  StatsView,
+  UpgradeStatus,
+} from './types.js';
+import { keptWorkspaces } from './workspaces.js';
+
+export interface ApiDeps {
+  store: Store;
+  engine: Engine;
+  /** GitHub Issues as the backlog. */
+  issues: IssueBridge;
+  /** The Master upgrading itself. */
+  upgrader: Upgrader;
+  /** Commit of the running Master's install directory. */
+  version: string | null;
+  config: () => LoadedConfig;
+  /** Built dashboard to serve at `/`; see `defaultWebDir()`. */
+  webDir?: string;
+  /** Reload status of the configuration; omitted = loaded once at startup. */
+  configStatus?: () => ConfigStatus;
+}
+
+class BadRequestError extends Error {}
+
+function noBranch(branch: string): string {
+  return t({ zh: `分支 ${branch} 不存在`, en: `Branch ${branch} does not exist` });
+}
+
+const RepoInput = z.strictObject({
+  name: z.string().regex(/^[\w.-]+$/, {
+    error: () =>
+      t({
+        zh: '名称只能包含字母、数字、. _ -',
+        en: 'a name may only contain letters, digits, . _ -',
+      }),
+  }),
+  path: z.string().min(1),
+  targetBranch: z.string().min(1).optional(),
+  verifyCommands: z.array(z.string()).default([]),
+  setupCommands: z.array(z.string()).default([]),
+});
+
+const RepoPatch = z.strictObject({
+  targetBranch: z.string().min(1).optional(),
+  verifyCommands: z.array(z.string()).optional(),
+  setupCommands: z.array(z.string()).optional(),
+});
+
+const CommentInput = z.strictObject({ comment: z.string().optional() });
+const ScoutInput = z.strictObject({ repo: z.string().min(1) });
+const WorkingInput = z.strictObject({ on: z.boolean() });
+const StatsQuery = z.strictObject({
+  range: z.enum(STATS_RANGES).default('7d'),
+  repo: z.string().min(1).optional(),
+});
+const RetryInput = z.strictObject({
+  agentId: z.string().optional(),
+  note: z.string().optional(),
+  budgetUsd: z.number().positive().optional(),
+});
+
+async function body<T>(
+  c: { req: { json: () => Promise<unknown> } },
+  schema: z.ZodType<T>,
+): Promise<T> {
+  let raw: unknown;
+  try {
+    raw = await c.req.json();
+  } catch {
+    raw = {};
+  }
+  const parsed = schema.safeParse(raw ?? {});
+  if (!parsed.success) {
+    throw new BadRequestError(
+      parsed.error.issues
+        .map((i) => `${i.path.join('.') || '(body)'}: ${i.message}`)
+        .join(t({ zh: '；', en: '; ' })),
+    );
+  }
+  return parsed.data;
+}
+
+/**
+ * HTTP API of the Master. The dashboard uses these endpoints; so can scripts and tests.
+ * Listens on 127.0.0.1 only: there is no login.
+ */
+export function createApi(deps: ApiDeps): Hono {
+  const { store, engine, issues, upgrader, version, config, configStatus, webDir } = deps;
+  const startedAt = new Date().toISOString();
+  const status =
+    configStatus ?? (() => ({ loadedAt: startedAt, reloadError: null, restartNeeded: [] }));
+  const app = new Hono();
+
+  app.onError((err, c) => {
+    const status =
+      err instanceof NotFoundError
+        ? 404
+        : err instanceof ConflictError || err instanceof InvalidStateError
+          ? 409
+          : err instanceof BadRequestError
+            ? 400
+            : 500;
+    return c.json({ error: err.message }, status);
+  });
+
+  const health = (): HealthView => ({
+    ok: true,
+    activeRun: engine.activeRunId ?? null,
+    working: store.working,
+    systemNotify: config().master.notify.system,
+    version,
+  });
+
+  app.get('/api/health', (c) => c.json(health()));
+
+  // The work switch.
+  app.put('/api/working', async (c) => {
+    const { on } = await body(c, WorkingInput);
+    engine.setWorking(on);
+    return c.json(health());
+  });
+
+  // ---- configuration (read-only) --------------------------------------
+  app.get('/api/config', (c) => {
+    const cfg = config();
+    return c.json({
+      language: cfg.master.language,
+      agents: [...cfg.agents.values()],
+      templates: [...cfg.templates.values()],
+      errors: cfg.errors,
+      warnings: cfg.warnings,
+      dir: cfg.dir,
+      configFile: cfg.configFile,
+      agentsFile: cfg.agentsFile,
+      agentEntries: cfg.agentEntries,
+      templateFiles: cfg.templateFiles,
+      ...status(),
+    } satisfies ConfigView);
+  });
+
+  // Agents with what they did: executions, outcomes, cost, latest error.
+  app.get('/api/agents', (c) => c.json(agentSummaries(store, config()) satisfies AgentSummary[]));
+
+  // ---- repos ---------------------------------------------------------------
+  app.get('/api/repos', (c) => c.json(store.listRepos()));
+
+  app.post('/api/repos', async (c) => {
+    const input = await body(c, RepoInput);
+    const path = resolve(input.path);
+    if (!isAbsolute(input.path)) {
+      throw new BadRequestError(
+        t({ zh: 'path 必须是绝对路径', en: 'path must be an absolute path' }),
+      );
+    }
+    if (!existsSync(path) || !(await isGitRepo(path))) {
+      throw new BadRequestError(
+        t({ zh: `${path} 不是 git 仓库`, en: `${path} is not a git repository` }),
+      );
+    }
+    if (store.findRepo(input.name)) {
+      throw new ConflictError(
+        t({
+          zh: `仓库名 ${input.name} 已存在`,
+          en: `A repo named ${input.name} already exists`,
+        }),
+      );
+    }
+    const targetBranch = input.targetBranch ?? (await currentBranch(path));
+    if (!(await branchExists(path, targetBranch))) {
+      throw new BadRequestError(noBranch(targetBranch));
+    }
+    const repo = store.createRepo({
+      name: input.name,
+      path,
+      targetBranch,
+      verifyCommands: input.verifyCommands,
+      setupCommands: input.setupCommands,
+      mergeMode: 'direct',
+    });
+    return c.json(repo, 201);
+  });
+
+  app.patch('/api/repos/:id', async (c) => {
+    const repo = store.getRepo(c.req.param('id'));
+    const input = await body(c, RepoPatch);
+    if (input.targetBranch && !(await branchExists(repo.path, input.targetBranch))) {
+      throw new BadRequestError(noBranch(input.targetBranch));
+    }
+    return c.json(store.updateRepo(repo.id, input));
+  });
+
+  app.delete('/api/repos/:id', (c) => {
+    const repo = store.getRepo(c.req.param('id'));
+    store.deleteRepo(repo.id);
+    return c.body(null, 204);
+  });
+
+  // ---- runs ----------------------------------------------------------------
+  // There is no endpoint for creating Runs: they only come from GitHub issues (IssueBridge).
+  app.get('/api/runs', (c) => {
+    const status = c.req.query('status') as RunStatus | undefined;
+    const repo = c.req.query('repo');
+    const repoId = repo ? store.getRepo(repo).id : undefined;
+    return c.json(store.listRuns({ status, repoId }).map((run) => summarizeRun(store, run)));
+  });
+
+  app.get('/api/runs/:id', async (c) => {
+    const id = c.req.param('id');
+    const run = store.getRun(id);
+    return c.json({
+      run,
+      repo: store.getRepo(run.repoId),
+      stageRuns: store.listStageRuns(id),
+      tasks: store.listRunTasks(id),
+      attempts: store.listRunAttempts(id),
+      checks: store.listChecks(id),
+      approvals: store.listApprovals(id),
+      artifacts: store.listArtifacts(id),
+      times: storedRunTimes(store, run),
+      ...(await engine.inspectWorkspace(run)),
+    } satisfies RunDetail);
+  });
+
+  app.get('/api/runs/:id/events', (c) => {
+    const after = Number(c.req.query('after') ?? 0);
+    return c.json(store.listEvents(c.req.param('id'), after));
+  });
+
+  // What the Run changes on its target branch, or one task commit with ?commit=<sha>.
+  app.get('/api/runs/:id/diff', async (c) => {
+    const run = store.getRun(c.req.param('id'));
+    const repo = store.getRepo(run.repoId);
+    const commit = c.req.query('commit');
+    if (commit) {
+      if (!store.listRunTasks(run.id).some((task) => task.commitSha === commit)) {
+        throw new NotFoundError(
+          t({
+            zh: `提交 ${commit} 不属于这个 Run`,
+            en: `Commit ${commit} does not belong to this Run`,
+          }),
+        );
+      }
+      return c.json(await diffView(repo.path, `${commit}^`, commit));
+    }
+    const range = await runDiffRange(repo, run, store.listEvents(run.id));
+    if (!range) return c.json(null);
+    return c.json(await diffView(repo.path, range.base, range.head));
+  });
+
+  app.get('/api/runs/:id/artifacts/:artifactId', (c) => {
+    const artifact = store
+      .listArtifacts(c.req.param('id'))
+      .find((a) => a.id === c.req.param('artifactId'));
+    if (!artifact) {
+      throw new NotFoundError(t({ zh: '产物不存在', en: 'No such artifact' }));
+    }
+    return c.text(readFileSync(artifact.path, 'utf8'));
+  });
+
+  app.post('/api/runs/:id/approve', async (c) => {
+    const { comment } = await body(c, CommentInput);
+    return c.json(engine.approve(c.req.param('id'), comment));
+  });
+
+  app.post('/api/runs/:id/reject', async (c) => {
+    const { comment } = await body(c, CommentInput);
+    return c.json(engine.reject(c.req.param('id'), comment ?? ''));
+  });
+
+  app.post('/api/runs/:id/retry', async (c) => {
+    const input = await body(c, RetryInput);
+    return c.json(await engine.retry(c.req.param('id'), input));
+  });
+
+  app.post('/api/runs/:id/pause', async (c) => c.json(await engine.pause(c.req.param('id'))));
+  app.post('/api/runs/:id/resume', (c) => c.json(engine.resume(c.req.param('id'))));
+  app.post('/api/runs/:id/cancel', async (c) => c.json(await engine.cancel(c.req.param('id'))));
+  // Remove the worktree and branch a failed / cancelled Run kept.
+  app.post('/api/runs/:id/cleanup', async (c) =>
+    c.json(await engine.cleanupWorkspace(c.req.param('id'))),
+  );
+
+  // ---- workspaces kept by finished Runs --------------------------------
+  app.get('/api/workspaces', async (c) =>
+    c.json((await keptWorkspaces(store, engine)) satisfies KeptWorkspace[]),
+  );
+
+  // ---- statistics ------------------------------------------------------
+  app.get('/api/stats', (c) => {
+    const parsed = StatsQuery.safeParse(c.req.query());
+    if (!parsed.success) {
+      throw new BadRequestError(
+        parsed.error.issues.map((i) => `${i.path.join('.') || '(query)'}: ${i.message}`).join('；'),
+      );
+    }
+    const { range, repo } = parsed.data;
+    const repoId = repo ? store.getRepo(repo).id : null;
+    return c.json(collectStats(store, { range, repoId }) satisfies StatsView);
+  });
+
+  // ---- the Master upgrading itself --------------------------------------
+  app.get('/api/upgrade', (c) => c.json(upgrader.status() satisfies UpgradeStatus));
+
+  app.post('/api/upgrade/check', async (c) => {
+    await upgrader.check();
+    return c.json(upgrader.status() satisfies UpgradeStatus);
+  });
+
+  // ---- GitHub issues and scouts --------------------------------------
+  app.get('/api/github', (c) => c.json(issues.status() satisfies GitHubStatus));
+
+  // Look for ready issues and catch issues up now instead of at the next poll.
+  app.post('/api/github/poll', async (c) => {
+    await issues.poll();
+    return c.json(issues.status() satisfies GitHubStatus);
+  });
+
+  app.get('/api/scouts', (c) => {
+    const repo = c.req.query('repo');
+    const repoId = repo ? store.getRepo(repo).id : undefined;
+    return c.json(store.listScouts({ repoId, limit: 30 }));
+  });
+
+  app.post('/api/scouts', async (c) => {
+    const { repo } = await body(c, ScoutInput);
+    return c.json(await issues.startScout(repo, 'manual'), 201);
+  });
+
+  // ---- logs ----------------------------------------------------------------
+  app.get('/api/attempts/:id/log', (c) => {
+    const attempt = store.getAttempt(c.req.param('id'));
+    if (!existsSync(attempt.logPath)) {
+      throw new NotFoundError(t({ zh: '日志文件不存在', en: 'The log file does not exist' }));
+    }
+    if (c.req.query('download') !== undefined) {
+      c.header('content-disposition', `attachment; filename="${attempt.id}.jsonl"`);
+    }
+    return c.text(readFileSync(attempt.logPath, 'utf8'));
+  });
+
+  // Normalized agent events recorded so far; live ones follow on /api/stream.
+  app.get('/api/attempts/:id/events', (c) => {
+    const attempt = store.getAttempt(c.req.param('id'));
+    return c.json(readAttemptEvents(attempt.logPath));
+  });
+
+  // ---- live stream (Server-Sent Events) --------------------------------------
+  app.get('/api/stream', (c) => {
+    const runId = c.req.query('run');
+    return streamSSE(c, async (stream) => {
+      const queue: { event: string; data: string }[] = [];
+      let wake: (() => void) | undefined;
+      const push = (event: string, data: unknown) => {
+        queue.push({ event, data: JSON.stringify(data) });
+        wake?.();
+      };
+      const onEvent = (e: EventRow) => {
+        if (!runId || e.runId === runId) push('event', e);
+      };
+      const onAgent = (e: LiveAgentEvent) => {
+        if (!runId || e.runId === runId) push('agent', e);
+      };
+      store.bus.on('event', onEvent);
+      engine.live.on('agent', onAgent);
+      let closed = false;
+      stream.onAbort(() => {
+        closed = true;
+        wake?.();
+      });
+      try {
+        while (!closed) {
+          const next = queue.shift();
+          if (next) {
+            await stream.writeSSE(next);
+            continue;
+          }
+          await new Promise<void>((r) => {
+            wake = r;
+            setTimeout(r, 15_000); // heartbeat
+          });
+          wake = undefined;
+          if (queue.length === 0 && !closed) await stream.writeSSE({ event: 'ping', data: '{}' });
+        }
+      } finally {
+        store.bus.off('event', onEvent);
+        engine.live.off('agent', onAgent);
+      }
+    });
+  });
+
+  mountDashboard(app, webDir);
+  return app;
+}
+
+function summarizeRun(store: Store, run: ReturnType<Store['getRun']>): RunSummary {
+  const { template, ...rest } = run;
+  let currentStage: { id: string; name: string; round: number } | null = null;
+  if (run.currentStageRunId) {
+    const sr = store.getStageRun(run.currentStageRunId);
+    const def = template.stages.find((s) => s.id === sr.stageId);
+    currentStage = { id: sr.stageId, name: def?.name ?? sr.stageId, round: sr.round };
+  }
+  return {
+    ...rest,
+    templateName: template.name ?? template.id,
+    currentStage,
+    costUnknown: store.listRunAttempts(run.id).some(isCostUnknown),
+  };
+}

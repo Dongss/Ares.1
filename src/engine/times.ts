@@ -1,0 +1,209 @@
+// How long a Run took, and how much of that the agents worked, the Run waited in the queue, or it
+// waited for a human. Used for the scout's digest, the issue's closing comment and the Run's page
+// on the dashboard, so that time spent queued behind other Runs, paused, or waiting for an
+// approval or a reply is not read as slow agents. Pure (type imports and src/i18n.ts only): the
+// dashboard imports it.
+
+import { t } from '../i18n.js';
+import type { Approval, Attempt, EventRow, Run, RunStatus } from '../store/types.js';
+
+export interface RunTimes {
+  /** From creation to finish; null while the Run has not finished. */
+  totalMs: number | null;
+  /** Executions that ended, each from start to end; executions side by side each count in full. */
+  agentMs: number;
+  /**
+   * Queued, from creation or each requeue until the Run's next status change: behind other Runs,
+   * while work is switched off, waiting for an upgrade or while the Master was not running.
+   * A stretch not over yet does not count.
+   */
+  queuedMs: number;
+  /** Approvals that were decided, each from asked to decided. */
+  approvalMs: number;
+  /**
+   * Blocks until the Run's next status change (retried, answered or terminated), the
+   * assessment's discussion included. A block not over yet does not count.
+   */
+  blockedMs: number;
+  /** Paused, each time until the Run's next status change (resumed or terminated). */
+  pausedMs: number;
+}
+
+/** What a Run's times are worked out from: its records as the store has them. */
+export interface RunRecords {
+  attempts: readonly Pick<Attempt, 'startedAt' | 'endedAt'>[];
+  approvals: readonly Pick<Approval, 'createdAt' | 'decidedAt'>[];
+  /** `run.status` events carry the new status in `data.status`. */
+  events: readonly Pick<EventRow, 'id' | 'ts' | 'type' | 'data'>[];
+}
+
+const span = (from: string, to: string) => Math.max(0, Date.parse(to) - Date.parse(from));
+
+/**
+ * Splits a Run's time. Executions, approvals and blocks go by the same rules as the waits on the
+ * stats page (src/api/stats.ts).
+ */
+export function runTimes(
+  run: Pick<Run, 'createdAt' | 'finishedAt'>,
+  records: RunRecords,
+): RunTimes {
+  let agentMs = 0;
+  for (const a of records.attempts) {
+    if (a.endedAt) agentMs += span(a.startedAt, a.endedAt);
+  }
+  let approvalMs = 0;
+  for (const ap of records.approvals) {
+    if (ap.decidedAt) approvalMs += span(ap.createdAt, ap.decidedAt);
+  }
+  // A Run is created queued without a status event; from then on every status change records a
+  // `run.status` event, which ends the status before it. A block is recorded right after the
+  // status change into it, so the next status change (a retry, a reply to the discussion,
+  // termination) ends it.
+  let queuedMs = 0;
+  let pausedMs = 0;
+  let blockedMs = 0;
+  let status: RunStatus | null = 'queued';
+  let since = run.createdAt;
+  let blockedSince: string[] = [];
+  for (const e of [...records.events].sort((a, b) => a.id - b.id)) {
+    if (e.type === 'run.blocked') {
+      blockedSince.push(e.ts);
+    } else if (e.type === 'run.status') {
+      for (const s of blockedSince) blockedMs += span(s, e.ts);
+      blockedSince = [];
+      if (status === 'queued') queuedMs += span(since, e.ts);
+      else if (status === 'paused') pausedMs += span(since, e.ts);
+      const next = e.data.status;
+      status = typeof next === 'string' ? (next as RunStatus) : null;
+      since = e.ts;
+    }
+  }
+  return {
+    totalMs: run.finishedAt ? span(run.createdAt, run.finishedAt) : null,
+    agentMs,
+    queuedMs,
+    approvalMs,
+    blockedMs,
+    pausedMs,
+  };
+}
+
+/**
+ * The store's reads `storedRunTimes` needs. Declared here rather than taking the store's type,
+ * so that this file does not pull the store (and node:sqlite) into the dashboard.
+ */
+export interface RunRecordReader {
+  listRunAttempts(runId: string): RunRecords['attempts'];
+  listApprovals(runId: string): RunRecords['approvals'];
+  listEvents(runId: string): RunRecords['events'];
+}
+
+/** `runTimes` of a Run, from its records in the store. */
+export function storedRunTimes(store: RunRecordReader, run: Run): RunTimes {
+  return runTimes(run, {
+    attempts: store.listRunAttempts(run.id),
+    approvals: store.listApprovals(run.id),
+    events: store.listEvents(run.id),
+  });
+}
+
+/** A part of a Run's time: every field of `RunTimes` but the total. */
+export type RunTimePart = Exclude<keyof RunTimes, 'totalMs'>;
+
+/**
+ * What each part of a Run's time is called in the language in use, in the order the parts are
+ * listed. A Record, so that a part added to `RunTimes` has to be named here (in every language),
+ * and then the scout's digest and the dashboard list it without another rule.
+ */
+export function runTimePartLabels(): Record<RunTimePart, string> {
+  return t({
+    zh: {
+      agentMs: 'Agent 执行',
+      queuedMs: '排队',
+      approvalMs: '等审批',
+      blockedMs: '卡住等人',
+      pausedMs: '暂停',
+    },
+    en: {
+      agentMs: 'Agent work',
+      queuedMs: 'Queued',
+      approvalMs: 'Awaiting approval',
+      blockedMs: 'Stuck, waiting for a human',
+      pausedMs: 'Paused',
+    },
+  });
+}
+
+/** [label, ms] for every part of a Run's time, in the order of `runTimePartLabels`. */
+export function runTimeParts(times: RunTimes): [label: string, ms: number][] {
+  const labels = runTimePartLabels();
+  return (Object.keys(labels) as RunTimePart[]).map((part) => [labels[part], times[part]]);
+}
+
+/**
+ * The coarser groups a Run's time is told in on the issue's closing comment: the agents' work,
+ * the queue, and everything spent waiting for a human.
+ */
+export type RunTimeGroup = 'agent' | 'queue' | 'human';
+
+/**
+ * Which group each part of a Run's time falls in. A Record, so that a part added to `RunTimes`
+ * has to be put in a group here, and the issue's closing comment counts it without another rule.
+ */
+export const RUN_TIME_PART_GROUP: Record<RunTimePart, RunTimeGroup> = {
+  agentMs: 'agent',
+  queuedMs: 'queue',
+  approvalMs: 'human',
+  blockedMs: 'human',
+  pausedMs: 'human',
+};
+
+/**
+ * What each group is called, in the order the groups are listed. The agents' work and the queue
+ * are called what their parts are called, so the issue's closing comment, the scout's digest and
+ * the dashboard name them alike.
+ */
+function runTimeGroupLabels(): Record<RunTimeGroup, string> {
+  const parts = runTimePartLabels();
+  return {
+    agent: parts.agentMs,
+    queue: parts.queuedMs,
+    human: t({ zh: '等人', en: 'Waiting for a human' }),
+  };
+}
+
+/**
+ * [label, ms] for every group of a Run's time, in the order of `runTimeGroupLabels`; each group
+ * is the sum of its parts.
+ */
+export function groupedTimeParts(times: RunTimes): [label: string, ms: number][] {
+  const parts = Object.keys(RUN_TIME_PART_GROUP) as RunTimePart[];
+  const labels = runTimeGroupLabels();
+  return (Object.keys(labels) as RunTimeGroup[]).map((group) => [
+    labels[group],
+    parts
+      .filter((part) => RUN_TIME_PART_GROUP[part] === group)
+      .reduce((sum, part) => sum + times[part], 0),
+  ]);
+}
+
+/** Whole minutes as shown to people; at least 1, so a short time does not read as none. */
+export function minutes(ms: number): number {
+  return Math.max(1, Math.round(ms / 60_000));
+}
+
+/** Parts of a Run's time shorter than this are left out: they would round to no minutes. */
+const SHOWN_PART_MS = 30_000;
+
+/**
+ * 「Agent 执行 40 分钟」 for each part of a Run's time. Parts under half a minute are left out:
+ * nearly every Run is queued for a few milliseconds whenever it is created or requeued, and
+ * 「排队 1 分钟」 for that would be noise.
+ */
+export function timeParts(parts: readonly (readonly [label: string, ms: number])[]): string[] {
+  return parts
+    .filter(([, ms]) => ms >= SHOWN_PART_MS)
+    .map(([label, ms]) =>
+      t({ zh: `${label} ${minutes(ms)} 分钟`, en: `${label} ${minutes(ms)} min` }),
+    );
+}

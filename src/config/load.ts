@@ -1,0 +1,560 @@
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { parse as parseYaml } from 'yaml';
+import { z } from 'zod';
+import { join as joinList, type Lang, setLang, t } from '../i18n.js';
+import { defaultAgentsYaml, defaultConfigYaml, defaultSelfDevYaml } from './defaults.js';
+import {
+  type AgentConfig,
+  type AgentEntry,
+  AgentSchema,
+  AgentsFileSchema,
+  type MasterConfig,
+  MasterConfigSchema,
+  type SourceFile,
+  type TemplateFile,
+  TemplateSchema,
+  type WorkflowTemplate,
+} from './schema.js';
+
+export class ConfigError extends Error {}
+
+export interface HomePaths {
+  home: string;
+  configFile: string;
+  agentsFile: string;
+  workflowsDir: string;
+  worktreesDir: string;
+  dataDir: string;
+  dbFile: string;
+  logsDir: string;
+  artifactsDir: string;
+}
+
+export function homePaths(home: string): HomePaths {
+  const dataDir = join(home, 'data');
+  return {
+    home,
+    configFile: join(home, 'config.yaml'),
+    agentsFile: join(home, 'agents.yaml'),
+    workflowsDir: join(home, 'workflows'),
+    worktreesDir: join(home, 'worktrees'),
+    dataDir,
+    dbFile: join(dataDir, 'ares1.db'),
+    logsDir: join(dataDir, 'logs'),
+    artifactsDir: join(dataDir, 'artifacts'),
+  };
+}
+
+/**
+ * Create the home layout and write default config files that do not exist yet, in the
+ * language in use.
+ */
+export function initHome(paths: HomePaths): void {
+  for (const dir of [
+    paths.home,
+    paths.workflowsDir,
+    paths.worktreesDir,
+    paths.dataDir,
+    paths.logsDir,
+    paths.artifactsDir,
+  ]) {
+    mkdirSync(dir, { recursive: true });
+  }
+  writeIfMissing(paths.configFile, defaultConfigYaml());
+  writeIfMissing(paths.agentsFile, defaultAgentsYaml());
+  if (readdirSync(paths.workflowsDir).length === 0) {
+    writeFileSync(join(paths.workflowsDir, 'self-dev.yaml'), defaultSelfDevYaml());
+  }
+}
+
+function writeIfMissing(file: string, content: string): void {
+  if (!existsSync(file)) writeFileSync(file, content);
+}
+
+export interface LoadedConfig {
+  master: MasterConfig;
+  /** Valid and enabled agents. */
+  agents: Map<string, AgentConfig>;
+  /** Valid templates (may still carry warnings). */
+  templates: Map<string, WorkflowTemplate>;
+  /** Problems keyed by "agents.yaml#<id>" or "workflows/<file>". Those items are disabled. */
+  errors: Record<string, string[]>;
+  /** Problems that disable nothing, keyed by "config.yaml" or "workflows/<file>". */
+  warnings: Record<string, string[]>;
+  /** The configuration directory (Master home). */
+  dir: string;
+  configFile: SourceFile;
+  agentsFile: SourceFile;
+  /** Every entry of agents.yaml, including disabled and invalid ones, in file order. */
+  agentEntries: AgentEntry[];
+  /** Every file in workflows/, including invalid ones, sorted by file name. */
+  templateFiles: TemplateFile[];
+}
+
+/**
+ * Load all configuration. An invalid config.yaml throws (the Master refuses to start);
+ * an invalid agent or template is only disabled and reported in `errors`.
+ */
+/** CLIs whose effort is part of the model name, so an `effort` field would be ignored. */
+function effortInModelName(cli: string): string | undefined {
+  if (cli !== 'cursor-agent') return undefined;
+  return t({
+    zh: 'cursor-agent 的 effort 包含在模型名里（如 grok-4.7-high），请写进 model，不要配置 effort 字段',
+    en: "cursor-agent's effort is part of the model name (e.g. grok-4.7-high): put it in model and do not set the effort field",
+  });
+}
+
+/**
+ * @param knownClis CLIs with an adapter; agents of other CLIs are invalid.
+ * @param readOnlyClis CLIs whose adapter can run an agent read-only, as assess stages need.
+ */
+export function loadConfig(
+  paths: HomePaths,
+  knownClis: readonly string[],
+  readOnlyClis: readonly string[] = [],
+): LoadedConfig {
+  const errors: Record<string, string[]> = {};
+  const warnings: Record<string, string[]> = {};
+
+  const { master, warnings: masterWarnings } = parseMaster(paths.configFile);
+  if (masterWarnings.length > 0) warnings['config.yaml'] = masterWarnings;
+
+  const agents = new Map<string, AgentConfig>();
+  const agentEntries: AgentEntry[] = [];
+  const agentsRaw = readYaml(paths.agentsFile, 'agents.yaml');
+  const agentsFile = AgentsFileSchema.safeParse(agentsRaw ?? {});
+  if (!agentsFile.success) {
+    errors['agents.yaml'] = formatZod(agentsFile.error);
+  } else {
+    for (const [id, raw] of Object.entries(agentsFile.data.agents)) {
+      const key = `agents.yaml#${id}`;
+      const entry: AgentEntry = {
+        id,
+        state: 'invalid',
+        config: null,
+        rawCli: rawString(raw, 'cli'),
+        rawModel: rawString(raw, 'model'),
+        errors: [],
+      };
+      agentEntries.push(entry);
+      const parsed = AgentSchema.safeParse(raw);
+      if (!parsed.success) {
+        entry.errors = errors[key] = formatZod(parsed.error);
+        continue;
+      }
+      entry.config = { ...parsed.data, id };
+      if (!knownClis.includes(parsed.data.cli)) {
+        entry.errors = errors[key] = [
+          t({
+            zh: `不支持的 cli：${parsed.data.cli}（可用：${knownClis.join('、')}）`,
+            en: `Unsupported cli: ${parsed.data.cli} (available: ${knownClis.join(', ')})`,
+          }),
+        ];
+        continue;
+      }
+      const effortProblem = parsed.data.effort ? effortInModelName(parsed.data.cli) : undefined;
+      if (effortProblem) {
+        entry.errors = errors[key] = [effortProblem];
+        continue;
+      }
+      entry.state = parsed.data.enabled ? 'enabled' : 'disabled';
+      if (parsed.data.enabled) agents.set(id, entry.config);
+    }
+  }
+
+  const templates = new Map<string, WorkflowTemplate>();
+  const templateFiles: TemplateFile[] = [];
+  const files = existsSync(paths.workflowsDir)
+    ? readdirSync(paths.workflowsDir)
+        .filter((f) => f.endsWith('.yaml') || f.endsWith('.yml'))
+        .sort()
+    : [];
+  for (const file of files) {
+    const key = `workflows/${file}`;
+    const path = join(paths.workflowsDir, file);
+    const entry: TemplateFile = {
+      key,
+      file,
+      path,
+      source: '',
+      templateId: null,
+      errors: [],
+      warnings: [],
+    };
+    templateFiles.push(entry);
+    let raw: unknown;
+    try {
+      entry.source = readSource(path) ?? '';
+      raw = parseSource(entry.source, key);
+    } catch (err) {
+      entry.errors = errors[key] = [(err as Error).message];
+      continue;
+    }
+    const parsed = TemplateSchema.safeParse(raw);
+    if (!parsed.success) {
+      entry.errors = errors[key] = formatZod(parsed.error);
+      continue;
+    }
+    const result = validateTemplate(parsed.data, agents, readOnlyClis);
+    if (templates.has(parsed.data.id)) {
+      result.errors.push(
+        t({
+          zh: `模板 id ${parsed.data.id} 与其他模板重复`,
+          en: `Template id ${parsed.data.id} is used by another template`,
+        }),
+      );
+    }
+    if (result.warnings.length > 0) entry.warnings = warnings[key] = result.warnings;
+    if (result.errors.length > 0) {
+      entry.errors = errors[key] = result.errors;
+      continue;
+    }
+    entry.templateId = parsed.data.id;
+    templates.set(parsed.data.id, parsed.data);
+  }
+
+  // GitHub repos refer to templates and agents; a broken reference disables that repo only.
+  for (const [name, repo] of Object.entries(master.github?.repos ?? {})) {
+    const problems: string[] = [];
+    if (!templates.has(repo.template)) {
+      problems.push(
+        t({
+          zh: `模板 ${repo.template} 不存在或无效`,
+          en: `Template ${repo.template} does not exist or is invalid`,
+        }),
+      );
+    }
+    if (repo.scout && !agents.has(repo.scout.agent)) {
+      problems.push(
+        t({
+          zh: `侦察用的 Agent ${repo.scout.agent} 不存在或未启用`,
+          en: `Scout agent ${repo.scout.agent} does not exist or is disabled`,
+        }),
+      );
+    }
+    if (problems.length > 0) errors[githubConfigKey(name)] = problems;
+  }
+
+  return {
+    master,
+    agents,
+    templates,
+    errors,
+    warnings,
+    dir: paths.home,
+    configFile: { path: paths.configFile, source: readSource(paths.configFile) },
+    agentsFile: { path: paths.agentsFile, source: readSource(paths.agentsFile) },
+    agentEntries,
+    templateFiles,
+  };
+}
+
+/** Key of a GitHub repo's problems in `errors`. */
+export function githubConfigKey(repoName: string): string {
+  return `config.yaml#github.repos.${repoName}`;
+}
+
+/** A string field of an unvalidated YAML mapping, or null. */
+function rawString(raw: unknown, field: string): string | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const value = (raw as Record<string, unknown>)[field];
+  return typeof value === 'string' ? value : null;
+}
+
+function parseMaster(file: string): { master: MasterConfig; warnings: string[] } {
+  const raw = readYaml(file, 'config.yaml');
+  const parsed = MasterConfigSchema.safeParse(raw ?? {});
+  if (!parsed.success) {
+    throw new ConfigError(
+      t({ zh: 'config.yaml 无效：\n', en: 'config.yaml is invalid:\n' }) +
+        formatZod(parsed.error).join('\n'),
+    );
+  }
+  // The configured language applies from here on, so that the rest of the configuration is
+  // reported in it. An invalid config.yaml keeps the language in use.
+  applyLanguage(parsed.data.language);
+  return { master: parsed.data, warnings: unknownMasterKeys(raw) };
+}
+
+/**
+ * Keys of config.yaml the schema drops without a word: the top level and `defaults` are not
+ * strict (unlike github, notify and upgrade), so a typo such as `upgarde:` would silently
+ * leave a setting off. Only warned about, so an existing config.yaml still starts the Master.
+ */
+function unknownMasterKeys(raw: unknown): string[] {
+  const warnings: string[] = [];
+  const check = (value: unknown, known: readonly string[], prefix: string) => {
+    if (!isMapping(value)) return;
+    for (const key of Object.keys(value)) {
+      if (known.includes(key)) continue;
+      warnings.push(
+        t({
+          zh: `未知的配置项 ${prefix}${key}，已忽略（是不是写错了？可用：${known.join('、')}）`,
+          en: `Unknown setting ${prefix}${key}, ignored (a typo? Available: ${known.join(', ')})`,
+        }),
+      );
+    }
+  };
+  check(raw, Object.keys(MasterConfigSchema.shape), '');
+  if (isMapping(raw)) {
+    check(raw.defaults, Object.keys(MasterConfigSchema.shape.defaults.unwrap().shape), 'defaults.');
+  }
+  return warnings;
+}
+
+/**
+ * Use a language for every text produced from now on, zod's own validation messages included
+ * (they are part of the configuration problems and of what agents are told about their output).
+ */
+function applyLanguage(l: Lang): void {
+  setLang(l);
+  z.config(l === 'zh' ? z.locales.zhCN() : z.locales.en());
+}
+
+function isMapping(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function readSource(file: string): string | null {
+  return existsSync(file) ? readFileSync(file, 'utf8') : null;
+}
+
+function readYaml(file: string, label: string): unknown {
+  const source = readSource(file);
+  return source === null ? undefined : parseSource(source, label);
+}
+
+function parseSource(source: string, label: string): unknown {
+  try {
+    return parseYaml(source);
+  } catch (err) {
+    const message = t({
+      zh: `${label} 不是合法的 YAML：${(err as Error).message}`,
+      en: `${label} is not valid YAML: ${(err as Error).message}`,
+    });
+    if (label === 'config.yaml') throw new ConfigError(message);
+    throw new Error(message);
+  }
+}
+
+function formatZod(error: z.ZodError): string[] {
+  const root = t({ zh: '(根)', en: '(root)' });
+  return error.issues.map((i) => `${i.path.join('.') || root}: ${i.message}`);
+}
+
+function switchAgentWarning(): string {
+  return t({
+    zh: 'on_agent_error: switch_agent（换 Agent）需要按难度和能力选择的候选 Agent，尚未实现，目前按 human 处理：Agent 出错时 Run 卡住等人处理',
+    en: 'on_agent_error: switch_agent (switch agents) needs candidate agents chosen by difficulty and ability, which is not implemented yet; it is treated as human: on an agent error the Run gets stuck until a human handles it',
+  });
+}
+
+/**
+ * Checks that need more than the schema: references between stages and agents,
+ * and features that are not implemented yet in this milestone.
+ */
+export function validateTemplate(
+  tpl: WorkflowTemplate,
+  agents: Map<string, AgentConfig>,
+  readOnlyClis: readonly string[] = [],
+): { errors: string[]; warnings: string[] } {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+  const ids = new Set<string>();
+  for (const s of tpl.stages) {
+    if (ids.has(s.id)) {
+      errors.push(t({ zh: `阶段 id 重复：${s.id}`, en: `Duplicate stage id: ${s.id}` }));
+    }
+    ids.add(s.id);
+  }
+
+  tpl.stages.forEach((s, idx) => {
+    const where = (problem: { zh: string; en: string }) =>
+      t({ zh: `阶段 ${s.id}：${problem.zh}`, en: `Stage ${s.id}: ${problem.en}` });
+    for (const ref of [s.on_fail, s.on_reject]) {
+      if (ref && !ids.has(ref)) {
+        errors.push(
+          where({ zh: `回退目标 ${ref} 不存在`, en: `rollback target ${ref} does not exist` }),
+        );
+      }
+    }
+    if (s.agent_candidates) {
+      errors.push(
+        where({
+          zh: 'agent_candidates（按难度选 Agent）尚未实现，请改用 agent',
+          en: 'agent_candidates (choosing agents by difficulty) is not implemented yet, use agent',
+        }),
+      );
+    }
+    if (s.planning === 'llm') {
+      errors.push(
+        where({
+          zh: 'planning: llm（LLM 拆任务）尚未实现，请改用 single',
+          en: 'planning: llm (an LLM splitting the task) is not implemented yet, use single',
+        }),
+      );
+    }
+    if (s.verify?.llm_check) {
+      errors.push(
+        where({
+          zh: 'verify.llm_check（LLM 验收判定）尚未实现',
+          en: 'verify.llm_check (an LLM judging acceptance) is not implemented yet',
+        }),
+      );
+    }
+    if (s.kind === 'placeholder') {
+      if (s.agent) {
+        errors.push(
+          where({
+            zh: 'placeholder（占位）阶段不执行任何操作，不能指定 agent',
+            en: 'a placeholder stage does nothing and cannot have an agent',
+          }),
+        );
+      }
+      if (s.verify?.commands?.length) {
+        errors.push(
+          where({
+            zh: 'placeholder（占位）阶段不执行任何操作，不能配置检查命令',
+            en: 'a placeholder stage does nothing and cannot have verify commands',
+          }),
+        );
+      }
+      return;
+    }
+    if (s.kind === 'merge') {
+      if (s.agent) {
+        errors.push(
+          where({
+            zh: 'merge 阶段由 Master 执行，不能指定 agent',
+            en: 'the Master runs the merge stage, it cannot have an agent',
+          }),
+        );
+      }
+      if (idx !== tpl.stages.length - 1) {
+        errors.push(
+          where({
+            zh: 'merge 阶段必须是最后一个阶段',
+            en: 'the merge stage must be the last stage',
+          }),
+        );
+      }
+      return;
+    }
+    if (s.kind === 'assess' && s.verify?.commands?.length) {
+      errors.push(
+        where({
+          zh: 'assess（需求评估）阶段只读，不改代码，不能配置检查命令',
+          en: 'an assess stage is read-only and changes no code, it cannot have verify commands',
+        }),
+      );
+    }
+    if (!s.agent) {
+      errors.push(where({ zh: '需要指定 agent', en: 'an agent is required' }));
+      return;
+    }
+    const agent = agents.get(s.agent);
+    if (!agent) {
+      errors.push(
+        where({
+          zh: `Agent ${s.agent} 不存在或未启用`,
+          en: `agent ${s.agent} does not exist or is disabled`,
+        }),
+      );
+      return;
+    }
+    if (s.kind === 'assess' && !readOnlyClis.includes(agent.cli)) {
+      errors.push(
+        where({
+          zh: `assess（需求评估）阶段要以只读方式运行，Agent ${s.agent} 的 CLI ${agent.cli} 不支持，请换用 ${readOnlyClis.join('、') || '支持只读的 CLI'} 的 Agent`,
+          en: `an assess stage runs read-only, which the CLI ${agent.cli} of agent ${s.agent} does not support; use an agent of ${readOnlyClis.join(', ') || 'a CLI that supports read-only'}`,
+        }),
+      );
+    }
+  });
+
+  // The reviewer should differ from the agents it reviews, or it reviews its own work.
+  tpl.stages.forEach((s, idx) => {
+    if (s.kind !== 'review' || !s.agent) return;
+    const reviewed = tpl.stages
+      .slice(0, idx)
+      .filter((p) => p.kind === 'agent' && p.agent)
+      .map((p) => p.agent);
+    if (reviewed.includes(s.agent)) {
+      warnings.push(
+        t({
+          zh: `阶段 ${s.id}：评审 Agent ${s.agent} 与编码 Agent 相同，建议换一个`,
+          en: `Stage ${s.id}: reviewer ${s.agent} is also the coding agent; better use another one`,
+        }),
+      );
+    }
+  });
+
+  // The engine silently skips an input no stage produced, so the agent misses it unnoticed.
+  // A later stage's artifact can be read after a rollback: only whether some stage produces
+  // the name matters, not the order.
+  const produced = producedArtifacts(tpl);
+  const available = joinList([...produced, 'diff']);
+  for (const s of tpl.stages) {
+    for (const name of new Set(s.inputs)) {
+      if (name === 'diff' || produced.includes(name)) continue;
+      warnings.push(
+        t({
+          zh: `阶段 ${s.id}：inputs 里的 ${name} 没有阶段会产出，不会放进提示词（可用：${available}）`,
+          en: `Stage ${s.id}: no stage produces ${name} in inputs, so it is left out of the prompt (available: ${available})`,
+        }),
+      );
+    }
+  }
+
+  // With an assess stage, the requirement as revised in the discussion only reaches the
+  // stages after it through `inputs: [assessment]`; without it they work from the original.
+  const assessIdx = tpl.stages.findIndex((s) => s.kind === 'assess');
+  if (assessIdx >= 0) {
+    for (const s of tpl.stages.slice(assessIdx + 1)) {
+      if (s.kind !== 'agent' && s.kind !== 'review') continue;
+      if (s.inputs.includes('assessment')) continue;
+      warnings.push(
+        t({
+          zh: `阶段 ${s.id}：模板有需求评估阶段，但这个阶段的 inputs 没有 assessment，讨论后修改的需求不会交给它`,
+          en: `Stage ${s.id}: the template has an assess stage but this stage's inputs lack assessment, so it will not get the requirement as revised in the discussion`,
+        }),
+      );
+    }
+  }
+
+  // switch_agent needs candidate agents, not implemented yet: the engine treats it as
+  // "human". Only a warning, so existing templates that use it stay usable.
+  if (tpl.defaults?.escalate?.on_agent_error === 'switch_agent') {
+    warnings.push(`defaults.escalate${t({ zh: '：', en: ': ' })}${switchAgentWarning()}`);
+  }
+  for (const s of tpl.stages) {
+    if (s.kind === 'merge' || s.kind === 'placeholder') continue; // no agent runs there
+    if (s.escalate?.on_agent_error === 'switch_agent') {
+      warnings.push(
+        t({
+          zh: `阶段 ${s.id}：${switchAgentWarning()}`,
+          en: `Stage ${s.id}: ${switchAgentWarning()}`,
+        }),
+      );
+    }
+  }
+
+  return { errors, warnings };
+}
+
+/**
+ * Artifact names the stages of a template produce, in stage order: what `inputs` may name
+ * besides `diff`. Mirrors the engine: an agent stage saves its last reply under each of its
+ * `outputs`, a review stage saves `review`, an assess stage saves `assessment`; merge and
+ * placeholder stages save nothing (nor do other stages save their `outputs`).
+ */
+function producedArtifacts(t: WorkflowTemplate): string[] {
+  const names = new Set<string>();
+  for (const s of t.stages) {
+    if (s.kind === 'agent') for (const name of s.outputs) names.add(name);
+    else if (s.kind === 'review') names.add('review');
+    else if (s.kind === 'assess') names.add('assessment');
+  }
+  return [...names];
+}

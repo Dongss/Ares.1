@@ -1,0 +1,259 @@
+import type { RunDetail, RunSummary } from '../../../src/api/types.js';
+import { brandTitle } from '../../../src/brand.js';
+import {
+  conclusionLabel,
+  conclusionOf,
+  formatAssessment,
+  verdictLabel,
+} from '../../../src/engine/discussion.js';
+import { t } from '../../../src/i18n.js';
+import {
+  type AssessmentEntry,
+  type DiscussionEntry,
+  FINISHED_RUN_STATUSES,
+  type Run,
+} from '../../../src/store/types.js';
+import type { Tone } from './format.js';
+
+export interface HomeGroups {
+  /** Waiting for a human: approvals and blocked Runs, oldest first. */
+  attention: RunSummary[];
+  running: RunSummary[];
+  /** In execution order. */
+  queued: RunSummary[];
+  paused: RunSummary[];
+  /** Most recently finished first. */
+  finished: RunSummary[];
+}
+
+/** How many finished runs "recently finished" shows when the status filter is "all". */
+export const FINISHED_PREVIEW_LIMIT = 20;
+
+const byTime = (key: 'createdAt' | 'updatedAt' | 'finishedAt', dir: 1 | -1) => {
+  return (a: RunSummary, b: RunSummary) => dir * (a[key] ?? '').localeCompare(b[key] ?? '');
+};
+
+export function groupRuns(
+  runs: readonly RunSummary[],
+  finishedLimit = FINISHED_PREVIEW_LIMIT,
+): HomeGroups {
+  const pick = (...statuses: RunSummary['status'][]) =>
+    runs.filter((r) => statuses.includes(r.status));
+  return {
+    attention: pick('waiting_approval', 'blocked').sort(byTime('updatedAt', 1)),
+    running: pick('running'),
+    queued: pick('queued').sort((a, b) => (a.queuePos ?? 0) - (b.queuePos ?? 0)),
+    paused: pick('paused').sort(byTime('updatedAt', -1)),
+    finished: pick('completed', 'failed', 'cancelled', 'dropped')
+      .sort(byTime('finishedAt', -1))
+      .slice(0, finishedLimit),
+  };
+}
+
+/**
+ * Global 1-based queue position by run id, in `groupRuns(runs).queued` order.
+ * Pass every run: the queue is global across repositories, so a repository
+ * filter must not renumber it.
+ */
+export function queueRanks(runs: readonly RunSummary[]): Map<string, number> {
+  const ranks = new Map<string, number>();
+  groupRuns(runs).queued.forEach((run, index) => {
+    ranks.set(run.id, index + 1);
+  });
+  return ranks;
+}
+
+/**
+ * Whether the Run detail offers to remove the worktree and branch kept for inspection:
+ * only for failed or cancelled Runs, and only while one of them is still there.
+ */
+export function canCleanUpWorkspace(
+  detail: Pick<RunDetail, 'worktreeExists' | 'branchExists'> & {
+    run: Pick<RunDetail['run'], 'status'>;
+  },
+): boolean {
+  const { run, worktreeExists, branchExists } = detail;
+  return (
+    (run.status === 'failed' || run.status === 'cancelled') && (worktreeExists || branchExists)
+  );
+}
+
+/** A branch or worktree line of the Run header. */
+export interface WorkspaceLine {
+  /** "分支" (branch) or "工作目录" (worktree), in the language in use. */
+  label: string;
+  value: string;
+  /**
+   * `removed`: recorded on the Run but gone (merged, or cleaned up by hand);
+   * `unrecorded`: created before the setup commands passed, not recorded on the Run yet.
+   */
+  note: 'removed' | 'unrecorded' | null;
+}
+
+/**
+ * The Run's branch and worktree for the header: those recorded on the Run, and the ones created
+ * before the setup commands passed while they are on disk, so leftovers of a failed or
+ * interrupted setup can be seen and cleaned up too.
+ */
+export function workspaceLines(
+  detail: Pick<RunDetail, 'workspace' | 'worktreeExists' | 'branchExists'> & {
+    run: Pick<RunDetail['run'], 'branch' | 'worktreePath'>;
+  },
+): WorkspaceLine[] {
+  const { run, workspace } = detail;
+  const line = (
+    label: WorkspaceLine['label'],
+    value: string,
+    recorded: boolean,
+    exists: boolean,
+  ): WorkspaceLine[] => {
+    if (recorded) return [{ label, value, note: exists ? null : 'removed' }];
+    return exists ? [{ label, value, note: 'unrecorded' }] : [];
+  };
+  return [
+    ...line(
+      t({ zh: '分支', en: 'Branch' }),
+      workspace.branch,
+      run.branch !== null,
+      detail.branchExists,
+    ),
+    ...line(
+      t({ zh: '工作目录', en: 'Worktree' }),
+      workspace.path,
+      run.worktreePath !== null,
+      detail.worktreeExists,
+    ),
+  ];
+}
+
+/** Number of Runs waiting for a human, shown in the tab title. */
+export function attentionCount(runs: RunSummary[]): number {
+  return runs.filter((r) => r.status === 'waiting_approval' || r.status === 'blocked').length;
+}
+
+/** Browser tab title: name and slogan, preceded by `(n) ` when n Runs wait for a human. */
+export function pageTitle(pending: number): string {
+  return pending > 0 ? `(${pending}) ${brandTitle()}` : brandTitle();
+}
+
+export interface PatchFile {
+  /** Path after the change (before it, for deletions). */
+  path: string;
+  lines: string[];
+  added: number;
+  removed: number;
+}
+
+/** Split a unified diff into files, for collapsible per-file views. */
+export function splitPatch(patch: string): PatchFile[] {
+  const files: PatchFile[] = [];
+  let current: PatchFile | undefined;
+  for (const line of patch.split('\n')) {
+    const header = /^diff --git a\/(.*) b\/(.*)$/.exec(line);
+    if (header) {
+      current = { path: header[2] ?? header[1] ?? '', lines: [], added: 0, removed: 0 };
+      files.push(current);
+    }
+    if (!current) continue;
+    current.lines.push(line);
+    if (line.startsWith('+') && !line.startsWith('+++')) current.added++;
+    else if (line.startsWith('-') && !line.startsWith('---')) current.removed++;
+  }
+  for (const file of files) {
+    while (file.lines.length > 0 && file.lines[file.lines.length - 1] === '') file.lines.pop();
+  }
+  return files;
+}
+
+/** CSS class for one line of a unified diff. */
+export function patchLineClass(line: string): string {
+  if (line.startsWith('diff --git') || line.startsWith('index ')) return 'diff-meta';
+  if (line.startsWith('+++') || line.startsWith('---')) return 'diff-meta';
+  if (line.startsWith('@@')) return 'diff-hunk';
+  if (line.startsWith('+')) return 'diff-add';
+  if (line.startsWith('-')) return 'diff-del';
+  return '';
+}
+
+// ---- requirement assessment --------------------------------------------------------------
+
+export interface AssessmentHeadline {
+  label: string;
+  tone: Tone;
+  /** The concluding round (go / drop), if the assessment has concluded. */
+  conclusion: AssessmentEntry | null;
+}
+
+/** Where the Run's requirement assessment stands; null when it had none. */
+export function assessmentHeadline(
+  run: Pick<Run, 'discussion' | 'status' | 'blocked'>,
+): AssessmentHeadline | null {
+  if (run.discussion.length === 0) return null;
+  const conclusion = conclusionOf(run.discussion);
+  if (conclusion) {
+    return {
+      label: t({
+        zh: `结论：${conclusionLabel(conclusion)}`,
+        en: `Conclusion: ${conclusionLabel(conclusion)}`,
+      }),
+      tone: conclusion.verdict === 'go' ? 'success' : 'muted',
+      conclusion,
+    };
+  }
+  if (run.status === 'blocked' && run.blocked?.kind === 'discussion') {
+    return {
+      label: t({
+        zh: '需求待讨论，等你回复',
+        en: 'The requirement is under discussion, waiting for your reply',
+      }),
+      tone: 'attention',
+      conclusion: null,
+    };
+  }
+  if (FINISHED_RUN_STATUSES.includes(run.status)) {
+    return { label: t({ zh: '没有结论', en: 'No conclusion' }), tone: 'muted', conclusion: null };
+  }
+  return { label: t({ zh: '重新评估中', en: 'Reassessing' }), tone: 'active', conclusion: null };
+}
+
+export interface DiscussionItem {
+  /** Who said it: the assessment (with its round) or a human. */
+  title: string;
+  tone: Tone;
+  text: string;
+  at: string;
+}
+
+/** The discussion, oldest first, as the Run detail lists it. */
+export function discussionItems(discussion: readonly DiscussionEntry[]): DiscussionItem[] {
+  let round = 0;
+  return discussion.map((e) => {
+    if (e.role === 'human') {
+      return {
+        title: t({
+          zh: `人的回复（${e.source === 'issue' ? 'issue 上' : '看板上'}）`,
+          en: `Human reply (${e.source === 'issue' ? 'on the issue' : 'on the dashboard'})`,
+        }),
+        tone: 'neutral',
+        text: e.text,
+        at: e.at,
+      };
+    }
+    round++;
+    const what =
+      e.verdict === 'ask'
+        ? e.proposedDrop
+          ? t({
+              zh: '认为不该做，请人确认',
+              en: 'Thinks it should not be done; asks a human to confirm',
+            })
+          : verdictLabel('ask')
+        : conclusionLabel(e);
+    return {
+      title: t({ zh: `第 ${round} 轮评估：${what}`, en: `Assessment round ${round}: ${what}` }),
+      tone: e.verdict === 'ask' ? 'attention' : e.verdict === 'go' ? 'success' : 'muted',
+      text: formatAssessment(e),
+      at: e.at,
+    };
+  });
+}

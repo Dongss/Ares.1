@@ -1,0 +1,868 @@
+import { Fragment, type ReactNode, useEffect, useState } from 'react';
+import type { ConfigView, GitHubRepoStatus, RunSummary } from '../../../src/api/types.js';
+import { brandName, brandSlogan } from '../../../src/brand.js';
+import { join, t } from '../../../src/i18n.js';
+import type { Repo } from '../../../src/store/types.js';
+import { Badge, Empty, ErrorBox, Pre } from '../components/ui.js';
+import { api } from '../lib/api.js';
+import { BLOCK_KIND, shortSha } from '../lib/format.js';
+import {
+  ACTOR,
+  type Actor,
+  autonomy,
+  autonomyLevel,
+  type CycleStage,
+  type CycleStep,
+  cycleSteps,
+  dataPaths,
+  GUIDE_SECTIONS,
+  type GuideInput,
+  type GuideSection,
+  guardrails,
+  idleReasons,
+  isGuideSection,
+  issueFlow,
+  labelHelp,
+  noticeRows,
+  notifyChannel,
+  runStages,
+  scoutGuide,
+  startCommand,
+  stopCommand,
+} from '../lib/guide.js';
+import { useReloadOn, useResource } from '../lib/hooks.js';
+import { issuesUrl, newIssueUrl } from '../lib/issues.js';
+import { href } from '../lib/router.js';
+import { attentionCount } from '../lib/runs.js';
+
+/**
+ * How this self-hosting project works: the loop, what is left to you, when you
+ * are notified, the guardrails. Everything that depends on the configuration is read from the
+ * API and follows config.yaml as it is reloaded.
+ */
+export function GuidePage(props: {
+  config: ConfigView | undefined;
+  configError: string | undefined;
+  repos: Repo[] | undefined;
+  runs: RunSummary[] | undefined;
+  /** Section to scroll to. */
+  section?: string;
+}) {
+  const github = useResource(() => api.github(), 'github');
+  const upgrade = useResource(() => api.upgrade(), 'upgrade');
+  const health = useResource(() => api.health(), 'health');
+  const config = (type: string) => type.startsWith('config.');
+  useReloadOn(
+    github.reload,
+    (e) =>
+      config(e.type) ||
+      e.type.startsWith('scout.') ||
+      e.type.startsWith('github.') ||
+      e.type.startsWith('issue.') ||
+      e.type === 'run.created' ||
+      e.type === 'run.status' ||
+      e.type === 'master.working',
+  );
+  useReloadOn(
+    upgrade.reload,
+    (e) =>
+      config(e.type) ||
+      e.type.startsWith('upgrade.') ||
+      e.type === 'run.status' ||
+      e.type === 'master.working',
+  );
+  useReloadOn(health.reload, (e) => config(e.type) || e.type === 'master.working');
+  const [picked, setPicked] = useState<string>();
+
+  const loaded = Boolean(github.data && upgrade.data && health.data && props.config);
+  const { section } = props;
+  useEffect(() => {
+    if (loaded && section && isGuideSection(section)) {
+      document.getElementById(`guide-${section}`)?.scrollIntoView({ block: 'start' });
+    }
+  }, [loaded, section]);
+
+  const error = github.error ?? upgrade.error ?? health.error ?? props.configError;
+  if (!github.data || !upgrade.data || !health.data || !props.config) {
+    return error ? (
+      <ErrorBox>{error}</ErrorBox>
+    ) : (
+      <Empty>{t({ zh: '加载中…', en: 'Loading…' })}</Empty>
+    );
+  }
+
+  const ghRepos = github.data.repos;
+  const repoStatus = ghRepos.find((r) => r.name === picked) ?? ghRepos[0] ?? null;
+  const repo = repoStatus ? props.repos?.find((r) => r.name === repoStatus.name) : undefined;
+  const input: GuideInput = {
+    github: github.data.enabled ? repoStatus : null,
+    pollMinutes: github.data.pollMinutes,
+    flow: repoStatus ? issueFlow(props.config, repoStatus, repo?.verifyCommands ?? null) : null,
+    targetBranch: repo?.targetBranch ?? null,
+    upgrade: upgrade.data,
+  };
+  const home = props.config.dir;
+  const working = health.data.working;
+
+  const content: Record<GuideSection, ReactNode> = {
+    intro: (
+      <Intro
+        input={input}
+        working={working}
+        version={health.data.version}
+        githubEnabled={github.data.enabled}
+      />
+    ),
+    cycle: <CycleSection input={input} />,
+    scout: <ScoutSection input={input} />,
+    you: <YouSection input={input} home={home} working={working} />,
+    notify: <NotifySection systemNotify={health.data.systemNotify} />,
+    labels: <LabelsSection autoAccept={input.github?.autoAccept ?? null} />,
+    guards: <GuardsSection input={input} working={working} />,
+    faq: (
+      <FaqSection
+        input={input}
+        home={home}
+        idle={idleReasons({
+          working,
+          upgrade: upgrade.data,
+          attention: props.runs ? attentionCount(props.runs) : 0,
+          github: input.github,
+        })}
+      />
+    ),
+  };
+
+  return (
+    <div className="guide">
+      <h1>{t({ zh: '说明', en: 'Guide' })}</h1>
+      <nav className="guide-toc" aria-label={t({ zh: '目录', en: 'Contents' })}>
+        {GUIDE_SECTIONS.map((s) => (
+          <a key={s.id} href={href.guideSection(s.id)}>
+            {s.title}
+          </a>
+        ))}
+      </nav>
+      {github.data.enabled && ghRepos.length > 1 && (
+        <div className="filter-row guide-repos">
+          <span className="muted">
+            {t({ zh: '按哪个仓库的设置说明：', en: 'Explain with the settings of:' })}
+          </span>
+          {ghRepos.map((r) => (
+            <button
+              key={r.name}
+              type="button"
+              className={r.name === repoStatus?.name ? 'filter-chip active' : 'filter-chip'}
+              onClick={() => setPicked(r.name)}
+            >
+              {r.name}
+            </button>
+          ))}
+        </div>
+      )}
+      {GUIDE_SECTIONS.map((s) => (
+        <section key={s.id} id={`guide-${s.id}`} className="guide-section">
+          <h2>{s.title}</h2>
+          <div className="card">{content[s.id]}</div>
+        </section>
+      ))}
+    </div>
+  );
+}
+
+function ActorBadges({ actors }: { actors: Actor[] }) {
+  if (actors.length === 0) {
+    return <Badge tone="muted">{t({ zh: '占位', en: 'Placeholder' })}</Badge>;
+  }
+  return (
+    <>
+      {actors.map((a) => (
+        <Badge key={a} tone={ACTOR[a].tone}>
+          {ACTOR[a].label}
+        </Badge>
+      ))}
+    </>
+  );
+}
+
+function Intro(props: {
+  input: GuideInput;
+  working: boolean;
+  version: string | null;
+  githubEnabled: boolean;
+}) {
+  const { auto, you } = autonomy(props.input);
+  const level = autonomyLevel(props.input.github);
+  return (
+    <>
+      <p className="guide-lead">
+        {t({
+          zh: (
+            <>
+              <strong>{brandName()}</strong>——{brandSlogan()}。Master 按 workflow 调度 Agent（Claude
+              Code 等）编码、评审、合并，并自己验收结果；现在它也用这套流程开发它自己。
+            </>
+          ),
+          en: (
+            <>
+              <strong>{brandName()}</strong> — {brandSlogan()}. The Master schedules agents (Claude
+              Code and others) along a workflow to code, review and merge, and checks the results
+              itself; it now develops itself with the same flow.
+            </>
+          ),
+        })}
+      </p>
+      <p>
+        {t({
+          zh: (
+            <>
+              需求以 GitHub issue 的形式提出：可以是你写的，也可以是 AI 读代码、文档和 Run
+              记录后提的。Master 把 issue 变成 Run
+              一步步做完、合并，再把自己升级到新版本，然后去找下一件事。下面按
+              <strong>当前配置</strong>说明哪些步骤它自己做、哪些由你来做；改了{' '}
+              <code>config.yaml</code> 后这页会跟着变。
+            </>
+          ),
+          en: (
+            <>
+              Requirements come as GitHub issues: written by you, or proposed by the AI after
+              reading the code, the docs and past Runs. The Master turns an issue into a Run, works
+              it through step by step and merges it, upgrades itself to the new version, then looks
+              for the next thing. Below, by the <strong>current configuration</strong>, is which
+              steps it does by itself and which are up to you; this page follows changes to{' '}
+              <code>config.yaml</code>.
+            </>
+          ),
+        })}
+      </p>
+      {!props.githubEnabled && (
+        <p className="guide-now guide-now-wait">
+          {t({
+            zh: (
+              <>
+                还没有接入 GitHub，现在建不了 Run：需求只从 GitHub issue 来。在{' '}
+                <code>config.yaml</code> 里加上 <code>github</code> 配置后自动生效，示例见
+                <a href={href.issues}>「需求」页</a>。
+              </>
+            ),
+            en: (
+              <>
+                GitHub is not set up yet, so no Run can be created now: requirements only come from
+                GitHub issues. Add a <code>github</code> section to <code>config.yaml</code> and it
+                takes effect by itself; see the <a href={href.issues}>Issues page</a> for an
+                example.
+              </>
+            ),
+          })}
+        </p>
+      )}
+      <dl className="meta">
+        <div>
+          <dt>Master</dt>
+          <dd>
+            {props.working
+              ? t({ zh: '工作中', en: 'Working' })
+              : t({ zh: '已停工', en: 'Stopped' })}
+            {props.version
+              ? t({
+                  zh: `（版本 ${shortSha(props.version)}）`,
+                  en: ` (version ${shortSha(props.version)})`,
+                })
+              : ''}
+          </dd>
+        </div>
+        {props.input.github && (
+          <div>
+            <dt>{t({ zh: '放权级别', en: 'Autonomy level' })}</dt>
+            <dd>{level ?? '—'}</dd>
+          </div>
+        )}
+        <div className="wide">
+          <dt>{t({ zh: '它自己做的', en: 'Done by itself' })}</dt>
+          <dd>{join(auto)}</dd>
+        </div>
+        <div className="wide">
+          <dt>{t({ zh: '由你来做的', en: 'Up to you' })}</dt>
+          <dd>
+            {you.length > 0
+              ? join(you)
+              : t({
+                  zh: '没有：全部交给它了，你只在收到通知时处理',
+                  en: 'Nothing: everything is handed over; you only act when notified',
+                })}
+          </dd>
+        </div>
+      </dl>
+    </>
+  );
+}
+
+function CycleSection({ input }: { input: GuideInput }) {
+  const steps = cycleSteps(input);
+  const stages = runStages(input);
+  const problems = input.github?.problems ?? [];
+  return (
+    <>
+      <div className="guide-legend">
+        {(Object.keys(ACTOR) as Actor[]).map((a) => (
+          <Badge key={a} tone={ACTOR[a].tone}>
+            {ACTOR[a].label}
+          </Badge>
+        ))}
+        <span className="muted">
+          {t({
+            zh: 'AI：Agent 来做；Master 自动：Master 按规则直接做；由你来做：配置没交给它，要你动手',
+            en: 'AI: an agent does it; Master (auto): the Master does it by its rules; Up to you: the configuration does not hand it over, so you do it',
+          })}
+        </span>
+      </div>
+      {problems.length > 0 && (
+        <ErrorBox>
+          {problems.map((p) => (
+            <div key={p}>{p}</div>
+          ))}
+        </ErrorBox>
+      )}
+      <div className="cycle">
+        <ol className="cycle-steps">
+          {steps.map((step, i) => (
+            <CycleStepItem
+              key={step.id}
+              n={i + 1}
+              step={step}
+              stages={step.id === 'run' ? stages : null}
+            />
+          ))}
+        </ol>
+        <div className="cycle-loop" aria-hidden="true">
+          <span>{t({ zh: '回到第 1 步', en: 'Back to step 1' })}</span>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function CycleStepItem(props: { n: number; step: CycleStep; stages: CycleStage[] | null }) {
+  const { step, stages } = props;
+  return (
+    <li className={`cycle-step cycle-${step.actors[0] ?? 'none'}`}>
+      <span className="cycle-num">{props.n}</span>
+      <div className="cycle-body">
+        <div className="cycle-head">
+          <strong>{step.name}</strong>
+          <ActorBadges actors={step.actors} />
+        </div>
+        <div className="cycle-text">{step.text}</div>
+        {stages && (
+          <ol className="cycle-stages" aria-label={t({ zh: 'Run 的阶段', en: 'Stages of a Run' })}>
+            {stages.map((s, i) => (
+              <Fragment key={s.id}>
+                {i > 0 && <li className="cycle-arrow" aria-hidden="true" />}
+                <li className="cycle-stage">
+                  <span className="cycle-head">
+                    <strong>{s.name}</strong>
+                    <ActorBadges actors={s.actors} />
+                  </span>
+                  <span className="muted">{s.note}</span>
+                </li>
+              </Fragment>
+            ))}
+          </ol>
+        )}
+      </div>
+    </li>
+  );
+}
+
+function ScoutSection({ input }: { input: GuideInput }) {
+  const guide = scoutGuide(input);
+  const hasConditions = guide.conditions.length > 0;
+  return (
+    <>
+      {input.github && (
+        <p>
+          {t({
+            zh: (
+              <>
+                Master 每 {input.pollMinutes} 分钟检查一次 GitHub：把带 <code>ares1:ready</code> 的
+                issue 建成 Run，补回写进展。
+                {hasConditions && '自动侦察要下面的条件都满足：'}
+              </>
+            ),
+            en: (
+              <>
+                Every {input.pollMinutes} minutes the Master checks GitHub: it turns issues labeled{' '}
+                <code>ares1:ready</code> into Runs and catches up on reporting progress.
+                {hasConditions && ' An automatic scout needs all of these:'}
+              </>
+            ),
+          })}
+        </p>
+      )}
+      {hasConditions && (
+        <ul className="guide-list">
+          {guide.conditions.map((c) => (
+            <li key={c}>{c}</li>
+          ))}
+        </ul>
+      )}
+      <p className={guide.waiting ? 'guide-now guide-now-wait' : 'guide-now'}>{guide.now}</p>
+      {input.github?.scout && (
+        <p className="muted">
+          {t({
+            zh: (
+              <>
+                手动侦察（<a href={href.issues}>「需求」页</a>的「让 AI
+                找活」）不受这些条件限制。侦察是只读的，不改文件、不跑命令。
+              </>
+            ),
+            en: (
+              <>
+                A manual scout ("Let the AI find work" on the <a href={href.issues}>Issues page</a>)
+                ignores these conditions. Scouting is read-only: it changes no files and runs no
+                commands.
+              </>
+            ),
+          })}
+        </p>
+      )}
+    </>
+  );
+}
+
+function YouSection(props: { input: GuideInput; home: string; working: boolean }) {
+  const { input, home } = props;
+  const issuesRepo = input.github?.issuesRepo ?? null;
+  const upgrade = input.upgrade;
+  const newIssue = issuesRepo && (
+    <a href={newIssueUrl(issuesRepo, 'ares1:ready')} target="_blank" rel="noreferrer">
+      {t({ zh: '新建 issue', en: 'new issue' })}
+    </a>
+  );
+  const proposals = issuesRepo && (
+    <a href={issuesUrl(issuesRepo, 'ares1:proposal')} target="_blank" rel="noreferrer">
+      {t({ zh: '待审提案', en: 'proposals to triage' })}
+    </a>
+  );
+  const target = input.targetBranch && <code>{input.targetBranch}</code>;
+  return (
+    <div className="guide-items">
+      <div>
+        <h3>{t({ zh: '开机后启动 Master', en: 'Start the Master after booting' })}</h3>
+        <p>
+          {t({
+            zh: (
+              <>
+                在稳定副本（Master 运行的那份代码，与开发仓库分开）里后台启动，输出追加到{' '}
+                <code>master.out</code>：
+              </>
+            ),
+            en: (
+              <>
+                Start it in the background from the stable copy (the code the Master runs, separate
+                from the development repo), appending its output to <code>master.out</code>:
+              </>
+            ),
+          })}
+        </p>
+        <Pre>{startCommand(upgrade.installDir, home)}</Pre>
+        <p className="muted">
+          {upgrade.installDir
+            ? t({
+                zh: '目录取自当前 Master 的安装目录。',
+                en: "The directory is the current Master's install directory. ",
+              })
+            : t({
+                zh: '当前 Master 不是从稳定副本的构建启动的（例如用 npm run dev），不能自动升级；把目录换成你的稳定副本。',
+                en: 'The current Master was not started from the build of a stable copy (e.g. with npm run dev), so it cannot upgrade itself; put your stable copy there. ',
+              })}
+          {t({
+            zh: '然后打开看板（就是这个页面）。关机前可以先点「停工」等正在执行的 Run 做完；直接关机也没关系，被打断的 Task 下次启动时从头重做。',
+            en: 'Then open the dashboard (this page). Before shutting down you can stop work and let running Runs finish; shutting down right away is fine too: an interrupted Task is redone from the start next time.',
+          })}
+        </p>
+      </div>
+      <div>
+        <h3>{t({ zh: '工作开关', en: 'The work switch' })}</h3>
+        <p>
+          {t({
+            zh: `顶栏的「工作中 / 已停工」（现在：${props.working ? '工作中' : '已停工'}）。停工时排队的 Run 不开始，不从 issue 接活、不自动采纳、不自动侦察，也不自动升级；正在执行的 Run 会做完，想立刻停下就在 Run 详情页暂停它；issue 被你关闭的 Run 照样终止。开工后马上继续排队的 Run，并立即检查一次 GitHub。状态存在数据库里，重启后保持。`,
+            en: `"Working / Stopped" in the top bar (now: ${props.working ? 'working' : 'stopped'}). While stopped, queued Runs do not start, no issues are taken, nothing is accepted or scouted automatically and there are no automatic upgrades; running Runs finish (pause one on its page to stop it at once), and Runs whose issue you close are still cancelled. Once working again, queued Runs continue right away and GitHub is checked at once. The state is kept in the database across restarts.`,
+          })}
+        </p>
+      </div>
+      <div>
+        <h3>{t({ zh: '收到通知时', en: 'When notified' })}</h3>
+        <p>
+          {t({
+            zh: (
+              <>
+                点通知会打开对应的 Run 或「需求」页；所有要你处理的 Run 都在
+                <a href={href.home}>首页「待我处理」</a>。每种通知怎么处理见
+                <a href={href.guideSection('notify')}>下面</a>。
+              </>
+            ),
+            en: (
+              <>
+                Clicking a notification opens its Run or the Issues page; every Run that needs you
+                is under <a href={href.home}>"Needs me" on the home page</a>. What to do about each
+                kind of notification is <a href={href.guideSection('notify')}>below</a>.
+              </>
+            ),
+          })}
+        </p>
+      </div>
+      <div>
+        <h3>{t({ zh: '给它提需求', en: 'Ask it for something' })}</h3>
+        <p>
+          {t({
+            zh: (
+              <>
+                在 GitHub 上写 issue，加上 <code>ares1:ready</code> 标签
+                {newIssue && <>（{newIssue}）</>}，
+                {input.github
+                  ? `Master 每 ${input.pollMinutes} 分钟查一次`
+                  : '接入 GitHub 后 Master 会定时查看'}
+                ，工作中时就建 Run。写清楚为什么、要做什么和验收标准，Agent
+                就照着做。看板不提供手动建 Run，需求只从 GitHub issue 来。
+              </>
+            ),
+            en: (
+              <>
+                Write an issue on GitHub and label it <code>ares1:ready</code>
+                {newIssue && <> ({newIssue})</>}.{' '}
+                {input.github
+                  ? `The Master checks every ${input.pollMinutes} minutes`
+                  : 'Once GitHub is set up, the Master checks regularly'}{' '}
+                and creates a Run while working. Say why, what to do and how to tell it is done, and
+                the agents follow it. The dashboard does not create Runs by hand: requirements only
+                come from GitHub issues.
+              </>
+            ),
+          })}
+        </p>
+      </div>
+      <div>
+        <h3>{t({ zh: '拒绝提案', en: 'Reject a proposal' })}</h3>
+        <p>
+          {t({
+            zh: (
+              <>
+                不想做的 <code>ares1:proposal</code>
+                {proposals && <>（{proposals}）</>}：在 GitHub 上关闭为 <strong>not planned</strong>
+                ，并留一句理由。侦察下次会把它当作反例，不再提类似的。已经开工的（例如自动采纳的）也会在
+                Master 下次检查时一并终止，Master 不再在这个 issue 上留言或改标签。
+              </>
+            ),
+            en: (
+              <>
+                For an <code>ares1:proposal</code> you do not want
+                {proposals && <> ({proposals})</>}: close it on GitHub as{' '}
+                <strong>not planned</strong> with a one-line reason. The next scout takes it as a
+                counterexample and does not propose anything like it again. If work has already
+                started (e.g. it was auto-accepted), the Run is cancelled at the Master's next
+                check, and the Master no longer comments on or relabels the issue.
+              </>
+            ),
+          })}
+        </p>
+      </div>
+      <div>
+        <h3>{t({ zh: '调整方向', en: 'Change direction' })}</h3>
+        <p>
+          {t({
+            zh: (
+              <>
+                改 <code>README.md</code> 里的目标（一切决定的依据）和 <code>AGENTS.md</code>，
+                提交到目标分支
+                {target && <>（{target}）</>}
+                。侦察每次都先读它们来判断该做什么，编码和评审的 Agent 也照着它们做。
+              </>
+            ),
+            en: (
+              <>
+                Change the goals in <code>README.md</code> (the basis for every decision) and{' '}
+                <code>AGENTS.md</code>, and commit them to the target branch
+                {target && <> ({target})</>}. The scout reads them first every time to decide what
+                to do, and the coding and review agents follow them too.
+              </>
+            ),
+          })}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function NotifySection({ systemNotify }: { systemNotify: boolean }) {
+  return (
+    <>
+      <p>
+        {t({
+          zh: '只在需要你做点什么时通知；Run 完成、侦察完成都已自动处理，不通知。',
+          en: 'You are notified only when you need to do something; finished Runs and scouts are handled automatically and do not notify.',
+        })}
+      </p>
+      <p className="guide-now">{notifyChannel(systemNotify)}</p>
+      <div className="table-wrap">
+        <table className="table">
+          <thead>
+            <tr>
+              <th>{t({ zh: '通知', en: 'Notification' })}</th>
+              <th>{t({ zh: '什么时候', en: 'When' })}</th>
+              <th>{t({ zh: '怎么处理', en: 'What to do' })}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {noticeRows().map((row) => (
+              <tr key={row.kind}>
+                <td className="guide-nowrap">{row.label}</td>
+                <td>{row.when}</td>
+                <td>{row.handle}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </>
+  );
+}
+
+function LabelsSection({ autoAccept }: { autoAccept: GitHubRepoStatus['autoAccept'] | null }) {
+  return (
+    <>
+      <p>
+        {t({
+          zh: (
+            <>
+              Master 第一次访问仓库时自动创建这些标签。<code>ares1:ready</code>、
+              <code>ares1:running</code>、<code>ares1:needs-you</code>、<code>ares1:failed</code>{' '}
+              是状态标签，同一时间只保留一个；其他标签（包括仓库自己的）不动。
+            </>
+          ),
+          en: (
+            <>
+              The Master creates these labels the first time it uses a repo.{' '}
+              <code>ares1:ready</code>, <code>ares1:running</code>, <code>ares1:needs-you</code> and{' '}
+              <code>ares1:failed</code> are status labels, only one at a time; other labels
+              (including the repo's own) are left alone.
+            </>
+          ),
+        })}
+      </p>
+      <dl className="meta">
+        {labelHelp(autoAccept).map(([label, text]) => (
+          <div key={label} className="wide">
+            <dt>
+              <code>{label}</code>
+            </dt>
+            <dd>{text}</dd>
+          </div>
+        ))}
+      </dl>
+    </>
+  );
+}
+
+function GuardsSection({ input, working }: { input: GuideInput; working: boolean }) {
+  return (
+    <>
+      <p>
+        {t({
+          zh: '即使全部交给它，下面这些仍然把关：',
+          en: 'Even with everything handed over, these still stand guard:',
+        })}
+      </p>
+      <ul className="guide-guards">
+        {guardrails(input, working).map((g) => (
+          <li key={g.title}>
+            <span className="guide-guard-head">
+              <strong>{g.title}</strong>
+              <Badge tone={g.on ? 'success' : 'muted'}>
+                {g.on ? t({ zh: '生效中', en: 'On' }) : t({ zh: '没开', en: 'Off' })}
+              </Badge>
+            </span>
+            <span>{g.text}</span>
+          </li>
+        ))}
+      </ul>
+    </>
+  );
+}
+
+function FaqSection(props: { input: GuideInput; home: string; idle: string[] }) {
+  const { input, home } = props;
+  const { github } = input;
+  return (
+    <div className="guide-items">
+      <div>
+        <h3>{t({ zh: '为什么一直没开始新的 Run？', en: 'Why does no new Run start?' })}</h3>
+        {props.idle.length > 0 ? (
+          <div className="guide-now guide-now-wait">
+            {t({ zh: '现在：', en: 'Now:' })}
+            <ul className="guide-list">
+              {props.idle.map((r) => (
+                <li key={r}>{r}</li>
+              ))}
+            </ul>
+          </div>
+        ) : (
+          <p className="guide-now">
+            {t({ zh: '现在没发现挡着的原因。', en: 'Nothing is in the way right now.' })}
+          </p>
+        )}
+        <p>{t({ zh: '常见原因：', en: 'Common reasons:' })}</p>
+        <ul className="guide-list">
+          <li>
+            {t({
+              zh: '停工了：顶栏显示「已停工」，点一下开工。',
+              en: 'Work is stopped: the top bar says "Stopped"; click it to start working.',
+            })}
+          </li>
+          <li>
+            {t({
+              zh: '在等 Master 升级：发现新版本后先做完手上的工作，不开始新的（「需求」页能看到升级状态）。',
+              en: 'Waiting for a Master upgrade: once a new version is found, it finishes the work at hand and starts nothing new (the Issues page shows the upgrade status).',
+            })}
+          </li>
+          <li>
+            {t({
+              zh: '前面有 Run 卡住或在等审批：它们会让出执行位，排队的 Run 照常执行；但仓库有未结束的 Run 时不会自动侦察，也就没有新的提案和 Run。到首页「待我处理」处理它，或者终止它。',
+              en: 'A Run is blocked or waiting for approval: it frees the execution slot and queued Runs still execute, but the repo is not scouted automatically while it has unfinished Runs, so no new proposals or Runs come. Handle it under "Needs me" on the home page, or cancel it.',
+            })}
+          </li>
+          <li>
+            {github && github.autoAccept.maxRisk !== 'none'
+              ? t({
+                  zh: '提案在等你采纳：超出自动采纳风险或大小为 L 的提案要你加 ares1:ready；未处理的提案太多时也不会再侦察。',
+                  en: 'Proposals are waiting for you: those above the auto-accept risk or of size L need you to add ares1:ready; with too many untriaged proposals it does not scout either.',
+                })
+              : t({
+                  zh: '提案在等你采纳：现在所有提案都要你加 ares1:ready；未处理的提案太多时也不会再侦察。',
+                  en: 'Proposals are waiting for you: every proposal needs you to add ares1:ready now; with too many untriaged proposals it does not scout either.',
+                })}
+          </li>
+          {github && github.budget.dailyUsd !== null && (
+            <li>
+              {t({
+                zh: '今天的自动花费到了上限：当天不再自动侦察和自动采纳，第二天恢复。',
+                en: "Today's automatic spending hit the limit: no automatic scouting or accepting for the rest of the day; it resumes the next day.",
+              })}
+            </li>
+          )}
+        </ul>
+      </div>
+      <div>
+        <h3>{t({ zh: 'Run 卡住了怎么办？', en: 'What if a Run is blocked?' })}</h3>
+        <p>
+          {t({
+            zh: `打开 Run 详情看原因和具体问题，可能是：${join(Object.values(BLOCK_KIND))}。处理方式：`,
+            en: `Open the Run to see the reason and the details; it can be: ${join(Object.values(BLOCK_KIND))}. What to do:`,
+          })}
+        </p>
+        <ul className="guide-list">
+          <li>
+            {t({
+              zh: '重试当前 Task：返工次数清零，排到队首；可以换 Agent，附一段说明作为提示。',
+              en: 'Retry the current Task: the rework count resets and it goes to the front of the queue; you can switch the agent and add a note as a hint.',
+            })}
+          </li>
+          <li>
+            {t({
+              zh: '超出预算：填一个更高的预算后继续，从停下的地方接着做。',
+              en: 'Over budget: enter a higher budget and continue from where it stopped.',
+            })}
+          </li>
+          <li>
+            {t({
+              zh: (
+                <>
+                  不想要了就终止：工作目录和分支保留，方便查看，在
+                  <a href={href.workspaces}>「工作区」</a>页清理。
+                </>
+              ),
+              en: (
+                <>
+                  No longer wanted, cancel it: the working directory and branch are kept for a look
+                  and cleaned up on the <a href={href.workspaces}>Workspaces</a> page.
+                </>
+              ),
+            })}
+          </li>
+        </ul>
+      </div>
+      <div>
+        <h3>{t({ zh: '怎么让它完全停下来？', en: 'How do I stop it completely?' })}</h3>
+        <ul className="guide-list">
+          <li>
+            {t({
+              zh: '顶栏「停工」：不再开始新的工作，正在执行的做完。',
+              en: 'Stop work in the top bar: nothing new starts, what is running finishes.',
+            })}
+          </li>
+          <li>
+            {t({
+              zh: '要立刻停下正在执行的 Run：在 Run 详情页暂停（丢弃未提交的改动，恢复后重做这个 Task）。',
+              en: 'To stop a running Run at once: pause it on its page (uncommitted changes are dropped; the Task is redone when resumed).',
+            })}
+          </li>
+          <li>
+            {t({
+              zh: '停掉 Master 进程：前台运行时按 Ctrl+C；按上面的命令后台启动的，用下面的命令。Master 会先停掉正在执行的 Agent 再退出，下次启动时被打断的 Run 排到队首重做。',
+              en: 'Stop the Master process: Ctrl+C when it runs in the foreground; started in the background with the command above, use the command below. The Master stops running agents before it exits, and interrupted Runs go to the front of the queue on the next start.',
+            })}
+          </li>
+        </ul>
+        <Pre>{stopCommand(home)}</Pre>
+        <p className="muted">
+          {t({
+            zh: (
+              <>
+                只想收回放权：在 <code>config.yaml</code> 里把 <code>auto_accept.max_risk</code>{' '}
+                设为 <code>none</code>、<code>scout.auto</code>、<code>auto_merge</code>、
+                <code>push</code>、<code>upgrade.auto</code> 设为 <code>false</code>
+                ，保存后自动生效。
+              </>
+            ),
+            en: (
+              <>
+                To just take back control: in <code>config.yaml</code> set{' '}
+                <code>auto_accept.max_risk</code> to <code>none</code> and <code>scout.auto</code>,{' '}
+                <code>auto_merge</code>, <code>push</code> and <code>upgrade.auto</code> to{' '}
+                <code>false</code>; it takes effect when saved.
+              </>
+            ),
+          })}
+        </p>
+      </div>
+      <div>
+        <h3>{t({ zh: '数据和日志在哪？', en: 'Where are the data and logs?' })}</h3>
+        <p>
+          {t({
+            zh: (
+              <>
+                都在数据目录 <code>{home}</code> 里，不在任何仓库中，Agent 正常工作时碰不到：
+              </>
+            ),
+            en: (
+              <>
+                All in the data directory <code>{home}</code>, outside any repo, so agents do not
+                touch them in normal work:
+              </>
+            ),
+          })}
+        </p>
+        <dl className="meta">
+          {dataPaths(home).map((p) => (
+            <div key={p.path} className="wide">
+              <dt>
+                <code>{p.path}</code>
+              </dt>
+              <dd>{p.what}</dd>
+            </div>
+          ))}
+        </dl>
+      </div>
+    </div>
+  );
+}
