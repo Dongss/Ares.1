@@ -1,5 +1,14 @@
 import type { GitHubRepoStatus, UpgradeStatus } from '../../../src/api/types.js';
-import { t } from '../../../src/i18n.js';
+import {
+  type AutoAcceptRule,
+  acceptSplit,
+  PROPOSAL_SIZES,
+  type ProposalKind,
+  type ProposalSize,
+  RISKS,
+  type Risk,
+} from '../../../src/config/flow.js';
+import { join, t } from '../../../src/i18n.js';
 import type { RunIssue, ScoutProposal, ScoutStatus } from '../../../src/store/types.js';
 import { formatCost, formatTime, type Tone } from './format.js';
 
@@ -147,21 +156,97 @@ export function upgradeText(u: UpgradeStatus): string {
   return [head + version, u.message].filter(Boolean).join(t({ zh: '：', en: ': ' }));
 }
 
-/** The proposals `auto_accept.max_risk` lets the Master accept by itself, by its setting. */
-export const RISK_UP_TO: Readonly<Record<'low' | 'mid' | 'high', string>> = {
-  get low() {
-    return t({ zh: '风险低', en: 'low-risk' });
-  },
-  get mid() {
-    return t({ zh: '风险中及以下', en: 'low- and medium-risk' });
-  },
-  get high() {
-    return t({ zh: '所有风险', en: 'all' });
-  },
+const RISK_WORD: Readonly<Record<Risk, { zh: string; en: string }>> = {
+  low: { zh: '低', en: 'low' },
+  mid: { zh: '中', en: 'medium' },
+  high: { zh: '高', en: 'high' },
 };
 
+/** "S、M" / "S or M", "S, M or L". */
+function orList(items: readonly string[]): string {
+  if (items.length < 2) return items.join('');
+  return t({ zh: join(items), en: `${items.slice(0, -1).join(', ')} or ${items.at(-1)}` });
+}
+
+/** "A和B", "A、B和C" / "A and B", "A, B and C". */
+function andList(items: readonly string[]): string {
+  if (items.length < 2) return items.join('');
+  return `${join(items.slice(0, -1))}${t({ zh: '和', en: ' and ' })}${items.at(-1)}`;
+}
+
+/** "风险中、高" / "medium- or high-risk". */
+function risksText(risks: readonly Risk[]): string {
+  const words = risks.map((r) => t(RISK_WORD[r]));
+  return t({
+    zh: `风险${join(words)}`,
+    en: `${orList(words.map((w, i) => (i < words.length - 1 ? `${w}-` : w)))}-risk`,
+  });
+}
+
+/**
+ * Kinds of proposals in a few words, e.g. "L 级提案和风险高的提案" / "size L proposals and
+ * high-risk proposals": whole sizes and whole risks first, then what they leave, by risk.
+ * null when there are none.
+ */
+export function proposalKindsText(kinds: readonly ProposalKind[]): string | null {
+  if (kinds.length === 0) return null;
+  const has = (risk: Risk, size: ProposalSize) =>
+    kinds.some((k) => k.risk === risk && k.size === size);
+  const sizes = PROPOSAL_SIZES.filter((s) => RISKS.every((r) => has(r, s)));
+  if (sizes.length === PROPOSAL_SIZES.length) return t({ zh: '所有提案', en: 'all proposals' });
+  const risks = RISKS.filter((r) => PROPOSAL_SIZES.every((s) => has(r, s)));
+  // The rest by risk, risks that leave the same sizes together.
+  const rest: { risks: Risk[]; sizes: ProposalSize[] }[] = [];
+  for (const r of RISKS) {
+    if (risks.includes(r)) continue;
+    const left = PROPOSAL_SIZES.filter((s) => !sizes.includes(s) && has(r, s));
+    if (left.length === 0) continue;
+    const same = rest.find((g) => g.sizes.join() === left.join());
+    if (same) same.risks.push(r);
+    else rest.push({ risks: [r], sizes: left });
+  }
+  const phrases = [
+    ...(sizes.length > 0
+      ? [t({ zh: `${orList(sizes)} 级提案`, en: `size ${orList(sizes)} proposals` })]
+      : []),
+    ...(risks.length > 0
+      ? [t({ zh: `${risksText(risks)}的提案`, en: `${risksText(risks)} proposals` })]
+      : []),
+    ...rest.map((g) =>
+      t({
+        zh: `${risksText(g.risks)}的 ${orList(g.sizes)} 级提案`,
+        en: `${risksText(g.risks)} proposals of size ${orList(g.sizes)}`,
+      }),
+    ),
+  ];
+  return andList(phrases);
+}
+
+/** Text to put right after Chinese: with a space when it starts with Latin, as in "采纳 L 级提案". */
+export function afterChinese(text: string): string {
+  return /^[A-Za-z0-9]/.test(text) ? ` ${text}` : text;
+}
+
+/** Text to put right before Chinese: with a space when it ends with Latin, as in "$20.00 后". */
+export function beforeChinese(text: string): string {
+  return /[A-Za-z0-9]$/.test(text) ? `${text} ` : text;
+}
+
+/**
+ * The proposals the Master accepts by itself under `auto_accept.max_risk` and those left to you,
+ * in words, by the auto-accept rule (`rule`; tests may pass another). null = none.
+ */
+export function acceptRanges(
+  maxRisk: Risk | 'none',
+  rule?: AutoAcceptRule,
+): { auto: string | null; human: string | null } {
+  const { auto, human } = acceptSplit(maxRisk, rule);
+  return { auto: proposalKindsText(auto), human: proposalKindsText(human) };
+}
+
 export function autoAcceptText(auto: GitHubRepoStatus['autoAccept']): string {
-  if (auto.maxRisk === 'none') {
+  const range = acceptRanges(auto.maxRisk).auto;
+  if (range === null) {
     return t({ zh: '关闭：提案都由你采纳', en: 'Off: you accept every proposal' });
   }
   const max = auto.maxPerDay;
@@ -170,7 +255,7 @@ export function autoAcceptText(auto: GitHubRepoStatus['autoAccept']): string {
       ? t({ zh: '不限条数', en: 'no daily limit' })
       : t({ zh: `每天最多 ${max} 条`, en: `at most ${max} a day` });
   return t({
-    zh: `${RISK_UP_TO[auto.maxRisk]}、一个 Run 能做完的提案；${limit}，今天 ${auto.usedToday} 条`,
-    en: `${RISK_UP_TO[auto.maxRisk]} proposals one Run can finish; ${limit}, ${auto.usedToday} today`,
+    zh: `${range}；${limit}，今天 ${auto.usedToday} 条`,
+    en: `${range}; ${limit}, ${auto.usedToday} today`,
   });
 }

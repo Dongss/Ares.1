@@ -1,11 +1,53 @@
 // How a workflow template flows: effective stage settings, verify commands and rollback targets;
-// also the overrides of Runs from issues and how long the automatic scout backs off.
+// also the overrides of Runs from issues, which proposals are accepted automatically and how long
+// the automatic scout backs off.
 // Pure logic (type imports and src/i18n.ts only), so the dashboard shows the same rules the engine
 // applies.
 
 import { t } from '../i18n.js';
 import type { Scout } from '../store/types.js';
 import type { Escalate, RunOverrides, StageDef, WorkflowTemplate } from './schema.js';
+
+/** Risk of a proposal, ordered; auto-accept takes everything up to a chosen level. */
+export const RISKS = ['low', 'mid', 'high'] as const;
+export type Risk = (typeof RISKS)[number];
+
+/** Size of a proposal: S within an hour, M within half a day, L larger. */
+export const PROPOSAL_SIZES = ['S', 'M', 'L'] as const;
+export type ProposalSize = (typeof PROPOSAL_SIZES)[number];
+
+/** What auto-accept looks at in a proposal. */
+export interface ProposalKind {
+  risk: Risk;
+  size: ProposalSize;
+}
+
+/** Whether a kind of proposal is accepted without a human under `auto_accept.max_risk`. */
+export type AutoAcceptRule = (p: ProposalKind, maxRisk: Risk | 'none') => boolean;
+
+/** Auto-accept up to the configured risk, and only what fits one Run. */
+export const isAutoAcceptable: AutoAcceptRule = (p, maxRisk) => {
+  if (maxRisk === 'none' || p.size === 'L') return false;
+  return RISKS.indexOf(p.risk) <= RISKS.indexOf(maxRisk);
+};
+
+/**
+ * Every kind of proposal (risk × size), split into those the Master accepts by itself under
+ * `maxRisk` and those left to a human. `rule` is the auto-accept rule; tests may pass another.
+ */
+export function acceptSplit(
+  maxRisk: Risk | 'none',
+  rule: AutoAcceptRule = isAutoAcceptable,
+): { auto: ProposalKind[]; human: ProposalKind[] } {
+  const auto: ProposalKind[] = [];
+  const human: ProposalKind[] = [];
+  for (const risk of RISKS) {
+    for (const size of PROPOSAL_SIZES) {
+      (rule({ risk, size }, maxRisk) ? auto : human).push({ risk, size });
+    }
+  }
+  return { auto, human };
+}
 
 export const SYSTEM_DEFAULTS = {
   escalate: {

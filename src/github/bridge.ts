@@ -3,7 +3,12 @@ import { join } from 'node:path';
 import type { AgentAdapter, AgentExecution } from '../adapters/types.js';
 import type { GitHubRepoStatus, GitHubStatus } from '../api/types.js';
 import { brandName } from '../brand.js';
-import { issueRunOverrides, replyTimeoutHours, scoutBackoff } from '../config/flow.js';
+import {
+  isAutoAcceptable,
+  issueRunOverrides,
+  replyTimeoutHours,
+  scoutBackoff,
+} from '../config/flow.js';
 import { githubConfigKey, type HomePaths, type LoadedConfig } from '../config/load.js';
 import type { GitHubRepoConfig } from '../config/schema.js';
 import { type Engine, estimateCost, InvalidStateError } from '../engine/engine.js';
@@ -36,7 +41,6 @@ import {
   type FailureOutcome,
   failedAttempt,
   goalFromIssue,
-  isAutoAcceptable,
   issueUpdate,
   LABELS,
   labelDefs,

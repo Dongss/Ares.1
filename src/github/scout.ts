@@ -2,7 +2,7 @@
 
 import { z } from 'zod';
 import { brandName } from '../brand.js';
-import type { Risk } from '../config/schema.js';
+import { isAutoAcceptable, PROPOSAL_SIZES, RISKS, type Risk } from '../config/flow.js';
 import {
   deniedOperations,
   parseReport,
@@ -31,13 +31,13 @@ import { join, t } from '../i18n.js';
 import type { Store } from '../store/store.js';
 import type { Attempt, CheckResult, Run, Scout, ScoutProposal, StageRun } from '../store/types.js';
 import type { GhIssue } from './client.js';
-import { isAutoAcceptable, isRetriesExhaustedComment, LABELS, stripMarker } from './issues.js';
+import { isRetriesExhaustedComment, LABELS, stripMarker } from './issues.js';
 
 export const ProposalSchema = z.object({
   title: z.string().trim().min(1).max(120),
   category: z.enum(['bug', 'feature', 'improvement', 'docs', 'test', 'refactor']),
-  size: z.enum(['S', 'M', 'L']),
-  risk: z.enum(['low', 'mid', 'high']),
+  size: z.enum(PROPOSAL_SIZES),
+  risk: z.enum(RISKS),
   why: z.string().trim().min(1),
   evidence: z.array(z.string().trim().min(1)).min(1),
   what: z.string().trim().min(1),
@@ -69,13 +69,13 @@ export function scoutReportJsonSchema() {
             },
             category: { enum: ['bug', 'feature', 'improvement', 'docs', 'test', 'refactor'] },
             size: {
-              enum: ['S', 'M', 'L'],
+              enum: [...PROPOSAL_SIZES],
               description: t({
                 zh: 'S：一小时内；M：半天内；L：更大',
                 en: 'S: within an hour; M: within half a day; L: larger',
               }),
             },
-            risk: { enum: ['low', 'mid', 'high'] },
+            risk: { enum: [...RISKS] },
             why: {
               type: 'string',
               description: t({

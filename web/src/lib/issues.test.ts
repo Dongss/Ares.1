@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { setLang } from '../../../src/i18n.js';
 import {
+  acceptRanges,
   autoAcceptText,
   budgetText,
   CATEGORY,
   issuesUrl,
+  proposalKindsText,
   RISK,
-  RISK_UP_TO,
   SCOUT_STATUS,
   scoutPlan,
   scoutWaitText,
@@ -60,11 +61,36 @@ describe('issues display', () => {
       '关闭：提案都由你采纳',
     );
     expect(autoAcceptText({ maxRisk: 'high', maxPerDay: null, usedToday: 3 })).toBe(
-      '所有风险、一个 Run 能做完的提案；不限条数，今天 3 条',
+      'S、M 级提案；不限条数，今天 3 条',
     );
     expect(autoAcceptText({ maxRisk: 'low', maxPerDay: 2, usedToday: 1 })).toBe(
-      '风险低、一个 Run 能做完的提案；每天最多 2 条，今天 1 条',
+      '风险低的 S、M 级提案；每天最多 2 条，今天 1 条',
     );
+  });
+
+  it('words which proposals auto-accept takes and which it leaves to you, by the rule', () => {
+    expect(acceptRanges('none')).toEqual({ auto: null, human: '所有提案' });
+    expect(acceptRanges('low')).toEqual({
+      auto: '风险低的 S、M 级提案',
+      human: 'L 级提案和风险中、高的提案',
+    });
+    expect(acceptRanges('mid')).toEqual({
+      auto: '风险低、中的 S、M 级提案',
+      human: 'L 级提案和风险高的提案',
+    });
+    expect(acceptRanges('high')).toEqual({ auto: 'S、M 级提案', human: 'L 级提案' });
+    expect(acceptRanges('none', () => true)).toEqual({ auto: '所有提案', human: null });
+    // Whatever is left after whole sizes and risks is worded by risk.
+    expect(
+      proposalKindsText([
+        { risk: 'high', size: 'S' },
+        { risk: 'high', size: 'M' },
+        { risk: 'high', size: 'L' },
+        { risk: 'low', size: 'M' },
+        { risk: 'mid', size: 'S' },
+      ]),
+    ).toBe('风险高的提案、风险低的 M 级提案和风险中的 S 级提案');
+    expect(proposalKindsText([])).toBeNull();
   });
 
   it('describes the upgrade state', () => {
@@ -117,8 +143,22 @@ describe('issues display in English', () => {
       'Off: you accept every proposal',
     );
     expect(autoAcceptText({ maxRisk: 'low', maxPerDay: 2, usedToday: 1 })).toBe(
-      'low-risk proposals one Run can finish; at most 2 a day, 1 today',
+      'low-risk proposals of size S or M; at most 2 a day, 1 today',
     );
+    expect(acceptRanges('none')).toEqual({ auto: null, human: 'all proposals' });
+    expect(acceptRanges('low')).toEqual({
+      auto: 'low-risk proposals of size S or M',
+      human: 'size L proposals and medium- or high-risk proposals',
+    });
+    expect(acceptRanges('mid')).toEqual({
+      auto: 'low- or medium-risk proposals of size S or M',
+      human: 'size L proposals and high-risk proposals',
+    });
+    expect(acceptRanges('high')).toEqual({
+      auto: 'size S or M proposals',
+      human: 'size L proposals',
+    });
+    expect(acceptRanges('none', () => true)).toEqual({ auto: 'all proposals', human: null });
     expect(
       upgradeText({
         auto: true,
@@ -139,7 +179,6 @@ describe('issues display in English', () => {
       ...Object.values(SCOUT_STATUS).map((s) => s.label),
       ...Object.values(RISK).map((r) => r.label),
       ...Object.values(CATEGORY),
-      ...Object.values(RISK_UP_TO),
     ];
     for (const label of labels) expect(label).not.toMatch(cjk);
     expect(RISK.mid).toMatchObject({ label: 'Medium risk', tone: 'attention' });

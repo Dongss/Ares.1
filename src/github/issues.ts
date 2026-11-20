@@ -1,7 +1,7 @@
 // Labels, issue texts and how a Run's status shows on its issue. Pure functions.
 
 import { brandName } from '../brand.js';
-import { RISKS, type Risk } from '../config/schema.js';
+import type { Risk } from '../config/flow.js';
 import { conclusionLabel, waitText } from '../engine/discussion.js';
 import { groupedTimeParts, minutes, type RunTimes, timeParts } from '../engine/times.js';
 import { join, t } from '../i18n.js';
@@ -164,15 +164,6 @@ const categoryText = (category: ScoutProposal['category']) =>
       refactor: 'refactor',
     },
   })[category];
-
-/** Auto-accept up to the configured risk, and only what fits one Run. */
-export function isAutoAcceptable(
-  p: Pick<ScoutProposal, 'risk' | 'size'>,
-  maxRisk: Risk | 'none',
-): boolean {
-  if (maxRisk === 'none' || p.size === 'L') return false;
-  return RISKS.indexOf(p.risk) <= RISKS.indexOf(maxRisk);
-}
 
 export function proposalBody(p: ScoutProposal, scoutId: string, auto: boolean): string {
   const list = (items: string[], prefix: string) => items.map((i) => `${prefix}${i}`).join('\n');

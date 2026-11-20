@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { DEFAULT_LANG, LANGUAGES, t } from '../i18n.js';
 import { isEffortArg } from './effort.js';
+import { RISKS } from './flow.js';
 
 export { agentEffort } from './effort.js';
 
@@ -10,10 +11,6 @@ export const Level = z.enum(['low', 'mid', 'high']);
 // ---------------------------------------------------------------------------
 // config.yaml
 // ---------------------------------------------------------------------------
-
-/** Risk of a proposal, ordered; auto-accept takes everything up to a chosen level. */
-export const RISKS = ['low', 'mid', 'high'] as const;
-export type Risk = (typeof RISKS)[number];
 
 /** GitHub Issues as the backlog of one registered repo. */
 export const GitHubRepoSchema = z.strictObject({

@@ -1,5 +1,6 @@
 import type { ConfigView, GitHubRepoStatus, UpgradeStatus } from '../../../src/api/types.js';
 import {
+  type AutoAcceptRule,
   effectiveBudget,
   issueRunOverrides,
   MAX_SCOUT_BACKOFF_HOURS,
@@ -9,7 +10,7 @@ import { join, t } from '../../../src/i18n.js';
 import { NOTICE_KINDS, type NoticeKind } from '../../../src/notify/notice.js';
 import { buildFlow, type FlowStage } from './flow.js';
 import { formatCost, type Tone } from './format.js';
-import { RISK_UP_TO, scoutWaitText } from './issues.js';
+import { acceptRanges, afterChinese, beforeChinese, scoutWaitText } from './issues.js';
 
 // The guide page: how the self-hosting loop works under the current configuration.
 // Every sentence that depends on the configuration is worded here, from the API's views, so the
@@ -165,11 +166,87 @@ function canUpgradeItself(upgrade: GuideInput['upgrade']): boolean {
 }
 
 /**
+ * The accept step: which proposals the Master accepts by itself and which are left to you, by the
+ * auto-accept rule (`rule`; tests may pass another). Only marked "up to you" when some are.
+ */
+export function acceptStep(github: GitHubRepoStatus | null, rule?: AutoAcceptRule): CycleStep {
+  const id = 'accept';
+  const name = t({ zh: '采纳', en: 'Accept' });
+  if (!github) {
+    return {
+      id,
+      name,
+      actors: ['human'],
+      text: t({
+        zh: '由你来做：接入 GitHub 后，给要做的 issue 加 ares1:ready',
+        en: 'Up to you: once GitHub is set up, label the issues to do with ares1:ready',
+      }),
+    };
+  }
+  const { auto, human } = acceptRanges(github.autoAccept.maxRisk, rule);
+  if (auto === null) {
+    // Nothing is accepted automatically, so every proposal is left to you.
+    const all = human ?? '';
+    return {
+      id,
+      name,
+      actors: ['human'],
+      text: t({
+        zh: `${all}都由你来做：给要做的 issue 加 ares1:ready；不做的关闭为 not planned 并写一句理由`,
+        en: `${capitalize(all)} are up to you: label the issues to do with ares1:ready; close the others as not planned with a one-line reason`,
+      }),
+    };
+  }
+  const { maxPerDay } = github.autoAccept;
+  const { dailyUsd } = github.budget;
+  // Both limits only pause it for the day: the next day the Master accepts the backlog itself.
+  const limits = [
+    maxPerDay !== null
+      ? t({
+          zh: `自动采纳满 ${maxPerDay} 条`,
+          en: `${maxPerDay} ${maxPerDay === 1 ? 'proposal is' : 'proposals are'} accepted`,
+        })
+      : null,
+    dailyUsd !== null
+      ? t({
+          zh: `自动花费到 ${formatCost(dailyUsd)}`,
+          en: `automatic spending reaches ${formatCost(dailyUsd)}`,
+        })
+      : null,
+  ].filter((l) => l !== null);
+  const pause =
+    limits.length > 0
+      ? t({
+          zh: `；当天${beforeChinese(limits.join('或'))}后暂停，第二天自动继续采纳积压的提案`,
+          en: `; once ${limits.join(' or ')} in a day, it pauses for the rest of the day and accepts the backlog by itself the next day`,
+        })
+      : '';
+  const accepted = t({
+    zh: `${auto}自动采纳（加 ares1:ready 和 ares1:auto）${pause}`,
+    en: `Accepted automatically: ${auto} (labeled ares1:ready and ares1:auto)${pause}`,
+  });
+  if (human === null) return { id, name, actors: ['master'], text: accepted };
+  return {
+    id,
+    name,
+    actors: ['master', 'human'],
+    text: t({
+      zh: `${accepted}；${human}由你来做：加 ares1:ready 或关闭`,
+      en: `${accepted}. Up to you: ${human}; add ares1:ready or close them`,
+    }),
+  };
+}
+
+function capitalize(s: string): string {
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+/**
  * The steps of the loop: scout → file issues → accept → Run → push → upgrade → scout again,
  * each with who does it under the current configuration. Steps the configuration leaves to a
- * human say so ("up to you").
+ * human say so ("up to you"). `rule` is the auto-accept rule; tests may pass another.
  */
-export function cycleSteps(input: GuideInput): CycleStep[] {
+export function cycleSteps(input: GuideInput, rule?: AutoAcceptRule): CycleStep[] {
   const { github, pollMinutes } = input;
   const scout = github?.scout ?? null;
   const step = (id: CycleStepId, name: string, actors: Actor[], text: string): CycleStep => ({
@@ -180,7 +257,6 @@ export function cycleSteps(input: GuideInput): CycleStep[] {
   });
   const scoutName = t({ zh: '侦察', en: 'Scout' });
   const proposeName = t({ zh: '提 issue', en: 'File issues' });
-  const acceptName = t({ zh: '采纳', en: 'Accept' });
   const pushName = t({ zh: '推送到 GitHub', en: 'Push to GitHub' });
   const upgradeName = t({ zh: 'Master 升级自己', en: 'Master upgrades itself' });
   const rescoutName = t({ zh: '空闲时再侦察', en: 'Scout again when idle' });
@@ -246,56 +322,7 @@ export function cycleSteps(input: GuideInput): CycleStep[] {
           }),
         );
 
-  let accept: CycleStep;
-  if (!github) {
-    accept = step(
-      'accept',
-      acceptName,
-      ['human'],
-      t({
-        zh: '由你来做：接入 GitHub 后，给要做的 issue 加 ares1:ready',
-        en: 'Up to you: once GitHub is set up, label the issues to do with ares1:ready',
-      }),
-    );
-  } else if (github.autoAccept.maxRisk === 'none') {
-    accept = step(
-      'accept',
-      acceptName,
-      ['human'],
-      t({
-        zh: '由你来做：给要做的 issue 加 ares1:ready；不做的关闭为 not planned 并写一句理由',
-        en: 'Up to you: label the issues to do with ares1:ready; close the others as not planned with a one-line reason',
-      }),
-    );
-  } else {
-    const { maxPerDay } = github.autoAccept;
-    const { dailyUsd } = github.budget;
-    const limits = [
-      maxPerDay !== null
-        ? t({ zh: `每天最多 ${maxPerDay} 条`, en: `at most ${maxPerDay} a day` })
-        : '',
-      dailyUsd !== null
-        ? t({
-            zh: `当天自动花费到 ${formatCost(dailyUsd)} 就停`,
-            en: `stops for the day once automatic spending reaches ${formatCost(dailyUsd)}`,
-          })
-        : '',
-    ].filter(Boolean);
-    const risk = RISK_UP_TO[github.autoAccept.maxRisk];
-    accept = step(
-      'accept',
-      acceptName,
-      ['master', 'human'],
-      t({
-        zh: `${risk}、大小不是 L 的提案自动采纳（加 ares1:ready 和 ares1:auto）${
-          limits.length > 0 ? `，${limits.join('，')}` : ''
-        }；其余的由你来做：加 ares1:ready 或关闭`,
-        en: `Accepted automatically: ${risk} proposals that are not size L (labeled ares1:ready and ares1:auto)${
-          limits.length > 0 ? `, ${limits.join(', ')}` : ''
-        }; the rest are up to you: add ares1:ready or close them`,
-      }),
-    );
-  }
+  const accept = acceptStep(github, rule);
 
   const stages = runStages(input);
   const runActors: Actor[] = ['ai', 'master'];
@@ -529,22 +556,28 @@ export function autonomyLevel(github: GitHubRepoStatus | null): 'L0' | 'L1' | 'L
 }
 
 /** What happens by itself and what is left to you, in a few words each. */
-export function autonomy(input: GuideInput): { auto: string[]; you: string[] } {
+export function autonomy(
+  input: GuideInput,
+  rule?: AutoAcceptRule,
+): { auto: string[]; you: string[] } {
   const { github } = input;
   const auto: string[] = [t({ zh: '编码', en: 'Coding' }), t({ zh: '评审', en: 'Review' })];
   const you: string[] = [];
   const add = (on: boolean, text: string, offText = text) =>
     on ? auto.push(text) : you.push(offText);
   add(github?.scout?.auto === true, t({ zh: '找活（侦察）', en: 'Finding work (scouting)' }));
-  const risk = github?.autoAccept.maxRisk ?? 'none';
-  const accepting = t({ zh: '采纳提案', en: 'Accepting proposals' });
-  add(
-    risk !== 'none',
-    risk === 'none'
-      ? accepting
-      : t({ zh: `采纳${RISK_UP_TO[risk]}的提案`, en: `Accepting ${RISK_UP_TO[risk]} proposals` }),
-    accepting,
-  );
+  // Accepting can be split: some proposals by itself, the others by you.
+  const accepting = (kinds: string) =>
+    t({ zh: `采纳${afterChinese(kinds)}`, en: `Accepting ${kinds}` });
+  const ranges = acceptRanges(github?.autoAccept.maxRisk ?? 'none', rule);
+  if (ranges.auto !== null) auto.push(accepting(ranges.auto));
+  if (ranges.human !== null) {
+    you.push(
+      ranges.auto === null
+        ? t({ zh: '采纳提案', en: 'Accepting proposals' })
+        : accepting(ranges.human),
+    );
+  }
   add(
     !mergeNeedsApproval(input),
     t({ zh: '合并', en: 'Merging' }),
@@ -595,6 +628,7 @@ export function scoutGuide(
   }
   const { budget } = github;
   const { pollMinutes } = input;
+  const leftToYou = acceptRanges(github.autoAccept.maxRisk).human;
   const conditions = [
     t({ zh: '工作开关是「工作中」', en: 'The work switch is on ("Working")' }),
     t({
@@ -630,8 +664,8 @@ export function scoutGuide(
           en: `Fewer than ${scout.maxProposals} proposals await triage (max_proposals)`,
         })
       : t({
-          zh: `在自动采纳范围内、还没采纳的提案少于 ${scout.maxProposals} 条（max_proposals）；超出范围的（风险更高或大小为 L）留给你处理，不挡侦察`,
-          en: `Fewer than ${scout.maxProposals} proposals within the auto-accept range are still unaccepted (max_proposals); those beyond it (higher risk or size L) are left to you and do not hold the scout back`,
+          zh: `在自动采纳范围内、还没采纳的提案少于 ${scout.maxProposals} 条（max_proposals）${leftToYou ? `；${leftToYou}留给你处理，不挡侦察` : ''}`,
+          en: `Fewer than ${scout.maxProposals} proposals within the auto-accept range are still unaccepted (max_proposals)${leftToYou ? `; ${leftToYou} are left to you and do not hold the scout back` : ''}`,
         }),
   ];
   if (!scout.auto) {
@@ -739,19 +773,20 @@ export function notifyChannel(systemNotify: boolean): string {
 
 /** The labels the Master puts on issues; ares1:auto as auto_accept is set now. */
 export function labelHelp(autoAccept: GitHubRepoStatus['autoAccept'] | null): [string, string][] {
+  const range = autoAccept && acceptRanges(autoAccept.maxRisk).auto;
   const auto = !autoAccept
     ? t({
-        zh: '按自动采纳设置（auto_accept）采纳的：风险在 max_risk 以内、大小不是 L',
-        en: 'Accepted by the auto-accept setting (auto_accept): risk within max_risk and size not L',
+        zh: '按自动采纳设置（auto_accept）采纳的：哪些提案会被自动采纳，由 max_risk 决定',
+        en: 'Accepted by the auto-accept setting (auto_accept): max_risk decides which proposals are accepted automatically',
       })
-    : autoAccept.maxRisk === 'none'
+    : range === null
       ? t({
-          zh: '按自动采纳设置（auto_accept）采纳的。现在自动采纳关闭（max_risk: none），不会再加这个标签',
-          en: 'Accepted by the auto-accept setting (auto_accept). Auto-accept is off now (max_risk: none), so this label is not added any more',
+          zh: `按自动采纳设置（auto_accept）采纳的。现在自动采纳关闭（max_risk: ${autoAccept.maxRisk}），不会再加这个标签`,
+          en: `Accepted by the auto-accept setting (auto_accept). Auto-accept is off now (max_risk: ${autoAccept.maxRisk}), so this label is not added any more`,
         })
       : t({
-          zh: `按自动采纳设置（auto_accept）采纳的：现在是${RISK_UP_TO[autoAccept.maxRisk]}、大小不是 L 的提案（max_risk: ${autoAccept.maxRisk}）`,
-          en: `Accepted by the auto-accept setting (auto_accept): now ${RISK_UP_TO[autoAccept.maxRisk]} proposals that are not size L (max_risk: ${autoAccept.maxRisk})`,
+          zh: `按自动采纳设置（auto_accept）采纳的：现在是${afterChinese(range)}（max_risk: ${autoAccept.maxRisk}）`,
+          en: `Accepted by the auto-accept setting (auto_accept): now ${range} (max_risk: ${autoAccept.maxRisk})`,
         });
   return [
     [

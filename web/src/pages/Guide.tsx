@@ -31,7 +31,7 @@ import {
   stopCommand,
 } from '../lib/guide.js';
 import { useReloadOn, useResource } from '../lib/hooks.js';
-import { issuesUrl, newIssueUrl } from '../lib/issues.js';
+import { acceptRanges, issuesUrl, newIssueUrl } from '../lib/issues.js';
 import { href } from '../lib/router.js';
 import { attentionCount } from '../lib/runs.js';
 
@@ -693,6 +693,7 @@ function GuardsSection({ input, working }: { input: GuideInput; working: boolean
 function FaqSection(props: { input: GuideInput; home: string; idle: string[] }) {
   const { input, home } = props;
   const { github } = input;
+  const leftToYou = github && acceptRanges(github.autoAccept.maxRisk).human;
   return (
     <div className="guide-items">
       <div>
@@ -733,10 +734,15 @@ function FaqSection(props: { input: GuideInput; home: string; idle: string[] }) 
           </li>
           <li>
             {github && github.autoAccept.maxRisk !== 'none'
-              ? t({
-                  zh: '提案在等你采纳：超出自动采纳风险或大小为 L 的提案要你加 ares1:ready，它们不挡侦察，系统照常找活；在自动采纳范围内的提案因为当天的自动采纳数已满而攒多了时，才不再侦察。',
-                  en: 'Proposals are waiting for you: those above the auto-accept risk or of size L need you to add ares1:ready, but they do not hold the scout back and it keeps finding work; it stops scouting only when proposals within the auto-accept range pile up because the auto-accept count for the day is used up.',
-                })
+              ? leftToYou
+                ? t({
+                    zh: `提案在等你采纳：${leftToYou}要你加 ares1:ready，它们不挡侦察，系统照常找活；在自动采纳范围内的提案因为当天的自动采纳数已满而攒多了时，才不再侦察。`,
+                    en: `Proposals are waiting for you: ${leftToYou} need you to add ares1:ready, but they do not hold the scout back and it keeps finding work; it stops scouting only when proposals within the auto-accept range pile up because the auto-accept count for the day is used up.`,
+                  })
+                : t({
+                    zh: '提案攒多了：所有提案都自动采纳，不用你处理；只有当天的自动采纳数已满、提案攒多了时才不再侦察，第二天自动采纳积压的提案后恢复。',
+                    en: 'Proposals pile up: every proposal is accepted automatically, so none waits for you; it stops scouting only when proposals pile up because the auto-accept count for the day is used up, and resumes once the backlog is accepted the next day.',
+                  })
               : t({
                   zh: '提案在等你采纳：现在所有提案都要你加 ares1:ready；未处理的提案太多时也不会再侦察。',
                   en: 'Proposals are waiting for you: every proposal needs you to add ares1:ready now; with too many untriaged proposals it does not scout either.',

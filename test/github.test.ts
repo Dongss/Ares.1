@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { acceptSplit, isAutoAcceptable, type ProposalKind } from '../src/config/flow.js';
 import { githubConfigKey } from '../src/config/load.js';
 import type { GhIssue } from '../src/github/client.js';
 import {
@@ -9,7 +10,6 @@ import {
   discussionComment,
   FOOTER_MARKER,
   goalFromIssue,
-  isAutoAcceptable,
   isMasterComment,
   isRetriesExhaustedComment,
   issueUpdate,
@@ -1606,6 +1606,16 @@ describe('issues: texts', () => {
     expect(isAutoAcceptable({ risk: 'high', size: 'S' }, 'high')).toBe(true);
     expect(isAutoAcceptable({ risk: 'low', size: 'L' }, 'high')).toBe(false);
     expect(isAutoAcceptable({ risk: 'low', size: 'S' }, 'none')).toBe(false);
+  });
+
+  it('splits every kind of proposal by the auto-accept rule', () => {
+    const kinds = (list: ProposalKind[]) => list.map((k) => `${k.risk}/${k.size}`);
+    expect(kinds(acceptSplit('none').auto)).toEqual([]);
+    expect(acceptSplit('none').human).toHaveLength(9);
+    expect(kinds(acceptSplit('low').auto)).toEqual(['low/S', 'low/M']);
+    expect(kinds(acceptSplit('high').human)).toEqual(['low/L', 'mid/L', 'high/L']);
+    // Another rule, e.g. one that accepts everything, leaves nothing to a human.
+    expect(acceptSplit('none', () => true).human).toEqual([]);
   });
 
   it('counts toward max_proposals only the proposals auto-accept would take, or all without it', () => {
