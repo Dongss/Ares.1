@@ -4,7 +4,12 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { isOurProcess, killProcessGroup } from '../adapters/process.js';
 import type { AgentAdapter, AgentResult } from '../adapters/types.js';
-import type { AgentEventRecord, LiveAgentEvent, RunWorkspaceState } from '../api/types.js';
+import type {
+  AgentEventRecord,
+  LiveAgentEvent,
+  RateLimitedWait,
+  RunWorkspaceState,
+} from '../api/types.js';
 import type { HomePaths, LoadedConfig } from '../config/load.js';
 import {
   type AgentConfig,
@@ -91,6 +96,8 @@ export interface EngineDeps {
   now?: () => number;
   /** How long to wait before retrying an agent that errored; default `AGENT_RETRY_BACKOFF`. */
   agentRetryBackoff?: Backoff;
+  /** How long a Run waits for its rate-limited agent's quota; default `RATE_LIMIT_WAIT`. */
+  rateLimitWait?: RateLimitWait;
 }
 
 /** An exponential backoff: the first wait, doubled on each further retry up to the longest. */
@@ -108,6 +115,36 @@ export const AGENT_RETRY_BACKOFF: Backoff = { firstMs: 30_000, maxMs: 600_000 };
 /** The wait before the `retry`-th retry (1 = the first). */
 export function backoffMs(backoff: Backoff, retry: number): number {
   return Math.min(backoff.firstMs * 2 ** Math.max(0, retry - 1), backoff.maxMs);
+}
+
+/**
+ * How long a Run waits when its agent is out of quota or rate-limited: until the reset time the
+ * CLI gave plus `marginMs` (clocks differ, and a quota may come back a little late); without
+ * one, a backoff over the limits hit in a row.
+ */
+export interface RateLimitWait extends Backoff {
+  marginMs: number;
+}
+
+/** 5, 10, 20, 40 minutes, then hourly; one more minute after a reset time the CLI gave. */
+export const RATE_LIMIT_WAIT: RateLimitWait = {
+  firstMs: 300_000,
+  maxMs: 3_600_000,
+  marginMs: 60_000,
+};
+
+/**
+ * The wait of a Run whose agent hit a limit: until `resetAt` (epoch ms, from the CLI) plus the
+ * margin when it is still ahead, else the backoff for the `inARow`-th limit in a row.
+ */
+export function rateLimitDelayMs(
+  wait: RateLimitWait,
+  now: number,
+  resetAt: number | undefined,
+  inARow: number,
+): number {
+  if (resetAt !== undefined && resetAt > now) return resetAt - now + wait.marginMs;
+  return backoffMs(wait, inARow);
 }
 
 const LEVEL_RANK = { low: 0, mid: 1, high: 2 } as const;
@@ -133,10 +170,11 @@ export function switchCandidate(
 }
 
 /**
- * The longest single wait for the next reply timeout: a deadline days away is checked again on
- * the way, so a sleeping machine or a changed clock is caught up with soon after.
+ * The longest single wait of a timer for a time ahead (a reply timeout, the end of a wait for a
+ * quota): a time days away is checked again on the way, so a sleeping machine or a changed clock
+ * is caught up with soon after.
  */
-const MAX_REPLY_TIMER_MS = 3_600_000;
+const MAX_TIMER_MS = 3_600_000;
 
 /** Where an attempt's normalized events are kept (one JSON record per line), next to its raw log. */
 export function attemptEventsPath(logPath: string): string {
@@ -187,6 +225,13 @@ interface Active {
   done: Promise<void>;
 }
 
+/** A queued Run waiting for its agent's quota (`Engine.limitWaits`). */
+interface RateLimitedRun {
+  agentId: string;
+  /** Not to start again before this, in epoch milliseconds. */
+  until: number;
+}
+
 /** Thrown inside a drive loop when the Run is being paused / cancelled / shut down. */
 class Aborted extends Error {}
 
@@ -208,14 +253,23 @@ export class Engine {
   private readonly cleanups = new Map<string, Promise<Run>>();
   /** Wakes `checkReplyTimeouts` at the next discussion's deadline. */
   private replyTimer: ReturnType<typeof setTimeout> | undefined;
+  /**
+   * Queued Runs whose agent was out of quota or rate-limited, by Run id: `kick` passes them by
+   * until `until` (epoch ms). Kept in memory only: after a Master restart they just try again.
+   */
+  private readonly limitWaits = new Map<string, RateLimitedRun>();
+  /** Wakes `kick` when the first wait in `limitWaits` ends. */
+  private limitTimer: ReturnType<typeof setTimeout> | undefined;
   private readonly store: Store;
   private readonly now: () => number;
   private readonly backoff: Backoff;
+  private readonly limitWait: RateLimitWait;
 
   constructor(private readonly deps: EngineDeps) {
     this.store = deps.store;
     this.now = deps.now ?? Date.now;
     this.backoff = deps.agentRetryBackoff ?? AGENT_RETRY_BACKOFF;
+    this.limitWait = deps.rateLimitWait ?? RATE_LIMIT_WAIT;
   }
 
   private get cfg(): LoadedConfig {
@@ -253,6 +307,9 @@ export class Engine {
     this.stopping = true;
     clearTimeout(this.replyTimer);
     this.replyTimer = undefined;
+    clearTimeout(this.limitTimer);
+    this.limitTimer = undefined;
+    this.limitWaits.clear();
     const active = this.active;
     if (!active) return;
     await this.interrupt();
@@ -290,11 +347,19 @@ export class Engine {
     return this.holding;
   }
 
-  /** Start the next queued Run if nothing is executing and the work switch is on. */
+  /**
+   * Start the next queued Run if nothing is executing and the work switch is on. Runs waiting for
+   * their agent's quota are passed by until their wait ends.
+   */
   kick(): void {
+    clearTimeout(this.limitTimer);
+    this.limitTimer = undefined;
+    // Whatever ends the early returns (a Run finishing, the switch turned on, the hold lifted)
+    // kicks again.
     if (this.active || this.stopping || this.holding || !this.store.working) return;
-    const next = this.store.nextQueuedRun();
+    const next = this.nextDueRun();
     if (!next) return;
+    this.limitWaits.delete(next.id);
     this.setStatus(next.id, 'running', { queuePos: null });
     const controller = new AbortController();
     const active: Active = { runId: next.id, controller, done: Promise.resolve() };
@@ -303,6 +368,41 @@ export class Engine {
       if (this.active === active) this.active = undefined;
       setImmediate(() => this.kick());
     });
+  }
+
+  /**
+   * The first queued Run that is not waiting for its agent's quota. When every queued Run is
+   * waiting, `kick` is woken up when the first wait ends.
+   */
+  private nextDueRun(): Run | undefined {
+    const queued = this.store.queuedRuns();
+    // A Run that left the queue meanwhile (paused, cancelled) waits no more.
+    const ids = new Set(queued.map((r) => r.id));
+    for (const id of this.limitWaits.keys()) if (!ids.has(id)) this.limitWaits.delete(id);
+    const now = this.now();
+    let wake: number | undefined;
+    for (const run of queued) {
+      const until = this.limitWaits.get(run.id)?.until;
+      if (until === undefined || until <= now) return run;
+      wake = Math.min(wake ?? until, until);
+    }
+    if (wake !== undefined) {
+      const timer = setTimeout(() => this.kick(), Math.min(wake - now, MAX_TIMER_MS));
+      timer.unref();
+      this.limitTimer = timer;
+    }
+    return undefined;
+  }
+
+  /**
+   * A queued Run waiting for its agent's quota to come back: the agent and when the Run goes on
+   * (then also waiting for the execution slot if another Run has it). null when it does not
+   * wait (any more).
+   */
+  rateLimited(run: Run): RateLimitedWait | null {
+    const wait = this.limitWaits.get(run.id);
+    if (!wait || wait.until <= this.now() || run.status !== 'queued') return null;
+    return { agentId: wait.agentId, retryAt: new Date(wait.until).toISOString() };
   }
 
   private async interrupt(): Promise<void> {
@@ -623,10 +723,7 @@ export class Engine {
       else if (this.store.working && this.timeOutDiscussion(run.id, now)) timedOut.push(run.id);
     }
     if (next !== undefined) {
-      const timer = setTimeout(
-        () => this.checkReplyTimeouts(),
-        Math.min(next - now, MAX_REPLY_TIMER_MS),
-      );
+      const timer = setTimeout(() => this.checkReplyTimeouts(), Math.min(next - now, MAX_TIMER_MS));
       timer.unref();
       this.replyTimer = timer;
     }
@@ -765,6 +862,8 @@ export class Engine {
       await this.discardInFlight(this.store.getRun(runId));
     }
     this.setStatus(runId, 'paused', { queuePos: null });
+    // Resuming runs it again at once, also when it was waiting for a quota.
+    this.limitWaits.delete(runId);
     return this.store.getRun(runId);
   }
 
@@ -809,6 +908,7 @@ export class Engine {
       }
       this.setStatus(runId, 'cancelled', { queuePos: null, finishedAt: nowIso() });
     });
+    this.limitWaits.delete(runId);
     return this.store.getRun(runId);
   }
 
@@ -1687,7 +1787,8 @@ export class Engine {
    * a row (counted apart from reworks). Then, by `on_agent_error`: `switch_agent` hands the task
    * to another agent, which gets as many retries; `human` blocks the Run for a human; when
    * nothing is left to try (`retry` and `switch_agent`), the Run ends as failed instead of
-   * waiting for a human.
+   * waiting for a human. An agent out of quota or rate-limited is none of these: see
+   * `waitForQuota`.
    */
   private async agentError(
     run: Run,
@@ -1697,11 +1798,10 @@ export class Engine {
     result: AgentResult,
     signal: AbortSignal,
   ): Promise<void> {
+    if (result.errorKind === 'rate_limited') return this.waitForQuota(run, task, attempt, result);
     const error =
       result.error ?? t({ zh: `执行状态：${result.status}`, en: `Status: ${result.status}` });
     this.store.updateAttempt(attempt.id, { outcome: 'agent_error' });
-    // Every error takes the path below. An exhausted quota or a rate limit calls for waiting
-    // rather than retrying or switching agents; that is to be recognized here, from `result`.
     const { max_retries: maxRetries, on_agent_error: mode } = eff.escalate;
 
     const errors = this.errorsInARow(run, task);
@@ -1787,10 +1887,60 @@ export class Engine {
   }
 
   /**
+   * The agent is out of quota or rate-limited. That passes on its own: no retry is used up, no
+   * other agent takes over, nobody is asked. The task goes back to pending with the same agent
+   * and feedback (a rework resumes the session of the attempt that hit the limit, which knows
+   * what it did so far; the worktree keeps its changes, as after an agent error), and the Run
+   * goes back to the head of the queue, giving up the execution slot until the quota is expected
+   * back (`rateLimitDelayMs`); other Runs go on meanwhile. The wait is kept in memory only
+   * (`limitWaits`).
+   */
+  private waitForQuota(run: Run, task: Task, attempt: Attempt, result: AgentResult): void {
+    this.store.updateAttempt(attempt.id, { outcome: 'rate_limited' });
+    const now = this.now();
+    const resetAt = result.retryAt ? Date.parse(result.retryAt) : Number.NaN;
+    const delayMs = rateLimitDelayMs(
+      this.limitWait,
+      now,
+      Number.isNaN(resetAt) ? undefined : resetAt,
+      this.limitsInARow(task),
+    );
+    const until = now + delayMs;
+    this.store.tx(() => {
+      this.store.updateTask(task.id, { status: 'pending' });
+      this.store.event(run.id, 'task.rate_limited', {
+        taskId: task.id,
+        agentId: attempt.agentId,
+        // When the Run goes on; the CLI's own reset time, when it gave one, is `resetAt`.
+        retryAt: new Date(until).toISOString(),
+        delayMs,
+        resetAt: result.retryAt ?? null,
+        error: result.error ?? null,
+      });
+      this.setStatus(run.id, 'queued', { queuePos: this.store.queueHead() });
+    });
+    this.limitWaits.set(run.id, { agentId: attempt.agentId, until });
+  }
+
+  /**
+   * How many times in a row the task's agent hit a limit, counting the attempt just made: its
+   * attempts from the latest back while they were rate-limited.
+   */
+  private limitsInARow(task: Task): number {
+    let limits = 0;
+    for (const a of this.store.listAttempts(task.id).reverse()) {
+      if (a.outcome !== 'rate_limited') break;
+      limits++;
+    }
+    return limits;
+  }
+
+  /**
    * How many times in a row the task's agent has errored, counting the attempt just made: its
    * attempts from the latest back while they are errors of this agent since a human last retried
    * the Run. An attempt that ran to the end (passed or sent back for rework), was stopped, or was
-   * made by another agent starts the count again.
+   * made by another agent starts the count again. Attempts that hit a quota or rate limit are
+   * passed over: they neither count nor start the count again.
    */
   private errorsInARow(run: Run, task: Task): number {
     const events = this.store.listEvents(run.id);
@@ -1802,6 +1952,7 @@ export class Engine {
     );
     let errors = 0;
     for (const a of this.store.listAttempts(task.id).reverse()) {
+      if (a.outcome === 'rate_limited') continue;
       if (a.outcome !== 'agent_error' || a.agentId !== task.agentId || !since.has(a.id)) break;
       errors++;
     }
@@ -2124,11 +2275,13 @@ export class Engine {
     return run;
   }
 
+  /** Put the Run first in the queue, to go on as soon as the execution slot is free. */
   private requeueHead(runId: string, eventType: string): void {
     this.store.tx(() => {
       this.setStatus(runId, 'queued', { queuePos: this.store.queueHead(), blocked: null });
       this.store.event(runId, eventType, {});
     });
+    this.limitWaits.delete(runId);
   }
 
   private block(runId: string, info: BlockInfo): void {

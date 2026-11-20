@@ -76,6 +76,19 @@ export interface RunDetail {
   worktreeExists: boolean;
   /** Whether `workspace.branch` still exists; it goes together with the worktree. */
   branchExists: boolean;
+  /**
+   * The Run is queued because its agent was out of quota or rate-limited, and goes on at
+   * `retryAt` (ISO; also waiting for the execution slot then if another Run has it). null when it
+   * is not waiting for a quota. The wait is not kept across a Master restart: the Run then just
+   * tries again.
+   */
+  rateLimited: RateLimitedWait | null;
+}
+
+/** A Run waiting for its agent's quota: which agent hit the limit and when the Run goes on. */
+export interface RateLimitedWait {
+  agentId: string;
+  retryAt: string;
 }
 
 /** Where a Run's worktree and branch are and whether they are still there. */

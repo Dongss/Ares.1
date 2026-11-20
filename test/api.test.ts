@@ -110,6 +110,7 @@ describe('HTTP API', () => {
     expect(detail.json.stageRuns).toHaveLength(3);
     expect(detail.json.attempts).toHaveLength(2);
     expect(detail.json.worktreeExists).toBe(true);
+    expect(detail.json.rateLimited).toBeNull();
     // The approval asked for is not decided yet, so it does not count.
     expect(detail.json.times).toMatchObject({ totalMs: null, approvalMs: 0 });
     expect(detail.json.times).toEqual(storedRunTimes(h.master.store, h.master.store.getRun(id)));
@@ -326,6 +327,34 @@ agents:
       source: 'dashboard',
     });
     await h.waitStatus(id, 'completed');
+  });
+
+  it('says when a run waiting for its agent quota goes on, until it is cancelled', async () => {
+    h = await harness({
+      master: { rateLimitWait: { firstMs: 600_000, maxMs: 600_000, marginMs: 0 } },
+    });
+    h.scripts.coder = () => ({
+      status: 'failed',
+      error: '额度用尽或被限流',
+      errorKind: 'rate_limited',
+    });
+    const { id } = h.run('g');
+    await waitFor(
+      () => h?.master.store.listEvents(id).some((e) => e.type === 'task.rate_limited') === true,
+      'the rate limit',
+    );
+    await h.waitStatus(id, 'queued');
+    const detail = await call('GET', `/api/runs/${id}`);
+    expect(detail.json.run).toMatchObject({ status: 'queued', blocked: null });
+    expect(detail.json.rateLimited).toEqual({
+      agentId: 'coder',
+      retryAt: h.master.store.listEvents(id).find((e) => e.type === 'task.rate_limited')?.data
+        .retryAt,
+    });
+    expect(detail.json.attempts.map((a: Attempt) => a.outcome)).toEqual(['rate_limited']);
+
+    expect((await call('POST', `/api/runs/${id}/cancel`)).json.status).toBe('cancelled');
+    expect((await call('GET', `/api/runs/${id}`)).json.rateLimited).toBeNull();
   });
 
   it('pauses, resumes and cancels', async () => {

@@ -466,6 +466,14 @@ export class Store {
     );
   }
 
+  /** Queued Runs in the order they execute, as `nextQueuedRun` picks them. */
+  queuedRuns(): Run[] {
+    return this.many<Run>(
+      'runs',
+      "SELECT * FROM runs WHERE status = 'queued' ORDER BY queue_pos, created_at",
+    );
+  }
+
   queueHead(): number {
     const row = this.db
       .prepare("SELECT MIN(queue_pos) AS p FROM runs WHERE status = 'queued'")

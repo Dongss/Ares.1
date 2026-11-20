@@ -67,6 +67,7 @@ export const ATTEMPT_OUTCOME: Record<AttemptOutcome, { label: string; tone: Tone
   passed: badge('通过', 'Passed', 'success'),
   rework: badge('需返工', 'Needs rework', 'attention'),
   agent_error: badge('Agent 出错', 'Agent error', 'danger'),
+  rate_limited: badge('额度用尽', 'Out of quota', 'attention'),
 };
 
 export { BLOCK_KIND } from '../../../src/notify/notice.js';

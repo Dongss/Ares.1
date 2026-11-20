@@ -80,6 +80,8 @@ export class FakeAdapter implements AgentAdapter {
         costUsd: outcome.costUsd,
         permissionDenials: outcome.permissionDenials ?? [],
         error: outcome.error,
+        ...(outcome.errorKind ? { errorKind: outcome.errorKind } : {}),
+        ...(outcome.retryAt ? { retryAt: outcome.retryAt } : {}),
         exitCode: outcome.exitCode ?? (outcome.status === 'failed' ? 1 : 0),
       };
       if (res.finalMessage) input.onEvent?.({ type: 'message', text: res.finalMessage });

@@ -55,6 +55,14 @@ export interface AgentResult {
   permissionDenials: string[];
   /** Human readable error when status is failed. */
   error?: string;
+  /**
+   * What kind of failure it was, when the CLI tells: `rate_limited` = out of quota or
+   * rate-limited. That passes on its own, so the Master waits and runs the task again instead of
+   * counting it as an agent error.
+   */
+  errorKind?: 'rate_limited';
+  /** With `rate_limited`: when the quota comes back (ISO time), if the CLI said. */
+  retryAt?: string;
   exitCode: number | null;
 }
 

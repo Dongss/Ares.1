@@ -210,6 +210,24 @@ describe('runDigest', () => {
     );
   });
 
+  it('counts executions that hit a quota or rate limit', async () => {
+    h = await harness({
+      workflow: IMPLEMENT_ONLY,
+      master: { rateLimitWait: { firstMs: 5, maxMs: 5, marginMs: 0 } },
+    });
+    let calls = 0;
+    h.scripts.coder = (ctx) => {
+      calls++;
+      if (calls === 1) return { status: 'failed', error: 'limit', errorKind: 'rate_limited' };
+      writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+      return done();
+    };
+    const run = h.run();
+    await h.waitStatus(run.id, 'completed');
+
+    expect(digest(h)).toContain('  编码第 1 轮：执行 2 次，返工原因：额度用尽或被限流 ×1');
+  });
+
   it('tells apart the three kinds of bad results and counts each', async () => {
     h = await harness({ workflow: IMPLEMENT_ONLY.replace('max_retries: 3', 'max_retries: 5') });
     let calls = 0;

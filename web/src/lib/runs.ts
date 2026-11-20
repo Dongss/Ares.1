@@ -1,4 +1,4 @@
-import type { RunDetail, RunSummary } from '../../../src/api/types.js';
+import type { RateLimitedWait, RunDetail, RunSummary } from '../../../src/api/types.js';
 import { brandTitle } from '../../../src/brand.js';
 import { replyTimeoutHours } from '../../../src/config/flow.js';
 import {
@@ -14,10 +14,11 @@ import { t } from '../../../src/i18n.js';
 import {
   type AssessmentEntry,
   type DiscussionEntry,
+  type EventRow,
   FINISHED_RUN_STATUSES,
   type Run,
 } from '../../../src/store/types.js';
-import type { Tone } from './format.js';
+import { formatTime, type Tone } from './format.js';
 
 export interface HomeGroups {
   /** Waiting for a human: approvals and blocked Runs, oldest first. */
@@ -242,6 +243,29 @@ export function replyDeadlineOf(detail: Pick<RunDetail, 'run' | 'stageRuns'>): n
   const stageId = detail.stageRuns.find((sr) => sr.id === info.stageRunId)?.stageId;
   const def = run.template.stages.find((s) => s.id === stageId);
   return def ? replyDeadline(run.discussion, replyTimeoutHours(def)) : null;
+}
+
+/** 「Agent coder 额度用尽或被限流，预计 14:05:00 继续」: why a queued Run waits, and until when. */
+export function rateLimitText(wait: RateLimitedWait, now = new Date()): string {
+  const at = formatTime(wait.retryAt, now);
+  return t({
+    zh: `Agent ${wait.agentId} 额度用尽或被限流，预计 ${at} 继续`,
+    en: `Agent ${wait.agentId} is out of quota or rate-limited; expected to continue at ${at}`,
+  });
+}
+
+/**
+ * The event in words, for the events list, from its structured data; null for events that only
+ * show their data.
+ */
+export function eventText(event: Pick<EventRow, 'type' | 'data'>, now = new Date()): string | null {
+  if (event.type === 'task.rate_limited') {
+    const { agentId, retryAt } = event.data;
+    if (typeof agentId === 'string' && typeof retryAt === 'string') {
+      return rateLimitText({ agentId, retryAt }, now);
+    }
+  }
+  return null;
 }
 
 export interface DiscussionItem {

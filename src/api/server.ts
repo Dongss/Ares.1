@@ -246,6 +246,7 @@ export function createApi(deps: ApiDeps): Hono {
       artifacts: store.listArtifacts(id),
       times: storedRunTimes(store, run),
       ...(await engine.inspectWorkspace(run)),
+      rateLimited: engine.rateLimited(run),
     } satisfies RunDetail);
   });
 

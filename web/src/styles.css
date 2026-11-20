@@ -916,6 +916,9 @@ textarea:focus {
 .event-data {
   word-break: break-all;
 }
+.event-text {
+  margin-bottom: 2px;
+}
 
 /* repos */
 .repo-head {

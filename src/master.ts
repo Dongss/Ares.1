@@ -18,7 +18,7 @@ import {
   loadConfig,
 } from './config/load.js';
 import { ConfigWatcher } from './config/watch.js';
-import { type Backoff, Engine } from './engine/engine.js';
+import { type Backoff, Engine, type RateLimitWait } from './engine/engine.js';
 import { IssueBridge } from './github/bridge.js';
 import type { GitHub } from './github/client.js';
 import { type Lang, lang, setLang } from './i18n.js';
@@ -63,6 +63,8 @@ export interface MasterOptions {
   now?: () => number;
   /** How long the engine waits before retrying an agent that errored (tests shorten it). */
   agentRetryBackoff?: Backoff;
+  /** How long a Run waits for its rate-limited agent's quota (tests shorten it). */
+  rateLimitWait?: RateLimitWait;
   /**
    * Language of the default config files written on first start (the CLI passes the system's);
    * omitted = the default. After that, config.yaml's `language` is the one in use.
@@ -153,6 +155,7 @@ export class Master {
       adapters,
       now: opts.now,
       agentRetryBackoff: opts.agentRetryBackoff,
+      rateLimitWait: opts.rateLimitWait,
     });
     const issues = new IssueBridge({ store, engine, paths, config, adapters, github: opts.github });
     const notifier = new SystemNotifier(store, config, opts.notice);

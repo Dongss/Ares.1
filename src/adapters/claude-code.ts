@@ -67,7 +67,10 @@ export class ClaudeCodeAdapter implements AgentAdapter {
     });
 
     const result = proc.done.then((outcome): AgentResult => {
-      const base = parser.toResult(outcome.exitCode);
+      const parsed = parser.toResult(outcome.exitCode);
+      // Not started, stopped or timed out: a limit the CLI hit on the way is not why it ended.
+      const { errorKind: _kind, retryAt: _at, ...ended } = parsed;
+      const base = outcome.ended === 'exit' ? parsed : ended;
       if (outcome.ended === 'spawn_error') {
         return {
           ...base,
@@ -124,6 +127,8 @@ export class StreamJsonParser {
   private lastText = '';
   private result: ResultEvent | undefined;
   private rateLimited = false;
+  /** When the quota is back (epoch ms), from the rate limit events. */
+  private resetAt: number | undefined;
 
   constructor(private readonly onEvent?: (e: AgentEvent) => void) {}
 
@@ -150,15 +155,27 @@ export class StreamJsonParser {
       case 'assistant':
         this.handleAssistant(event.message);
         break;
-      case 'rate_limit_event': {
-        const info = event.rate_limit_info as { status?: string } | undefined;
-        if (info?.status && info.status !== 'allowed') this.rateLimited = true;
+      case 'rate_limit_event':
+        this.handleRateLimit(event.rate_limit_info);
         break;
-      }
       case 'result':
         this.result = event as unknown as ResultEvent;
         break;
     }
+  }
+
+  /**
+   * `rate_limit_info.status` is `allowed`, `allowed_warning` (close to a limit, still allowed) or
+   * something else when a limit is hit (`rejected`). Of the limits hit, the latest reset time
+   * counts: the quota is back only once every one of them has reset.
+   */
+  private handleRateLimit(info: unknown): void {
+    if (!info || typeof info !== 'object') return;
+    const { status, resetsAt, resets_at } = info as Record<string, unknown>;
+    if (typeof status !== 'string' || !status || status.startsWith('allowed')) return;
+    this.rateLimited = true;
+    const reset = resetTime(resetsAt ?? resets_at);
+    if (reset !== undefined) this.resetAt = Math.max(this.resetAt ?? reset, reset);
   }
 
   private handleAssistant(message: unknown): void {
@@ -178,6 +195,15 @@ export class StreamJsonParser {
     }
   }
 
+  /** Marks a failure as a rate limit when a limit was hit on the way, with its reset time. */
+  private limitFields(): Pick<AgentResult, 'errorKind' | 'retryAt'> {
+    if (!this.rateLimited) return {};
+    return {
+      errorKind: 'rate_limited',
+      ...(this.resetAt !== undefined ? { retryAt: new Date(this.resetAt).toISOString() } : {}),
+    };
+  }
+
   toResult(exitCode: number | null): AgentResult {
     const r = this.result;
     if (!r) {
@@ -191,6 +217,7 @@ export class StreamJsonParser {
         error: this.rateLimited
           ? t({ zh: '额度用尽或被限流', en: 'Out of quota or rate-limited' })
           : undefined,
+        ...this.limitFields(),
       };
     }
     const usage: AgentUsage = {
@@ -214,6 +241,25 @@ export class StreamJsonParser {
         ? [r.result, ...(r.errors ?? [])].filter(Boolean).join('\n') ||
           t({ zh: `失败（${r.subtype}）`, en: `Failed (${r.subtype})` })
         : undefined,
+      // A limit hit on the way does not matter once the turn finished.
+      ...(failed ? this.limitFields() : {}),
     };
   }
+}
+
+/**
+ * A reset time as the CLI writes it, in epoch milliseconds: epoch seconds or milliseconds (a
+ * number below 1e12 is taken as seconds, which reaches to the year 33658), or an ISO time.
+ */
+export function resetTime(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+    return value < 1e12 ? value * 1000 : value;
+  }
+  if (typeof value === 'string' && value.trim()) {
+    const n = Number(value);
+    if (Number.isFinite(n)) return resetTime(n);
+    const ms = Date.parse(value);
+    return Number.isNaN(ms) ? undefined : ms;
+  }
+  return undefined;
 }

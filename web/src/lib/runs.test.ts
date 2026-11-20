@@ -7,9 +7,11 @@ import {
   attentionCount,
   canCleanUpWorkspace,
   discussionItems,
+  eventText,
   groupRuns,
   pageTitle,
   patchLineClass,
+  rateLimitText,
   replyDeadlineOf,
   splitPatch,
   workspaceLines,
@@ -331,5 +333,39 @@ describe('requirement assessment', () => {
     } finally {
       setLang('zh');
     }
+  });
+});
+
+describe('rate limits', () => {
+  afterEach(() => setLang('zh'));
+  // Local times, as the dashboard shows them.
+  const now = new Date(2026, 10, 20, 9, 0, 0);
+  const today = new Date(2026, 10, 20, 14, 5, 0).toISOString();
+  const tomorrow = new Date(2026, 10, 21, 3, 30, 0).toISOString();
+  const event = (data: Record<string, unknown>) => ({ type: 'task.rate_limited', data });
+
+  it('says which agent hit the limit and when the Run goes on', () => {
+    expect(rateLimitText({ agentId: 'coder', retryAt: today }, now)).toBe(
+      'Agent coder 额度用尽或被限流，预计 14:05:00 继续',
+    );
+    expect(rateLimitText({ agentId: 'coder', retryAt: tomorrow }, now)).toBe(
+      'Agent coder 额度用尽或被限流，预计 11-21 03:30 继续',
+    );
+  });
+
+  it('words task.rate_limited events from their data, and no others', () => {
+    const data = { taskId: 't', agentId: 'coder', retryAt: today, delayMs: 1, resetAt: null };
+    expect(eventText(event(data), now)).toBe('Agent coder 额度用尽或被限流，预计 14:05:00 继续');
+    expect(eventText(event({ taskId: 't' }), now)).toBeNull();
+    expect(eventText({ type: 'task.passed', data: { taskId: 't' } }, now)).toBeNull();
+  });
+
+  it('in English', () => {
+    setLang('en');
+    const text = eventText(event({ agentId: 'coder', retryAt: today }), now);
+    expect(text).toBe(
+      'Agent coder is out of quota or rate-limited; expected to continue at 14:05:00',
+    );
+    expect(text).not.toMatch(/[一-鿿]/);
   });
 });

@@ -44,6 +44,8 @@ import {
   assessmentHeadline,
   canCleanUpWorkspace,
   discussionItems,
+  eventText,
+  rateLimitText,
   replyDeadlineOf,
   workspaceLines,
 } from '../lib/runs.js';
@@ -328,6 +330,17 @@ function RunActions(props: {
         <BlockedPanel detail={props.detail} config={props.config} onChanged={props.onChanged} />
       )}
       {run.status === 'failed' && run.error && <ErrorBox>{run.error}</ErrorBox>}
+      {run.status === 'queued' && props.detail.rateLimited && (
+        <div className="panel">
+          <h2>{rateLimitText(props.detail.rateLimited)}</h2>
+          <p>
+            {t({
+              zh: '这不算出错，不消耗重试次数，也不用人处理：执行槽先让给其他 Run，到时间后从同一个 Task 接着做。想马上再试，可以暂停后再恢复。',
+              en: 'This is not an error: it uses up no retries and needs no human. The execution slot goes to other Runs meanwhile, and the same Task carries on at that time. To try again right away, pause and resume the Run.',
+            })}
+          </p>
+        </div>
+      )}
       {!finished && (
         <div className="controls">
           {pausable && (
@@ -1000,19 +1013,23 @@ function EventsPanel({ runId }: { runId: string }) {
     <div className="card">
       <table className="events">
         <tbody>
-          {events.data.map((e) => (
-            <tr key={e.id}>
-              <td className="muted">{formatTime(e.ts)}</td>
-              <td>
-                <code>{e.type}</code>
-              </td>
-              <td>
-                <code className="event-data">
-                  {Object.keys(e.data).length > 0 ? JSON.stringify(e.data) : ''}
-                </code>
-              </td>
-            </tr>
-          ))}
+          {events.data.map((e) => {
+            const text = eventText(e);
+            return (
+              <tr key={e.id}>
+                <td className="muted">{formatTime(e.ts)}</td>
+                <td>
+                  <code>{e.type}</code>
+                </td>
+                <td>
+                  {text && <div className="event-text">{text}</div>}
+                  <code className="event-data">
+                    {Object.keys(e.data).length > 0 ? JSON.stringify(e.data) : ''}
+                  </code>
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>

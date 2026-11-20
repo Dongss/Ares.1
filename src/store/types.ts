@@ -281,7 +281,12 @@ export interface Task {
   updatedAt: string;
 }
 
-export type AttemptOutcome = 'passed' | 'rework' | 'agent_error';
+/**
+ * What came of an attempt: passed, sent back for rework, the agent errored (timeouts included),
+ * or the agent was out of quota / rate-limited, after which the task runs again once the quota
+ * is back (not an error).
+ */
+export type AttemptOutcome = 'passed' | 'rework' | 'agent_error' | 'rate_limited';
 
 export interface Attempt {
   id: string;

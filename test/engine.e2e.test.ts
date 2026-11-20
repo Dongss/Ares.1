@@ -1,9 +1,15 @@
 import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { FakeAdapter } from '../src/adapters/fake.js';
+import { FakeAdapter, type FakeContext, type FakeOutcome } from '../src/adapters/fake.js';
 import type { AgentAdapter } from '../src/adapters/types.js';
-import { AGENT_RETRY_BACKOFF, backoffMs, InvalidStateError } from '../src/engine/engine.js';
+import {
+  AGENT_RETRY_BACKOFF,
+  backoffMs,
+  InvalidStateError,
+  RATE_LIMIT_WAIT,
+  rateLimitDelayMs,
+} from '../src/engine/engine.js';
 import { setLang } from '../src/i18n.js';
 import { noticeFor } from '../src/notify/notice.js';
 import { NotFoundError } from '../src/store/store.js';
@@ -805,6 +811,169 @@ agents:
       expect(failed.error).toContain('Agent reviewer failed: model not found');
       expect(failed.error).not.toMatch(/[一-鿿]/);
     });
+  });
+});
+
+describe('engine: rate limits', () => {
+  const eventData = (runId: string, type: string) =>
+    (h as Harness).master.store
+      .listEvents(runId)
+      .filter((e) => e.type === type)
+      .map((e) => e.data);
+  /** Only a coding stage, where an agent error would wait for a human at once. */
+  const WORKFLOW = `
+id: dev
+defaults:
+  escalate: { max_retries: 0, on_agent_error: human }
+stages:
+  - id: implement
+    agent: coder
+`;
+  const limited = (retryAt?: string): FakeOutcome => ({
+    status: 'failed',
+    error: '额度用尽或被限流',
+    errorKind: 'rate_limited',
+    ...(retryAt ? { retryAt } : {}),
+  });
+  const writeFeature = (ctx: FakeContext): FakeOutcome => {
+    writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+    return done();
+  };
+
+  it('waits 5, 10, 20, 40 minutes, then hourly; or until the reset time plus a minute', () => {
+    expect(
+      [1, 2, 3, 4, 5, 6].map((n) => rateLimitDelayMs(RATE_LIMIT_WAIT, 0, undefined, n)),
+    ).toEqual([300_000, 600_000, 1_200_000, 2_400_000, 3_600_000, 3_600_000]);
+    expect(rateLimitDelayMs(RATE_LIMIT_WAIT, 1000, 1000 + 7_200_000, 1)).toBe(7_260_000);
+    // A reset time already past says nothing about when the quota is back.
+    expect(rateLimitDelayMs(RATE_LIMIT_WAIT, 1000, 500, 2)).toBe(600_000);
+  });
+
+  it('waits for the quota without using up retries or blocking, then completes', async () => {
+    h = await harness({
+      workflow: WORKFLOW,
+      master: { rateLimitWait: { firstMs: 50, maxMs: 50, marginMs: 0 } },
+    });
+    const at: number[] = [];
+    h.scripts.coder = (ctx) => {
+      at.push(Date.now());
+      return at.length === 1 ? limited() : writeFeature(ctx);
+    };
+    const run = h.run();
+    const completed = await h.waitStatus(run.id, 'completed');
+    expect(h.fake.calls.map((c) => c.model)).toEqual(['coder', 'coder']);
+    expect((at[1] as number) - (at[0] as number)).toBeGreaterThanOrEqual(45);
+    const task = h.master.store.listRunTasks(run.id)[0] as Task;
+    expect(task.retries).toBe(0);
+    expect(task.agentId).toBe('coder');
+    expect(h.master.store.listAttempts(task.id).map((a) => a.outcome)).toEqual([
+      'rate_limited',
+      'passed',
+    ]);
+    const events = eventData(run.id, 'task.rate_limited');
+    expect(events).toEqual([
+      {
+        taskId: task.id,
+        agentId: 'coder',
+        retryAt: expect.any(String),
+        delayMs: 50,
+        resetAt: null,
+        error: '额度用尽或被限流',
+      },
+    ]);
+    // Waited in the queue: no retry after an error, no other agent, nothing for a human.
+    expect(eventData(run.id, 'task.retry_after_error')).toEqual([]);
+    expect(eventData(run.id, 'task.agent_switched')).toEqual([]);
+    expect(eventData(run.id, 'run.blocked')).toEqual([]);
+    expect(eventData(run.id, 'run.status').map((d) => d.status)).toEqual([
+      'running',
+      'queued',
+      'running',
+      'completed',
+    ]);
+    expect(completed.blocked).toBeNull();
+    expect(h.master.engine.rateLimited(completed)).toBeNull();
+  });
+
+  it('waits until the reset time the CLI gave, plus the margin', async () => {
+    h = await harness({
+      workflow: WORKFLOW,
+      master: { rateLimitWait: { firstMs: 600_000, maxMs: 600_000, marginMs: 100 } },
+    });
+    const at: number[] = [];
+    let resetAt = 0;
+    h.scripts.coder = (ctx) => {
+      at.push(Date.now());
+      if (at.length > 1) return writeFeature(ctx);
+      resetAt = Date.now() + 200;
+      return limited(new Date(resetAt).toISOString());
+    };
+    const run = h.run();
+    // Not the ten-minute backoff.
+    await h.waitStatus(run.id, 'completed');
+    const [event] = eventData(run.id, 'task.rate_limited');
+    expect(event?.resetAt).toBe(new Date(resetAt).toISOString());
+    expect(event?.retryAt).toBe(new Date(resetAt + 100).toISOString());
+    expect(at[1]).toBeGreaterThanOrEqual(resetAt + 100 - 5);
+  });
+
+  it('gives the execution slot to other Runs; pausing and resuming tries again at once', async () => {
+    h = await harness({
+      workflow: WORKFLOW,
+      master: { rateLimitWait: { firstMs: 600_000, maxMs: 600_000, marginMs: 0 } },
+    });
+    let quota = false;
+    h.scripts.coder = (ctx) =>
+      ctx.input.prompt.includes('第一个') && !quota ? limited() : writeFeature(ctx);
+    const first = h.run('第一个');
+    await waitFor(() => eventData(first.id, 'task.rate_limited').length === 1, 'the rate limit');
+    const waiting = await h.waitStatus(first.id, 'queued');
+    expect(waiting.blocked).toBeNull();
+    const wait = h.master.engine.rateLimited(waiting);
+    expect(wait).toEqual({
+      agentId: 'coder',
+      retryAt: eventData(first.id, 'task.rate_limited')[0]?.retryAt,
+    });
+    expect(Date.parse(wait?.retryAt as string) - Date.now()).toBeGreaterThan(500_000);
+
+    // Another Run goes ahead meanwhile; the waiting one stays in the queue.
+    const second = h.run('第二个');
+    await h.waitStatus(second.id, 'completed');
+    expect(h.master.store.getRun(first.id).status).toBe('queued');
+
+    quota = true;
+    expect((await h.master.engine.pause(first.id)).status).toBe('paused');
+    expect(h.master.engine.rateLimited(h.master.store.getRun(first.id))).toBeNull();
+    h.master.engine.resume(first.id);
+    await h.waitStatus(first.id, 'completed');
+    expect(h.fake.calls.map((c) => c.prompt.includes('第一个'))).toEqual([true, false, true]);
+  });
+
+  it('waits longer for each limit in a row; limits neither count as errors nor reset their count', async () => {
+    h = await harness({
+      workflow: WORKFLOW.replace(
+        'max_retries: 0, on_agent_error: human',
+        'max_retries: 1, on_agent_error: retry',
+      ),
+      master: { rateLimitWait: { firstMs: 10, maxMs: 25, marginMs: 0 } },
+    });
+    const outcomes: FakeOutcome[] = [
+      limited(),
+      limited(),
+      limited(),
+      { status: 'failed', error: 'boom 1' },
+      limited(),
+      { status: 'failed', error: 'boom 2' },
+    ];
+    let calls = 0;
+    h.scripts.coder = () => outcomes[calls++] ?? done();
+    const run = h.run();
+    const failed = await h.waitStatus(run.id, 'failed');
+    expect(calls).toBe(6);
+    expect(eventData(run.id, 'task.rate_limited').map((d) => d.delayMs)).toEqual([10, 20, 25, 10]);
+    // boom 1 used the one retry; the limit after it did not give another.
+    expect(eventData(run.id, 'task.retry_after_error').map((d) => d.error)).toEqual(['boom 1']);
+    expect(failed.error).toContain('boom 2');
   });
 });
 

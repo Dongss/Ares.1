@@ -207,6 +207,9 @@ function deniedIn(attempt: Attempt, failedChecks: CheckResult[]): string[] {
 /** Why one execution did not pass, from its failed checks. */
 function reworkReasons(attempt: Attempt, failedChecks: CheckResult[]): string[] {
   if (attempt.outcome === 'agent_error') return [t({ zh: 'Agent 出错', en: 'agent error' })];
+  if (attempt.outcome === 'rate_limited') {
+    return [t({ zh: '额度用尽或被限流', en: 'out of quota or rate-limited' })];
+  }
   const reasons = failedChecks.map((c) =>
     c.kind === 'command'
       ? t({ zh: `\`${c.name}\` 未通过`, en: `\`${c.name}\` failed` })
@@ -218,8 +221,9 @@ function reworkReasons(attempt: Attempt, failedChecks: CheckResult[]): string[] 
 
 /**
  * Executions within one stage round, when some of them had to be redone: rework inside a stage
- * (failed verify commands, bad output, agent errors) never shows up in the stage rounds. The
- * operations denied in the round follow, one per line, so the scout can tell what was refused.
+ * (failed verify commands, bad output, agent errors, quota or rate limits) never shows up in the
+ * stage rounds. The operations denied in the round follow, one per line, so the scout can tell
+ * what was refused.
  */
 function reworkLines(
   head: string,
@@ -229,7 +233,9 @@ function reworkLines(
   const counts = new Map<string, number>();
   const denied = new Set<string>();
   for (const a of attempts) {
-    if (a.outcome !== 'rework' && a.outcome !== 'agent_error') continue;
+    if (a.outcome !== 'rework' && a.outcome !== 'agent_error' && a.outcome !== 'rate_limited') {
+      continue;
+    }
     const checks = failedChecks.get(a.id) ?? [];
     for (const reason of reworkReasons(a, checks)) {
       counts.set(reason, (counts.get(reason) ?? 0) + 1);

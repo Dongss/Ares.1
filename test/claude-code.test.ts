@@ -1,8 +1,9 @@
 import { chmodSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { ClaudeCodeAdapter } from '../src/adapters/claude-code.js';
+import { ClaudeCodeAdapter, resetTime, StreamJsonParser } from '../src/adapters/claude-code.js';
 import type { AgentEvent, StartInput } from '../src/adapters/types.js';
+import { setLang } from '../src/i18n.js';
 import { tmpDir, writeFile } from './helpers.js';
 
 // A stand-in `claude` executable that records how it was called and prints stream-json
@@ -28,6 +29,16 @@ process.stdin.on('end', () => {
   }
   out({ type: 'assistant', session_id: sid, message: { content: [{ type: 'tool_use', name: 'Write', input: { file_path: 'a.txt', content: 'x' } }] } });
   out({ type: 'assistant', session_id: sid, message: { content: [{ type: 'text', text: 'all done' }] } });
+  if (input.includes('MODE=limit')) {
+    out({ type: 'rate_limit_event', session_id: sid, rate_limit_info: { status: 'allowed_warning', resetsAt: 1900000000, rateLimitType: 'seven_day' } });
+    out({ type: 'rate_limit_event', session_id: sid, rate_limit_info: { status: 'rejected', resetsAt: 1800000000, rateLimitType: 'five_hour' } });
+    if (input.includes('MODE=limit-hang')) {
+      setInterval(() => {}, 1000);
+      return;
+    }
+    out({ type: 'result', subtype: 'success', is_error: true, result: "You've hit your limit", session_id: sid, usage: {}, permission_denials: [] });
+    process.exit(1);
+  }
   if (input.includes('MODE=error')) {
     out({ type: 'result', subtype: 'success', is_error: true, result: 'There is an issue with the selected model', session_id: sid, usage: {}, permission_denials: [] });
     process.exit(1);
@@ -154,6 +165,24 @@ describe('ClaudeCodeAdapter', () => {
     expect(result.exitCode).toBe(1);
   });
 
+  it('reports a rate limit with its reset time; a timeout is not one', async () => {
+    const { adapter, input } = setup();
+    const result = await adapter.start(input('MODE=limit')).result;
+    expect(result).toMatchObject({
+      status: 'failed',
+      errorKind: 'rate_limited',
+      // The limit that was hit (rejected), not the one only warned about.
+      retryAt: new Date(1_800_000_000_000).toISOString(),
+      exitCode: 1,
+    });
+    expect(result.error).toContain("You've hit your limit");
+
+    const slow = await adapter.start(input('MODE=limit-hang', { timeoutMs: 300 })).result;
+    expect(slow.status).toBe('timeout');
+    expect(slow.errorKind).toBeUndefined();
+    expect(slow.retryAt).toBeUndefined();
+  });
+
   it('reports a crash without a result using stderr', async () => {
     const { adapter, input } = setup();
     const result = await adapter.start(input('MODE=crash')).result;
@@ -177,5 +206,103 @@ describe('ClaudeCodeAdapter', () => {
     const result = await new ClaudeCodeAdapter('/nonexistent/claude').start(input('x')).result;
     expect(result.status).toBe('failed');
     expect(result.error).toMatch(/无法启动/);
+  });
+});
+
+describe('StreamJsonParser: rate limits', () => {
+  const limit = (info: Record<string, unknown>) =>
+    JSON.stringify({ type: 'rate_limit_event', rate_limit_info: info });
+  const result = (extra: Record<string, unknown> = {}) =>
+    JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'ok', ...extra });
+  const parse = (...lines: string[]) => {
+    const parser = new StreamJsonParser();
+    for (const line of lines) parser.feed(line);
+    return parser.toResult(1);
+  };
+  const SECONDS = 1_800_000_000;
+  const AT = new Date(SECONDS * 1000).toISOString();
+
+  it('marks a limit without a result as rate_limited, with the reset time in seconds', () => {
+    const r = parse(limit({ status: 'rejected', resetsAt: SECONDS }));
+    expect(r).toMatchObject({ status: 'failed', errorKind: 'rate_limited', retryAt: AT });
+    expect(r.error).toBe('额度用尽或被限流');
+  });
+
+  it('takes the reset time in milliseconds, as an ISO time or as resets_at', () => {
+    for (const info of [
+      { status: 'rejected', resetsAt: SECONDS * 1000 },
+      { status: 'rejected', resetsAt: AT },
+      { status: 'rejected', resets_at: SECONDS },
+      { status: 'rejected', resetsAt: String(SECONDS) },
+    ]) {
+      expect(parse(limit(info)).retryAt).toBe(AT);
+    }
+  });
+
+  it('marks a limit without a reset time as rate_limited, without retryAt', () => {
+    for (const info of [{ status: 'rejected' }, { status: 'rejected', resetsAt: 'soon' }]) {
+      const r = parse(limit(info));
+      expect(r.errorKind).toBe('rate_limited');
+      expect(r).not.toHaveProperty('retryAt');
+    }
+  });
+
+  it('marks an error result after a limit as rate_limited, keeping the CLI message', () => {
+    const r = parse(
+      limit({ status: 'rejected', resetsAt: SECONDS }),
+      result({ is_error: true, result: 'Usage limit reached' }),
+    );
+    expect(r).toMatchObject({
+      status: 'failed',
+      error: 'Usage limit reached',
+      errorKind: 'rate_limited',
+      retryAt: AT,
+    });
+  });
+
+  it('keeps the latest reset time of the limits hit', () => {
+    const r = parse(
+      limit({ status: 'rejected', resetsAt: SECONDS + 3600 }),
+      limit({ status: 'rejected', resetsAt: SECONDS }),
+    );
+    expect(r.retryAt).toBe(new Date((SECONDS + 3600) * 1000).toISOString());
+  });
+
+  it('is no rate limit when the turn finished, or when the CLI only allowed or warned', () => {
+    const finished = parse(limit({ status: 'rejected', resetsAt: SECONDS }), result());
+    expect(finished.status).toBe('completed');
+    expect(finished).not.toHaveProperty('errorKind');
+    expect(finished).not.toHaveProperty('retryAt');
+
+    for (const status of ['allowed', 'allowed_warning']) {
+      const failed = parse(
+        limit({ status, resetsAt: SECONDS }),
+        result({ is_error: true, result: 'boom' }),
+      );
+      expect(failed.status).toBe('failed');
+      expect(failed.errorKind).toBeUndefined();
+      expect(parse(limit({ status })).errorKind).toBeUndefined();
+    }
+  });
+
+  it('reads reset times as seconds below 1e12, milliseconds above', () => {
+    expect(resetTime(SECONDS)).toBe(SECONDS * 1000);
+    expect(resetTime(SECONDS * 1000)).toBe(SECONDS * 1000);
+    expect(resetTime(AT)).toBe(SECONDS * 1000);
+    expect(resetTime(undefined)).toBeUndefined();
+    expect(resetTime(0)).toBeUndefined();
+    expect(resetTime('')).toBeUndefined();
+    expect(resetTime('later')).toBeUndefined();
+  });
+
+  it('says so in English too', () => {
+    setLang('en');
+    try {
+      const r = parse(limit({ status: 'rejected' }));
+      expect(r.error).toBe('Out of quota or rate-limited');
+      expect(r.error).not.toMatch(/[一-鿿]/);
+    } finally {
+      setLang('zh');
+    }
   });
 });
