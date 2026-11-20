@@ -1,13 +1,16 @@
 import { brandName } from '../brand.js';
 import type { AgentConfig, StageDef } from '../config/schema.js';
 import { join, t } from '../i18n.js';
-import type { AssessmentEntry, DiscussionEntry } from '../store/types.js';
+import type { AssessmentEntry, DiscussionEntry, ReplyTimeoutEntry } from '../store/types.js';
 import {
   assessmentRounds,
   conclusionLabel,
   formatAssessment,
+  formatReplyTimeout,
   hasHumanReply,
+  pendingTimeout,
   verdictLabel,
+  waitText,
 } from './discussion.js';
 
 export interface PromptContext {
@@ -332,6 +335,10 @@ export function formatDiscussion(discussion: readonly DiscussionEntry[], level =
             : t({ zh: '人的回复（看板上）', en: 'Human reply (on the dashboard)' });
         return `${h} ${head}\n\n${e.text.trim()}`;
       }
+      if (e.role === 'timeout') {
+        const { title, text } = formatReplyTimeout(e);
+        return `${h} ${title}\n\n${text}`;
+      }
       round++;
       const verdict = e.proposedDrop
         ? t({ zh: '认为不该做，请人确认', en: 'Should not be done; asks a human to confirm' })
@@ -345,7 +352,58 @@ export function formatDiscussion(discussion: readonly DiscussionEntry[], level =
     .join('\n\n');
 }
 
-/** Prompt of a requirement assessment: read-only, ends with go / ask / drop. */
+/**
+ * The conclusion and output format of the round after nobody replied in time: go with the
+ * assumptions written down, or drop; asking again is not accepted (`assessmentProblem`).
+ */
+function decideAloneConclusion(timeout: ReplyTimeoutEntry): string {
+  const why =
+    timeout.hours === 0
+      ? t({ zh: '这个阶段不等人回复', en: 'This stage does not wait for replies' })
+      : t({
+          zh: `上面的疑问 ${waitText(timeout.hours)}内没有人回复`,
+          en: `Nobody replied to the questions above within ${waitText(timeout.hours)}`,
+        });
+  return t({
+    zh: `## 结论
+
+${why}，这一轮由你自己决定，不能再给 ask。verdict 二选一：
+- go（开工）：按你认为最合理的理解开工。summary 写评估意见，并逐条写明你对之前的疑问做了哪些假设；后面的编码和评审会读到 summary，按这些假设去做。不要写 revisedGoal。
+- drop（不做）：认为不该做时给出，summary 写明理由。
+
+summary 用中文书写。
+
+## 输出格式
+
+最后一条回复以一个 JSON 代码块结束：
+
+\`\`\`json
+{"verdict": "go", "summary": "评估意见，以及对每个疑问做了什么假设"}
+\`\`\`
+`,
+    en: `## Conclusion
+
+${why}, so you decide this round on your own, and ask is not allowed. Pick one verdict:
+- go: start on what you think is the most sensible reading. Write your assessment in summary, and for each of the earlier questions the assumption you made; coding and review read summary and go by these assumptions. Do not write revisedGoal.
+- drop: when you think it should not be done; give the reasons in summary.
+
+Write summary in English.
+
+## Output format
+
+End your last reply with a JSON code block:
+
+\`\`\`json
+{"verdict": "go", "summary": "your assessment, and the assumption made for each question"}
+\`\`\`
+`,
+  });
+}
+
+/**
+ * Prompt of a requirement assessment: read-only, ends with go / ask / drop. After nobody replied
+ * in time (the discussion ends with a timeout), only go / drop.
+ */
 export function assessPrompt(
   ctx: PromptContext,
   discussion: readonly DiscussionEntry[],
@@ -353,6 +411,7 @@ export function assessPrompt(
 ): string {
   const instructions = ctx.stage.instructions ? fill(ctx.stage.instructions, ctx.goal).trim() : '';
   const replied = hasHumanReply(discussion);
+  const timeout = pendingTimeout(discussion);
   const history =
     discussion.length > 0
       ? t({
@@ -379,7 +438,7 @@ export function assessPrompt(
       })
     : '';
   const rest = `${requirements}${history}${inputsSection(ctx.inputs)}${notes}${lastFeedback}`;
-  return t({
+  const intro = t({
     zh: `你是${brandName()}的「需求评估」Agent。Run 开始编码之前，先判断下面这个需求是否合理、能不能开工。你只能读文件和搜索，不能修改任何文件，也不能执行命令。
 
 ## 需求
@@ -397,23 +456,7 @@ ${ctx.goal}
   5. 有没有明显更好的做法。
 - 只有真正影响能否做好的问题才需要问人；细节自己按最合理的方式定下来，写进 summary，不要为它们打扰人。
 
-${rest}## 结论
-
-verdict 三选一：
-- go（开工）：可以开始编码。summary 写评估意见，包括你替人定下的细节。${replied ? '讨论后需求有修改或补充时，在 revisedGoal 里写修改后的完整需求（要能替代原需求，包括验收标准，后面的编码和评审以它为准）；没有修改就不写 revisedGoal。' : '还没有和人讨论过，不要写 revisedGoal：需求要改就先 ask。'}
-- ask（需要讨论）：有疑问或顾虑，要人回答或确认。questions 列出疑问和顾虑，suggestions 写建议怎么改。认为不该做时也给 ask，在 summary 里写明理由，并在 questions 里请人确认是否不做。
-- drop（不做）：${replied ? '只有讨论记录里人已经同意不做时才能给出，summary 写明理由。' : '还没有和人讨论过，不能给出 drop；认为不该做就给 ask。'}
-
-summary、questions、suggestions 和 revisedGoal 都用中文书写。
-
-## 输出格式
-
-最后一条回复以一个 JSON 代码块结束：
-
-\`\`\`json
-{"verdict": "ask", "summary": "评估意见", "questions": ["疑问或顾虑"], "suggestions": ["建议怎么改"]}
-\`\`\`
-`,
+${rest}`,
     en: `You are the requirement assessment agent of ${brandName()}. Before a Run starts coding, judge whether the requirement below is sound and ready to start. You may only read files and search; you may not modify any file or run commands.
 
 ## Requirement
@@ -431,7 +474,28 @@ ${ctx.goal}
   5. whether there is a clearly better approach.
 - Ask the human only about what really decides whether it can be done well; settle details yourself in the most sensible way and write them in summary instead of bothering the human with them.
 
-${rest}## Conclusion
+${rest}`,
+  });
+  if (timeout) return `${intro}${decideAloneConclusion(timeout)}`;
+  return `${intro}${t({
+    zh: `## 结论
+
+verdict 三选一：
+- go（开工）：可以开始编码。summary 写评估意见，包括你替人定下的细节。${replied ? '讨论后需求有修改或补充时，在 revisedGoal 里写修改后的完整需求（要能替代原需求，包括验收标准，后面的编码和评审以它为准）；没有修改就不写 revisedGoal。' : '还没有和人讨论过，不要写 revisedGoal：需求要改就先 ask。'}
+- ask（需要讨论）：有疑问或顾虑，要人回答或确认。questions 列出疑问和顾虑，suggestions 写建议怎么改。认为不该做时也给 ask，在 summary 里写明理由，并在 questions 里请人确认是否不做。
+- drop（不做）：${replied ? '只有讨论记录里人已经同意不做时才能给出，summary 写明理由。' : '还没有和人讨论过，不能给出 drop；认为不该做就给 ask。'}
+
+summary、questions、suggestions 和 revisedGoal 都用中文书写。
+
+## 输出格式
+
+最后一条回复以一个 JSON 代码块结束：
+
+\`\`\`json
+{"verdict": "ask", "summary": "评估意见", "questions": ["疑问或顾虑"], "suggestions": ["建议怎么改"]}
+\`\`\`
+`,
+    en: `## Conclusion
 
 Pick one verdict:
 - go: coding can start. Write your assessment in summary, including the details you settled for the human. ${replied ? 'When the discussion changed or added to the requirement, write the complete revised requirement in revisedGoal (it must be able to replace the original, acceptance criteria included; coding and review go by it); without changes, leave revisedGoal out.' : 'There has been no discussion with the human yet, so do not write revisedGoal: if the requirement should change, ask first.'}
@@ -448,7 +512,7 @@ End your last reply with a JSON code block:
 {"verdict": "ask", "summary": "your assessment", "questions": ["a question or concern"], "suggestions": ["how to change it"]}
 \`\`\`
 `,
-  });
+  })}`;
 }
 
 /**

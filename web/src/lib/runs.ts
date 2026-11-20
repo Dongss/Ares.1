@@ -1,9 +1,13 @@
 import type { RunDetail, RunSummary } from '../../../src/api/types.js';
 import { brandTitle } from '../../../src/brand.js';
+import { replyTimeoutHours } from '../../../src/config/flow.js';
 import {
   conclusionLabel,
   conclusionOf,
   formatAssessment,
+  formatReplyTimeout,
+  pendingTimeout,
+  replyDeadline,
   verdictLabel,
 } from '../../../src/engine/discussion.js';
 import { t } from '../../../src/i18n.js';
@@ -213,7 +217,31 @@ export function assessmentHeadline(
   if (FINISHED_RUN_STATUSES.includes(run.status)) {
     return { label: t({ zh: '没有结论', en: 'No conclusion' }), tone: 'muted', conclusion: null };
   }
+  if (pendingTimeout(run.discussion)) {
+    return {
+      label: t({
+        zh: '没人回复，评估自己决定中',
+        en: 'Nobody replied; the assessment is deciding on its own',
+      }),
+      tone: 'active',
+      conclusion: null,
+    };
+  }
   return { label: t({ zh: '重新评估中', en: 'Reassessing' }), tone: 'active', conclusion: null };
+}
+
+/**
+ * When a Run waiting for a reply to the assessment's questions stops waiting and the assessment
+ * decides on its own, in epoch milliseconds, as the engine computes it; null when it is not
+ * waiting, or waits however long it takes.
+ */
+export function replyDeadlineOf(detail: Pick<RunDetail, 'run' | 'stageRuns'>): number | null {
+  const { run } = detail;
+  const info = run.blocked;
+  if (run.status !== 'blocked' || info?.kind !== 'discussion') return null;
+  const stageId = detail.stageRuns.find((sr) => sr.id === info.stageRunId)?.stageId;
+  const def = run.template.stages.find((s) => s.id === stageId);
+  return def ? replyDeadline(run.discussion, replyTimeoutHours(def)) : null;
 }
 
 export interface DiscussionItem {
@@ -238,6 +266,9 @@ export function discussionItems(discussion: readonly DiscussionEntry[]): Discuss
         text: e.text,
         at: e.at,
       };
+    }
+    if (e.role === 'timeout') {
+      return { ...formatReplyTimeout(e), tone: 'muted', at: e.at };
     }
     round++;
     const what =

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { TemplateSchema } from '../../../src/config/schema.js';
 import { setLang } from '../../../src/i18n.js';
 import type { StageRun } from '../../../src/store/types.js';
-import { buildFlow, FLOW_STATUS, stageProgress } from './flow.js';
+import { assessInDoubt, buildFlow, FLOW_STATUS, stageProgress } from './flow.js';
 
 const template = TemplateSchema.parse({
   id: 'dev',
@@ -232,6 +232,43 @@ describe('assess stages', () => {
       agents,
     });
     expect(gated[0]?.onReject).toEqual({ id: 'assess', name: '需求评估' });
+  });
+
+  it('say how long they wait for a reply before deciding on their own', () => {
+    const waiting = (reply_timeout_hours?: number | null) =>
+      buildFlow({
+        template: TemplateSchema.parse({
+          id: 'a',
+          stages: [
+            { id: 'assess', kind: 'assess', agent: 'reviewer', reply_timeout_hours },
+            { id: 'code', agent: 'coder', inputs: ['assessment'] },
+          ],
+        }),
+        repoVerifyCommands: [],
+        agents,
+      });
+    expect(waiting().map((s) => s.replyTimeoutHours)).toEqual([24, null]);
+    expect(waiting(0)[0]?.replyTimeoutHours).toBe(0);
+    expect(waiting(null)[0]?.replyTimeoutHours).toBeNull();
+
+    expect(assessInDoubt(24)).toBe(
+      '在 issue 或 Run 详情页讨论，回复后重新评估；你同意不做时 Run 结束。24 小时内没人回复时由评估自己决定：写明假设后开工，或者不做',
+    );
+    expect(assessInDoubt(null)).toBe(
+      '在 issue 或 Run 详情页讨论，回复后重新评估；你同意不做时 Run 结束',
+    );
+    expect(assessInDoubt(0)).toBe('不等人回复：评估自己决定，写明假设后开工，或者不做');
+  });
+
+  it('say so in English', () => {
+    setLang('en');
+    try {
+      expect(assessInDoubt(1)).toContain('If nobody replies within 1 hour, the assessment decides');
+      expect(assessInDoubt(0.25)).toContain('within 15 minutes');
+      for (const hours of [24, 0, null]) expect(assessInDoubt(hours)).not.toMatch(/[一-鿿]/);
+    } finally {
+      setLang('zh');
+    }
   });
 });
 

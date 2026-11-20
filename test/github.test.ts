@@ -778,12 +778,10 @@ describe('issues: requirement assessment', () => {
     await t.master.issues.poll();
     const completed = await t.waitStatus(run.id, 'completed');
     expect(assessorCalls(t)).toHaveLength(2);
-    expect(completed.discussion.map((e) => (e.role === 'human' ? e.source : e.verdict))).toEqual([
-      'ask',
-      'issue',
-      'issue',
-      'go',
-    ]);
+    const kinds = completed.discussion.map((e) =>
+      e.role === 'human' ? e.source : e.role === 'assessor' ? e.verdict : e.role,
+    );
+    expect(kinds).toEqual(['ask', 'issue', 'issue', 'go']);
 
     await t.master.issues.sync();
     expect(issue.state).toBe('closed');
@@ -1093,14 +1091,44 @@ describe('issues: texts', () => {
       at: '2026-11-19T00:00:00.000Z',
       ...patch,
     });
-    const dc = { dashboardUrl: 'http://127.0.0.1:4870', runId: 'run_1', pollMinutes: 5 };
-    expect(discussionComment(entry({ verdict: 'ask', questions: ['Q'] }), dc)).toContain(
-      '每 5 分钟',
+    const dc = {
+      dashboardUrl: 'http://127.0.0.1:4870',
+      runId: 'run_1',
+      pollMinutes: 5,
+      replyTimeoutHours: 24,
+    };
+    const asked = discussionComment(entry({ verdict: 'ask', questions: ['Q'] }), dc);
+    expect(asked).toContain('每 5 分钟');
+    // How long the questions wait, and what happens then.
+    expect(asked).toContain('24 小时内没有人回复的话，评估会自己决定');
+    const forever = { ...dc, replyTimeoutHours: null };
+    expect(discussionComment(entry({ verdict: 'ask', questions: ['Q'] }), forever)).not.toContain(
+      '没有人回复',
     );
+    const noWait = discussionComment(entry({ verdict: 'ask', questions: ['Q'] }), {
+      ...dc,
+      replyTimeoutHours: 0,
+    });
+    expect(noWait).toContain('不等回复，评估接着自己决定');
+    expect(noWait).not.toContain('直接在这个 issue 下回复就行');
     expect(discussionComment(entry({ revisedGoal: '新需求' }), dc)).toContain(
       '需求评估结论：按讨论后修改的需求开工',
     );
     expect(discussionComment(entry({ verdict: 'drop' }), dc)).toContain('需求评估结论：不做');
+    // Nobody replied in time: said on the issue, and the conclusion says the assessment decided.
+    const timeout = { role: 'timeout', hours: 24, at: '' } as const;
+    expect(discussionComment(timeout, dc)).toContain(
+      '### 需求评估：24 小时内没有人回复，由评估自己决定',
+    );
+    expect(discussionComment({ ...timeout, hours: 0 }, dc)).toContain(
+      '### 需求评估：不等回复，由评估自己决定',
+    );
+    expect(discussionComment(entry({ decidedAlone: true }), dc)).toContain(
+      '### 需求评估结论：没人回复，按评估的假设开工',
+    );
+    const droppedAlone = discussionComment(entry({ verdict: 'drop', decidedAlone: true }), dc);
+    expect(droppedAlone).toContain('### 需求评估结论：没人回复，评估决定不做');
+    expect(droppedAlone).toContain('理由：理由');
     const reply = { role: 'human', text: 'x', at: '' } as const;
     expect(discussionComment({ ...reply, source: 'issue' }, dc)).toBeNull();
     expect(discussionComment({ ...reply, source: 'dashboard' }, dc)).toContain('> x');

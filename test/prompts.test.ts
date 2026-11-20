@@ -11,6 +11,7 @@ import {
   taskPrompt,
 } from '../src/engine/prompts.js';
 import { setLang } from '../src/i18n.js';
+import type { AssessmentEntry, ReplyTimeoutEntry } from '../src/store/types.js';
 
 const ctx = (stage: Partial<StageDef> = {}): PromptContext => ({
   goal: '添加 feature.txt',
@@ -114,6 +115,56 @@ describe('prompts', () => {
     expect(prompt).toContain('不要要求扩大改动范围');
     expect(prompt).toContain('summary 和每条问题的 description 都用中文书写');
   });
+
+  const asked: AssessmentEntry = {
+    role: 'assessor',
+    verdict: 'ask',
+    summary: '范围不清',
+    questions: ['改哪些页面？'],
+    suggestions: [],
+    revisedGoal: null,
+    proposedDrop: false,
+    stageRunId: 'sr',
+    at: '2026-11-20T00:00:00Z',
+  };
+  const timeout: ReplyTimeoutEntry = { role: 'timeout', hours: 24, at: '2026-11-21T00:00:00Z' };
+
+  it('asks the round after nobody replied to decide on its own: go with assumptions, or drop', () => {
+    const prompt = assessPrompt(ctx({ id: 'assess', kind: 'assess' }), [asked, timeout], null);
+    expect(prompt).toContain('### 第 1 轮评估：需要讨论');
+    expect(prompt).toContain('改哪些页面？');
+    expect(prompt).toContain('### 24 小时内没有人回复');
+    expect(prompt).toContain('上面的疑问 24 小时内没有人回复，这一轮由你自己决定，不能再给 ask');
+    expect(prompt).toContain('逐条写明你对之前的疑问做了哪些假设');
+    expect(prompt).toContain('drop（不做）：认为不该做时给出，summary 写明理由');
+    expect(prompt).toContain('不要写 revisedGoal');
+    expect(prompt).toContain('{"verdict": "go"');
+    expect(prompt).not.toContain('verdict 三选一');
+    // A stage that does not wait says so instead.
+    const noWait = assessPrompt(
+      ctx({ id: 'assess', kind: 'assess' }),
+      [asked, { ...timeout, hours: 0 }],
+      null,
+    );
+    expect(noWait).toContain('这个阶段不等人回复，这一轮由你自己决定');
+    // While the questions still wait for a reply, the usual three verdicts apply.
+    expect(assessPrompt(ctx({ id: 'assess', kind: 'assess' }), [asked], null)).toContain(
+      'verdict 三选一',
+    );
+  });
+
+  it('carries the timeout into the assessment artifact of a go decided alone', () => {
+    const go: AssessmentEntry = {
+      ...asked,
+      verdict: 'go',
+      summary: '假设只改首页',
+      questions: [],
+      decidedAlone: true,
+    };
+    const text = assessmentArtifact(go, [asked, timeout]);
+    expect(text.startsWith('需求评估结论：没人回复，按评估的假设开工\n\n假设只改首页')).toBe(true);
+    expect(text).toContain('#### 24 小时内没有人回复');
+  });
 });
 
 describe('commitMessage', () => {
@@ -170,6 +221,11 @@ describe('prompts in English', () => {
         [{ role: 'human', text: 'yes, do it', source: 'issue', at: '2026-11-20T00:00:00Z' }],
         null,
       ),
+      assessAlone: assessPrompt(
+        enCtx({ id: 'assess', kind: 'assess' }),
+        [{ role: 'timeout', hours: 2, at: '2026-11-20T00:00:00Z' }],
+        'asked again',
+      ),
     };
     for (const [name, prompt] of Object.entries(prompts)) {
       expect(prompt, name).not.toMatch(CJK);
@@ -181,6 +237,11 @@ describe('prompts in English', () => {
       'Write summary, questions, suggestions and revisedGoal in English.',
     );
     expect(prompts.assess).toContain('the goals in the README are the basis');
+    expect(prompts.assessAlone).toContain('### Nobody replied within 2 hours');
+    expect(prompts.assessAlone).toContain(
+      'Nobody replied to the questions above within 2 hours, so you decide this round on your own, and ask is not allowed.',
+    );
+    expect(prompts.assessAlone).toContain('Write summary in English.');
   });
 
   it('reports result problems and review issues in English, still parsed back', () => {

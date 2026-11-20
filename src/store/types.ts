@@ -11,7 +11,10 @@ export type RunStatus =
   | 'completed'
   | 'failed'
   | 'cancelled'
-  /** Ended by the requirement assessment: a human agreed not to do it. Not a failure. */
+  /**
+   * Ended by the requirement assessment: a human agreed not to do it, or nobody replied to its
+   * questions in time and it concluded not to. Not a failure.
+   */
   | 'dropped';
 
 export const FINISHED_RUN_STATUSES: readonly RunStatus[] = [
@@ -57,7 +60,10 @@ export type BlockKind =
   | 'workspace'
   /** The Run's cost reached its budget before starting another agent execution. */
   | 'budget'
-  /** The requirement assessment has questions; waits for a human's reply. */
+  /**
+   * The requirement assessment has questions; waits for a human's reply, at most the assess
+   * stage's `reply_timeout_hours`.
+   */
   | 'discussion'
   | 'error';
 
@@ -122,7 +128,8 @@ export interface RunIssue {
 
 /**
  * What an assessment concluded. go: start the work; ask: questions for a human first (also when
- * it thinks the requirement should not be done); drop: not doing it, only after a human agreed.
+ * it thinks the requirement should not be done); drop: not doing it, only after a human agreed or
+ * after nobody replied to the questions in time.
  */
 export type AssessVerdict = 'go' | 'ask' | 'drop';
 
@@ -131,7 +138,7 @@ export interface AssessmentEntry {
   role: 'assessor';
   /** As the Master took it: a drop before any human reply counts as ask. */
   verdict: AssessVerdict;
-  /** Opinion (go), what is unclear (ask), why not (drop). */
+  /** Opinion and the assumptions it made (go), what is unclear (ask), why not (drop). */
   summary: string;
   /** Questions and concerns a human should answer (ask). */
   questions: string[];
@@ -141,6 +148,11 @@ export interface AssessmentEntry {
   revisedGoal: string | null;
   /** The agent said drop before any human reply; a human is asked to confirm instead. */
   proposedDrop: boolean;
+  /**
+   * Concluded on its own after nobody replied to the questions in time: go on the assumptions in
+   * `summary`, or drop. Missing in entries recorded before replies could time out.
+   */
+  decidedAlone?: boolean;
   stageRunId: string;
   at: string;
 }
@@ -154,7 +166,18 @@ export interface ReplyEntry {
   at: string;
 }
 
-export type DiscussionEntry = AssessmentEntry | ReplyEntry;
+/**
+ * Nobody replied to the assessment's questions within the assess stage's `reply_timeout_hours`:
+ * the next round decides on its own (go with its assumptions, or drop).
+ */
+export interface ReplyTimeoutEntry {
+  role: 'timeout';
+  /** The configured wait, in hours; 0 = the stage does not wait for replies. */
+  hours: number;
+  at: string;
+}
+
+export type DiscussionEntry = AssessmentEntry | ReplyEntry | ReplyTimeoutEntry;
 
 export type ScoutStatus = 'running' | 'completed' | 'failed' | 'interrupted';
 

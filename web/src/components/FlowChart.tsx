@@ -3,6 +3,7 @@ import { runsNoCommands } from '../../../src/config/flow.js';
 import { t } from '../../../src/i18n.js';
 import {
   type AgentConfigState,
+  assessInDoubt,
   FLOW_STATUS,
   type FlowProgress,
   type FlowStage,
@@ -151,10 +152,7 @@ function FlowStageBody({ stage, progress }: { stage: FlowStage; progress?: FlowP
       )}
       {stage.kind === 'assess' && (
         <Line label={t({ zh: '有疑问', en: 'In doubt' })}>
-          {t({
-            zh: '在 issue 或 Run 详情页讨论，回复后重新评估；你同意不做时 Run 结束',
-            en: 'Discuss on the issue or the Run page and reassess after each reply; the Run ends if you agree to drop it',
-          })}
+          {assessInDoubt(stage.replyTimeoutHours)}
         </Line>
       )}
       {stage.onFail && <Line label={failLabel()}>{backTo(stage.onFail.name)}</Line>}

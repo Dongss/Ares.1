@@ -10,6 +10,7 @@ import {
   groupRuns,
   pageTitle,
   patchLineClass,
+  replyDeadlineOf,
   splitPatch,
   workspaceLines,
 } from './runs.js';
@@ -250,5 +251,85 @@ describe('requirement assessment', () => {
     ]);
     expect(items[0]?.text).toContain('疑问和顾虑：\n1. 写什么？');
     expect(items[2]?.text).toContain('修改后的需求：\n\n新需求');
+  });
+
+  const timeout: DiscussionEntry = { role: 'timeout', hours: 24, at };
+  const alone = assessed({
+    verdict: 'go',
+    summary: '假设写 ok',
+    questions: [],
+    decidedAlone: true,
+  });
+
+  it('shows that nobody replied in time and the assessment decided on its own', () => {
+    const items = discussionItems([assessed({}), timeout, alone]);
+    expect(items.map((i) => i.title)).toEqual([
+      '第 1 轮评估：需要讨论',
+      '24 小时内没有人回复',
+      '第 2 轮评估：没人回复，按评估的假设开工',
+    ]);
+    expect(items[1]).toMatchObject({ tone: 'muted', at });
+    expect(items[1]?.text).toContain('下一轮由评估自己决定');
+    expect(discussionItems([assessed({}), { ...timeout, hours: 0 }])[1]?.title).toBe('不等人回复');
+
+    const headline = (discussion: DiscussionEntry[], status: RunSummary['status'] = 'running') =>
+      assessmentHeadline({ discussion, status, blocked: null });
+    expect(headline([assessed({}), timeout])).toMatchObject({
+      label: '没人回复，评估自己决定中',
+      tone: 'active',
+    });
+    expect(headline([assessed({}), timeout, alone])?.label).toBe(
+      '结论：没人回复，按评估的假设开工',
+    );
+    expect(
+      headline(
+        [assessed({}), timeout, assessed({ verdict: 'drop', decidedAlone: true })],
+        'dropped',
+      )?.label,
+    ).toBe('结论：没人回复，评估决定不做');
+  });
+
+  it('works out when a Run waiting for a reply stops waiting, as the engine does', () => {
+    const detail = (
+      reply_timeout_hours: number | null | undefined,
+      discussion: DiscussionEntry[],
+    ) =>
+      ({
+        run: {
+          ...run('r', 'blocked'),
+          blocked: { kind: 'discussion', message: '', taskId: 't', stageRunId: 'sr' },
+          discussion,
+          template: {
+            id: 'dev',
+            stages: [{ id: 'assess', kind: 'assess', reply_timeout_hours }],
+          },
+        },
+        stageRuns: [{ id: 'sr', stageId: 'assess' }],
+      }) as unknown as Parameters<typeof replyDeadlineOf>[0];
+    const asked = Date.parse(at);
+    expect(replyDeadlineOf(detail(undefined, [assessed({})]))).toBe(asked + 24 * 3_600_000);
+    expect(replyDeadlineOf(detail(0.5, [assessed({})]))).toBe(asked + 1_800_000);
+    expect(replyDeadlineOf(detail(null, [assessed({})]))).toBeNull();
+    // Not waiting on these questions any more: a reply or a timeout came after them.
+    expect(replyDeadlineOf(detail(24, [assessed({}), reply]))).toBeNull();
+    const notBlocked = detail(24, [assessed({})]);
+    notBlocked.run.status = 'running';
+    expect(replyDeadlineOf(notBlocked)).toBeNull();
+  });
+
+  it('words the timeout in English', () => {
+    setLang('en');
+    try {
+      const items = discussionItems([assessed({}), { ...timeout, hours: 1 }, alone]);
+      expect(items[1]?.title).toBe('Nobody replied within 1 hour');
+      expect(items[2]?.title).toBe(
+        "Assessment round 2: Go ahead on the assessment's assumptions, as nobody replied",
+      );
+      // The assessment's own summary stays as the agent wrote it.
+      const words = `${items[1]?.title}${items[1]?.text}${items[2]?.title}`;
+      expect(words).not.toMatch(/[一-鿿]/);
+    } finally {
+      setLang('zh');
+    }
   });
 });

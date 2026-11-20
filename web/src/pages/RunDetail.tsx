@@ -44,6 +44,7 @@ import {
   assessmentHeadline,
   canCleanUpWorkspace,
   discussionItems,
+  replyDeadlineOf,
   workspaceLines,
 } from '../lib/runs.js';
 
@@ -497,6 +498,7 @@ function DiscussionPanel({ detail, onChanged }: { detail: RunDetail; onChanged: 
   const [reply, setReply] = useState('');
   const action = useAction();
   if (!run.blocked) return null;
+  const deadline = replyDeadlineOf(detail);
   const send = async () => {
     const result = await action.run(() => api.retry(run.id, { note: reply.trim() }));
     if (result) {
@@ -527,6 +529,11 @@ function DiscussionPanel({ detail, onChanged }: { detail: RunDetail; onChanged: 
           zh: '同意不做也请回复说明，评估会给出「不做」的结论，Run 结束（不算失败）。',
           en: 'If you agree not to do it, say so too: the assessment concludes "drop" and the Run ends (not as a failure).',
         })}
+        {deadline !== null &&
+          t({
+            zh: `到 ${formatTime(new Date(deadline).toISOString())} 还没有人回复的话，评估会自己决定：写明做了哪些假设后开工，或者给出不做的结论。`,
+            en: ` If nobody replies by ${formatTime(new Date(deadline).toISOString())}, the assessment decides on its own: it goes ahead with its assumptions written down, or concludes not to do it.`,
+          })}
       </p>
       <label className="field">
         <span>

@@ -15,6 +15,7 @@ import {
   failTarget,
   type RunOverrides,
   RunOverridesSchema,
+  replyTimeoutHours,
   rollbackTarget,
   stageVerifyCommands,
 } from '../config/schema.js';
@@ -26,6 +27,7 @@ import {
   type DiscussionEntry,
   FINISHED_RUN_STATUSES,
   type ReplyEntry,
+  type ReplyTimeoutEntry,
   type Run,
   type RunIssue,
   type RunStatus,
@@ -62,7 +64,13 @@ import {
   TASK_REPORT_JSON_SCHEMA,
   TaskReportSchema,
 } from './contracts.js';
-import { formatAssessment, takeAssessment } from './discussion.js';
+import {
+  assessmentProblem,
+  formatAssessment,
+  replyDeadline,
+  takeAssessment,
+  waitText,
+} from './discussion.js';
 import {
   assessmentArtifact,
   assessPrompt,
@@ -78,7 +86,15 @@ export interface EngineDeps {
   paths: HomePaths;
   config: () => LoadedConfig;
   adapters: ReadonlyMap<string, AgentAdapter>;
+  /** The current time in epoch milliseconds (tests move it on); default Date.now. */
+  now?: () => number;
 }
+
+/**
+ * The longest single wait for the next reply timeout: a deadline days away is checked again on
+ * the way, so a sleeping machine or a changed clock is caught up with soon after.
+ */
+const MAX_REPLY_TIMER_MS = 3_600_000;
 
 /** Where an attempt's normalized events are kept (one JSON record per line), next to its raw log. */
 export function attemptEventsPath(logPath: string): string {
@@ -148,10 +164,14 @@ export class Engine {
   private holding = false;
   /** Workspace cleanups in progress, by Run id; a second request joins the first. */
   private readonly cleanups = new Map<string, Promise<Run>>();
+  /** Wakes `checkReplyTimeouts` at the next discussion's deadline. */
+  private replyTimer: ReturnType<typeof setTimeout> | undefined;
   private readonly store: Store;
+  private readonly now: () => number;
 
   constructor(private readonly deps: EngineDeps) {
     this.store = deps.store;
+    this.now = deps.now ?? Date.now;
   }
 
   private get cfg(): LoadedConfig {
@@ -179,12 +199,16 @@ export class Engine {
       await this.discardInFlight(this.store.getRun(run.id));
       this.requeueHead(run.id, 'run.recovered');
     }
+    // Discussions may have timed out while the Master was not running.
+    this.checkReplyTimeouts();
     this.kick();
   }
 
   /** Graceful shutdown: stop the active agent like a manual pause and requeue its Run. */
   async stop(): Promise<void> {
     this.stopping = true;
+    clearTimeout(this.replyTimer);
+    this.replyTimer = undefined;
     const active = this.active;
     if (!active) return;
     await this.interrupt();
@@ -254,7 +278,10 @@ export class Engine {
    */
   setWorking(on: boolean): boolean {
     if (this.store.working !== on) this.store.setWorking(on);
-    if (on) this.kick();
+    if (on) {
+      this.checkReplyTimeouts();
+      this.kick();
+    }
     return this.store.working;
   }
 
@@ -530,6 +557,82 @@ export class Engine {
     });
     this.kick();
     return this.store.getRun(runId);
+  }
+
+  /**
+   * Discussions nobody replied to within their assess stage's `reply_timeout_hours`: each goes
+   * back to the assessment, which then decides on its own. Not while the work switch is off (the
+   * Run could not go on anyway, and a human may still reply); switching it on checks again.
+   * Schedules itself for the next deadline. Returns the Runs that timed out.
+   */
+  checkReplyTimeouts(): string[] {
+    clearTimeout(this.replyTimer);
+    this.replyTimer = undefined;
+    if (this.stopping) return [];
+    const now = this.now();
+    const timedOut: string[] = [];
+    let next: number | undefined;
+    for (const run of this.store.listRuns({ status: 'blocked' })) {
+      const wait = this.replyWait(run);
+      if (!wait) continue;
+      if (wait.deadline > now) next = Math.min(next ?? wait.deadline, wait.deadline);
+      else if (this.store.working && this.timeOutDiscussion(run.id, now)) timedOut.push(run.id);
+    }
+    if (next !== undefined) {
+      const timer = setTimeout(
+        () => this.checkReplyTimeouts(),
+        Math.min(next - now, MAX_REPLY_TIMER_MS),
+      );
+      timer.unref();
+      this.replyTimer = timer;
+    }
+    if (timedOut.length > 0) this.kick();
+    return timedOut;
+  }
+
+  /** When a Run blocked on a discussion stops waiting for a reply; null = it waits for one. */
+  private replyWait(run: Run): { deadline: number; hours: number } | null {
+    const info = run.blocked;
+    if (run.status !== 'blocked' || info?.kind !== 'discussion' || !info.stageRunId) return null;
+    const { stageId } = this.store.getStageRun(info.stageRunId);
+    const def = run.template.stages.find((s) => s.id === stageId);
+    const hours = def ? replyTimeoutHours(def) : null;
+    const deadline = replyDeadline(run.discussion, hours);
+    return hours === null || deadline === null ? null : { deadline, hours };
+  }
+
+  /**
+   * Nobody replied in time: record it in the discussion and run the assessment again, in one
+   * transaction. Nothing changes when the Run was replied to, retried or cancelled meanwhile.
+   */
+  private timeOutDiscussion(runId: string, now: number): boolean {
+    return this.store.tx(() => {
+      const run = this.store.getRun(runId);
+      const wait = this.replyWait(run);
+      if (!wait || wait.deadline > now) return false;
+      this.resumeAlone(run, wait.hours, run.blocked?.taskId);
+      this.requeueHead(runId, 'run.resumed');
+      return true;
+    });
+  }
+
+  /**
+   * Add a timeout to the discussion and make the assessment task run again: the next round
+   * decides on its own. Part of the caller's transaction.
+   */
+  private resumeAlone(run: Run, hours: number, taskId: string | undefined): void {
+    const entry: ReplyTimeoutEntry = { role: 'timeout', hours, at: nowIso() };
+    this.store.updateRun(run.id, { discussion: [...run.discussion, entry] });
+    if (taskId) {
+      this.store.updateTask(taskId, {
+        status: 'pending',
+        retries: 0,
+        sessionId: null,
+        sessionAgentId: null,
+        pendingFeedback: null,
+      });
+    }
+    this.store.event(run.id, 'discussion.timed_out', { hours });
   }
 
   /**
@@ -1234,8 +1337,10 @@ export class Engine {
   /**
    * Requirement assessment: a read-only agent judges the goal and answers go / ask / drop.
    * go: the task passes, the stage passes (or waits for its approval). ask: the Run blocks until a
-   * human replies (`reply`), then the task runs again with the discussion. drop (only after a
-   * human reply): the Run ends as dropped.
+   * human replies (`reply`), then the task runs again with the discussion; when nobody replies
+   * within the stage's `reply_timeout_hours` (`checkReplyTimeouts`; right away for 0) the task
+   * runs again to decide on its own, go or drop. drop (only after a human reply or a timeout):
+   * the Run ends as dropped.
    */
   private async runAssessTask(
     run: Run,
@@ -1268,8 +1373,11 @@ export class Engine {
     if (!report.ok) {
       return this.rework(run, eff, task, attempt, formatFeedback(report.error));
     }
+    const problem = assessmentProblem(report.value, run.discussion);
+    if (problem) return this.rework(run, eff, task, attempt, problem);
     const entry = takeAssessment(report.value, run.discussion, { stageRunId: sr.id, at: nowIso() });
     const detail = formatAssessment(entry);
+    const waitHours = replyTimeoutHours(eff.def);
     this.store.tx(() => {
       this.saveArtifact(
         run,
@@ -1293,9 +1401,17 @@ export class Engine {
         verdict: entry.verdict,
         proposedDrop: entry.proposedDrop,
         revised: entry.revisedGoal !== null,
+        ...(entry.decidedAlone ? { decidedAlone: true } : {}),
       });
+      if (entry.verdict === 'ask' && waitHours === 0) {
+        // The stage does not wait for replies: the next round decides on its own right away,
+        // without blocking (nobody is asked to reply).
+        this.resumeAlone(this.store.getRun(run.id), 0, task.id);
+        return;
+      }
       if (entry.verdict === 'ask') {
-        // Runs again once a human replied; the discussion carries everything it needs.
+        // Runs again once a human replied, or nobody did in time; the discussion carries
+        // everything it needs.
         this.store.updateTask(task.id, {
           status: 'pending',
           retries: 0,
@@ -1303,14 +1419,21 @@ export class Engine {
           sessionAgentId: null,
           pendingFeedback: null,
         });
+        const timeout =
+          waitHours === null
+            ? ''
+            : t({
+                zh: `\n\n${waitText(waitHours)}内没有人回复的话，评估会自己决定：写明做了哪些假设后开工，或者给出不做的结论。`,
+                en: `\n\nIf nobody replies within ${waitText(waitHours)}, the assessment decides on its own: it goes ahead with its assumptions written down, or concludes not to do it.`,
+              });
         const message = entry.proposedDrop
           ? t({
-              zh: `需求评估认为不该做，请确认：\n\n${detail}\n\n回复后 Master 会带着讨论重新评估；同意不做也请回复说明。`,
-              en: `The requirement assessment thinks this should not be done; please confirm:\n\n${detail}\n\nAfter your reply the Master assesses again with the discussion; if you agree to drop it, reply saying so as well.`,
+              zh: `需求评估认为不该做，请确认：\n\n${detail}\n\n回复后 Master 会带着讨论重新评估；同意不做也请回复说明。${timeout}`,
+              en: `The requirement assessment thinks this should not be done; please confirm:\n\n${detail}\n\nAfter your reply the Master assesses again with the discussion; if you agree to drop it, reply saying so as well.${timeout}`,
             })
           : t({
-              zh: `需求评估有疑问，等你回复：\n\n${detail}\n\n回复后 Master 会带着讨论重新评估；同意不做也请回复说明。`,
-              en: `The requirement assessment has questions and waits for your reply:\n\n${detail}\n\nAfter your reply the Master assesses again with the discussion; if you agree to drop it, reply saying so as well.`,
+              zh: `需求评估有疑问，等你回复：\n\n${detail}\n\n回复后 Master 会带着讨论重新评估；同意不做也请回复说明。${timeout}`,
+              en: `The requirement assessment has questions and waits for your reply:\n\n${detail}\n\nAfter your reply the Master assesses again with the discussion; if you agree to drop it, reply saying so as well.${timeout}`,
             });
         this.block(run.id, {
           kind: 'discussion',
@@ -1323,12 +1446,15 @@ export class Engine {
       this.store.updateTask(task.id, { status: 'passed', pendingFeedback: null });
       // go: the next step passes the stage or asks for its approval.
       if (entry.verdict === 'drop') {
-        // A human agreed not to do it: no approval of this stage, the Run ends here, in the same
-        // transaction, so nothing can resume it into the next stage.
+        // A human agreed not to do it, or nobody replied in time and the assessment decided so:
+        // no approval of this stage, the Run ends here, in the same transaction, so nothing can
+        // resume it into the next stage.
         this.passStage(run, sr);
         this.setStatus(run.id, 'dropped', { queuePos: null, finishedAt: nowIso() });
       }
     });
+    // Wake up at the new discussion's deadline.
+    if (entry.verdict === 'ask' && waitHours) this.checkReplyTimeouts();
     // Nothing was done in the workspace.
     if (entry.verdict === 'drop') await this.removeMergedWorkspace(run);
   }

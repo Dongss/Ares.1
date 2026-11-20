@@ -2,6 +2,7 @@ import { agentEffort } from '../../../src/config/effort.js';
 import {
   effectiveStage,
   failTarget,
+  replyTimeoutHours,
   rollbackTarget,
   runsNoCommands,
   stageVerifyCommands,
@@ -12,6 +13,7 @@ import type {
   StageDef,
   WorkflowTemplate,
 } from '../../../src/config/schema.js';
+import { waitText } from '../../../src/engine/discussion.js';
 import { t } from '../../../src/i18n.js';
 import type { RunStatus, StageRun } from '../../../src/store/types.js';
 import type { Tone } from './format.js';
@@ -46,6 +48,11 @@ export interface FlowStage extends FlowStageRef {
   commandsFromRepo: boolean;
   /** How many times a task is reworked before a human is needed (agent stages). */
   maxRetries: number;
+  /**
+   * Assess stages: hours to wait for a reply to the questions before the assessment decides on
+   * its own (0 = no wait, null = however long it takes). null for other stages.
+   */
+  replyTimeoutHours: number | null;
   /** Needs a human approval: after the stage, or before merging for merge stages. */
   gate: boolean;
   /**
@@ -111,10 +118,34 @@ export function buildFlow({
       commands,
       commandsFromRepo: usesRepoDefault,
       maxRetries: eff.escalate.max_retries,
+      replyTimeoutHours: def.kind === 'assess' ? replyTimeoutHours(def) : null,
       gate: eff.gate,
       onFail: failsTo === null ? null : ref(failsTo),
       onReject: eff.gate ? ref(rollbackTarget(template, def.id, 'reject')) : null,
     };
+  });
+}
+
+/**
+ * What an assess stage does when it has questions: discuss with a human, and decide on its own
+ * once nobody replied within `replyTimeoutHours`.
+ */
+export function assessInDoubt(replyTimeoutHours: number | null): string {
+  const discuss = t({
+    zh: '在 issue 或 Run 详情页讨论，回复后重新评估；你同意不做时 Run 结束',
+    en: 'Discuss on the issue or the Run page and reassess after each reply; the Run ends if you agree to drop it',
+  });
+  if (replyTimeoutHours === null) return discuss;
+  if (replyTimeoutHours === 0) {
+    return t({
+      zh: '不等人回复：评估自己决定，写明假设后开工，或者不做',
+      en: 'No wait for replies: the assessment decides on its own, going ahead on written-down assumptions or dropping it',
+    });
+  }
+  const wait = waitText(replyTimeoutHours);
+  return t({
+    zh: `${discuss}。${wait}内没人回复时由评估自己决定：写明假设后开工，或者不做`,
+    en: `${discuss}. If nobody replies within ${wait}, the assessment decides on its own: it goes ahead on written-down assumptions, or drops it`,
   });
 }
 

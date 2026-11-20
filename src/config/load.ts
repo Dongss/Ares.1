@@ -523,6 +523,17 @@ export function validateTemplate(
     }
   }
 
+  // Only an assessment asks a human questions, so only it waits for replies.
+  for (const s of tpl.stages) {
+    if (s.kind === 'assess' || s.reply_timeout_hours === undefined) continue;
+    warnings.push(
+      t({
+        zh: `阶段 ${s.id}：reply_timeout_hours 只对需求评估阶段（kind: assess）有效，这里不起作用`,
+        en: `Stage ${s.id}: reply_timeout_hours only applies to assess stages (kind: assess) and has no effect here`,
+      }),
+    );
+  }
+
   // switch_agent needs candidate agents, not implemented yet: the engine treats it as
   // "human". Only a warning, so existing templates that use it stay usable.
   if (tpl.defaults?.escalate?.on_agent_error === 'switch_agent') {

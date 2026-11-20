@@ -186,6 +186,12 @@ export const StageSchema = z.strictObject({
   on_fail: z.string().optional(),
   on_reject: z.string().optional(),
   timeout_minutes: z.number().positive().optional(),
+  /**
+   * assess stages: how many hours to wait for a human to reply to the questions before the
+   * assessment decides on its own (go with its assumptions, or drop). 0 = do not wait; null =
+   * wait however long it takes; omitted = the system default (`replyTimeoutHours`).
+   */
+  reply_timeout_hours: z.number().min(0).nullable().optional(),
 });
 export type StageDef = z.infer<typeof StageSchema>;
 
@@ -270,6 +276,7 @@ export {
   effectiveMaxLoops,
   effectiveStage,
   failTarget,
+  replyTimeoutHours,
   rollbackTarget,
   SYSTEM_DEFAULTS,
   stageVerifyCommands,

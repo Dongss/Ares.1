@@ -158,6 +158,7 @@ stages:
     name: 需求评估
     kind: assess               # 只读地评估需求：go 开工；ask 在 issue / 看板上讨论；人同意后 drop 不做
     agent: claude-reviewer     # 以只读方式运行，要用支持只读的 CLI（claude-code）
+    reply_timeout_hours: 24    # 提出疑问后等人回复几小时，超时由评估自己决定（写明假设后开工，或者不做）；0 = 不等人；null = 一直等
 
   - id: implement
     name: 编码
@@ -205,6 +206,7 @@ stages:
     name: Requirement assessment
     kind: assess               # judges the requirement read-only: go starts; ask discusses on the issue / dashboard; drop (once a human agrees) skips it
     agent: claude-reviewer     # runs read-only, so it needs a CLI that supports that (claude-code)
+    reply_timeout_hours: 24    # hours to wait for a reply to its questions; then the assessment decides on its own (goes ahead on written-down assumptions, or drops it); 0 = no wait; null = wait forever
 
   - id: implement
     name: Coding

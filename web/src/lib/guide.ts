@@ -1,5 +1,6 @@
 import type { ConfigView, GitHubRepoStatus, UpgradeStatus } from '../../../src/api/types.js';
 import { effectiveBudget, issueRunOverrides } from '../../../src/config/flow.js';
+import { waitText } from '../../../src/engine/discussion.js';
 import { join, t } from '../../../src/i18n.js';
 import { NOTICE_KINDS, type NoticeKind } from '../../../src/notify/notice.js';
 import { buildFlow, type FlowStage } from './flow.js';
@@ -432,10 +433,24 @@ export function runStages(
     }
     if (s.kind === 'assess') {
       const agent = s.agent?.id ?? noAgent;
-      const work = t({
-        zh: `${agent} 只读评估需求：合理就开工；有疑问在 issue 上和你讨论，你同意不做时关闭 issue`,
-        en: `${agent} assesses the requirement read-only: if it makes sense, work starts; questions are discussed with you on the issue, and the issue is closed when you agree not to do it`,
-      });
+      const hours = s.replyTimeoutHours;
+      const alone =
+        hours === null
+          ? ''
+          : t({
+              zh: `${hours === 0 ? '不等人回复' : `${waitText(hours)}内没人回复`}就自己决定（写明假设后开工，或者不做）`,
+              en: `${hours === 0 ? 'without waiting for replies' : `if nobody replies within ${waitText(hours)}`} it decides on its own (going ahead on written-down assumptions, or dropping it)`,
+            });
+      const work =
+        hours === 0
+          ? t({
+              zh: `${agent} 只读评估需求：合理就开工；有疑问时${alone}`,
+              en: `${agent} assesses the requirement read-only: if it makes sense, work starts; with questions, ${alone}`,
+            })
+          : t({
+              zh: `${agent} 只读评估需求：合理就开工；有疑问在 issue 上和你讨论，你同意不做时关闭 issue${alone ? `；${alone}` : ''}`,
+              en: `${agent} assesses the requirement read-only: if it makes sense, work starts; questions are discussed with you on the issue, and the issue is closed when you agree not to do it${alone ? `; ${alone}` : ''}`,
+            });
       return s.gate
         ? {
             id,
@@ -653,8 +668,8 @@ function noticeHandling(kind: NoticeKind): string {
       });
     case 'discussion':
       return t({
-        zh: '看评估提出的疑问：来自 issue 的直接在 issue 上回复，也可以在 Run 详情页回复；回复后自动重新评估。同意不做也回复说明，评估会给出「不做」的结论',
-        en: 'Read the questions of the assessment: for a Run from an issue reply on the issue, or reply on the Run page; it is reassessed after your reply. To agree not to do it, reply saying so and the assessment concludes "drop"',
+        zh: '看评估提出的疑问：来自 issue 的直接在 issue 上回复，也可以在 Run 详情页回复；回复后自动重新评估。同意不做也回复说明，评估会给出「不做」的结论。等过评估阶段的 reply_timeout_hours 还没人回复，评估会自己决定',
+        en: 'Read the questions of the assessment: for a Run from an issue reply on the issue, or reply on the Run page; it is reassessed after your reply. To agree not to do it, reply saying so and the assessment concludes "drop". If nobody replies within the assess stage\'s reply_timeout_hours, the assessment decides on its own',
       });
     case 'blocked':
       return t({

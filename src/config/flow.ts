@@ -12,6 +12,8 @@ export const SYSTEM_DEFAULTS = {
     on_budget_exceeded: 'pause',
   } satisfies Required<Escalate>,
   max_loops: 3,
+  /** How long an assess stage waits for a reply to its questions when it does not say. */
+  reply_timeout_hours: 24,
 };
 
 export interface EffectiveStage {
@@ -50,6 +52,17 @@ export function effectiveStage(
 
 export function effectiveMaxLoops(template: WorkflowTemplate, overrides: RunOverrides): number {
   return overrides.max_loops ?? template.defaults?.max_loops ?? SYSTEM_DEFAULTS.max_loops;
+}
+
+/**
+ * How many hours an assess stage waits for a human to reply to its questions before the
+ * assessment decides on its own: the stage's `reply_timeout_hours`, else the system default.
+ * 0 = it does not wait; null = it waits however long it takes.
+ */
+export function replyTimeoutHours(def: StageDef): number | null {
+  return def.reply_timeout_hours === undefined
+    ? SYSTEM_DEFAULTS.reply_timeout_hours
+    : def.reply_timeout_hours;
 }
 
 /** The Run's budget in USD: run override → template default; undefined = no budget. */

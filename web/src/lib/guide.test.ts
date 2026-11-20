@@ -237,8 +237,36 @@ describe('the Run stages', () => {
       id: 'assess',
       name: '需求评估',
       actors: ['ai'],
-      note: 'claude-reviewer 只读评估需求：合理就开工；有疑问在 issue 上和你讨论，你同意不做时关闭 issue',
+      note: 'claude-reviewer 只读评估需求：合理就开工；有疑问在 issue 上和你讨论，你同意不做时关闭 issue；24 小时内没人回复就自己决定（写明假设后开工，或者不做）',
     });
+  });
+
+  it('words the assess stage after how long it waits for replies', () => {
+    const noteWith = (reply_timeout_hours: number | null) => {
+      const withAssess = TemplateSchema.parse({
+        ...template,
+        stages: [
+          {
+            id: 'assess',
+            name: '需求评估',
+            kind: 'assess',
+            agent: 'claude-reviewer',
+            reply_timeout_hours,
+          },
+          ...template.stages,
+        ],
+      });
+      const cfg = { ...config, templates: [withAssess] } as typeof config;
+      const i = { ...input(manualRepo), flow: issueFlow(cfg, manualRepo, ['npm test']) };
+      return runStages(i)?.[0]?.note;
+    };
+    expect(noteWith(null)).toBe(
+      'claude-reviewer 只读评估需求：合理就开工；有疑问在 issue 上和你讨论，你同意不做时关闭 issue',
+    );
+    expect(noteWith(0)).toBe(
+      'claude-reviewer 只读评估需求：合理就开工；有疑问时不等人回复就自己决定（写明假设后开工，或者不做）',
+    );
+    expect(noteWith(0.5)).toContain('30 分钟内没人回复就自己决定');
   });
 
   it('merges without approval with auto_merge, as the Master creates those Runs', () => {

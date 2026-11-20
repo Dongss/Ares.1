@@ -2,7 +2,7 @@
 
 import { brandName } from '../brand.js';
 import { RISKS, type Risk } from '../config/schema.js';
-import { conclusionLabel } from '../engine/discussion.js';
+import { conclusionLabel, waitText } from '../engine/discussion.js';
 import { groupedTimeParts, minutes, type RunTimes, timeParts } from '../engine/times.js';
 import { join, t } from '../i18n.js';
 import type { DiscussionEntry, Run, RunStatus, ScoutProposal } from '../store/types.js';
@@ -343,15 +343,20 @@ export interface DiscussionCommentContext {
   runId: string;
   /** How often the Master looks at GitHub, to say when a reply is picked up. */
   pollMinutes: number;
+  /**
+   * How long the assess stage of the entry waits for a reply (`replyTimeoutHours`), to say what
+   * happens when nobody replies; null = it waits however long it takes.
+   */
+  replyTimeoutHours: number | null;
 }
 
 const numbered = (items: string[]) => items.map((q, i) => `${i + 1}. ${q}`).join('\n');
 const bulleted = (items: string[]) => items.map((q) => `- ${q}`).join('\n');
 
 /**
- * How one discussion entry shows on the issue: the assessment's questions, its conclusion (the
- * 「需求评估结论」 comment), or a reply written on the dashboard. null for replies written on the
- * issue itself.
+ * How one discussion entry shows on the issue: the assessment's questions, nobody having replied
+ * in time, its conclusion (the 「需求评估结论」 comment), or a reply written on the dashboard. null
+ * for replies written on the issue itself.
  */
 export function discussionComment(
   entry: DiscussionEntry,
@@ -364,6 +369,26 @@ export function discussionComment(
       zh: `在看板上回复了需求评估：\n\n${quote(entry.text, 4000)}`,
       en: `Replied to the requirement assessment on the dashboard:\n\n${quote(entry.text, 4000)}`,
     });
+  }
+  if (entry.role === 'timeout') {
+    const head =
+      entry.hours === 0
+        ? t({
+            zh: '### 需求评估：不等回复，由评估自己决定',
+            en: '### Requirement assessment: not waiting for replies, the assessment decides',
+          })
+        : t({
+            zh: `### 需求评估：${waitText(entry.hours)}内没有人回复，由评估自己决定`,
+            en: `### Requirement assessment: nobody replied within ${waitText(entry.hours)}, the assessment decides`,
+          });
+    return [
+      head,
+      t({
+        zh: '按配置（`reply_timeout_hours`）不再等回复。评估接着自己决定：写明做了哪些假设后开工，或者给出不做的结论并写明理由。结论会发在这里。',
+        en: 'As configured (`reply_timeout_hours`), no longer waiting for replies. The assessment now decides on its own: it goes ahead with its assumptions written down, or concludes not to do it with the reasons. The conclusion is posted here.',
+      }),
+      link,
+    ].join('\n\n');
   }
   const parts: string[] = [];
   if (entry.verdict === 'ask') {
@@ -390,12 +415,30 @@ export function discussionComment(
         `${t({ zh: '**建议**', en: '**Suggestions**' })}\n\n${bulleted(entry.suggestions)}`,
       );
     }
-    parts.push(
-      t({
-        zh: `直接在这个 issue 下回复就行：Master 下次检查 GitHub 时（每 ${ctx.pollMinutes} 分钟）会带着讨论重新评估，讨论可以有多轮。${entry.proposedDrop ? '同意不做就回复说明，评估会给出不做的结论并关闭这个 issue；想继续做也请写明理由。' : '如果同意不做，也回复说明。'}`,
-        en: `Just reply on this issue: the next time the Master checks GitHub (every ${ctx.pollMinutes} min) it assesses again with the discussion, which can take several rounds. ${entry.proposedDrop ? 'If you agree not to do it, say so in a reply, and the assessment concludes with not doing it and closes this issue; to go ahead anyway, please give your reasons.' : 'If you agree not to do it, say so in a reply too.'}`,
-      }),
-    );
+    const hours = ctx.replyTimeoutHours;
+    if (hours === 0) {
+      parts.push(
+        t({
+          zh: '按配置（`reply_timeout_hours: 0`）不等回复，评估接着自己决定。',
+          en: 'As configured (`reply_timeout_hours: 0`), there is no wait for replies: the assessment decides on its own next.',
+        }),
+      );
+    } else {
+      parts.push(
+        t({
+          zh: `直接在这个 issue 下回复就行：Master 下次检查 GitHub 时（每 ${ctx.pollMinutes} 分钟）会带着讨论重新评估，讨论可以有多轮。${entry.proposedDrop ? '同意不做就回复说明，评估会给出不做的结论并关闭这个 issue；想继续做也请写明理由。' : '如果同意不做，也回复说明。'}`,
+          en: `Just reply on this issue: the next time the Master checks GitHub (every ${ctx.pollMinutes} min) it assesses again with the discussion, which can take several rounds. ${entry.proposedDrop ? 'If you agree not to do it, say so in a reply, and the assessment concludes with not doing it and closes this issue; to go ahead anyway, please give your reasons.' : 'If you agree not to do it, say so in a reply too.'}`,
+        }),
+      );
+      if (hours !== null) {
+        parts.push(
+          t({
+            zh: `${waitText(hours)}内没有人回复的话，评估会自己决定：写明做了哪些假设后开工，或者给出不做的结论。`,
+            en: `If nobody replies within ${waitText(hours)}, the assessment decides on its own: it goes ahead with its assumptions written down, or concludes not to do it.`,
+          }),
+        );
+      }
+    }
   } else {
     parts.push(
       t({ zh: '### 需求评估结论：', en: '### Requirement assessment conclusion: ' }) +

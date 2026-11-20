@@ -59,6 +59,8 @@ export interface MasterOptions {
   exit?: () => void;
   /** Send a system notification (tests replace it). */
   notice?: SendNotice;
+  /** The engine's clock for reply timeouts, in epoch milliseconds (tests move it on). */
+  now?: () => number;
   /**
    * Language of the default config files written on first start (the CLI passes the system's);
    * omitted = the default. After that, config.yaml's `language` is the one in use.
@@ -142,7 +144,7 @@ export class Master {
       readOnlyClis,
     );
     const config = () => watcher.current;
-    const engine = new Engine({ store, paths, config, adapters });
+    const engine = new Engine({ store, paths, config, adapters, now: opts.now });
     const issues = new IssueBridge({ store, engine, paths, config, adapters, github: opts.github });
     const notifier = new SystemNotifier(store, config, opts.notice);
     const installDir = opts.installDir ?? null;

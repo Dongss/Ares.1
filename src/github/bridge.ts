@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import type { AgentAdapter, AgentExecution } from '../adapters/types.js';
 import type { GitHubRepoStatus, GitHubStatus } from '../api/types.js';
 import { brandName } from '../brand.js';
-import { issueRunOverrides } from '../config/flow.js';
+import { issueRunOverrides, replyTimeoutHours } from '../config/flow.js';
 import { githubConfigKey, type HomePaths, type LoadedConfig } from '../config/load.js';
 import type { GitHubRepoConfig } from '../config/schema.js';
 import { type Engine, estimateCost, InvalidStateError } from '../engine/engine.js';
@@ -11,6 +11,7 @@ import { storedRunTimes } from '../engine/times.js';
 import { t } from '../i18n.js';
 import { NotFoundError, type Store } from '../store/store.js';
 import {
+  type DiscussionEntry,
   type EventRow,
   FINISHED_RUN_STATUSES,
   type Repo,
@@ -121,7 +122,12 @@ export class IssueBridge {
   private stopping = false;
   private readonly onEvent = (e: EventRow) => {
     // An assessment's result changes the discussion, not always the Run status (go keeps running).
-    if (e.type === 'run.status' || e.type === 'assess.result' || e.type === 'discussion.replied') {
+    if (
+      e.type === 'run.status' ||
+      e.type === 'assess.result' ||
+      e.type === 'discussion.replied' ||
+      e.type === 'discussion.timed_out'
+    ) {
       this.scheduleSync();
     }
     if (e.type === 'master.working' && e.data.on === true) void this.poll();
@@ -554,6 +560,16 @@ export class IssueBridge {
 
   /** Post the discussion entries the issue does not have yet, one comment each, in order. */
   private async syncDiscussion(run: Run, issue: RunIssue): Promise<void> {
+    if (run.issueDiscussionSynced >= run.discussion.length) return;
+    const stageOf = new Map(
+      this.deps.store.listStageRuns(run.id).map((sr) => [sr.id, sr.stageId] as const),
+    );
+    // How long the round's assess stage waits for a reply, as the engine reads it.
+    const waitOf = (entry: DiscussionEntry): number | null => {
+      if (entry.role !== 'assessor') return null;
+      const def = run.template.stages.find((s) => s.id === stageOf.get(entry.stageRunId));
+      return def ? replyTimeoutHours(def) : null;
+    };
     const ctx = {
       dashboardUrl: this.dashboardUrl(),
       runId: run.id,
@@ -562,7 +578,9 @@ export class IssueBridge {
     for (let i = run.issueDiscussionSynced; i < run.discussion.length; i++) {
       if (this.stopping) return;
       const entry = run.discussion[i];
-      const body = entry ? discussionComment(entry, ctx) : null;
+      const body = entry
+        ? discussionComment(entry, { ...ctx, replyTimeoutHours: waitOf(entry) })
+        : null;
       if (body) await this.comment(issue.repo, issue.number, body);
       this.deps.store.setIssueDiscussionSynced(run.id, i + 1);
     }

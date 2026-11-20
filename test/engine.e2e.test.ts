@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { InvalidStateError } from '../src/engine/engine.js';
 import { noticeFor } from '../src/notify/notice.js';
 import { NotFoundError } from '../src/store/store.js';
+import type { Run } from '../src/store/types.js';
 import {
   ASSESS_AGENTS_YAML,
   ASSESS_WORKFLOW_YAML,
@@ -607,6 +608,13 @@ stages:
   });
 });
 
+/** The discussion of a Run in short: 「assessor:ask」, 「human:dashboard」, 「timeout:24」. */
+const discussionKinds = (run: Run) =>
+  run.discussion.map(
+    (e) =>
+      `${e.role}:${e.role === 'assessor' ? e.verdict : e.role === 'human' ? e.source : e.hours}`,
+  );
+
 describe('engine: requirement assessment', () => {
   const start = () => harness({ agents: ASSESS_AGENTS_YAML, workflow: ASSESS_WORKFLOW_YAML });
   const prompts = (t: Harness, model: string) =>
@@ -686,9 +694,7 @@ describe('engine: requirement assessment', () => {
     await h.master.engine.retry(run.id, { note: '写 ok，再加一行 B' });
     const completed = await h.waitStatus(run.id, 'completed');
 
-    expect(
-      completed.discussion.map((e) => `${e.role}:${'verdict' in e ? e.verdict : e.source}`),
-    ).toEqual(['assessor:ask', 'human:dashboard', 'assessor:go']);
+    expect(discussionKinds(completed)).toEqual(['assessor:ask', 'human:dashboard', 'assessor:go']);
     expect(completed.discussion[2]).toMatchObject({
       revisedGoal: '添加 feature.txt，第一行 ok，第二行 B',
     });
@@ -788,6 +794,185 @@ describe('engine: requirement assessment', () => {
     expect(second).toContain('## 上一次评估没有完成');
     expect(second).toContain('verdict 为 ask 时要在 questions 里列出疑问或顾虑');
     expect(h.master.store.getRun(run.id).discussion.map((e) => e.role)).toEqual(['assessor']);
+  });
+});
+
+describe('engine: requirement assessment without a reply', () => {
+  const HOUR = 3_600_000;
+  /** The assess stage of ASSESS_WORKFLOW_YAML with `reply_timeout_hours: <value>`. */
+  const withTimeout = (value: string) =>
+    ASSESS_WORKFLOW_YAML.replace(
+      '    kind: assess\n    agent: assessor\n',
+      `    kind: assess\n    agent: assessor\n    reply_timeout_hours: ${value}\n`,
+    );
+  /** A Master whose clock is `offset` ms ahead of the real one. */
+  const clock = { offset: 0 };
+  const start = (workflow = ASSESS_WORKFLOW_YAML) => {
+    clock.offset = 0;
+    return harness({
+      agents: ASSESS_AGENTS_YAML,
+      workflow,
+      master: { now: () => Date.now() + clock.offset },
+    });
+  };
+  const prompts = (t: Harness) =>
+    t.fake.calls.filter((c) => c.model === 'assessor').map((c) => c.prompt);
+  const ask = () =>
+    assessment('ask', { summary: '没说 feature.txt 写什么', questions: ['feature.txt 写什么？'] });
+
+  it('decides on its own once nobody replied within the default 24 hours, then goes ahead', async () => {
+    h = await start();
+    let n = 0;
+    h.scripts.assessor = (ctx) => {
+      if (++n === 1) return ask();
+      // The round after the timeout sees the questions and may only conclude.
+      expect(ctx.input.prompt).toContain('feature.txt 写什么？');
+      expect(ctx.input.prompt).toContain('### 24 小时内没有人回复');
+      expect(ctx.input.prompt).toContain('上面的疑问 24 小时内没有人回复，这一轮由你自己决定');
+      expect(ctx.input.prompt).toContain('不能再给 ask');
+      expect(ctx.input.prompt).toContain('不要写 revisedGoal');
+      return assessment('go', {
+        summary: '没人回复，假设 feature.txt 写 ok',
+        // Not taken: assumptions go into the summary.
+        revisedGoal: '别的需求',
+      });
+    };
+    const run = h.run();
+    const blocked = await h.waitStatus(run.id, 'blocked');
+    expect(blocked.blocked?.kind).toBe('discussion');
+    expect(blocked.blocked?.message).toContain('24 小时内没有人回复的话，评估会自己决定');
+    const engine = h.master.engine;
+
+    // Not yet: it keeps waiting.
+    clock.offset = 23 * HOUR;
+    expect(engine.checkReplyTimeouts()).toEqual([]);
+    expect(h.master.store.getRun(run.id).status).toBe('blocked');
+
+    // Over the deadline but with the work switch off: a human may still reply.
+    clock.offset = 24 * HOUR + 1000;
+    engine.setWorking(false);
+    expect(engine.checkReplyTimeouts()).toEqual([]);
+    expect(h.master.store.getRun(run.id).status).toBe('blocked');
+
+    // Switching it on times the discussion out, and the Run goes on by itself.
+    engine.setWorking(true);
+    const completed = await h.waitStatus(run.id, 'completed');
+    expect(discussionKinds(completed)).toEqual(['assessor:ask', 'timeout:24', 'assessor:go']);
+    expect(completed.discussion.at(-1)).toMatchObject({
+      verdict: 'go',
+      summary: '没人回复，假设 feature.txt 写 ok',
+      revisedGoal: null,
+      decidedAlone: true,
+    });
+    const events = h.master.store.listEvents(run.id);
+    expect(events.filter((e) => e.type === 'discussion.timed_out').map((e) => e.data)).toEqual([
+      { hours: 24 },
+    ]);
+    // The same assessment task ran again, in the same stage round.
+    expect(h.master.store.countStageRounds(run.id, 'assess')).toBe(1);
+    expect(prompts(h)).toHaveLength(2);
+
+    // The coder works on the assessment's assumptions and sees the discussion.
+    const [coder] = h.fake.calls.filter((c) => c.model === 'coder').map((c) => c.prompt);
+    expect(coder).toContain('需求评估结论：没人回复，按评估的假设开工');
+    expect(coder).toContain('没人回复，假设 feature.txt 写 ok');
+    expect(coder).toContain('feature.txt 写什么？');
+    expect(coder).not.toContain('别的需求');
+  });
+
+  it('ends the Run as dropped when the assessment decides so after the timeout', async () => {
+    // A timeout of about a second, run by the engine's own timer.
+    h = await start(withTimeout('0.0003'));
+    let n = 0;
+    h.scripts.assessor = () =>
+      ++n === 1
+        ? assessment('drop', { summary: '和已有的 X 重复' })
+        : assessment('drop', { summary: '没人确认，和 X 重复，不做' });
+    const run = h.run();
+    const blocked = await h.waitStatus(run.id, 'blocked');
+    // Before the timeout a drop still waits for a human to confirm.
+    expect(blocked.discussion).toMatchObject([{ verdict: 'ask', proposedDrop: true }]);
+    const dropped = await h.waitStatus(run.id, 'dropped');
+
+    expect(dropped.error).toBeNull();
+    expect(discussionKinds(dropped)).toEqual(['assessor:ask', 'timeout:0.0003', 'assessor:drop']);
+    expect(dropped.discussion.at(-1)).toMatchObject({
+      verdict: 'drop',
+      summary: '没人确认，和 X 重复，不做',
+      proposedDrop: false,
+      decidedAlone: true,
+    });
+    expect(h.fake.calls.map((c) => c.model)).toEqual(['assessor', 'assessor']);
+    const events = h.master.store.listEvents(run.id);
+    expect(events.map((e) => noticeFor(e, run.goal)?.kind)).not.toContain('failed');
+  });
+
+  it('does not wait at all with 0, and refuses another ask in the round that decides', async () => {
+    h = await start(withTimeout('0'));
+    let n = 0;
+    h.scripts.assessor = () => (++n <= 2 ? ask() : assessment('go', { summary: '假设写 ok' }));
+    const run = h.run();
+    const completed = await h.waitStatus(run.id, 'completed');
+
+    // Never blocked: nobody was asked to reply.
+    const events = h.master.store.listEvents(run.id);
+    expect(events.some((e) => e.type === 'run.blocked')).toBe(false);
+    expect(discussionKinds(completed)).toEqual(['assessor:ask', 'timeout:0', 'assessor:go']);
+    const [, second, third] = prompts(h);
+    expect(second).toContain('这个阶段不等人回复，这一轮由你自己决定');
+    // The second round asked again: sent back as a result that does not pass.
+    expect(third).toContain('## 上一次评估没有完成');
+    expect(third).toContain('这一轮不能再给 ask');
+    expect(
+      h.master.store
+        .listRunAttempts(run.id)
+        .filter((a) => a.agentId === 'assessor')
+        .map((a) => a.outcome),
+    ).toEqual(['passed', 'rework', 'passed']);
+  });
+
+  it('a reply before the timeout is followed as before, and nothing times out after it', async () => {
+    h = await start();
+    let n = 0;
+    h.scripts.assessor = (ctx) => {
+      if (++n === 1) return ask();
+      // The usual round after a reply: the human's answer, and a revised goal is allowed.
+      expect(ctx.input.prompt).toContain('### 人的回复（看板上）\n\n写 ok');
+      expect(ctx.input.prompt).toContain('在 revisedGoal 里写修改后的完整需求');
+      expect(ctx.input.prompt).not.toContain('不能再给 ask');
+      return assessment('go', { summary: '按回复', revisedGoal: '添加 feature.txt，内容 ok' });
+    };
+    const run = h.run();
+    await h.waitStatus(run.id, 'blocked');
+    clock.offset = 23 * HOUR;
+    expect(h.master.engine.checkReplyTimeouts()).toEqual([]);
+    await h.master.engine.retry(run.id, { note: '写 ok' });
+    const completed = await h.waitStatus(run.id, 'completed');
+
+    clock.offset = 48 * HOUR;
+    expect(h.master.engine.checkReplyTimeouts()).toEqual([]);
+    expect(discussionKinds(h.master.store.getRun(run.id))).toEqual([
+      'assessor:ask',
+      'human:dashboard',
+      'assessor:go',
+    ]);
+    expect(completed.discussion.at(-1)).toMatchObject({
+      revisedGoal: '添加 feature.txt，内容 ok',
+    });
+    expect(completed.discussion.at(-1)).not.toHaveProperty('decidedAlone');
+    const events = h.master.store.listEvents(run.id);
+    expect(events.some((e) => e.type === 'discussion.timed_out')).toBe(false);
+  });
+
+  it('waits however long it takes with null', async () => {
+    h = await start(withTimeout('null'));
+    h.scripts.assessor = ask;
+    const run = h.run();
+    const blocked = await h.waitStatus(run.id, 'blocked');
+    expect(blocked.blocked?.message).not.toContain('没有人回复');
+    clock.offset = 1000 * HOUR;
+    expect(h.master.engine.checkReplyTimeouts()).toEqual([]);
+    expect(h.master.store.getRun(run.id).status).toBe('blocked');
   });
 });
 

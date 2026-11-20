@@ -317,10 +317,17 @@ function conclusionText(run: Run): string {
   if (run.finishedAt) {
     return t({ zh: '没有（Run 在讨论中结束）', en: 'none (the Run ended during the discussion)' });
   }
-  if (run.discussion.at(-1)?.role === 'human') {
+  const last = run.discussion.at(-1);
+  if (last?.role === 'human') {
     return t({
       zh: '还没有（人已回复，重新评估中）',
       en: 'not yet (a human replied; assessing again)',
+    });
+  }
+  if (last?.role === 'timeout') {
+    return t({
+      zh: '还没有（没人回复，评估自己决定中）',
+      en: 'not yet (nobody replied; the assessment is deciding on its own)',
     });
   }
   return assessmentRounds(run.discussion).at(-1)?.proposedDrop
@@ -340,11 +347,19 @@ function discussionLines(run: Run): string[] {
   if (run.discussion.length === 0) return [];
   const rounds = assessmentRounds(run.discussion);
   const replies = humanReplies(run.discussion).length;
+  const timeouts = run.discussion.filter((e) => e.role === 'timeout').length;
   const n = rounds.length;
+  const unanswered =
+    timeouts > 0
+      ? t({
+          zh: `，没人回复 ${timeouts} 次`,
+          en: `, ${timeouts} time${timeouts === 1 ? '' : 's'} nobody replied`,
+        })
+      : '';
   const lines = [
     t({
-      zh: `  需求评估：评估 ${n} 轮，人回复 ${replies} 次；结论：${conclusionText(run)}`,
-      en: `  Requirement assessment: ${n} round${n === 1 ? '' : 's'}, ${replies} human repl${replies === 1 ? 'y' : 'ies'}; conclusion: ${conclusionText(run)}`,
+      zh: `  需求评估：评估 ${n} 轮，人回复 ${replies} 次${unanswered}；结论：${conclusionText(run)}`,
+      en: `  Requirement assessment: ${n} round${n === 1 ? '' : 's'}, ${replies} human repl${replies === 1 ? 'y' : 'ies'}${unanswered}; conclusion: ${conclusionText(run)}`,
     }),
   ];
   for (const [i, round] of rounds.entries()) {

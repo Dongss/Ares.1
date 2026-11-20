@@ -8,6 +8,7 @@ import {
   defaultRollbackTarget,
   effectiveStage,
   failTarget,
+  replyTimeoutHours,
   rollbackTarget,
   stageVerifyCommands,
   TemplateSchema,
@@ -45,6 +46,8 @@ describe('config', () => {
       'e2e:placeholder',
       'merge:merge',
     ]);
+    // Nobody replying to the assessment does not stop the Run for good.
+    expect(t?.stages[0]?.reply_timeout_hours).toBe(24);
     // Coding and review work from the requirement as the assessment confirmed it.
     expect(t?.stages.find((s) => s.id === 'implement')?.inputs).toEqual(['assessment']);
     expect(t?.stages.find((s) => s.id === 'review')?.inputs).toEqual(['diff', 'assessment']);
@@ -353,6 +356,43 @@ stages:
     expect(stageVerifyCommands(assess, ['npm test'])).toEqual([]);
     expect(failTarget(t, 'assess')).toBeNull();
     expect(rollbackTarget(t, 'assess', 'reject')).toBe('assess');
+  });
+
+  it('reads how long an assess stage waits for a reply: 24 hours unless it says otherwise', () => {
+    const stage = (extra: object) =>
+      TemplateSchema.safeParse({
+        id: 'dev',
+        stages: [{ id: 'assess', kind: 'assess', agent: 'claude', ...extra }],
+      });
+    const hours = (extra: object) => {
+      const parsed = stage(extra);
+      if (!parsed.success) throw parsed.error;
+      return replyTimeoutHours(parsed.data.stages[0] as WorkflowTemplate['stages'][number]);
+    };
+    expect(hours({})).toBe(24);
+    expect(hours({ reply_timeout_hours: 2.5 })).toBe(2.5);
+    // 0 = do not wait; null = wait however long it takes.
+    expect(hours({ reply_timeout_hours: 0 })).toBe(0);
+    expect(hours({ reply_timeout_hours: null })).toBeNull();
+    expect(stage({ reply_timeout_hours: -1 }).success).toBe(false);
+    expect(stage({ reply_timeout_hours: '24' }).success).toBe(false);
+
+    // Only an assessment waits for replies: elsewhere it is a warning, the template stays.
+    const paths = home();
+    writeFile(
+      join(paths.workflowsDir, 'self-dev.yaml'),
+      `id: self-dev
+stages:
+  - { id: assess, kind: assess, agent: claude-reviewer, reply_timeout_hours: null }
+  - { id: implement, agent: claude-coder, inputs: [assessment], reply_timeout_hours: 1 }
+  - { id: merge, kind: merge }
+`,
+    );
+    const cfg = loadConfig(paths, ['claude-code'], ['claude-code']);
+    expect(cfg.templates.has('self-dev')).toBe(true);
+    expect(cfg.warnings['workflows/self-dev.yaml']).toEqual([
+      '阶段 implement：reply_timeout_hours 只对需求评估阶段（kind: assess）有效，这里不起作用',
+    ]);
   });
 
   it('warns when the reviewer is the same agent as the coder', () => {
