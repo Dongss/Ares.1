@@ -83,6 +83,9 @@ export const FAIL_REASON: Record<StageFailReason, string> = {
   get rejected() {
     return t({ zh: '审批被驳回', en: 'Approval rejected' });
   },
+  get conflict() {
+    return t({ zh: '和目标分支冲突', en: 'Conflicts with the target branch' });
+  },
 };
 
 const defaultEffort = () => t({ zh: '默认 effort', en: 'default effort' });

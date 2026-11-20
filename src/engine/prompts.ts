@@ -136,15 +136,56 @@ function noGitHubRule(): string {
   });
 }
 
+/** A merge of the target branch the Master started in the worktree for the agent to finish. */
+export interface MergeInProgress {
+  /** The target branch's name. */
+  target: string;
+  /** Files that conflicted; empty when everything merged cleanly. */
+  files: string[];
+}
+
+function mergeSection(merge: MergeInProgress | undefined): string {
+  if (!merge) return '';
+  const files = merge.files.map((f) => `- \`${f}\``).join('\n');
+  const conflicts =
+    merge.files.length > 0
+      ? t({
+          zh: `下面这些文件有冲突，冲突的地方用 \`<<<<<<<\`、\`=======\`、\`>>>>>>>\` 标出来了：\n\n${files}\n\n解决每一处冲突：同时保留 ${merge.target} 的改动和本需求的改动，把两边的意图合在一起，并删掉所有冲突标记。冲突标记没清干净的话，这次结果不算通过，要返工。`,
+          en: `These files have conflicts, marked with \`<<<<<<<\`, \`=======\` and \`>>>>>>>\`:\n\n${files}\n\nResolve every conflict: keep both the changes of ${merge.target} and those of this requirement, bringing together what each side meant, and remove every conflict marker. If any conflict marker is left, this result does not pass and has to be reworked.`,
+        })
+      : t({
+          zh: `这次合并没有冲突，但 ${merge.target} 的新代码可能和本需求的改动配合不上，需要时一起调整。`,
+          en: `This merge has no conflicts, but the new code of ${merge.target} may not fit the changes of this requirement; adjust them together where needed.`,
+        });
+  return t({
+    zh: `## 未完成的合并
+
+本需求的分支在合并进 ${merge.target} 时冲突了。Master 已经在工作目录里开始合并 ${merge.target} 的最新代码（git merge --no-commit），还没有提交。${conflicts}
+
+- 不要执行 git commit、git merge --abort、git reset，也不要用 git checkout 丢掉哪一边的改动；改好文件就行，合并提交由 Master 完成。
+
+`,
+    en: `## A merge in progress
+
+This requirement's branch conflicted when it was to be merged into ${merge.target}. The Master has started merging the latest code of ${merge.target} in the working directory (git merge --no-commit), without committing it. ${conflicts}
+
+- Do not run git commit, git merge --abort or git reset, and do not throw away either side's changes with git checkout; just fix the files, and the Master makes the merge commit.
+
+`,
+  });
+}
+
 /**
  * First prompt of a task in an agent stage (or any attempt that starts a new session).
  * @param permission the running agent's permission: a "safe" agent cannot run commands, so it is
  *   not told to run the verify commands itself.
+ * @param merge a merge of the target branch the Master started for the agent to resolve.
  */
 export function taskPrompt(
   ctx: PromptContext,
   feedback: string | null,
   permission: AgentPermission,
+  merge?: MergeInProgress,
 ): string {
   const stageName = ctx.stage.name ?? ctx.stage.id;
   const instructions = ctx.stage.instructions ? fill(ctx.stage.instructions, ctx.goal).trim() : '';
@@ -173,7 +214,7 @@ export function taskPrompt(
         en: `## The previous attempt did not pass\n\n${feedback}\n\n`,
       })
     : '';
-  const rest = `${inputsSection(ctx.inputs)}${earlierAttemptsSection(ctx.earlierAttempts, 'task')}${stageFeedback}${lastFeedback}`;
+  const rest = `${inputsSection(ctx.inputs)}${earlierAttemptsSection(ctx.earlierAttempts, 'task')}${stageFeedback}${mergeSection(merge)}${lastFeedback}`;
   return t({
     zh: `你是${brandName()}调度的开发 Agent，正在仓库的一个独立工作目录（git worktree）中工作。
 

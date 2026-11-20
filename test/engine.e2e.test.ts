@@ -448,8 +448,14 @@ agents:
     expect(existsSync(join(h.repoDir, 'feature.txt'))).toBe(true);
   });
 
-  it('blocks on a merge conflict until the human merges, resolves and commits', async () => {
-    h = await harness();
+  it('blocks on a merge conflict when no agent stage can resolve it, until a human does', async () => {
+    // The merge stage goes back to the review stage, which cannot change files.
+    h = await harness({
+      workflow: TEST_WORKFLOW_YAML.replace(
+        '    gate: true\n    on_reject: implement\n',
+        '    gate: true\n    on_reject: implement\n    on_fail: review\n',
+      ),
+    });
     const store = h.master.store;
     const run = h.run();
     const waiting = await h.waitStatus(run.id, 'waiting_approval');
@@ -469,11 +475,14 @@ agents:
       expect(blocked.blocked?.kind).toBe('merge_conflict');
       expect(blocked.blocked?.message).toContain('`git merge main`');
       expect(blocked.blocked?.message).toContain(worktree);
+      expect(blocked.blocked?.message).toContain('- feature.txt');
       // The merge was given up: main did not move and the worktree is clean on the run's commit.
       expect(git(h?.repoDir as string, 'rev-parse', 'main')).toBe(mainHead);
       expect(git(h?.repoDir as string, 'show', 'main:feature.txt')).toBe('from main');
       expect(git(worktree, 'status', '--porcelain')).toBe('');
       expect(git(worktree, 'rev-parse', 'HEAD')).toBe(runHead);
+      // Nothing went back to another stage.
+      expect(store.listStageRuns(run.id).some((sr) => sr.failReason === 'conflict')).toBe(false);
     };
 
     h.master.engine.approve(run.id);
@@ -1619,6 +1628,316 @@ describe('engine: budget', () => {
     const waiting = await h.waitStatus(run.id, 'waiting_approval');
     expect(waiting.costUsd).toBe(300);
     await expect(h.master.engine.retry(run.id, { budgetUsd: 5 })).rejects.toThrow(/blocked/);
+  });
+});
+
+describe('engine: merge conflicts', () => {
+  /** Another Run's work lands on main: commit `content` to `file` there; returns the commit. */
+  const commitOnMain = (repoDir: string, file: string, content: string): string => {
+    writeFile(join(repoDir, file), content);
+    git(repoDir, 'add', '-A');
+    git(repoDir, 'commit', '-q', '-m', `main changes ${file}`);
+    return git(repoDir, 'rev-parse', 'main');
+  };
+  const merging = (worktree: string) => {
+    try {
+      git(worktree, 'rev-parse', '-q', '--verify', 'MERGE_HEAD');
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const coderCalls = () => (h as Harness).fake.calls.filter((c) => c.model === 'coder');
+  const eventsOf = (runId: string, type: string) =>
+    (h as Harness).master.store.listEvents(runId).filter((e) => e.type === type);
+  /** Merges without approval, so a Run goes from coding to merging on its own. */
+  const noGate = { stages: { merge: { gate: false } } };
+
+  it('goes back to coding, where the agent resolves the conflict, then merges both sides', async () => {
+    h = await harness();
+    const store = h.master.store;
+    const run = h.run();
+    const waiting = await h.waitStatus(run.id, 'waiting_approval');
+    const worktree = waiting.worktreePath as string;
+    const runHead = git(worktree, 'rev-parse', 'HEAD');
+    // Another Run merged into main while this one waited for its approval.
+    const mainHead = commitOnMain(h.repoDir, 'feature.txt', 'from main\n');
+    const seen: string[] = [];
+    h.scripts.coder = (ctx) => {
+      const file = join(ctx.input.workdir, 'feature.txt');
+      seen.push(readFileSync(file, 'utf8'));
+      writeFile(file, 'ok\nfrom main\n');
+      return done('解决了冲突');
+    };
+
+    h.master.engine.approve(run.id);
+    const mergeRounds = () => store.listStageRuns(run.id).filter((s) => s.stageId === 'merge');
+    await waitFor(
+      () => mergeRounds().length === 2 && store.getRun(run.id).status === 'waiting_approval',
+      'the second merge approval',
+    );
+    expect(store.listStageRuns(run.id).map((s) => [s.stageId, s.status, s.failReason])).toEqual([
+      ['implement', 'passed', null],
+      ['review', 'passed', null],
+      ['merge', 'failed', 'conflict'],
+      ['implement', 'passed', null],
+      ['review', 'passed', null],
+      ['merge', 'waiting_approval', null],
+    ]);
+    const failedMerge = mergeRounds()[0];
+    expect(failedMerge?.failFeedback).toContain('这些文件有冲突：\n- feature.txt');
+    expect(failedMerge?.failFeedback).toContain('同时保留本需求的改动');
+    const rerun = store.listStageRuns(run.id)[3];
+    expect(rerun?.feedback).toContain('- feature.txt');
+
+    // The coding agent got the conflicts in the file, and was told about the merge.
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatch(/^<<<<<<< /m);
+    expect(seen[0]).toMatch(/^>>>>>>> /m);
+    const call = coderCalls()[1];
+    expect(call?.resumeSessionId).toBeUndefined();
+    expect(call?.prompt).toContain('## 未完成的合并');
+    expect(call?.prompt).toContain('- `feature.txt`');
+    expect(call?.prompt).toContain('不要执行 git commit、git merge --abort、git reset');
+    const checks = store.listChecks(run.id).filter((c) => c.stageRunId === rerun?.id);
+    expect(checks.map((c) => [c.kind, c.name, c.passed, c.detail])).toContainEqual([
+      'merge',
+      '合并 main',
+      true,
+      '冲突已解决：feature.txt',
+    ]);
+
+    // The coding round's commit is the merge commit; the review compares against main's commit.
+    expect(git(worktree, 'rev-parse', 'HEAD^1', 'HEAD^2').split('\n')).toEqual([runHead, mainHead]);
+    expect(merging(worktree)).toBe(false);
+    const reviewCall = h.fake.calls.filter((c) => c.model === 'reviewer')[1];
+    expect(reviewCall?.prompt).toContain(`git diff ${mainHead}...HEAD`);
+    expect(eventsOf(run.id, 'merge.synced').map((e) => e.data.targetHead)).toEqual([mainHead]);
+    expect(eventsOf(run.id, 'run.blocked')).toEqual([]);
+
+    h.master.engine.approve(run.id);
+    await h.waitStatus(run.id, 'completed');
+    expect(git(h.repoDir, 'show', 'main:feature.txt')).toBe('ok\nfrom main');
+    expect(git(h.repoDir, 'rev-parse', 'main^2')).toBe(mainHead);
+  });
+
+  it('reworks while conflict markers are left in the files', async () => {
+    h = await harness();
+    const repoDir = h.repoDir;
+    let calls = 0;
+    h.scripts.coder = (ctx) => {
+      calls++;
+      const file = join(ctx.input.workdir, 'feature.txt');
+      if (calls === 1) {
+        writeFile(file, 'ok\n');
+        commitOnMain(repoDir, 'feature.txt', 'from main\n');
+      }
+      // The second call leaves the conflict as it is: its markers still pass the check command.
+      if (calls === 3) writeFile(file, 'ok\nfrom main\n');
+      return done();
+    };
+    const run = h.run('目标', noGate);
+    await h.waitStatus(run.id, 'completed');
+    expect(git(h.repoDir, 'show', 'main:feature.txt')).toBe('ok\nfrom main');
+
+    const [, left, fixed] = coderCalls();
+    // The rework goes on in the same session with the merge still in progress.
+    expect(fixed?.resumeSessionId).toBeTruthy();
+    expect(fixed?.prompt).toContain('这些文件里还有冲突标记');
+    expect(fixed?.prompt).toContain('feature.txt');
+    const store = h.master.store;
+    const attempts = store.listRunAttempts(run.id).filter((a) => a.agentId === 'coder');
+    expect(attempts.map((a) => a.outcome)).toEqual(['passed', 'rework', 'passed']);
+    const leftCheck = store
+      .listChecks(run.id)
+      .find((c) => c.attemptId === attempts[1]?.id && c.kind === 'merge');
+    expect(leftCheck?.passed).toBe(false);
+    expect(left?.prompt).toContain('## 未完成的合并');
+    // Only one merge was started: the rework did not start it again.
+    expect(eventsOf(run.id, 'merge.started')).toHaveLength(1);
+  });
+
+  it('ends the Run once the conflicts keep coming back past max_loops', async () => {
+    h = await harness();
+    const repoDir = h.repoDir;
+    let n = 0;
+    // Each round resolves the conflict, and each time another Run changes the same line on main.
+    h.scripts.coder = (ctx) => {
+      n++;
+      writeFile(join(ctx.input.workdir, 'feature.txt'), `ok ${n}\n`);
+      commitOnMain(repoDir, 'feature.txt', `from main ${n}\n`);
+      return done();
+    };
+    const run = h.run('目标', { ...noGate, max_loops: 1 });
+    const failed = await h.waitStatus(run.id, 'failed');
+    const store = h.master.store;
+    expect(store.countStageRounds(run.id, 'implement')).toBe(2);
+    const merges = store.listStageRuns(run.id).filter((s) => s.stageId === 'merge');
+    expect(merges.map((s) => s.failReason)).toEqual(['conflict', 'conflict']);
+    expect(failed.error).toContain(
+      '阶段「编码」已执行 2 轮，超过回退上限 1，Run 结束（on_exhausted: fail），工作目录和分支已保留。最后一次「合并」没有通过：\n',
+    );
+    expect(failed.error).toContain('- feature.txt');
+    expect(eventsOf(run.id, 'run.blocked')).toEqual([]);
+    // No merge is left half done in the kept worktree.
+    const worktree = failed.worktreePath as string;
+    expect(merging(worktree)).toBe(false);
+    expect(git(worktree, 'status', '--porcelain')).toBe('');
+  });
+
+  it('with on_exhausted: human, waits at max_loops and a retry resolves the conflict again', async () => {
+    h = await harness({ workflow: WAIT_WHEN_EXHAUSTED });
+    const repoDir = h.repoDir;
+    let n = 0;
+    h.scripts.coder = (ctx) => {
+      n++;
+      writeFile(join(ctx.input.workdir, 'feature.txt'), `ok ${n}\n`);
+      commitOnMain(repoDir, 'feature.txt', `from main ${n}\n`);
+      return done();
+    };
+    const run = h.run('目标', { ...noGate, max_loops: 1 });
+    const blocked = await h.waitStatus(run.id, 'blocked');
+    expect(blocked.blocked?.kind).toBe('max_loops');
+    expect(blocked.blocked?.message).toContain('- feature.txt');
+
+    // main stops moving; the extra round merges it and resolves the conflict.
+    h.scripts.coder = (ctx) => {
+      writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+      return done();
+    };
+    await h.master.engine.retry(run.id);
+    await h.waitStatus(run.id, 'completed');
+    expect(h.master.store.countStageRounds(run.id, 'implement')).toBe(3);
+    expect(git(h.repoDir, 'show', 'main:feature.txt')).toBe('ok');
+    expect(git(h.repoDir, 'log', '-1', '--format=%P', 'main').split(' ')).toHaveLength(2);
+  });
+
+  it('a pause gives the merge up; the resumed round merges the latest main again', async () => {
+    h = await harness();
+    const repoDir = h.repoDir;
+    let calls = 0;
+    h.scripts.coder = async (ctx) => {
+      calls++;
+      const file = join(ctx.input.workdir, 'feature.txt');
+      if (calls === 1) {
+        writeFile(file, 'ok\n');
+        commitOnMain(repoDir, 'feature.txt', 'from main\n');
+        return done();
+      }
+      if (calls === 2) {
+        writeFile(file, 'half resolved\n');
+        await new Promise((resolve) => ctx.signal.addEventListener('abort', resolve));
+        return done();
+      }
+      expect(readFileSync(file, 'utf8')).toMatch(/^<<<<<<< /m);
+      writeFile(file, 'ok\nfrom main\n');
+      return done();
+    };
+    const run = h.run('目标', noGate);
+    await waitFor(() => calls === 2, 'the coding agent to resolve the conflict');
+    const worktree = h.master.store.getRun(run.id).worktreePath as string;
+    expect(merging(worktree)).toBe(true);
+    const task = h.master.store.listRunTasks(run.id).findLast((t) => t.title === '编码') as Task;
+
+    await h.master.engine.pause(run.id);
+    // Back to before the merge: no MERGE_HEAD, nothing uncommitted.
+    expect(merging(worktree)).toBe(false);
+    expect(git(worktree, 'status', '--porcelain')).toBe('');
+    expect(git(worktree, 'rev-parse', 'HEAD')).toBe(task.baseCommit);
+
+    // main moves on meanwhile; resuming merges what it is now.
+    const latest = commitOnMain(repoDir, 'other.txt', 'other\n');
+    h.master.engine.resume(run.id);
+    await h.waitStatus(run.id, 'completed');
+    expect(git(h.repoDir, 'show', 'main:feature.txt')).toBe('ok\nfrom main');
+    expect(git(h.repoDir, 'show', 'main:other.txt')).toBe('other');
+    const started = eventsOf(run.id, 'merge.started');
+    expect(started).toHaveLength(2);
+    expect(started[1]?.data.targetHead).toBe(latest);
+    // The redo starts a fresh session: the worktree no longer has the stopped one's work.
+    expect(coderCalls()[2]?.resumeSessionId).toBeUndefined();
+  });
+
+  it('a restart gives the merge up and the new Master merges and resolves it again', async () => {
+    const first = await harness();
+    const repoDir = first.repoDir;
+    let calls = 0;
+    first.scripts.coder = async (ctx) => {
+      calls++;
+      if (calls === 1) {
+        writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+        commitOnMain(repoDir, 'feature.txt', 'from main\n');
+        return done();
+      }
+      await new Promise((resolve) => ctx.signal.addEventListener('abort', resolve));
+      return done();
+    };
+    const run = first.run('目标', noGate);
+    await waitFor(() => calls === 2, 'the coding agent to resolve the conflict');
+    const worktree = first.master.store.getRun(run.id).worktreePath as string;
+    expect(merging(worktree)).toBe(true);
+    await first.close();
+    expect(merging(worktree)).toBe(false);
+    expect(git(worktree, 'status', '--porcelain')).toBe('');
+
+    const resolve: Script = (ctx) => {
+      const file = join(ctx.input.workdir, 'feature.txt');
+      if (!/^<<<<<<< /m.test(readFileSync(file, 'utf8'))) throw new Error('no conflict to resolve');
+      writeFile(file, 'ok\nfrom main\n');
+      return done();
+    };
+    h = await harness({
+      home: first.home,
+      repoDir,
+      scripts: { coder: resolve, reviewer: () => review() },
+    });
+    await h.waitStatus(run.id, 'completed');
+    expect(git(repoDir, 'show', 'main:feature.txt')).toBe('ok\nfrom main');
+  });
+
+  describe('in English', () => {
+    afterEach(() => setLang('zh'));
+
+    it('tells the agent about the merge and says what conflicted without Chinese', async () => {
+      const englishWorkflow = TEST_WORKFLOW_YAML.replace('name: 测试流程', 'name: Test flow')
+        .replace('name: 编码', 'name: Coding')
+        .replace('name: 评审', 'name: Review')
+        .replace('name: 合并', 'name: Merge');
+      h = await harness({ config: 'language: en\n', workflow: englishWorkflow });
+      const repoDir = h.repoDir;
+      let calls = 0;
+      h.scripts.coder = (ctx) => {
+        calls++;
+        const file = join(ctx.input.workdir, 'feature.txt');
+        if (calls === 1) {
+          writeFile(file, 'ok\n');
+          commitOnMain(repoDir, 'feature.txt', 'from main\n');
+        }
+        if (calls === 3) writeFile(file, 'ok\nfrom main\n');
+        return done('resolved');
+      };
+      const run = h.run('Add feature.txt', noGate);
+      await h.waitStatus(run.id, 'completed');
+      const store = h.master.store;
+      const rounds = store.listStageRuns(run.id);
+      const texts = [
+        rounds.find((s) => s.failReason === 'conflict')?.failFeedback,
+        rounds[3]?.feedback,
+        coderCalls()[1]?.prompt,
+        coderCalls()[2]?.prompt,
+        ...store
+          .listChecks(run.id)
+          .filter((c) => c.kind === 'merge')
+          .map((c) => `${c.name}: ${c.detail}`),
+      ];
+      expect(texts[0]).toContain('ran into conflicts in these files:\n- feature.txt');
+      expect(texts[2]).toContain('## A merge in progress');
+      expect(texts[3]).toContain('These files still have conflict markers');
+      for (const text of texts) {
+        expect(text).toBeTruthy();
+        expect(text).not.toMatch(/[一-鿿]/);
+      }
+    });
   });
 });
 

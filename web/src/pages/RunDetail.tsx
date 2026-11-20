@@ -872,7 +872,7 @@ function StageBlock(props: {
       {approvals.map((a) => (
         <ApprovalLine key={a.id} approval={a} />
       ))}
-      {sr.failReason === 'check' && sr.failFeedback && (
+      {(sr.failReason === 'check' || sr.failReason === 'conflict') && sr.failFeedback && (
         <Collapsible title={t({ zh: '没有通过的原因', en: 'Why it did not pass' })} defaultOpen>
           <Pre>{sr.failFeedback}</Pre>
         </Collapsible>

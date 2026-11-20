@@ -14,6 +14,7 @@ import type { HomePaths, LoadedConfig } from '../config/load.js';
 import {
   type AgentConfig,
   agentEffort,
+  conflictTarget,
   type EffectiveStage,
   effectiveBudget,
   effectiveMaxLoops,
@@ -48,16 +49,21 @@ import {
   addWorktree,
   branchExists,
   commitAll,
+  conflictedFiles,
   currentBranch,
   diffStat,
   fastForwardBranch,
+  filesWithConflictMarkers,
   hasChanges,
   isAncestor,
+  isMerging,
   listBranches,
+  mergeBase,
   mergeOrAbort,
   removeWorktree,
   resetHard,
   revParse,
+  startMerge,
 } from '../workspace/git.js';
 import {
   ASSESS_REPORT_JSON_SCHEMA,
@@ -81,6 +87,7 @@ import {
 import {
   assessmentArtifact,
   assessPrompt,
+  type MergeInProgress,
   type PreviousReview,
   type PromptContext,
   reviewPrompt,
@@ -236,6 +243,14 @@ interface RateLimitedRun {
   agentId: string;
   /** Not to start again before this, in epoch milliseconds. */
   until: number;
+}
+
+/** A merge of the target branch in the worktree that a task's agent resolves (`conflictMerge`). */
+interface ConflictMerge extends MergeInProgress {
+  /** The target branch's commit being merged in (MERGE_HEAD). */
+  targetHead: string;
+  /** Started for this attempt: no earlier session saw the worktree as it is now. */
+  started: boolean;
 }
 
 /** Thrown inside a drive loop when the Run is being paused / cancelled / shut down. */
@@ -1339,19 +1354,22 @@ export class Engine {
     const workdir = this.workdir(run);
     const repo = this.store.getRepo(run.repoId);
     let task = initial;
+    // Before any merge below: rolling the task back to its base gives that merge up too.
     if (!task.baseCommit) {
       task = this.store.updateTask(task.id, { baseCommit: await revParse(workdir, 'HEAD') });
       this.checkAbort(signal);
     }
+    const merge = await this.conflictMerge(run, sr, task, workdir, signal);
     const verify = stageVerifyCommands(eff.def, repo.verifyCommands);
     const ctx = this.promptContext(run, sr, eff, verify);
+    // A merge started just now reset the worktree: no earlier session matches it.
     const resume =
-      task.pendingFeedback && task.sessionId && task.sessionAgentId === agent.id
+      !merge?.started && task.pendingFeedback && task.sessionId && task.sessionAgentId === agent.id
         ? task.sessionId
         : undefined;
     const prompt = resume
       ? reworkPrompt(task.pendingFeedback ?? '')
-      : taskPrompt(ctx, task.pendingFeedback, agent.permission);
+      : taskPrompt(ctx, task.pendingFeedback, agent.permission, merge ?? undefined);
 
     const { attempt, result } = await this.execute(run, task, agent, adapter, {
       prompt,
@@ -1380,6 +1398,29 @@ export class Engine {
       return this.rework(run, eff, task, attempt, problem?.message ?? '');
     }
 
+    // A merge to resolve: still in progress, and no conflict marker left behind.
+    if (merge) {
+      const unresolved = await this.unresolvedMerge(workdir, merge);
+      this.checkAbort(signal);
+      const resolved =
+        merge.files.length > 0
+          ? t({
+              zh: `冲突已解决：${joinList(merge.files)}`,
+              en: `Conflicts resolved: ${joinList(merge.files)}`,
+            })
+          : t({ zh: '合并没有冲突', en: 'The merge had no conflicts' });
+      this.store.addCheck({
+        runId: run.id,
+        stageRunId: sr.id,
+        attemptId: attempt.id,
+        kind: 'merge',
+        name: t({ zh: `合并 ${merge.target}`, en: `Merge ${merge.target}` }),
+        passed: unresolved === null,
+        detail: unresolved ?? resolved,
+      });
+      if (unresolved !== null) return this.rework(run, eff, task, attempt, unresolved);
+    }
+
     // Layer 2: verify commands, after every task.
     this.store.updateTask(task.id, { status: 'verifying' });
     const results = await runCommands(verify, workdir, {
@@ -1403,7 +1444,7 @@ export class Engine {
     const failed = results.find((r) => !r.passed);
     if (failed) return this.rework(run, eff, task, attempt, formatCommandFailure(failed));
 
-    // Passed: one commit per task.
+    // Passed: one commit per task, the merge commit when resolving a merge.
     const sha = await commitAll(
       workdir,
       commitMessage({
@@ -1424,7 +1465,89 @@ export class Engine {
       for (const name of eff.def.outputs) {
         this.saveArtifact(run, sr, name, 'output', result.finalMessage);
       }
+      if (merge) {
+        // Like a merge stage's sync: the Run's changes are counted from this target commit on.
+        this.store.event(run.id, 'merge.synced', {
+          target: merge.target,
+          targetHead: merge.targetHead,
+          taskId: task.id,
+        });
+      }
       this.store.event(run.id, 'task.passed', { taskId: task.id, commit: sha });
+    });
+  }
+
+  /**
+   * The merge of the target branch a round of an agent stage resolves, when a merge conflict
+   * rolled back to it (`conflictTarget`); null otherwise, or once the target branch is merged in.
+   * Every attempt needs the merge in progress in the worktree. A rework goes on with the one
+   * there. Otherwise (the first attempt, or after a pause, a restart or a failed task reset the
+   * worktree, which gives the merge up) the Master starts merging the target branch's latest
+   * commit without committing, leaving the conflicts in the files for the agent; the task's commit
+   * is then the merge commit.
+   */
+  private async conflictMerge(
+    run: Run,
+    sr: StageRun,
+    task: Task,
+    workdir: string,
+    signal: AbortSignal,
+  ): Promise<ConflictMerge | null> {
+    if (!this.resolvesConflict(run, sr)) return null;
+    const repo = this.store.getRepo(run.repoId);
+    const target = repo.targetBranch;
+    if (await isMerging(workdir)) {
+      const targetHead = await revParse(workdir, 'MERGE_HEAD');
+      // The files that conflicted when it started; the agent may have staged some since.
+      const recorded = this.store
+        .listEvents(run.id)
+        .findLast(
+          (e) =>
+            e.type === 'merge.started' &&
+            e.data.taskId === task.id &&
+            e.data.targetHead === targetHead,
+        )?.data.files;
+      const files = Array.isArray(recorded)
+        ? recorded.filter((f): f is string => typeof f === 'string')
+        : await conflictedFiles(workdir);
+      this.checkAbort(signal);
+      return { target, targetHead, files, started: false };
+    }
+    const targetHead = await revParse(repo.path, target);
+    const merged = await isAncestor(workdir, targetHead, 'HEAD');
+    this.checkAbort(signal);
+    if (merged) return null;
+    // Only an agent that gave up the merge itself leaves changes without one: start over.
+    if (await hasChanges(workdir)) await resetHard(workdir, 'HEAD');
+    const files = await startMerge(workdir, targetHead);
+    this.checkAbort(signal);
+    this.store.event(run.id, 'merge.started', { taskId: task.id, target, targetHead, files });
+    return { target, targetHead, files, started: true };
+  }
+
+  /** Whether a stage round exists because merging the target branch conflicted. */
+  private resolvesConflict(run: Run, sr: StageRun): boolean {
+    // `rollback` starts the round right after the one that failed.
+    const rounds = this.store.listStageRuns(run.id);
+    const before = rounds[rounds.findIndex((s) => s.id === sr.id) - 1];
+    return before?.failReason === 'conflict';
+  }
+
+  /** What is wrong with a merge an agent was to resolve; null when it is ready to commit. */
+  private async unresolvedMerge(workdir: string, merge: ConflictMerge): Promise<string | null> {
+    if (!(await isMerging(workdir))) {
+      // Committed by the agent itself: against the rules, but merged all the same.
+      if (await isAncestor(workdir, merge.targetHead, 'HEAD')) return null;
+      return t({
+        zh: `工作目录里合并 ${merge.target} 的操作被中止了。不要执行 git merge --abort、git reset 或 git commit；下一次尝试前 Master 会重新开始合并。`,
+        en: `The merge of ${merge.target} in the working directory was given up. Do not run git merge --abort, git reset or git commit; the Master starts the merge again before the next attempt.`,
+      });
+    }
+    const left = await filesWithConflictMarkers(workdir, merge.files);
+    if (left.length === 0) return null;
+    return t({
+      zh: `这些文件里还有冲突标记（<<<<<<<、=======、>>>>>>>）：${joinList(left)}。请解决这些冲突，删掉所有冲突标记，同时保留 ${merge.target} 的改动和本需求的改动。`,
+      en: `These files still have conflict markers (<<<<<<<, =======, >>>>>>>): ${joinList(left)}. Resolve those conflicts and remove every conflict marker, keeping both the changes of ${merge.target} and those of this requirement.`,
     });
   }
 
@@ -1438,12 +1561,11 @@ export class Engine {
     signal: AbortSignal,
   ): Promise<void> {
     const workdir = this.workdir(run);
-    const base = run.baseCommit ?? (await revParse(workdir, 'HEAD'));
+    const head = await revParse(workdir, 'HEAD');
+    const base = await this.reviewBase(run, head);
     const stat = await diffStat(workdir, base);
     this.checkAbort(signal);
     const ctx = this.promptContext(run, sr, eff, []);
-    const head = await revParse(workdir, 'HEAD');
-    this.checkAbort(signal);
     let prompt = reviewPrompt(
       ctx,
       base,
@@ -1631,6 +1753,20 @@ export class Engine {
     if (entry.verdict === 'ask' && waitHours) this.checkReplyTimeouts();
     // Nothing was done in the workspace.
     if (entry.verdict === 'drop') await this.removeMergedWorkspace(run);
+  }
+
+  /**
+   * What a review compares the Run's work against: where its branch and the target branch last
+   * met. That is the Run's base until the Run merges the target branch in (resolving a conflict),
+   * and the target's commit merged from then on, so that the target's own changes are not
+   * reviewed as the Run's. The Run's base when the target branch went somewhere stranger.
+   */
+  private async reviewBase(run: Run, head: string): Promise<string> {
+    const repo = this.store.getRepo(run.repoId);
+    const met = await mergeBase(repo.path, repo.targetBranch, head).catch(() => null);
+    if (!run.baseCommit) return met ?? head;
+    if (met && (await isAncestor(repo.path, run.baseCommit, met))) return met;
+    return run.baseCommit;
   }
 
   /** From round 2 on: the latest review saved by an earlier round of this review stage. */
@@ -2101,8 +2237,9 @@ export class Engine {
   private rollback(run: Run, sr: StageRun): void {
     const def = run.template.stages.find((s) => s.id === sr.stageId);
     const reason = sr.failReason === 'rejected' ? 'reject' : 'fail';
-    // Only review / merge stages fail their checks (failTarget); agent stages rework instead and
-    // reach here only after a rejected approval. The fallback keeps rollbackTarget's rule.
+    // Only review / merge stages fail their checks or a merge (failTarget); agent stages rework
+    // instead and reach here only after a rejected approval. The fallback keeps rollbackTarget's
+    // rule.
     const target =
       (reason === 'fail' ? failTarget(run.template, sr.stageId) : null) ??
       rollbackTarget(run.template, sr.stageId, reason);
@@ -2143,7 +2280,8 @@ export class Engine {
 
   /**
    * Merge stage: bring in the latest target branch, re-run checks if it moved,
-   * then fast-forward the target branch.
+   * then fast-forward the target branch. A conflict goes back to an agent stage to resolve
+   * (`mergeConflict`).
    */
   private async executeMerge(
     run: Run,
@@ -2166,36 +2304,8 @@ export class Engine {
     if (!(await isAncestor(workdir, targetHead, head))) {
       const merged = await mergeOrAbort(workdir, targetHead, `Merge ${target} into ${run.branch}`);
       this.checkAbort(signal);
-      if (!merged) {
-        this.store.addCheck({
-          runId: run.id,
-          stageRunId: sr.id,
-          attemptId: null,
-          kind: 'merge',
-          name: t({ zh: `同步 ${target}`, en: `Sync ${target}` }),
-          passed: false,
-          detail: t({
-            zh: `合并 ${target} 的最新代码时有冲突，已放弃这次合并，工作目录保持原样`,
-            en: `Merging the latest ${target} ran into conflicts; the merge was abandoned and the working directory is unchanged`,
-          }),
-        });
-        // The merge was aborted, so there is nothing to resolve in the worktree yet: tell the
-        // human to redo the merge themselves and commit it, since a retry discards anything
-        // uncommitted before merging again.
-        this.block(run.id, {
-          kind: 'merge_conflict',
-          message: t({
-            zh:
-              `合并 ${target} 的最新代码时有冲突，Master 已放弃这次合并，工作目录保持原样。` +
-              `要自己解决：在 ${workdir} 里运行 \`git merge ${target}\`，解决冲突后 \`git add\` 并 \`git commit\`，再重试（重试时没提交的改动会被丢弃）；` +
-              '不想要这个 Run 了就终止。',
-            en:
-              `Merging the latest ${target} ran into conflicts; the Master abandoned the merge and the working directory is unchanged. ` +
-              `To resolve it yourself: run \`git merge ${target}\` in ${workdir}, resolve the conflicts, \`git add\` and \`git commit\`, then retry (a retry discards uncommitted changes); ` +
-              'cancel the Run if you no longer want it.',
-          }),
-          stageRunId: sr.id,
-        });
+      if (!merged.ok) {
+        this.mergeConflict(run, sr, workdir, target, targetHead, merged);
         return;
       }
       synced = true;
@@ -2280,6 +2390,87 @@ export class Engine {
     this.passStage(run, sr);
   }
 
+  /**
+   * Merging the target branch's latest code conflicted; the merge was given up and the worktree
+   * is as before. When an agent stage can resolve it (`conflictTarget`), the merge stage fails like
+   * failed checks and `rollback` goes back there within max_loops; that round merges the target
+   * branch again and its agent resolves the conflicts (`conflictMerge`). Otherwise, or when git
+   * named no conflicted file (the merge failed some other way), the Run waits for a human.
+   */
+  private mergeConflict(
+    run: Run,
+    sr: StageRun,
+    workdir: string,
+    target: string,
+    targetHead: string,
+    merged: { files: string[]; error: string },
+  ): void {
+    const { files } = merged;
+    const list = files.map((f) => `- ${f}`).join('\n');
+    const resolver = files.length > 0 ? conflictTarget(run.template, sr.stageId) : null;
+    this.store.tx(() => {
+      this.store.addCheck({
+        runId: run.id,
+        stageRunId: sr.id,
+        attemptId: null,
+        kind: 'merge',
+        name: t({ zh: `同步 ${target}`, en: `Sync ${target}` }),
+        passed: false,
+        detail:
+          files.length > 0
+            ? t({
+                zh: `合并 ${target} 的最新代码时，这些文件有冲突，已放弃这次合并：\n${list}`,
+                en: `Merging the latest ${target} ran into conflicts in these files; the merge was abandoned:\n${list}`,
+              })
+            : t({
+                zh: `合并 ${target} 的最新代码失败，已放弃这次合并：${merged.error}`,
+                en: `Merging the latest ${target} failed; the merge was abandoned: ${merged.error}`,
+              }),
+      });
+      if (resolver) {
+        this.store.updateStageRun(sr.id, {
+          status: 'failed',
+          failReason: 'conflict',
+          failFeedback: t({
+            zh: `合并 ${target} 的最新代码（${targetHead.slice(0, 8)}）时，这些文件有冲突：\n${list}\n\n需要合入 ${target} 的最新代码并解决冲突，同时保留本需求的改动。Master 会在工作目录里重新开始这次合并，冲突标记留在文件里。`,
+            en: `Merging the latest ${target} (${targetHead.slice(0, 8)}) ran into conflicts in these files:\n${list}\n\nThe latest ${target} has to be merged in with the conflicts resolved, keeping the changes of this requirement. The Master starts the merge again in the working directory, with the conflict markers left in the files.`,
+          }),
+          endedAt: nowIso(),
+        });
+        this.store.event(run.id, 'stage.failed', {
+          stageId: sr.stageId,
+          reason: 'conflict',
+          files,
+        });
+        return;
+      }
+      const why =
+        files.length > 0
+          ? t({
+              zh: `这些文件有冲突：\n${list}\n合并阶段回退到的不是 Agent 阶段，没法交给 Agent 解决。`,
+              en: `These files conflict:\n${list}\nThe merge stage does not go back to an agent stage, so no agent can resolve them.`,
+            })
+          : t({ zh: `git 报错：${merged.error}`, en: `git says: ${merged.error}` });
+      // The merge was aborted, so there is nothing to resolve in the worktree yet: tell the
+      // human to redo the merge themselves and commit it, since a retry discards anything
+      // uncommitted before merging again.
+      this.block(run.id, {
+        kind: 'merge_conflict',
+        message: t({
+          zh:
+            `合并 ${target} 的最新代码失败，Master 已放弃这次合并，工作目录保持原样。${why}\n` +
+            `要自己解决：在 ${workdir} 里运行 \`git merge ${target}\`，解决冲突后 \`git add\` 并 \`git commit\`，再重试（重试时没提交的改动会被丢弃）；` +
+            '不想要这个 Run 了就终止。',
+          en:
+            `Merging the latest ${target} failed; the Master abandoned the merge and the working directory is unchanged. ${why}\n` +
+            `To resolve it yourself: run \`git merge ${target}\` in ${workdir}, resolve the conflicts, \`git add\` and \`git commit\`, then retry (a retry discards uncommitted changes); ` +
+            'cancel the Run if you no longer want it.',
+        }),
+        stageRunId: sr.id,
+      });
+    });
+  }
+
   private async complete(run: Run): Promise<void> {
     await this.removeMergedWorkspace(run);
     this.setStatus(run.id, 'completed', { finishedAt: nowIso() });
@@ -2317,7 +2508,13 @@ export class Engine {
       });
       this.store.event(run.id, 'task.discarded', { taskId: task.id });
     }
-    if (run.worktreePath && (await hasChanges(run.worktreePath).catch(() => false))) {
+    // Also gives up a merge started for an agent (`conflictMerge`) before the agent ran, which
+    // may leave nothing else to see; it starts again with the task.
+    if (
+      run.worktreePath &&
+      ((await hasChanges(run.worktreePath).catch(() => false)) ||
+        (await isMerging(run.worktreePath)))
+    ) {
       await resetHard(run.worktreePath, 'HEAD');
     }
     // A merge stage may have merged the target branch in without finishing its checks:

@@ -3,6 +3,7 @@ import { setLang } from '../../../src/i18n.js';
 import {
   agentOptionLabel,
   attemptAgentLabel,
+  FAIL_REASON,
   formatAttemptCost,
   formatCost,
   formatDuration,
@@ -339,6 +340,13 @@ describe('format helpers in English', () => {
         .map((s) => s.label)
         .join(' '),
     ).not.toMatch(/[\u4e00-\u9fff]/);
+  });
+
+  it('names every reason a stage round failed, in the language in use', () => {
+    expect(FAIL_REASON.conflict).toBe('\u548c\u76ee\u6807\u5206\u652f\u51b2\u7a81');
+    setLang('en');
+    expect(FAIL_REASON.conflict).toBe('Conflicts with the target branch');
+    expect(Object.values(FAIL_REASON).join(' ')).not.toMatch(/[\u4e00-\u9fff]/);
   });
 
   it('excerpts English command failures and review issues the same way', () => {

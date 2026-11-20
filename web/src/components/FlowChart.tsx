@@ -150,6 +150,16 @@ function FlowStageBody({ stage, progress }: { stage: FlowStage; progress?: FlowP
         </Line>
       )}
       {stage.onFail && <Line label={failLabel()}>{backTo(stage.onFail.name)}</Line>}
+      {stage.kind === 'merge' && (
+        <Line label={t({ zh: '冲突', en: 'Conflicts' })}>
+          {stage.onConflict
+            ? t({
+                zh: `回到「${stage.onConflict.name}」，由 Agent 解决`,
+                en: `Back to "${stage.onConflict.name}", where the agent resolves them`,
+              })
+            : t({ zh: '等人解决', en: 'Wait for a human to resolve them' })}
+        </Line>
+      )}
       {stage.gate && (
         <Line label={t({ zh: '审批', en: 'Approval' })} tone="attention">
           {stage.kind === 'merge'

@@ -156,8 +156,13 @@ const statusText = (status: Run['status']) =>
 
 const failText = (reason: NonNullable<StageRun['failReason']>) =>
   t({
-    zh: { check: '检查未通过', review: '评审未通过', rejected: '审批被驳回' },
-    en: { check: 'checks failed', review: 'review failed', rejected: 'approval rejected' },
+    zh: { check: '检查未通过', review: '评审未通过', rejected: '审批被驳回', conflict: '合并冲突' },
+    en: {
+      check: 'checks failed',
+      review: 'review failed',
+      rejected: 'approval rejected',
+      conflict: 'merge conflict',
+    },
   })[reason];
 
 const resultText = (kind: ResultProblemKind) =>

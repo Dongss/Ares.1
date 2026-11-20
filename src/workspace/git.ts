@@ -44,6 +44,22 @@ async function gitOk(cwd: string, args: string[]): Promise<boolean> {
   }
 }
 
+/** Run git and return its stdout whatever the exit code (for commands that report by exiting 1). */
+function gitOutput(cwd: string, args: string[]): Promise<string> {
+  return new Promise((resolve) => {
+    execFile('git', args, { cwd, maxBuffer: 64 * 1024 * 1024 }, (_err, stdout) => {
+      resolve(stdout ?? '');
+    });
+  });
+}
+
+/** The repo's identity when configured, otherwise an ares1 one (commits and merges need one). */
+async function identityArgs(cwd: string): Promise<string[]> {
+  return (await gitOk(cwd, ['config', 'user.email']))
+    ? []
+    : ['-c', 'user.name=ares1', '-c', 'user.email=ares1@localhost'];
+}
+
 export async function isGitRepo(path: string): Promise<boolean> {
   return gitOk(path, ['rev-parse', '--git-dir']);
 }
@@ -151,13 +167,14 @@ export async function hasChanges(cwd: string): Promise<boolean> {
 /**
  * Commit everything in the worktree. Uses the repo's identity when configured,
  * otherwise falls back to an ares1 identity. Returns null when there is nothing to commit.
+ * During a merge (`startMerge`) it always commits, the merge commit, even when the result is the
+ * same as HEAD (every conflict resolved our way): without it the other branch would not count as
+ * merged and the next merge would conflict again.
  */
 export async function commitAll(cwd: string, message: string): Promise<string | null> {
   await git(cwd, ['add', '-A']);
-  if (await gitOk(cwd, ['diff', '--cached', '--quiet'])) return null;
-  const identity = (await gitOk(cwd, ['config', 'user.email']))
-    ? []
-    : ['-c', 'user.name=ares1', '-c', 'user.email=ares1@localhost'];
+  if (!(await isMerging(cwd)) && (await gitOk(cwd, ['diff', '--cached', '--quiet']))) return null;
+  const identity = await identityArgs(cwd);
   await git(cwd, [...identity, 'commit', '--no-verify', '-q', '-m', message]);
   return revParse(cwd, 'HEAD');
 }
@@ -194,18 +211,77 @@ export async function diffRange(
   return { stat, patch };
 }
 
-/** Merge `ref` into the current branch. Returns false (after aborting) on conflicts. */
-export async function mergeOrAbort(cwd: string, ref: string, message: string): Promise<boolean> {
-  const identity = (await gitOk(cwd, ['config', 'user.email']))
-    ? []
-    : ['-c', 'user.name=ares1', '-c', 'user.email=ares1@localhost'];
+export type MergeOutcome =
+  | { ok: true }
+  /**
+   * `files`: those that conflicted, empty when the merge failed for another reason, which
+   * `error` tells.
+   */
+  | { ok: false; files: string[]; error: string };
+
+/**
+ * Merge `ref` into the current branch. On conflicts the merge is aborted (the worktree is left as
+ * it was) and the conflicted files are returned.
+ */
+export async function mergeOrAbort(
+  cwd: string,
+  ref: string,
+  message: string,
+): Promise<MergeOutcome> {
+  const identity = await identityArgs(cwd);
   try {
     await git(cwd, [...identity, 'merge', '--no-ff', '--no-verify', '-m', message, ref]);
-    return true;
-  } catch {
+    return { ok: true };
+  } catch (err) {
+    const files = await conflictedFiles(cwd).catch(() => []);
     await gitOk(cwd, ['merge', '--abort']);
-    return false;
+    return { ok: false, files, error: err instanceof Error ? err.message : String(err) };
   }
+}
+
+/**
+ * Start merging `ref` into the current branch without committing it: conflicts stay in the files,
+ * with their markers, for someone to resolve. MERGE_HEAD stays as well, so the next commit
+ * (`commitAll`) is the merge commit; `resetHard` gives up the merge. Returns the conflicted files,
+ * empty when everything merged cleanly. Throws when the merge cannot start (e.g. local changes in
+ * the way).
+ */
+export async function startMerge(cwd: string, ref: string): Promise<string[]> {
+  const identity = await identityArgs(cwd);
+  try {
+    await git(cwd, [...identity, 'merge', '--no-commit', '--no-ff', '-q', ref]);
+    return [];
+  } catch (err) {
+    if (!(await isMerging(cwd))) throw err;
+    return conflictedFiles(cwd);
+  }
+}
+
+/** Whether a merge is in progress (MERGE_HEAD exists). */
+export function isMerging(cwd: string): Promise<boolean> {
+  return gitOk(cwd, ['rev-parse', '-q', '--verify', 'MERGE_HEAD']);
+}
+
+/** Files with unresolved conflicts in the index, during a merge. */
+export async function conflictedFiles(cwd: string): Promise<string[]> {
+  const out = await git(cwd, ['diff', '--name-only', '-z', '--diff-filter=U']);
+  return [...new Set(out.split('\0').filter(Boolean))];
+}
+
+/**
+ * Of `files`, those that still have conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`) on lines
+ * added since HEAD, as `git diff --check` finds them; markers HEAD already had are no conflict.
+ */
+export async function filesWithConflictMarkers(cwd: string, files: string[]): Promise<string[]> {
+  const left: string[] = [];
+  for (const file of files) {
+    // One file at a time: the report quotes unusual file names, which then need no parsing.
+    const out = await gitOutput(cwd, ['diff', '--check', 'HEAD', '--', `:(literal)${file}`]);
+    if (out.split('\n').some((line) => line.endsWith(': leftover conflict marker'))) {
+      left.push(file);
+    }
+  }
+  return left;
 }
 
 /** Path of the worktree that has `branch` checked out, if any. */

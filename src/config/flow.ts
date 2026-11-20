@@ -252,7 +252,8 @@ export function rollbackTarget(
  *   the stage itself never fails.
  * - review / merge stage → the stage is marked failed and `rollback` goes to
  *   `rollbackTarget(…, 'fail')`, i.e. `on_fail` or the nearest earlier agent stage.
- *   (A merge stage only fails when its verify commands fail after syncing the target branch.)
+ *   (A merge stage fails when its verify commands fail after syncing the target branch, or when
+ *   syncing it conflicts and `conflictTarget` has an agent stage to resolve that.)
  */
 export function failTarget(template: WorkflowTemplate, stageId: string): string | null {
   const def = template.stages.find((s) => s.id === stageId);
@@ -262,4 +263,17 @@ export function failTarget(template: WorkflowTemplate, stageId: string): string 
     return null;
   }
   return rollbackTarget(template, stageId, 'fail');
+}
+
+/**
+ * Where a merge stage goes when merging the target branch's latest code conflicts: its
+ * `failTarget`, whose agent merges the target branch again and resolves the conflicts (rounds
+ * count toward max_loops like any rollback). Only an agent stage can change files; for anything
+ * else null: the Run waits for a human (`merge_conflict`).
+ */
+export function conflictTarget(template: WorkflowTemplate, stageId: string): string | null {
+  if (template.stages.find((s) => s.id === stageId)?.kind !== 'merge') return null;
+  const target = failTarget(template, stageId);
+  const def = template.stages.find((s) => s.id === target);
+  return def?.kind === 'agent' ? def.id : null;
 }

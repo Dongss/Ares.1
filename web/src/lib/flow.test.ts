@@ -64,7 +64,27 @@ describe('buildFlow', () => {
     }
   });
 
-  it('a merge stage without verify commands cannot fail', () => {
+  it('a merge stage sends a conflict back to the agent stage it fails to', () => {
+    expect(stage('merge')?.onConflict).toEqual({ id: 'code', name: '编码' });
+    // Without verify commands a conflict still goes back there.
+    const noChecks = buildFlow({ template, repoVerifyCommands: [], agents });
+    expect(noChecks.find((s) => s.id === 'merge')?.onConflict).toEqual({
+      id: 'code',
+      name: '编码',
+    });
+    for (const id of ['design', 'code', 'review']) expect(stage(id)?.onConflict).toBeNull();
+    // A stage that cannot change files cannot resolve it: a human does.
+    const toReview = TemplateSchema.parse({
+      ...template,
+      stages: template.stages.map((s) => (s.id === 'merge' ? { ...s, on_fail: 'review' } : s)),
+    });
+    const merge = buildFlow({ template: toReview, repoVerifyCommands: [], agents }).find(
+      (s) => s.id === 'merge',
+    );
+    expect(merge?.onConflict).toBeNull();
+  });
+
+  it('a merge stage without verify commands cannot fail its checks', () => {
     const noChecks = buildFlow({ template, repoVerifyCommands: [], agents });
     const merge = noChecks.find((s) => s.id === 'merge');
     expect(merge).toMatchObject({ commands: [], onFail: null });

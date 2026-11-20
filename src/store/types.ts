@@ -271,7 +271,11 @@ export interface Scout {
   endedAt: string | null;
 }
 
-export type StageFailReason = 'check' | 'review' | 'rejected';
+/**
+ * check: verify commands failed; review: the reviewer asked for changes; rejected: the approval
+ * was rejected; conflict: merging the target branch's latest code conflicted (merge stages).
+ */
+export type StageFailReason = 'check' | 'review' | 'rejected' | 'conflict';
 
 export interface StageRun {
   id: string;

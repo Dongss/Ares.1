@@ -78,11 +78,11 @@ export const NOTICE_KINDS: Record<NoticeKind, { label: string; when: string }> =
   blocked: {
     zh: {
       label: 'Run 卡住了',
-      when: 'Run 停下来等你处理，标题后面写着原因，例如合并冲突、超出预算，或配置为等人（on_exhausted: human）时返工次数用完仍未通过',
+      when: 'Run 停下来等你处理，标题后面写着原因，例如超出预算、目标分支有未提交的改动，或配置为等人（on_exhausted: human）时返工次数用完仍未通过',
     },
     en: {
       label: 'Run is stuck',
-      when: 'A Run stopped and waits for you, with the reason after the title, e.g. a merge conflict, over budget, or still failing after all retries with on_exhausted: human',
+      when: 'A Run stopped and waits for you, with the reason after the title, e.g. over budget, uncommitted changes on the target branch, or still failing after all retries with on_exhausted: human',
     },
   },
   failed: {

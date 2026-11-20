@@ -75,6 +75,20 @@ describe('prompts', () => {
     expect(prompt).not.toContain('改文件请直接用编辑文件的工具');
   });
 
+  it('tells the agent about a merge in progress and its conflicts, only when there is one', () => {
+    expect(taskPrompt(ctx(), null, 'full')).not.toContain('未完成的合并');
+    const prompt = taskPrompt(ctx(), null, 'full', { target: 'main', files: ['a.ts', 'b.md'] });
+    expect(prompt).toContain('## 未完成的合并');
+    expect(prompt).toContain('开始合并 main 的最新代码（git merge --no-commit）');
+    expect(prompt).toContain('- `a.ts`\n- `b.md`');
+    expect(prompt).toContain('同时保留 main 的改动和本需求的改动');
+    expect(prompt).toContain('删掉所有冲突标记');
+    expect(prompt).toContain('不要执行 git commit、git merge --abort、git reset');
+    const clean = taskPrompt(ctx(), null, 'full', { target: 'main', files: [] });
+    expect(clean).toContain('这次合并没有冲突');
+    expect(clean).not.toContain('冲突的地方');
+  });
+
   it('leaves out the verify commands when there are none, under either permission', () => {
     for (const permission of ['full', 'safe'] as const) {
       const prompt = taskPrompt({ ...ctx(), verifyCommands: [] }, null, permission);
@@ -281,6 +295,8 @@ describe('prompts in English', () => {
         [],
         null,
       ),
+      mergeTask: taskPrompt(enCtx(), null, 'full', { target: 'main', files: ['a.ts'] }),
+      cleanMergeTask: taskPrompt(enCtx(), null, 'safe', { target: 'main', files: [] }),
     };
     for (const [name, prompt] of Object.entries(prompts)) {
       expect(prompt, name).not.toMatch(CJK);
@@ -304,6 +320,10 @@ describe('prompts in English', () => {
       '### Attempt 1 (Run run_a, failed in the "Coding" stage)\n\ntests kept failing',
     );
     expect(prompts.redoAssess).toContain('if the requirement itself is the problem, say so');
+    expect(prompts.mergeTask).toContain('## A merge in progress');
+    expect(prompts.mergeTask).toContain('- `a.ts`');
+    expect(prompts.mergeTask).toContain('Do not run git commit, git merge --abort or git reset');
+    expect(prompts.cleanMergeTask).toContain('This merge has no conflicts');
     for (const name of ['task', 'safeTask', 'review', 'assess'] as const) {
       expect(prompts[name], name).toContain(
         'do not read issues or comments on GitHub yourself (with `gh issue view`, for example). There are no GitHub credentials here',

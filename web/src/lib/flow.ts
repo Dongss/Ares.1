@@ -1,5 +1,6 @@
 import { agentEffort } from '../../../src/config/effort.js';
 import {
+  conflictTarget,
   effectiveStage,
   failTarget,
   replyTimeoutHours,
@@ -64,6 +65,11 @@ export interface FlowStage extends FlowStageRef {
    * which cannot fail.
    */
   onFail: FlowStageRef | null;
+  /**
+   * Merge stages: the agent stage that resolves a conflict with the target branch
+   * (`conflictTarget`); null when a conflict waits for a human, and for other stages.
+   */
+  onConflict: FlowStageRef | null;
   /** Where the stage goes back to when the approval is rejected; null without a gate. */
   onReject: FlowStageRef | null;
 }
@@ -105,6 +111,7 @@ export function buildFlow({
     // Without a repo, a merge stage on the repo default may have commands, so it may fail.
     const failsTo =
       def.kind === 'merge' && commands?.length === 0 ? null : failTarget(template, def.id);
+    const conflictTo = conflictTarget(template, def.id);
     return {
       id: def.id,
       name: def.name ?? def.id,
@@ -125,6 +132,7 @@ export function buildFlow({
       replyTimeoutHours: def.kind === 'assess' ? replyTimeoutHours(def) : null,
       gate: eff.gate,
       onFail: failsTo === null ? null : ref(failsTo),
+      onConflict: conflictTo === null ? null : ref(conflictTo),
       onReject: eff.gate ? ref(rollbackTarget(template, def.id, 'reject')) : null,
     };
   });

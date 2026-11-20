@@ -277,6 +277,7 @@ export type RunOverrides = z.infer<typeof RunOverridesSchema>;
 // Rules on top of these types (effective settings, rollback targets) live in flow.ts, which the
 // dashboard imports too.
 export {
+  conflictTarget,
   defaultRollbackTarget,
   type EffectiveStage,
   effectiveBudget,
