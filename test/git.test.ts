@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { readFileSync, rmSync } from 'node:fs';
+import { readFileSync, realpathSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
@@ -16,6 +16,7 @@ import {
   resetHard,
   revParse,
   startMerge,
+  targetCheckoutDirty,
 } from '../src/workspace/git.js';
 import { git, initRepo, tmpDir, writeFile } from './helpers.js';
 
@@ -82,6 +83,22 @@ describe('git workspace', () => {
     git(repo, 'commit', '-qam', 'diverge');
     const diverged = await fastForwardBranch(repo, 'main', sha);
     expect(diverged).toMatchObject({ ok: false, reason: 'diverged' });
+  });
+
+  it('targetCheckoutDirty finds uncommitted changes where the target is checked out', async () => {
+    const repo = initRepo();
+    expect(await targetCheckoutDirty(repo, 'main')).toBeUndefined();
+    // Untracked files do not count, as for the fast-forward.
+    writeFile(join(repo, 'new.txt'), 'new\n');
+    expect(await targetCheckoutDirty(repo, 'main')).toBeUndefined();
+    writeFile(join(repo, 'README.md'), 'dirty\n');
+    expect(await targetCheckoutDirty(repo, 'main')).toEqual({
+      worktree: realpathSync(repo),
+      status: ' M README.md',
+    });
+    // Not checked out anywhere: nothing to disturb.
+    git(repo, 'checkout', '-q', '-b', 'other');
+    expect(await targetCheckoutDirty(repo, 'main')).toBeUndefined();
   });
 
   it('removeWorktree removes the worktree and branch and tolerates missing ones', async () => {

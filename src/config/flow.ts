@@ -146,8 +146,11 @@ export function discussionReplyWait(
 /** A repo's unfinished Runs, by whether they go on without a human. */
 export interface UnfinishedRuns<R> {
   /**
-   * They go on by themselves: queued, running, or waiting for a reply to the assessment's
-   * questions that times out (`discussionReplyWait`).
+   * They go on by themselves: queued, running, waiting for a reply to the assessment's
+   * questions that times out (`discussionReplyWait`), or waiting for uncommitted changes on the
+   * target branch to go away (`target_dirty`): nobody has to decide anything for those, they
+   * only pause while a human's changes are in the way, and the engine merges them once the
+   * changes are committed or discarded.
    */
   moving: R[];
   /**
@@ -172,6 +175,7 @@ export function splitUnfinishedRuns<
     const moving =
       run.status === 'queued' ||
       run.status === 'running' ||
+      (run.status === 'blocked' && run.blocked?.kind === 'target_dirty') ||
       discussionReplyWait(run, stageIdOf) !== null;
     (moving ? split.moving : split.stuck).push(run);
   }

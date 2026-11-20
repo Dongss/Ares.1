@@ -912,6 +912,19 @@ describe('splitUnfinishedRuns', () => {
     expect(ids(stuck)).toEqual(['approval', 'paused', 'error', 'setup', 'budget', 'stranger']);
   });
 
+  it('lets a Run waiting for changes on its target branch to clear move on, as the engine does', () => {
+    const { moving, stuck } = splitUnfinishedRuns(
+      [
+        run('dirty', 'blocked', 'target_dirty'),
+        run('conflict', 'blocked', 'merge_conflict'),
+        run('workspace', 'blocked', 'workspace'),
+      ],
+      stageIdOf,
+    );
+    expect(ids(moving)).toEqual(['dirty']);
+    expect(ids(stuck)).toEqual(['conflict', 'workspace']);
+  });
+
   it('lets a Run waiting for a reply move on only when the reply times out, as the engine does', () => {
     const { moving, stuck } = splitUnfinishedRuns(
       [

@@ -66,6 +66,11 @@ export interface MasterOptions {
   /** How long a Run waits for its rate-limited agent's quota (tests shorten it). */
   rateLimitWait?: RateLimitWait;
   /**
+   * How often a Run blocked on uncommitted changes on its target branch looks again whether they
+   * are gone (tests shorten it).
+   */
+  dirtyTargetCheckMs?: number;
+  /**
    * Language of the default config files written on first start (the CLI passes the system's);
    * omitted = the default. After that, config.yaml's `language` is the one in use.
    */
@@ -156,6 +161,7 @@ export class Master {
       now: opts.now,
       agentRetryBackoff: opts.agentRetryBackoff,
       rateLimitWait: opts.rateLimitWait,
+      dirtyTargetCheckMs: opts.dirtyTargetCheckMs,
     });
     const issues = new IssueBridge({ store, engine, paths, config, adapters, github: opts.github });
     const notifier = new SystemNotifier(store, config, opts.notice);

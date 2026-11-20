@@ -295,6 +295,26 @@ export async function worktreeForBranch(repo: string, branch: string): Promise<s
   return undefined;
 }
 
+/** Uncommitted changes to tracked files in a worktree (`git status --porcelain`); '' = none. */
+function trackedChanges(worktree: string): Promise<string> {
+  return git(worktree, ['status', '--porcelain', '--untracked-files=no']);
+}
+
+/**
+ * Where `target` is checked out with uncommitted changes, which keep `fastForwardBranch` from
+ * moving it; undefined when it is clean or not checked out anywhere. Used to see when a human
+ * has cleared them.
+ */
+export async function targetCheckoutDirty(
+  repo: string,
+  target: string,
+): Promise<{ worktree: string; status: string } | undefined> {
+  const worktree = await worktreeForBranch(repo, target);
+  if (worktree === undefined) return undefined;
+  const status = await trackedChanges(worktree);
+  return status.length > 0 ? { worktree, status } : undefined;
+}
+
 /**
  * Move `target` forward to `newHead` (which must descend from it) without disturbing anyone:
  * - target not checked out anywhere: compare-and-swap the ref;
@@ -322,7 +342,7 @@ export async function fastForwardBranch(
     await git(repo, ['update-ref', `refs/heads/${target}`, newHead, oldHead]);
     return { ok: true };
   }
-  const status = await git(wt, ['status', '--porcelain', '--untracked-files=no']);
+  const status = await trackedChanges(wt);
   if (status.length > 0) {
     return {
       ok: false,

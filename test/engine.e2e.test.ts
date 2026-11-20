@@ -466,6 +466,99 @@ agents:
     expect(existsSync(join(h.repoDir, 'feature.txt'))).toBe(true);
   });
 
+  /** A Run blocked because main, checked out in the repo, has an uncommitted edit. */
+  async function blockOnDirtyTarget(target: Harness): Promise<Run> {
+    const run = target.run();
+    await target.waitStatus(run.id, 'waiting_approval');
+    writeFile(join(target.repoDir, 'README.md'), '# local edit\n');
+    target.master.engine.approve(run.id);
+    const blocked = await target.waitStatus(run.id, 'blocked');
+    expect(blocked.blocked?.kind).toBe('target_dirty');
+    await waitFor(() => target.master.engine.activeRunId === undefined, 'the Run to stop');
+    return blocked;
+  }
+
+  it('goes on merging by itself once the changes on the target branch are gone', async () => {
+    const sent: string[] = [];
+    h = await harness({
+      config: 'notify:\n  system: true\n',
+      master: { notice: (title) => sent.push(title) },
+    });
+    const { store, engine } = h.master;
+    const run = await blockOnDirtyTarget(h);
+    expect(run.blocked?.message).toContain('README.md');
+    expect(run.blocked?.message).toContain('提交或丢弃这些改动后，Run 会自动继续合并，不用重试');
+    expect(sent.at(-1)).toContain('Run 卡住了');
+
+    // The changes are still there: nothing changes, and nobody is notified again.
+    const events = store.listEvents(run.id).length;
+    const notices = sent.length;
+    expect(await engine.checkDirtyTargets()).toEqual([]);
+    expect(store.getRun(run.id)).toMatchObject({
+      status: 'blocked',
+      blocked: { kind: 'target_dirty' },
+    });
+    expect(store.listEvents(run.id)).toHaveLength(events);
+    expect(sent).toHaveLength(notices);
+
+    // Committed: main moved, so the merge stage syncs and checks again before it fast-forwards.
+    git(h.repoDir, 'commit', '-q', '-am', 'local edit');
+    expect(await engine.checkDirtyTargets()).toEqual([run.id]);
+    await h.waitStatus(run.id, 'completed');
+    expect(readFileSync(join(h.repoDir, 'README.md'), 'utf8')).toBe('# local edit\n');
+    expect(readFileSync(join(h.repoDir, 'feature.txt'), 'utf8')).toBe('ok\n');
+    const after = store.listEvents(run.id);
+    expect(after.find((e) => e.type === 'merge.target_clean')?.data).toEqual({ target: 'main' });
+    expect(after.some((e) => e.type === 'merge.synced')).toBe(true);
+    expect(after.filter((e) => e.type === 'run.blocked')).toHaveLength(1);
+    expect(after.some((e) => e.type === 'run.retry')).toBe(false);
+    // Nothing is left to check.
+    expect(await engine.checkDirtyTargets()).toEqual([]);
+  });
+
+  it('checks the target branch again by itself while a Run waits for it', async () => {
+    h = await harness({ master: { dirtyTargetCheckMs: 20 } });
+    const { store } = h.master;
+    const run = await blockOnDirtyTarget(h);
+    // Several checks find the changes still there and leave the Run as it is.
+    const events = store.listEvents(run.id).length;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(store.getRun(run.id).status).toBe('blocked');
+    expect(store.listEvents(run.id)).toHaveLength(events);
+
+    // Discarded: the next check moves it on, with no call from anyone.
+    git(h.repoDir, 'checkout', '--', 'README.md');
+    await h.waitStatus(run.id, 'completed');
+    expect(existsSync(join(h.repoDir, 'feature.txt'))).toBe(true);
+  });
+
+  it('does not go on by itself while the work switch is off; switching it on checks again', async () => {
+    h = await harness();
+    const { store, engine } = h.master;
+    const run = await blockOnDirtyTarget(h);
+    git(h.repoDir, 'checkout', '--', 'README.md');
+
+    engine.setWorking(false);
+    expect(await engine.checkDirtyTargets()).toEqual([]);
+    expect(store.getRun(run.id).status).toBe('blocked');
+    expect(store.listEvents(run.id).some((e) => e.type === 'merge.target_clean')).toBe(false);
+
+    engine.setWorking(true);
+    await h.waitStatus(run.id, 'completed');
+    expect(store.listEvents(run.id).some((e) => e.type === 'merge.target_clean')).toBe(true);
+  });
+
+  it('goes on at start when the changes were cleared while the Master was stopped', async () => {
+    const first = await harness();
+    const run = await blockOnDirtyTarget(first);
+    await first.close();
+    git(first.repoDir, 'checkout', '--', 'README.md');
+
+    h = await harness({ home: first.home, repoDir: first.repoDir });
+    await h.waitStatus(run.id, 'completed');
+    expect(existsSync(join(h.repoDir, 'feature.txt'))).toBe(true);
+  });
+
   it('blocks on a merge conflict when no agent stage can resolve it, until a human does', async () => {
     // The merge stage goes back to the review stage, which cannot change files.
     h = await harness({

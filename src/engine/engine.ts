@@ -66,6 +66,7 @@ import {
   resetHard,
   revParse,
   startMerge,
+  targetCheckoutDirty,
 } from '../workspace/git.js';
 import {
   ASSESS_REPORT_JSON_SCHEMA,
@@ -102,6 +103,11 @@ export interface EngineDeps {
   agentRetryBackoff?: Backoff;
   /** How long a Run waits for its rate-limited agent's quota; default `RATE_LIMIT_WAIT`. */
   rateLimitWait?: RateLimitWait;
+  /**
+   * How often a Run blocked on uncommitted changes on its target branch looks again whether they
+   * are gone; default `DIRTY_TARGET_CHECK_MS`.
+   */
+  dirtyTargetCheckMs?: number;
 }
 
 /** An exponential backoff: the first wait, doubled on each further retry up to the longest. */
@@ -179,6 +185,12 @@ export function switchCandidate(
  * is caught up with soon after.
  */
 const MAX_TIMER_MS = 3_600_000;
+
+/**
+ * How often Runs blocked on uncommitted changes on their target branch (`target_dirty`) look
+ * again whether a human has committed or discarded them, to go on merging by themselves.
+ */
+export const DIRTY_TARGET_CHECK_MS = 60_000;
 
 /** Where an attempt's normalized events are kept (one JSON record per line), next to its raw log. */
 export function attemptEventsPath(logPath: string): string {
@@ -270,6 +282,10 @@ export class Engine {
   private readonly cleanups = new Map<string, Promise<Run>>();
   /** Wakes `checkReplyTimeouts` at the next discussion's deadline. */
   private replyTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Wakes `checkDirtyTargets` while Runs wait for their target branch's changes to clear. */
+  private dirtyTimer: ReturnType<typeof setTimeout> | undefined;
+  /** The `checkDirtyTargets` in progress (or the last one); the next waits for it. */
+  private dirtyCheck: Promise<unknown> = Promise.resolve();
   /**
    * Queued Runs whose agent was out of quota or rate-limited, by Run id: `kick` passes them by
    * until `until` (epoch ms). Kept in memory only: after a Master restart they just try again.
@@ -314,9 +330,11 @@ export class Engine {
       await this.discardInFlight(this.store.getRun(run.id));
       this.requeueHead(run.id, 'run.recovered');
     }
-    // Discussions may have timed out while the Master was not running.
+    // Discussions may have timed out while the Master was not running, and target branches may
+    // have been cleaned up.
     this.checkReplyTimeouts();
     this.kick();
+    void this.checkDirtyTargets();
   }
 
   /** Graceful shutdown: stop the active agent like a manual pause and requeue its Run. */
@@ -324,6 +342,8 @@ export class Engine {
     this.stopping = true;
     clearTimeout(this.replyTimer);
     this.replyTimer = undefined;
+    clearTimeout(this.dirtyTimer);
+    this.dirtyTimer = undefined;
     clearTimeout(this.limitTimer);
     this.limitTimer = undefined;
     this.limitWaits.clear();
@@ -442,6 +462,7 @@ export class Engine {
     if (on) {
       this.checkReplyTimeouts();
       this.kick();
+      void this.checkDirtyTargets();
     }
     return this.store.working;
   }
@@ -795,6 +816,93 @@ export class Engine {
       });
     }
     this.store.event(run.id, 'discussion.timed_out', { hours });
+  }
+
+  /**
+   * Runs blocked because their target branch is checked out with uncommitted changes
+   * (`target_dirty`) need no decision from a human, only the changes gone: once they are
+   * committed or discarded, each such Run goes back to the head of the queue, and its merge stage
+   * syncs, checks and fast-forwards again. Runs whose changes are still there are left as they
+   * are. Not while the work switch is off; switching it on checks again. While such Runs are
+   * left, it checks again every `DIRTY_TARGET_CHECK_MS`. One check at a time: a call during a
+   * check runs after it, as it may come from a change that check did not see. Returns the Runs
+   * that went on.
+   */
+  checkDirtyTargets(): Promise<string[]> {
+    const check = this.dirtyCheck.then(() => this.recheckDirtyTargets());
+    this.dirtyCheck = check;
+    return check;
+  }
+
+  /** `checkDirtyTargets` itself; never rejects, so that a timer can start it. */
+  private async recheckDirtyTargets(): Promise<string[]> {
+    clearTimeout(this.dirtyTimer);
+    this.dirtyTimer = undefined;
+    const resumed: string[] = [];
+    try {
+      // Several Runs of one repo share its target branch: look at it once.
+      const dirtyByRepo = new Map<string, Promise<boolean>>();
+      for (const run of this.dirtyTargetRuns()) {
+        if (this.stopping || !this.store.working) break;
+        const repo = this.store.findRepo(run.repoId);
+        if (!repo) continue;
+        let dirty = dirtyByRepo.get(repo.id);
+        if (!dirty) {
+          // The same check as the merge stage's fast-forward. When git fails, the Run stays
+          // blocked until the next check.
+          dirty = targetCheckoutDirty(repo.path, repo.targetBranch).then(
+            (found) => found !== undefined,
+            () => true,
+          );
+          dirtyByRepo.set(repo.id, dirty);
+        }
+        if (await dirty) continue;
+        if (this.stopping) break;
+        if (this.resumeCleanTarget(run, repo.targetBranch)) resumed.push(run.id);
+      }
+      if (resumed.length > 0) this.kick();
+      this.scheduleDirtyCheck();
+    } catch {
+      // The store failed (e.g. the Master is shutting down): the Runs stay blocked, and a human
+      // can still retry them.
+    }
+    return resumed;
+  }
+
+  /** Runs waiting for uncommitted changes on their target branch to go away. */
+  private dirtyTargetRuns(): Run[] {
+    return this.store
+      .listRuns({ status: 'blocked' })
+      .filter((r) => r.blocked?.kind === 'target_dirty');
+  }
+
+  /** Check again in `DIRTY_TARGET_CHECK_MS` while some Run waits for its target branch. */
+  private scheduleDirtyCheck(): void {
+    if (this.stopping || this.dirtyTimer || this.dirtyTargetRuns().length === 0) return;
+    const timer = setTimeout(
+      () => void this.checkDirtyTargets(),
+      this.deps.dirtyTargetCheckMs ?? DIRTY_TARGET_CHECK_MS,
+    );
+    timer.unref();
+    this.dirtyTimer = timer;
+  }
+
+  /**
+   * The target branch's changes are gone: put the Run back at the head of the queue, in one
+   * transaction. Nothing changes when it was retried, cancelled or blocked on something else
+   * while git looked, or the work switch was turned off meanwhile.
+   */
+  private resumeCleanTarget(run: Run, target: string): boolean {
+    const before = run.blocked;
+    if (!before) return false;
+    return this.store.tx(() => {
+      const current = this.store.getRun(run.id);
+      if (current.status !== 'blocked' || !sameBlock(current.blocked, before)) return false;
+      if (!this.store.working) return false;
+      this.store.event(run.id, 'merge.target_clean', { target });
+      this.requeueHead(run.id, 'run.resumed');
+      return true;
+    });
   }
 
   /**
@@ -2415,7 +2523,13 @@ export class Engine {
         passed: false,
         detail: ff.detail,
       });
-      this.block(run.id, { kind: 'target_dirty', message: ff.detail, stageRunId: sr.id });
+      // Nothing for a human to decide: the Run goes on by itself once the changes are gone.
+      const message = `${ff.detail}\n\n${t({
+        zh: '提交或丢弃这些改动后，Run 会自动继续合并，不用重试。',
+        en: 'Once these changes are committed or discarded, the Run goes on merging by itself; no retry needed.',
+      })}`;
+      this.block(run.id, { kind: 'target_dirty', message, stageRunId: sr.id });
+      this.scheduleDirtyCheck();
       return;
     }
     this.store.addCheck({

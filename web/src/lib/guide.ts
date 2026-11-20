@@ -632,8 +632,8 @@ export function scoutGuide(
   const conditions = [
     t({ zh: '工作开关是「工作中」', en: 'The work switch is on ("Working")' }),
     t({
-      zh: '仓库没有会自己往下走的 Run（排队、执行中，或等评估回复且设了超时）：手上的活做完了才找新活；只等人的 Run 不用等，算进下面的上限',
-      en: 'The repo has no Run that goes on by itself (queued, running, or waiting for a reply to the assessment that times out): new work is found only once the current work is done; Runs only a human moves on are not waited for, and count toward the limit below',
+      zh: '仓库没有会自己往下走的 Run（排队、执行中、等评估回复且设了超时，或等目标分支上的改动清掉后自动合并）：手上的活做完了才找新活；只等人的 Run 不用等，算进下面的上限',
+      en: 'The repo has no Run that goes on by itself (queued, running, waiting for a reply to the assessment that times out, or waiting for uncommitted changes on the target branch to clear before it merges): new work is found only once the current work is done; Runs only a human moves on are not waited for, and count toward the limit below',
     }),
     t({ zh: '不在等 Master 升级', en: 'No Master upgrade is pending' }),
     budget.dailyUsd === null

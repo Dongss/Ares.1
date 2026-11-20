@@ -491,8 +491,8 @@ function retryHint(kind: BlockKind): string {
       en: 'The Master gave up this merge, so there is no conflict to resolve in the worktree. Run git merge <target branch> in the worktree, resolve the conflicts, git add and git commit, then retry (uncommitted changes are discarded on retry). Cancel the Run if you no longer want it.',
     },
     target_dirty: {
-      zh: '先提交或清理目标分支所在目录中的改动，再重试。',
-      en: 'Commit or clean up the changes in the directory of the target branch, then retry.',
+      zh: '提交或丢弃目标分支所在目录中的改动后，Run 会在约一分钟内自动继续合并，不用重试；也可以清掉改动后手动重试，立刻继续。',
+      en: 'Once the changes in the directory of the target branch are committed or discarded, the Run goes on merging by itself within about a minute; no retry needed. You can also retry by hand after clearing them to go on at once.',
     },
     setup_failed: {
       zh: '重试会重新创建工作目录并执行准备命令。',
