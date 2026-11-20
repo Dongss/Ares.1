@@ -30,8 +30,8 @@ import {
 import { join, t } from '../i18n.js';
 import type { Store } from '../store/store.js';
 import type { Attempt, CheckResult, Run, Scout, ScoutProposal, StageRun } from '../store/types.js';
-import type { GhIssue } from './client.js';
-import { isRetriesExhaustedComment, LABELS, stripMarker } from './issues.js';
+import type { GhAuthored, GhIssue } from './client.js';
+import { isRetriesExhaustedComment, isTrusted, LABELS, stripMarker } from './issues.js';
 
 export const ProposalSchema = z.object({
   title: z.string().trim().min(1).max(120),
@@ -410,6 +410,15 @@ function tookText(times: RunTimes): string {
   });
 }
 
+/**
+ * Whether the Run's goal may go into a prompt: anything but the goal of an issue written by
+ * someone the Master does not trust, before a human confirmed it.
+ */
+function trustedGoal(run: Run): boolean {
+  const untrusted = run.issue?.untrusted;
+  return !untrusted || untrusted.confirmedAt !== null;
+}
+
 /** Recent Runs of the repo, with what went wrong in them: the scout's best evidence. */
 export function runDigest(store: Store, repoId: string, limit = 15): string {
   const runs = store.listRuns({ repoId }).slice(0, limit);
@@ -429,7 +438,12 @@ export function runDigest(store: Store, repoId: string, limit = 15): string {
       const took = run.finishedAt ? tookText(storedRunTimes(store, run)) : '';
       const status = statusText(run.status);
       const date = run.createdAt.slice(0, 10);
-      const goal = oneLine(run.goal.split('\n')[0] ?? '', 100);
+      const goal = trustedGoal(run)
+        ? oneLine(run.goal.split('\n')[0] ?? '', 100)
+        : t({
+            zh: `#${run.issue?.number}（issue 的作者不是仓库成员，也没有人确认过，内容不列出）`,
+            en: `#${run.issue?.number} (written by someone who is not a member of the repo and confirmed by nobody, so not shown)`,
+          });
       const roundList =
         [...rounds].map(([id, n]) => `${name(id)}×${n}`).join(' ') || t({ zh: '无', en: 'none' });
       const cost = `$${run.costUsd.toFixed(2)}`;
@@ -448,8 +462,12 @@ export function runDigest(store: Store, repoId: string, limit = 15): string {
         }),
       ];
       // Blocked on the discussion: its lines below say so and list the questions the block
-      // message repeats.
-      if (run.blocked && run.blocked.kind !== 'discussion') {
+      // message repeats. Waiting for a human to confirm an untrusted goal: the goal says so.
+      if (
+        run.blocked &&
+        run.blocked.kind !== 'discussion' &&
+        run.blocked.kind !== 'untrusted_issue'
+      ) {
         lines.push(
           `  ${t({ zh: '卡住', en: 'Stuck' })}${colon()}${oneLine(run.blocked.message, 300)}`,
         );
@@ -468,17 +486,24 @@ export function runDigest(store: Store, repoId: string, limit = 15): string {
     .join('\n');
 }
 
-/** Existing issues, so the scout does not propose them again; rejections are counterexamples. */
-export function issueDigest(open: GhIssue[], closed: GhIssue[]): string {
+/**
+ * Existing issues, so the scout does not propose them again; rejections are counterexamples.
+ * Anybody can open an issue or comment on a public repo, so only issues and comments written by
+ * people the Master trusts (`isTrusted`, the Master itself included) are listed; `master` is the
+ * login the Master acts as.
+ */
+export function issueDigest(open: GhIssue[], closed: GhIssue[], master: string | null): string {
+  const trusted = <T extends GhAuthored>(items: T[]) => items.filter((i) => isTrusted(i, master));
   const labels = (i: GhIssue) => {
     const ours = i.labels.filter((l) => l.startsWith('ares1:'));
     return ours.length ? ` [${ours.join(', ')}]` : '';
   };
-  const openLines = open.map((i) => `- #${i.number}${labels(i)} ${i.title}`);
-  const closedLines = closed.map((i) => {
+  const openLines = trusted(open).map((i) => `- #${i.number}${labels(i)} ${i.title}`);
+  const closedLines = trusted(closed).map((i) => {
+    const comments = trusted(i.comments).map((c) => c.body);
     // Closed by the Master after every attempt failed: not a human's rejection.
-    const exhausted = i.comments.findLast(isRetriesExhaustedComment);
-    if (i.stateReason === 'not_planned' && exhausted && exhausted === i.comments.at(-1)) {
+    const exhausted = comments.findLast(isRetriesExhaustedComment);
+    if (i.stateReason === 'not_planned' && exhausted && exhausted === comments.at(-1)) {
       const head = t({
         zh: '多次失败后关闭（不是人拒绝的）',
         en: 'Closed after repeated failures (not rejected by a human)',
@@ -487,7 +512,7 @@ export function issueDigest(open: GhIssue[], closed: GhIssue[]): string {
       return `- #${i.number} ${head}${colon()}${i.title}\n  ${reasons}`;
     }
     if (i.stateReason === 'not_planned') {
-      const last = i.comments.at(-1);
+      const last = comments.at(-1);
       const reason = last && stripMarker(last);
       const why = reason
         ? `\n  ${t({ zh: '理由', en: 'Reason' })}${colon()}${oneLine(reason, 300)}`

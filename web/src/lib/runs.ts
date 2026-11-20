@@ -274,6 +274,42 @@ export interface DiscussionItem {
   tone: Tone;
   text: string;
   at: string;
+  /** What else happened to it, e.g. comments on the issue that were not taken as replies. */
+  note?: string;
+}
+
+/**
+ * 「issue 上有 2 条非仓库成员的评论，没有当作回复」: comments after the assessment's questions by
+ * people the Master does not trust.
+ */
+export function ignoredCommentsText(n: number): string {
+  return t({
+    zh: `issue 上有 ${n} 条非仓库成员的评论，没有当作回复，也不会交给 Agent`,
+    en: `${n} comment${n === 1 ? '' : 's'} on the issue by non-members of the repo ${n === 1 ? 'was' : 'were'} not taken as ${n === 1 ? 'a reply' : 'replies'} and ${n === 1 ? 'does' : 'do'} not go to the agents`,
+  });
+}
+
+/**
+ * 「issue 作者 @x（NONE）不是仓库成员……」: what the Run page says about an issue written by
+ * someone the Master does not trust; null when it trusts the author (or did not check).
+ */
+export function untrustedIssueText(issue: Run['issue']): string | null {
+  const untrusted = issue?.untrusted;
+  if (!untrusted) return null;
+  const who = untrusted.author
+    ? `@${untrusted.author}`
+    : t({ zh: '已删除的账号', en: 'a deleted account' });
+  const role = untrusted.association;
+  if (untrusted.confirmedAt === null) {
+    return t({
+      zh: `issue 的作者 ${who}（${role}）不是仓库成员：目标是建 Run 时 issue 的内容，要你确认后才交给 Agent。`,
+      en: `The issue's author ${who} (${role}) is not a member of the repo: the goal is the issue as it was when the Run was created, and goes to the agents only once you confirm it.`,
+    });
+  }
+  return t({
+    zh: `issue 的作者 ${who}（${role}）不是仓库成员：目标是建 Run 时 issue 的内容，${formatTime(untrusted.confirmedAt)} 由人确认后才交给 Agent。`,
+    en: `The issue's author ${who} (${role}) is not a member of the repo: the goal is the issue as it was when the Run was created, confirmed by a human at ${formatTime(untrusted.confirmedAt)} before it went to the agents.`,
+  });
 }
 
 /** The discussion, oldest first, as the Run detail lists it. */
@@ -309,6 +345,7 @@ export function discussionItems(discussion: readonly DiscussionEntry[]): Discuss
       tone: e.verdict === 'ask' ? 'attention' : e.verdict === 'go' ? 'success' : 'muted',
       text: formatAssessment(e),
       at: e.at,
+      ...(e.ignoredComments ? { note: ignoredCommentsText(e.ignoredComments) } : {}),
     };
   });
 }

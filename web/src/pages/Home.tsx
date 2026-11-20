@@ -139,10 +139,12 @@ function attentionExtra(run: RunSummary): ReactNode {
                 zh: '需求待讨论，等你回复',
                 en: 'Requirement under discussion, waiting for your reply',
               })
-            : t({
-                zh: `卡住：${BLOCK_KIND[run.blocked.kind]}`,
-                en: `Stuck: ${BLOCK_KIND[run.blocked.kind]}`,
-              })}
+            : run.blocked.kind === 'untrusted_issue'
+              ? BLOCK_KIND.untrusted_issue
+              : t({
+                  zh: `卡住：${BLOCK_KIND[run.blocked.kind]}`,
+                  en: `Stuck: ${BLOCK_KIND[run.blocked.kind]}`,
+                })}
         </div>
         <div className="run-card-note-detail">{messageExcerpt(run.blocked.message)}</div>
       </div>

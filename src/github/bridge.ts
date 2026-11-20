@@ -24,6 +24,7 @@ import {
   type RunIssue,
   type Scout,
   type ScoutProposal,
+  type UntrustedAuthor,
 } from '../store/types.js';
 import { errorMessage, nowIso } from '../util.js';
 import {
@@ -42,12 +43,15 @@ import {
   failedAttempt,
   goalFromIssue,
   issueUpdate,
+  isTrusted,
   LABELS,
   labelDefs,
   markComment,
   proposalBody,
   redoStartedComment,
   repliesAfterMaster,
+  untrustedAuthor,
+  untrustedGoalMessage,
   withStatusLabel,
 } from './issues.js';
 import {
@@ -121,6 +125,8 @@ export class IssueBridge {
   private syncTimer: ReturnType<typeof setTimeout> | undefined;
   private chain: Promise<void> = Promise.resolve();
   private client: { key: string; gh: GitHub } | undefined;
+  /** gh's active account, for the client it was asked with. */
+  private viewer: { gh: GitHub; login: string } | undefined;
   private readonly labelsReady = new Set<string>();
   private readonly resolved = new Map<string, string>();
   private readonly scouting = new Map<string, ScoutEntry>();
@@ -157,6 +163,18 @@ export class IssueBridge {
     const key = `${bin}|${account ?? ''}`;
     if (this.client?.key !== key) this.client = { key, gh: new GhCli(bin, account) };
     return this.client.gh;
+  }
+
+  /**
+   * Login of the account the Master acts as, which it trusts like a member of the repo:
+   * `github.account`, else gh's active account, asked once per client.
+   */
+  private async masterLogin(): Promise<string> {
+    const account = this.cfg.master.github?.account;
+    if (account) return account;
+    const gh = this.gh();
+    if (this.viewer?.gh !== gh) this.viewer = { gh, login: await gh.viewer() };
+    return this.viewer.login;
   }
 
   // ---- lifecycle -------------------------------------------------------------
@@ -384,6 +402,11 @@ export class IssueBridge {
         const template = this.cfg.templates.get(cfg.template);
         // L2: no approval before merging; other gates of the template stay.
         const overrides = issueRunOverrides(template, cfg.auto_merge);
+        // Only people allowed to triage can add ares1:ready, but anybody may have written the
+        // issue, and may edit it after the label was added.
+        const untrusted = isTrusted(issue, await this.masterLogin())
+          ? undefined
+          : untrustedAuthor(issue, null);
         run = this.deps.engine.createRun({
           repo: repo.name,
           template: cfg.template,
@@ -396,7 +419,9 @@ export class IssueBridge {
             url: issue.url,
             auto: issue.labels.includes(LABELS.auto),
             attempt: 1,
+            ...(untrusted ? { untrusted } : {}),
           },
+          confirmGoal: untrusted ? untrustedGoalMessage(issue) : undefined,
         });
         const templateName = template?.name ?? cfg.template;
         const runUrl = `${this.dashboardUrl()}/#/runs/${run.id}`;
@@ -654,10 +679,20 @@ export class IssueBridge {
       const attempt = (prev.attempt ?? 1) + 1;
       const max = Math.max(cfg.max_run_attempts, attempt);
       // The goal is read from the issue again: a human may have made it clearer meanwhile.
+      const goal = goalFromIssue(issue);
+      let untrusted: UntrustedAuthor | undefined;
+      if (!isTrusted(issue, await this.masterLogin())) {
+        // What a human confirmed for the failed Run goes on; a changed text is asked about again.
+        const confirmed = prev.untrusted?.confirmedAt;
+        untrusted = untrustedAuthor(
+          issue,
+          confirmed && goal.trim() === failed.goal ? confirmed : null,
+        );
+      }
       const next = this.deps.engine.createRun({
         repo: repo.name,
         template: cfg.template,
-        goal: goalFromIssue(issue),
+        goal,
         overrides: issueRunOverrides(template, cfg.auto_merge),
         issue: {
           repo: prev.repo,
@@ -669,7 +704,10 @@ export class IssueBridge {
             ...(prev.earlier ?? []),
             failedAttempt(failed, this.stageNameOf(failed) ?? null),
           ],
+          ...(untrusted ? { untrusted } : {}),
         },
+        confirmGoal:
+          untrusted && untrusted.confirmedAt === null ? untrustedGoalMessage(issue) : undefined,
       });
       store.tx(() => {
         store.setIssueRedo(failed.id, 'redone');
@@ -741,8 +779,9 @@ export class IssueBridge {
 
   /**
    * Replies on the issue to the assessment's questions: comments without the Master's marker
-   * after its last comment. Only once the latest questions are on the issue, so earlier comments
-   * are never taken for answers to them. The Run is assessed again with the replies.
+   * after its last comment, written by people it trusts (`isTrusted`); the others are only
+   * counted on the questions. Only once the latest questions are on the issue, so earlier
+   * comments are never taken for answers to them. The Run is assessed again with the replies.
    */
   private async collectReplies(name: string): Promise<void> {
     const { repo } = this.repoSetup(name);
@@ -753,16 +792,40 @@ export class IssueBridge {
       if (this.stopping) return;
       const issue = run.issue;
       if (!issue || run.issueDiscussionSynced < run.discussion.length) continue;
-      const replies = repliesAfterMaster(await this.gh().listComments(issue.repo, issue.number));
+      const master = await this.masterLogin();
+      const comments = await this.gh().listComments(issue.repo, issue.number);
+      const { replies, ignored } = repliesAfterMaster(comments, master);
       // Someone may have replied on the dashboard meanwhile; the next questions come first then.
       const now = this.deps.store.getRun(run.id);
       const still =
         now.blocked?.kind === 'discussion' && now.discussion.length === run.discussion.length;
-      if (replies.length === 0 || now.status !== 'blocked' || !still) continue;
+      if (now.status !== 'blocked' || !still) continue;
+      this.recordIgnored(now, issue, ignored);
+      if (replies.length === 0) continue;
       const replied = this.deps.engine.reply(run.id, replies, 'issue');
       // The replies came from the issue: nothing to post for them.
       this.deps.store.setIssueDiscussionSynced(run.id, replied.discussion.length);
     }
+  }
+
+  /**
+   * Count, on the questions the Run waits on, the comments after them that were not taken as
+   * replies because the Master does not trust their authors, so the dashboard can show them.
+   */
+  private recordIgnored(run: Run, issue: RunIssue, ignored: number): void {
+    const last = run.discussion.at(-1);
+    if (last?.role !== 'assessor' || (last.ignoredComments ?? 0) === ignored) return;
+    // Stored as JSON, where an undefined count is left out.
+    const entry: DiscussionEntry = { ...last, ignoredComments: ignored > 0 ? ignored : undefined };
+    const store = this.deps.store;
+    store.tx(() => {
+      store.updateRun(run.id, { discussion: [...run.discussion.slice(0, -1), entry] });
+      store.event(run.id, 'discussion.comments_ignored', {
+        repo: issue.repo,
+        issue: issue.number,
+        count: ignored,
+      });
+    });
   }
 
   // ---- guardrails --------------------------------------------------------
@@ -1011,7 +1074,7 @@ export class IssueBridge {
         repoName: repo.name,
         max: scoutCfg.max_proposals,
         runs: runDigest(store, repo.id),
-        issues: issueDigest(open, closed),
+        issues: issueDigest(open, closed, await this.masterLogin()),
       });
       // Read the target branch as committed, like a Run does, not whatever the main worktree has
       // checked out or left uncommitted. A detached worktree creates no branch.

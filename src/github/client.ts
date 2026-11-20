@@ -1,8 +1,23 @@
 import { execFile } from 'node:child_process';
 import { t } from '../i18n.js';
 
+/** Who wrote an issue or a comment, which decides whether the Master trusts what it says. */
+export interface GhAuthored {
+  /** Login of the author; null when the account was deleted. */
+  author: string | null;
+  /**
+   * The author's relation to the repo, as GitHub gives it: OWNER, MEMBER, COLLABORATOR,
+   * CONTRIBUTOR, FIRST_TIME_CONTRIBUTOR, FIRST_TIMER, MANNEQUIN or NONE.
+   */
+  authorAssociation: string;
+}
+
+export interface GhComment extends GhAuthored {
+  body: string;
+}
+
 /** An issue as the Master needs it. */
-export interface GhIssue {
+export interface GhIssue extends GhAuthored {
   number: number;
   title: string;
   body: string;
@@ -11,8 +26,8 @@ export interface GhIssue {
   stateReason: string | null;
   labels: string[];
   url: string;
-  /** Comment bodies, oldest first; only filled when asked for. */
-  comments: string[];
+  /** The latest comments (up to 100), oldest first; only filled when asked for. */
+  comments: GhComment[];
 }
 
 export interface LabelDef {
@@ -25,6 +40,8 @@ export interface LabelDef {
 export interface GitHub {
   /** "owner/name" of the GitHub repo behind a local clone. */
   resolveRepo(path: string): Promise<string>;
+  /** Login of the account the Master acts as. */
+  viewer(): Promise<string>;
   /** Create the labels, or update their color and description. */
   ensureLabels(repo: string, labels: readonly LabelDef[]): Promise<void>;
   listIssues(
@@ -41,8 +58,8 @@ export interface GitHub {
   /** Replace all labels of the issue. */
   setLabels(repo: string, number: number, labels: string[]): Promise<void>;
   comment(repo: string, number: number, body: string): Promise<void>;
-  /** Comment bodies of the issue, oldest first. */
-  listComments(repo: string, number: number): Promise<string[]>;
+  /** The latest comments of the issue (up to 100), oldest first. */
+  listComments(repo: string, number: number): Promise<GhComment[]>;
   /** Close as completed (done) or as not planned. */
   close(repo: string, number: number, reason: 'completed' | 'not_planned'): Promise<void>;
   /** Push `branch` of the local clone at `path` to the GitHub repo, as the same account. */
@@ -51,29 +68,73 @@ export interface GitHub {
 
 export class GhError extends Error {}
 
-/** An issue as `gh issue list/view --json` prints it. */
-interface RawIssue {
+/** A comment as the GraphQL API returns it (see ISSUE_FRAGMENT). */
+interface RawComment {
+  body?: string | null;
+  author?: { login: string } | null;
+  authorAssociation?: string | null;
+}
+
+/** An issue as the GraphQL API returns it (see ISSUE_FRAGMENT). */
+interface RawIssue extends RawComment {
   number: number;
   title: string;
-  body?: string | null;
   state: string;
   stateReason?: string | null;
-  labels?: { name: string }[];
   url: string;
-  comments?: { body: string }[];
+  labels?: { nodes?: { name: string }[] | null } | null;
+  comments?: { nodes?: RawComment[] | null } | null;
+}
+
+/**
+ * The fields of an issue the Master reads. GraphQL, because `gh issue list/view --json` and the
+ * REST API leave out how the author of an issue is related to the repo, which decides whether
+ * the Master trusts what the issue says. The comments come only with `$withComments`.
+ */
+const ISSUE_FRAGMENT = `fragment issue on Issue {
+  number title body state stateReason url
+  author { login }
+  authorAssociation
+  labels(first: 100) { nodes { name } }
+  comments(last: 100) @include(if: $withComments) {
+    nodes { body author { login } authorAssociation }
+  }
+}`;
+
+/** The most a GraphQL connection returns at once. */
+const MAX_PAGE = 100;
+
+function fromRawComment(c: RawComment): GhComment {
+  return {
+    body: c.body ?? '',
+    author: c.author?.login ?? null,
+    // Unknown counts as unrelated to the repo: never trusted.
+    authorAssociation: c.authorAssociation ?? 'NONE',
+  };
 }
 
 function fromRaw(i: RawIssue): GhIssue {
   return {
+    ...fromRawComment(i),
     number: i.number,
     title: i.title,
-    body: i.body ?? '',
     state: i.state.toLowerCase() === 'open' ? 'open' : 'closed',
     stateReason: i.stateReason ? i.stateReason.toLowerCase() : null,
-    labels: (i.labels ?? []).map((l) => l.name),
+    labels: (i.labels?.nodes ?? []).map((l) => l.name),
     url: i.url,
-    comments: (i.comments ?? []).map((c) => c.body),
+    comments: (i.comments?.nodes ?? []).map(fromRawComment),
   };
+}
+
+/** "owner/name" split for GraphQL. */
+function repoParts(repo: string): { owner: string; name: string } {
+  const [owner, name, ...rest] = repo.split('/');
+  if (!owner || !name || rest.length > 0) {
+    throw new GhError(
+      t({ zh: `仓库名应为 owner/name：${repo}`, en: `A repo is named owner/name: ${repo}` }),
+    );
+  }
+  return { owner, name };
 }
 
 const TOKEN_TTL_MS = 10 * 60_000;
@@ -131,10 +192,46 @@ export class GhCli implements GitHub {
     return this.exec(args, { ...opts, env: await this.env() });
   }
 
+  /** A GraphQL query; the request goes through stdin, so variables keep their JSON types. */
+  private async graphql<T>(query: string, variables: Record<string, unknown>): Promise<T> {
+    const out = await this.gh(['api', 'graphql', '--input', '-'], {
+      stdin: JSON.stringify({ query, variables }),
+    });
+    const res = JSON.parse(out) as { data?: T | null; errors?: { message?: string }[] };
+    if (res.errors?.length || !res.data) {
+      const detail = res.errors?.map((e) => e.message ?? '').join('; ') || out.slice(0, 300);
+      throw new GhError(
+        t({ zh: `gh api graphql 失败：${detail}`, en: `gh api graphql failed: ${detail}` }),
+      );
+    }
+    return res.data;
+  }
+
+  private async issue(repo: string, number: number, withComments: boolean): Promise<GhIssue> {
+    const data = await this.graphql<{ repository: { issue: RawIssue | null } | null }>(
+      `query($owner: String!, $name: String!, $number: Int!, $withComments: Boolean!) {
+        repository(owner: $owner, name: $name) { issue(number: $number) { ...issue } }
+      }
+      ${ISSUE_FRAGMENT}`,
+      { ...repoParts(repo), number, withComments },
+    );
+    const raw = data.repository?.issue;
+    if (!raw) {
+      throw new GhError(
+        t({ zh: `${repo} 没有 issue #${number}`, en: `${repo} has no issue #${number}` }),
+      );
+    }
+    return fromRaw(raw);
+  }
+
   async resolveRepo(path: string): Promise<string> {
     return this.gh(['repo', 'view', '--json', 'nameWithOwner', '-q', '.nameWithOwner'], {
       cwd: path,
     });
+  }
+
+  async viewer(): Promise<string> {
+    return this.gh(['api', 'user', '-q', '.login']);
   }
 
   async ensureLabels(repo: string, labels: readonly LabelDef[]): Promise<void> {
@@ -158,12 +255,24 @@ export class GhCli implements GitHub {
     repo: string,
     query: { state: 'open' | 'closed'; label?: string; limit: number; comments?: boolean },
   ): Promise<GhIssue[]> {
-    const fields = ['number', 'title', 'body', 'state', 'stateReason', 'labels', 'url'];
-    if (query.comments) fields.push('comments');
-    const args = ['issue', 'list', '-R', repo, '--state', query.state];
-    args.push('--limit', String(query.limit), '--json', fields.join(','));
-    if (query.label) args.push('--label', query.label);
-    return (JSON.parse(await this.gh(args)) as RawIssue[]).map(fromRaw);
+    const data = await this.graphql<{ repository: { issues: { nodes: RawIssue[] } } | null }>(
+      `query($owner: String!, $name: String!, $states: [IssueState!], $labels: [String!],
+        $first: Int!, $withComments: Boolean!) {
+        repository(owner: $owner, name: $name) {
+          issues(first: $first, states: $states, labels: $labels,
+            orderBy: { field: CREATED_AT, direction: DESC }) { nodes { ...issue } }
+        }
+      }
+      ${ISSUE_FRAGMENT}`,
+      {
+        ...repoParts(repo),
+        states: [query.state.toUpperCase()],
+        labels: query.label ? [query.label] : null,
+        first: Math.min(Math.max(query.limit, 1), MAX_PAGE),
+        withComments: query.comments === true,
+      },
+    );
+    return (data.repository?.issues.nodes ?? []).map(fromRaw);
   }
 
   async createIssue(
@@ -186,11 +295,7 @@ export class GhCli implements GitHub {
   }
 
   async getIssue(repo: string, number: number): Promise<GhIssue> {
-    const fields = 'number,title,body,state,stateReason,labels,url';
-    const raw = JSON.parse(
-      await this.gh(['issue', 'view', String(number), '-R', repo, '--json', fields]),
-    ) as RawIssue;
-    return fromRaw(raw);
+    return this.issue(repo, number, false);
   }
 
   async getLabels(repo: string, number: number): Promise<string[]> {
@@ -211,11 +316,8 @@ export class GhCli implements GitHub {
     });
   }
 
-  async listComments(repo: string, number: number): Promise<string[]> {
-    const raw = JSON.parse(
-      await this.gh(['issue', 'view', String(number), '-R', repo, '--json', 'comments']),
-    ) as { comments?: { body: string }[] };
-    return (raw.comments ?? []).map((c) => c.body ?? '');
+  async listComments(repo: string, number: number): Promise<GhComment[]> {
+    return (await this.issue(repo, number, true)).comments;
   }
 
   async close(repo: string, number: number, reason: 'completed' | 'not_planned'): Promise<void> {

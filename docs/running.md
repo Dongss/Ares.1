@@ -53,7 +53,7 @@ Master 第一次访问仓库时会自动创建这些标签：
 | `ares1:proposal` | AI 侦察提出的需求，等你决定。采纳就加 `ares1:ready`，不做就关闭为 not planned 并写一句理由 |
 | `ares1:ready` | 可以开工。你自己写的 issue 加上它也会被做 |
 | `ares1:running` | 正在做 |
-| `ares1:needs-you` | 等你处理：审批、卡住，或需求待讨论（在 issue 下回复即可） |
+| `ares1:needs-you` | 等你处理：审批、卡住、需求待讨论（在 issue 下回复即可），或在看板上确认非仓库成员写的需求 |
 | `ares1:failed` | 被终止，或失败次数达到上限后不再自动重做。重新加 `ares1:ready` 会再做一次 |
 | `ares1:auto` | 按 `auto_accept` 的设置自动采纳的 |
 
@@ -95,6 +95,20 @@ github:
 - 用完 `max_run_attempts` 次后不再重做：评论列出每次失败的原因，issue 打上 `ares1:failed`，关闭为 not planned。这不等于不要这个需求：侦察读到这类 issue 时知道它不是人拒绝的，可以换个思路重新提案。要按原样再做，重新打开 issue 并加上 `ares1:ready`。
 - 人加 `ares1:ready` 开始的 Run 是第 1 次；之后重新加 `ares1:ready`，次数从头算。等待重做期间关闭 issue，就不再重做，issue 保持你留下的样子。
 - 被终止的 Run（人在看板上终止，或者关闭了 issue）不重做，issue 打上 `ares1:failed`，等你决定。
+
+### 只信任仓库成员写的内容
+
+公开仓库里任何人都能发 issue、写评论，而编码 Agent 会在运行 Master 的机器上执行命令，所以从 GitHub 读进 Agent 提示词的内容只认这些人写的：
+
+- GitHub 的 `authorAssociation` 为 `OWNER`、`MEMBER`、`COLLABORATOR` 的人，也就是仓库所有者、所属组织的成员和协作者；
+- Master 自己用的账号：`github.account`，没配时是 gh 当前登录的账号（启动后第一次需要时查一次）。
+
+其余的人一律不信任，包括提过 PR 的 `CONTRIBUTOR`、`FIRST_TIME_CONTRIBUTOR` 和 `NONE`。Master 自己的评论仍然靠隐藏标记识别，但只认受信任的人写的：别人照抄标记也不算 Master 的。具体是：
+
+- **需求评估的回复**：只把受信任的人的评论当作回复。陌生人的评论不交给 Agent，只在看板的讨论记录里记下「issue 上有 N 条非仓库成员的评论，没有当作回复」。只有陌生人回复时，就当作还没人回复，照常等待或按 `reply_timeout_hours` 超时。
+- **侦察**：提示词里只列受信任的人或 Master 建的 issue；「不做」的理由只取受信任的人写的最后一条评论，没有就不写理由；「多次失败后关闭」也只认受信任的人写的标记。陌生人建的 issue 完全不出现，代价是侦察可能提出和它重复的提案，你在采纳时能发现。最近的 Run 里，来自陌生人 issue、还没人确认过的 Run 只列 issue 编号，不列内容。
+- **从 issue 建 Run**：只有有 triage 及以上权限的人能加 `ares1:ready`，所以标签可信，但 issue 可能是陌生人写的，加标签之后也还能改。这时 Master 照常建 Run，目标是建 Run 那一刻 issue 的内容，之后再改 issue 不影响它；Run 一建好就停在「issue 作者不是仓库成员，等你确认需求」，在 issue 上说明原因，打上 `ares1:needs-you`。在这之前没有任何 Agent（包括只读的需求评估）读到它。你在 Run 详情页读过目标后点「确认并开始」，Run 才从头开始，之后照常按模板和 `auto_merge` 的设置走；这一步不管怎么设置都要人来做。不想做就终止 Run 或关闭 issue。Run 页上一直标着 issue 作者和确认的时间。
+- **自动重做**：重做时目标从 issue 重新读。作者不受信任时，内容和上次确认过的一样就直接重做，改过就要重新确认。
 
 ## Agent 出错时
 

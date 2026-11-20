@@ -45,8 +45,10 @@ import {
   canCleanUpWorkspace,
   discussionItems,
   eventText,
+  ignoredCommentsText,
   rateLimitText,
   replyDeadlineOf,
+  untrustedIssueText,
   workspaceLines,
 } from '../lib/runs.js';
 
@@ -145,12 +147,14 @@ function RunHeader({ detail, onChanged }: { detail: RunDetail; onChanged: () => 
   const current = stageRuns.find((s) => s.id === run.currentStageRunId);
   const multiLine = run.goal.trim().includes('\n');
   const budget = effectiveBudget(run.template, run.overrides);
+  const untrusted = untrustedIssueText(run.issue);
   return (
     <header className="card run-header">
       <div className="run-title">
         <Badge tone={status.tone}>{status.label}</Badge>
         <h1>{goalTitle(run.goal, 200)}</h1>
       </div>
+      {untrusted && <div className="warn-box">{untrusted}</div>}
       {multiLine && <div className="goal">{run.goal.trim()}</div>}
       <dl className="meta">
         <div>
@@ -326,9 +330,15 @@ function RunActions(props: {
       {run.status === 'blocked' && run.blocked?.kind === 'discussion' && (
         <DiscussionPanel detail={props.detail} onChanged={props.onChanged} />
       )}
-      {run.status === 'blocked' && run.blocked && run.blocked.kind !== 'discussion' && (
-        <BlockedPanel detail={props.detail} config={props.config} onChanged={props.onChanged} />
+      {run.status === 'blocked' && run.blocked?.kind === 'untrusted_issue' && (
+        <ConfirmGoalPanel detail={props.detail} onChanged={props.onChanged} />
       )}
+      {run.status === 'blocked' &&
+        run.blocked &&
+        run.blocked.kind !== 'discussion' &&
+        run.blocked.kind !== 'untrusted_issue' && (
+          <BlockedPanel detail={props.detail} config={props.config} onChanged={props.onChanged} />
+        )}
       {run.status === 'failed' && run.error && <ErrorBox>{run.error}</ErrorBox>}
       {run.status === 'queued' && props.detail.rateLimited && (
         <div className="panel">
@@ -500,6 +510,10 @@ function retryHint(kind: BlockKind): string {
       zh: '回复评估提出的疑问后，评估会带着讨论重新进行。',
       en: 'Once you answer the questions of the assessment, it runs again with the discussion.',
     },
+    untrusted_issue: {
+      zh: '读过目标、确认可以交给 Agent 后，Run 从头开始。',
+      en: 'Once you have read the goal and confirmed it can go to the agents, the Run starts from the beginning.',
+    },
     error: {
       zh: '重试会从出错的 Task 开始前的提交重做。',
       en: 'Retrying redoes the failed Task from the commit before it started.',
@@ -518,6 +532,8 @@ function DiscussionPanel({ detail, onChanged }: { detail: RunDetail; onChanged: 
   const action = useAction();
   if (!run.blocked) return null;
   const deadline = replyDeadlineOf(detail);
+  const asked = run.discussion.at(-1);
+  const ignored = asked?.role === 'assessor' ? (asked.ignoredComments ?? 0) : 0;
   const send = async () => {
     const result = await action.run(() => api.retry(run.id, { note: reply.trim() }));
     if (result) {
@@ -534,11 +550,12 @@ function DiscussionPanel({ detail, onChanged }: { detail: RunDetail; onChanged: 
         })}
       </h2>
       <Pre>{run.blocked.message}</Pre>
+      {ignored > 0 && <p className="warn-box">{ignoredCommentsText(ignored)}</p>}
       <p className="hint">
         {run.issue
           ? t({
-              zh: '可以直接在 issue 上回复，Master 下次检查 GitHub 时会带着回复重新评估；也可以在这里回复。',
-              en: 'You can reply on the issue: the Master reassesses with your reply the next time it checks GitHub. Or reply here. ',
+              zh: '可以直接在 issue 上回复（只认仓库成员的回复），Master 下次检查 GitHub 时会带着回复重新评估；也可以在这里回复。',
+              en: 'You can reply on the issue (only replies by members of the repo count): the Master reassesses with your reply the next time it checks GitHub. Or reply here. ',
             })
           : t({
               zh: '回复后评估会带着讨论重新进行，讨论可以有多轮。',
@@ -572,6 +589,38 @@ function DiscussionPanel({ detail, onChanged }: { detail: RunDetail; onChanged: 
         >
           {t({ zh: '回复并重新评估', en: 'Reply and reassess' })}
         </button>
+      </div>
+      <ErrorBox>{action.error}</ErrorBox>
+    </div>
+  );
+}
+
+/**
+ * The Run's goal was written by someone the Master does not trust: nothing runs until a human
+ * read it and confirmed it can go to the agents (POST /retry). Cancelling is in the controls.
+ */
+function ConfirmGoalPanel({ detail, onChanged }: { detail: RunDetail; onChanged: () => void }) {
+  const { run } = detail;
+  const action = useAction();
+  if (!run.blocked) return null;
+  const confirm = async () => {
+    if (await action.run(() => api.retry(run.id, {}))) onChanged();
+  };
+  return (
+    <div className="panel panel-attention">
+      <h2>{BLOCK_KIND.untrusted_issue}</h2>
+      <Pre>{run.blocked.message}</Pre>
+      <p className="hint">{retryHint('untrusted_issue')}</p>
+      <div className="form-actions">
+        <ConfirmButton
+          label={t({ zh: '确认并开始', en: 'Confirm and start' })}
+          confirmLabel={t({
+            zh: '已读过目标，交给 Agent',
+            en: 'I have read the goal: hand it to the agents',
+          })}
+          disabled={action.busy}
+          onConfirm={confirm}
+        />
       </div>
       <ErrorBox>{action.error}</ErrorBox>
     </div>
@@ -618,6 +667,7 @@ function AssessmentCard({ detail }: { detail: RunDetail }) {
                 <span className="muted">{formatTime(item.at)}</span>
               </div>
               <Pre>{item.text}</Pre>
+              {item.note && <p className="hint">{item.note}</p>}
             </li>
           ))}
         </ol>

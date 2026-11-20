@@ -1,6 +1,7 @@
 import { rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import type { GhIssue } from '../src/github/client.js';
 import { issueDigest, runDigest, scoutPrompt } from '../src/github/scout.js';
 import { setLang } from '../src/i18n.js';
 import type { Run, RunStatus } from '../src/store/types.js';
@@ -617,23 +618,27 @@ describe('scout in English', () => {
 
   it('lists existing issues in English', () => {
     setLang('en');
-    const issue = (number: number, title: string, extra: object = {}) => ({
+    const issue = (number: number, title: string, extra: Partial<GhIssue> = {}): GhIssue => ({
       number,
       title,
       body: '',
-      state: 'closed' as const,
+      state: 'closed',
       stateReason: 'completed',
       labels: [],
       url: '',
+      author: 'me',
+      authorAssociation: 'OWNER',
       comments: [],
       ...extra,
     });
+    const reason = { body: 'Out of scope', author: 'me', authorAssociation: 'OWNER' };
     const digest = issueDigest(
       [issue(1, 'Open one', { state: 'open', stateReason: null, labels: ['ares1:proposal'] })],
       [
-        issue(2, 'Rejected', { stateReason: 'not_planned', comments: ['Out of scope'] }),
+        issue(2, 'Rejected', { stateReason: 'not_planned', comments: [reason] }),
         issue(3, 'Finished'),
       ],
+      'me',
     );
     expect(digest).toBe(
       [

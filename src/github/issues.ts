@@ -11,8 +11,9 @@ import type {
   Run,
   RunStatus,
   ScoutProposal,
+  UntrustedAuthor,
 } from '../store/types.js';
-import type { LabelDef } from './client.js';
+import type { GhAuthored, GhComment, LabelDef } from './client.js';
 
 export const LABELS = {
   /** Proposed by an AI scout, waiting for a human. */
@@ -116,6 +117,7 @@ export function markComment(body: string): string {
   return `${body.trimEnd()}\n\n${COMMENT_MARKER}`;
 }
 
+/** Whether a comment body carries the Master's marker; see `isMasterCommentBy` for the author. */
 export function isMasterComment(body: string): boolean {
   return body.includes(COMMENT_MARKER);
 }
@@ -129,14 +131,80 @@ export function stripMarker(body: string): string {
   return body.replaceAll(COMMENT_MARKER, '').replaceAll(RETRIES_EXHAUSTED_MARKER, '').trim();
 }
 
+/** Relations to the repo whose holders the Master trusts: they can change the repo anyway. */
+export const TRUSTED_ASSOCIATIONS: readonly string[] = ['OWNER', 'MEMBER', 'COLLABORATOR'];
+
 /**
- * A human's replies to the assessment on the issue: the comments after the Master's last one.
- * Empty when the Master has not commented yet (its questions are not posted).
+ * Whether the Master trusts what an issue or comment says: anybody can write on a public repo,
+ * and what reaches an agent's prompt steers an agent that runs commands on the Master's machine.
+ * Trusted are the repo's owner, the members of its organization, its collaborators, and the
+ * account the Master acts as (`master`: `github.account`, else gh's active account; null when
+ * not known). Everybody else is not, contributors included.
  */
-export function repliesAfterMaster(comments: readonly string[]): string[] {
-  const last = comments.findLastIndex(isMasterComment);
-  if (last < 0) return [];
-  return comments.slice(last + 1).filter((c) => c.trim().length > 0);
+export function isTrusted(item: GhAuthored, master: string | null): boolean {
+  if (TRUSTED_ASSOCIATIONS.includes(item.authorAssociation.toUpperCase())) return true;
+  return (
+    master !== null && item.author !== null && item.author.toLowerCase() === master.toLowerCase()
+  );
+}
+
+/**
+ * A comment the Master posted: its marker, written by someone it trusts. Anybody can copy the
+ * marker into a comment of theirs; that does not make it the Master's.
+ */
+export function isMasterCommentBy(comment: GhComment, master: string | null): boolean {
+  return isMasterComment(comment.body) && isTrusted(comment, master);
+}
+
+/** Replies to the assessment's questions on the issue, and how many comments were left out. */
+export interface IssueReplies {
+  /** Bodies of the trusted comments after the Master's last one, oldest first. */
+  replies: string[];
+  /** Comments after the Master's last one by people it does not trust: not taken as replies. */
+  ignored: number;
+}
+
+/**
+ * A human's replies to the assessment on the issue: the comments after the Master's last one,
+ * written by people the Master trusts (`isTrusted`). None when the Master has not commented yet
+ * (its questions are not posted).
+ */
+export function repliesAfterMaster(
+  comments: readonly GhComment[],
+  master: string | null,
+): IssueReplies {
+  const last = comments.findLastIndex((c) => isMasterCommentBy(c, master));
+  if (last < 0) return { replies: [], ignored: 0 };
+  const after = comments.slice(last + 1).filter((c) => c.body.trim().length > 0);
+  const replies = after.filter((c) => isTrusted(c, master)).map((c) => c.body);
+  return { replies, ignored: after.length - replies.length };
+}
+
+/** How a Run records the author of its issue whom the Master does not trust. */
+export function untrustedAuthor(issue: GhAuthored, confirmedAt: string | null): UntrustedAuthor {
+  return { author: issue.author, association: issue.authorAssociation, confirmedAt };
+}
+
+/** 「@login（NONE）」, who wrote an issue the Master does not trust. */
+export function authorText(author: string | null, association: string): string {
+  const who = author ? `@${author}` : t({ zh: '已删除的账号', en: 'a deleted account' });
+  return t({ zh: `${who}（${association}）`, en: `${who} (${association})` });
+}
+
+/**
+ * Why a Run from an issue written by someone the Master does not trust waits for a human before
+ * it starts: the block message of the Run.
+ */
+export function untrustedGoalMessage(issue: {
+  number: number;
+  author: string | null;
+  authorAssociation: string;
+}): string {
+  const who = authorText(issue.author, issue.authorAssociation);
+  return t({
+    zh: `issue #${issue.number} 的作者 ${who}不是这个仓库的成员。任何人都能在公开仓库发 issue，内容可能是用来操纵 Agent 的（Agent 会在这台机器上执行命令）。Run 的目标是建 Run 时 issue 的内容，之后 issue 再怎么改也不会变。请读一遍上面的目标，确认可以交给 Agent 后点「确认并开始」；不想做就终止这个 Run，或关闭 issue。`,
+    en: `The author of issue #${issue.number}, ${who}, is not a member of this repo. Anybody can open an issue on a public repo, and its text may be meant to steer the agents (which run commands on this machine). The Run's goal is the issue as it was when the Run was created; later edits of the issue do not change it. Read the goal above, and once you are sure it can go to the agents, click "Confirm and start"; if not, cancel this Run or close the issue.`,
+  });
 }
 
 const riskText = (risk: Risk) =>
@@ -363,6 +431,18 @@ export function issueUpdate(run: Run, ctx: IssueUpdateContext): IssueUpdate {
       // The assessment's questions are posted with the discussion (`discussionComment`).
       if (run.blocked?.kind === 'discussion') {
         return { label: LABELS.needsYou, comment: null, close: null };
+      }
+      if (run.blocked?.kind === 'untrusted_issue') {
+        const author = run.issue?.untrusted;
+        const who = author ? authorText(author.author, author.association) : '';
+        return {
+          label: LABELS.needsYou,
+          comment: t({
+            zh: `issue 的作者${who ? ` ${who}` : ''}不是这个仓库的成员，所以 Run 要等仓库成员在看板上确认需求后才开始，在这之前不会有 Agent 读到它。之后再改这个 issue 不会改变 Run 的需求。\n\n${link}`,
+            en: `The author of this issue${who ? `, ${who},` : ''} is not a member of this repo, so the Run waits until a member confirms the requirement on the dashboard; until then no agent reads it. Editing this issue afterwards does not change the Run's requirement.\n\n${link}`,
+          }),
+          close: null,
+        };
       }
       return {
         label: LABELS.needsYou,

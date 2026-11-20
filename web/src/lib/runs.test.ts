@@ -9,11 +9,13 @@ import {
   discussionItems,
   eventText,
   groupRuns,
+  ignoredCommentsText,
   pageTitle,
   patchLineClass,
   rateLimitText,
   replyDeadlineOf,
   splitPatch,
+  untrustedIssueText,
   workspaceLines,
 } from './runs.js';
 
@@ -206,6 +208,7 @@ describe('workspaceLines', () => {
 });
 
 describe('requirement assessment', () => {
+  afterEach(() => setLang('zh'));
   const at = '2026-11-19T00:00:00.000Z';
   const assessed = (patch: Partial<AssessmentEntry>): AssessmentEntry => ({
     role: 'assessor',
@@ -253,6 +256,44 @@ describe('requirement assessment', () => {
     ]);
     expect(items[0]?.text).toContain('疑问和顾虑：\n1. 写什么？');
     expect(items[2]?.text).toContain('修改后的需求：\n\n新需求');
+  });
+
+  it('notes the comments of non-members that were not taken as replies', () => {
+    const items = discussionItems([assessed({ ignoredComments: 2 }), reply, go]);
+    expect(items[0]?.note).toBe('issue 上有 2 条非仓库成员的评论，没有当作回复，也不会交给 Agent');
+    expect(items[1]?.note).toBeUndefined();
+    expect(items[2]?.note).toBeUndefined();
+    setLang('en');
+    expect(ignoredCommentsText(1)).toBe(
+      '1 comment on the issue by non-members of the repo was not taken as a reply and does not go to the agents',
+    );
+    expect(ignoredCommentsText(3)).toBe(
+      '3 comments on the issue by non-members of the repo were not taken as replies and do not go to the agents',
+    );
+  });
+
+  it('says who wrote an untrusted issue and whether its goal was confirmed', () => {
+    const issue = (confirmedAt: string | null, author: string | null = 'stranger') => ({
+      repo: 'me/demo',
+      number: 3,
+      url: '',
+      auto: false,
+      untrusted: { author, association: 'NONE', confirmedAt },
+    });
+    expect(untrustedIssueText(null)).toBeNull();
+    expect(untrustedIssueText({ ...issue(null), untrusted: undefined })).toBeNull();
+    expect(untrustedIssueText(issue(null))).toBe(
+      'issue 的作者 @stranger（NONE）不是仓库成员：目标是建 Run 时 issue 的内容，要你确认后才交给 Agent。',
+    );
+    expect(untrustedIssueText(issue(at))).toContain('由人确认后才交给 Agent');
+    setLang('en');
+    expect(untrustedIssueText(issue(null, null))).toBe(
+      "The issue's author a deleted account (NONE) is not a member of the repo: the goal is the issue as it was when the Run was created, and goes to the agents only once you confirm it.",
+    );
+    expect(untrustedIssueText(issue(at))).toMatch(
+      /^The issue's author @stranger \(NONE\) is not a member of the repo: .*confirmed by a human at /,
+    );
+    expect(untrustedIssueText(issue(at))).not.toMatch(/[一-鿿]/);
   });
 
   const timeout: DiscussionEntry = { role: 'timeout', hours: 24, at };

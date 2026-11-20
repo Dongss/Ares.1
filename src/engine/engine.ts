@@ -205,6 +205,11 @@ export interface CreateRunInput {
   overrides?: unknown;
   /** The GitHub issue the Run is created from. */
   issue?: RunIssue;
+  /**
+   * The goal comes from someone the Master does not trust: the Run is created blocked
+   * (`untrusted_issue`) with this message, and starts once a human confirms it with a retry.
+   */
+  confirmGoal?: string;
 }
 
 export interface RetryInput {
@@ -486,6 +491,11 @@ export class Engine {
         template: template.id,
         ...(input.issue ? { issue: input.issue.number } : {}),
       });
+      if (input.confirmGoal !== undefined) {
+        // Blocked before it ever runs: no agent reads the goal until a human confirmed it.
+        this.block(r.id, { kind: 'untrusted_issue', message: input.confirmGoal });
+        return this.store.getRun(r.id);
+      }
       return r;
     });
     this.kick();
@@ -650,6 +660,11 @@ export class Engine {
           baseCommit: null,
           headCommit: null,
         });
+      }
+      if (info.kind === 'untrusted_issue' && current.issue?.untrusted) {
+        // A human read the goal written by someone untrusted and let it go to the agents.
+        const untrusted = { ...current.issue.untrusted, confirmedAt: nowIso() };
+        this.store.updateRun(runId, { issue: { ...current.issue, untrusted } });
       }
       this.store.event(runId, 'run.retry', { kind: info.kind, ...input });
       this.requeueHead(runId, 'run.resumed');

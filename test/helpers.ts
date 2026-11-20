@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { FakeAdapter, type FakeContext, type FakeOutcome } from '../src/adapters/fake.js';
-import type { GhIssue, GitHub, LabelDef } from '../src/github/client.js';
+import type { GhComment, GhIssue, GitHub, LabelDef } from '../src/github/client.js';
 import { Master, type MasterOptions } from '../src/master.js';
 import type { Repo, Run, RunStatus } from '../src/store/types.js';
 
@@ -261,14 +261,39 @@ export async function harness(opts: HarnessOptions = {}): Promise<Harness> {
   };
 }
 
+/** Who wrote an issue or a comment on FakeGitHub. */
+export interface FakeAuthor {
+  login: string | null;
+  /** GitHub's authorAssociation, e.g. OWNER or NONE. */
+  association: string;
+}
+
+/** The owner of "me/demo"; the Master acts as this account unless a test says otherwise. */
+export const OWNER: FakeAuthor = { login: 'me', association: 'OWNER' };
+
+/** Somebody with no relation to the repo, as anybody on a public repo. */
+export const STRANGER: FakeAuthor = { login: 'stranger', association: 'NONE' };
+
+/**
+ * An issue as FakeGitHub keeps it: the comment bodies as strings, so tests read and add them
+ * directly, and who wrote each beside them.
+ */
+export interface FakeIssue extends Omit<GhIssue, 'comments'> {
+  comments: string[];
+  /** Authors of `comments` by index; a comment without one was written by OWNER. */
+  commentAuthors: (FakeAuthor | undefined)[];
+}
+
 /** GitHub in memory: issues of one repo, "me/demo". */
 export class FakeGitHub implements GitHub {
-  readonly issues = new Map<number, GhIssue>();
+  readonly issues = new Map<number, FakeIssue>();
   readonly labelDefs = new Map<string, LabelDef>();
   /** Every call, e.g. "comment #3". */
   readonly calls: string[] = [];
   /** When set, every call throws this message. */
   failWith: string | null = null;
+  /** The account the Master acts as: it writes the Master's comments and issues. */
+  master: FakeAuthor = OWNER;
   private next = 1;
 
   private call(what: string): void {
@@ -276,10 +301,11 @@ export class FakeGitHub implements GitHub {
     if (this.failWith) throw new Error(this.failWith);
   }
 
-  /** An issue written by a human. */
-  add(issue: { title: string; body?: string; labels?: string[] }): GhIssue {
+  /** An issue written by a human, the repo's owner unless `author` says otherwise. */
+  add(issue: { title: string; body?: string; labels?: string[]; author?: FakeAuthor }): FakeIssue {
     const number = this.next++;
-    const created: GhIssue = {
+    const author = issue.author ?? OWNER;
+    const created: FakeIssue = {
       number,
       title: issue.title,
       body: issue.body ?? '',
@@ -287,21 +313,60 @@ export class FakeGitHub implements GitHub {
       stateReason: null,
       labels: issue.labels ?? [],
       url: `https://github.com/me/demo/issues/${number}`,
+      author: author.login,
+      authorAssociation: author.association,
       comments: [],
+      commentAuthors: [],
     };
     this.issues.set(number, created);
     return created;
   }
 
-  get(number: number): GhIssue {
+  /** A comment on issue #number written by `author`, as a human writes it on GitHub. */
+  commentAs(number: number, author: FakeAuthor, body: string): void {
+    const issue = this.get(number);
+    issue.commentAuthors[issue.comments.length] = author;
+    issue.comments.push(body);
+  }
+
+  get(number: number): FakeIssue {
     const issue = this.issues.get(number);
     if (!issue) throw new Error(`no issue #${number}`);
     return issue;
   }
 
+  /** The issue as the GitHub client returns it, with or without its comments. */
+  private view(issue: FakeIssue, withComments: boolean): GhIssue {
+    return {
+      number: issue.number,
+      title: issue.title,
+      body: issue.body,
+      state: issue.state,
+      stateReason: issue.stateReason,
+      labels: [...issue.labels],
+      url: issue.url,
+      author: issue.author,
+      authorAssociation: issue.authorAssociation,
+      comments: withComments ? this.commentsOf(issue) : [],
+    };
+  }
+
+  private commentsOf(issue: FakeIssue): GhComment[] {
+    return issue.comments.map((body, i) => {
+      const author = issue.commentAuthors[i] ?? OWNER;
+      return { body, author: author.login, authorAssociation: author.association };
+    });
+  }
+
   async resolveRepo(): Promise<string> {
     this.call('resolveRepo');
     return 'me/demo';
+  }
+
+  async viewer(): Promise<string> {
+    this.call('viewer');
+    if (!this.master.login) throw new Error('the Master has no login');
+    return this.master.login;
   }
 
   async ensureLabels(_repo: string, labels: readonly LabelDef[]): Promise<void> {
@@ -318,7 +383,7 @@ export class FakeGitHub implements GitHub {
       .filter((i) => i.state === q.state && (!q.label || i.labels.includes(q.label)))
       .sort((a, b) => b.number - a.number)
       .slice(0, q.limit)
-      .map((i) => structuredClone({ ...i, comments: q.comments ? i.comments : [] }));
+      .map((i) => this.view(i, q.comments === true));
   }
 
   async createIssue(
@@ -326,13 +391,13 @@ export class FakeGitHub implements GitHub {
     issue: { title: string; body: string; labels: string[] },
   ): Promise<{ number: number; url: string }> {
     this.call(`create ${issue.title}`);
-    const created = this.add(issue);
+    const created = this.add({ ...issue, author: this.master });
     return { number: created.number, url: created.url };
   }
 
   async getIssue(_repo: string, number: number): Promise<GhIssue> {
     this.call(`getIssue #${number}`);
-    return structuredClone({ ...this.get(number), comments: [] });
+    return this.view(this.get(number), false);
   }
 
   async getLabels(_repo: string, number: number): Promise<string[]> {
@@ -347,7 +412,7 @@ export class FakeGitHub implements GitHub {
 
   async comment(_repo: string, number: number, body: string): Promise<void> {
     this.call(`comment #${number}`);
-    this.get(number).comments.push(body);
+    this.commentAs(number, this.master, body);
   }
 
   /** Branch heads pushed, in order. */
@@ -360,9 +425,9 @@ export class FakeGitHub implements GitHub {
     );
   }
 
-  async listComments(_repo: string, number: number): Promise<string[]> {
+  async listComments(_repo: string, number: number): Promise<GhComment[]> {
     this.call(`listComments #${number}`);
-    return [...this.get(number).comments];
+    return this.commentsOf(this.get(number));
   }
 
   async close(_repo: string, number: number, reason: 'completed' | 'not_planned'): Promise<void> {

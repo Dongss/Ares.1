@@ -65,6 +65,11 @@ export type BlockKind =
    * stage's `reply_timeout_hours`.
    */
   | 'discussion'
+  /**
+   * The Run comes from an issue written by someone the Master does not trust (not a member of
+   * the repo): it waits for a human to confirm its goal before any agent reads it.
+   */
+  | 'untrusted_issue'
   | 'error';
 
 /** Why a Run is blocked; also tells `retry` what to redo. */
@@ -134,6 +139,23 @@ export interface RunIssue {
   earlier?: FailedAttempt[];
   /** What became of the issue after this Run failed; missing while it has not. */
   redo?: RedoState;
+  /**
+   * The issue was written by someone the Master does not trust (not a member of the repo), so
+   * its text may be meant to steer the agents. The goal is the issue as it was when the Run was
+   * created; the Run started blocked (`untrusted_issue`) until a human confirmed it. Missing
+   * when the author is trusted, and in Runs created before authors were checked.
+   */
+  untrusted?: UntrustedAuthor;
+}
+
+/** Who wrote an issue the Master does not trust, and when a human confirmed the Run's goal. */
+export interface UntrustedAuthor {
+  /** GitHub login; null when the account was deleted. */
+  author: string | null;
+  /** The author's relation to the repo as GitHub gives it, e.g. NONE or CONTRIBUTOR. */
+  association: string;
+  /** When a human confirmed the goal on the dashboard; null while nobody has. */
+  confirmedAt: string | null;
 }
 
 /**
@@ -180,6 +202,12 @@ export interface AssessmentEntry {
    * `summary`, or drop. Missing in entries recorded before replies could time out.
    */
   decidedAlone?: boolean;
+  /**
+   * ask, for a Run from an issue: comments on the issue after these questions by people the
+   * Master does not trust (not members of the repo), which were not taken as replies. Missing
+   * while there are none.
+   */
+  ignoredComments?: number;
   stageRunId: string;
   at: string;
 }

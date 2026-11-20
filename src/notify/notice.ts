@@ -28,6 +28,10 @@ export const BLOCK_KIND: Record<BlockKind, string> = localized<BlockKind, string
   workspace: { zh: '工作目录与记录不一致', en: 'Workspace does not match the record' },
   budget: { zh: '超出预算', en: 'Over budget' },
   discussion: { zh: '需求待讨论', en: 'Requirement under discussion' },
+  untrusted_issue: {
+    zh: 'issue 作者不是仓库成员，等你确认需求',
+    en: 'Issue by a non-member: confirm the requirement',
+  },
   error: { zh: 'Master 内部错误', en: 'Master internal error' },
 });
 
