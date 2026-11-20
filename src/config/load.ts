@@ -29,6 +29,8 @@ export interface HomePaths {
   dbFile: string;
   logsDir: string;
   artifactsDir: string;
+  /** gh's config directory for agents and their commands: kept empty, so gh has no login. */
+  agentGhConfigDir: string;
 }
 
 export function homePaths(home: string): HomePaths {
@@ -43,6 +45,7 @@ export function homePaths(home: string): HomePaths {
     dbFile: join(dataDir, 'ares1.db'),
     logsDir: join(dataDir, 'logs'),
     artifactsDir: join(dataDir, 'artifacts'),
+    agentGhConfigDir: join(dataDir, 'agent-gh-config'),
   };
 }
 

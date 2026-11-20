@@ -49,9 +49,10 @@ src/
                       back-off (shared by engine, GitHub bridge and dashboard)
     effort.ts         helpers for agent effort (shared by engine and dashboard)
   store/              SQLite store (node:sqlite): store.ts, migrations.ts, types.ts (entity types)
-  adapters/           agent adapters: types.ts (common interface), process.ts (child processes and
-                      process groups), claude-code.ts, cursor-agent.ts, fake.ts (fake agent for
-                      tests), tool-summary.ts
+  adapters/           agent adapters: types.ts (common interface), process.ts (child processes,
+                      process groups and the environment of agents: no GitHub credentials),
+                      claude-code.ts, cursor-agent.ts, fake.ts (fake agent for tests),
+                      tool-summary.ts
   engine/
     engine.ts         workflow engine: queue, state machine, checks, rework, agent errors (retry
                       with backoff, switching agents), rollback, approvals, merge, recovery after
@@ -130,6 +131,7 @@ test/
   - the display name and slogan: `brandName()` / `brandSlogan()` / `brandTitle()` in `src/brand.ts`. Never write them as literals elsewhere. The exception is the `<title>` of `web/index.html`, a static file that keeps the Chinese title; a test keeps the two in sync.
 - Every comment the Master posts on an issue goes through `markComment` (`src/github/issues.ts`), which adds the hidden marker that tells it apart from human replies.
 - Anybody can write on a public repo. Text read from GitHub (issues, comments) goes into an agent's prompt only when `isTrusted` (`src/github/issues.ts`) trusts its author: the repo's owner, members and collaborators, and the account the Master acts as. A Run from an issue by anyone else waits for a human to confirm its goal (`untrusted_issue`).
+- Agents and the commands run on their work (setup and verify commands) get no GitHub credentials, so they cannot read untrusted comments themselves or act as the accounts logged in on the machine. Start them only with `prepareAgentEnv` (`src/adapters/process.ts`), the one place that defines their environment; the Master's own GitHub and git calls keep the credentials.
 - No natively compiled dependencies (e.g. better-sqlite3): keep `npm install` simple.
 - Dashboard:
   - Import API data types from `src/api/types.ts` and `src/store/types.ts`; don't redefine them in `web/`. These two files hold type declarations only and must not import Node modules.

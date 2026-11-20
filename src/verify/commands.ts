@@ -14,11 +14,22 @@ export interface CommandResult {
   outputTail: string;
 }
 
+export interface CommandOptions {
+  timeoutMs: number;
+  logPath: string;
+  /**
+   * Environment of the command. These commands run code the agents wrote, so the engine passes
+   * `prepareAgentEnv` (see `src/adapters/process.ts`): no GitHub credentials.
+   */
+  env: NodeJS.ProcessEnv;
+  signal?: AbortSignal;
+}
+
 /** Run one shell command in `cwd`; output is appended to `logPath`. */
 export function runCommand(
   command: string,
   cwd: string,
-  opts: { timeoutMs: number; logPath: string; signal?: AbortSignal },
+  opts: CommandOptions,
 ): Promise<CommandResult> {
   mkdirSync(dirname(opts.logPath), { recursive: true });
   appendFileSync(opts.logPath, `\n$ ${command}\n`);
@@ -27,7 +38,7 @@ export function runCommand(
     const child = spawn('/bin/sh', ['-c', command], {
       cwd,
       // NO_COLOR as well: tools using tinyrainbow (vitest) treat any FORCE_COLOR, even "0", as "on".
-      env: { ...process.env, CI: '1', FORCE_COLOR: '0', NO_COLOR: '1' },
+      env: { ...opts.env, CI: '1', FORCE_COLOR: '0', NO_COLOR: '1' },
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -80,7 +91,7 @@ export function runCommand(
 export async function runCommands(
   commands: readonly string[],
   cwd: string,
-  opts: { timeoutMs: number; logPath: string; signal?: AbortSignal },
+  opts: CommandOptions,
 ): Promise<CommandResult[]> {
   const results: CommandResult[] = [];
   for (const command of commands) {

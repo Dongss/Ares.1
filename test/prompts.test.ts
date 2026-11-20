@@ -34,6 +34,23 @@ describe('prompts', () => {
     for (const prompt of Object.values(prompts)) expect(prompt).not.toContain('ares1');
   });
 
+  it('tells every agent that the issue is already in the prompt, not to read it on GitHub', () => {
+    const prompts = {
+      task: taskPrompt(ctx(), null, 'full'),
+      safeTask: taskPrompt(ctx(), null, 'safe'),
+      review: reviewPrompt(ctx({ id: 'review', kind: 'review' }), 'abc123', ''),
+      assess: assessPrompt(ctx({ id: 'assess', kind: 'assess' }), [], null),
+    };
+    for (const [name, prompt] of Object.entries(prompts)) {
+      expect(prompt, name).toContain(
+        '需求、讨论和 issue 的内容都已经写在这里，不要自己去 GitHub 读 issue 或评论（比如运行 `gh issue view`）。这里没有 GitHub 的登录凭据，这类命令也会失败。',
+      );
+    }
+    // Neither the coder nor the reviewer commits or pushes.
+    expect(prompts.task).toContain('不要执行 git commit、git push');
+    expect(prompts.review).toContain('不要执行 git commit 或 git push');
+  });
+
   it('asks coding agents for a Chinese summary, first time and on rework', () => {
     expect(taskPrompt(ctx(), null, 'full')).toContain('summary 用中文书写');
     expect(reworkPrompt('测试没过')).toContain('summary 用中文书写');
@@ -287,6 +304,12 @@ describe('prompts in English', () => {
       '### Attempt 1 (Run run_a, failed in the "Coding" stage)\n\ntests kept failing',
     );
     expect(prompts.redoAssess).toContain('if the requirement itself is the problem, say so');
+    for (const name of ['task', 'safeTask', 'review', 'assess'] as const) {
+      expect(prompts[name], name).toContain(
+        'do not read issues or comments on GitHub yourself (with `gh issue view`, for example). There are no GitHub credentials here',
+      );
+    }
+    expect(prompts.review).toContain('do not run git commit or git push');
   });
 
   it('reports result problems and review issues in English, still parsed back', () => {

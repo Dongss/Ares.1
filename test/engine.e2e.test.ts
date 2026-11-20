@@ -1,7 +1,8 @@
-import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { FakeAdapter, type FakeContext, type FakeOutcome } from '../src/adapters/fake.js';
+import { AGENT_GH_TOKEN } from '../src/adapters/process.js';
 import type { AgentAdapter } from '../src/adapters/types.js';
 import {
   AGENT_RETRY_BACKOFF,
@@ -22,9 +23,11 @@ import {
   git,
   type Harness,
   harness,
+  readEnvFile,
   review,
   type Script,
   TEST_WORKFLOW_YAML,
+  tmpDir,
   waitFor,
   writeFile,
 } from './helpers.js';
@@ -33,6 +36,7 @@ let h: Harness | undefined;
 afterEach(async () => {
   await h?.close();
   h = undefined;
+  vi.unstubAllEnvs();
 });
 
 describe('engine: full run with fake agents', () => {
@@ -557,6 +561,48 @@ agents:
     git(h.repoDir, 'commit', '-q', '-m', 'add setup-ok');
     await h.master.engine.retry(run.id);
     await h.waitStatus(run.id, 'waiting_approval');
+  });
+
+  it('gives agents and the setup and verify commands no GitHub credentials', async () => {
+    vi.stubEnv('GH_TOKEN', 'gho_master');
+    vi.stubEnv('GITHUB_TOKEN', 'ghp_master');
+    vi.stubEnv('GH_ENTERPRISE_TOKEN', 'ghe_master');
+    vi.stubEnv('GITHUB_ENTERPRISE_TOKEN', 'ghe_master2');
+    vi.stubEnv('ARES1_TEST_KEEP', 'kept');
+    const out = tmpDir('ares1-env-');
+    h = await harness({
+      // The setup command also leaves a gh login behind, which the next agent must not get.
+      setupCommands: [`env > ${out}/setup.env && echo token > "$GH_CONFIG_DIR/hosts.yml"`],
+      verifyCommands: [`env > ${out}/verify.env`, 'grep -q ok feature.txt'],
+    });
+    const ghDir = h.master.paths.agentGhConfigDir;
+    const seen: string[][] = [];
+    const coder = h.scripts.coder as Script;
+    h.scripts.coder = (ctx) => {
+      seen.push(readdirSync(ghDir));
+      return coder(ctx);
+    };
+    const run = h.run();
+    await h.waitStatus(run.id, 'waiting_approval');
+
+    const expectNoGitHub = (env: Record<string, string | undefined>) => {
+      expect(env.GH_TOKEN).toBe(AGENT_GH_TOKEN);
+      expect(env.GITHUB_TOKEN).toBeUndefined();
+      expect(env.GH_ENTERPRISE_TOKEN).toBeUndefined();
+      expect(env.GITHUB_ENTERPRISE_TOKEN).toBeUndefined();
+      expect(env.GH_CONFIG_DIR).toBe(ghDir);
+      expect(env.GIT_TERMINAL_PROMPT).toBe('0');
+      expect(env.ARES1_TEST_KEEP).toBe('kept');
+      expect(env.PATH).toBe(process.env.PATH);
+    };
+    // The coder and the reviewer.
+    expect(h.fake.calls.map((c) => c.model)).toEqual(['coder', 'reviewer']);
+    for (const call of h.fake.calls) expectNoGitHub(call.env);
+    expectNoGitHub(readEnvFile(join(out, 'setup.env')));
+    expectNoGitHub(readEnvFile(join(out, 'verify.env')));
+    expect(seen).toEqual([[]]);
+    // The Master keeps its own credentials.
+    expect(process.env.GH_TOKEN).toBe('gho_master');
   });
 });
 

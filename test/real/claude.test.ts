@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
+import { agentEnv } from '../../src/adapters/process.js';
 import {
   parseReport,
   TASK_REPORT_JSON_SCHEMA,
@@ -25,6 +26,8 @@ describe('real Claude Code', () => {
       outputSchema: TASK_REPORT_JSON_SCHEMA,
       timeoutMs: 180_000,
       extraArgs: [],
+      // What the engine gives agents: the CLI has to work without GitHub credentials.
+      env: agentEnv(process.env, tmpDir('ares1-real-gh-')),
     };
 
     const first = await adapter.start({

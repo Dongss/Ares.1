@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { FakeAdapter, type FakeContext, type FakeOutcome } from '../src/adapters/fake.js';
@@ -18,6 +18,16 @@ export function git(cwd: string, ...args: string[]): string {
 export function writeFile(path: string, content: string): void {
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, content);
+}
+
+/** The variables `env` printed into `file`, one `NAME=value` per line. */
+export function readEnvFile(file: string): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const line of readFileSync(file, 'utf8').split('\n')) {
+    const at = line.indexOf('=');
+    if (at > 0) env[line.slice(0, at)] = line.slice(at + 1);
+  }
+  return env;
 }
 
 /** A git repo on branch main with one commit. */

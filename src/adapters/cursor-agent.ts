@@ -37,6 +37,7 @@ export class CursorAgentAdapter implements AgentAdapter {
       bin: this.bin,
       args: this.buildArgs(input),
       cwd: input.workdir,
+      env: input.env,
       stdin: input.prompt,
       timeoutMs: input.timeoutMs,
       logPath: input.logPath,

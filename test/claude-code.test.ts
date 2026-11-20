@@ -2,6 +2,7 @@ import { chmodSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { ClaudeCodeAdapter, resetTime, StreamJsonParser } from '../src/adapters/claude-code.js';
+import { AGENT_GH_TOKEN, agentEnv } from '../src/adapters/process.js';
 import type { AgentEvent, StartInput } from '../src/adapters/types.js';
 import { setLang } from '../src/i18n.js';
 import { tmpDir, writeFile } from './helpers.js';
@@ -14,7 +15,7 @@ let input = '';
 process.stdin.on('data', (d) => (input += d));
 process.stdin.on('end', () => {
   const argv = process.argv.slice(2);
-  fs.writeFileSync('.fake-claude-call.json', JSON.stringify({ args: argv, stdin: input }));
+  fs.writeFileSync('.fake-claude-call.json', JSON.stringify({ args: argv, stdin: input, env: process.env }));
   const at = (flag) => (argv.indexOf(flag) >= 0 ? argv[argv.indexOf(flag) + 1] : undefined);
   const sid = at('--session-id') || at('--resume');
   const out = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
@@ -68,6 +69,7 @@ function setup() {
     permission: 'full',
     timeoutMs: 10_000,
     extraArgs: [],
+    env: process.env,
     logPath: join(dir, 'logs', 'a.jsonl'),
     onEvent: (e) => events.push(e),
     ...extra,
@@ -76,6 +78,7 @@ function setup() {
     JSON.parse(readFileSync(join(workdir, '.fake-claude-call.json'), 'utf8')) as {
       args: string[];
       stdin: string;
+      env: Record<string, string>;
     };
   return { adapter: new ClaudeCodeAdapter(bin), input, events, call, dir };
 }
@@ -142,6 +145,28 @@ describe('ClaudeCodeAdapter', () => {
     const { args } = call();
     expect(args.slice(4, 8)).toEqual(['--model', 'opus', '--effort', 'xhigh']);
     expect(args.filter((a) => a === '--effort')).toHaveLength(1);
+  });
+
+  it('starts the CLI with the environment it is given: the agent one has no GitHub access', async () => {
+    const { adapter, input, call, dir } = setup();
+    const ghDir = join(dir, 'gh-config');
+    const base = {
+      ...process.env,
+      GH_TOKEN: 'gho_master',
+      GITHUB_TOKEN: 'ghp_master',
+      ANTHROPIC_API_KEY: 'sk-ant-keep',
+    };
+    const result = await adapter.start(input('MODE=ok', { env: agentEnv(base, ghDir) })).result;
+    expect(result.status).toBe('completed');
+    const { env } = call();
+    expect(env.GH_TOKEN).toBe(AGENT_GH_TOKEN);
+    expect(env.GITHUB_TOKEN).toBeUndefined();
+    expect(env.GH_CONFIG_DIR).toBe(ghDir);
+    expect(env.GIT_TERMINAL_PROMPT).toBe('0');
+    // The CLI's own login and everything else are passed on.
+    expect(env.ANTHROPIC_API_KEY).toBe('sk-ant-keep');
+    expect(env.PATH).toBe(process.env.PATH);
+    expect(env.HOME).toBe(process.env.HOME);
   });
 
   it('resumes a session and maps "safe" permission to acceptEdits', async () => {

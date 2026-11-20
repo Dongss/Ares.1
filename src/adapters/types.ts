@@ -21,6 +21,11 @@ export interface StartInput {
   readOnly?: boolean;
   timeoutMs: number;
   extraArgs: string[];
+  /**
+   * Environment of the CLI process. The engine and the scout pass `prepareAgentEnv` (see
+   * `src/adapters/process.ts`): no GitHub credentials.
+   */
+  env: Record<string, string | undefined>;
   /** Raw CLI output is appended here (one line per event for stream-json CLIs). */
   logPath: string;
   /** Called for every normalized event, for live views. */

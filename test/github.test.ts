@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { AGENT_GH_TOKEN } from '../src/adapters/process.js';
 import { acceptSplit, isAutoAcceptable, type ProposalKind } from '../src/config/flow.js';
 import { githubConfigKey } from '../src/config/load.js';
 import type { GhComment, GhIssue } from '../src/github/client.js';
@@ -353,6 +354,9 @@ describe('issues: scout', () => {
     rejected.comments.push('不需要，太复杂');
     t.scripts.scout = (ctx) => {
       expect(ctx.input.readOnly).toBe(true);
+      // No GitHub credentials, the same environment as every agent.
+      expect(ctx.input.env.GH_TOKEN).toBe(AGENT_GH_TOKEN);
+      expect(ctx.input.env.GH_CONFIG_DIR).toBe(t.master.paths.agentGhConfigDir);
       return {
         structured: {
           proposals: [

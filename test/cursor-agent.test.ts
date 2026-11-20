@@ -2,6 +2,7 @@ import { chmodSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { CursorAgentAdapter } from '../src/adapters/cursor-agent.js';
+import { AGENT_GH_TOKEN, agentEnv } from '../src/adapters/process.js';
 import type { AgentEvent, StartInput } from '../src/adapters/types.js';
 import { tmpDir, writeFile } from './helpers.js';
 
@@ -13,7 +14,7 @@ let input = '';
 process.stdin.on('data', (d) => (input += d));
 process.stdin.on('end', () => {
   const argv = process.argv.slice(2);
-  fs.writeFileSync('.fake-cursor-call.json', JSON.stringify({ args: argv, stdin: input }));
+  fs.writeFileSync('.fake-cursor-call.json', JSON.stringify({ args: argv, stdin: input, env: process.env }));
   const at = (flag) => (argv.indexOf(flag) >= 0 ? argv[argv.indexOf(flag) + 1] : undefined);
   const sid = at('--resume') || 'chat-1';
   const out = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
@@ -60,6 +61,7 @@ function setup() {
     permission: 'full',
     timeoutMs: 10_000,
     extraArgs: [],
+    env: process.env,
     logPath: join(dir, 'logs', 'a.jsonl'),
     onEvent: (e) => events.push(e),
     ...extra,
@@ -68,6 +70,7 @@ function setup() {
     JSON.parse(readFileSync(join(workdir, '.fake-cursor-call.json'), 'utf8')) as {
       args: string[];
       stdin: string;
+      env: Record<string, string>;
     };
   return { adapter: new CursorAgentAdapter(bin), input, events, call, dir };
 }
@@ -114,6 +117,28 @@ describe('CursorAgentAdapter', () => {
         .trim()
         .split('\n'),
     ).toHaveLength(9);
+  });
+
+  it('starts the CLI with the environment it is given: the agent one has no GitHub access', async () => {
+    const { adapter, input, call, dir } = setup();
+    const ghDir = join(dir, 'gh-config');
+    const base = {
+      ...process.env,
+      GH_TOKEN: 'gho_master',
+      GH_ENTERPRISE_TOKEN: 'ghe_master',
+      CURSOR_API_KEY: 'cursor-keep',
+    };
+    const result = await adapter.start(input('MODE=ok', { env: agentEnv(base, ghDir) })).result;
+    expect(result.status).toBe('completed');
+    const { env } = call();
+    expect(env.GH_TOKEN).toBe(AGENT_GH_TOKEN);
+    expect(env.GH_ENTERPRISE_TOKEN).toBeUndefined();
+    expect(env.GH_CONFIG_DIR).toBe(ghDir);
+    expect(env.GIT_TERMINAL_PROMPT).toBe('0');
+    // The CLI's own login and everything else are passed on.
+    expect(env.CURSOR_API_KEY).toBe('cursor-keep');
+    expect(env.PATH).toBe(process.env.PATH);
+    expect(env.HOME).toBe(process.env.HOME);
   });
 
   it('ignores effort, resumes a session, and leaves out --force for "safe"', async () => {

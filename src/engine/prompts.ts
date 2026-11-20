@@ -125,6 +125,18 @@ function permissionRules(permission: AgentPermission): string {
 }
 
 /**
+ * Everything the agent should know from GitHub is in its prompt, filtered by who wrote it; reading
+ * issues itself would bring back what people the Master does not trust wrote. Agents get no
+ * GitHub credentials either (`agentEnv`).
+ */
+function noGitHubRule(): string {
+  return t({
+    zh: '- 需求、讨论和 issue 的内容都已经写在这里，不要自己去 GitHub 读 issue 或评论（比如运行 `gh issue view`）。这里没有 GitHub 的登录凭据，这类命令也会失败。\n',
+    en: '- The requirement, the discussion and what the issue says are all here already; do not read issues or comments on GitHub yourself (with `gh issue view`, for example). There are no GitHub credentials here, so such commands fail anyway.\n',
+  });
+}
+
+/**
  * First prompt of a task in an agent stage (or any attempt that starts a new session).
  * @param permission the running agent's permission: a "safe" agent cannot run commands, so it is
  *   not told to run the verify commands itself.
@@ -177,7 +189,7 @@ ${rest}## 要求
 
 - 直接修改当前目录中的文件来完成任务。
 - 不要执行 git commit、git push，也不要切换分支；提交由 Master 负责。
-${permissionRules(permission)}${checks}
+${noGitHubRule()}${permissionRules(permission)}${checks}
 ${taskReportFormat()}
 `,
     en: `You are a development agent scheduled by ${brandName()}, working in a separate working directory of the repository (a git worktree).
@@ -194,7 +206,7 @@ ${rest}## Requirements
 
 - Complete the task by editing the files in the current directory.
 - Do not run git commit or git push, and do not switch branches; the Master makes the commits.
-${permissionRules(permission)}${checks}
+${noGitHubRule()}${permissionRules(permission)}${checks}
 ${taskReportFormat()}
 `,
   });
@@ -312,8 +324,8 @@ ${diffStat || '（没有改动）'}
 
 ${rest}## 规则
 
-- 只评审，不要修改任何文件。
-- 问题分两级：
+- 只评审，不要修改任何文件，也不要执行 git commit 或 git push。
+${noGitHubRule()}- 问题分两级：
   - must（必须修改）：只限以下情况——没有达成目标；有缺陷或破坏了已有功能；改动的行为缺少测试；违反仓库 AGENTS.md 中的约定。
   - suggestion（建议）：其他可以改进的地方，包括超出目标范围的改进、边缘情况的打磨、风格偏好。这些不影响合并，不要要求扩大改动范围。
 - 没有问题时 issues 为空数组。
@@ -341,8 +353,8 @@ ${diffStat || '(no changes)'}
 
 ${rest}## Rules
 
-- Only review; do not modify any file.
-- Issues come in two levels:
+- Only review; do not modify any file, and do not run git commit or git push.
+${noGitHubRule()}- Issues come in two levels:
   - must (has to be fixed): only when the goal is not achieved; there is a defect or existing functionality is broken; changed behavior lacks tests; the repository's AGENTS.md conventions are violated.
   - suggestion: anything else that could be better, including improvements beyond the goal, polishing edge cases and style preferences. These do not block the merge; do not ask to widen the scope of the change.
 - When there are no issues, issues is an empty array.
@@ -503,7 +515,7 @@ ${ctx.goal}
   4. 一个 Run（编码 → 评审 → 合并）能否做完；
   5. 有没有明显更好的做法。
 - 只有真正影响能否做好的问题才需要问人；细节自己按最合理的方式定下来，写进 summary，不要为它们打扰人。
-
+${noGitHubRule()}
 ${rest}`,
     en: `You are the requirement assessment agent of ${brandName()}. Before a Run starts coding, judge whether the requirement below is sound and ready to start. You may only read files and search; you may not modify any file or run commands.
 
@@ -521,7 +533,7 @@ ${ctx.goal}
   4. whether one Run (coding → review → merge) can finish it;
   5. whether there is a clearly better approach.
 - Ask the human only about what really decides whether it can be done well; settle details yourself in the most sensible way and write them in summary instead of bothering the human with them.
-
+${noGitHubRule()}
 ${rest}`,
   });
   if (timeout) return `${intro}${decideAloneConclusion(timeout)}`;

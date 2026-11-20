@@ -23,6 +23,7 @@ node dist/cli.js      # 数据目录 ~/.ares1（或 $ARES1_HOME），端口 4870
 | `workflows/` | 流程模板 |
 | `data/ares1.db` | 运行状态（SQLite），升级迁移前自动备份 |
 | `data/logs/`、`data/artifacts/` | Agent 的执行日志和产物 |
+| `data/agent-gh-config/` | 给 Agent 用的空 gh 配置目录，每次用之前清空（见「Agent 拿不到 GitHub 凭据」） |
 | `worktrees/` | 每个 Run 的工作目录 |
 | `master.out`、`upgrade.log` | 后台运行时的输出、自动升级的日志 |
 
@@ -109,6 +110,20 @@ github:
 - **侦察**：提示词里只列受信任的人或 Master 建的 issue；「不做」的理由只取受信任的人写的最后一条评论，没有就不写理由；「多次失败后关闭」也只认受信任的人写的标记。陌生人建的 issue 完全不出现，代价是侦察可能提出和它重复的提案，你在采纳时能发现。最近的 Run 里，来自陌生人 issue、还没人确认过的 Run 只列 issue 编号，不列内容。
 - **从 issue 建 Run**：只有有 triage 及以上权限的人能加 `ares1:ready`，所以标签可信，但 issue 可能是陌生人写的，加标签之后也还能改。这时 Master 照常建 Run，目标是建 Run 那一刻 issue 的内容，之后再改 issue 不影响它；Run 一建好就停在「issue 作者不是仓库成员，等你确认需求」，在 issue 上说明原因，打上 `ares1:needs-you`。在这之前没有任何 Agent（包括只读的需求评估）读到它。你在 Run 详情页读过目标后点「确认并开始」，Run 才从头开始，之后照常按模板和 `auto_merge` 的设置走；这一步不管怎么设置都要人来做。不想做就终止 Run 或关闭 issue。Run 页上一直标着 issue 作者和确认的时间。
 - **自动重做**：重做时目标从 issue 重新读。作者不受信任时，内容和上次确认过的一样就直接重做，改过就要重新确认。
+
+### Agent 拿不到 GitHub 凭据
+
+只把陌生人写的内容挡在提示词外面还不够：Agent 能执行命令，要是继承了本机 gh 的登录，它自己跑一下 `gh issue view 12 --comments`，陌生人的评论就又进来了；它还能以本机登录的所有 GitHub 账号读写这些账号能访问的所有仓库。Master 读 issue、发评论、推送都是自己做的，Agent 用不着 GitHub 凭据，所以 Agent（编码、评审、需求评估、侦察）和准备命令、检查命令都在去掉了 GitHub 凭据的环境里运行：
+
+- 去掉 `GH_TOKEN`、`GITHUB_TOKEN`、`GH_ENTERPRISE_TOKEN`、`GITHUB_ENTERPRISE_TOKEN`，再把 `GH_TOKEN` 设成一个无效的值 `ares1-agent-no-github-access`。gh 优先用 `GH_TOKEN`，GitHub 会拒绝它，gh 也就不会退回去用存在配置文件或 macOS 钥匙串里的登录。
+- `GH_CONFIG_DIR` 指向数据目录下的空目录 `data/agent-gh-config/`，gh 在里面是未登录状态。每次启动 Agent、运行命令之前都会把它清空，Agent 往里面写的东西留不到下一次。
+- git 的凭据助手（钥匙串、gh 等）全部清掉，去掉 `GIT_ASKPASS`、`SSH_ASKPASS`，并设置 `GIT_TERMINAL_PROMPT=0`：通过 https 访问需要登录的仓库会直接失败，不会弹出要密码的提示。
+- 其他环境变量原样保留，包括 `PATH`、`HOME`，以及 Claude Code 和 cursor-agent 自己的登录信息。
+- 给 Agent 的提示词也写明：需求、讨论和 issue 的内容都已经在提示词里，不要自己去 GitHub 读。
+
+副作用：准备命令和检查命令里需要 GitHub 凭据的操作会失败，比如通过 https 安装 GitHub 上的私有依赖、在测试里调用需要登录的 GitHub API。
+
+剩下的边界：Agent 和 Master 以同一个系统用户运行，用户目录里的东西 Agent 仍然读得到、用得上，包括 SSH 密钥（可以用 SSH 推送）、gh 自己的配置目录、钥匙串（可以直接调用 `security` 命令读出 gh 存的 token）和其他文件。上面这些做法只能防止 Agent 无意中用到这些权限，挡不住它有意为之。被构建的是公开仓库、或者需求不完全受信时，建议让 Master 以单独的系统用户运行（这个用户只有这个项目需要的权限，比如单个仓库的 deploy key 或权限最小的 token），或者放在单独的机器上跑。
 
 ## Agent 出错时
 

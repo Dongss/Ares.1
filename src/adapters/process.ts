@@ -1,7 +1,83 @@
 import { execFile, spawn } from 'node:child_process';
-import { createWriteStream, mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { createWriteStream, lstatSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
+
+/**
+ * The GitHub token agents and their commands get: invalid on purpose. gh takes GH_TOKEN before
+ * any login it keeps elsewhere (its config, the macOS keychain), so it fails instead of falling
+ * back to one of those.
+ */
+export const AGENT_GH_TOKEN = 'ares1-agent-no-github-access';
+
+/** Variables that hand GitHub credentials to gh and other tools. */
+const GITHUB_TOKEN_VARS = [
+  'GH_TOKEN',
+  'GITHUB_TOKEN',
+  'GH_ENTERPRISE_TOKEN',
+  'GITHUB_ENTERPRISE_TOKEN',
+] as const;
+
+/**
+ * Programs git and ssh ask for a password when there is no terminal. Editors set them to hand
+ * out their own logins (VS Code's GIT_ASKPASS answers with its GitHub session).
+ */
+const ASKPASS_VARS = ['GIT_ASKPASS', 'SSH_ASKPASS'] as const;
+
+/**
+ * The environment of agent CLIs and of the commands run on their work (setup and verify
+ * commands, which execute code the agents wrote): the Master's own without its GitHub access.
+ * The Master reads issues and pushes by itself, so agents need no GitHub credentials; with them
+ * they could read what people the Master does not trust wrote, and act as every GitHub account
+ * logged in on this machine.
+ * - GitHub tokens are dropped and GH_TOKEN is an invalid one;
+ * - gh's config directory is `ghConfigDir`, meant to be an empty directory: gh has no login;
+ * - git has no credential helper (keychain, gh) or askpass program and never prompts.
+ * Everything else stays as it is, PATH, HOME and the agent CLIs' own logins included.
+ */
+export function agentEnv(base: NodeJS.ProcessEnv, ghConfigDir: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...base };
+  for (const name of [...GITHUB_TOKEN_VARS, ...ASKPASS_VARS]) delete env[name];
+  env.GH_TOKEN = AGENT_GH_TOKEN;
+  env.GH_CONFIG_DIR = ghConfigDir;
+  env.GIT_TERMINAL_PROMPT = '0';
+  // git reads config from the environment after every config file, and an empty helper empties
+  // the list of helpers set before it, URL-specific ones included. Added after any such config
+  // the environment already has.
+  const count = Number(base.GIT_CONFIG_COUNT ?? 0);
+  const n = Number.isInteger(count) && count > 0 ? count : 0;
+  env[`GIT_CONFIG_KEY_${n}`] = 'credential.helper';
+  env[`GIT_CONFIG_VALUE_${n}`] = '';
+  env.GIT_CONFIG_COUNT = String(n + 1);
+  return env;
+}
+
+/**
+ * `agentEnv` of the Master's environment, with `ghConfigDir` emptied first: whatever an earlier
+ * agent wrote there (a gh login, say) does not reach the next one.
+ */
+export function prepareAgentEnv(ghConfigDir: string): NodeJS.ProcessEnv {
+  emptyDir(ghConfigDir);
+  return agentEnv(process.env, ghConfigDir);
+}
+
+/** Makes `dir` an empty directory. A symlink put in its place is removed, never followed. */
+export function emptyDir(dir: string): void {
+  let isDir = false;
+  try {
+    isDir = lstatSync(dir).isDirectory();
+  } catch {
+    // missing
+  }
+  if (!isDir) {
+    rmSync(dir, { force: true });
+    mkdirSync(dir, { recursive: true });
+    return;
+  }
+  for (const entry of readdirSync(dir)) {
+    rmSync(join(dir, entry), { recursive: true, force: true });
+  }
+}
 
 export interface ProcessOptions {
   bin: string;

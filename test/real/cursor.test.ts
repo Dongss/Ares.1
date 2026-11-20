@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { CursorAgentAdapter } from '../../src/adapters/cursor-agent.js';
+import { agentEnv } from '../../src/adapters/process.js';
 import { parseReport, TaskReportSchema } from '../../src/engine/contracts.js';
 import { initRepo, tmpDir } from '../helpers.js';
 
@@ -20,6 +21,8 @@ describe('real cursor-agent', () => {
       permission: 'full' as const,
       timeoutMs: 180_000,
       extraArgs: [],
+      // What the engine gives agents: the CLI has to work without GitHub credentials.
+      env: agentEnv(process.env, tmpDir('ares1-real-gh-')),
     };
 
     const first = await adapter.start({

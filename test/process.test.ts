@@ -1,15 +1,18 @@
 import { type ChildProcess, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, lstatSync, readdirSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterAll, afterEach, describe, expect, it } from 'vitest';
 import {
+  AGENT_GH_TOKEN,
+  agentEnv,
   isOurProcess,
   killProcessGroup,
   type ProcessOptions,
+  prepareAgentEnv,
   runProcess,
 } from '../src/adapters/process.js';
-import { tmpDir } from './helpers.js';
+import { tmpDir, writeFile } from './helpers.js';
 
 // These tests start real processes through /bin/sh and rely on POSIX process groups
 // (macOS and Linux).
@@ -336,5 +339,95 @@ describe('killProcessGroup', () => {
 
     expect(await gone(pid)).toBe(true);
     expect(await gone(member)).toBe(true);
+  });
+});
+
+describe('agentEnv', () => {
+  it('drops GitHub credentials, gives gh an empty config dir and git no way to get a password', () => {
+    const base = {
+      PATH: '/usr/bin:/bin',
+      HOME: '/Users/me',
+      ANTHROPIC_API_KEY: 'sk-ant',
+      CURSOR_API_KEY: 'cursor',
+      GH_TOKEN: 'gho_master',
+      GITHUB_TOKEN: 'ghp_master',
+      GH_ENTERPRISE_TOKEN: 'ghe_master',
+      GITHUB_ENTERPRISE_TOKEN: 'ghe_master2',
+      GIT_ASKPASS: '/Applications/Editor/askpass.sh',
+      SSH_ASKPASS: '/usr/bin/ssh-askpass',
+    };
+    expect(agentEnv(base, '/data/agent-gh-config')).toEqual({
+      // Everything else is passed on as it is, the agent CLIs' own logins included.
+      PATH: '/usr/bin:/bin',
+      HOME: '/Users/me',
+      ANTHROPIC_API_KEY: 'sk-ant',
+      CURSOR_API_KEY: 'cursor',
+      GH_TOKEN: AGENT_GH_TOKEN,
+      GH_CONFIG_DIR: '/data/agent-gh-config',
+      GIT_TERMINAL_PROMPT: '0',
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: 'credential.helper',
+      GIT_CONFIG_VALUE_0: '',
+    });
+    // The Master's own environment is left alone.
+    expect(base.GH_TOKEN).toBe('gho_master');
+  });
+
+  it('adds the empty credential helper after the git config the environment already has', () => {
+    const env = agentEnv(
+      {
+        GIT_CONFIG_COUNT: '2',
+        GIT_CONFIG_KEY_0: 'core.hooksPath',
+        GIT_CONFIG_VALUE_0: '/hooks',
+        GIT_CONFIG_KEY_1: 'credential.helper',
+        GIT_CONFIG_VALUE_1: 'osxkeychain',
+      },
+      '/gh',
+    );
+    expect(env).toMatchObject({
+      GIT_CONFIG_COUNT: '3',
+      GIT_CONFIG_KEY_0: 'core.hooksPath',
+      GIT_CONFIG_VALUE_0: '/hooks',
+      GIT_CONFIG_KEY_1: 'credential.helper',
+      GIT_CONFIG_VALUE_1: 'osxkeychain',
+      GIT_CONFIG_KEY_2: 'credential.helper',
+      GIT_CONFIG_VALUE_2: '',
+    });
+  });
+});
+
+describe('prepareAgentEnv', () => {
+  it("is agentEnv of the Master's environment, with the gh config dir created empty", () => {
+    const dir = join(tmp(), 'data', 'agent-gh-config');
+    const env = prepareAgentEnv(dir);
+    expect(env).toEqual(agentEnv(process.env, dir));
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  it('empties the gh config dir of whatever an earlier agent left there', () => {
+    const dir = join(tmp(), 'agent-gh-config');
+    prepareAgentEnv(dir);
+    writeFile(join(dir, 'hosts.yml'), 'github.com:\n  oauth_token: gho_left\n');
+    writeFile(join(dir, 'extensions', 'x', 'bin'), 'x');
+    prepareAgentEnv(dir);
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  it('removes a symlink or file put in place of the dir, never what a symlink points to', () => {
+    const root = tmp();
+    const real = join(root, 'real-gh-config');
+    writeFile(join(real, 'hosts.yml'), 'mine');
+    const dir = join(root, 'agent-gh-config');
+    symlinkSync(real, dir);
+    prepareAgentEnv(dir);
+    expect(lstatSync(dir).isDirectory()).toBe(true);
+    expect(readdirSync(dir)).toEqual([]);
+    expect(readFileSync(join(real, 'hosts.yml'), 'utf8')).toBe('mine');
+
+    rmSync(dir, { recursive: true });
+    writeFile(dir, 'a file');
+    prepareAgentEnv(dir);
+    expect(lstatSync(dir).isDirectory()).toBe(true);
+    expect(readdirSync(dir)).toEqual([]);
   });
 });

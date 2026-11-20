@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { isOurProcess, killProcessGroup } from '../adapters/process.js';
+import { isOurProcess, killProcessGroup, prepareAgentEnv } from '../adapters/process.js';
 import type { AgentAdapter, AgentResult } from '../adapters/types.js';
 import type {
   AgentEventRecord,
@@ -1114,6 +1114,7 @@ export class Engine {
       const results = await runCommands(repo.setupCommands, path, {
         timeoutMs: this.commandTimeoutMs(),
         logPath: join(this.runLogDir(run.id), 'setup.log'),
+        env: this.agentEnv(),
         signal,
       });
       this.checkAbort(signal);
@@ -1383,6 +1384,7 @@ export class Engine {
     const results = await runCommands(verify, workdir, {
       timeoutMs: this.commandTimeoutMs(),
       logPath: attempt.logPath.replace(/\.jsonl$/, '.verify.log'),
+      env: this.agentEnv(),
       signal,
     });
     this.checkAbort(signal);
@@ -1666,6 +1668,8 @@ export class Engine {
     },
   ): Promise<{ attempt: Attempt; result: AgentResult }> {
     this.checkAbort(opts.signal);
+    // Before the attempt is recorded, so that a failure here leaves no attempt running.
+    const env = this.agentEnv();
     const attemptId = newId('att');
     const logPath = join(this.runLogDir(run.id), `${attemptId}.jsonl`);
     const effort = agentEffort(agent) ?? null;
@@ -1707,6 +1711,7 @@ export class Engine {
       outputSchema: opts.outputSchema,
       timeoutMs: opts.timeoutMs,
       extraArgs: agent.args,
+      env,
       logPath,
       onEvent: (event) => {
         if (event.type === 'session')
@@ -2163,6 +2168,7 @@ export class Engine {
       const results = await runCommands(commands, workdir, {
         timeoutMs: this.commandTimeoutMs(),
         logPath: join(this.runLogDir(run.id), `merge-${sr.id}.log`),
+        env: this.agentEnv(),
         signal,
       });
       this.checkAbort(signal);
@@ -2355,6 +2361,11 @@ export class Engine {
 
   private commandTimeoutMs(): number {
     return this.cfg.master.defaults.command_timeout_minutes * 60_000;
+  }
+
+  /** Environment of agents and of the commands run on their work: no GitHub credentials. */
+  private agentEnv(): NodeJS.ProcessEnv {
+    return prepareAgentEnv(this.deps.paths.agentGhConfigDir);
   }
 }
 

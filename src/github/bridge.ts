@@ -1,5 +1,6 @@
 import { readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { prepareAgentEnv } from '../adapters/process.js';
 import type { AgentAdapter, AgentExecution } from '../adapters/types.js';
 import type { GitHubRepoStatus, GitHubStatus } from '../api/types.js';
 import { brandName } from '../brand.js';
@@ -1101,6 +1102,8 @@ export class IssueBridge {
         outputSchema: scoutReportJsonSchema(),
         timeoutMs: (agent.timeout_minutes ?? this.cfg.master.defaults.timeout_minutes) * 60_000,
         extraArgs: agent.args,
+        // Read-only, but it still must not get to what untrusted people wrote on GitHub.
+        env: prepareAgentEnv(this.deps.paths.agentGhConfigDir),
         logPath: scout.logPath,
       });
       entry.exec = exec;
