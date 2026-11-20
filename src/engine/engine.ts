@@ -2606,11 +2606,14 @@ export class Engine {
   }
 
   /**
-   * Merging the target branch's latest code conflicted; the merge was given up and the worktree
-   * is as before. When an agent stage can resolve it (`conflictTarget`), the merge stage fails like
-   * failed checks and `rollback` goes back there within max_loops; that round merges the target
-   * branch again and its agent resolves the conflicts (`conflictMerge`). Otherwise, or when git
-   * named no conflicted file (the merge failed some other way), the Run waits for a human.
+   * Merging the target branch's latest code failed; the merge was given up and the worktree is as
+   * before. When git named conflicted files and an agent stage can resolve them
+   * (`conflictTarget`), the merge stage fails like failed checks and `rollback` goes back there
+   * within max_loops; that round merges the target branch again and its agent resolves the
+   * conflicts (`conflictMerge`). When no agent stage can, the Run waits for a human to merge by
+   * hand. When git named no conflicted file, the merge failed some other way (a lock, the disk, a
+   * broken index): that is mostly passing or due to the environment and leaves a human nothing to
+   * resolve, so the Run ends as failed, and a Run from an issue is redone in a fresh worktree.
    */
   private mergeConflict(
     run: Run,
@@ -2622,7 +2625,6 @@ export class Engine {
   ): void {
     const { files } = merged;
     const list = files.map((f) => `- ${f}`).join('\n');
-    const resolver = files.length > 0 ? conflictTarget(run.template, sr.stageId) : null;
     this.store.tx(() => {
       this.store.addCheck({
         runId: run.id,
@@ -2642,7 +2644,18 @@ export class Engine {
                 en: `Merging the latest ${target} failed; the merge was abandoned: ${merged.error}`,
               }),
       });
-      if (resolver) {
+      if (files.length === 0) {
+        const reason = merged.error.trim();
+        this.failRun(
+          run.id,
+          t({
+            zh: `合并 ${target} 的最新代码失败：${reason}\nRun 结束，工作目录和分支已保留。`,
+            en: `Merging the latest ${target} failed: ${reason}\nThe Run ended; the working directory and branch are kept.`,
+          }),
+        );
+        return;
+      }
+      if (conflictTarget(run.template, sr.stageId)) {
         this.store.updateStageRun(sr.id, {
           status: 'failed',
           failReason: 'conflict',
@@ -2659,13 +2672,10 @@ export class Engine {
         });
         return;
       }
-      const why =
-        files.length > 0
-          ? t({
-              zh: `这些文件有冲突：\n${list}\n合并阶段回退到的不是 Agent 阶段，没法交给 Agent 解决。`,
-              en: `These files conflict:\n${list}\nThe merge stage does not go back to an agent stage, so no agent can resolve them.`,
-            })
-          : t({ zh: `git 报错：${merged.error}`, en: `git says: ${merged.error}` });
+      const why = t({
+        zh: `这些文件有冲突：\n${list}\n合并阶段回退到的不是 Agent 阶段，没法交给 Agent 解决。`,
+        en: `These files conflict:\n${list}\nThe merge stage does not go back to an agent stage, so no agent can resolve them.`,
+      });
       // The merge was aborted, so there is nothing to resolve in the worktree yet: tell the
       // human to redo the merge themselves and commit it, since a retry discards anything
       // uncommitted before merging again.

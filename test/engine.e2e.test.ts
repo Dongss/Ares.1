@@ -2144,6 +2144,19 @@ describe('engine: merge conflicts', () => {
     (h as Harness).master.store.listEvents(runId).filter((e) => e.type === type);
   /** Merges without approval, so a Run goes from coding to merging on its own. */
   const noGate = { stages: { merge: { gate: false } } };
+  /**
+   * Once the Run waits for its merge approval, main moves on without touching the Run's files and
+   * the worktree's index is locked, as by a git that got stuck: syncing main then fails with no
+   * conflicted file.
+   */
+  const lockBeforeMerge = async (runId: string) => {
+    const waiting = await (h as Harness).waitStatus(runId, 'waiting_approval');
+    const worktree = waiting.worktreePath as string;
+    const runHead = git(worktree, 'rev-parse', 'HEAD');
+    const mainHead = commitOnMain((h as Harness).repoDir, 'other.txt', 'other\n');
+    writeFile(join(git(worktree, 'rev-parse', '--absolute-git-dir'), 'index.lock'), '');
+    return { worktree, runHead, mainHead };
+  };
 
   it('goes back to coding, where the agent resolves the conflict, then merges both sides', async () => {
     h = await harness();
@@ -2387,8 +2400,54 @@ describe('engine: merge conflicts', () => {
     expect(git(repoDir, 'show', 'main:feature.txt')).toBe('ok\nfrom main');
   });
 
+  it('ends the Run as failed when git fails to merge main without a conflict', async () => {
+    h = await harness();
+    const store = h.master.store;
+    const run = h.run();
+    const { worktree, runHead, mainHead } = await lockBeforeMerge(run.id);
+
+    h.master.engine.approve(run.id);
+    const failed = await h.waitStatus(run.id, 'failed');
+    expect(failed.blocked).toBeNull();
+    expect(failed.finishedAt).toBeTruthy();
+    expect(failed.error).toMatch(/^合并 main 的最新代码失败：git .*merge .*失败：.*index\.lock/s);
+    expect(failed.error).toMatch(/\nRun 结束，工作目录和分支已保留。$/);
+    expect(eventsOf(run.id, 'run.blocked')).toEqual([]);
+    const check = store.listChecks(run.id).find((c) => c.kind === 'merge');
+    expect(check).toMatchObject({ name: '同步 main', passed: false });
+    expect(check?.detail).toContain('index.lock');
+    // Nothing went back to another stage, and nothing was merged.
+    expect(store.listStageRuns(run.id).some((sr) => sr.failReason === 'conflict')).toBe(false);
+    expect(git(h.repoDir, 'rev-parse', 'main')).toBe(mainHead);
+    expect(git(worktree, 'rev-parse', 'HEAD')).toBe(runHead);
+    expect(existsSync(worktree)).toBe(true);
+    // Nothing waits for a human: the next Run starts.
+    await h.waitStatus(h.run('下一个').id, 'waiting_approval');
+  });
+
   describe('in English', () => {
     afterEach(() => setLang('zh'));
+
+    it('says why syncing main failed without Chinese of its own', async () => {
+      h = await harness({ config: 'language: en\n' });
+      const run = h.run('Add feature.txt');
+      await lockBeforeMerge(run.id);
+      h.master.engine.approve(run.id);
+      const failed = await h.waitStatus(run.id, 'failed');
+      const error = failed.error as string;
+      const match =
+        /^Merging the latest main failed: git .*? failed: ([\s\S]*)\nThe Run ended; the working directory and branch are kept\.$/.exec(
+          error,
+        );
+      expect(match).not.toBeNull();
+      // git's own message comes in the system's language; what the Master says around it is English.
+      const gitSays = match?.[1] as string;
+      expect(gitSays).toContain('index.lock');
+      expect(error.replace(gitSays, '')).not.toMatch(/[一-鿿]/);
+      const check = h.master.store.listChecks(run.id).find((c) => c.kind === 'merge');
+      expect(check?.name).toBe('Sync main');
+      expect(check?.detail?.replace(gitSays, '')).not.toMatch(/[一-鿿]/);
+    });
 
     it('tells the agent about the merge and says what conflicted without Chinese', async () => {
       const englishWorkflow = TEST_WORKFLOW_YAML.replace('name: 测试流程', 'name: Test flow')
