@@ -83,7 +83,7 @@ stages:
 
 ### Run 失败后自动重做
 
-从 issue 来的 Run 失败后（`failed`，比如 Agent 出错且重试、换 Agent 都用完，返工或回退次数用完，超出预算且配置为终止，准备命令失败，Master 内部错误，合并时 git 因冲突以外的原因失败，工作目录与记录不一致；不包括被终止的），Master 不等人，自动再开一个 Run 重做。次数上限是 `github.repos.<name>.max_run_attempts`：
+从 issue 来的 Run 失败后（`failed`，比如 Agent 出错且重试、换 Agent 都用完，返工或回退次数用完，超出 Run 预算（默认），准备命令失败，Master 内部错误，合并时 git 因冲突以外的原因失败，工作目录与记录不一致；不包括被终止的），Master 不等人，自动再开一个 Run 重做。次数上限是 `github.repos.<name>.max_run_attempts`：
 
 ```yaml
 github:
@@ -193,19 +193,19 @@ Run 卡住（`blocked`）、已暂停或等审批时会让出执行位，排队�
 
 - 审批：模板里设了 `gate` 的阶段（从 issue 来的 Run 打开 `auto_merge` 时，合并不等审批）。
 - 需求评估有疑问，等你回复，最多等 `reply_timeout_hours`（到时间评估自己决定，所以这种 Run 算作会自己往下走；设为 `null` 时一直等，算作只等人）；issue 作者不是仓库成员，等你确认需求。
-- 超出预算（`on_budget_exceeded: pause`，默认）。
 - 合并冲突但没有 Agent 阶段能解决（见上面的「合并冲突」）。
-- 配置为等人时：`on_agent_error: human`（包括 Agent 不可用时）、`on_exhausted: human`。
+- 配置为等人时：`on_agent_error: human`（包括 Agent 不可用时）、`on_exhausted: human`、`on_budget_exceeded: pause`（超出预算）。
 
 目标分支有未提交的改动时，Run 也会卡住（`target_dirty`），但不用你做任何决定：合并阶段要快进目标分支，而目标分支在某个目录里检出、且有已跟踪文件的改动没提交（未跟踪的文件不算），快进会动到这些改动，所以先停下，并照常发「Run 卡住了」的通知。之后 Master 大约每分钟复查一次，你提交或丢弃这些改动后，Run 会自己回到队首接着合并：重新同步目标分支，有新提交时重跑检查，再快进。不用去看板点重试（点了也行，会立刻继续）。改动还在时复查什么都不改，也不会重复通知；工作开关关着时不会自动继续，打开时马上查一次。自举时 Master 正是往开发仓库的 `main` 合并，在那里随手改了文件，处理掉就行。这种 Run 算作会自己往下走，不计入 `scout.max_proposals`。
 
-Agent 出错且重试、换 Agent 都用完，Agent 不可用且没有可换的 Agent（或配置为 `on_agent_error: retry`），返工或回退用完，超出预算且配置为 `on_budget_exceeded: abort`，准备命令失败，Master 内部错误，合并时 git 因冲突以外的原因失败，工作目录与记录不一致（工作目录只是被删了的除外，见下面）时，Run 不等人，直接结束、标为失败。工作目录和分支保留，Master 接着做别的；从 issue 来的 Run 按 `max_run_attempts` 自动重做（见上面的「Run 失败后自动重做」），重做时失败原因会交给新 Run 的 Agent。
+Agent 出错且重试、换 Agent 都用完，Agent 不可用且没有可换的 Agent（或配置为 `on_agent_error: retry`），返工或回退用完，超出预算（默认；配置为 `on_budget_exceeded: pause` 时才等人），准备命令失败，Master 内部错误，合并时 git 因冲突以外的原因失败，工作目录与记录不一致（工作目录只是被删了的除外，见下面）时，Run 不等人，直接结束、标为失败。工作目录和分支保留，Master 接着做别的；从 issue 来的 Run 按 `max_run_attempts` 自动重做（见上面的「Run 失败后自动重做」），重做时失败原因会交给新 Run 的 Agent。
 
+- 超出预算：模板或 Run 设了 `budget_usd` 时，Master 每次启动 Agent 之前检查花费，越过预算的那次执行照常检查和提交，之后不再开始新的执行。默认（`on_budget_exceeded: abort`）Run 结束、标为失败，`error` 写明已花费多少、预算多少。重做的 Run 从零算花费，总花费仍然有界：每个 Run 受 `budget_usd` 限制，次数受 `max_run_attempts` 限制，当天的总花费受 `daily_budget_usd` 限制。配置为 `on_budget_exceeded: pause` 时 Run 卡住（超出预算），在看板上填一个更高的预算后重试，从停下的地方接着做；配置页会对这个设置给出警告，`on_agent_error: human`、`on_exhausted: human` 也一样。
 - 准备命令失败：`error` 里写明是哪条准备命令、退出码或超时，以及输出的末尾。准备命令失败多半是偶发的或者和环境有关（依赖源连不上、安装中途出错等），重做时会在新的工作目录里重新运行。
 - Master 内部错误：Master 自己执行 Run 时出了异常（git 锁、磁盘满、命令起不来等）。`error` 以「Master 内部错误：」开头（英文为 `Master internal error:`），后面是原因。正在执行的 Agent 会被结束，这次执行记为中断（`interrupted`），没做完的 Task 标为已取消；工作目录保持出错时的样子，不回滚，方便查看。
 - 合并时 git 因冲突以外的原因失败：合并阶段同步目标分支时 `git merge` 出错，但没报出冲突的文件（git 锁、磁盘满、索引损坏等）。这次合并已放弃，工作目录保持合并之前的样子。`error` 写明「合并 <目标分支> 的最新代码失败：」（英文为 `Merging the latest <目标分支> failed:`），后面是 git 的报错；合并阶段的检查里也记下这次失败。
 - 工作目录与记录不一致：Run 每次拿到执行位时（包括 Master 重启后），Master 都会检查它的工作目录还是不是自己留下的样子。工作目录只是被删了（比如清理磁盘时删掉），而 Run 的分支还在时，Master 自己从分支把工作目录恢复回来（`git worktree add`），复查通过就照常接着做，不停下，事件列表里记一条 `run.workspace_restored`（数据里有路径和分支）。其他情况说明工作目录已经不可信，Run 结束、标为失败，`error` 写明原因：工作目录当前不在 Run 的分支上；提交历史和记录不一致（Master 记录的最新提交已不在分支上，比如被手动 `git reset` 或改写过）；工作目录和分支都没了；从分支恢复失败（比如分支在别处检出）或恢复后复查仍不一致。工作目录和分支按实际情况保留（`error` 末尾写明保留了哪些），不做改动，方便查看；重做会在新的工作目录里进行。在工作目录里手动加的提交不算不一致，后面的检查照常会检查它们。
-- 这几种情况都没有「卡住等人」的配置：要是原因确实每次都会重现，issue 会把 `max_run_attempts` 次用完，然后关闭并写明每次的原因。
+- 除超出预算外，这几种情况都没有「卡住等人」的配置：要是原因确实每次都会重现，issue 会把 `max_run_attempts` 次用完，然后关闭并写明每次的原因。
 - 旧版本里因为这几种情况卡住（`blocked`）的 Run 仍然可以在看板上重试或终止：准备命令失败的会重新建工作目录、重新运行准备命令；内部错误的从出错的 Task 开始重做；合并失败的重新同步目标分支；工作目录与记录不一致的会先把被删的工作目录从分支恢复回来，再以工作目录当前的提交为准接着做。
 
 ## 稳定副本和自动升级

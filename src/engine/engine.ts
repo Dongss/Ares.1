@@ -1561,7 +1561,10 @@ export class Engine {
     );
   }
 
-  /** The Run has spent its budget: wait for a human, or end it (`on_budget_exceeded`). */
+  /**
+   * The Run has spent its budget: end it as failed (`on_budget_exceeded: abort`, the default; an
+   * issue's Run is then redone), or wait for a human to raise the budget (`pause`).
+   */
   private budgetExceeded(run: Run, sr: StageRun, eff: EffectiveStage, budget: number): void {
     const over = run.costUsd > budget;
     const spent = t({
@@ -1589,8 +1592,8 @@ export class Engine {
       this.failRun(
         run.id,
         t({
-          zh: `${spent}，按配置（on_budget_exceeded: abort）终止。工作目录和分支已保留。`,
-          en: `${spent}; ended as configured (on_budget_exceeded: abort). The working directory and branch are kept.`,
+          zh: `${spent}，Run 结束（on_budget_exceeded: abort），工作目录和分支已保留。`,
+          en: `${spent}, so the Run ended (on_budget_exceeded: abort); the working directory and branch are kept.`,
         }),
       );
     });

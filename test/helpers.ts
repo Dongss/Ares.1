@@ -143,6 +143,17 @@ export const blockOnAgentError = (stage = 'implement') => ({
   stages: { [stage]: { escalate: { max_retries: 0, on_agent_error: 'human' } } },
 });
 
+/**
+ * Run overrides that give the Run a budget of `budgetUsd` and make it wait for a human once the
+ * budget is spent (instead of ending, the default) in the agent stages of TEST_WORKFLOW_YAML.
+ */
+export const blockOverBudget = (budgetUsd: number) => ({
+  budget_usd: budgetUsd,
+  stages: Object.fromEntries(
+    ['implement', 'review'].map((id) => [id, { escalate: { on_budget_exceeded: 'pause' } }]),
+  ),
+});
+
 export type Script = (ctx: FakeContext) => FakeOutcome | Promise<FakeOutcome>;
 
 export const done = (summary = 'ok'): FakeOutcome => ({

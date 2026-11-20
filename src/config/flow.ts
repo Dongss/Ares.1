@@ -55,7 +55,10 @@ export const SYSTEM_DEFAULTS = {
     max_retries: 2,
     // Nobody has to be there: retry, then another agent, then the Run ends as failed.
     on_agent_error: 'switch_agent',
-    on_budget_exceeded: 'pause',
+    // Over budget: the Run ends as failed rather than waiting for a human to raise the budget, so
+    // nothing stops while nobody is around. A Run from an issue is redone, within max_run_attempts
+    // and daily_budget_usd, so spending stays bounded.
+    on_budget_exceeded: 'abort',
     // Out of reworks or rollbacks: the Run ends as failed, so an issue is redone with the reason
     // and nothing waits for a human.
     on_exhausted: 'fail',
@@ -188,6 +191,20 @@ export function effectiveBudget(
   overrides: RunOverrides,
 ): number | undefined {
   return overrides.budget_usd ?? template.defaults?.budget_usd;
+}
+
+/**
+ * Whether a Run over its budget waits for a human to raise it (`on_budget_exceeded: pause`) in
+ * some stage, rather than ending as failed. Only stages that run an agent count: the budget is
+ * checked before an agent runs.
+ */
+export function budgetPauses(template: WorkflowTemplate, overrides: RunOverrides): boolean {
+  return template.stages.some(
+    (s) =>
+      s.kind !== 'merge' &&
+      s.kind !== 'placeholder' &&
+      effectiveStage(template, s.id, overrides).escalate.on_budget_exceeded === 'pause',
+  );
 }
 
 /**

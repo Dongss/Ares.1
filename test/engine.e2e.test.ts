@@ -2012,6 +2012,12 @@ describe('engine: requirement assessment without a reply', () => {
 describe('engine: budget', () => {
   const withBudget = (defaults: string) =>
     TEST_WORKFLOW_YAML.replace('  max_loops: 3\n', `  max_loops: 3\n${defaults}`);
+  /** A Run over its budget waits for a human to raise it, instead of ending (the default). */
+  const pausing = (workflow: string) =>
+    workflow.replace(
+      '    on_agent_error: switch_agent\n',
+      '    on_agent_error: switch_agent\n    on_budget_exceeded: pause\n',
+    );
 
   /** Every execution costs `cost`; the coder's first result fails the verify command. */
   function costly(target: Harness, cost: number): void {
@@ -2024,8 +2030,34 @@ describe('engine: budget', () => {
     target.scripts.reviewer = () => ({ ...review(), costUsd: cost });
   }
 
-  it('blocks before the next execution once the budget is spent; a higher budget continues', async () => {
+  it('ends the Run as failed by default once the budget is spent, without waiting for anyone', async () => {
     h = await harness({ workflow: withBudget('  budget_usd: 1\n') });
+    costly(h, 1.2);
+    const run = h.run();
+    const failed = await h.waitStatus(run.id, 'failed');
+    expect(failed.blocked).toBeNull();
+    expect(failed.finishedAt).toBeTruthy();
+    expect(failed.error).toBe(
+      '已花费 $1.20，超过预算 $1.00，Run 结束（on_budget_exceeded: abort），工作目录和分支已保留。',
+    );
+    // Soft limit: the execution that crossed the budget was checked; the rework never started.
+    expect(h.fake.calls).toHaveLength(1);
+    expect(h.master.store.listRunTasks(run.id).map((t) => t.status)).toEqual(['cancelled']);
+    const events = h.master.store.listEvents(run.id);
+    const exceeded = events.filter((e) => e.type === 'run.budget_exceeded');
+    expect(exceeded.map((e) => e.data)).toEqual([
+      { costUsd: expect.closeTo(1.2), budgetUsd: 1, action: 'abort' },
+    ]);
+    expect(events.some((e) => e.type === 'run.blocked')).toBe(false);
+    // Kept for inspection, like a cancelled Run; nothing to raise the budget of.
+    expect(existsSync(failed.worktreePath as string)).toBe(true);
+    await expect(h.master.engine.retry(run.id, { budgetUsd: 5 })).rejects.toThrow(/blocked/);
+    // Nothing waits for a human: the next Run starts.
+    await h.waitStatus(h.run('下一个', { budget_usd: 10 }).id, 'waiting_approval');
+  });
+
+  it('blocks before the next execution once the budget is spent with on_budget_exceeded: pause; a higher budget continues', async () => {
+    h = await harness({ workflow: pausing(withBudget('  budget_usd: 1\n')) });
     costly(h, 1.2);
     const run = h.run();
     const blocked = await h.waitStatus(run.id, 'blocked');
@@ -2066,7 +2098,7 @@ describe('engine: budget', () => {
   });
 
   it('keeps going while under budget and checks before every execution', async () => {
-    h = await harness({ workflow: withBudget('  budget_usd: 1\n') });
+    h = await harness({ workflow: pausing(withBudget('  budget_usd: 1\n')) });
     costly(h, 0.8);
     const run = h.run();
     const blocked = await h.waitStatus(run.id, 'blocked');
@@ -2078,7 +2110,7 @@ describe('engine: budget', () => {
     expect(current.stageId).toBe('review');
   });
 
-  it('fails the Run when on_budget_exceeded is abort', async () => {
+  it('fails the Run when on_budget_exceeded is set to abort', async () => {
     h = await harness({
       workflow: withBudget('  budget_usd: 1\n').replace(
         '    on_agent_error: switch_agent\n',
@@ -2109,8 +2141,35 @@ describe('engine: budget', () => {
     // A lower one applies as well.
     costly(h, 0.3);
     const tight = h.run('目标', { budget_usd: 0.25 });
-    const blocked = await h.waitStatus(tight.id, 'blocked');
-    expect(blocked.blocked?.message).toContain('预算 $0.25');
+    const failed = await h.waitStatus(tight.id, 'failed');
+    expect(failed.error).toContain('预算 $0.25');
+  });
+
+  it('a stage set to pause in the Run overrides waits there even though the default ends it', async () => {
+    h = await harness({ workflow: withBudget('  budget_usd: 1\n') });
+    costly(h, 1.2);
+    const run = h.run('目标', {
+      stages: { implement: { escalate: { on_budget_exceeded: 'pause' } } },
+    });
+    const blocked = await h.waitStatus(run.id, 'blocked');
+    expect(blocked.blocked?.kind).toBe('budget');
+    expect(h.master.store.getStageRun(blocked.currentStageRunId as string).stageId).toBe(
+      'implement',
+    );
+  });
+
+  describe('in English', () => {
+    afterEach(() => setLang('zh'));
+
+    it('says why a Run over budget ended without Chinese', async () => {
+      h = await harness({ config: 'language: en\n', workflow: withBudget('  budget_usd: 1\n') });
+      costly(h, 1.2);
+      const failed = await h.waitStatus(h.run('Add feature.txt').id, 'failed');
+      expect(failed.error).toBe(
+        'Spent $1.20, over the budget of $1.00, so the Run ended (on_budget_exceeded: abort); the working directory and branch are kept.',
+      );
+      expect(failed.error).not.toMatch(/[一-鿿]/);
+    });
   });
 
   it('does not check anything without a budget', async () => {

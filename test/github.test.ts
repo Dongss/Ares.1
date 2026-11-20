@@ -1825,6 +1825,52 @@ stages:
     expect(runsOf(t)).toHaveLength(2);
   });
 
+  it('redoes a Run that spent its budget instead of waiting for a higher one', async () => {
+    // A budget, and nothing said about on_budget_exceeded: the default ends the Run over it.
+    const t = await start(
+      config(),
+      REDO_WORKFLOW.replace('stages:\n', '  budget_usd: 1\nstages:\n'),
+    );
+    let assessed = 0;
+    t.scripts.assessor = () => {
+      assessed++;
+      // The first assessment alone spends more than the budget, so coding never starts.
+      return { ...assessment('go'), costUsd: assessed === 1 ? 1.5 : 0.1 };
+    };
+    t.scripts.coder = coderFailingOn([]);
+    gh.add({ title: '加 feature', body: '写 feature.txt', labels: [LABELS.ready] });
+    await t.master.issues.poll();
+
+    const first = nth(t, 0);
+    const failed = await t.waitStatus(first.id, 'failed');
+    expect(failed.blocked).toBeNull();
+    expect(failed.error).toBe(
+      '已花费 $1.50，超过预算 $1.00，Run 结束（on_budget_exceeded: abort），工作目录和分支已保留。',
+    );
+    expect(callsOf(t, 'coder')).toHaveLength(0);
+    await t.master.issues.sync();
+    const failure = gh.get(1).comments.find((c) => c.includes('Run 失败了')) ?? '';
+    expect(failure).toContain('Run 失败了（第 1/3 次尝试）');
+    expect(failure).toContain('超过预算 $1.00');
+    expect(gh.get(1).labels).toEqual([LABELS.running]);
+
+    // The redo starts over with a budget of its own and gets the work done.
+    const second = nth(t, 1);
+    expect(second.issue?.attempt).toBe(2);
+    expect(second.issue?.earlier).toEqual([
+      {
+        runId: first.id,
+        attempt: 1,
+        stage: '编码',
+        error: expect.stringContaining('on_budget_exceeded: abort'),
+      },
+    ]);
+    const completed = await t.waitStatus(second.id, 'completed');
+    expect(completed.costUsd).toBeCloseTo(2.1);
+    await t.master.issues.sync();
+    expect(gh.get(1)).toMatchObject({ state: 'closed', stateReason: 'completed' });
+  });
+
   it('redoes a Run that failed on its setup commands or a Master internal error', async () => {
     const t = await start(config(), REDO_WORKFLOW);
     t.master.store.updateRepo(t.repo.id, {

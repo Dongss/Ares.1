@@ -347,16 +347,29 @@ function formatZod(error: z.ZodError): string[] {
   return error.issues.map((i) => `${i.path.join('.') || root}: ${i.message}`);
 }
 
-/** The escalate options whose `human` choice makes a Run wait for a human. */
-const WAITING_OPTIONS = ['on_agent_error', 'on_exhausted'] as const;
+/** The escalate options that can make a Run wait for a human, and the value that does. */
+const WAITING_OPTIONS = {
+  on_agent_error: 'human',
+  on_exhausted: 'human',
+  on_budget_exceeded: 'pause',
+} as const satisfies { [K in keyof Escalate]?: Escalate[K] };
 
-/** Escalate options of `escalate` set to `human`, in WAITING_OPTIONS order. */
-function waitsForHuman(escalate: Escalate | undefined): (typeof WAITING_OPTIONS)[number][] {
-  return WAITING_OPTIONS.filter((option) => escalate?.[option] === 'human');
+type WaitingOption = keyof typeof WAITING_OPTIONS;
+
+/** Escalate options of `escalate` set to wait for a human, in WAITING_OPTIONS order. */
+function waitsForHuman(escalate: Escalate | undefined): WaitingOption[] {
+  return (Object.keys(WAITING_OPTIONS) as WaitingOption[]).filter(
+    (option) => escalate?.[option] === WAITING_OPTIONS[option],
+  );
 }
 
-function waitForHumanWarning(option: (typeof WAITING_OPTIONS)[number]): string {
+function waitForHumanWarning(option: WaitingOption): string {
   switch (option) {
+    case 'on_budget_exceeded':
+      return t({
+        zh: 'on_budget_exceeded: pause：Run 花费达到预算（budget_usd）后会卡住等人调高预算，没人在场时就停在那里。建议改成 abort：结束 Run、标为失败，从 issue 来的 Run 会在 max_run_attempts 和 daily_budget_usd 的限制内自动重做',
+        en: 'on_budget_exceeded: pause: once a Run has spent its budget (budget_usd), it waits for a human to raise the budget, stuck while nobody is around. Better use abort: the Run ends as failed, and a Run from an issue is redone within max_run_attempts and daily_budget_usd',
+      });
     case 'on_agent_error':
       return t({
         zh: 'on_agent_error: human：Agent 出错时自动重试 max_retries 次后，Run 会卡住等人处理，没人在场时就停在那里。建议改成 switch_agent：重试用完后换另一个 Agent 再试，都不行就结束 Run、标为失败',
@@ -554,13 +567,15 @@ export function validateTemplate(
     );
   }
 
-  // "human" is a valid choice, but a Run waiting for a human stops the system while nobody is
-  // around. Only a warning: templates already installed (self-dev used to say human) stay usable.
+  // "human" (or "pause" over budget) is a valid choice, but a Run waiting for a human stops the
+  // system while nobody is around. Only a warning: templates already installed (self-dev used to
+  // say human) stay usable.
   for (const option of waitsForHuman(tpl.defaults?.escalate)) {
     warnings.push(`defaults.escalate${t({ zh: '：', en: ': ' })}${waitForHumanWarning(option)}`);
   }
   for (const s of tpl.stages) {
-    // No agent runs there, so nothing errors or is reworked; their rollbacks follow the defaults.
+    // No agent runs there, so nothing errors, is reworked or checks the budget; their rollbacks
+    // follow the defaults.
     if (s.kind === 'merge' || s.kind === 'placeholder') continue;
     for (const option of waitsForHuman(s.escalate)) {
       warnings.push(

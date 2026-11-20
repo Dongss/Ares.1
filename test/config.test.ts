@@ -2,6 +2,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  budgetPauses,
   discussionReplyWait,
   issueRunOverrides,
   loopsExhausted,
@@ -709,6 +710,111 @@ stages:
     expect(warnings[0]).not.toMatch(/[一-鿿]/);
   });
 
+  it('does not wait for a human over budget by default', () => {
+    for (const lang of ['zh', 'en'] as const) {
+      setLang(lang);
+      const paths = home();
+      // A budget alone, with nothing said about what happens over it: no warning.
+      writeFile(
+        join(paths.workflowsDir, 'budget.yaml'),
+        `id: budget
+defaults:
+  budget_usd: 5
+stages:
+  - id: implement
+    agent: claude-coder
+`,
+      );
+      const cfg = loadConfig(paths, ['claude-code'], ['claude-code']);
+      expect(cfg.warnings['workflows/budget.yaml']).toBeUndefined();
+      expect(cfg.warnings['workflows/self-dev.yaml']).toBeUndefined();
+      const selfDev = cfg.templates.get('self-dev') as WorkflowTemplate;
+      expect(budgetPauses(selfDev, {})).toBe(false);
+      const budget = cfg.templates.get('budget') as WorkflowTemplate;
+      expect(effectiveStage(budget, 'implement', {}).escalate.on_budget_exceeded).toBe('abort');
+      expect(budgetPauses(budget, {})).toBe(false);
+    }
+    setLang('zh');
+    // A Run override can still make it wait.
+    const bare = TemplateSchema.parse({ id: 't', stages: [{ id: 'a', agent: 'x' }] });
+    const o = { stages: { a: { escalate: { on_budget_exceeded: 'pause' as const } } } };
+    expect(effectiveStage(bare, 'a', o).escalate.on_budget_exceeded).toBe('pause');
+    expect(budgetPauses(bare, o)).toBe(true);
+  });
+
+  it('warns about on_budget_exceeded: pause in the defaults and in stages that run an agent', () => {
+    const paths = home();
+    writeFile(
+      join(paths.workflowsDir, 'defaults.yaml'),
+      `id: by-default
+defaults:
+  budget_usd: 5
+  escalate: { on_agent_error: switch_agent, on_budget_exceeded: pause }
+stages:
+  - id: implement
+    agent: claude-coder
+`,
+    );
+    writeFile(
+      join(paths.workflowsDir, 'stage.yaml'),
+      `id: by-stage
+stages:
+  - id: implement
+    agent: claude-coder
+    escalate: { on_budget_exceeded: pause }
+  - id: review
+    kind: review
+    agent: claude-reviewer
+    escalate: { on_budget_exceeded: abort }
+  - id: merge
+    kind: merge
+    escalate: { on_budget_exceeded: pause }
+`,
+    );
+    const cfg = loadConfig(paths, ['claude-code']);
+    expect(cfg.errors['workflows/defaults.yaml']).toBeUndefined();
+    expect(cfg.errors['workflows/stage.yaml']).toBeUndefined();
+    expect(cfg.templates.has('by-default')).toBe(true);
+    expect(cfg.templates.has('by-stage')).toBe(true);
+
+    const byDefault = cfg.warnings['workflows/defaults.yaml'] ?? [];
+    expect(byDefault).toHaveLength(1);
+    expect(byDefault[0]).toMatch(/^defaults\.escalate：on_budget_exceeded: pause：/);
+    expect(byDefault[0]).toContain('卡住等人调高预算，没人在场时就停在那里');
+    expect(byDefault[0]).toContain('建议改成 abort');
+    expect(byDefault[0]).toContain('从 issue 来的 Run 会在 max_run_attempts 和 daily_budget_usd');
+
+    // Only the stage that runs an agent; merge never checks the budget. abort is not warned about.
+    expect(cfg.warnings['workflows/stage.yaml']).toEqual([
+      expect.stringMatching(/^阶段 implement：on_budget_exceeded: pause：/),
+    ]);
+  });
+
+  it('warns about on_budget_exceeded: pause in English too', () => {
+    setLang('en');
+    const paths = home();
+    writeFile(
+      join(paths.workflowsDir, 'self-dev.yaml'),
+      `id: self-dev
+defaults:
+  escalate: { on_budget_exceeded: pause }
+stages:
+  - id: implement
+    agent: claude-coder
+    escalate: { on_budget_exceeded: pause }
+`,
+    );
+    const warnings = loadConfig(paths, ['claude-code']).warnings['workflows/self-dev.yaml'] ?? [];
+    expect(warnings).toHaveLength(2);
+    expect(warnings[0]).toMatch(/^defaults\.escalate: on_budget_exceeded: pause: /);
+    expect(warnings[1]).toMatch(/^Stage implement: on_budget_exceeded: pause: /);
+    for (const warning of warnings) {
+      expect(warning).toContain('waits for a human to raise the budget');
+      expect(warning).toContain('Better use abort');
+      expect(warning).not.toMatch(/[一-鿿]/);
+    }
+  });
+
   it('resolves stage settings: system default → template → stage → run override', () => {
     const t: WorkflowTemplate = TemplateSchema.parse({
       id: 't',
@@ -722,7 +828,7 @@ stages:
     expect(effectiveStage(t, 'a', {}).escalate).toEqual({
       max_retries: 5,
       on_agent_error: 'human',
-      on_budget_exceeded: 'pause',
+      on_budget_exceeded: 'abort',
       on_exhausted: 'fail',
     });
     const o = { stages: { a: { escalate: { max_retries: 1 } }, m: { gate: false } } };

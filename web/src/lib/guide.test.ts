@@ -586,8 +586,40 @@ describe('guardrails', () => {
       ...input(manualRepo),
       flow: issueFlow({ ...config, templates: [budgeted] }, manualRepo, null),
     };
+    expect(i.flow?.budgetPauses).toBe(false);
     expect(rail(i, 'Run 预算')).toMatchObject({ on: true });
-    expect(rail(i, 'Run 预算')?.text).toContain('$5.00');
+    // By default a Run over budget ends as failed and nothing waits for you.
+    expect(rail(i, 'Run 预算')?.text).toBe(
+      '每个 Run 最多花 $5.00（模板的 budget_usd），超出后不再开始新的执行，Run 结束、标为失败，从 issue 来的会自动重做',
+    );
+  });
+
+  it('says a Run over budget waits for you only where on_budget_exceeded is pause', () => {
+    const withEscalate = (defaults: object, stage: Record<string, object> = {}) =>
+      TemplateSchema.parse({
+        ...template,
+        defaults: { budget_usd: 5, ...defaults },
+        stages: template.stages.map((st) => ({ ...st, ...(stage[st.id] ?? {}) })),
+      });
+    const flowOf = (tpl: typeof template) =>
+      issueFlow({ ...config, templates: [tpl] }, manualRepo, null);
+    const pause = { escalate: { on_budget_exceeded: 'pause' } };
+    const abort = { escalate: { on_budget_exceeded: 'abort' } };
+
+    const paused = flowOf(withEscalate(pause));
+    expect(paused?.budgetPauses).toBe(true);
+    const i: GuideInput = { ...input(manualRepo), flow: paused };
+    expect(rail(i, 'Run 预算')?.text).toBe(
+      '每个 Run 最多花 $5.00（模板的 budget_usd），超出后不再开始新的执行，卡住等你调高预算（on_budget_exceeded: pause）',
+    );
+    // A stage that runs an agent decides as well, over the template's defaults.
+    expect(flowOf(withEscalate({}, { review: pause }))?.budgetPauses).toBe(true);
+    expect(flowOf(withEscalate(pause, { implement: abort, review: abort }))?.budgetPauses).toBe(
+      false,
+    );
+    // No agent runs in merge and placeholder stages, so the budget is never checked there.
+    expect(flowOf(withEscalate({}, { e2e: pause, merge: pause }))?.budgetPauses).toBe(false);
+    expect(flowOf(withEscalate(abort))?.budgetPauses).toBe(false);
   });
 
   it('leaves out the GitHub ones without GitHub', () => {
@@ -779,6 +811,28 @@ describe('in English', () => {
     });
     const checks = guardrails(inputEn(manualRepo), true).find((g) => g.title === 'Checks');
     expect(checks?.text).toContain('npm run build, npm test run');
+  });
+
+  it('words the Run budget without Chinese, whether a Run over it ends or waits', () => {
+    setLang('en');
+    const texts = [{}, { escalate: { on_budget_exceeded: 'pause' } }].map((escalate) => {
+      const budgeted = TemplateSchema.parse({
+        ...enTemplate,
+        defaults: { budget_usd: 5, ...escalate },
+      });
+      const i: GuideInput = {
+        ...inputEn(manualRepo),
+        flow: issueFlow({ ...enConfig, templates: [budgeted] }, manualRepo, null),
+      };
+      return guardrails(i, true).find((g) => g.title === 'Run budget')?.text ?? '';
+    });
+    expect(texts[0]).toBe(
+      "Each Run spends at most $5.00 (the template's budget_usd); beyond that no new execution starts, the Run ends as failed, and a Run from an issue is redone automatically",
+    );
+    expect(texts[1]).toBe(
+      "Each Run spends at most $5.00 (the template's budget_usd); beyond that no new execution starts, and it is blocked until you raise the budget (on_budget_exceeded: pause)",
+    );
+    for (const text of texts) expect(text).not.toMatch(CJK);
   });
 
   it('names the sections, the actors and the labels in English', () => {

@@ -1,6 +1,7 @@
 import type { ConfigView, GitHubRepoStatus, UpgradeStatus } from '../../../src/api/types.js';
 import {
   type AutoAcceptRule,
+  budgetPauses,
   effectiveBudget,
   issueRunOverrides,
   MAX_SCOUT_BACKOFF_HOURS,
@@ -113,6 +114,8 @@ export interface IssueFlow {
   stages: FlowStage[];
   /** The Run's budget in USD; undefined = no limit. */
   budgetUsd: number | undefined;
+  /** Whether a Run over its budget waits for you to raise it, rather than ending as failed. */
+  budgetPauses: boolean;
 }
 
 /**
@@ -131,6 +134,7 @@ export function issueFlow(
     templateName: template.name ?? template.id,
     stages: buildFlow({ template, overrides, repoVerifyCommands, agents: config.agents }),
     budgetUsd: effectiveBudget(template, overrides),
+    budgetPauses: budgetPauses(template, overrides),
   };
 }
 
@@ -947,10 +951,15 @@ export function guardrails(input: GuideInput, working: boolean | undefined): Gua
       ? {
           title: budgetTitle,
           on: true,
-          text: t({
-            zh: `每个 Run 最多花 ${formatCost(flow.budgetUsd)}（模板的 budget_usd），超出后不再开始新的执行，默认卡住等你调高预算`,
-            en: `Each Run spends at most ${formatCost(flow.budgetUsd)} (the template's budget_usd); beyond that no new execution starts, and by default it is blocked until you raise the budget`,
-          }),
+          text: flow.budgetPauses
+            ? t({
+                zh: `每个 Run 最多花 ${formatCost(flow.budgetUsd)}（模板的 budget_usd），超出后不再开始新的执行，卡住等你调高预算（on_budget_exceeded: pause）`,
+                en: `Each Run spends at most ${formatCost(flow.budgetUsd)} (the template's budget_usd); beyond that no new execution starts, and it is blocked until you raise the budget (on_budget_exceeded: pause)`,
+              })
+            : t({
+                zh: `每个 Run 最多花 ${formatCost(flow.budgetUsd)}（模板的 budget_usd），超出后不再开始新的执行，Run 结束、标为失败，从 issue 来的会自动重做`,
+                en: `Each Run spends at most ${formatCost(flow.budgetUsd)} (the template's budget_usd); beyond that no new execution starts, the Run ends as failed, and a Run from an issue is redone automatically`,
+              }),
         }
       : {
           title: budgetTitle,

@@ -19,6 +19,7 @@ import {
   ASSESS_WORKFLOW_YAML,
   assessment,
   blockOnAgentError,
+  blockOverBudget,
   done,
   FakeGitHub,
   git,
@@ -288,8 +289,8 @@ agents:
       return { ...done(), costUsd: 0.5 };
     };
     // The run's 0.4 overrides the template's 5: blocked before the review.
-    const created = h.run('g', { budget_usd: 0.4 });
-    expect(created.overrides).toEqual({ budget_usd: 0.4 });
+    const created = h.run('g', blockOverBudget(0.4));
+    expect(created.overrides).toEqual(blockOverBudget(0.4));
     const id = created.id;
     await h.waitStatus(id, 'blocked');
     expect((await call('GET', `/api/runs/${id}`)).json.run.blocked.kind).toBe('budget');
@@ -509,7 +510,7 @@ agents:
       writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
       return { ...done(), costUsd: 0.5 };
     };
-    const blocked = h.run('卡住', { budget_usd: 0.4 });
+    const blocked = h.run('卡住', blockOverBudget(0.4));
     await h.waitStatus(blocked.id, 'blocked');
     await refused(blocked.id, 'blocked');
 
@@ -805,7 +806,7 @@ github:
 
     // C: out of budget after the first execution, then terminated.
     hh.scripts.coder = coder('ok\n');
-    const c = hh.run('C', { budget_usd: 0.4 });
+    const c = hh.run('C', blockOverBudget(0.4));
     await hh.waitStatus(c.id, 'blocked');
     await call('POST', `/api/runs/${c.id}/cancel`);
 
