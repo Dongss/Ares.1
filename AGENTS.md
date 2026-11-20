@@ -52,8 +52,9 @@ src/
                       process groups), claude-code.ts, cursor-agent.ts, fake.ts (fake agent for
                       tests), tool-summary.ts
   engine/
-    engine.ts         workflow engine: queue, state machine, checks, rework, rollback, approvals,
-                      merge, recovery after restart
+    engine.ts         workflow engine: queue, state machine, checks, rework, agent errors (retry
+                      with backoff, switching agents), rollback, approvals, merge, recovery after
+                      restart
     prompts.ts        prompts for the assess, coding and review agents
     contracts.ts      agents' structured output: contract and validation
     discussion.ts     how an assessment's conclusion and discussion are found and named

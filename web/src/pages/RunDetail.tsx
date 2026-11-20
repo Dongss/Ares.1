@@ -446,8 +446,8 @@ function retryHint(kind: BlockKind): string {
       en: 'Retrying redoes this Task from the commit before it started, with the rework count reset. You can switch to another agent or add a note.',
     },
     agent_error: {
-      zh: '重试会从这个 Task 开始前的提交重做。可以换一个 Agent，或补充说明。',
-      en: 'Retrying redoes this Task from the commit before it started. You can switch to another agent or add a note.',
+      zh: '重试会从这个 Task 开始前的提交重做，出错后的自动重试次数重新算。可以换一个 Agent，或补充说明。',
+      en: 'Retrying redoes this Task from the commit before it started, and the automatic retries after errors start over. You can switch to another agent or add a note.',
     },
     agent_unavailable: {
       zh: '确认 Agent 可用后重试。',

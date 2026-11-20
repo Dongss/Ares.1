@@ -763,8 +763,8 @@ function FaqSection(props: { input: GuideInput; home: string; idle: string[] }) 
         <ul className="guide-list">
           <li>
             {t({
-              zh: '重试当前 Task：返工次数清零，排到队首；可以换 Agent，附一段说明作为提示。',
-              en: 'Retry the current Task: the rework count resets and it goes to the front of the queue; you can switch the agent and add a note as a hint.',
+              zh: '重试当前 Task：返工次数和出错后的自动重试次数都重新算，排到队首；可以换 Agent，附一段说明作为提示。',
+              en: 'Retry the current Task: the rework count and the automatic retries after errors start over, and it goes to the front of the queue; you can switch the agent and add a note as a hint.',
             })}
           </li>
           <li>

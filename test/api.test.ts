@@ -18,6 +18,7 @@ import {
   ASSESS_AGENTS_YAML,
   ASSESS_WORKFLOW_YAML,
   assessment,
+  blockOnAgentError,
   done,
   FakeGitHub,
   git,
@@ -398,8 +399,8 @@ agents:
   it('cleans up the workspace of a failed run', async () => {
     h = await harness({
       workflow: TEST_WORKFLOW_YAML.replace(
-        '    on_agent_error: human\n',
-        '    on_agent_error: human\n    on_budget_exceeded: abort\n',
+        '    on_agent_error: switch_agent\n',
+        '    on_agent_error: switch_agent\n    on_budget_exceeded: abort\n',
       ),
     });
     h.scripts.coder = (ctx) => {
@@ -746,7 +747,7 @@ github:
       return { ...done(), usage: { inputTokens: 200, outputTokens: 20 } };
     };
     hh.scripts.reviewer = reviewer();
-    const b = hh.run('B');
+    const b = hh.run('B', blockOnAgentError());
     await hh.waitStatus(b.id, 'blocked');
     await call('POST', `/api/runs/${b.id}/retry`, { agentId: 'coder2' });
     await hh.waitStatus(b.id, 'waiting_approval');
@@ -994,7 +995,7 @@ github:
       writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
       return done();
     };
-    const b = hh.run('B');
+    const b = hh.run('B', blockOnAgentError());
     await hh.waitStatus(b.id, 'blocked');
     await call('POST', `/api/runs/${b.id}/retry`, { agentId: 'coder2' });
     await hh.waitStatus(b.id, 'waiting_approval');

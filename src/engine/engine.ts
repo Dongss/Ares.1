@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { isOurProcess, killProcessGroup } from '../adapters/process.js';
 import type { AgentAdapter, AgentResult } from '../adapters/types.js';
 import type { AgentEventRecord, LiveAgentEvent, RunWorkspaceState } from '../api/types.js';
@@ -19,7 +20,7 @@ import {
   rollbackTarget,
   stageVerifyCommands,
 } from '../config/schema.js';
-import { t } from '../i18n.js';
+import { join as joinList, t } from '../i18n.js';
 import { ConflictError, NotFoundError, type Store } from '../store/store.js';
 import {
   type Attempt,
@@ -88,6 +89,47 @@ export interface EngineDeps {
   adapters: ReadonlyMap<string, AgentAdapter>;
   /** The current time in epoch milliseconds (tests move it on); default Date.now. */
   now?: () => number;
+  /** How long to wait before retrying an agent that errored; default `AGENT_RETRY_BACKOFF`. */
+  agentRetryBackoff?: Backoff;
+}
+
+/** An exponential backoff: the first wait, doubled on each further retry up to the longest. */
+export interface Backoff {
+  firstMs: number;
+  maxMs: number;
+}
+
+/**
+ * Waits before retrying an agent that errored: an error is often passing (a network hiccup, an
+ * overloaded service), and retrying at once tends to hit it again.
+ */
+export const AGENT_RETRY_BACKOFF: Backoff = { firstMs: 30_000, maxMs: 600_000 };
+
+/** The wait before the `retry`-th retry (1 = the first). */
+export function backoffMs(backoff: Backoff, retry: number): number {
+  return Math.min(backoff.firstMs * 2 ** Math.max(0, retry - 1), backoff.maxMs);
+}
+
+const LEVEL_RANK = { low: 0, mid: 1, high: 2 } as const;
+
+/**
+ * The agent to switch a task to after its agent kept erroring (`on_agent_error: switch_agent`):
+ * one the task has not tried yet that can run the stage, those of the current agent's tier or
+ * higher first, then the cheaper first; agents.yaml's order decides the rest. Undefined when
+ * there is none. `agents` holds only enabled agents.
+ */
+export function switchCandidate(
+  agents: Iterable<AgentConfig>,
+  current: AgentConfig | undefined,
+  tried: ReadonlySet<string>,
+  usable: (agent: AgentConfig) => boolean,
+): AgentConfig | undefined {
+  const floor = current ? LEVEL_RANK[current.tier] : 0;
+  const lower = (a: AgentConfig) => (LEVEL_RANK[a.tier] >= floor ? 0 : 1);
+  const candidates = [...agents].filter((a) => !tried.has(a.id) && usable(a));
+  // Array.prototype.sort is stable: equal ranks keep the file order.
+  candidates.sort((a, b) => lower(a) - lower(b) || LEVEL_RANK[a.cost] - LEVEL_RANK[b.cost]);
+  return candidates[0];
 }
 
 /**
@@ -168,10 +210,12 @@ export class Engine {
   private replyTimer: ReturnType<typeof setTimeout> | undefined;
   private readonly store: Store;
   private readonly now: () => number;
+  private readonly backoff: Backoff;
 
   constructor(private readonly deps: EngineDeps) {
     this.store = deps.store;
     this.now = deps.now ?? Date.now;
+    this.backoff = deps.agentRetryBackoff ?? AGENT_RETRY_BACKOFF;
   }
 
   private get cfg(): LoadedConfig {
@@ -1114,20 +1158,29 @@ export class Engine {
         });
         return;
       }
-      // abort: like a cancel, unfinished tasks are cancelled and the worktree and branch are kept.
-      for (const task of this.store.listRunTasks(run.id)) {
+      this.failRun(
+        run.id,
+        t({
+          zh: `${spent}，按配置（on_budget_exceeded: abort）终止。工作目录和分支已保留。`,
+          en: `${spent}; ended as configured (on_budget_exceeded: abort). The working directory and branch are kept.`,
+        }),
+      );
+    });
+  }
+
+  /**
+   * End the Run as failed, without waiting for a human: like a cancel, unfinished tasks are
+   * cancelled and the worktree and branch are kept for inspection. The issue it came from is
+   * released (marked failed), so the system moves on.
+   */
+  private failRun(runId: string, error: string): void {
+    this.store.tx(() => {
+      for (const task of this.store.listRunTasks(runId)) {
         if (task.status !== 'passed' && task.status !== 'failed') {
           this.store.updateTask(task.id, { status: 'cancelled' });
         }
       }
-      this.setStatus(run.id, 'failed', {
-        queuePos: null,
-        error: t({
-          zh: `${spent}，按配置（on_budget_exceeded: abort）终止。工作目录和分支已保留。`,
-          en: `${spent}; ended as configured (on_budget_exceeded: abort). The working directory and branch are kept.`,
-        }),
-        finishedAt: nowIso(),
-      });
+      this.setStatus(runId, 'failed', { queuePos: null, error, finishedAt: nowIso() });
     });
   }
 
@@ -1192,7 +1245,7 @@ export class Engine {
 
     // Layer 1: did the agent run properly and report completion?
     if (result.status !== 'completed') {
-      return this.agentError(run, eff, task, attempt, result);
+      return this.agentError(run, eff, task, attempt, result, signal);
     }
     const report = parseReport(TaskReportSchema, result.structured, result.finalMessage);
     const problem = resultProblem(report, result.permissionDenials);
@@ -1302,7 +1355,8 @@ export class Engine {
     }
     this.checkAbort(signal);
 
-    if (result.status !== 'completed') return this.agentError(run, eff, task, attempt, result);
+    if (result.status !== 'completed')
+      return this.agentError(run, eff, task, attempt, result, signal);
     const report = parseReport(ReviewReportSchema, result.structured, result.finalMessage);
     if (!report.ok) {
       return this.rework(run, eff, task, attempt, formatFeedback(report.error));
@@ -1368,7 +1422,8 @@ export class Engine {
     }
     this.checkAbort(signal);
 
-    if (result.status !== 'completed') return this.agentError(run, eff, task, attempt, result);
+    if (result.status !== 'completed')
+      return this.agentError(run, eff, task, attempt, result, signal);
     const report = parseReport(AssessReportSchema, result.structured, result.finalMessage);
     if (!report.ok) {
       return this.rework(run, eff, task, attempt, formatFeedback(report.error));
@@ -1626,40 +1681,153 @@ export class Engine {
     this.store.event(run.id, 'task.rework', { taskId: task.id, retries, feedback });
   }
 
+  /**
+   * The agent errored (failed, timed out): retry it after a backoff, up to `max_retries` times in
+   * a row (counted apart from reworks). Then, by `on_agent_error`: `switch_agent` hands the task
+   * to another agent, which gets as many retries; `human` blocks the Run for a human; when
+   * nothing is left to try (`retry` and `switch_agent`), the Run ends as failed instead of
+   * waiting for a human.
+   */
   private async agentError(
     run: Run,
     eff: EffectiveStage,
     task: Task,
     attempt: Attempt,
     result: AgentResult,
+    signal: AbortSignal,
   ): Promise<void> {
     const error =
       result.error ?? t({ zh: `执行状态：${result.status}`, en: `Status: ${result.status}` });
     this.store.updateAttempt(attempt.id, { outcome: 'agent_error' });
-    const mode = eff.escalate.on_agent_error;
-    if (mode === 'retry' && task.retries < eff.escalate.max_retries) {
-      this.store.updateTask(task.id, { status: 'pending', retries: task.retries + 1 });
-      this.store.event(run.id, 'task.retry_after_error', { taskId: task.id, error });
+    // Every error takes the path below. An exhausted quota or a rate limit calls for waiting
+    // rather than retrying or switching agents; that is to be recognized here, from `result`.
+    const { max_retries: maxRetries, on_agent_error: mode } = eff.escalate;
+
+    const errors = this.errorsInARow(run, task);
+    if (errors <= maxRetries) {
+      const delayMs = backoffMs(this.backoff, errors);
+      this.store.tx(() => {
+        this.store.updateTask(task.id, { status: 'pending' });
+        this.store.event(run.id, 'task.retry_after_error', {
+          taskId: task.id,
+          agentId: task.agentId,
+          error,
+          attempt: errors,
+          delayMs,
+        });
+      });
+      // Holds the execution slot meanwhile; a pause, cancel or shutdown ends the wait at once.
+      if (delayMs > 0) await delay(delayMs, undefined, { signal }).catch(() => {});
+      this.checkAbort(signal);
       return;
     }
-    // switch_agent needs candidate agents; until then it escalates like "human"
-    // (templates using it get a warning when loaded).
+
+    const tried = this.triedAgents(task);
+    if (mode === 'switch_agent') {
+      const next = this.switchTarget(eff, task, tried);
+      if (next) {
+        this.store.tx(() => {
+          this.store.updateTask(task.id, {
+            status: 'pending',
+            agentId: next.id,
+            // Another agent cannot resume this one's session.
+            sessionId: null,
+            sessionAgentId: null,
+          });
+          this.store.event(run.id, 'task.agent_switched', {
+            taskId: task.id,
+            from: task.agentId,
+            to: next.id,
+            error,
+          });
+        });
+        return;
+      }
+    }
+
     await this.failTask(run, task, task.retries, task.pendingFeedback);
-    const note =
+    const failed = t({
+      zh: `Agent ${task.agentId} 运行出错：${error}`,
+      en: `Agent ${task.agentId} failed: ${error}`,
+    });
+    if (mode === 'human') {
+      const note =
+        maxRetries > 0
+          ? t({
+              zh: `\n\n已自动重试 ${maxRetries} 次，仍然出错。`,
+              en: `\n\nIt still failed after ${retryTimes(maxRetries)}.`,
+            })
+          : '';
+      this.block(run.id, {
+        kind: 'agent_error',
+        message: `${failed}${note}`,
+        taskId: task.id,
+      });
+      return;
+    }
+    const retried = maxRetries > 0;
+    const ended =
       mode === 'switch_agent'
         ? t({
-            zh: '（switch_agent 尚未实现，按 human 处理）',
-            en: ' (switch_agent is not implemented yet; handled as human)',
+            zh: `Task「${task.title}」执行出错：试过的 Agent（${joinList(tried)}）都出错了${retried ? `，每个都自动重试了 ${maxRetries} 次` : ''}，没有别的可用 Agent 了，Run 结束（on_agent_error: switch_agent）。`,
+            en: `Task "${task.title}" kept failing: every agent tried (${joinList(tried)}) failed${retried ? `, each after ${retryTimes(maxRetries)}` : ''}, and no other agent can take over, so the Run ended (on_agent_error: switch_agent).`,
           })
-        : '';
-    this.block(run.id, {
-      kind: 'agent_error',
-      message: t({
-        zh: `Agent ${task.agentId} 运行出错：${error}${note}`,
-        en: `Agent ${task.agentId} failed: ${error}${note}`,
+        : t({
+            zh: `Task「${task.title}」执行出错${retried ? `，自动重试 ${maxRetries} 次后仍然出错` : ''}，Run 结束（on_agent_error: retry）。`,
+            en: `Task "${task.title}" failed${retried ? ` again after ${retryTimes(maxRetries)}` : ''}, so the Run ended (on_agent_error: retry).`,
+          });
+    this.failRun(
+      run.id,
+      t({
+        zh: `${ended}\n最后一次：${failed}\n工作目录和分支已保留。`,
+        en: `${ended}\nThe last one: ${failed}\nThe working directory and branch are kept.`,
       }),
-      taskId: task.id,
-    });
+    );
+  }
+
+  /**
+   * How many times in a row the task's agent has errored, counting the attempt just made: its
+   * attempts from the latest back while they are errors of this agent since a human last retried
+   * the Run. An attempt that ran to the end (passed or sent back for rework), was stopped, or was
+   * made by another agent starts the count again.
+   */
+  private errorsInARow(run: Run, task: Task): number {
+    const events = this.store.listEvents(run.id);
+    const retried = events.findLast((e) => e.type === 'run.retry')?.id ?? 0;
+    const since = new Set(
+      events
+        .filter((e) => e.id > retried && e.type === 'attempt.started')
+        .map((e) => e.data.attemptId),
+    );
+    let errors = 0;
+    for (const a of this.store.listAttempts(task.id).reverse()) {
+      if (a.outcome !== 'agent_error' || a.agentId !== task.agentId || !since.has(a.id)) break;
+      errors++;
+    }
+    return errors;
+  }
+
+  /** The agents a task has run with, in the order it first did, its current one included. */
+  private triedAgents(task: Task): string[] {
+    return [...new Set([...this.store.listAttempts(task.id).map((a) => a.agentId), task.agentId])];
+  }
+
+  /** Who takes over a task whose agent kept erroring; undefined when nobody is left. */
+  private switchTarget(
+    eff: EffectiveStage,
+    task: Task,
+    tried: readonly string[],
+  ): AgentConfig | undefined {
+    const readOnly = eff.def.kind === 'assess';
+    return switchCandidate(
+      this.cfg.agents.values(),
+      this.cfg.agents.get(task.agentId),
+      new Set(tried),
+      (agent) => {
+        const adapter = this.deps.adapters.get(agent.cli);
+        return adapter !== undefined && (!readOnly || adapter.supportsReadOnly === true);
+      },
+    );
   }
 
   /** Final failure: roll the worktree back to before the task. */
@@ -2072,6 +2240,11 @@ export function commitMessage(input: {
 }
 
 export { ConflictError, NotFoundError };
+
+/** "1 retry", "2 retries": English only, Chinese writes 「n 次」 in place. */
+function retryTimes(n: number): string {
+  return n === 1 ? '1 retry' : `${n} retries`;
+}
 
 function unknownAgent(agentId: string): string {
   return t({

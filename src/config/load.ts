@@ -343,10 +343,10 @@ function formatZod(error: z.ZodError): string[] {
   return error.issues.map((i) => `${i.path.join('.') || root}: ${i.message}`);
 }
 
-function switchAgentWarning(): string {
+function waitForHumanWarning(): string {
   return t({
-    zh: 'on_agent_error: switch_agent（换 Agent）需要按难度和能力选择的候选 Agent，尚未实现，目前按 human 处理：Agent 出错时 Run 卡住等人处理',
-    en: 'on_agent_error: switch_agent (switch agents) needs candidate agents chosen by difficulty and ability, which is not implemented yet; it is treated as human: on an agent error the Run gets stuck until a human handles it',
+    zh: 'on_agent_error: human：Agent 出错时自动重试 max_retries 次后，Run 会卡住等人处理，没人在场时就停在那里。建议改成 switch_agent：重试用完后换另一个 Agent 再试，都不行就结束 Run、标为失败',
+    en: 'on_agent_error: human: when an agent errors, the Run is retried max_retries times and then waits for a human, stuck while nobody is around. Better use switch_agent: once the retries are used up another agent tries, and if none succeeds the Run ends as failed',
   });
 }
 
@@ -534,18 +534,18 @@ export function validateTemplate(
     );
   }
 
-  // switch_agent needs candidate agents, not implemented yet: the engine treats it as
-  // "human". Only a warning, so existing templates that use it stay usable.
-  if (tpl.defaults?.escalate?.on_agent_error === 'switch_agent') {
-    warnings.push(`defaults.escalate${t({ zh: '：', en: ': ' })}${switchAgentWarning()}`);
+  // "human" is a valid choice, but a Run waiting for a human stops the system while nobody is
+  // around. Only a warning: templates already installed (self-dev used to say human) stay usable.
+  if (tpl.defaults?.escalate?.on_agent_error === 'human') {
+    warnings.push(`defaults.escalate${t({ zh: '：', en: ': ' })}${waitForHumanWarning()}`);
   }
   for (const s of tpl.stages) {
     if (s.kind === 'merge' || s.kind === 'placeholder') continue; // no agent runs there
-    if (s.escalate?.on_agent_error === 'switch_agent') {
+    if (s.escalate?.on_agent_error === 'human') {
       warnings.push(
         t({
-          zh: `阶段 ${s.id}：${switchAgentWarning()}`,
-          en: `Stage ${s.id}: ${switchAgentWarning()}`,
+          zh: `阶段 ${s.id}：${waitForHumanWarning()}`,
+          en: `Stage ${s.id}: ${waitForHumanWarning()}`,
         }),
       );
     }

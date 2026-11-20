@@ -64,7 +64,7 @@ name: 测试流程
 defaults:
   escalate:
     max_retries: 2
-    on_agent_error: human
+    on_agent_error: switch_agent
   max_loops: 3
 stages:
   - id: implement
@@ -101,7 +101,7 @@ name: 测试流程
 defaults:
   escalate:
     max_retries: 2
-    on_agent_error: human
+    on_agent_error: switch_agent
   max_loops: 3
 stages:
   - id: assess
@@ -124,6 +124,14 @@ stages:
     kind: merge
     on_reject: implement
 `;
+
+/**
+ * Run overrides that make an agent error of a stage wait for a human at once (no automatic
+ * retries, no other agent), for tests about what a human does with a blocked Run.
+ */
+export const blockOnAgentError = (stage = 'implement') => ({
+  stages: { [stage]: { escalate: { max_retries: 0, on_agent_error: 'human' } } },
+});
 
 export type Script = (ctx: FakeContext) => FakeOutcome | Promise<FakeOutcome>;
 
@@ -217,6 +225,8 @@ export async function harness(opts: HarnessOptions = {}): Promise<Harness> {
     pollIssues: false,
     upgradeTimer: false,
     notice: () => {},
+    // Retry an agent that errored right away.
+    agentRetryBackoff: { firstMs: 0, maxMs: 0 },
     ...opts.master,
   });
   const repoDir = opts.repoDir ?? initRepo();

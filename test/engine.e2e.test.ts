@@ -1,10 +1,13 @@
 import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { InvalidStateError } from '../src/engine/engine.js';
+import { FakeAdapter } from '../src/adapters/fake.js';
+import type { AgentAdapter } from '../src/adapters/types.js';
+import { AGENT_RETRY_BACKOFF, backoffMs, InvalidStateError } from '../src/engine/engine.js';
+import { setLang } from '../src/i18n.js';
 import { noticeFor } from '../src/notify/notice.js';
 import { NotFoundError } from '../src/store/store.js';
-import type { Run } from '../src/store/types.js';
+import type { Run, Task } from '../src/store/types.js';
 import {
   ASSESS_AGENTS_YAML,
   ASSESS_WORKFLOW_YAML,
@@ -14,6 +17,7 @@ import {
   type Harness,
   harness,
   review,
+  type Script,
   TEST_WORKFLOW_YAML,
   waitFor,
   writeFile,
@@ -338,64 +342,6 @@ agents:
     expect(h.master.store.listRunTasks(run.id)[0]?.agentId).toBe('coder2');
   });
 
-  it('escalates an agent error to a human when on_agent_error is human', async () => {
-    h = await harness();
-    h.scripts.coder = () => ({ status: 'failed', error: '模型不存在' });
-    const run = h.run();
-    const blocked = await h.waitStatus(run.id, 'blocked');
-    expect(blocked.blocked?.kind).toBe('agent_error');
-    expect(blocked.blocked?.message).toContain('模型不存在');
-    expect(blocked.blocked?.message).not.toContain('switch_agent');
-    expect(() => h?.master.engine.approve(run.id)).toThrow();
-  });
-
-  it('escalates an agent error to a human when on_agent_error is switch_agent (not implemented)', async () => {
-    h = await harness({
-      workflow: `
-id: dev
-defaults:
-  escalate: { max_retries: 2, on_agent_error: switch_agent }
-stages:
-  - id: implement
-    agent: coder
-`,
-    });
-    h.scripts.coder = () => ({ status: 'failed', error: '模型不存在' });
-    const run = h.run();
-    const blocked = await h.waitStatus(run.id, 'blocked');
-    expect(blocked.blocked?.kind).toBe('agent_error');
-    expect(blocked.blocked?.message).toContain('模型不存在');
-    expect(blocked.blocked?.message).toContain('switch_agent 尚未实现，按 human 处理');
-    // No other agent was tried, and the same one was not retried.
-    expect(h.fake.calls.map((c) => c.model)).toEqual(['coder']);
-    expect(h.master.store.listRunTasks(run.id)[0]?.status).toBe('failed');
-  });
-
-  it('retries the agent on error when on_agent_error is retry', async () => {
-    h = await harness({
-      workflow: `
-id: dev
-defaults:
-  escalate: { max_retries: 2, on_agent_error: retry }
-stages:
-  - id: implement
-    agent: coder
-`,
-    });
-    let calls = 0;
-    h.scripts.coder = (ctx) => {
-      calls++;
-      if (calls === 1) return { status: 'failed', error: 'boom' };
-      writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
-      return done();
-    };
-    const run = h.run();
-    await h.waitStatus(run.id, 'completed');
-    expect(calls).toBe(2);
-    // No merge stage: the work stays on its branch, so the worktree is kept.
-    expect(existsSync(h.master.store.getRun(run.id).worktreePath as string)).toBe(true);
-  });
-
   it('pausing stops the agent and discards its changes; resuming redoes the task', async () => {
     h = await harness();
     let calls = 0;
@@ -614,6 +560,253 @@ const discussionKinds = (run: Run) =>
     (e) =>
       `${e.role}:${e.role === 'assessor' ? e.verdict : e.role === 'human' ? e.source : e.hours}`,
   );
+
+describe('engine: agent errors', () => {
+  const failing =
+    (error = '模型不存在'): Script =>
+    () => ({ status: 'failed', error });
+  const eventData = (runId: string, type: string) =>
+    (h as Harness).master.store
+      .listEvents(runId)
+      .filter((e) => e.type === type)
+      .map((e) => e.data);
+  /** Only a coding stage, so a Run that passes it completes on its own. */
+  const implementOnly = (escalate: string) => `
+id: dev
+defaults:
+  escalate: ${escalate}
+stages:
+  - id: implement
+    agent: coder
+`;
+
+  it('waits longer before each retry, up to a limit', () => {
+    expect([1, 2, 3, 4, 5, 6].map((n) => backoffMs(AGENT_RETRY_BACKOFF, n))).toEqual([
+      30_000, 60_000, 120_000, 240_000, 480_000, 600_000,
+    ]);
+  });
+
+  it('retries an agent that errored after a backoff, and goes on once it succeeds', async () => {
+    h = await harness({ master: { agentRetryBackoff: { firstMs: 5, maxMs: 8 } } });
+    let calls = 0;
+    h.scripts.coder = (ctx) => {
+      calls++;
+      if (calls <= 2) return { status: 'failed', error: `第 ${calls} 次出错` };
+      writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+      return done();
+    };
+    const run = h.run();
+    await h.waitStatus(run.id, 'waiting_approval');
+    expect(h.fake.calls.map((c) => c.model)).toEqual(['coder', 'coder', 'coder', 'reviewer']);
+    const task = h.master.store.listRunTasks(run.id)[0] as Task;
+    expect(eventData(run.id, 'task.retry_after_error')).toEqual([
+      { taskId: task.id, agentId: 'coder', error: '第 1 次出错', attempt: 1, delayMs: 5 },
+      { taskId: task.id, agentId: 'coder', error: '第 2 次出错', attempt: 2, delayMs: 8 },
+    ]);
+    expect(eventData(run.id, 'task.agent_switched')).toEqual([]);
+    expect(h.master.store.listAttempts(task.id).map((a) => a.outcome)).toEqual([
+      'agent_error',
+      'agent_error',
+      'passed',
+    ]);
+    // Errors are counted apart from reworks: none was used up.
+    expect(task.retries).toBe(0);
+  });
+
+  it('a pause ends the wait before a retry at once; resuming retries', async () => {
+    h = await harness({ master: { agentRetryBackoff: { firstMs: 600_000, maxMs: 600_000 } } });
+    let calls = 0;
+    h.scripts.coder = (ctx) => {
+      calls++;
+      if (calls === 1) return { status: 'failed', error: 'boom' };
+      writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+      return done();
+    };
+    const run = h.run();
+    await waitFor(() => eventData(run.id, 'task.retry_after_error').length === 1, 'the wait');
+    expect(h.master.store.getRun(run.id).status).toBe('running');
+    // Would take ten minutes if the wait went on.
+    expect((await h.master.engine.pause(run.id)).status).toBe('paused');
+    expect(calls).toBe(1);
+    h.master.engine.resume(run.id);
+    await h.waitStatus(run.id, 'waiting_approval');
+    expect(calls).toBe(2);
+  });
+
+  it('switches to another agent once the retries are used up (switch_agent)', async () => {
+    h = await harness();
+    h.scripts.coder = failing();
+    const run = h.run();
+    const waiting = await h.waitStatus(run.id, 'waiting_approval');
+    // 1 try + 2 retries (max_retries: 2), then coder2 takes over and passes.
+    expect(h.fake.calls.map((c) => c.model)).toEqual([
+      'coder',
+      'coder',
+      'coder',
+      'coder2',
+      'reviewer',
+    ]);
+    const task = h.master.store.listRunTasks(run.id)[0] as Task;
+    expect(task.agentId).toBe('coder2');
+    expect(eventData(run.id, 'task.agent_switched')).toEqual([
+      { taskId: task.id, from: 'coder', to: 'coder2', error: '模型不存在' },
+    ]);
+    expect(git(waiting.worktreePath as string, 'log', '-1', '--format=%b')).toContain(
+      'Agent: coder2 (fake',
+    );
+  });
+
+  it('ends the Run as failed, not blocked, when every agent kept erroring', async () => {
+    h = await harness({
+      agents: `
+agents:
+  coder: { cli: fake, model: coder, tier: high, cost: high }
+  cheap: { cli: fake, model: cheap, tier: low, cost: low }
+  pricey: { cli: fake, model: pricey, tier: high, cost: high }
+  coder2: { cli: fake, model: coder2, tier: high, cost: mid }
+  reviewer: { cli: fake, model: reviewer }
+  off: { cli: fake, model: off, tier: high, cost: low, enabled: false }
+`,
+      workflow: implementOnly('{ max_retries: 1, on_agent_error: switch_agent }'),
+    });
+    for (const model of ['coder', 'cheap', 'pricey', 'coder2', 'reviewer']) {
+      h.scripts[model] = (ctx) => {
+        writeFile(join(ctx.input.workdir, 'junk.txt'), `${model}\n`);
+        return { status: 'failed', error: `${model} 出错` };
+      };
+    }
+    const run = h.run();
+    const failed = await h.waitStatus(run.id, 'failed');
+    // Each agent: 1 try + 1 retry. Agents of the same tier or higher first, the cheaper first;
+    // then the lower tiers, the cheaper first. The disabled one never.
+    const order = ['coder', 'coder2', 'pricey', 'cheap', 'reviewer'];
+    expect(h.fake.calls.map((c) => c.model)).toEqual(order.flatMap((m) => [m, m]));
+    expect(eventData(run.id, 'task.agent_switched').map((d) => [d.from, d.to])).toEqual([
+      ['coder', 'coder2'],
+      ['coder2', 'pricey'],
+      ['pricey', 'cheap'],
+      ['cheap', 'reviewer'],
+    ]);
+    expect(failed.blocked).toBeNull();
+    expect(failed.finishedAt).toBeTruthy();
+    expect(failed.error).toContain(
+      '试过的 Agent（coder、coder2、pricey、cheap、reviewer）都出错了',
+    );
+    expect(failed.error).toContain('每个都自动重试了 1 次');
+    expect(failed.error).toContain('on_agent_error: switch_agent');
+    expect(failed.error).toContain('Agent reviewer 运行出错：reviewer 出错');
+    expect(h.master.store.listRunTasks(run.id).map((t) => t.status)).toEqual(['failed']);
+    // Rolled back to before the task, and kept for inspection.
+    const worktree = failed.worktreePath as string;
+    expect(existsSync(join(worktree, 'junk.txt'))).toBe(false);
+    expect(git(worktree, 'status', '--porcelain')).toBe('');
+    expect(git(h.repoDir, 'branch', '--list', failed.branch as string)).not.toBe('');
+    // Nothing waits for a human: the next Run starts.
+    await expect(h.master.engine.retry(run.id)).rejects.toThrow(/blocked/);
+    h.scripts.coder = (ctx) => {
+      writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+      return done();
+    };
+    await h.waitStatus(h.run('下一个').id, 'completed');
+  });
+
+  it('ends the Run as failed once the retries are used up with on_agent_error: retry', async () => {
+    h = await harness({ workflow: implementOnly('{ max_retries: 1, on_agent_error: retry }') });
+    h.scripts.coder = failing();
+    const run = h.run();
+    const failed = await h.waitStatus(run.id, 'failed');
+    expect(h.fake.calls.map((c) => c.model)).toEqual(['coder', 'coder']);
+    expect(eventData(run.id, 'task.agent_switched')).toEqual([]);
+    expect(failed.error).toContain('自动重试 1 次后仍然出错，Run 结束（on_agent_error: retry）');
+    expect(failed.error).toContain('Agent coder 运行出错：模型不存在');
+    expect(failed.blocked).toBeNull();
+  });
+
+  it('with on_agent_error: human, retries first and then waits; a retry starts over', async () => {
+    h = await harness({
+      workflow: TEST_WORKFLOW_YAML.replace('on_agent_error: switch_agent', 'on_agent_error: human'),
+    });
+    h.scripts.coder = failing();
+    const run = h.run();
+    const blocked = await h.waitStatus(run.id, 'blocked');
+    expect(blocked.blocked?.kind).toBe('agent_error');
+    expect(blocked.blocked?.message).toContain('Agent coder 运行出错：模型不存在');
+    expect(blocked.blocked?.message).toContain('已自动重试 2 次，仍然出错');
+    expect(h.fake.calls.map((c) => c.model)).toEqual(['coder', 'coder', 'coder']);
+    expect(eventData(run.id, 'task.agent_switched')).toEqual([]);
+    expect(() => h?.master.engine.approve(run.id)).toThrow();
+
+    // A human's retry with the same agent gets all the retries again.
+    await h.master.engine.retry(run.id);
+    await h.waitStatus(run.id, 'blocked');
+    expect(h.fake.calls).toHaveLength(6);
+    expect(eventData(run.id, 'task.retry_after_error').map((d) => d.attempt)).toEqual([1, 2, 1, 2]);
+    // Or with another agent.
+    await h.master.engine.retry(run.id, { agentId: 'coder2' });
+    await h.waitStatus(run.id, 'waiting_approval');
+  });
+
+  it('switches an assessment only to an agent that can run read-only', async () => {
+    const scripts: Record<string, Script> = {
+      assessor: failing('评估出错'),
+      writer: () => assessment('go'),
+      backup: () => assessment('go'),
+      coder: (ctx) => {
+        writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+        return done();
+      },
+      reviewer: () => review(),
+    };
+    const fake = new FakeAdapter((ctx) => (scripts[ctx.input.model] as Script)(ctx));
+    // A CLI that cannot run an agent read-only.
+    const writeOnly: AgentAdapter = { cli: 'fake-rw', start: (input) => fake.start(input) };
+    h = await harness({
+      agents: `
+agents:
+  assessor: { cli: fake, model: assessor, tier: high }
+  writer: { cli: fake-rw, model: writer, tier: high, cost: low }
+  backup: { cli: fake, model: backup, tier: high }
+  coder: { cli: fake, model: coder }
+  reviewer: { cli: fake, model: reviewer }
+`,
+      workflow: ASSESS_WORKFLOW_YAML,
+      scripts,
+      master: { adapters: [fake, writeOnly] },
+    });
+    const run = h.run();
+    await h.waitStatus(run.id, 'completed');
+    expect(eventData(run.id, 'task.agent_switched').map((d) => [d.from, d.to])).toEqual([
+      ['assessor', 'backup'],
+    ]);
+    expect(fake.calls.map((c) => c.model)).toEqual([
+      'assessor',
+      'assessor',
+      'assessor',
+      'backup',
+      'coder',
+      'reviewer',
+    ]);
+  });
+
+  describe('in English', () => {
+    afterEach(() => setLang('zh'));
+
+    it('says why the Run ended without Chinese', async () => {
+      h = await harness({
+        config: 'language: en\n',
+        workflow: implementOnly('{ max_retries: 1, on_agent_error: switch_agent }'),
+      });
+      h.scripts.coder = failing('model not found');
+      h.scripts.coder2 = failing('model not found');
+      h.scripts.reviewer = failing('model not found');
+      const failed = await h.waitStatus(h.run('Add feature.txt').id, 'failed');
+      expect(failed.error).toContain('every agent tried (coder, coder2, reviewer) failed');
+      expect(failed.error).toContain('each after 1 retry');
+      expect(failed.error).toContain('Agent reviewer failed: model not found');
+      expect(failed.error).not.toMatch(/[一-鿿]/);
+    });
+  });
+});
 
 describe('engine: requirement assessment', () => {
   const start = () => harness({ agents: ASSESS_AGENTS_YAML, workflow: ASSESS_WORKFLOW_YAML });
@@ -1048,8 +1241,8 @@ describe('engine: budget', () => {
   it('fails the Run when on_budget_exceeded is abort', async () => {
     h = await harness({
       workflow: withBudget('  budget_usd: 1\n').replace(
-        '    on_agent_error: human\n',
-        '    on_agent_error: human\n    on_budget_exceeded: abort\n',
+        '    on_agent_error: switch_agent\n',
+        '    on_agent_error: switch_agent\n    on_budget_exceeded: abort\n',
       ),
     });
     costly(h, 1.2);

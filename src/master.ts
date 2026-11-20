@@ -18,7 +18,7 @@ import {
   loadConfig,
 } from './config/load.js';
 import { ConfigWatcher } from './config/watch.js';
-import { Engine } from './engine/engine.js';
+import { type Backoff, Engine } from './engine/engine.js';
 import { IssueBridge } from './github/bridge.js';
 import type { GitHub } from './github/client.js';
 import { type Lang, lang, setLang } from './i18n.js';
@@ -61,6 +61,8 @@ export interface MasterOptions {
   notice?: SendNotice;
   /** The engine's clock for reply timeouts, in epoch milliseconds (tests move it on). */
   now?: () => number;
+  /** How long the engine waits before retrying an agent that errored (tests shorten it). */
+  agentRetryBackoff?: Backoff;
   /**
    * Language of the default config files written on first start (the CLI passes the system's);
    * omitted = the default. After that, config.yaml's `language` is the one in use.
@@ -144,7 +146,14 @@ export class Master {
       readOnlyClis,
     );
     const config = () => watcher.current;
-    const engine = new Engine({ store, paths, config, adapters, now: opts.now });
+    const engine = new Engine({
+      store,
+      paths,
+      config,
+      adapters,
+      now: opts.now,
+      agentRetryBackoff: opts.agentRetryBackoff,
+    });
     const issues = new IssueBridge({ store, engine, paths, config, adapters, github: opts.github });
     const notifier = new SystemNotifier(store, config, opts.notice);
     const installDir = opts.installDir ?? null;

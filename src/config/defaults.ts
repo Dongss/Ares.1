@@ -149,8 +149,8 @@ name: 自举开发
 
 defaults:
   escalate:
-    max_retries: 2
-    on_agent_error: human
+    max_retries: 2               # 返工次数上限；Agent 出错时也按这个次数重试（带退避），两者分开计数
+    on_agent_error: switch_agent # Agent 出错：重试用完后换另一个 Agent 再试，都不行就结束 Run、标为失败；human = 重试用完后卡住等人
   max_loops: 3
 
 stages:
@@ -197,8 +197,8 @@ name: Self-development
 
 defaults:
   escalate:
-    max_retries: 2
-    on_agent_error: human
+    max_retries: 2               # reworks allowed; an agent that errors is also retried this many times (with a backoff), counted apart
+    on_agent_error: switch_agent # agent errors: once the retries are used up, another agent tries; if none succeeds, the Run ends as failed; human = wait for a human once the retries are used up
   max_loops: 3
 
 stages:

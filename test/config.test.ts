@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { issueRunOverrides } from '../src/config/flow.js';
 import { ConfigError, homePaths, initHome, loadConfig } from '../src/config/load.js';
 import {
@@ -14,7 +14,10 @@ import {
   TemplateSchema,
   type WorkflowTemplate,
 } from '../src/config/schema.js';
+import { setLang } from '../src/i18n.js';
 import { tmpDir, writeFile } from './helpers.js';
+
+afterEach(() => setLang('zh'));
 
 function home(): ReturnType<typeof homePaths> {
   const paths = homePaths(tmpDir('ares1-cfg-'));
@@ -496,13 +499,14 @@ stages:
     expect(warnings(tpl(', inputs: [assessment]', ', inputs: [diff, assessment]'))).toBeUndefined();
   });
 
-  it('keeps templates using on_agent_error: switch_agent, with a warning that it acts as human', () => {
+  it('keeps templates using on_agent_error: human, with a warning that the Run waits for a human', () => {
     const paths = home();
+    // What self-dev.yaml said before switch_agent was its default: installed copies keep it.
     writeFile(
       join(paths.workflowsDir, 'defaults.yaml'),
       `id: by-default
 defaults:
-  escalate: { on_agent_error: switch_agent }
+  escalate: { max_retries: 2, on_agent_error: human }
 stages:
   - id: implement
     agent: claude-coder
@@ -514,14 +518,14 @@ stages:
 stages:
   - id: implement
     agent: claude-coder
-    escalate: { max_retries: 3, on_agent_error: switch_agent }
+    escalate: { max_retries: 3, on_agent_error: human }
   - id: review
     kind: review
     agent: claude-reviewer
-    escalate: { on_agent_error: human }
+    escalate: { on_agent_error: switch_agent }
   - id: merge
     kind: merge
-    escalate: { on_agent_error: switch_agent }
+    escalate: { on_agent_error: human }
 `,
     );
     const cfg = loadConfig(paths, ['claude-code']);
@@ -532,19 +536,49 @@ stages:
 
     const byDefault = cfg.warnings['workflows/defaults.yaml'] ?? [];
     expect(byDefault).toHaveLength(1);
-    expect(byDefault[0]).toMatch(/^defaults\.escalate：on_agent_error: switch_agent/);
-    expect(byDefault[0]).toMatch(/尚未实现，目前按 human 处理/);
+    expect(byDefault[0]).toMatch(/^defaults\.escalate：on_agent_error: human：/);
+    expect(byDefault[0]).toMatch(/自动重试 max_retries 次后，Run 会卡住等人处理/);
+    expect(byDefault[0]).toMatch(/建议改成 switch_agent/);
 
-    // Only the stage that runs an agent; merge never calls one.
+    // Only the stage that runs an agent; merge never calls one. switch_agent is not warned about.
     const byStage = cfg.warnings['workflows/stage.yaml'] ?? [];
     expect(byStage).toHaveLength(1);
-    expect(byStage[0]).toMatch(/^阶段 implement：on_agent_error: switch_agent/);
-    expect(byStage[0]).toMatch(/Agent 出错时 Run 卡住等人处理/);
+    expect(byStage[0]).toMatch(/^阶段 implement：on_agent_error: human：/);
 
     // The config page shows the warnings on the template's card.
     const file = cfg.templateFiles.find((f) => f.key === 'workflows/stage.yaml');
     expect(file?.templateId).toBe('by-stage');
     expect(file?.warnings).toEqual(byStage);
+  });
+
+  it('warns about on_agent_error: human in English too', () => {
+    setLang('en');
+    const paths = home();
+    writeFile(
+      join(paths.workflowsDir, 'self-dev.yaml'),
+      `id: self-dev
+defaults:
+  escalate: { on_agent_error: human }
+stages:
+  - id: implement
+    agent: claude-coder
+`,
+    );
+    const warnings = loadConfig(paths, ['claude-code']).warnings['workflows/self-dev.yaml'] ?? [];
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/^defaults\.escalate: on_agent_error: human: /);
+    expect(warnings[0]).toContain('Better use switch_agent');
+    expect(warnings[0]).not.toMatch(/[一-鿿]/);
+  });
+
+  it('does not wait for a human on agent errors by default', () => {
+    const paths = home();
+    const cfg = loadConfig(paths, ['claude-code'], ['claude-code']);
+    const selfDev = cfg.templates.get('self-dev') as WorkflowTemplate;
+    expect(selfDev.defaults?.escalate?.on_agent_error).toBe('switch_agent');
+    // A template that does not say gets the system default.
+    const bare = TemplateSchema.parse({ id: 't', stages: [{ id: 'a', agent: 'x' }] });
+    expect(effectiveStage(bare, 'a', {}).escalate.on_agent_error).toBe('switch_agent');
   });
 
   it('resolves stage settings: system default → template → stage → run override', () => {

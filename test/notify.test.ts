@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { setLang } from '../src/i18n.js';
 import { BLOCK_KIND, NOTICE_KINDS, noticeFor } from '../src/notify/notice.js';
 import { noticeScript } from '../src/notify/system.js';
-import { type Harness, harness } from './helpers.js';
+import { blockOnAgentError, type Harness, harness } from './helpers.js';
 
 let h: Harness | undefined;
 
@@ -19,7 +19,7 @@ describe('system notifications', () => {
       master: { notice: (title, body) => sent.push(`${title}|${body}`) },
     });
     h.scripts.coder = () => ({ status: 'failed', error: '炸了' });
-    const run = h.run('做一件事\n细节');
+    const run = h.run('做一件事\n细节', blockOnAgentError());
     await h.waitStatus(run.id, 'blocked');
     expect(sent).toEqual(['Run 卡住了：Agent 执行出错|做一件事']);
 
@@ -40,7 +40,7 @@ describe('system notifications', () => {
     const sent: string[] = [];
     h = await harness({ master: { notice: (title) => sent.push(title) } });
     h.scripts.coder = () => ({ status: 'failed', error: '炸了' });
-    const run = h.run();
+    const run = h.run('添加 feature.txt', blockOnAgentError());
     await h.waitStatus(run.id, 'blocked');
     expect(sent).toEqual([]);
   });

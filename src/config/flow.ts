@@ -8,7 +8,8 @@ import type { Escalate, RunOverrides, StageDef, WorkflowTemplate } from './schem
 export const SYSTEM_DEFAULTS = {
   escalate: {
     max_retries: 2,
-    on_agent_error: 'retry',
+    // Nobody has to be there: retry, then another agent, then the Run ends as failed.
+    on_agent_error: 'switch_agent',
     on_budget_exceeded: 'pause',
   } satisfies Required<Escalate>,
   max_loops: 3,
