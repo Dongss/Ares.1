@@ -1,13 +1,12 @@
 import type { RateLimitedWait, RunDetail, RunSummary } from '../../../src/api/types.js';
 import { brandTitle } from '../../../src/brand.js';
-import { replyTimeoutHours } from '../../../src/config/flow.js';
+import { discussionReplyWait } from '../../../src/config/flow.js';
 import {
   conclusionLabel,
   conclusionOf,
   formatAssessment,
   formatReplyTimeout,
   pendingTimeout,
-  replyDeadline,
   verdictLabel,
 } from '../../../src/engine/discussion.js';
 import { t } from '../../../src/i18n.js';
@@ -237,12 +236,8 @@ export function assessmentHeadline(
  * waiting, or waits however long it takes.
  */
 export function replyDeadlineOf(detail: Pick<RunDetail, 'run' | 'stageRuns'>): number | null {
-  const { run } = detail;
-  const info = run.blocked;
-  if (run.status !== 'blocked' || info?.kind !== 'discussion') return null;
-  const stageId = detail.stageRuns.find((sr) => sr.id === info.stageRunId)?.stageId;
-  const def = run.template.stages.find((s) => s.id === stageId);
-  return def ? replyDeadline(run.discussion, replyTimeoutHours(def)) : null;
+  const stageIdOf = (id: string) => detail.stageRuns.find((sr) => sr.id === id)?.stageId;
+  return discussionReplyWait(detail.run, stageIdOf)?.deadline ?? null;
 }
 
 /** 「Agent coder 额度用尽或被限流，预计 14:05:00 继续」: why a queued Run waits, and until when. */

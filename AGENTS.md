@@ -46,7 +46,8 @@ src/
     watch.ts          reload config when its files change
     flow.ts           effective stage settings, check commands, rollback targets, budgets,
                       which proposals are accepted automatically, the automatic scout's
-                      back-off (shared by engine, GitHub bridge and dashboard)
+                      back-off, which unfinished Runs go on by themselves and which only wait
+                      for a human (shared by engine, GitHub bridge and dashboard)
     effort.ts         helpers for agent effort (shared by engine and dashboard)
   store/              SQLite store (node:sqlite): store.ts, migrations.ts, types.ts (entity types)
   adapters/           agent adapters: types.ts (common interface), process.ts (child processes,
@@ -125,7 +126,8 @@ test/
 - In the engine, after every `await`, if the Run may have been paused or cancelled meanwhile, call `checkAbort(signal)` before changing state.
 - Each rule lives in one place, shared by engine and dashboard:
   - rollback targets, effective settings, which proposals are accepted automatically, the
-    automatic scout's back-off and the like: `src/config/flow.ts`
+    automatic scout's back-off, which unfinished Runs it waits for and the like:
+    `src/config/flow.ts`
   - notification rules: `src/notify/notice.ts`
   - assessment conclusion rules: `src/engine/discussion.ts`
   - how a Run's time is split, and the names and groups of the parts: `src/engine/times.ts`

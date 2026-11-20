@@ -31,7 +31,7 @@ import {
 } from '../src/github/issues.js';
 import { filedProposal, issueDigest, proposalsHoldingScout } from '../src/github/scout.js';
 import { setLang } from '../src/i18n.js';
-import type { AssessmentEntry, Run, ScoutProposal } from '../src/store/types.js';
+import type { AssessmentEntry, BlockKind, Run, ScoutProposal } from '../src/store/types.js';
 import {
   ASSESS_AGENTS_YAML,
   ASSESS_WORKFLOW_YAML,
@@ -775,6 +775,103 @@ describe('issues: scout', () => {
     expect(t.master.issues.status().repos[0]?.scout?.waiting?.reason).toBe(
       '等 1 个未结束的 Run 做完',
     );
+  });
+
+  describe('Runs stuck waiting for a human', () => {
+    afterEach(() => setLang('zh'));
+    const waitReason = (t: Harness) => t.master.issues.status().repos[0]?.scout?.waiting?.reason;
+
+    /**
+     * A Run of the repo that only a human moves on: created while the work switch is off, so no
+     * agent starts it, then left as `patch` says.
+     */
+    function stuckRun(t: Harness, patch: Partial<Run>): Run {
+      t.master.store.setWorking(false);
+      const run = t.run();
+      t.master.store.setWorking(true);
+      return t.master.store.updateRun(run.id, { queuePos: null, ...patch });
+    }
+    const blocked = (kind: BlockKind): Partial<Run> => ({
+      status: 'blocked',
+      blocked: { kind, message: `卡住了：${kind}` },
+    });
+
+    it('scouts while the only unfinished Runs wait for a human, below max_proposals', async () => {
+      const t = await start(config({ auto: true }));
+      t.scripts.scout = () => ({ structured: { proposals: [] } });
+      stuckRun(t, blocked('error'));
+      stuckRun(t, blocked('setup_failed'));
+      await t.master.issues.poll();
+      const [scout] = t.master.store.listScouts();
+      expect(scout?.trigger).toBe('auto');
+      await scoutDone(t, scout?.id ?? '');
+    });
+
+    it('still waits for queued and running Runs, counting only those', async () => {
+      const t = await start(config({ auto: true }));
+      stuckRun(t, blocked('error'));
+      t.scripts.coder = () => new Promise(() => {});
+      const running = t.run();
+      await t.waitStatus(running.id, 'running');
+      const queued = t.run();
+      expect(t.master.store.getRun(queued.id).status).toBe('queued');
+      await t.master.issues.poll();
+      expect(t.master.store.listScouts()).toHaveLength(0);
+      expect(waitReason(t)).toBe('等 2 个未结束的 Run 做完');
+    });
+
+    it('waits once proposals and stuck Runs reach max_proposals, saying how many of each', async () => {
+      const t = await start(config({ auto: true }));
+      for (const title of ['a', 'b']) gh.add({ title, labels: [LABELS.proposal] });
+      const error = stuckRun(t, blocked('error'));
+      await t.master.issues.poll();
+      expect(t.master.store.listScouts()).toHaveLength(0);
+      expect(waitReason(t)).toBe('有 2 条提案、1 个卡住的 Run 等你处理');
+
+      // Runs waiting for an approval or paused by a human count too.
+      for (const n of [1, 2]) gh.get(n).state = 'closed';
+      stuckRun(t, { status: 'waiting_approval' });
+      const paused = stuckRun(t, { status: 'paused' });
+      await t.master.issues.poll();
+      expect(t.master.store.listScouts()).toHaveLength(0);
+      expect(waitReason(t)).toBe('有 3 个卡住的 Run 等你处理');
+
+      setLang('en'); // after the Master started: it applies config.yaml's language
+      await t.master.issues.poll();
+      expect(waitReason(t)).toBe('3 stuck Runs waiting for you');
+      gh.get(1).state = 'open';
+      t.master.store.updateRun(paused.id, { status: 'cancelled' });
+      await t.master.issues.poll();
+      expect(waitReason(t)).toBe('1 proposal and 2 stuck Runs waiting for you');
+      expect(waitReason(t)).not.toMatch(/[一-鿿]/);
+      gh.get(2).state = 'open';
+      t.master.store.updateRun(error.id, { status: 'cancelled' });
+      await t.master.issues.poll();
+      expect(waitReason(t)).toBe('2 proposals and 1 stuck Run waiting for you');
+      expect(t.master.store.listScouts()).toHaveLength(0);
+    });
+
+    it('scouts while a Run waits for a reply that never times out, the issue among the open ones', async () => {
+      const forever = ASSESS_WORKFLOW_YAML.replace(
+        '    agent: assessor\n',
+        '    agent: assessor\n    reply_timeout_hours: null\n',
+      );
+      expect(forever).not.toBe(ASSESS_WORKFLOW_YAML);
+      const t = await start(config({ auto: true }), forever);
+      t.scripts.assessor = () => assessment('ask', { questions: ['写什么？'] });
+      t.scripts.scout = () => ({ structured: { proposals: [] } });
+      gh.add({ title: '加 feature', labels: [LABELS.ready] });
+      await t.master.issues.poll();
+      const [run] = t.master.store.listRuns();
+      await t.waitStatus(run?.id ?? '', 'blocked');
+      expect(t.master.store.getRun(run?.id ?? '').blocked?.kind).toBe('discussion');
+      await t.master.issues.poll();
+      const [scout] = t.master.store.listScouts();
+      expect(scout?.trigger).toBe('auto');
+      await scoutDone(t, scout?.id ?? '');
+      // The scout sees the stuck Run's issue among the open ones, and does not propose it again.
+      expect(t.fake.calls.at(-1)?.prompt).toContain('#1 加 feature');
+    });
   });
 
   it('marks a scout with an unusable answer as failed', async () => {

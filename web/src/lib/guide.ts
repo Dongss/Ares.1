@@ -424,10 +424,10 @@ export function cycleSteps(input: GuideInput, rule?: AutoAcceptRule): CycleStep[
           rescoutName,
           ['ai'],
           t({
-            zh: `仓库没有未结束的 Run 时，下次检查（每 ${pollMinutes} 分钟）就再侦察${
+            zh: `仓库没有在进行中的 Run 时（只等人的 Run 不挡），下次检查（每 ${pollMinutes} 分钟）就再侦察${
               scout.intervalHours > 0 ? `，两次至少隔 ${scout.intervalHours} 小时` : ''
             }，参考新的 Run 记录和被拒的 issue`,
-            en: `When the repo has no unfinished Run, it scouts again at the next check (every ${pollMinutes} minutes)${
+            en: `When the repo has no Run in progress (Runs waiting only for you do not hold it back), it scouts again at the next check (every ${pollMinutes} minutes)${
               scout.intervalHours > 0 ? `, at least ${scout.intervalHours} hours apart` : ''
             }, taking new Runs and rejected issues into account`,
           }),
@@ -632,8 +632,8 @@ export function scoutGuide(
   const conditions = [
     t({ zh: '工作开关是「工作中」', en: 'The work switch is on ("Working")' }),
     t({
-      zh: '仓库没有未结束的 Run（排队、执行中、等审批、卡住、已暂停都算）：手上的活做完了才找新活',
-      en: 'The repo has no unfinished Run (queued, running, waiting for approval, blocked and paused all count): new work is found only once the current work is done',
+      zh: '仓库没有会自己往下走的 Run（排队、执行中，或等评估回复且设了超时）：手上的活做完了才找新活；只等人的 Run 不用等，算进下面的上限',
+      en: 'The repo has no Run that goes on by itself (queued, running, or waiting for a reply to the assessment that times out): new work is found only once the current work is done; Runs only a human moves on are not waited for, and count toward the limit below',
     }),
     t({ zh: '不在等 Master 升级', en: 'No Master upgrade is pending' }),
     budget.dailyUsd === null
@@ -660,12 +660,12 @@ export function scoutGuide(
     }),
     github.autoAccept.maxRisk === 'none'
       ? t({
-          zh: `还没处理的提案少于 ${scout.maxProposals} 条（max_proposals）`,
-          en: `Fewer than ${scout.maxProposals} proposals await triage (max_proposals)`,
+          zh: `还没处理的提案加上卡住等人的 Run 少于 ${scout.maxProposals} 个（max_proposals）`,
+          en: `Fewer than ${scout.maxProposals} proposals awaiting triage and Runs stuck waiting for a human in total (max_proposals)`,
         })
       : t({
-          zh: `在自动采纳范围内、还没采纳的提案少于 ${scout.maxProposals} 条（max_proposals）${leftToYou ? `；${leftToYou}留给你处理，不挡侦察` : ''}`,
-          en: `Fewer than ${scout.maxProposals} proposals within the auto-accept range are still unaccepted (max_proposals)${leftToYou ? `; ${leftToYou} are left to you and do not hold the scout back` : ''}`,
+          zh: `在自动采纳范围内、还没采纳的提案加上卡住等人的 Run 少于 ${scout.maxProposals} 个（max_proposals）${leftToYou ? `；${leftToYou}留给你处理，不挡侦察` : ''}`,
+          en: `Fewer than ${scout.maxProposals} unaccepted proposals within the auto-accept range and Runs stuck waiting for a human in total (max_proposals)${leftToYou ? `; ${leftToYou} are left to you and do not hold the scout back` : ''}`,
         }),
   ];
   if (!scout.auto) {
@@ -1072,10 +1072,6 @@ function isWorkSwitchReason(reason: string): boolean {
   return reason === '工作开关已关闭' || /^the work switch is off\b/i.test(reason);
 }
 
-function isWaitingForWorkReason(reason: string): boolean {
-  return reason.startsWith('等 ') || /^waiting for /i.test(reason);
-}
-
 /** What keeps new Runs from starting right now; empty when nothing is in the way. */
 export function idleReasons(input: IdleInput, now = new Date()): string[] {
   const reasons: string[] = [];
@@ -1112,18 +1108,14 @@ export function idleReasons(input: IdleInput, now = new Date()): string[] {
     const n = input.attention;
     reasons.push(
       t({
-        zh: `有 ${n} 个 Run 在等你审批或卡住了：它们让出了执行位，但仓库有未结束的 Run 时不会自动侦察。到首页「待我处理」处理。`,
-        en: `${n} ${n === 1 ? 'Run is' : 'Runs are'} waiting for your approval or blocked: ${n === 1 ? 'it frees' : 'they free'} the execution slot, but the repo is not scouted automatically while it has unfinished Runs. Handle ${n === 1 ? 'it' : 'them'} under "Needs me" on the home page.`,
+        zh: `有 ${n} 个 Run 在等你审批或卡住了：它们让出了执行位；只等人的 Run 不挡自动侦察，但和等你处理的提案一起计入上限（max_proposals），攒满后不再侦察。到首页「待我处理」处理。`,
+        en: `${n} ${n === 1 ? 'Run is' : 'Runs are'} waiting for your approval or blocked: ${n === 1 ? 'it frees' : 'they free'} the execution slot. Runs waiting only for you do not hold the automatic scout back, but count toward its limit (max_proposals) together with the proposals waiting for you, and it stops scouting once that is reached. Handle ${n === 1 ? 'it' : 'them'} under "Needs me" on the home page.`,
       }),
     );
   }
   const waiting = input.github?.scout?.auto ? input.github.scout.waiting : null;
-  // The work switch and unfinished Runs are said above already.
-  if (
-    waiting &&
-    !(input.working === false && isWorkSwitchReason(waiting.reason)) &&
-    !(input.attention > 0 && isWaitingForWorkReason(waiting.reason))
-  ) {
+  // The work switch is said above already.
+  if (waiting && !(input.working === false && isWorkSwitchReason(waiting.reason))) {
     const why = scoutWaitText(waiting, now);
     reasons.push(t({ zh: `自动侦察在等：${why}。`, en: `Automatic scouting is waiting: ${why}.` }));
   }

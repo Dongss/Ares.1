@@ -10,6 +10,7 @@ import type {
   RateLimitedWait,
   RunWorkspaceState,
 } from '../api/types.js';
+import { discussionReplyWait } from '../config/flow.js';
 import type { HomePaths, LoadedConfig } from '../config/load.js';
 import {
   type AgentConfig,
@@ -78,13 +79,7 @@ import {
   TASK_REPORT_JSON_SCHEMA,
   TaskReportSchema,
 } from './contracts.js';
-import {
-  assessmentProblem,
-  formatAssessment,
-  replyDeadline,
-  takeAssessment,
-  waitText,
-} from './discussion.js';
+import { assessmentProblem, formatAssessment, takeAssessment, waitText } from './discussion.js';
 import {
   assessmentArtifact,
   assessPrompt,
@@ -765,13 +760,7 @@ export class Engine {
 
   /** When a Run blocked on a discussion stops waiting for a reply; null = it waits for one. */
   private replyWait(run: Run): { deadline: number; hours: number } | null {
-    const info = run.blocked;
-    if (run.status !== 'blocked' || info?.kind !== 'discussion' || !info.stageRunId) return null;
-    const { stageId } = this.store.getStageRun(info.stageRunId);
-    const def = run.template.stages.find((s) => s.id === stageId);
-    const hours = def ? replyTimeoutHours(def) : null;
-    const deadline = replyDeadline(run.discussion, hours);
-    return hours === null || deadline === null ? null : { deadline, hours };
+    return discussionReplyWait(run, (id) => this.store.getStageRun(id).stageId);
   }
 
   /**

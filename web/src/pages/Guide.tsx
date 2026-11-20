@@ -728,8 +728,8 @@ function FaqSection(props: { input: GuideInput; home: string; idle: string[] }) 
           </li>
           <li>
             {t({
-              zh: '前面有 Run 卡住或在等审批：它们会让出执行位，排队的 Run 照常执行；但仓库有未结束的 Run 时不会自动侦察，也就没有新的提案和 Run。到首页「待我处理」处理它，或者终止它。',
-              en: 'A Run is blocked or waiting for approval: it frees the execution slot and queued Runs still execute, but the repo is not scouted automatically while it has unfinished Runs, so no new proposals or Runs come. Handle it under "Needs me" on the home page, or cancel it.',
+              zh: '前面有 Run 卡住或在等审批：它们会让出执行位，排队的 Run 照常执行，也不挡自动侦察；但它们和等你处理的提案一起计入 max_proposals，攒满后不再自动侦察，也就没有新的提案和 Run。到首页「待我处理」处理它，或者终止它。',
+              en: 'A Run is blocked or waiting for approval: it frees the execution slot, queued Runs still execute and the automatic scout goes on; but such Runs count toward max_proposals together with the proposals waiting for you, and once that is reached the repo is not scouted automatically, so no new proposals or Runs come. Handle it under "Needs me" on the home page, or cancel it.',
             })}
           </li>
           <li>

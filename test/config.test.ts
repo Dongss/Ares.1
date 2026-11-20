@@ -1,7 +1,13 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { issueRunOverrides, loopsExhausted, scoutBackoff } from '../src/config/flow.js';
+import {
+  discussionReplyWait,
+  issueRunOverrides,
+  loopsExhausted,
+  scoutBackoff,
+  splitUnfinishedRuns,
+} from '../src/config/flow.js';
 import { ConfigError, homePaths, initHome, loadConfig } from '../src/config/load.js';
 import {
   agentEffort,
@@ -16,7 +22,15 @@ import {
   type WorkflowTemplate,
 } from '../src/config/schema.js';
 import { setLang } from '../src/i18n.js';
-import type { Scout, ScoutProposal } from '../src/store/types.js';
+import type {
+  AssessmentEntry,
+  BlockKind,
+  DiscussionEntry,
+  Run,
+  RunStatus,
+  Scout,
+  ScoutProposal,
+} from '../src/store/types.js';
 import { tmpDir, writeFile } from './helpers.js';
 
 afterEach(() => setLang('zh'));
@@ -832,5 +846,104 @@ describe('scoutBackoff', () => {
   it('counts from the start of a scout that has no end', () => {
     const scouts = [{ ...scout(10, 'failed'), endedAt: null }];
     expect(scoutBackoff(scouts, 5)).toEqual({ count: 1, until: at(15) });
+  });
+});
+
+describe('splitUnfinishedRuns', () => {
+  const asked = '2026-11-20T00:00:00.000Z';
+  const ask: AssessmentEntry = {
+    role: 'assessor',
+    verdict: 'ask',
+    summary: '不清楚',
+    questions: ['写什么？'],
+    suggestions: [],
+    revisedGoal: null,
+    proposedDrop: false,
+    stageRunId: 'sr-assess',
+    at: asked,
+  };
+  const reply: DiscussionEntry = { role: 'human', text: '写这个', source: 'issue', at: asked };
+  const template = (reply_timeout_hours?: number | null): WorkflowTemplate =>
+    TemplateSchema.parse({
+      id: 't',
+      stages: [
+        { id: 'assess', kind: 'assess', agent: 'x', reply_timeout_hours },
+        { id: 'code', agent: 'x' },
+      ],
+    });
+  /** The stage runs of the fixtures: sr-assess belongs to the assess stage. */
+  const stageIdOf = (id: string) => (id === 'sr-assess' ? 'assess' : undefined);
+  type Fixture = Pick<Run, 'status' | 'blocked' | 'discussion' | 'template'> & { id: string };
+  const run = (
+    id: string,
+    status: RunStatus,
+    kind?: BlockKind,
+    opts: { hours?: number | null; discussion?: DiscussionEntry[]; stageRunId?: string } = {},
+  ): Fixture => ({
+    id,
+    status,
+    blocked: kind
+      ? { kind, message: '', stageRunId: 'stageRunId' in opts ? opts.stageRunId : 'sr-assess' }
+      : null,
+    discussion: opts.discussion ?? (kind === 'discussion' ? [ask] : []),
+    template: template(opts.hours),
+  });
+  const ids = (runs: Fixture[]) => runs.map((r) => r.id);
+
+  it('waits for queued and running Runs, and counts the ones only a human moves on', () => {
+    const { moving, stuck } = splitUnfinishedRuns(
+      [
+        run('queued', 'queued'),
+        run('running', 'running'),
+        run('approval', 'waiting_approval'),
+        run('paused', 'paused'),
+        run('error', 'blocked', 'error'),
+        run('setup', 'blocked', 'setup_failed'),
+        run('budget', 'blocked', 'budget'),
+        run('stranger', 'blocked', 'untrusted_issue'),
+        run('completed', 'completed'),
+        run('failed', 'failed'),
+        run('cancelled', 'cancelled'),
+        run('dropped', 'dropped'),
+      ],
+      stageIdOf,
+    );
+    expect(ids(moving)).toEqual(['queued', 'running']);
+    expect(ids(stuck)).toEqual(['approval', 'paused', 'error', 'setup', 'budget', 'stranger']);
+  });
+
+  it('lets a Run waiting for a reply move on only when the reply times out, as the engine does', () => {
+    const { moving, stuck } = splitUnfinishedRuns(
+      [
+        run('default', 'blocked', 'discussion'),
+        run('half-hour', 'blocked', 'discussion', { hours: 0.5 }),
+        run('forever', 'blocked', 'discussion', { hours: null }),
+        // Not waiting on the questions any more: a human replied after them.
+        run('replied', 'blocked', 'discussion', { discussion: [ask, reply] }),
+        // The stage is unknown: nothing times it out.
+        run('no-stage', 'blocked', 'discussion', { stageRunId: 'sr-gone' }),
+        run('no-stage-run', 'blocked', 'discussion', { stageRunId: undefined }),
+      ],
+      stageIdOf,
+    );
+    expect(ids(moving)).toEqual(['default', 'half-hour']);
+    expect(ids(stuck)).toEqual(['forever', 'replied', 'no-stage', 'no-stage-run']);
+  });
+
+  it('works out when the reply times out', () => {
+    const at = Date.parse(asked);
+    expect(discussionReplyWait(run('d', 'blocked', 'discussion'), stageIdOf)).toEqual({
+      deadline: at + 24 * 3_600_000,
+      hours: 24,
+    });
+    expect(discussionReplyWait(run('d', 'blocked', 'discussion', { hours: 0 }), stageIdOf)).toEqual(
+      { deadline: at, hours: 0 },
+    );
+    expect(
+      discussionReplyWait(run('d', 'blocked', 'discussion', { hours: null }), stageIdOf),
+    ).toBeNull();
+    expect(discussionReplyWait(run('e', 'blocked', 'error'), stageIdOf)).toBeNull();
+    const notBlocked = { ...run('d', 'blocked', 'discussion'), status: 'running' as const };
+    expect(discussionReplyWait(notBlocked, stageIdOf)).toBeNull();
   });
 });

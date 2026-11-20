@@ -75,7 +75,10 @@ export function issueRef(issue: RunIssue): string {
   return `#${issue.number}`;
 }
 
-/** When the scout of a repo runs by itself, e.g. "没有未结束的 Run 时自动侦察，至少间隔 2 小时". */
+/**
+ * When the scout of a repo runs by itself, e.g.
+ * "没有在进行中的 Run 时自动侦察（只等人的 Run 不挡），至少间隔 2 小时".
+ */
 export function scoutPlan(scout: NonNullable<GitHubRepoStatus['scout']>): string {
   if (!scout.auto) return t({ zh: '只在这里手动触发', en: 'Only when started here' });
   const h = scout.intervalHours;
@@ -84,8 +87,8 @@ export function scoutPlan(scout: NonNullable<GitHubRepoStatus['scout']>): string
       ? t({ zh: `，至少间隔 ${h} 小时`, en: `, at least ${h} ${h === 1 ? 'hour' : 'hours'} apart` })
       : '';
   return t({
-    zh: `没有未结束的 Run 时自动侦察${gap}`,
-    en: `Scouts by itself when no Run is unfinished${gap}`,
+    zh: `没有在进行中的 Run 时自动侦察（只等人的 Run 不挡）${gap}`,
+    en: `Scouts by itself when no Run is in progress (Runs waiting only for you do not hold it back)${gap}`,
   });
 }
 

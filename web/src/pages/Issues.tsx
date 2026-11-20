@@ -213,7 +213,7 @@ function NotConfigured() {
       template: self-dev     # 从 issue 建 Run 用的模板
       scout:
         agent: claude-reviewer
-        auto: true           # 没有未结束的 Run 时自动侦察；false = 只手动触发
+        auto: true           # 没有在进行中的 Run 时自动侦察（只等人的 Run 不挡）；false = 只手动触发
       auto_accept:
         max_risk: none       # 自动采纳到哪个风险等级：none / low / mid / high
       auto_merge: false      # 从 issue 来的 Run 合并前不再等你审批
@@ -227,7 +227,7 @@ function NotConfigured() {
       template: self-dev     # template of the Runs created from issues
       scout:
         agent: claude-reviewer
-        auto: true           # scout by itself when no Run is unfinished; false = by hand only
+        auto: true           # scout by itself when no Run is in progress (Runs waiting only for you do not hold it back); false = by hand only
       auto_accept:
         max_risk: none       # highest risk accepted automatically: none / low / mid / high
       auto_merge: false      # Runs from issues merge without waiting for your approval

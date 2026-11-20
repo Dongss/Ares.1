@@ -158,7 +158,7 @@ describe('the cycle', () => {
     expect(steps.upgrade?.actors).toEqual(['master']);
     expect(steps.rescout?.actors).toEqual(['ai']);
     expect(steps.rescout?.text).toBe(
-      '仓库没有未结束的 Run 时，下次检查（每 5 分钟）就再侦察，参考新的 Run 记录和被拒的 issue',
+      '仓库没有在进行中的 Run 时（只等人的 Run 不挡），下次检查（每 5 分钟）就再侦察，参考新的 Run 记录和被拒的 issue',
     );
   });
 
@@ -416,7 +416,10 @@ describe('scoutGuide', () => {
       '不在退避：侦察没找到需求或失败后先等 5 分钟，连续每多一次等待翻倍，最长 6 小时；有侦察找到了需求，或目标分支有了新提交，就不再等',
     );
     expect(g.conditions).toContain(
-      '在自动采纳范围内、还没采纳的提案少于 5 条（max_proposals）；L 级提案留给你处理，不挡侦察',
+      '仓库没有会自己往下走的 Run（排队、执行中，或等评估回复且设了超时）：手上的活做完了才找新活；只等人的 Run 不用等，算进下面的上限',
+    );
+    expect(g.conditions).toContain(
+      '在自动采纳范围内、还没采纳的提案加上卡住等人的 Run 少于 5 个（max_proposals）；L 级提案留给你处理，不挡侦察',
     );
     expect(g.now).toBe('条件都满足，下次检查（每 5 分钟）时就会侦察。');
     expect(g.waiting).toBe(false);
@@ -425,12 +428,12 @@ describe('scoutGuide', () => {
     expect(p.conditions).toContain('距上次侦察满 6 小时（interval_hours）');
     expect(p.conditions).toContain('没设每日花费上限（daily_budget_usd），不受花费限制');
     expect(p.conditions).toContain(
-      '在自动采纳范围内、还没采纳的提案少于 5 条（max_proposals）；L 级提案和风险中、高的提案留给你处理，不挡侦察',
+      '在自动采纳范围内、还没采纳的提案加上卡住等人的 Run 少于 5 个（max_proposals）；L 级提案和风险中、高的提案留给你处理，不挡侦察',
     );
 
     // Without auto-accept every untriaged proposal counts.
     const m = scoutGuide(input({ ...manualRepo, scout }), now);
-    expect(m.conditions).toContain('还没处理的提案少于 5 条（max_proposals）');
+    expect(m.conditions).toContain('还没处理的提案加上卡住等人的 Run 少于 5 个（max_proposals）');
     expect(m.conditions.join('\n')).not.toContain('不挡侦察');
   });
 
@@ -632,12 +635,21 @@ describe('idleReasons', () => {
       ...autoRepo,
       scout: { ...scout, waiting: { reason: '等 1 个未结束的 Run 做完' } },
     };
+    const stuck =
+      '有 1 个 Run 在等你审批或卡住了：它们让出了执行位；只等人的 Run 不挡自动侦察，但和等你处理的提案一起计入上限（max_proposals），攒满后不再侦察。到首页「待我处理」处理。';
+    expect(idleReasons({ ...base, attention: 1 }, now)).toEqual([stuck]);
+    // Runs waiting for you no longer hold the scout: what it waits for is said on its own.
     expect(idleReasons({ ...base, attention: 1, github: busy }, now)).toEqual([
-      '有 1 个 Run 在等你审批或卡住了：它们让出了执行位，但仓库有未结束的 Run 时不会自动侦察。到首页「待我处理」处理。',
+      stuck,
+      '自动侦察在等：等 1 个未结束的 Run 做完。',
     ]);
-    const full = { ...autoRepo, scout: { ...scout, waiting: { reason: '有 5 条提案等你处理' } } };
-    expect(idleReasons({ ...base, github: full }, now)).toEqual([
-      '自动侦察在等：有 5 条提案等你处理。',
+    const full = {
+      ...autoRepo,
+      scout: { ...scout, waiting: { reason: '有 4 条提案、1 个卡住的 Run 等你处理' } },
+    };
+    expect(idleReasons({ ...base, attention: 1, github: full }, now)).toEqual([
+      stuck,
+      '自动侦察在等：有 4 条提案、1 个卡住的 Run 等你处理。',
     ]);
   });
 
@@ -824,11 +836,11 @@ describe('in English', () => {
         stopped,
       );
     }
-    for (const reason of ['等 1 个未结束的 Run 做完', 'Waiting for 1 unfinished Run to finish']) {
-      expect(idleReasons({ ...base, attention: 1, github: waitingFor(reason) }, now)).toEqual([
-        '1 Run is waiting for your approval or blocked: it frees the execution slot, but the repo is not scouted automatically while it has unfinished Runs. Handle it under "Needs me" on the home page.',
-      ]);
-    }
+    const stuck = idleReasons({ ...base, attention: 2 }, now);
+    expect(stuck).toEqual([
+      '2 Runs are waiting for your approval or blocked: they free the execution slot. Runs waiting only for you do not hold the automatic scout back, but count toward its limit (max_proposals) together with the proposals waiting for you, and it stops scouting once that is reached. Handle them under "Needs me" on the home page.',
+    ]);
+    expect(stuck.join('\n')).not.toMatch(/[一-鿿]/);
     expect(idleReasons({ ...base, github: waitingFor('5 proposals await you') }, now)).toEqual([
       'Automatic scouting is waiting: 5 proposals await you.',
     ]);

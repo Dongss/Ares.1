@@ -9,6 +9,7 @@ import {
   issueRunOverrides,
   replyTimeoutHours,
   scoutBackoff,
+  splitUnfinishedRuns,
 } from '../config/flow.js';
 import { githubConfigKey, type HomePaths, type LoadedConfig } from '../config/load.js';
 import type { GitHubRepoConfig } from '../config/schema.js';
@@ -77,6 +78,23 @@ const notRegistered = (name: string) =>
     en: `Repo ${name} is not registered on the dashboard`,
   });
 
+/**
+ * Why the automatic scout waits for a human: 「有 2 条提案、1 个卡住的 Run 等你处理」. A part
+ * that is 0 is left out.
+ */
+function waitingForYouText(proposals: number, stuck: number): string {
+  const p = `${proposals} proposal${proposals === 1 ? '' : 's'}`;
+  const s = `${stuck} stuck Run${stuck === 1 ? '' : 's'}`;
+  if (stuck === 0) return t({ zh: `有 ${proposals} 条提案等你处理`, en: `${p} waiting for you` });
+  if (proposals === 0) {
+    return t({ zh: `有 ${stuck} 个卡住的 Run 等你处理`, en: `${s} waiting for you` });
+  }
+  return t({
+    zh: `有 ${proposals} 条提案、${stuck} 个卡住的 Run 等你处理`,
+    en: `${p} and ${s} waiting for you`,
+  });
+}
+
 /** A scout in progress: its agent once started, and the whole scout including the cleanup. */
 interface ScoutEntry {
   scoutId: string;
@@ -117,7 +135,8 @@ export function startOfToday(now = new Date()): string {
  * - discussion: the requirement assessment's questions and conclusion are posted on the issue,
  *   and a human's replies there go back to the Run;
  * - scout: an AI reads the repo and its Run history and proposes issues, on demand or by itself
- *   whenever the repo is idle (backing off while scouts find nothing or fail); proposals up to
+ *   whenever no Run of the repo goes on by itself (backing off while scouts find nothing or
+ *   fail, and capping the proposals and stuck Runs left for a human); proposals up to
  *   the configured risk are accepted without a human.
  * Intake, auto-accept and automatic scouts only happen while the work switch is on.
  * GitHub is only a mirror: failures are reported and retried on the next poll, never block Runs.
@@ -870,11 +889,12 @@ export class IssueBridge {
   }
 
   /**
-   * Scout by itself when there is nothing to do: the repo has no unfinished Run, few
-   * proposals hold it back (see proposalsHoldingScout), the day's budget is not spent, the
-   * configured interval since the last scout has passed, and it is not backing off after scouts
-   * that found nothing or failed (see scoutBackoff: the wait doubles with each such scout in a
-   * row, and ends once a scout files an issue or the target branch gets a new commit).
+   * Scout by itself when there is nothing to do: the repo has no Run that goes on by itself
+   * (see splitUnfinishedRuns), the proposals that hold it back (see proposalsHoldingScout) and
+   * the Runs stuck waiting for a human are fewer than max_proposals together, the day's budget is
+   * not spent, the configured interval since the last scout has passed, and it is not backing off
+   * after scouts that found nothing or failed (see scoutBackoff: the wait doubles with each such
+   * scout in a row, and ends once a scout files an issue or the target branch gets a new commit).
    * Records why it waits, for the dashboard.
    */
   private async maybeAutoScout(name: string): Promise<void> {
@@ -892,14 +912,17 @@ export class IssueBridge {
       };
     }
     if (this.scouting.has(repo.id)) return { reason: t({ zh: '正在侦察', en: 'Scouting' }) };
-    const busy = this.deps.store
-      .listRuns({ repoId: repo.id })
-      .filter((r) => !FINISHED_RUN_STATUSES.includes(r.status));
-    if (busy.length > 0) {
+    const store = this.deps.store;
+    const runs = splitUnfinishedRuns(
+      store.listRuns({ repoId: repo.id }),
+      (id) => store.getStageRun(id).stageId,
+    );
+    const busy = runs.moving.length;
+    if (busy > 0) {
       return {
         reason: t({
-          zh: `等 ${busy.length} 个未结束的 Run 做完`,
-          en: `Waiting for ${busy.length} unfinished Run${busy.length === 1 ? '' : 's'} to finish`,
+          zh: `等 ${busy} 个未结束的 Run 做完`,
+          en: `Waiting for ${busy} unfinished Run${busy === 1 ? '' : 's'} to finish`,
         }),
       };
     }
@@ -934,22 +957,18 @@ export class IssueBridge {
       wait = backoff;
     }
     if (wait) return wait;
-    // Do not pile up proposals nobody has looked at.
+    // Do not pile up work nobody has looked at: proposals and Runs stuck waiting for a human.
     const full = await this.issuesRepo(repo, cfg);
     const open = await this.gh().listIssues(full, {
       state: 'open',
       label: LABELS.proposal,
       limit: 100,
     });
-    const scouts = this.deps.store.listScouts({ repoId: repo.id, limit: 200 });
+    const scouts = store.listScouts({ repoId: repo.id, limit: 200 });
     const pending = proposalsHoldingScout(open, scouts, cfg.auto_accept.max_risk).length;
-    if (pending >= scout.max_proposals) {
-      return {
-        reason: t({
-          zh: `有 ${pending} 条提案等你处理`,
-          en: `${pending} proposal${pending === 1 ? '' : 's'} waiting for you`,
-        }),
-      };
+    const stuck = runs.stuck.length;
+    if (pending + stuck >= scout.max_proposals) {
+      return { reason: waitingForYouText(pending, stuck) };
     }
     return null;
   }

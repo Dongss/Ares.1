@@ -32,9 +32,9 @@ describe('issues display', () => {
       lastAt: null,
       waiting: null,
     };
-    expect(scoutPlan(scout)).toBe('没有未结束的 Run 时自动侦察');
+    expect(scoutPlan(scout)).toBe('没有在进行中的 Run 时自动侦察（只等人的 Run 不挡）');
     expect(scoutPlan({ ...scout, intervalHours: 6 })).toBe(
-      '没有未结束的 Run 时自动侦察，至少间隔 6 小时',
+      '没有在进行中的 Run 时自动侦察（只等人的 Run 不挡），至少间隔 6 小时',
     );
     expect(scoutPlan({ ...scout, auto: false })).toBe('只在这里手动触发');
     const now = new Date('2026-11-19T12:00:00');
@@ -131,7 +131,7 @@ describe('issues display in English', () => {
   it('describes the scout plan, limits and the upgrade state in English', () => {
     setLang('en');
     expect(scoutPlan(scout)).toBe(
-      'Scouts by itself when no Run is unfinished, at least 1 hour apart',
+      'Scouts by itself when no Run is in progress (Runs waiting only for you do not hold it back), at least 1 hour apart',
     );
     expect(scoutPlan({ ...scout, intervalHours: 6 })).toContain('at least 6 hours apart');
     expect(scoutPlan({ ...scout, auto: false })).toBe('Only when started here');

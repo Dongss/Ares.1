@@ -1,11 +1,12 @@
 // How a workflow template flows: effective stage settings, verify commands and rollback targets;
-// also the overrides of Runs from issues, which proposals are accepted automatically and how long
-// the automatic scout backs off.
-// Pure logic (type imports and src/i18n.ts only), so the dashboard shows the same rules the engine
-// applies.
+// also the overrides of Runs from issues, which proposals are accepted automatically, how long
+// the automatic scout backs off and which unfinished Runs it waits for.
+// Pure logic (type imports, src/i18n.ts, src/store/types.ts and src/engine/discussion.ts only),
+// so the dashboard shows the same rules the engine applies.
 
+import { replyDeadline } from '../engine/discussion.js';
 import { t } from '../i18n.js';
-import type { Scout } from '../store/types.js';
+import { FINISHED_RUN_STATUSES, type Run, type Scout } from '../store/types.js';
 import type { Escalate, RunOverrides, StageDef, WorkflowTemplate } from './schema.js';
 
 /** Risk of a proposal, ordered; auto-accept takes everything up to a chosen level. */
@@ -120,6 +121,61 @@ export function replyTimeoutHours(def: StageDef): number | null {
   return def.reply_timeout_hours === undefined
     ? SYSTEM_DEFAULTS.reply_timeout_hours
     : def.reply_timeout_hours;
+}
+
+/**
+ * When a Run blocked on the assessment's questions stops waiting for a reply and the assessment
+ * decides on its own: the latest round's questions plus the assess stage's `replyTimeoutHours`
+ * (`replyDeadline`, epoch milliseconds). null when the Run does not wait for a reply, its stage
+ * waits however long it takes, or the discussion no longer ends with the questions: then only a
+ * human moves it on. `stageIdOf` gives the stage of one of the Run's stage runs.
+ */
+export function discussionReplyWait(
+  run: Pick<Run, 'status' | 'blocked' | 'discussion' | 'template'>,
+  stageIdOf: (stageRunId: string) => string | undefined,
+): { deadline: number; hours: number } | null {
+  const info = run.blocked;
+  if (run.status !== 'blocked' || info?.kind !== 'discussion' || !info.stageRunId) return null;
+  const stageId = stageIdOf(info.stageRunId);
+  const def = run.template.stages.find((s) => s.id === stageId);
+  const hours = def ? replyTimeoutHours(def) : null;
+  const deadline = replyDeadline(run.discussion, hours);
+  return hours === null || deadline === null ? null : { deadline, hours };
+}
+
+/** A repo's unfinished Runs, by whether they go on without a human. */
+export interface UnfinishedRuns<R> {
+  /**
+   * They go on by themselves: queued, running, or waiting for a reply to the assessment's
+   * questions that times out (`discussionReplyWait`).
+   */
+  moving: R[];
+  /**
+   * Only a human moves them on: every other blocked Run, paused Runs, Runs waiting for approval.
+   */
+  stuck: R[];
+}
+
+/**
+ * Split a repo's Runs that have not finished by whether they go on without a human. The
+ * automatic scout waits for the moving ones, as their results change what is worth doing next.
+ * The stuck ones would hold it for good when nobody is there, so they count toward
+ * `max_proposals` together with the proposals waiting for a human instead: work left for a human
+ * is still capped, but no longer stops the repo. Finished Runs are left out.
+ */
+export function splitUnfinishedRuns<
+  R extends Pick<Run, 'status' | 'blocked' | 'discussion' | 'template'>,
+>(runs: readonly R[], stageIdOf: (stageRunId: string) => string | undefined): UnfinishedRuns<R> {
+  const split: UnfinishedRuns<R> = { moving: [], stuck: [] };
+  for (const run of runs) {
+    if (FINISHED_RUN_STATUSES.includes(run.status)) continue;
+    const moving =
+      run.status === 'queued' ||
+      run.status === 'running' ||
+      discussionReplyWait(run, stageIdOf) !== null;
+    (moving ? split.moving : split.stuck).push(run);
+  }
+  return split;
 }
 
 /** The Run's budget in USD: run override → template default; undefined = no budget. */
