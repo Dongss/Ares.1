@@ -323,8 +323,9 @@ describe('scoutGuide', () => {
     expect(g.conditions).toContain(
       '今天侦察、自动采纳和自动重做的 Run 一共花费不到 $20.00（现在 $3.20）',
     );
+    expect(g.conditions).toContain('不限间隔（interval_hours: 0）');
     expect(g.conditions).toContain(
-      '不限间隔（interval_hours: 0）：上次侦察失败或没找到新需求也不额外等',
+      '不在退避：侦察没找到需求或失败后先等 5 分钟，连续每多一次等待翻倍，最长 6 小时；有侦察找到了需求，或目标分支有了新提交，就不再等',
     );
     expect(g.conditions).toContain(
       '在自动采纳范围内、还没采纳的提案少于 5 条（max_proposals）；超出范围的（风险更高或大小为 L）留给你处理，不挡侦察',
@@ -711,6 +712,12 @@ describe('in English', () => {
     expect(scoutGuide(inputEn(autoRepo), now).now).toBe(
       'All conditions are met; it scouts at the next check (every 5 minutes).',
     );
+    expect(scoutGuide(inputEn(autoRepo), now).conditions).toContain(
+      'Not backing off: after a scout finds nothing or fails it waits 5 minutes, twice as long for each further one in a row, up to 6 hours; a scout that finds work, or a new commit on the target branch, ends the wait',
+    );
+    expect(
+      scoutGuide({ ...inputEn(autoRepo), pollMinutes: 1 }, now).conditions.join('\n'),
+    ).toContain('waits 1 minute,');
   });
 
   it("recognizes the scout's reasons in the Master's language, whatever the dashboard's", () => {

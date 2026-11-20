@@ -1,8 +1,10 @@
-// How a workflow template flows: effective stage settings, verify commands and rollback targets.
+// How a workflow template flows: effective stage settings, verify commands and rollback targets;
+// also the overrides of Runs from issues and how long the automatic scout backs off.
 // Pure logic (type imports and src/i18n.ts only), so the dashboard shows the same rules the engine
 // applies.
 
 import { t } from '../i18n.js';
+import type { Scout } from '../store/types.js';
 import type { Escalate, RunOverrides, StageDef, WorkflowTemplate } from './schema.js';
 
 export const SYSTEM_DEFAULTS = {
@@ -86,6 +88,52 @@ export function issueRunOverrides(
   const merges = (template?.stages ?? []).filter((st) => st.kind === 'merge');
   if (!autoMerge || merges.length === 0) return undefined;
   return { stages: Object.fromEntries(merges.map((st) => [st.id, { gate: false }])) };
+}
+
+/** The longest the automatic scout backs off after scouts that found nothing or failed. */
+export const MAX_SCOUT_BACKOFF_HOURS = 6;
+
+export interface ScoutBackoff {
+  /** Scouts in a row, counting back from the newest, that found nothing or failed. */
+  count: number;
+  /** When the next automatic scout may start. */
+  until: string;
+}
+
+/**
+ * How long the automatic scout backs off: scouting an unchanged repo again most likely finds
+ * nothing again, at the price of a full read of the repo every poll. Counting back from the newest
+ * scout (started by hand or not), k is the number of scouts in a row that failed or filed no
+ * issue (proposals that were all duplicates or could not be filed find nothing). The next one may
+ * start poll_minutes × 2^(k-1) after the newest of them ended, at most MAX_SCOUT_BACKOFF_HOURS.
+ * - A scout that filed an issue ends the streak.
+ * - So does a scout started before `changedAt` (the target branch's latest commit): it did not
+ *   see the repo as it is now.
+ * - A scout cut short by the Master stopping, or still running, neither counts nor ends it.
+ * `scouts` are newest first. null: no streak, no back-off.
+ */
+export function scoutBackoff(
+  scouts: Pick<Scout, 'status' | 'proposals' | 'startedAt' | 'endedAt'>[],
+  pollMinutes: number,
+  changedAt = Number.NEGATIVE_INFINITY,
+): ScoutBackoff | null {
+  let count = 0;
+  let newest: (typeof scouts)[number] | undefined;
+  for (const s of scouts) {
+    if (s.status === 'interrupted' || s.status === 'running') continue;
+    if (Date.parse(s.startedAt) < changedAt) break;
+    if (s.status === 'completed' && s.proposals.some((p) => p.issue)) break;
+    count++;
+    newest ??= s;
+  }
+  if (!newest) return null;
+  // 2^(k-1) stops mattering long before it could overflow: the wait is capped.
+  const delay = Math.min(
+    pollMinutes * 60_000 * 2 ** Math.min(count - 1, 30),
+    MAX_SCOUT_BACKOFF_HOURS * 3_600_000,
+  );
+  const from = Date.parse(newest.endedAt ?? newest.startedAt);
+  return { count, until: new Date(from + delay).toISOString() };
 }
 
 function stripUndefined<T extends object>(obj: T | undefined): Partial<T> {

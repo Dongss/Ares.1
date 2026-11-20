@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import type { AgentAdapter, AgentExecution } from '../adapters/types.js';
 import type { GitHubRepoStatus, GitHubStatus } from '../api/types.js';
 import { brandName } from '../brand.js';
-import { issueRunOverrides, replyTimeoutHours } from '../config/flow.js';
+import { issueRunOverrides, replyTimeoutHours, scoutBackoff } from '../config/flow.js';
 import { githubConfigKey, type HomePaths, type LoadedConfig } from '../config/load.js';
 import type { GitHubRepoConfig } from '../config/schema.js';
 import { type Engine, estimateCost, InvalidStateError } from '../engine/engine.js';
@@ -23,6 +23,7 @@ import {
 import { errorMessage, nowIso } from '../util.js';
 import {
   addDetachedWorktree,
+  commitTime,
   dropWorktree,
   pruneWorktrees,
   revParse,
@@ -106,7 +107,8 @@ export function startOfToday(now = new Date()): string {
  * - discussion: the requirement assessment's questions and conclusion are posted on the issue,
  *   and a human's replies there go back to the Run;
  * - scout: an AI reads the repo and its Run history and proposes issues, on demand or by itself
- *   whenever the repo is idle; proposals up to the configured risk are accepted without a human.
+ *   whenever the repo is idle (backing off while scouts find nothing or fail); proposals up to
+ *   the configured risk are accepted without a human.
  * Intake, auto-accept and automatic scouts only happen while the work switch is on.
  * GitHub is only a mirror: failures are reported and retried on the next poll, never block Runs.
  */
@@ -797,9 +799,10 @@ export class IssueBridge {
 
   /**
    * Scout by itself when there is nothing to do: the repo has no unfinished Run, few
-   * proposals hold it back (see proposalsHoldingScout), the day's budget is not spent, and the
-   * configured interval since the last scout has passed (no extra wait after a scout that failed
-   * or found nothing).
+   * proposals hold it back (see proposalsHoldingScout), the day's budget is not spent, the
+   * configured interval since the last scout has passed, and it is not backing off after scouts
+   * that found nothing or failed (see scoutBackoff: the wait doubles with each such scout in a
+   * row, and ends once a scout files an issue or the target branch gets a new commit).
    * Records why it waits, for the dashboard.
    */
   private async maybeAutoScout(name: string): Promise<void> {
@@ -839,11 +842,13 @@ export class IssueBridge {
         }),
       };
     }
+    // Both the set interval and the back-off hold it; it waits for the later of the two.
+    let wait: ScoutWait | null = null;
     const last = this.deps.store.listScouts({ repoId: repo.id, limit: 1 })[0];
     if (last && scout.interval_hours > 0) {
       const next = Date.parse(last.startedAt) + scout.interval_hours * 3_600_000;
       if (next > Date.now()) {
-        return {
+        wait = {
           reason: t({
             zh: '离上次侦察不到设定的间隔',
             en: 'Less than the set interval since the last scout',
@@ -852,6 +857,11 @@ export class IssueBridge {
         };
       }
     }
+    const backoff = await this.scoutBackoffWait(repo);
+    if (backoff && (!wait?.until || Date.parse(backoff.until) > Date.parse(wait.until))) {
+      wait = backoff;
+    }
+    if (wait) return wait;
     // Do not pile up proposals nobody has looked at.
     const full = await this.issuesRepo(repo, cfg);
     const open = await this.gh().listIssues(full, {
@@ -870,6 +880,30 @@ export class IssueBridge {
       };
     }
     return null;
+  }
+
+  /** The back-off after scouts that found nothing or failed, if it holds the scout now. */
+  private async scoutBackoffWait(repo: Repo): Promise<(ScoutWait & { until: string }) | null> {
+    const pollMinutes = this.cfg.master.github?.poll_minutes ?? 5;
+    const scouts = this.deps.store.listScouts({ repoId: repo.id, limit: 100 });
+    let backoff = scoutBackoff(scouts, pollMinutes);
+    if (!backoff || Date.parse(backoff.until) <= Date.now()) return null;
+    // Scouts that ran before the target branch's latest commit do not count: they did not see it.
+    // When git cannot tell, the back-off stays as counted.
+    const changedAt = await commitTime(repo.path, repo.targetBranch).catch(() => undefined);
+    if (changedAt !== undefined) backoff = scoutBackoff(scouts, pollMinutes, changedAt);
+    if (!backoff || Date.parse(backoff.until) <= Date.now()) return null;
+    const k = backoff.count;
+    return {
+      reason: t({
+        zh: `最近 ${k} 次侦察没有找到需求或失败，退避中`,
+        en:
+          k === 1
+            ? 'The last scout found nothing or failed; backing off'
+            : `The last ${k} scouts found nothing or failed; backing off`,
+      }),
+      until: backoff.until,
+    };
   }
 
   // ---- scouting ------------------------------------------------------------

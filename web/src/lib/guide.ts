@@ -1,5 +1,9 @@
 import type { ConfigView, GitHubRepoStatus, UpgradeStatus } from '../../../src/api/types.js';
-import { effectiveBudget, issueRunOverrides } from '../../../src/config/flow.js';
+import {
+  effectiveBudget,
+  issueRunOverrides,
+  MAX_SCOUT_BACKOFF_HOURS,
+} from '../../../src/config/flow.js';
 import { waitText } from '../../../src/engine/discussion.js';
 import { join, t } from '../../../src/i18n.js';
 import { NOTICE_KINDS, type NoticeKind } from '../../../src/notify/notice.js';
@@ -590,6 +594,7 @@ export function scoutGuide(
     };
   }
   const { budget } = github;
+  const { pollMinutes } = input;
   const conditions = [
     t({ zh: '工作开关是「工作中」', en: 'The work switch is on ("Working")' }),
     t({
@@ -612,9 +617,13 @@ export function scoutGuide(
           en: `At least ${scout.intervalHours} hours since the last scout (interval_hours)`,
         })
       : t({
-          zh: '不限间隔（interval_hours: 0）：上次侦察失败或没找到新需求也不额外等',
-          en: 'No minimum interval (interval_hours: 0): no extra wait even if the last scout failed or found nothing new',
+          zh: '不限间隔（interval_hours: 0）',
+          en: 'No minimum interval (interval_hours: 0)',
         }),
+    t({
+      zh: `不在退避：侦察没找到需求或失败后先等 ${pollMinutes} 分钟，连续每多一次等待翻倍，最长 ${MAX_SCOUT_BACKOFF_HOURS} 小时；有侦察找到了需求，或目标分支有了新提交，就不再等`,
+      en: `Not backing off: after a scout finds nothing or fails it waits ${pollMinutes} ${pollMinutes === 1 ? 'minute' : 'minutes'}, twice as long for each further one in a row, up to ${MAX_SCOUT_BACKOFF_HOURS} hours; a scout that finds work, or a new commit on the target branch, ends the wait`,
+    }),
     github.autoAccept.maxRisk === 'none'
       ? t({
           zh: `还没处理的提案少于 ${scout.maxProposals} 条（max_proposals）`,

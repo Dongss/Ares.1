@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -118,6 +119,28 @@ async function scoutDone(t: Harness, id: string) {
 }
 
 const scoutDir = (t: Harness, id: string) => join(t.home, 'worktrees', 'scouts', id);
+
+/**
+ * The target branch's latest commit, as committed a day ago: older than the test's scouts even
+ * after `elapse`, so that only the time decides the back-off.
+ */
+function oldTargetBranch(t: Harness) {
+  execFileSync('git', ['commit', '-q', '--amend', '--no-edit'], {
+    cwd: t.repoDir,
+    env: { ...process.env, GIT_COMMITTER_DATE: new Date(Date.now() - 86_400_000).toISOString() },
+  });
+}
+
+/** As if `ms` had passed since the scouts so far: their times move back that much. */
+function elapse(t: Harness, ms: number) {
+  const back = (iso: string) => new Date(Date.parse(iso) - ms).toISOString();
+  for (const s of t.master.store.listScouts()) {
+    t.master.store.updateScout(s.id, {
+      startedAt: back(s.startedAt),
+      endedAt: s.endedAt === null ? null : back(s.endedAt),
+    });
+  }
+}
 
 /** A new Master on the closed one's home and repo, as after a restart. */
 async function restart(closed: Harness): Promise<Harness> {
@@ -368,6 +391,14 @@ describe('issues: scout', () => {
     // The proposals of size L are left for a human, and the scout goes on.
     expect(gh.get(1).labels).toEqual([LABELS.proposal]);
     expect(t.master.store.listRuns()).toHaveLength(0);
+    // The second scout found nothing: the next waits out the back-off, then goes on.
+    oldTargetBranch(t);
+    await t.master.issues.poll();
+    expect(t.master.store.listScouts()).toHaveLength(2);
+    expect(t.master.issues.status().repos[0]?.scout?.waiting?.reason).toBe(
+      '最近 1 次侦察没有找到需求或失败，退避中',
+    );
+    elapse(t, 5 * 60_000);
     await t.master.issues.poll();
     expect(t.master.store.listScouts()).toHaveLength(3);
     await scoutDone(t, t.master.store.listScouts()[0]?.id ?? '');
@@ -392,29 +423,141 @@ describe('issues: scout', () => {
     expect(gh.issues.size).toBe(2);
   });
 
-  it('scouts again right away after a scout that found nothing or failed', async () => {
-    const t = await start(config({ auto: true }));
-    let n = 0;
-    t.scripts.scout = () =>
-      ++n === 2
-        ? { structured: { proposals: [{ title: '缺字段' }] } }
-        : { structured: { proposals: [] } };
-    await t.master.issues.poll();
-    const first = await scoutDone(t, t.master.store.listScouts()[0]?.id ?? '');
-    expect(first.status).toBe('completed');
-    expect(first.proposals).toHaveLength(0);
+  describe('backing off after scouts that found nothing or failed', () => {
+    afterEach(() => setLang('zh'));
+    const MIN = 60_000;
+    const waiting = (t: Harness) => t.master.issues.status().repos[0]?.scout?.waiting;
+    /** `ms` after the scout ended, as ISO. */
+    const endPlus = (s: { endedAt: string | null }, ms: number) =>
+      new Date(Date.parse(s.endedAt ?? '') + ms).toISOString();
 
-    await t.master.issues.poll();
-    const second = await scoutDone(t, t.master.store.listScouts()[0]?.id ?? '');
-    expect(second.id).not.toBe(first.id);
-    expect(second.status).toBe('failed');
+    /** Auto scouting on a repo whose last commit is old: the first scout finds nothing. */
+    async function emptyScout(scripts: (n: number) => Script) {
+      const t = await start(config({ auto: true }));
+      oldTargetBranch(t);
+      let n = 0;
+      t.scripts.scout = (ctx) => scripts(++n)(ctx);
+      await t.master.issues.poll();
+      const first = await scoutDone(t, t.master.store.listScouts()[0]?.id ?? '');
+      expect(first).toMatchObject({ status: 'completed', proposals: [], trigger: 'auto' });
+      return { t, first };
+    }
+    const nothing: Script = () => ({ structured: { proposals: [] } });
+    const broken: Script = () => ({ structured: { proposals: [{ title: '缺字段' }] } });
+    const work: Script = () => ({ structured: { proposals: [proposal('有活', 'mid')] } });
 
-    await t.master.issues.poll();
-    const scouts = t.master.store.listScouts();
-    expect(scouts).toHaveLength(3);
-    expect(scouts.every((s) => s.trigger === 'auto')).toBe(true);
-    await scoutDone(t, scouts[0]?.id ?? '');
-    expect(gh.issues.size).toBe(0);
+    it('waits poll_minutes, twice as long after each further one in a row', async () => {
+      const { t, first } = await emptyScout((n) => (n === 2 ? broken : nothing));
+      await t.master.issues.poll();
+      expect(t.master.store.listScouts()).toHaveLength(1);
+      expect(waiting(t)).toEqual({
+        reason: '最近 1 次侦察没有找到需求或失败，退避中',
+        until: endPlus(first, 5 * MIN),
+      });
+
+      elapse(t, 5 * MIN);
+      await t.master.issues.poll();
+      const second = await scoutDone(t, t.master.store.listScouts()[0]?.id ?? '');
+      expect(second.id).not.toBe(first.id);
+      expect(second).toMatchObject({ status: 'failed', trigger: 'auto' });
+
+      await t.master.issues.poll();
+      expect(t.master.store.listScouts()).toHaveLength(2);
+      expect(waiting(t)).toEqual({
+        reason: '最近 2 次侦察没有找到需求或失败，退避中',
+        until: endPlus(second, 10 * MIN),
+      });
+      elapse(t, 9 * MIN);
+      await t.master.issues.poll();
+      expect(t.master.store.listScouts()).toHaveLength(2);
+      expect(waiting(t)?.reason).toBe('最近 2 次侦察没有找到需求或失败，退避中');
+
+      elapse(t, MIN);
+      await t.master.issues.poll();
+      const scouts = t.master.store.listScouts();
+      expect(scouts).toHaveLength(3);
+      expect(scouts.every((s) => s.trigger === 'auto')).toBe(true);
+      await scoutDone(t, scouts[0]?.id ?? '');
+      expect(gh.issues.size).toBe(0);
+      await t.master.issues.poll();
+      expect(waiting(t)?.reason).toBe('最近 3 次侦察没有找到需求或失败，退避中');
+    });
+
+    it('stops backing off once the target branch has a new commit', async () => {
+      const { t } = await emptyScout(() => nothing);
+      // The scout started a little before the commit, as one does at least a second earlier.
+      elapse(t, 2_000);
+      await t.master.issues.poll();
+      expect(t.master.store.listScouts()).toHaveLength(1);
+      expect(waiting(t)?.until).toBeDefined();
+
+      writeFile(join(t.repoDir, 'new.txt'), '新提交\n');
+      git(t.repoDir, 'add', '-A');
+      git(t.repoDir, 'commit', '-q', '-m', 'new');
+      await t.master.issues.poll();
+      const scouts = t.master.store.listScouts();
+      expect(scouts).toHaveLength(2);
+      const second = await scoutDone(t, scouts[0]?.id ?? '');
+      // The scouts before the commit no longer count: the wait starts over.
+      await t.master.issues.poll();
+      expect(t.master.store.listScouts()).toHaveLength(2);
+      expect(waiting(t)).toEqual({
+        reason: '最近 1 次侦察没有找到需求或失败，退避中',
+        until: endPlus(second, 5 * MIN),
+      });
+    });
+
+    it('lets a scout started by hand run, and stops backing off once a scout finds work', async () => {
+      const { t } = await emptyScout((n) => (n === 2 ? work : nothing));
+      await t.master.issues.poll();
+      expect(t.master.store.listScouts()).toHaveLength(1);
+      expect(waiting(t)?.until).toBeDefined();
+
+      const manual = await t.master.issues.startScout('demo', 'manual');
+      const found = await scoutDone(t, manual.id);
+      expect(found.proposals[0]?.issue?.number).toBe(1);
+      await t.master.issues.poll();
+      const scouts = t.master.store.listScouts();
+      expect(scouts).toHaveLength(3);
+      expect(scouts[0]?.trigger).toBe('auto');
+      await scoutDone(t, scouts[0]?.id ?? '');
+    });
+
+    it('waits for the later of the back-off and interval_hours', async () => {
+      const t = await start(config({ auto: true, intervalHours: 1 }));
+      oldTargetBranch(t);
+      t.scripts.scout = nothing;
+      await t.master.issues.poll();
+      const first = await scoutDone(t, t.master.store.listScouts()[0]?.id ?? '');
+      await t.master.issues.poll();
+      expect(waiting(t)?.reason).toBe('离上次侦察不到设定的间隔');
+      for (let i = 0; i < 5; i++) {
+        elapse(t, 2 * 3_600_000);
+        await t.master.issues.poll();
+        await scoutDone(t, t.master.store.listScouts()[0]?.id ?? '');
+      }
+      // 6 in a row: 5 min × 2^5 = 160 min, more than the hour of interval_hours.
+      await t.master.issues.poll();
+      const last = t.master.store.listScouts()[0];
+      expect(last?.id).not.toBe(first.id);
+      expect(waiting(t)).toEqual({
+        reason: '最近 6 次侦察没有找到需求或失败，退避中',
+        until: endPlus(last ?? first, 160 * MIN),
+      });
+    });
+
+    it('says why it waits in English', async () => {
+      const { t } = await emptyScout((n) => (n === 2 ? broken : nothing));
+      setLang('en'); // after the Master started: it applies config.yaml's language
+      await t.master.issues.poll();
+      expect(waiting(t)?.reason).toBe('The last scout found nothing or failed; backing off');
+      elapse(t, 5 * MIN);
+      await t.master.issues.poll();
+      await scoutDone(t, t.master.store.listScouts()[0]?.id ?? '');
+      await t.master.issues.poll();
+      expect(waiting(t)?.reason).toBe('The last 2 scouts found nothing or failed; backing off');
+      expect(waiting(t)?.reason).not.toMatch(/[一-鿿]/);
+    });
   });
 
   it('waits interval_hours between automatic scouts', async () => {

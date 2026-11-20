@@ -44,8 +44,9 @@ src/
     load.ts           load and validate config; invalid agents and templates are only disabled
                       and reported; applies config.yaml's language
     watch.ts          reload config when its files change
-    flow.ts           effective stage settings, check commands, rollback targets, budgets
-                      (shared by engine and dashboard)
+    flow.ts           effective stage settings, check commands, rollback targets, budgets,
+                      the automatic scout's back-off (shared by engine, GitHub bridge and
+                      dashboard)
     effort.ts         helpers for agent effort (shared by engine and dashboard)
   store/              SQLite store (node:sqlite): store.ts, migrations.ts, types.ts (entity types)
   adapters/           agent adapters: types.ts (common interface), process.ts (child processes and
@@ -121,7 +122,8 @@ test/
   - Prefer structured event data over rendered text, so that the dashboard can show events in its own language.
 - In the engine, after every `await`, if the Run may have been paused or cancelled meanwhile, call `checkAbort(signal)` before changing state.
 - Each rule lives in one place, shared by engine and dashboard:
-  - rollback targets, effective settings and the like: `src/config/flow.ts`
+  - rollback targets, effective settings, the automatic scout's back-off and the like:
+    `src/config/flow.ts`
   - notification rules: `src/notify/notice.ts`
   - assessment conclusion rules: `src/engine/discussion.ts`
   - how a Run's time is split, and the names and groups of the parts: `src/engine/times.ts`

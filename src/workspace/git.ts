@@ -52,6 +52,26 @@ export function revParse(cwd: string, ref: string): Promise<string> {
   return git(cwd, ['rev-parse', '--verify', `${ref}^{commit}`]);
 }
 
+/**
+ * When `ref`'s commit was committed (the committer date, which a rebase or cherry-pick updates,
+ * unlike the author date), in ms since the epoch; git keeps whole seconds.
+ */
+export async function commitTime(cwd: string, ref: string): Promise<number> {
+  const out = await git(cwd, ['show', '-s', '--format=%ct', `${ref}^{commit}`]);
+  const seconds = Number(out);
+  if (!out || !Number.isFinite(seconds)) {
+    throw new GitError(
+      t({
+        zh: `读不出 ${ref} 的提交时间：${out}`,
+        en: `Could not read the commit time of ${ref}: ${out}`,
+      }),
+      '',
+      null,
+    );
+  }
+  return seconds * 1000;
+}
+
 export function branchExists(repo: string, branch: string): Promise<boolean> {
   return gitOk(repo, ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`]);
 }

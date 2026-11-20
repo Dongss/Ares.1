@@ -1,8 +1,10 @@
+import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   addWorktree,
   commitAll,
+  commitTime,
   fastForwardBranch,
   hasChanges,
   removeWorktree,
@@ -26,6 +28,16 @@ describe('git workspace', () => {
     const { wt, sha } = await branchWithCommit(repo);
     expect(sha).toMatch(/^[0-9a-f]{40}$/);
     expect(await commitAll(wt, 'empty')).toBeNull();
+  });
+
+  it("reads a branch's commit time from the committer date, and fails on an unknown ref", async () => {
+    const repo = initRepo();
+    execFileSync('git', ['commit', '-q', '--amend', '--no-edit'], {
+      cwd: repo,
+      env: { ...process.env, GIT_COMMITTER_DATE: '2026-01-02T03:04:05Z' },
+    });
+    expect(await commitTime(repo, 'main')).toBe(Date.parse('2026-01-02T03:04:05Z'));
+    await expect(commitTime(repo, 'nope')).rejects.toThrow();
   });
 
   it('resetHard drops tracked and untracked changes', async () => {

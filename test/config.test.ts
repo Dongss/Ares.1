@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { issueRunOverrides } from '../src/config/flow.js';
+import { issueRunOverrides, scoutBackoff } from '../src/config/flow.js';
 import { ConfigError, homePaths, initHome, loadConfig } from '../src/config/load.js';
 import {
   agentEffort,
@@ -16,6 +16,7 @@ import {
   type WorkflowTemplate,
 } from '../src/config/schema.js';
 import { setLang } from '../src/i18n.js';
+import type { Scout, ScoutProposal } from '../src/store/types.js';
 import { tmpDir, writeFile } from './helpers.js';
 
 afterEach(() => setLang('zh'));
@@ -665,5 +666,68 @@ describe('issueRunOverrides', () => {
     const noMerge = TemplateSchema.parse({ id: 'n', stages: [{ id: 'code', agent: 'a' }] });
     expect(issueRunOverrides(noMerge, true)).toBeUndefined();
     expect(issueRunOverrides(undefined, true)).toBeUndefined();
+  });
+});
+
+describe('scoutBackoff', () => {
+  const MIN = 60_000;
+  const at = (min: number) => new Date(Date.UTC(2026, 10, 20, 0, min)).toISOString();
+  /** A scout that started at minute `min` and ran a minute. */
+  const scout = (
+    min: number,
+    status: Scout['status'],
+    proposals: Pick<ScoutProposal, 'issue'>[] = [],
+  ) => ({
+    status,
+    proposals: proposals as ScoutProposal[],
+    startedAt: at(min),
+    endedAt: status === 'running' ? null : at(min + 1),
+  });
+  const filed = [{ issue: { number: 1, url: '', auto: false } }];
+
+  it('has none before any scout, or after a scout that filed an issue', () => {
+    expect(scoutBackoff([], 5)).toBeNull();
+    expect(scoutBackoff([scout(10, 'completed', filed), scout(0, 'failed')], 5)).toBeNull();
+  });
+
+  it('doubles poll_minutes with every scout in a row that found nothing or failed', () => {
+    const one = [scout(20, 'completed')];
+    expect(scoutBackoff(one, 5)).toEqual({ count: 1, until: at(21 + 5) });
+    // Proposals that filed no issue (duplicates, GitHub failing) found nothing either.
+    const two = [scout(30, 'completed', [{}]), ...one];
+    expect(scoutBackoff(two, 5)).toEqual({ count: 2, until: at(31 + 10) });
+    const three = [scout(40, 'failed'), ...two, scout(10, 'completed', filed), scout(0, 'failed')];
+    expect(scoutBackoff(three, 5)).toEqual({ count: 3, until: at(41 + 20) });
+  });
+
+  it('waits 6 hours at most, however long the streak', () => {
+    const scouts = Array.from({ length: 80 }, (_, i) => scout(1000 - i * 10, 'failed'));
+    const backoff = scoutBackoff(scouts, 5);
+    expect(backoff?.count).toBe(80);
+    expect(backoff?.until).toBe(new Date(Date.parse(at(1001)) + 6 * 60 * MIN).toISOString());
+  });
+
+  it('skips scouts the Master cut short, or still running, and counts from the one before', () => {
+    const scouts = [
+      scout(50, 'running'),
+      scout(40, 'interrupted'),
+      scout(30, 'failed'),
+      scout(20, 'interrupted'),
+      scout(10, 'completed'),
+    ];
+    expect(scoutBackoff(scouts, 5)).toEqual({ count: 2, until: at(31 + 10) });
+    expect(scoutBackoff([scout(10, 'interrupted')], 5)).toBeNull();
+  });
+
+  it('counts only scouts started after the target branch last changed', () => {
+    const scouts = [scout(30, 'failed'), scout(20, 'completed'), scout(10, 'failed')];
+    expect(scoutBackoff(scouts, 5, Date.parse(at(15)))).toEqual({ count: 2, until: at(31 + 10) });
+    expect(scoutBackoff(scouts, 5, Date.parse(at(30)))).toEqual({ count: 1, until: at(31 + 5) });
+    expect(scoutBackoff(scouts, 5, Date.parse(at(35)))).toBeNull();
+  });
+
+  it('counts from the start of a scout that has no end', () => {
+    const scouts = [{ ...scout(10, 'failed'), endedAt: null }];
+    expect(scoutBackoff(scouts, 5)).toEqual({ count: 1, until: at(15) });
   });
 });
