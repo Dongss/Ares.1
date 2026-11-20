@@ -586,17 +586,26 @@ agents:
     expect(existsSync(join(waiting.worktreePath as string, 'reviewer-was-here.txt'))).toBe(false);
   });
 
-  it('blocks when setup commands fail and retry recreates the workspace', async () => {
-    h = await harness({ setupCommands: ['test -f setup-ok'] });
+  it('ends the Run as failed when setup commands fail, keeping the workspace', async () => {
+    h = await harness({ setupCommands: ['echo 依赖装不上 && false'] });
     const run = h.run();
-    const blocked = await h.waitStatus(run.id, 'blocked');
-    expect(blocked.blocked?.kind).toBe('setup_failed');
-
-    writeFile(join(h.repoDir, 'setup-ok'), '1\n');
-    git(h.repoDir, 'add', '-A');
-    git(h.repoDir, 'commit', '-q', '-m', 'add setup-ok');
-    await h.master.engine.retry(run.id);
-    await h.waitStatus(run.id, 'waiting_approval');
+    const failed = await h.waitStatus(run.id, 'failed');
+    expect(failed.blocked).toBeNull();
+    expect(failed.finishedAt).toBeTruthy();
+    expect(failed.error).toBe(
+      '准备命令 `echo 依赖装不上 && false` 失败（退出码 1）。输出末尾：\n```\n依赖装不上\n\n```\nRun 结束，工作目录和分支已保留。',
+    );
+    expect(h.master.store.listEvents(run.id).map((e) => e.type)).not.toContain('run.blocked');
+    expect(h.fake.calls).toEqual([]);
+    // The workspace is kept and on record, like any failed Run's.
+    const base = git(h.repoDir, 'rev-parse', 'main');
+    expect(failed).toMatchObject({ baseCommit: base, headCommit: base });
+    expect(existsSync(failed.worktreePath as string)).toBe(true);
+    expect(git(h.repoDir, 'branch', '--list', failed.branch as string)).not.toBe('');
+    // Nothing waits for a human: the next Run starts.
+    await expect(h.master.engine.retry(run.id)).rejects.toThrow(/blocked/);
+    h.master.store.updateRepo(h.repo.id, { setupCommands: [] });
+    await h.waitStatus(h.run('下一个').id, 'waiting_approval');
   });
 
   it('gives agents and the setup and verify commands no GitHub credentials', async () => {
@@ -1007,6 +1016,140 @@ describe('engine: reworks and rollbacks used up', () => {
       );
       expect(looped.error).toContain('still wrong');
       expect(looped.error).not.toMatch(/[一-鿿]/);
+    });
+  });
+});
+
+describe('engine: Master internal errors', () => {
+  /** Nothing of the Run is left executing: no task running or verifying, no attempt running. */
+  const expectNothingRunning = (runId: string) => {
+    const { store } = (h as Harness).master;
+    for (const task of store.listRunTasks(runId)) {
+      expect(['running', 'verifying']).not.toContain(task.status);
+    }
+    expect(store.listRunAttempts(runId, 'running')).toEqual([]);
+  };
+  /** A coder that writes its work, then finds the worktree's index locked by another git. */
+  const lockingCoder: Script = (ctx) => {
+    writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+    const gitDir = git(ctx.input.workdir, 'rev-parse', '--absolute-git-dir');
+    writeFile(join(gitDir, 'index.lock'), '');
+    return done();
+  };
+
+  it('ends the Run as failed when something throws while the agent runs', async () => {
+    h = await harness();
+    h.scripts.coder = () => {
+      throw new Error('磁盘满了');
+    };
+    const run = h.run();
+    const failed = await h.waitStatus(run.id, 'failed');
+    expect(failed.blocked).toBeNull();
+    expect(failed.finishedAt).toBeTruthy();
+    expect(failed.error).toBe('Master 内部错误：磁盘满了\nRun 结束，工作目录和分支已保留。');
+    const { store } = h.master;
+    expect(store.listEvents(run.id).map((e) => e.type)).not.toContain('run.blocked');
+    expectNothingRunning(run.id);
+    expect(store.listRunTasks(run.id).map((t) => t.status)).toEqual(['cancelled']);
+    const [attempt, ...more] = store.listRunAttempts(run.id);
+    expect(more).toEqual([]);
+    expect(attempt).toMatchObject({ status: 'interrupted', error: 'Master 内部错误：磁盘满了' });
+    expect(attempt?.endedAt).toBeTruthy();
+    // Not taken for an agent error: no retry, no other agent.
+    expect(h.fake.calls.map((c) => c.model)).toEqual(['coder']);
+    expect(existsSync(failed.worktreePath as string)).toBe(true);
+    // Nothing waits for a human: the next Run starts.
+    h.scripts.coder = (ctx) => {
+      writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+      return done();
+    };
+    await h.waitStatus(h.run('下一个').id, 'waiting_approval');
+  });
+
+  it('ends the Run as failed when git fails while the task is checked, keeping the worktree', async () => {
+    h = await harness();
+    h.scripts.coder = lockingCoder;
+    const run = h.run();
+    const failed = await h.waitStatus(run.id, 'failed');
+    expect(failed.error).toMatch(/^Master 内部错误：git add -A 失败：.*index\.lock/);
+    expect(failed.error).toMatch(/\nRun 结束，工作目录和分支已保留。$/);
+    expectNothingRunning(run.id);
+    expect(h.master.store.listRunTasks(run.id).map((t) => t.status)).toEqual(['cancelled']);
+    // The agent itself had finished.
+    expect(h.master.store.listRunAttempts(run.id).map((a) => a.status)).toEqual(['completed']);
+    // The worktree stays as it was, uncommitted work included.
+    const worktree = failed.worktreePath as string;
+    expect(readFileSync(join(worktree, 'feature.txt'), 'utf8')).toBe('ok\n');
+  });
+
+  it('still retries Runs that an internal error or a failed setup blocked before', async () => {
+    h = await harness({ setupCommands: ['test -f setup-ok'] });
+    const { store, engine } = h.master;
+    // A Run blocked on its setup before it ended as failed instead: nothing recorded yet.
+    store.setWorking(false);
+    const setup = h.run('准备');
+    store.updateRun(setup.id, {
+      status: 'blocked',
+      queuePos: null,
+      blocked: { kind: 'setup_failed', message: '准备命令失败' },
+    });
+    store.setWorking(true);
+    writeFile(join(h.repoDir, 'setup-ok'), '1\n');
+    git(h.repoDir, 'add', '-A');
+    git(h.repoDir, 'commit', '-q', '-m', 'add setup-ok');
+    await engine.retry(setup.id);
+    await h.waitStatus(setup.id, 'waiting_approval');
+    await engine.cancel(setup.id);
+
+    // A Run blocked on an internal error in the middle of its task, its half-done work left in
+    // the worktree: the retry starts the task over from its base.
+    const calls = h.fake.calls.length;
+    h.scripts.coder = () => new Promise<FakeOutcome>(() => {});
+    const error = h.run('内部错误');
+    await waitFor(() => h?.fake.calls.length === calls + 1, 'the coder of the second Run');
+    await engine.pause(error.id);
+    const worktree = store.getRun(error.id).worktreePath as string;
+    writeFile(join(worktree, 'half-done.txt'), 'x\n');
+    const [task] = store.listRunTasks(error.id);
+    store.updateRun(error.id, {
+      status: 'blocked',
+      blocked: { kind: 'error', message: 'Master 内部错误：磁盘满了', taskId: task?.id },
+    });
+    let leftOver: boolean | undefined;
+    h.scripts.coder = (ctx) => {
+      leftOver = existsSync(join(ctx.input.workdir, 'half-done.txt'));
+      writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+      return done();
+    };
+    await engine.retry(error.id);
+    await h.waitStatus(error.id, 'waiting_approval');
+    expect(leftOver).toBe(false);
+  });
+
+  describe('in English', () => {
+    afterEach(() => setLang('zh'));
+
+    it('says "Master internal error" without Chinese', async () => {
+      h = await harness({ config: 'language: en\n' });
+      // Not a git error: git's own messages follow the system's locale.
+      h.scripts.coder = () => {
+        throw new Error('disk full');
+      };
+      const run = h.run('Add feature.txt');
+      const failed = await h.waitStatus(run.id, 'failed');
+      expect(failed.error).toBe(
+        'Master internal error: disk full\nThe Run ended; the working directory and branch are kept.',
+      );
+      expect(h.master.store.listRunAttempts(run.id)[0]?.error).toBe(
+        'Master internal error: disk full',
+      );
+      expectNothingRunning(run.id);
+
+      h.master.store.updateRepo(h.repo.id, { setupCommands: ['echo no registry && false'] });
+      const setup = await h.waitStatus(h.run('Add feature.txt').id, 'failed');
+      expect(setup.error).toBe(
+        'Setup command `echo no registry && false` failed (exit code 1). End of the output:\n```\nno registry\n\n```\nThe Run ended; the working directory and branch are kept.',
+      );
     });
   });
 });

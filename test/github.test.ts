@@ -1825,6 +1825,70 @@ stages:
     expect(runsOf(t)).toHaveLength(2);
   });
 
+  it('redoes a Run that failed on its setup commands or a Master internal error', async () => {
+    const t = await start(config(), REDO_WORKFLOW);
+    t.master.store.updateRepo(t.repo.id, {
+      setupCommands: ['test -f setup-ok || { echo 缺少 setup-ok; exit 1; }'],
+    });
+    t.scripts.assessor = () => assessment('go');
+    let coded = 0;
+    t.scripts.coder = (ctx) => {
+      coded++;
+      if (coded === 1) throw new Error('磁盘满了');
+      writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+      return done('写了 feature.txt');
+    };
+    gh.add({ title: '加 feature', body: '写 feature.txt', labels: [LABELS.ready] });
+    await t.master.issues.poll();
+
+    // The setup commands fail: the Run fails instead of waiting for a human, and is redone.
+    const first = nth(t, 0);
+    const setupFailed = await t.waitStatus(first.id, 'failed');
+    expect(setupFailed.blocked).toBeNull();
+    expect(setupFailed.error).toContain('准备命令 `test -f setup-ok');
+    expect(setupFailed.error).toContain('缺少 setup-ok');
+    writeFile(join(t.repoDir, 'setup-ok'), '1\n');
+    git(t.repoDir, 'add', '-A');
+    git(t.repoDir, 'commit', '-q', '-m', 'add setup-ok');
+    await t.master.issues.sync();
+    expect(gh.get(1).comments.find((c) => c.includes('Run 失败了'))).toContain('第 1/3 次尝试');
+    expect(gh.get(1).labels).toEqual([LABELS.running]);
+    const second = nth(t, 1);
+    expect(second.issue?.attempt).toBe(2);
+    expect(second.issue?.earlier).toEqual([
+      { runId: first.id, attempt: 1, stage: null, error: expect.stringContaining('缺少 setup-ok') },
+    ]);
+
+    // A Master internal error while coding: failed and redone the same way.
+    const internal = await t.waitStatus(second.id, 'failed');
+    expect(internal.blocked).toBeNull();
+    expect(internal.error).toMatch(/^Master 内部错误：磁盘满了\n/);
+    await t.master.issues.sync();
+    const third = nth(t, 2);
+    expect(third.issue?.attempt).toBe(3);
+    expect(third.issue?.earlier?.[1]).toEqual({
+      runId: second.id,
+      attempt: 2,
+      stage: '编码',
+      error: expect.stringMatching(/^Master 内部错误：磁盘满了/),
+    });
+
+    // The new Runs' agents read why the earlier ones failed.
+    await t.waitStatus(third.id, 'completed');
+    const assessed = callsOf(t, 'assessor').map((c) => c.prompt);
+    expect(assessed).toHaveLength(2);
+    expect(assessed[0]).toContain(`### 第 1 次（Run ${first.id}）\n\n准备命令 \`test -f setup-ok`);
+    expect(assessed[1]).toContain('缺少 setup-ok');
+    expect(assessed[1]).toContain(`### 第 2 次（Run ${second.id}，失败在「编码」阶段）`);
+    expect(assessed[1]).toContain('Master 内部错误：磁盘满了');
+    const coded3 = callsOf(t, 'coder')[1]?.prompt;
+    expect(coded3).toContain('## 之前的尝试');
+    expect(coded3).toContain('缺少 setup-ok');
+    expect(coded3).toContain('Master 内部错误：磁盘满了');
+    await t.master.issues.sync();
+    expect(gh.get(1)).toMatchObject({ state: 'closed', stateReason: 'completed' });
+  });
+
   it('waits for the next day when the automatic spending is at its limit, costing no attempt', async () => {
     const t = await startRedo(config({ budget: 1 }), [1]);
     const spent = spendToday(t);

@@ -1064,16 +1064,46 @@ export class Engine {
       if (signal.aborted || err instanceof Aborted) return;
       const current = this.store.getRun(runId);
       if (current.status !== 'running') return;
-      const inFlight = this.store.listRunTasks(runId).find((t) => IN_FLIGHT_TASK.has(t.status));
-      this.block(runId, {
-        kind: 'error',
-        message: t({
-          zh: `Master 内部错误：${errorMessage(err)}`,
-          en: `Master internal error: ${errorMessage(err)}`,
-        }),
-        taskId: inFlight?.id,
-      });
+      await this.internalError(runId, err, signal);
     }
+  }
+
+  /**
+   * Something failed inside the Master while it drove the Run (a git lock, a full disk, a command
+   * that could not start). That is mostly passing or due to the environment, so the Run ends as
+   * failed instead of waiting for a human: a Run from an issue is redone in a fresh worktree, and
+   * once its attempts are used up the issue is closed with the reasons. Whatever was executing is
+   * ended first, so that no task or attempt is left running; the worktree is kept as it is, for
+   * inspection.
+   */
+  private async internalError(runId: string, err: unknown, signal: AbortSignal): Promise<void> {
+    const reason = errorMessage(err).trim();
+    const what = t({ zh: `Master 内部错误：${reason}`, en: `Master internal error: ${reason}` });
+    const running = this.store.listRunAttempts(runId, 'running');
+    for (const attempt of running) {
+      // The error may have come while the agent was still running.
+      await this.killOrphan(attempt).catch(() => {});
+    }
+    this.store.tx(() => {
+      for (const attempt of running) {
+        this.store.updateAttempt(attempt.id, {
+          status: 'interrupted',
+          error: what,
+          endedAt: nowIso(),
+        });
+      }
+      // Paused or cancelled while the agent was being stopped: that takes the Run over.
+      const run = this.store.getRun(runId);
+      if (signal.aborted || run.status !== 'running') return;
+      // Before the setup commands pass, the Run has no worktree recorded to speak of.
+      const kept = run.worktreePath
+        ? t({
+            zh: '\nRun 结束，工作目录和分支已保留。',
+            en: '\nThe Run ended; the working directory and branch are kept.',
+          })
+        : t({ zh: '\nRun 结束。', en: '\nThe Run ended.' });
+      this.failRun(runId, what + kept);
+    });
   }
 
   private checkAbort(signal: AbortSignal): void {
@@ -1137,7 +1167,24 @@ export class Engine {
       }
       const failed = results.find((r) => !r.passed);
       if (failed) {
-        this.block(run.id, { kind: 'setup_failed', message: formatCommandFailure(failed) });
+        // Mostly passing or due to the environment (a registry down, a flaky install): end the
+        // Run instead of waiting for a human, so that a Run from an issue is redone in a fresh
+        // worktree. The workspace is recorded to be kept and shown like any failed Run's.
+        this.store.tx(() => {
+          this.store.updateRun(run.id, {
+            branch,
+            worktreePath: path,
+            baseCommit: base,
+            headCommit: base,
+          });
+          this.failRun(
+            run.id,
+            t({
+              zh: `${formatCommandFailure(failed, 'setup')}\nRun 结束，工作目录和分支已保留。`,
+              en: `${formatCommandFailure(failed, 'setup')}\nThe Run ended; the working directory and branch are kept.`,
+            }),
+          );
+        });
         return;
       }
     }

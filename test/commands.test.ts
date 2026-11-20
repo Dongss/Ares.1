@@ -18,6 +18,9 @@ describe('runCommand', () => {
     expect(formatCommandFailure(result)).toBe(
       '检查命令 `echo "CI=$CI NO_COLOR=$NO_COLOR"; exit 3` 未通过（退出码 3）。输出末尾：\n```\nCI=1 NO_COLOR=1\n\n```',
     );
+    expect(formatCommandFailure(result, 'setup')).toBe(
+      '准备命令 `echo "CI=$CI NO_COLOR=$NO_COLOR"; exit 3` 失败（退出码 3）。输出末尾：\n```\nCI=1 NO_COLOR=1\n\n```',
+    );
   });
 
   it('runs every command in the environment it is given: the agent one has no GitHub access', async () => {

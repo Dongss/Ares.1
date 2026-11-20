@@ -83,7 +83,7 @@ stages:
 
 ### Run 失败后自动重做
 
-从 issue 来的 Run 失败后（`failed`，比如 Agent 出错且重试、换 Agent 都用完，返工或回退次数用完，超出预算且配置为终止；不包括被终止的），Master 不等人，自动再开一个 Run 重做。次数上限是 `github.repos.<name>.max_run_attempts`：
+从 issue 来的 Run 失败后（`failed`，比如 Agent 出错且重试、换 Agent 都用完，返工或回退次数用完，超出预算且配置为终止，准备命令失败，Master 内部错误；不包括被终止的），Master 不等人，自动再开一个 Run 重做。次数上限是 `github.repos.<name>.max_run_attempts`：
 
 ```yaml
 github:
@@ -188,10 +188,15 @@ Run 卡住（`blocked`）、已暂停或等审批时会让出执行位，排队�
 - 审批：模板里设了 `gate` 的阶段（从 issue 来的 Run 打开 `auto_merge` 时，合并不等审批）。
 - 需求评估有疑问，等你回复，最多等 `reply_timeout_hours`（到时间评估自己决定，所以这种 Run 算作会自己往下走；设为 `null` 时一直等，算作只等人）；issue 作者不是仓库成员，等你确认需求。
 - 超出预算（`on_budget_exceeded: pause`，默认）。
-- 合并冲突但没有 Agent 阶段能解决（见上面的「合并冲突」）、目标分支有未提交的改动、准备命令失败、工作目录与记录不一致、Agent 不可用、Master 内部错误。
+- 合并冲突但没有 Agent 阶段能解决（见上面的「合并冲突」）、目标分支有未提交的改动、工作目录与记录不一致、Agent 不可用。
 - 配置为等人时：`on_agent_error: human`、`on_exhausted: human`。
 
-Agent 出错且重试、换 Agent 都用完，返工或回退用完，超出预算且配置为 `on_budget_exceeded: abort` 时，Run 不等人，直接结束、标为失败。
+Agent 出错且重试、换 Agent 都用完，返工或回退用完，超出预算且配置为 `on_budget_exceeded: abort`，准备命令失败，Master 内部错误时，Run 不等人，直接结束、标为失败。工作目录和分支保留，Master 接着做别的；从 issue 来的 Run 按 `max_run_attempts` 自动重做（见上面的「Run 失败后自动重做」），重做时失败原因会交给新 Run 的 Agent。
+
+- 准备命令失败：`error` 里写明是哪条准备命令、退出码或超时，以及输出的末尾。准备命令失败多半是偶发的或者和环境有关（依赖源连不上、安装中途出错等），重做时会在新的工作目录里重新运行。
+- Master 内部错误：Master 自己执行 Run 时出了异常（git 锁、磁盘满、命令起不来等）。`error` 以「Master 内部错误：」开头（英文为 `Master internal error:`），后面是原因。正在执行的 Agent 会被结束，这次执行记为中断（`interrupted`），没做完的 Task 标为已取消；工作目录保持出错时的样子，不回滚，方便查看。
+- 这两种情况都没有「卡住等人」的配置：要是原因确实每次都会重现，issue 会把 `max_run_attempts` 次用完，然后关闭并写明每次的原因。
+- 旧版本里因为这两种情况卡住（`blocked`）的 Run 仍然可以在看板上重试：准备命令失败的会重新建工作目录、重新运行准备命令；内部错误的从出错的 Task 开始重做。
 
 ## 稳定副本和自动升级
 

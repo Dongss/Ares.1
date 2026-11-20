@@ -103,11 +103,24 @@ export async function runCommands(
   return results;
 }
 
-export function formatCommandFailure(result: CommandResult): string {
+/**
+ * A failed command and the end of its output, as agents and the dashboard read it: the line
+ * before the output fence always ends in 「输出末尾：」 / "output:".
+ */
+export function formatCommandFailure(
+  result: CommandResult,
+  kind: 'verify' | 'setup' = 'verify',
+): string {
   const why = result.timedOut
     ? t({ zh: '超时', en: 'timed out' })
     : t({ zh: `退出码 ${result.exitCode}`, en: `exit code ${result.exitCode}` });
   const output = `\n\`\`\`\n${result.outputTail}\n\`\`\``;
+  if (kind === 'setup') {
+    return t({
+      zh: `准备命令 \`${result.command}\` 失败（${why}）。输出末尾：${output}`,
+      en: `Setup command \`${result.command}\` failed (${why}). End of the output:${output}`,
+    });
+  }
   return t({
     zh: `检查命令 \`${result.command}\` 未通过（${why}）。输出末尾：${output}`,
     en: `Verify command \`${result.command}\` failed (${why}). End of the output:${output}`,

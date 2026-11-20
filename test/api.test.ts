@@ -606,12 +606,24 @@ agents:
     expect((await listed()).map((i) => i.run.id)).toEqual([running.id]);
   });
 
-  it('lists what a failed setup left behind, and kept workspaces of completed runs', async () => {
-    h = await harness({ setupCommands: ['false'] });
-    const setup = h.run('准备失败');
-    await h.waitStatus(setup.id, 'blocked');
-    // Not finished yet while blocked.
-    expect((await call('GET', '/api/workspaces')).json).toEqual([]);
+  it('lists what a failed or interrupted setup left behind, and kept workspaces of completed runs', async () => {
+    const hh = await harness({ setupCommands: ['false'] });
+    h = hh;
+    // A failed setup ends the Run with its workspace on record.
+    const failed = await h.waitStatus(h.run('准备失败').id, 'failed');
+    expect(failed.worktreePath).not.toBeNull();
+
+    // A setup interrupted by a cancel leaves its workspace behind without a record.
+    h.master.store.updateRepo(h.repo.id, { setupCommands: ['sleep 30'] });
+    const setup = h.run('准备中断');
+    await waitFor(
+      () => hh.master.store.listEvents(setup.id).some((e) => e.type === 'workspace.created'),
+      'workspace created',
+    );
+    // Not finished yet while it runs.
+    expect((await call('GET', '/api/workspaces')).json.map((i: KeptWorkspace) => i.run.id)).toEqual(
+      [failed.id],
+    );
     await call('POST', `/api/runs/${setup.id}/cancel`);
     const event = h.master.store.listEvents(setup.id).find((e) => e.type === 'workspace.created');
     const { path, branch } = (event as EventRow).data as { path: string; branch: string };
@@ -627,7 +639,7 @@ agents:
     git(h.repoDir, 'branch', completed.branch as string, 'main');
 
     const items = (await call('GET', '/api/workspaces')).json as KeptWorkspace[];
-    expect(items.map((i) => i.run.id)).toEqual([finished.id, setup.id]);
+    expect(items.map((i) => i.run.id)).toEqual([finished.id, setup.id, failed.id]);
     expect(items[0]).toMatchObject({
       run: { status: 'completed' },
       worktreeExists: false,
@@ -643,8 +655,18 @@ agents:
       recorded: false,
       canCleanUp: true,
     });
+    expect(items[2]).toMatchObject({
+      run: { id: failed.id, status: 'failed' },
+      workspace: { path: failed.worktreePath, branch: failed.branch },
+      worktreeExists: true,
+      branchExists: true,
+      recorded: true,
+      canCleanUp: true,
+    });
 
-    expect((await call('POST', `/api/runs/${setup.id}/cleanup`)).status).toBe(200);
+    for (const id of [setup.id, failed.id]) {
+      expect((await call('POST', `/api/runs/${id}/cleanup`)).status).toBe(200);
+    }
     expect((await call('GET', '/api/workspaces')).json.map((i: KeptWorkspace) => i.run.id)).toEqual(
       [finished.id],
     );
