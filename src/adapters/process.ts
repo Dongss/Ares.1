@@ -57,12 +57,13 @@ export function runProcess(opts: ProcessOptions): RunningProcess {
   let stderrTail = '';
   let exited = false;
 
+  // Signals the whole group even after the leader has exited: other members may still be there.
   const killGroup = (signal: NodeJS.Signals) => {
-    if (child.pid === undefined || exited) return;
+    if (child.pid === undefined) return;
     try {
       process.kill(-child.pid, signal);
     } catch {
-      // already gone
+      // the group is empty
     }
   };
 
@@ -112,12 +113,17 @@ export function runProcess(opts: ProcessOptions): RunningProcess {
   });
 
   const stop = async (reason: 'stopped' | 'timeout') => {
+    // Once the leader has ended on its own there is nothing to stop.
     if (exited) return;
     stopReason ??= reason;
     killGroup('SIGTERM');
-    const grace = setTimeout(() => killGroup('SIGKILL'), opts.killGraceMs ?? 5000);
+    // The leader may exit on SIGTERM while members that ignore it live on, so the SIGKILL is
+    // not tied to `done`: it goes to whatever is left of the group when the grace period ends.
+    // Unref'd so that it never holds the Master's exit.
+    setTimeout(() => {
+      if (child.pid !== undefined && groupAlive(child.pid)) killGroup('SIGKILL');
+    }, opts.killGraceMs ?? 5000).unref();
     await done;
-    clearTimeout(grace);
   };
 
   const timer = setTimeout(() => void stop('timeout'), opts.timeoutMs);
@@ -150,7 +156,24 @@ export async function isOurProcess(pid: number, expect: string): Promise<boolean
   });
 }
 
-/** SIGTERM a process group, then SIGKILL if it is still there after the grace period. */
+/**
+ * Whether any process is left in the group `pgid`, the leader or any other member. A group id is
+ * not reused while the group has members, so signalling a group that is still there is safe.
+ */
+function groupAlive(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (err) {
+    // EPERM and the like mean the group exists even if we may not signal it.
+    return (err as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+/**
+ * SIGTERM a process group, then SIGKILL whatever is left of it after the grace period. The
+ * whole group is watched, not just the leader: members that ignore SIGTERM outlive it.
+ */
 export async function killProcessGroup(pid: number, graceMs = 5000): Promise<void> {
   const send = (signal: NodeJS.Signals) => {
     try {
@@ -164,11 +187,7 @@ export async function killProcessGroup(pid: number, graceMs = 5000): Promise<voi
   const deadline = Date.now() + graceMs;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 100));
-    try {
-      process.kill(pid, 0);
-    } catch {
-      return;
-    }
+    if (!groupAlive(pid)) return;
   }
   send('SIGKILL');
 }

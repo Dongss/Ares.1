@@ -246,12 +246,27 @@ describe('runProcess', () => {
     await proc.stop();
   });
 
-  // Known defect: once the leader has exited, `exited` is true and the SIGKILL after the grace
-  // period is skipped, so a group member that ignores SIGTERM and does not hold the stdout pipe
-  // is left running. Reproduce with killGraceMs 300 and
-  // sh -c `(trap '' TERM; exec sleep 30) >/dev/null 2>&1 & echo $! > "$PIDFILE"; sleep 30`:
-  // after stop() the background sleep is still alive.
-  it.todo('stop() SIGKILLs group members that ignore SIGTERM after the leader has exited');
+  it('stop() SIGKILLs group members that ignore SIGTERM after the leader has exited', async () => {
+    const killGraceMs = 300;
+    // The member does not hold the stdout pipe, so the leader's close comes as soon as it exits.
+    const { proc, pidFile } = sh(
+      `(trap '' TERM; exec sleep 30) >/dev/null 2>&1 & echo $! > "$PIDFILE"; sleep 30`,
+      { killGraceMs },
+    );
+    const member = await readPid(pidFile);
+    expect(alive(member)).toBe(true);
+
+    const started = Date.now();
+    await proc.stop();
+    const elapsed = Date.now() - started;
+    const outcome = await proc.done;
+
+    // The leader ends on SIGTERM and `done` does not wait for the member.
+    expect(outcome).toMatchObject({ exitCode: null, signal: 'SIGTERM', ended: 'stopped' });
+    expect(elapsed).toBeLessThan(killGraceMs + 2000);
+    expect(alive(pidOf(proc))).toBe(false);
+    expect(await gone(member)).toBe(true);
+  });
 });
 
 describe('isOurProcess', () => {
@@ -309,10 +324,17 @@ describe('killProcessGroup', () => {
     expect(Date.now() - started).toBeLessThan(1000);
   });
 
-  // Known defect: only the leader's pid is polled, so when the leader dies of SIGTERM the
-  // function returns without SIGKILL and a group member that ignores SIGTERM is left running.
-  // Reproduce with killProcessGroup(pid, 300) on
-  // sh -c `(trap '' TERM; exec sleep 30) & echo $! > "$PIDFILE"; sleep 30`:
-  // afterwards the background sleep is still alive.
-  it.todo('SIGKILLs group members that ignore SIGTERM after the leader has exited');
+  it('SIGKILLs group members that ignore SIGTERM after the leader has exited', async () => {
+    const graceMs = 300;
+    const { pid, pidFile } = detachedSh(
+      `(trap '' TERM; exec sleep 30) & echo $! > "$PIDFILE"; sleep 30`,
+    );
+    const member = await readPid(pidFile);
+    expect(alive(member)).toBe(true);
+
+    await killProcessGroup(pid, graceMs);
+
+    expect(await gone(pid)).toBe(true);
+    expect(await gone(member)).toBe(true);
+  });
 });
