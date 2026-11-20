@@ -70,6 +70,7 @@ src/
     bridge.ts         polling, Runs from issues, progress on issues, auto-accept, push, auto-scout
     issues.ts         labels, issue texts (assessment questions and conclusions, hidden comment
                       markers), Run status ↔ issue (pure functions)
+    redact.ts         text before it is published on GitHub: the user's home directory → ~
     scout.ts          the AI scout's prompt, output format and Run summary
   notify/
     notice.ts         which events notify people (shared by system notifications and dashboard)
@@ -130,6 +131,7 @@ test/
   - how a Run's time is split, and the names and groups of the parts: `src/engine/times.ts`
   - the display name and slogan: `brandName()` / `brandSlogan()` / `brandTitle()` in `src/brand.ts`. Never write them as literals elsewhere. The exception is the `<title>` of `web/index.html`, a static file that keeps the Chinese title; a test keeps the two in sync.
 - Every comment the Master posts on an issue goes through `markComment` (`src/github/issues.ts`), which adds the hidden marker that tells it apart from human replies.
+- Every text the Master publishes on GitHub goes through `redactForGitHub` (`src/github/redact.ts`), which turns paths under the user's home directory into `~` so the system user name stays private: comments (in the bridge's `comment()`), the issues it creates, and the commit messages it makes (they may be pushed). Store the original text: the dashboard and logs keep the full paths.
 - Anybody can write on a public repo. Text read from GitHub (issues, comments) goes into an agent's prompt only when `isTrusted` (`src/github/issues.ts`) trusts its author: the repo's owner, members and collaborators, and the account the Master acts as. A Run from an issue by anyone else waits for a human to confirm its goal (`untrusted_issue`).
 - Agents and the commands run on their work (setup and verify commands) get no GitHub credentials, so they cannot read untrusted comments themselves or act as the accounts logged in on the machine. Start them only with `prepareAgentEnv` (`src/adapters/process.ts`), the one place that defines their environment; the Master's own GitHub and git calls keep the credentials.
 - No natively compiled dependencies (e.g. better-sqlite3): keep `npm install` simple.

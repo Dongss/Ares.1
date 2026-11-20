@@ -55,6 +55,7 @@ import {
   untrustedGoalMessage,
   withStatusLabel,
 } from './issues.js';
+import { redactForGitHub } from './redact.js';
 import {
   filedProposal,
   issueDigest,
@@ -272,9 +273,12 @@ export class IssueBridge {
     return next;
   }
 
-  /** Every comment of the Master carries the marker that tells it from a human's. */
+  /**
+   * Every comment of the Master carries the marker that tells it from a human's, and leaves out
+   * the user's home directory: it quotes error output and agents' words, which carry local paths.
+   */
   private comment(repo: string, number: number, body: string): Promise<void> {
-    return this.gh().comment(repo, number, markComment(body));
+    return this.gh().comment(repo, number, markComment(redactForGitHub(body)));
   }
 
   private report(err: unknown): void {
@@ -1169,9 +1173,10 @@ export class IssueBridge {
       const labels: string[] = [LABELS.proposal];
       if (auto) labels.push(LABELS.ready, LABELS.auto);
       try {
+        // The scout wrote them in a worktree under the user's home directory.
         const issue = await this.gh().createIssue(scout.issuesRepo, {
-          title: p.title,
-          body: proposalBody(p, scout.id, auto),
+          title: redactForGitHub(p.title),
+          body: redactForGitHub(proposalBody(p, scout.id, auto)),
           labels,
         });
         p.issue = { ...issue, auto };

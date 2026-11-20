@@ -27,6 +27,7 @@ import {
   rollbackTarget,
   stageVerifyCommands,
 } from '../config/schema.js';
+import { redactForGitHub } from '../github/redact.js';
 import { join as joinList, t } from '../i18n.js';
 import { ConflictError, NotFoundError, type Store } from '../store/store.js';
 import {
@@ -2302,7 +2303,11 @@ export class Engine {
 
     let synced = false;
     if (!(await isAncestor(workdir, targetHead, head))) {
-      const merged = await mergeOrAbort(workdir, targetHead, `Merge ${target} into ${run.branch}`);
+      const merged = await mergeOrAbort(
+        workdir,
+        targetHead,
+        redactForGitHub(`Merge ${target} into ${run.branch}`),
+      );
       this.checkAbort(signal);
       if (!merged.ok) {
         this.mergeConflict(run, sr, workdir, target, targetHead, merged);
@@ -2635,6 +2640,8 @@ export function estimateCost(agent: AgentConfig, usage: AgentResult['usage']): n
 /**
  * Commit message for an accepted task: rounds after the first are marked in the title so
  * repeated rounds of one stage can be told apart; the Agent line records model and effort.
+ * Commits may be pushed to GitHub, so the user's home directory is left out of the goal and the
+ * agent's summary, which often name files by their absolute paths in the worktree.
  */
 export function commitMessage(input: {
   stageName: string;
@@ -2645,7 +2652,8 @@ export function commitMessage(input: {
   agent: Pick<AgentConfig, 'id' | 'cli'>;
   attempt: Pick<Attempt, 'model' | 'actualModel' | 'effort'>;
 }): string {
-  const goalLine = input.goal.split('\n')[0]?.slice(0, 60) ?? '';
+  // Before the cut, which could otherwise leave part of the home directory.
+  const goalLine = redactForGitHub(input.goal).split('\n')[0]?.slice(0, 60) ?? '';
   const stage =
     input.round > 1
       ? t({
@@ -2656,7 +2664,9 @@ export function commitMessage(input: {
   const { agent, attempt } = input;
   const model = attempt.actualModel ?? attempt.model ?? t({ zh: '未知', en: 'unknown' });
   const effort = attempt.effort ?? t({ zh: '默认', en: 'default' });
-  return `${stage}: ${goalLine}\n\n${input.summary}\n\nRun: ${input.runId}\nAgent: ${agent.id} (${agent.cli}, model: ${model}, effort: ${effort})\n`;
+  return redactForGitHub(
+    `${stage}: ${goalLine}\n\n${input.summary}\n\nRun: ${input.runId}\nAgent: ${agent.id} (${agent.cli}, model: ${model}, effort: ${effort})\n`,
+  );
 }
 
 export { ConflictError, NotFoundError };

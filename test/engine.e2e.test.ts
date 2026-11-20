@@ -1,4 +1,5 @@
 import { existsSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { FakeAdapter, type FakeContext, type FakeOutcome } from '../src/adapters/fake.js';
@@ -276,6 +277,23 @@ agents:
     const body = git(waiting.worktreePath as string, 'log', '-1', '--format=%b');
     expect(body).toContain(`Run: ${run.id}`);
     expect(body).toContain('Agent: coder (fake, model: fake-coder-1, effort: high)');
+  });
+
+  it('leaves the home directory out of the commit message, which may be pushed', async () => {
+    h = await harness();
+    const file = join(homedir(), '.ares1', 'worktrees', 'run-x', 'feature.txt');
+    h.scripts.coder = (ctx) => {
+      writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+      return done(`写了 ${file}`);
+    };
+    const run = h.run(`改 ${file}`);
+    const waiting = await h.waitStatus(run.id, 'waiting_approval');
+    const message = git(waiting.worktreePath as string, 'log', '-1', '--format=%B');
+    expect(message).toContain('改 ~/.ares1/worktrees/run-x/feature.txt');
+    expect(message).toContain('写了 ~/.ares1/worktrees/run-x/feature.txt');
+    expect(message).not.toContain(homedir());
+    // The Run itself keeps the goal as it was given.
+    expect(waiting.goal).toBe(`改 ${file}`);
   });
 
   it('a rejected merge approval sends the comment back to implement', async () => {

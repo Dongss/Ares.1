@@ -1,3 +1,5 @@
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { StageDef } from '../src/config/schema.js';
 import { formatFeedback, formatReviewIssues, resultProblem } from '../src/engine/contracts.js';
@@ -254,6 +256,18 @@ describe('commitMessage', () => {
       attempt: { model: 'opus', actualModel: null, effort: null },
     });
     expect(msg).toContain('Agent: claude-coder (claude-code, model: opus, effort: 默认)');
+  });
+
+  it('leaves the home directory out of the goal and the summary', () => {
+    const dir = join(homedir(), '.ares1', 'worktrees', 'run-1');
+    const msg = commitMessage({ ...base, goal: `修 ${dir}/a.ts`, summary: `改了 ${dir}/a.ts。` });
+    expect(msg).toContain(
+      '修 ~/.ares1/worktrees/run-1/a.ts\n\n改了 ~/.ares1/worktrees/run-1/a.ts。',
+    );
+    expect(msg).not.toContain(homedir());
+    // The title is cut after the home directory is gone, never in the middle of it.
+    const long = commitMessage({ ...base, goal: `${'x'.repeat(55)} ${homedir()}/a` });
+    expect(long.split('\n')[0]).toBe(`编码: ${'x'.repeat(55)} ~/a`);
   });
 });
 

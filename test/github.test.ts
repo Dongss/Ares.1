@@ -1,8 +1,10 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { AGENT_GH_TOKEN } from '../src/adapters/process.js';
+import type { RunDetail } from '../src/api/types.js';
 import { acceptSplit, isAutoAcceptable, type ProposalKind } from '../src/config/flow.js';
 import { githubConfigKey } from '../src/config/load.js';
 import type { GhComment, GhIssue } from '../src/github/client.js';
@@ -235,6 +237,47 @@ describe('issues: from ready issue to closed issue', () => {
     expect(t.master.store.listRuns()).toHaveLength(1);
   });
 
+  it('leaves the home directory out of its comments; the dashboard keeps the full paths', async () => {
+    const t = await start(
+      config(),
+      `
+id: dev
+name: 测试流程
+defaults:
+  escalate:
+    max_retries: 0
+    on_agent_error: human
+stages:
+  - id: implement
+    name: 编码
+    kind: agent
+    agent: coder
+  - id: merge
+    name: 合并
+    kind: merge
+`,
+    );
+    const file = join(homedir(), '.ares1', 'worktrees', 'run-x', 'src', 'a.ts');
+    t.scripts.coder = () => ({ status: 'failed', error: `ENOENT: no such file, open '${file}'` });
+    gh.add({ title: '加 feature', labels: [LABELS.ready] });
+    await t.master.issues.poll();
+    const run = t.master.store.listRuns()[0] as Run;
+    await t.waitStatus(run.id, 'blocked');
+    await waitFor(
+      () => gh.get(1).comments.some((c) => c.includes('Run 卡住了')),
+      'comment on the stuck Run',
+    );
+
+    const stuck = gh.get(1).comments.find((c) => c.includes('Run 卡住了')) ?? '';
+    expect(stuck).toContain("open '~/.ares1/worktrees/run-x/src/a.ts'");
+    expect(gh.get(1).comments.join('\n')).not.toContain(homedir());
+    expect(isMasterComment(stuck)).toBe(true);
+
+    const res = await t.master.app.request(`/api/runs/${run.id}`);
+    const detail = (await res.json()) as RunDetail;
+    expect(detail.run.blocked?.message).toContain(`open '${file}'`);
+  });
+
   it('does not start a second Run while one is unfinished; a cancelled one waits for ares1:ready', async () => {
     const t = await start();
     const coder = t.scripts.coder as NonNullable<typeof t.scripts.coder>;
@@ -402,6 +445,31 @@ describe('issues: scout', () => {
     const status = t.master.issues.status().repos[0];
     expect(status?.autoAccept).toEqual({ maxRisk: 'low', maxPerDay: 1, usedToday: 1 });
     expect(status?.budget.spentToday).toBeGreaterThanOrEqual(1.5);
+  });
+
+  it('leaves the home directory out of the issues it files', async () => {
+    const t = await start();
+    const dir = join(homedir(), '.ares1', 'worktrees', 'scouts', 'x');
+    t.scripts.scout = () => ({
+      structured: {
+        proposals: [
+          {
+            ...proposal(`修 ${dir}/a.ts 的报错`, 'high'),
+            evidence: [`${dir}/logs/run.log 里有 3 次 ENOENT`],
+          },
+        ],
+      },
+    });
+
+    const scout = await t.master.issues.startScout('demo', 'manual');
+    const finished = await scoutDone(t, scout.id);
+    const filed = finished.proposals[0];
+    const issue = gh.get(filed?.issue?.number ?? 0);
+    expect(issue.title).toBe('修 ~/.ares1/worktrees/scouts/x/a.ts 的报错');
+    expect(issue.body).toContain('~/.ares1/worktrees/scouts/x/logs/run.log 里有 3 次 ENOENT');
+    expect(`${issue.title}\n${issue.body}`).not.toContain(homedir());
+    // The dashboard shows the proposal as the scout wrote it.
+    expect(filed?.title).toBe(`修 ${dir}/a.ts 的报错`);
   });
 
   it("keeps issues and comments by people it does not trust out of the scout's prompt", async () => {
