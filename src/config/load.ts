@@ -9,6 +9,7 @@ import {
   type AgentEntry,
   AgentSchema,
   AgentsFileSchema,
+  type Escalate,
   type MasterConfig,
   MasterConfigSchema,
   type SourceFile,
@@ -346,11 +347,27 @@ function formatZod(error: z.ZodError): string[] {
   return error.issues.map((i) => `${i.path.join('.') || root}: ${i.message}`);
 }
 
-function waitForHumanWarning(): string {
-  return t({
-    zh: 'on_agent_error: human：Agent 出错时自动重试 max_retries 次后，Run 会卡住等人处理，没人在场时就停在那里。建议改成 switch_agent：重试用完后换另一个 Agent 再试，都不行就结束 Run、标为失败',
-    en: 'on_agent_error: human: when an agent errors, the Run is retried max_retries times and then waits for a human, stuck while nobody is around. Better use switch_agent: once the retries are used up another agent tries, and if none succeeds the Run ends as failed',
-  });
+/** The escalate options whose `human` choice makes a Run wait for a human. */
+const WAITING_OPTIONS = ['on_agent_error', 'on_exhausted'] as const;
+
+/** Escalate options of `escalate` set to `human`, in WAITING_OPTIONS order. */
+function waitsForHuman(escalate: Escalate | undefined): (typeof WAITING_OPTIONS)[number][] {
+  return WAITING_OPTIONS.filter((option) => escalate?.[option] === 'human');
+}
+
+function waitForHumanWarning(option: (typeof WAITING_OPTIONS)[number]): string {
+  switch (option) {
+    case 'on_agent_error':
+      return t({
+        zh: 'on_agent_error: human：Agent 出错时自动重试 max_retries 次后，Run 会卡住等人处理，没人在场时就停在那里。建议改成 switch_agent：重试用完后换另一个 Agent 再试，都不行就结束 Run、标为失败',
+        en: 'on_agent_error: human: when an agent errors, the Run is retried max_retries times and then waits for a human, stuck while nobody is around. Better use switch_agent: once the retries are used up another agent tries, and if none succeeds the Run ends as failed',
+      });
+    case 'on_exhausted':
+      return t({
+        zh: 'on_exhausted: human：返工 max_retries 次后仍未通过，或回退超过 max_loops 时，Run 会卡住等人处理，没人在场时就停在那里。建议改成 fail：结束 Run、标为失败，从 issue 来的 Run 会带着失败原因自动重做',
+        en: 'on_exhausted: human: when a task still fails after max_retries reworks, or the stages roll back more than max_loops times, the Run waits for a human, stuck while nobody is around. Better use fail: the Run ends as failed, and a Run from an issue is redone with the reason it failed',
+      });
+  }
 }
 
 /**
@@ -539,16 +556,17 @@ export function validateTemplate(
 
   // "human" is a valid choice, but a Run waiting for a human stops the system while nobody is
   // around. Only a warning: templates already installed (self-dev used to say human) stay usable.
-  if (tpl.defaults?.escalate?.on_agent_error === 'human') {
-    warnings.push(`defaults.escalate${t({ zh: '：', en: ': ' })}${waitForHumanWarning()}`);
+  for (const option of waitsForHuman(tpl.defaults?.escalate)) {
+    warnings.push(`defaults.escalate${t({ zh: '：', en: ': ' })}${waitForHumanWarning(option)}`);
   }
   for (const s of tpl.stages) {
-    if (s.kind === 'merge' || s.kind === 'placeholder') continue; // no agent runs there
-    if (s.escalate?.on_agent_error === 'human') {
+    // No agent runs there, so nothing errors or is reworked; their rollbacks follow the defaults.
+    if (s.kind === 'merge' || s.kind === 'placeholder') continue;
+    for (const option of waitsForHuman(s.escalate)) {
       warnings.push(
         t({
-          zh: `阶段 ${s.id}：${waitForHumanWarning()}`,
-          en: `Stage ${s.id}: ${waitForHumanWarning()}`,
+          zh: `阶段 ${s.id}：${waitForHumanWarning(option)}`,
+          en: `Stage ${s.id}: ${waitForHumanWarning(option)}`,
         }),
       );
     }

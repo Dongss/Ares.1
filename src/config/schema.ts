@@ -154,6 +154,11 @@ export const EscalateSchema = z.strictObject({
   max_retries: z.number().int().min(0).optional(),
   on_agent_error: z.enum(['retry', 'switch_agent', 'human']).optional(),
   on_budget_exceeded: z.enum(['pause', 'abort']).optional(),
+  /**
+   * When a task still fails after max_retries reworks, or a stage rolls back past max_loops:
+   * `fail` ends the Run as failed (a Run from an issue is redone); `human` waits for a human.
+   */
+  on_exhausted: z.enum(['fail', 'human']).optional(),
 });
 export type Escalate = z.infer<typeof EscalateSchema>;
 
@@ -278,6 +283,7 @@ export {
   effectiveMaxLoops,
   effectiveStage,
   failTarget,
+  loopsExhausted,
   replyTimeoutHours,
   rollbackTarget,
   SYSTEM_DEFAULTS,

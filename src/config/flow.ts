@@ -55,6 +55,9 @@ export const SYSTEM_DEFAULTS = {
     // Nobody has to be there: retry, then another agent, then the Run ends as failed.
     on_agent_error: 'switch_agent',
     on_budget_exceeded: 'pause',
+    // Out of reworks or rollbacks: the Run ends as failed, so an issue is redone with the reason
+    // and nothing waits for a human.
+    on_exhausted: 'fail',
   } satisfies Required<Escalate>,
   max_loops: 3,
   /** How long an assess stage waits for a reply to its questions when it does not say. */
@@ -97,6 +100,15 @@ export function effectiveStage(
 
 export function effectiveMaxLoops(template: WorkflowTemplate, overrides: RunOverrides): number {
   return overrides.max_loops ?? template.defaults?.max_loops ?? SYSTEM_DEFAULTS.max_loops;
+}
+
+/**
+ * What happens when a Run rolls back past max_loops: the template's `defaults.escalate.
+ * on_exhausted`, else the system default. A rollback belongs to no single stage, so stage
+ * settings do not apply, just as max_loops itself is set for the whole Run.
+ */
+export function loopsExhausted(template: WorkflowTemplate): Required<Escalate>['on_exhausted'] {
+  return template.defaults?.escalate?.on_exhausted ?? SYSTEM_DEFAULTS.escalate.on_exhausted;
 }
 
 /**
@@ -236,7 +248,8 @@ export function rollbackTarget(
  * - assess stage → null: doubts about the requirement are discussed with a human and the stage
  *   assesses again with the replies; it ends with going ahead or dropping the Run, never fails.
  * - agent stage → null: a task that fails its checks is reworked within the stage
- *   (`rework`, up to `max_retries`, then a human is needed); the stage itself never fails.
+ *   (`rework`, up to `max_retries`, then the Run fails or waits for a human by `on_exhausted`);
+ *   the stage itself never fails.
  * - review / merge stage → the stage is marked failed and `rollback` goes to
  *   `rollbackTarget(…, 'fail')`, i.e. `on_fail` or the nearest earlier agent stage.
  *   (A merge stage only fails when its verify commands fail after syncing the target branch.)

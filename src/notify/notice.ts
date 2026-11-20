@@ -78,21 +78,21 @@ export const NOTICE_KINDS: Record<NoticeKind, { label: string; when: string }> =
   blocked: {
     zh: {
       label: 'Run 卡住了',
-      when: 'Run 停下来等你处理，标题后面写着原因，例如返工次数用完仍未通过、合并冲突、超出预算',
+      when: 'Run 停下来等你处理，标题后面写着原因，例如合并冲突、超出预算，或配置为等人（on_exhausted: human）时返工次数用完仍未通过',
     },
     en: {
       label: 'Run is stuck',
-      when: 'A Run stopped and waits for you, with the reason after the title, e.g. still failing after all retries, a merge conflict, over budget',
+      when: 'A Run stopped and waits for you, with the reason after the title, e.g. a merge conflict, over budget, or still failing after all retries with on_exhausted: human',
     },
   },
   failed: {
     zh: {
       label: 'Run 失败了',
-      when: 'Run 没做完就结束了，例如超出预算且配置为直接终止（on_budget_exceeded: abort）；你自己终止的不通知',
+      when: 'Run 没做完就结束了，例如返工次数用完仍未通过、阶段回退次数用完（on_exhausted: fail），Agent 出错且重试、换 Agent 都用完，或超出预算且配置为直接终止（on_budget_exceeded: abort）；你自己终止的不通知',
     },
     en: {
       label: 'Run failed',
-      when: 'A Run ended unfinished, e.g. over budget with on_budget_exceeded: abort; Runs you cancel yourself are not notified',
+      when: 'A Run ended unfinished, e.g. still failing after all retries or past the stage loop limit (on_exhausted: fail), an agent error with every retry and agent used up, or over budget with on_budget_exceeded: abort; Runs you cancel yourself are not notified',
     },
   },
   proposals: {

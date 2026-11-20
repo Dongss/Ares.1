@@ -762,8 +762,14 @@ function FaqSection(props: { input: GuideInput; home: string; idle: string[] }) 
         <h3>{t({ zh: 'Run 卡住了怎么办？', en: 'What if a Run is blocked?' })}</h3>
         <p>
           {t({
-            zh: `打开 Run 详情看原因和具体问题，可能是：${join(Object.values(BLOCK_KIND))}。处理方式：`,
-            en: `Open the Run to see the reason and the details; it can be: ${join(Object.values(BLOCK_KIND))}. What to do:`,
+            zh: `打开 Run 详情看原因和具体问题，可能是：${join(Object.values(BLOCK_KIND))}。`,
+            en: `Open the Run to see the reason and the details; it can be: ${join(Object.values(BLOCK_KIND))}.`,
+          })}
+        </p>
+        <p>
+          {t({
+            zh: `其中「${BLOCK_KIND.task_failed}」和「${BLOCK_KIND.max_loops}」只在模板配置 on_exhausted: human 时卡住等人；默认（on_exhausted: fail）Run 直接结束、标为失败，从 issue 来的会带着失败原因自动重做，不挡后面的工作。Agent 出错也一样，只在 on_agent_error: human 时卡住。处理方式：`,
+            en: `Of these, "${BLOCK_KIND.task_failed}" and "${BLOCK_KIND.max_loops}" wait for a human only when the template sets on_exhausted: human; by default (on_exhausted: fail) the Run ends as failed, and a Run from an issue is redone with the reason it failed, holding nothing up. Agent errors likewise wait only with on_agent_error: human. What to do:`,
           })}
         </p>
         <ul className="guide-list">

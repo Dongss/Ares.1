@@ -41,6 +41,7 @@ import {
   type Harness,
   harness,
   OWNER,
+  review,
   type Script,
   STRANGER,
   waitFor,
@@ -1593,6 +1594,70 @@ stages:
     expect(prompt).toContain('「多次失败后关闭」的 issue 不一样：它不是人拒绝的');
     expect(prompt).toContain(`- ${second.id}（失败，`);
     expect(prompt).toContain('，第 2 次尝试）#1 加 feature');
+  });
+
+  it('redoes a Run that failed after its reworks or rollbacks were used up', async () => {
+    // One rework, no rollback: the first attempt runs out of reworks, the second of rollbacks.
+    const workflow = ASSESS_WORKFLOW_YAML.replace('max_retries: 2', 'max_retries: 1').replace(
+      'max_loops: 3',
+      'max_loops: 0',
+    );
+    const t = await start(config({ maxAttempts: 2 }), workflow);
+    t.scripts.assessor = () => assessment('go');
+    let coded = 0;
+    t.scripts.coder = (ctx) => {
+      coded++;
+      writeFile(join(ctx.input.workdir, 'feature.txt'), coded <= 2 ? 'wrong\n' : 'ok\n');
+      return done();
+    };
+    t.scripts.reviewer = () => review([{ severity: 'must', description: '缺少测试' }]);
+    gh.add({ title: '加 feature', body: '写 feature.txt', labels: [LABELS.ready] });
+    await t.master.issues.poll();
+
+    // Out of reworks: the Run fails instead of waiting for a human, and the issue is redone.
+    const first = nth(t, 0);
+    const failed = await t.waitStatus(first.id, 'failed');
+    expect(failed.blocked).toBeNull();
+    expect(failed.error).toContain(
+      'Task「编码」返工 1 次后仍未通过验收，Run 结束（on_exhausted: fail）',
+    );
+    expect(failed.error).toContain('检查命令 `grep -q ok feature.txt` 未通过');
+    await t.master.issues.sync();
+    const comments = gh.get(1).comments;
+    expect(comments.find((c) => c.includes('Run 失败了'))).toContain('第 1/2 次尝试');
+    expect(gh.get(1).labels).toEqual([LABELS.running]);
+    const second = nth(t, 1);
+    expect(second.issue?.attempt).toBe(2);
+    expect(second.issue?.earlier).toEqual([
+      {
+        runId: first.id,
+        attempt: 1,
+        stage: '编码',
+        error: expect.stringContaining('返工 1 次后仍未通过验收'),
+      },
+    ]);
+
+    // Out of rollbacks: failed too, and with no attempts left the issue is closed.
+    const failedAgain = await t.waitStatus(second.id, 'failed');
+    expect(failedAgain.error).toContain('超过回退上限 0，Run 结束（on_exhausted: fail）');
+    expect(failedAgain.error).toContain('缺少测试');
+    // The second attempt's agents were told why the first one failed.
+    const prompt = callsOf(t, 'coder')[2]?.prompt;
+    expect(prompt).toContain('## 之前的尝试');
+    expect(prompt).toContain('返工 1 次后仍未通过验收');
+    await t.master.issues.sync();
+    const issue = gh.get(1);
+    expect(issue).toMatchObject({ state: 'closed', stateReason: 'not_planned' });
+    expect(issue.labels).toEqual([LABELS.failed]);
+    const last = issue.comments.at(-1) ?? '';
+    expect(last).toContain(
+      '### 失败了 2 次，达到尝试次数上限（`max_run_attempts: 2`），不再自动重做',
+    );
+    expect(last).toContain(`- 第 1 次，Run \`${first.id}\`，在「编码」阶段：`);
+    expect(last).toContain(`- 第 2 次，Run \`${second.id}\`，在「评审」阶段：`);
+    expect(last).toContain('缺少测试');
+    await t.master.issues.poll();
+    expect(runsOf(t)).toHaveLength(2);
   });
 
   it('waits for the next day when the automatic spending is at its limit, costing no attempt', async () => {

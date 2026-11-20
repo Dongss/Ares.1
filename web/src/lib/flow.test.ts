@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { TemplateSchema } from '../../../src/config/schema.js';
 import { setLang } from '../../../src/i18n.js';
 import type { StageRun } from '../../../src/store/types.js';
-import { assessInDoubt, buildFlow, FLOW_STATUS, stageProgress } from './flow.js';
+import { assessInDoubt, buildFlow, FLOW_STATUS, reworkText, stageProgress } from './flow.js';
 
 const template = TemplateSchema.parse({
   id: 'dev',
@@ -80,6 +80,42 @@ describe('buildFlow', () => {
       stages: [{ id: 'code', agent: 'coder' }],
     });
     expect(buildFlow({ template: t, repoVerifyCommands: [], agents })[0]?.maxRetries).toBe(0);
+  });
+
+  it('says what happens once the reworks are used up', () => {
+    // By default the Run fails; a stage or Run override can make it wait for a human.
+    expect(stage('code')?.onExhausted).toBe('fail');
+    const waits = buildFlow({
+      template,
+      overrides: { stages: { code: { escalate: { on_exhausted: 'human' } } } },
+      repoVerifyCommands: [],
+      agents,
+    });
+    expect(waits.map((s) => s.onExhausted)).toEqual(['fail', 'human', 'fail', 'fail']);
+
+    expect(reworkText(3, 'fail')).toBe(
+      '返工，最多 3 次，仍不通过时 Run 结束、标为失败（从 issue 来的会自动重做）',
+    );
+    expect(reworkText(3, 'human')).toBe('返工，最多 3 次，仍不通过时等人处理');
+    expect(reworkText(0, 'fail')).toBe('不返工，Run 直接结束、标为失败（从 issue 来的会自动重做）');
+    expect(reworkText(0, 'human')).toBe('不返工，直接等人处理');
+  });
+
+  it('says what happens once the reworks are used up in English', () => {
+    setLang('en');
+    try {
+      expect(reworkText(1, 'fail')).toBe(
+        'Rework up to 1 time, then the Run ends as failed (a Run from an issue is redone)',
+      );
+      expect(reworkText(2, 'human')).toBe('Rework up to 2 times, then wait for a human');
+      for (const n of [0, 1, 2]) {
+        for (const mode of ['fail', 'human'] as const) {
+          expect(reworkText(n, mode)).not.toMatch(/[一-鿿]/);
+        }
+      }
+    } finally {
+      setLang('zh');
+    }
   });
 
   it('uses the stage verify commands, else the repo default; review runs none', () => {

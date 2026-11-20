@@ -19,6 +19,7 @@ import {
   effectiveMaxLoops,
   effectiveStage,
   failTarget,
+  loopsExhausted,
   type RunOverrides,
   RunOverridesSchema,
   replyTimeoutHours,
@@ -1776,7 +1777,11 @@ export class Engine {
     return { attempt, result };
   }
 
-  /** The attempt did not pass: rework with feedback, or give up after max_retries. */
+  /**
+   * The attempt did not pass: rework with feedback. After max_retries reworks, by
+   * `on_exhausted`: `fail` ends the Run as failed, with the last feedback in its error (a Run from
+   * an issue is redone with it); `human` blocks the Run for a human.
+   */
   private async rework(
     run: Run,
     eff: EffectiveStage,
@@ -1786,16 +1791,39 @@ export class Engine {
   ): Promise<void> {
     const retries = task.retries + 1;
     this.store.updateAttempt(attempt.id, { outcome: 'rework' });
-    if (retries > eff.escalate.max_retries) {
+    const { max_retries: maxRetries, on_exhausted: mode } = eff.escalate;
+    if (retries > maxRetries) {
+      // Like an agent error with nothing left to try: no checkAbort before failing the Run, which
+      // ends either way; a pause or cancel meanwhile finds it finished.
       await this.failTask(run, task, retries, feedback);
-      this.block(run.id, {
-        kind: 'task_failed',
-        message: t({
-          zh: `Task「${task.title}」返工 ${eff.escalate.max_retries} 次后仍未通过验收。最后一次的问题：\n${feedback}`,
-          en: `Task "${task.title}" still does not pass after ${eff.escalate.max_retries} reworks. The last problems:\n${feedback}`,
+      const notPassed =
+        maxRetries > 0
+          ? t({
+              zh: `Task「${task.title}」返工 ${maxRetries} 次后仍未通过验收`,
+              en: `Task "${task.title}" still does not pass after ${reworkTimes(maxRetries)}`,
+            })
+          : t({
+              zh: `Task「${task.title}」未通过验收（max_retries: 0，不返工）`,
+              en: `Task "${task.title}" does not pass (max_retries: 0, no rework)`,
+            });
+      if (mode === 'human') {
+        this.block(run.id, {
+          kind: 'task_failed',
+          message: t({
+            zh: `${notPassed}。最后一次的问题：\n${feedback}`,
+            en: `${notPassed}. The last problems:\n${feedback}`,
+          }),
+          taskId: task.id,
+        });
+        return;
+      }
+      this.failRun(
+        run.id,
+        t({
+          zh: `${notPassed}，Run 结束（on_exhausted: fail），工作目录和分支已保留。最后一次的问题：\n${feedback}`,
+          en: `${notPassed}, so the Run ended (on_exhausted: fail); the working directory and branch are kept. The last problems:\n${feedback}`,
         }),
-        taskId: task.id,
-      });
+      );
       return;
     }
     this.store.updateTask(task.id, { status: 'pending', retries, pendingFeedback: feedback });
@@ -2065,7 +2093,11 @@ export class Engine {
     await this.complete(run);
   }
 
-  /** Go back to on_fail / on_reject, carrying the reason as feedback. */
+  /**
+   * Go back to on_fail / on_reject, carrying the reason as feedback. Past max_loops rounds, by the
+   * template's `on_exhausted` (`loopsExhausted`): `fail` ends the Run as failed, with the last
+   * reason in its error; `human` blocks the Run for a human, whose retry grants one more round.
+   */
   private rollback(run: Run, sr: StageRun): void {
     const def = run.template.stages.find((s) => s.id === sr.stageId);
     const reason = sr.failReason === 'rejected' ? 'reject' : 'fail';
@@ -2074,22 +2106,33 @@ export class Engine {
     const target =
       (reason === 'fail' ? failTarget(run.template, sr.stageId) : null) ??
       rollbackTarget(run.template, sr.stageId, reason);
-    const maxLoops = effectiveMaxLoops(run.template, run.overrides) + run.extraLoops;
-    const rounds = this.store.countStageRounds(run.id, target);
-    if (rounds > maxLoops) {
-      this.block(run.id, {
-        kind: 'max_loops',
-        message: t({
-          zh: `阶段 ${target} 已执行 ${rounds} 轮，超过回退上限 ${maxLoops}。最后一次的原因：\n${sr.failFeedback ?? ''}`,
-          en: `Stage ${target} has run ${rounds} rounds, over the rollback limit of ${maxLoops}. The last reason:\n${sr.failFeedback ?? ''}`,
-        }),
-        stageRunId: sr.id,
-      });
-      return;
-    }
     const stageName = def?.name ?? sr.stageId;
     const rejected = reason === 'reject';
     const why = sr.failFeedback ?? t({ zh: '（没有说明）', en: '(no explanation)' });
+    const maxLoops = effectiveMaxLoops(run.template, run.overrides) + run.extraLoops;
+    const rounds = this.store.countStageRounds(run.id, target);
+    if (rounds > maxLoops) {
+      if (loopsExhausted(run.template) === 'human') {
+        this.block(run.id, {
+          kind: 'max_loops',
+          message: t({
+            zh: `阶段 ${target} 已执行 ${rounds} 轮，超过回退上限 ${maxLoops}。最后一次的原因：\n${sr.failFeedback ?? ''}`,
+            en: `Stage ${target} has run ${rounds} rounds, over the rollback limit of ${maxLoops}. The last reason:\n${sr.failFeedback ?? ''}`,
+          }),
+          stageRunId: sr.id,
+        });
+        return;
+      }
+      const targetName = run.template.stages.find((s) => s.id === target)?.name ?? target;
+      this.failRun(
+        run.id,
+        t({
+          zh: `阶段「${targetName}」已执行 ${rounds} 轮，超过回退上限 ${maxLoops}，Run 结束（on_exhausted: fail），工作目录和分支已保留。最后一次「${stageName}」${rejected ? '审批被驳回' : '没有通过'}：\n${why}`,
+          en: `Stage "${targetName}" has run ${rounds} rounds, over the rollback limit of ${maxLoops}, so the Run ended (on_exhausted: fail); the working directory and branch are kept. The last time, "${stageName}" ${rejected ? 'was rejected at approval' : 'did not pass'}:\n${why}`,
+        }),
+      );
+      return;
+    }
     const feedback = t({
       zh: `「${stageName}」${rejected ? '审批被驳回' : '没有通过'}：\n${why}`,
       en: `"${stageName}" ${rejected ? 'was rejected at approval' : 'did not pass'}:\n${why}`,
@@ -2424,6 +2467,10 @@ export { ConflictError, NotFoundError };
 /** "1 retry", "2 retries": English only, Chinese writes 「n 次」 in place. */
 function retryTimes(n: number): string {
   return n === 1 ? '1 retry' : `${n} retries`;
+}
+
+function reworkTimes(n: number): string {
+  return n === 1 ? '1 rework' : `${n} reworks`;
 }
 
 function unknownAgent(agentId: string): string {

@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { issueRunOverrides, scoutBackoff } from '../src/config/flow.js';
+import { issueRunOverrides, loopsExhausted, scoutBackoff } from '../src/config/flow.js';
 import { ConfigError, homePaths, initHome, loadConfig } from '../src/config/load.js';
 import {
   agentEffort,
@@ -593,6 +593,108 @@ stages:
     expect(effectiveStage(bare, 'a', {}).escalate.on_agent_error).toBe('switch_agent');
   });
 
+  it('does not wait for a human once reworks or rollbacks are used up by default', () => {
+    for (const lang of ['zh', 'en'] as const) {
+      setLang(lang);
+      const paths = home();
+      const cfg = loadConfig(paths, ['claude-code'], ['claude-code']);
+      const selfDev = cfg.templates.get('self-dev') as WorkflowTemplate;
+      expect(selfDev.defaults?.escalate?.on_exhausted).toBe('fail');
+      expect(loopsExhausted(selfDev)).toBe('fail');
+      expect(cfg.warnings['workflows/self-dev.yaml']).toBeUndefined();
+      // The comment says what the other choice does.
+      const source = readFileSync(join(paths.workflowsDir, 'self-dev.yaml'), 'utf8');
+      expect(source).toMatch(/on_exhausted: fail +# .*human = /);
+    }
+    setLang('zh');
+    // A template that does not say gets the system default.
+    const bare = TemplateSchema.parse({ id: 't', stages: [{ id: 'a', agent: 'x' }] });
+    expect(effectiveStage(bare, 'a', {}).escalate.on_exhausted).toBe('fail');
+    expect(loopsExhausted(bare)).toBe('fail');
+    // Rollbacks follow the template's defaults only; reworks the stage's effective setting.
+    const set = TemplateSchema.parse({
+      id: 't',
+      defaults: { escalate: { on_exhausted: 'human' } },
+      stages: [{ id: 'a', agent: 'x', escalate: { on_exhausted: 'fail' } }],
+    });
+    expect(loopsExhausted(set)).toBe('human');
+    expect(effectiveStage(set, 'a', {}).escalate.on_exhausted).toBe('fail');
+    const o = { stages: { a: { escalate: { on_exhausted: 'human' as const } } } };
+    expect(effectiveStage(bare, 'a', o).escalate.on_exhausted).toBe('human');
+    expect(() =>
+      TemplateSchema.parse({
+        id: 't',
+        defaults: { escalate: { on_exhausted: 'wait' } },
+        stages: [{ id: 'a', agent: 'x' }],
+      }),
+    ).toThrow();
+  });
+
+  it('warns about on_exhausted: human in the defaults and in stages that run an agent', () => {
+    const paths = home();
+    writeFile(
+      join(paths.workflowsDir, 'defaults.yaml'),
+      `id: by-default
+defaults:
+  escalate: { on_agent_error: human, on_exhausted: human }
+stages:
+  - id: implement
+    agent: claude-coder
+`,
+    );
+    writeFile(
+      join(paths.workflowsDir, 'stage.yaml'),
+      `id: by-stage
+stages:
+  - id: implement
+    agent: claude-coder
+    escalate: { on_exhausted: human }
+  - id: review
+    kind: review
+    agent: claude-reviewer
+    escalate: { on_exhausted: fail }
+  - id: merge
+    kind: merge
+    escalate: { on_exhausted: human }
+`,
+    );
+    const cfg = loadConfig(paths, ['claude-code']);
+    expect(cfg.templates.has('by-default')).toBe(true);
+    expect(cfg.templates.has('by-stage')).toBe(true);
+
+    const byDefault = cfg.warnings['workflows/defaults.yaml'] ?? [];
+    expect(byDefault).toHaveLength(2);
+    expect(byDefault[0]).toMatch(/^defaults\.escalate：on_agent_error: human：/);
+    expect(byDefault[1]).toMatch(/^defaults\.escalate：on_exhausted: human：/);
+    expect(byDefault[1]).toContain('返工 max_retries 次后仍未通过，或回退超过 max_loops 时');
+    expect(byDefault[1]).toContain('建议改成 fail');
+
+    // Only the stage that runs an agent; merge never reworks. fail is not warned about.
+    expect(cfg.warnings['workflows/stage.yaml']).toEqual([
+      expect.stringMatching(/^阶段 implement：on_exhausted: human：/),
+    ]);
+  });
+
+  it('warns about on_exhausted: human in English too', () => {
+    setLang('en');
+    const paths = home();
+    writeFile(
+      join(paths.workflowsDir, 'self-dev.yaml'),
+      `id: self-dev
+defaults:
+  escalate: { on_exhausted: human }
+stages:
+  - id: implement
+    agent: claude-coder
+`,
+    );
+    const warnings = loadConfig(paths, ['claude-code']).warnings['workflows/self-dev.yaml'] ?? [];
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/^defaults\.escalate: on_exhausted: human: /);
+    expect(warnings[0]).toContain('Better use fail');
+    expect(warnings[0]).not.toMatch(/[一-鿿]/);
+  });
+
   it('resolves stage settings: system default → template → stage → run override', () => {
     const t: WorkflowTemplate = TemplateSchema.parse({
       id: 't',
@@ -607,6 +709,7 @@ stages:
       max_retries: 5,
       on_agent_error: 'human',
       on_budget_exceeded: 'pause',
+      on_exhausted: 'fail',
     });
     const o = { stages: { a: { escalate: { max_retries: 1 } }, m: { gate: false } } };
     expect(effectiveStage(t, 'a', o).escalate.max_retries).toBe(1);

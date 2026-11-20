@@ -7,6 +7,7 @@ import {
   FLOW_STATUS,
   type FlowProgress,
   type FlowStage,
+  reworkText,
 } from '../lib/flow.js';
 import { Badge } from './ui.js';
 
@@ -141,14 +142,7 @@ function FlowStageBody({ stage, progress }: { stage: FlowStage; progress?: FlowP
         </Line>
       )}
       {stage.kind === 'agent' && (
-        <Line label={failLabel()}>
-          {stage.maxRetries > 0
-            ? t({
-                zh: `返工，最多 ${stage.maxRetries} 次，仍不通过时等人处理`,
-                en: `Rework up to ${stage.maxRetries} ${stage.maxRetries === 1 ? 'time' : 'times'}, then wait for a human`,
-              })
-            : t({ zh: '不返工，直接等人处理', en: 'No rework: wait for a human' })}
-        </Line>
+        <Line label={failLabel()}>{reworkText(stage.maxRetries, stage.onExhausted)}</Line>
       )}
       {stage.kind === 'assess' && (
         <Line label={t({ zh: '有疑问', en: 'In doubt' })}>

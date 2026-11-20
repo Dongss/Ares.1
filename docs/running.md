@@ -81,7 +81,7 @@ stages:
 
 ### Run 失败后自动重做
 
-从 issue 来的 Run 失败后（`failed`，不包括被终止的），Master 不等人，自动再开一个 Run 重做。次数上限是 `github.repos.<name>.max_run_attempts`：
+从 issue 来的 Run 失败后（`failed`，比如 Agent 出错且重试、换 Agent 都用完，返工或回退次数用完，超出预算且配置为终止；不包括被终止的），Master 不等人，自动再开一个 Run 重做。次数上限是 `github.repos.<name>.max_run_attempts`：
 
 ```yaml
 github:
@@ -146,6 +146,35 @@ defaults:
 - 额度用尽或被限流（目前能识别 Claude Code 的限流事件）不算出错：不消耗重试次数，不换 Agent，也不卡住等人。Run 回到队首排队并让出执行位，别的 Run 照常执行；CLI 给了额度重置时间就等到那时再多等 1 分钟，没给就按连续被限流的次数等 5、10、20、40 分钟，之后每次 1 小时。到时间后从同一个 Task 接着做（返工意见不变）。等待期间 Run 详情页和事件列表会写明「额度用尽或被限流，预计 HH:mm 继续」。这个时间只记在内存里，Master 重启后 Run 会直接再试一次；想马上再试，可以暂停后再恢复。
 
 数据目录里已经装好的 `workflows/self-dev.yaml` 不会自动更新。旧版本写的是 `on_agent_error: human`：出错时会先自动重试，重试用完后才卡住等人，加载时也会提示。想让它出错时也不等人，就手动改成 `switch_agent`。
+
+## 返工或回退用完时
+
+Task 没通过检查（检查命令失败、结构化输出不合格等）时，带着问题返工；评审打回、审批被驳回、合并前同步目标分支后检查没过时，回退到 `on_fail` / `on_reject` 指向的阶段重做。两者都有上限，用完后怎么处理由 `escalate.on_exhausted` 决定：
+
+```yaml
+defaults:
+  escalate:
+    max_retries: 2       # 返工次数上限，不写也是 2
+    on_exhausted: fail   # 不写也是 fail
+  max_loops: 3           # 同一阶段最多回退重做几轮，不写也是 3
+```
+
+- `fail`（默认）：Run 结束、标为失败，不等人。`error` 里写明是哪个 Task 返工了几次、或哪个阶段回退了几轮，以及最后一次没通过的原因（检查命令的输出、评审意见或驳回意见）。工作目录和分支保留，Master 接着做别的；issue 按 `max_run_attempts` 自动重做（见上面的「Run 失败后自动重做」），重做时这个原因会交给新 Run 的 Agent，次数用完后 issue 关闭并写明每次的原因。
+- `human`：Run 卡住，等人重试或终止。重试时返工次数重新计算；回退用完的，重试会多给一轮。没人在场时 Run 会一直停在那里，加载模板时会提示改成 `fail`。
+- 返工用完时取这个阶段生效的 `on_exhausted`，所以也可以按阶段写。回退不属于某个阶段，回退用完时只看 `defaults.escalate.on_exhausted`。审批被人多次驳回导致回退用完，也按它处理。
+- 旧版本的 `self-dev.yaml` 没写 `on_exhausted`，按默认的 `fail` 处理；想保持以前卡住等人的做法，就加上 `on_exhausted: human`。
+
+## Run 什么时候停下来等人
+
+Run 卡住（`blocked`）或等审批时会让出执行位，排队的 Run 照常执行；但仓库有未结束的 Run 时不会自动侦察。默认配置下，只有这些情况会停下来等人：
+
+- 审批：模板里设了 `gate` 的阶段（从 issue 来的 Run 打开 `auto_merge` 时，合并不等审批）。
+- 需求评估有疑问，等你回复，最多等 `reply_timeout_hours`；issue 作者不是仓库成员，等你确认需求。
+- 超出预算（`on_budget_exceeded: pause`，默认）。
+- 合并冲突、目标分支有未提交的改动、准备命令失败、工作目录与记录不一致、Agent 不可用、Master 内部错误。
+- 配置为等人时：`on_agent_error: human`、`on_exhausted: human`。
+
+Agent 出错且重试、换 Agent 都用完，返工或回退用完，超出预算且配置为 `on_budget_exceeded: abort` 时，Run 不等人，直接结束、标为失败。
 
 ## 稳定副本和自动升级
 

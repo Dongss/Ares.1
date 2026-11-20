@@ -9,6 +9,7 @@ import {
 } from '../../../src/config/flow.js';
 import type {
   AgentConfig,
+  Escalate,
   RunOverrides,
   StageDef,
   WorkflowTemplate,
@@ -46,8 +47,10 @@ export interface FlowStage extends FlowStageRef {
   commands: string[] | null;
   /** The commands are the repo default, not the stage's own. */
   commandsFromRepo: boolean;
-  /** How many times a task is reworked before a human is needed (agent stages). */
+  /** How many times a task is reworked before giving up (agent stages). */
   maxRetries: number;
+  /** What happens once the reworks are used up: the Run fails, or waits for a human. */
+  onExhausted: Required<Escalate>['on_exhausted'];
   /**
    * Assess stages: hours to wait for a reply to the questions before the assessment decides on
    * its own (0 = no wait, null = however long it takes). null for other stages.
@@ -118,12 +121,42 @@ export function buildFlow({
       commands,
       commandsFromRepo: usesRepoDefault,
       maxRetries: eff.escalate.max_retries,
+      onExhausted: eff.escalate.on_exhausted,
       replyTimeoutHours: def.kind === 'assess' ? replyTimeoutHours(def) : null,
       gate: eff.gate,
       onFail: failsTo === null ? null : ref(failsTo),
       onReject: eff.gate ? ref(rollbackTarget(template, def.id, 'reject')) : null,
     };
   });
+}
+
+/**
+ * What an agent stage does when a task fails its checks: rework up to `maxRetries` times, then
+ * end the Run as failed or wait for a human (`on_exhausted`).
+ */
+export function reworkText(
+  maxRetries: number,
+  onExhausted: Required<Escalate>['on_exhausted'],
+): string {
+  const fail = onExhausted === 'fail';
+  if (maxRetries === 0) {
+    return fail
+      ? t({
+          zh: '不返工，Run 直接结束、标为失败（从 issue 来的会自动重做）',
+          en: 'No rework: the Run ends as failed (a Run from an issue is redone)',
+        })
+      : t({ zh: '不返工，直接等人处理', en: 'No rework: wait for a human' });
+  }
+  const times = t({
+    zh: `返工，最多 ${maxRetries} 次`,
+    en: `Rework up to ${maxRetries} ${maxRetries === 1 ? 'time' : 'times'}`,
+  });
+  return fail
+    ? t({
+        zh: `${times}，仍不通过时 Run 结束、标为失败（从 issue 来的会自动重做）`,
+        en: `${times}, then the Run ends as failed (a Run from an issue is redone)`,
+      })
+    : t({ zh: `${times}，仍不通过时等人处理`, en: `${times}, then wait for a human` });
 }
 
 /**

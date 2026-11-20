@@ -153,7 +153,8 @@ defaults:
   escalate:
     max_retries: 2               # 返工次数上限；Agent 出错时也按这个次数重试（带退避），两者分开计数
     on_agent_error: switch_agent # Agent 出错：重试用完后换另一个 Agent 再试，都不行就结束 Run、标为失败；human = 重试用完后卡住等人
-  max_loops: 3
+    on_exhausted: fail           # 返工 max_retries 次仍未通过，或回退超过 max_loops：结束 Run、标为失败，从 issue 来的会带着原因自动重做；human = 卡住等人
+  max_loops: 3                 # 同一阶段最多回退重做几轮（评审打回、审批驳回都算）
 
 stages:
   - id: assess
@@ -201,7 +202,8 @@ defaults:
   escalate:
     max_retries: 2               # reworks allowed; an agent that errors is also retried this many times (with a backoff), counted apart
     on_agent_error: switch_agent # agent errors: once the retries are used up, another agent tries; if none succeeds, the Run ends as failed; human = wait for a human once the retries are used up
-  max_loops: 3
+    on_exhausted: fail           # still failing after max_retries reworks, or rolled back more than max_loops times: the Run ends as failed, and a Run from an issue is redone with the reason; human = wait for a human
+  max_loops: 3                 # how many times a stage may be redone after rollbacks (sent back by a review or rejected at approval)
 
 stages:
   - id: assess

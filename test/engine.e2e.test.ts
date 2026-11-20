@@ -32,6 +32,12 @@ import {
   writeFile,
 } from './helpers.js';
 
+/** TEST_WORKFLOW_YAML whose reworks and rollbacks, once used up, wait for a human. */
+const WAIT_WHEN_EXHAUSTED = TEST_WORKFLOW_YAML.replace(
+  '    on_agent_error: switch_agent\n',
+  '    on_agent_error: switch_agent\n    on_exhausted: human\n',
+);
+
 let h: Harness | undefined;
 afterEach(async () => {
   await h?.close();
@@ -327,16 +333,19 @@ agents:
     );
   });
 
-  it('blocks after max_retries, rolls back, and a manual retry can switch agent', async () => {
+  it('with on_exhausted: human, blocks after max_retries, rolls back, and a manual retry can switch agent', async () => {
     h = await harness();
     h.scripts.coder = (ctx) => {
       writeFile(join(ctx.input.workdir, 'feature.txt'), 'wrong\n');
       writeFile(join(ctx.input.workdir, 'junk.txt'), 'junk\n');
       return done();
     };
-    const run = h.run();
+    // Set on the stage only: a rework follows the stage's effective setting.
+    const run = h.run('目标', { stages: { implement: { escalate: { on_exhausted: 'human' } } } });
     const blocked = await h.waitStatus(run.id, 'blocked');
     expect(blocked.blocked?.kind).toBe('task_failed');
+    expect(blocked.blocked?.message).toContain('Task「编码」返工 2 次后仍未通过验收');
+    expect(blocked.error).toBeNull();
     // 1 first try + 2 reworks (max_retries: 2)
     expect(h.fake.calls.filter((c) => c.model === 'coder')).toHaveLength(3);
     // A task that finally fails is rolled back to before it started.
@@ -505,8 +514,8 @@ agents:
     ]);
   });
 
-  it('blocks on max_loops and a retry grants one more round', async () => {
-    h = await harness();
+  it('with on_exhausted: human, blocks on max_loops and a retry grants one more round', async () => {
+    h = await harness({ workflow: WAIT_WHEN_EXHAUSTED });
     h.scripts.reviewer = () => review([{ severity: 'must', description: '还是不行' }]);
     const run = h.run('目标', { max_loops: 1 });
     const blocked = await h.waitStatus(run.id, 'blocked');
@@ -856,6 +865,121 @@ agents:
       expect(failed.error).toContain('each after 1 retry');
       expect(failed.error).toContain('Agent reviewer failed: model not found');
       expect(failed.error).not.toMatch(/[一-鿿]/);
+    });
+  });
+});
+
+describe('engine: reworks and rollbacks used up', () => {
+  const eventTypes = (runId: string) =>
+    (h as Harness).master.store.listEvents(runId).map((e) => e.type);
+  /** A coder whose work never passes the checks (feature.txt must say ok). */
+  const wrongCoder: Script = (ctx) => {
+    writeFile(join(ctx.input.workdir, 'feature.txt'), 'wrong\n');
+    writeFile(join(ctx.input.workdir, 'junk.txt'), 'junk\n');
+    return done();
+  };
+  const goodCoder: Script = (ctx) => {
+    writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+    return done();
+  };
+
+  it('ends the Run as failed once the reworks are used up, with the last problems', async () => {
+    h = await harness();
+    h.scripts.coder = wrongCoder;
+    const run = h.run();
+    const failed = await h.waitStatus(run.id, 'failed');
+    // 1 first try + 2 reworks (max_retries: 2)
+    expect(h.fake.calls.filter((c) => c.model === 'coder')).toHaveLength(3);
+    expect(failed.blocked).toBeNull();
+    expect(failed.finishedAt).toBeTruthy();
+    expect(failed.error).toContain(
+      'Task「编码」返工 2 次后仍未通过验收，Run 结束（on_exhausted: fail），工作目录和分支已保留。最后一次的问题：\n',
+    );
+    expect(failed.error).toContain('检查命令 `grep -q ok feature.txt` 未通过');
+    expect(eventTypes(run.id)).not.toContain('run.blocked');
+    expect(h.master.store.listRunTasks(run.id).map((t) => t.status)).toEqual(['failed']);
+    // The task is rolled back to before it started, and the worktree kept for inspection.
+    const worktree = failed.worktreePath as string;
+    expect(existsSync(join(worktree, 'junk.txt'))).toBe(false);
+    expect(git(worktree, 'status', '--porcelain')).toBe('');
+    expect(git(h.repoDir, 'branch', '--list', failed.branch as string)).not.toBe('');
+    // Nothing waits for a human: the next Run starts.
+    await expect(h.master.engine.retry(run.id)).rejects.toThrow(/blocked/);
+    h.scripts.coder = goodCoder;
+    await h.waitStatus(h.run('下一个').id, 'waiting_approval');
+  });
+
+  it('ends the Run as failed once the rollbacks are used up, with the last reason', async () => {
+    h = await harness();
+    h.scripts.reviewer = () => review([{ severity: 'must', description: '还是不行' }]);
+    // The stage's own setting does not apply to rollbacks: max_loops is the Run's.
+    const run = h.run('目标', {
+      max_loops: 1,
+      stages: { review: { escalate: { on_exhausted: 'human' } } },
+    });
+    const failed = await h.waitStatus(run.id, 'failed');
+    expect(h.master.store.countStageRounds(run.id, 'implement')).toBe(2);
+    expect(failed.blocked).toBeNull();
+    expect(failed.error).toContain(
+      '阶段「编码」已执行 2 轮，超过回退上限 1，Run 结束（on_exhausted: fail），工作目录和分支已保留。最后一次「评审」没有通过：\n',
+    );
+    expect(failed.error).toContain('还是不行');
+    expect(eventTypes(run.id)).not.toContain('run.blocked');
+    await expect(h.master.engine.retry(run.id)).rejects.toThrow(/blocked/);
+  });
+
+  it('counts rejected approvals toward max_loops too', async () => {
+    h = await harness();
+    const run = h.run('目标', { max_loops: 0 });
+    await h.waitStatus(run.id, 'waiting_approval');
+    h.master.engine.reject(run.id, '方向不对');
+    const failed = await h.waitStatus(run.id, 'failed');
+    expect(failed.error).toContain('超过回退上限 0');
+    expect(failed.error).toContain('最后一次「合并」审批被驳回：\n方向不对');
+    expect(existsSync(join(h.repoDir, 'feature.txt'))).toBe(false);
+  });
+
+  it('with on_exhausted: human in the defaults, a rework used up waits for a human', async () => {
+    h = await harness({ workflow: WAIT_WHEN_EXHAUSTED });
+    h.scripts.coder = wrongCoder;
+    const run = h.run();
+    const blocked = await h.waitStatus(run.id, 'blocked');
+    expect(blocked.blocked?.kind).toBe('task_failed');
+    expect(blocked.blocked?.message).toContain('检查命令 `grep -q ok feature.txt` 未通过');
+    // A retry gets all the reworks again.
+    h.scripts.coder = goodCoder;
+    await h.master.engine.retry(run.id);
+    await h.waitStatus(run.id, 'waiting_approval');
+  });
+
+  describe('in English', () => {
+    afterEach(() => setLang('zh'));
+
+    const englishWorkflow = TEST_WORKFLOW_YAML.replace('name: 测试流程', 'name: Test flow')
+      .replace('name: 编码', 'name: Coding')
+      .replace('name: 评审', 'name: Review')
+      .replace('name: 合并', 'name: Merge');
+
+    it('says why the Run ended without Chinese', async () => {
+      h = await harness({ config: 'language: en\n', workflow: englishWorkflow });
+      h.scripts.coder = wrongCoder;
+      const reworked = await h.waitStatus(h.run('Add feature.txt').id, 'failed');
+      expect(reworked.error).toContain(
+        'Task "Coding" still does not pass after 2 reworks, so the Run ended (on_exhausted: fail); the working directory and branch are kept. The last problems:\n',
+      );
+      expect(reworked.error).not.toMatch(/[一-鿿]/);
+
+      h.scripts.coder = goodCoder;
+      const issues = [{ severity: 'must', description: 'still wrong' }];
+      h.scripts.reviewer = (): FakeOutcome => ({
+        finalMessage: `\`\`\`json\n${JSON.stringify({ summary: 'needs work', issues })}\n\`\`\``,
+      });
+      const looped = await h.waitStatus(h.run('Add feature.txt', { max_loops: 1 }).id, 'failed');
+      expect(looped.error).toContain(
+        'Stage "Coding" has run 2 rounds, over the rollback limit of 1, so the Run ended (on_exhausted: fail); the working directory and branch are kept. The last time, "Review" did not pass:\n',
+      );
+      expect(looped.error).toContain('still wrong');
+      expect(looped.error).not.toMatch(/[一-鿿]/);
     });
   });
 });
