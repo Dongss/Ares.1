@@ -603,8 +603,8 @@ export function scoutGuide(
           en: 'No daily spending limit is set (daily_budget_usd), so spending does not stop it',
         })
       : t({
-          zh: `今天侦察和自动采纳的 Run 一共花费不到 ${formatCost(budget.dailyUsd)}（现在 ${formatCost(budget.spentToday)}）`,
-          en: `Today's scouts and auto-accepted Runs have spent less than ${formatCost(budget.dailyUsd)} in total (now ${formatCost(budget.spentToday)})`,
+          zh: `今天侦察、自动采纳和自动重做的 Run 一共花费不到 ${formatCost(budget.dailyUsd)}（现在 ${formatCost(budget.spentToday)}）`,
+          en: `Today's scouts, auto-accepted Runs and automatic redos have spent less than ${formatCost(budget.dailyUsd)} in total (now ${formatCost(budget.spentToday)})`,
         }),
     scout.intervalHours > 0
       ? t({
@@ -678,8 +678,8 @@ function noticeHandling(kind: NoticeKind): string {
       });
     case 'failed':
       return t({
-        zh: '看 Run 上的错误说明；要重做就给 issue 重新加 ares1:ready。保留的工作目录在「工作区」页清理',
-        en: 'Read the error on the Run; to redo it, add ares1:ready to the issue again. Clean up the kept working directory on the Workspaces page',
+        zh: '看 Run 上的错误说明。从 issue 来的 Run 会带着失败原因自动重做，一个 issue 最多跑 max_run_attempts 次，用完后 issue 关闭并写明每次的原因；不想再做就关闭 issue。保留的工作目录在「工作区」页清理',
+        en: 'Read the error on the Run. A Run from an issue is redone automatically with the reason it failed, up to max_run_attempts Runs per issue; after that the issue is closed with every reason. To stop it, close the issue. Clean up the kept working directory on the Workspaces page',
       });
     case 'proposals':
       return t({
@@ -776,8 +776,8 @@ export function labelHelp(autoAccept: GitHubRepoStatus['autoAccept'] | null): [s
     [
       'ares1:failed',
       t({
-        zh: 'Run 失败或被终止；重新加 ares1:ready 会重做',
-        en: 'The Run failed or was cancelled; add ares1:ready again to redo it',
+        zh: 'Run 被终止，或失败次数达到 max_run_attempts 后不再自动重做；重新加 ares1:ready 会重做',
+        en: 'The Run was cancelled, or failed max_run_attempts times and is not redone again; add ares1:ready again to redo it',
       }),
     ],
     ['ares1:auto', auto],
@@ -932,8 +932,8 @@ export function guardrails(input: GuideInput, working: boolean | undefined): Gua
             title: dailyTitle,
             on: false,
             text: t({
-              zh: `没设（daily_budget_usd）：侦察和自动采纳不受花费限制。今天已花 ${formatCost(spentToday)}`,
-              en: `Not set (daily_budget_usd): spending does not limit scouting and auto-accepting. Spent today: ${formatCost(spentToday)}`,
+              zh: `没设（daily_budget_usd）：侦察、自动采纳和自动重做不受花费限制。今天已花 ${formatCost(spentToday)}`,
+              en: `Not set (daily_budget_usd): spending does not limit scouting, auto-accepting and automatic redos. Spent today: ${formatCost(spentToday)}`,
             }),
           }
         : {
@@ -942,13 +942,28 @@ export function guardrails(input: GuideInput, working: boolean | undefined): Gua
             text: t({
               zh: `${formatCost(dailyUsd)}，今天已花 ${formatCost(spentToday)}${
                 reached ? '，已达上限' : ''
-              }：达到后当天停止自动侦察和自动采纳，手动侦察和你采纳的不受影响`,
+              }：达到后当天停止自动侦察、自动采纳和失败后的自动重做（第二天再重做，不算用掉一次），手动侦察和你采纳的不受影响`,
               en: `${formatCost(dailyUsd)}, spent today ${formatCost(spentToday)}${
                 reached ? ', limit reached' : ''
-              }: once reached, automatic scouting and auto-accepting stop for the day; manual scouts and what you accept are not affected`,
+              }: once reached, automatic scouting, auto-accepting and redoing failed Runs stop for the day (the redo waits for the next day and costs no attempt); manual scouts and what you accept are not affected`,
             }),
           },
     );
+    const attempts = github.maxRunAttempts;
+    items.push({
+      title: t({ zh: '失败后重做的次数上限', en: 'Limit on redoing failed Runs' }),
+      on: true,
+      text:
+        attempts > 1
+          ? t({
+              zh: `从 issue 来的 Run 失败后自动重做，带上之前的失败原因；一个 issue 最多跑 ${attempts} 次（max_run_attempts），用完后关闭为 not planned，并写明每次失败的原因`,
+              en: `A failed Run from an issue is redone automatically, told why the earlier attempts failed; an issue gets at most ${attempts} Runs (max_run_attempts), after which it is closed as not planned with the reason of every failure`,
+            })
+          : t({
+              zh: '失败的 Run 不重做（max_run_attempts: 1）：issue 关闭为 not planned，并写明失败原因',
+              en: 'Failed Runs are not redone (max_run_attempts: 1): the issue is closed as not planned with the reason',
+            }),
+    });
   }
 
   const rollback = t({ zh: '升级失败自动回退', en: 'Rollback of failed upgrades' });

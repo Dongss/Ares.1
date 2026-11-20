@@ -31,7 +31,7 @@ import { join, t } from '../i18n.js';
 import type { Store } from '../store/store.js';
 import type { Attempt, CheckResult, Run, Scout, ScoutProposal, StageRun } from '../store/types.js';
 import type { GhIssue } from './client.js';
-import { isAutoAcceptable, LABELS, stripMarker } from './issues.js';
+import { isAutoAcceptable, isRetriesExhaustedComment, LABELS, stripMarker } from './issues.js';
 
 export const ProposalSchema = z.object({
   title: z.string().trim().min(1).max(120),
@@ -427,10 +427,14 @@ export function runDigest(store: Store, repoId: string, limit = 15): string {
       const roundList =
         [...rounds].map(([id, n]) => `${name(id)}×${n}`).join(' ') || t({ zh: '无', en: 'none' });
       const cost = `$${run.costUsd.toFixed(2)}`;
+      // An automatic redo of the same issue after earlier Runs failed.
+      const attempt = run.issue?.attempt ?? 1;
+      const redo =
+        attempt > 1 ? t({ zh: `，第 ${attempt} 次尝试`, en: `, attempt ${attempt}` }) : '';
       const lines = [
         t({
-          zh: `- ${run.id}（${status}，${date}）${goal}`,
-          en: `- ${run.id} (${status}, ${date}) ${goal}`,
+          zh: `- ${run.id}（${status}，${date}${redo}）${goal}`,
+          en: `- ${run.id} (${status}, ${date}${redo}) ${goal}`,
         }),
         t({
           zh: `  轮次：${roundList}；费用 ${cost}${took}`,
@@ -466,6 +470,16 @@ export function issueDigest(open: GhIssue[], closed: GhIssue[]): string {
   };
   const openLines = open.map((i) => `- #${i.number}${labels(i)} ${i.title}`);
   const closedLines = closed.map((i) => {
+    // Closed by the Master after every attempt failed: not a human's rejection.
+    const exhausted = i.comments.findLast(isRetriesExhaustedComment);
+    if (i.stateReason === 'not_planned' && exhausted && exhausted === i.comments.at(-1)) {
+      const head = t({
+        zh: '多次失败后关闭（不是人拒绝的）',
+        en: 'Closed after repeated failures (not rejected by a human)',
+      });
+      const reasons = `${t({ zh: '失败原因', en: 'Failures' })}${colon()}${oneLine(stripMarker(exhausted), 800)}`;
+      return `- #${i.number} ${head}${colon()}${i.title}\n  ${reasons}`;
+    }
     if (i.stateReason === 'not_planned') {
       const last = i.comments.at(-1);
       const reason = last && stripMarker(last);
@@ -562,6 +576,7 @@ const scoutPromptZh = (input: ScoutPromptInput) =>
 - 最多 ${input.max} 条，宁缺毋滥；没有值得做的就返回空列表。按价值从高到低排列。
 - 每条都要有能核对的证据：Run id、文件:行号、README 或 AGENTS.md 中的段落。拿不出证据的不要提。
 - 不要和下面已有的 issue 重复，包括已关闭的。被关闭为「不做」的 issue 是反例，注意其中的理由，不要换个说法再提。
+- 「多次失败后关闭」的 issue 不一样：它不是人拒绝的，而是 Run 尝试了几次都失败了，需求本身可能仍然需要。可以根据其中的失败原因换个思路重新提案（比如拆小、先补上缺的能力、换一种做法），在 why 里说明和上次的不同；不要原样再提。
 - 每条要能独立完成、独立合并，一个 Run 能做完。太大的拆成几条，实在拆不开就把 size 标为 L。
 - risk 的含义：
   - low：只涉及文档、测试、看板展示，或不改变行为的重构；
@@ -592,6 +607,7 @@ const scoutPromptEn = (input: ScoutPromptInput) =>
 - At most ${input.max}, and only ones that are worth it; return an empty list if nothing is. Order them by value, most valuable first.
 - Every proposal needs verifiable evidence: Run ids, file:line, passages of README or AGENTS.md. Do not propose anything you cannot back with evidence.
 - Do not duplicate the existing issues below, including closed ones. Issues closed as not planned are counterexamples: note their reasons and do not propose them again in other words.
+- Issues "closed after repeated failures" are different: no human rejected them; their Runs failed attempt after attempt, and the requirement may well still be wanted. You may propose them again with another approach based on the failures (e.g. split them up, first add a missing capability, do it another way), saying in why what is different this time; do not propose them again as they were.
 - Each proposal must be doable and mergeable on its own, within one Run. Split anything too large; if it really cannot be split, set its size to L.
 - What risk means:
   - low: only documentation, tests, how the dashboard shows things, or refactoring without behavior change;

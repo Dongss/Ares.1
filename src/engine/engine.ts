@@ -1206,6 +1206,7 @@ export class Engine {
       inputs,
       stageFeedback: sr.feedback,
       verifyCommands: verify,
+      earlierAttempts: run.issue?.earlier ?? [],
     };
   }
 

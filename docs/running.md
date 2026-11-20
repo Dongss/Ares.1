@@ -54,7 +54,7 @@ Master 第一次访问仓库时会自动创建这些标签：
 | `ares1:ready` | 可以开工。你自己写的 issue 加上它也会被做 |
 | `ares1:running` | 正在做 |
 | `ares1:needs-you` | 等你处理：审批、卡住，或需求待讨论（在 issue 下回复即可） |
-| `ares1:failed` | 失败或被终止。重新加 `ares1:ready` 会再做一次 |
+| `ares1:failed` | 被终止，或失败次数达到上限后不再自动重做。重新加 `ares1:ready` 会再做一次 |
 | `ares1:auto` | 按 `auto_accept` 的设置自动采纳的 |
 
 AI 侦察、自动采纳、自动合并、推送和每日预算的设置写在 `config.yaml` 的注释里。
@@ -76,6 +76,24 @@ stages:
 
 为了不堆积没人看的提案，等着采纳的提案达到 `scout.max_proposals` 条时，Master 不再自动侦察。`auto_accept.max_risk` 为 `none` 时，所有没处理的提案都算；开了自动采纳时，只算在采纳范围内、因为当天的自动采纳数（`max_per_day`）已满还没采纳的提案，以及找不到侦察记录的提案。超出范围的提案（风险更高，或大小为 L）照样等你决定，但不会让侦察停下。
 
+### Run 失败后自动重做
+
+从 issue 来的 Run 失败后（`failed`，不包括被终止的），Master 不等人，自动再开一个 Run 重做。次数上限是 `github.repos.<name>.max_run_attempts`：
+
+```yaml
+github:
+  repos:
+    my-repo:
+      template: self-dev
+      max_run_attempts: 3   # 一个 issue 最多跑几次 Run，含第一次；不写也是 3；1 = 不重做
+```
+
+- 失败时，issue 上的评论写明失败原因和「第 n/N 次尝试」，标签保持 `ares1:running`。新 Run 的目标仍然从 issue 读（期间改过 issue 就用改过的），之前每次失败的原因和失败的阶段会写进需求评估和编码的提示词，提醒 Agent 避开同样的问题。
+- 自动重做的 Run 计入当天的自动花费（`daily_budget_usd`）。花费已达上限时先不重做，issue 上会说明，第二天预算恢复后再做；等待不算用掉一次。工作开关关着时也不重做，打开后再做。
+- 用完 `max_run_attempts` 次后不再重做：评论列出每次失败的原因，issue 打上 `ares1:failed`，关闭为 not planned。这不等于不要这个需求：侦察读到这类 issue 时知道它不是人拒绝的，可以换个思路重新提案。要按原样再做，重新打开 issue 并加上 `ares1:ready`。
+- 人加 `ares1:ready` 开始的 Run 是第 1 次；之后重新加 `ares1:ready`，次数从头算。等待重做期间关闭 issue，就不再重做，issue 保持你留下的样子。
+- 被终止的 Run（人在看板上终止，或者关闭了 issue）不重做，issue 打上 `ares1:failed`，等你决定。
+
 ## Agent 出错时
 
 Agent 执行出错（CLI 报错、超时等）时怎么处理，由流程模板的 `escalate` 决定，可以写在 `defaults` 里，也可以按阶段写：
@@ -92,7 +110,7 @@ defaults:
   - `switch_agent`（默认）：从 `agents.yaml` 里挑一个这个 Task 还没用过、已启用的 Agent 接着做，需求评估阶段只挑支持只读的。先挑档次（`tier`）不低于当前 Agent 的，同档次里挑成本（`cost`）低的，再一样就按文件里的顺序。换上的 Agent 同样有 `max_retries` 次重试。没有可换的 Agent 时，Run 结束、标为失败。
   - `retry`：不换 Agent，重试用完后 Run 结束、标为失败。
   - `human`：重试用完后 Run 卡住，等人重试（可以换 Agent）或终止。没人在场时 Run 会一直停在那里，加载模板时会提示改成 `switch_agent`。
-- Run 因此失败时，`error` 里写明最后是哪个 Agent 出了什么错、试过哪些 Agent。工作目录和分支保留，issue 打上 `ares1:failed`，Master 接着做别的。要再做一次，重新加 `ares1:ready`。
+- Run 因此失败时，`error` 里写明最后是哪个 Agent 出了什么错、试过哪些 Agent。工作目录和分支保留，Master 接着做别的；issue 按 `max_run_attempts` 自动重做（见上面的「Run 失败后自动重做」），重做时这个错误会交给新 Run 的 Agent。
 - 人在看板上重试卡住的 Run 后，返工次数和出错重试次数都重新计算。
 
 数据目录里已经装好的 `workflows/self-dev.yaml` 不会自动更新。旧版本写的是 `on_agent_error: human`：出错时会先自动重试，重试用完后才卡住等人，加载时也会提示。想让它出错时也不等人，就手动改成 `switch_agent`。

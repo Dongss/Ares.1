@@ -169,6 +169,12 @@ function RunHeader({ detail, onChanged }: { detail: RunDetail; onChanged: () => 
                 {run.issue.repo}#{run.issue.number}
               </a>
               {run.issue.auto ? t({ zh: '（自动采纳）', en: ' (auto-accepted)' }) : ''}
+              {(run.issue.attempt ?? 1) > 1
+                ? t({
+                    zh: `，失败后自动重做的第 ${run.issue.attempt} 次尝试`,
+                    en: `, attempt ${run.issue.attempt}: redone after earlier Runs failed`,
+                  })
+                : ''}
             </dd>
           </div>
         )}

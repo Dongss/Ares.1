@@ -10,24 +10,31 @@ import {
   goalFromIssue,
   isAutoAcceptable,
   isMasterComment,
+  isRetriesExhaustedComment,
   issueUpdate,
   LABELS,
   labelDefs,
+  markComment,
   proposalBody,
+  RETRIES_EXHAUSTED_MARKER,
+  redoStartedComment,
   repliesAfterMaster,
+  stripMarker,
   withStatusLabel,
 } from '../src/github/issues.js';
-import { filedProposal, proposalsHoldingScout } from '../src/github/scout.js';
+import { filedProposal, issueDigest, proposalsHoldingScout } from '../src/github/scout.js';
 import { setLang } from '../src/i18n.js';
 import type { AssessmentEntry, Run, ScoutProposal } from '../src/store/types.js';
 import {
   ASSESS_AGENTS_YAML,
   ASSESS_WORKFLOW_YAML,
   assessment,
+  done,
   FakeGitHub,
   git,
   type Harness,
   harness,
+  type Script,
   waitFor,
   writeFile,
 } from './helpers.js';
@@ -50,6 +57,8 @@ interface ConfigOptions {
   /** null = no daily limit. */
   budget?: number | null;
   template?: string;
+  /** max_run_attempts; omitted = the default (3). */
+  maxAttempts?: number;
 }
 
 const config = (opts: ConfigOptions = {}) => {
@@ -70,6 +79,7 @@ ${maxPerDay === null ? '' : `        max_per_day: ${maxPerDay}`}
       auto_merge: ${opts.autoMerge ?? false}
       push: ${opts.push ?? false}
 ${opts.budget === null ? '' : `      daily_budget_usd: ${opts.budget ?? 20}`}
+${opts.maxAttempts === undefined ? '' : `      max_run_attempts: ${opts.maxAttempts}`}
 `;
 };
 
@@ -147,6 +157,7 @@ describe('issues: from ready issue to closed issue', () => {
       number: 1,
       url: 'https://github.com/me/demo/issues/1',
       auto: false,
+      attempt: 1,
     });
     expect(gh.get(1).labels).toEqual(['bug', LABELS.running]);
     expect(gh.get(1).comments[0]).toContain(run.id);
@@ -193,7 +204,7 @@ describe('issues: from ready issue to closed issue', () => {
     expect(t.master.store.listRuns()).toHaveLength(1);
   });
 
-  it('does not start a second Run while one is unfinished; a failed one can be redone', async () => {
+  it('does not start a second Run while one is unfinished; a cancelled one waits for ares1:ready', async () => {
     const t = await start();
     const coder = t.scripts.coder as NonNullable<typeof t.scripts.coder>;
     t.scripts.coder = () => new Promise(() => {});
@@ -212,6 +223,11 @@ describe('issues: from ready issue to closed issue', () => {
     await t.master.issues.sync();
     expect(gh.get(1).labels).toEqual([LABELS.failed]);
     expect(gh.get(1).comments.at(-1)).toContain('Run 已终止');
+    // A human ended it: it is not redone by itself.
+    await t.master.issues.poll();
+    expect(t.master.store.listRuns()).toHaveLength(1);
+    expect(t.master.store.getRun(first.id).issue?.redo).toBeUndefined();
+    expect(gh.get(1).labels).toEqual([LABELS.failed]);
 
     t.scripts.coder = coder;
     gh.get(1).labels.push(LABELS.ready);
@@ -1047,6 +1063,288 @@ describe('issues: closed by a human', () => {
   });
 });
 
+describe('issues: redo after a failure', () => {
+  /**
+   * Requirement assessment → coding → merge without approval; an agent error ends the Run as
+   * failed at once.
+   */
+  const REDO_WORKFLOW = `
+id: dev
+name: 测试流程
+defaults:
+  escalate:
+    max_retries: 0
+    on_agent_error: retry
+stages:
+  - id: assess
+    name: 需求评估
+    kind: assess
+    agent: assessor
+  - id: implement
+    name: 编码
+    kind: agent
+    agent: coder
+    inputs: [assessment]
+  - id: merge
+    name: 合并
+    kind: merge
+`;
+
+  /** The Runs of issue #n, oldest first. */
+  const runsOf = (t: Harness, n = 1) =>
+    t.master.store
+      .listRuns()
+      .filter((r) => r.issue?.number === n)
+      .reverse();
+  const nth = (t: Harness, i: number, n = 1) => {
+    const run = runsOf(t, n)[i];
+    if (!run) throw new Error(`no run ${i} for #${n}`);
+    return run;
+  };
+  const callsOf = (t: Harness, model: string) => t.fake.calls.filter((c) => c.model === model);
+  const eventData = (t: Harness, runId: string, type: string) =>
+    t.master.store
+      .listEvents(runId)
+      .filter((e) => e.type === type)
+      .map((e) => e.data);
+
+  /**
+   * A coder that errors on the calls listed (counted from 1) and otherwise writes feature.txt at
+   * a cost of $2.
+   */
+  const coderFailingOn = (failing: number[]): Script => {
+    let calls = 0;
+    return (ctx) => {
+      calls++;
+      if (failing.includes(calls)) {
+        return { status: 'failed', error: `第 ${calls} 次：模型额度用完了` };
+      }
+      writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+      return { ...done('写了 feature.txt'), costUsd: 2 };
+    };
+  };
+
+  async function startRedo(cfg: string, failing: number[]): Promise<Harness> {
+    const t = await start(cfg, REDO_WORKFLOW);
+    t.scripts.assessor = () => assessment('go');
+    t.scripts.coder = coderFailingOn(failing);
+    return t;
+  }
+
+  /** Today's automatic spending is $5 already: a scout cost that much. Returns the scout. */
+  const spendToday = (t: Harness) => {
+    const store = t.master.store;
+    const scout = store.createScout({
+      repoId: t.repo.id,
+      issuesRepo: 'me/demo',
+      trigger: 'auto',
+      agentId: 'scout',
+      model: 'scout',
+      logPath: '',
+    });
+    return store.updateScout(scout.id, {
+      status: 'completed',
+      costUsd: 5,
+      endedAt: new Date().toISOString(),
+    });
+  };
+  /** As on the next day: the scout's spend is yesterday's. */
+  const nextDay = (t: Harness, scoutId: string) =>
+    t.master.store.updateScout(scoutId, {
+      startedAt: new Date(Date.now() - 86_400_000).toISOString(),
+    });
+
+  it('redoes a failed Run as a new one whose agents are told why it failed', async () => {
+    const t = await startRedo(config(), [1]);
+    gh.add({ title: '加 feature', body: '写 feature.txt', labels: [LABELS.ready] });
+    await t.master.issues.poll();
+    const first = nth(t, 0);
+    await t.waitStatus(first.id, 'failed');
+    await t.master.issues.sync();
+
+    const comments = gh.get(1).comments;
+    const failure = comments.find((c) => c.includes('Run 失败了')) ?? '';
+    expect(failure).toContain('Run 失败了（第 1/3 次尝试）');
+    expect(failure).toContain('第 1 次：模型额度用完了');
+    expect(failure).toContain(
+      '会自动重做：新的 Run 会带上这次的失败原因。不想再做就关闭这个 issue。',
+    );
+    expect(t.master.store.getRun(first.id).issue?.redo).toBe('redone');
+
+    expect(runsOf(t)).toHaveLength(2);
+    const second = nth(t, 1);
+    expect(second.goal).toBe('#1 加 feature\n\n写 feature.txt');
+    expect(second.issue).toEqual({
+      repo: 'me/demo',
+      number: 1,
+      url: 'https://github.com/me/demo/issues/1',
+      auto: false,
+      attempt: 2,
+      earlier: [
+        {
+          runId: first.id,
+          attempt: 1,
+          stage: '编码',
+          error: expect.stringContaining('第 1 次：模型额度用完了'),
+        },
+      ],
+    });
+    const started = comments.find((c) => c.includes('自动重做：Run')) ?? '';
+    expect(started).toContain(
+      `战神一号自动重做：Run \`${second.id}\`（第 2/3 次尝试，模板「测试流程」）`,
+    );
+    expect(comments.indexOf(started)).toBeGreaterThan(comments.indexOf(failure));
+    expect(gh.get(1).labels).toEqual([LABELS.running]);
+    expect(eventData(t, second.id, 'issue.redone')).toEqual([
+      { repo: 'demo', issue: 1, attempt: 2, maxAttempts: 3, failedRunId: first.id },
+    ]);
+
+    await t.waitStatus(second.id, 'completed');
+    // The second attempt's agents read why the first one failed; the first one's did not.
+    const assessed = callsOf(t, 'assessor').map((c) => c.prompt);
+    expect(assessed[0]).not.toContain('之前的尝试');
+    expect(assessed[1]).toContain('## 之前的尝试');
+    expect(assessed[1]).toContain(`### 第 1 次（Run ${first.id}，失败在「编码」阶段）`);
+    expect(assessed[1]).toContain('第 1 次：模型额度用完了');
+    const coded = callsOf(t, 'coder')[1]?.prompt;
+    expect(coded).toContain('## 之前的尝试');
+    expect(coded).toContain('第 1 次：模型额度用完了');
+    // The redo counts toward today's automatic spending; the attempt a human started does not.
+    expect(t.master.issues.status().repos[0]?.budget.spentToday).toBe(2);
+
+    await t.master.issues.sync();
+    expect(gh.get(1)).toMatchObject({ state: 'closed', stateReason: 'completed' });
+  });
+
+  it('closes the issue with the reason of every attempt once max_run_attempts is used up', async () => {
+    const t = await startRedo(config({ maxAttempts: 2 }), [1, 2]);
+    gh.add({ title: '加 feature', labels: [LABELS.ready] });
+    await t.master.issues.poll();
+    const first = nth(t, 0);
+    await t.waitStatus(first.id, 'failed');
+    await t.master.issues.sync();
+    const second = nth(t, 1);
+    expect(second.issue?.attempt).toBe(2);
+    await t.waitStatus(second.id, 'failed');
+    await t.master.issues.sync();
+
+    const issue = gh.get(1);
+    expect(issue).toMatchObject({ state: 'closed', stateReason: 'not_planned' });
+    expect(issue.labels).toEqual([LABELS.failed]);
+    const last = issue.comments.at(-1) ?? '';
+    expect(last).toContain(
+      '### 失败了 2 次，达到尝试次数上限（`max_run_attempts: 2`），不再自动重做',
+    );
+    expect(last).toContain(`- 第 1 次，Run \`${first.id}\`，在「编码」阶段：`);
+    expect(last).toContain('第 1 次：模型额度用完了');
+    expect(last).toContain(`- 第 2 次，Run \`${second.id}\`，在「编码」阶段：`);
+    expect(last).toContain('第 2 次：模型额度用完了');
+    expect(last).toContain('这不等于不要这个需求');
+    expect(last).toContain(RETRIES_EXHAUSTED_MARKER);
+    expect(isMasterComment(last)).toBe(true);
+    expect(t.master.store.getRun(second.id).issue?.redo).toBe('exhausted');
+    expect(eventData(t, second.id, 'issue.retries_exhausted')).toEqual([
+      { repo: 'demo', issue: 1, attempts: 2, maxAttempts: 2, runIds: [first.id, second.id] },
+    ]);
+
+    await t.master.issues.poll();
+    expect(runsOf(t)).toHaveLength(2);
+
+    // The scout reads it as given up after failures, not as a human's rejection.
+    t.scripts.scout = () => ({ structured: { proposals: [] } });
+    const scout = await t.master.issues.startScout('demo', 'manual');
+    await scoutDone(t, scout.id);
+    const prompt = t.fake.calls.at(-1)?.prompt ?? '';
+    expect(prompt).toContain('- #1 多次失败后关闭（不是人拒绝的）：加 feature\n  失败原因：');
+    expect(prompt).toContain('第 2 次：模型额度用完了');
+    expect(prompt).not.toContain('- #1 不做');
+    expect(prompt).toContain('「多次失败后关闭」的 issue 不一样：它不是人拒绝的');
+    expect(prompt).toContain(`- ${second.id}（失败，`);
+    expect(prompt).toContain('，第 2 次尝试）#1 加 feature');
+  });
+
+  it('waits for the next day when the automatic spending is at its limit, costing no attempt', async () => {
+    const t = await startRedo(config({ budget: 1 }), [1]);
+    const spent = spendToday(t);
+    gh.add({ title: '加 feature', labels: [LABELS.ready] });
+    await t.master.issues.poll();
+    const first = nth(t, 0);
+    await t.waitStatus(first.id, 'failed');
+    await t.master.issues.sync();
+    expect(gh.get(1).comments.at(-1)).toContain(
+      '今天的自动花费已达上限（`daily_budget_usd`），等明天预算恢复后再重做。',
+    );
+    expect(gh.get(1).labels).toEqual([LABELS.running]);
+    await t.master.issues.poll();
+    expect(runsOf(t)).toHaveLength(1);
+    expect(t.master.store.getRun(first.id).issue?.redo).toBe('pending');
+
+    nextDay(t, spent.id);
+    await t.master.issues.poll();
+    const second = nth(t, 1);
+    expect(second.issue?.attempt).toBe(2);
+    expect(gh.get(1).comments.at(-1)).toContain('（第 2/3 次尝试');
+    await t.waitStatus(second.id, 'completed');
+  });
+
+  it('is not redone once a human closed the issue or started it over', async () => {
+    const t = await startRedo(config({ budget: 1 }), [1, 2]);
+    const spent = spendToday(t);
+    gh.add({ title: '关掉的', labels: [LABELS.ready] });
+    gh.add({ title: '重新开始的', labels: [LABELS.ready] });
+    await t.master.issues.poll();
+    const closed = nth(t, 0, 1);
+    const restarted = nth(t, 0, 2);
+    await t.waitStatus(closed.id, 'failed');
+    await t.waitStatus(restarted.id, 'failed');
+    await t.master.issues.sync();
+    expect(gh.get(1).labels).toEqual([LABELS.running]);
+    expect(gh.get(2).labels).toEqual([LABELS.running]);
+
+    // While both wait for the budget: #1 is closed, #2 gets ares1:ready again.
+    const issue1 = gh.get(1);
+    issue1.state = 'closed';
+    issue1.stateReason = 'not_planned';
+    issue1.comments.push('不用做了');
+    const left = structuredClone(issue1);
+    gh.get(2).labels.push(LABELS.ready);
+    nextDay(t, spent.id);
+    await t.master.issues.poll();
+
+    expect(runsOf(t, 1)).toHaveLength(1);
+    expect(gh.get(1)).toEqual(left);
+    expect(t.master.store.getRun(closed.id).issue?.redo).toBe('abandoned');
+    expect(eventData(t, closed.id, 'issue.redo_abandoned')).toEqual([
+      { repo: 'demo', issue: 1, reason: 'closed' },
+    ]);
+    // A human's ares1:ready starts the count over: attempt 1, nothing earlier.
+    expect(runsOf(t, 2)).toHaveLength(2);
+    expect(nth(t, 1, 2).issue).toMatchObject({ attempt: 1 });
+    expect(nth(t, 1, 2).issue?.earlier).toBeUndefined();
+    expect(t.master.store.getRun(restarted.id).issue?.redo).toBe('abandoned');
+    expect(eventData(t, restarted.id, 'issue.redo_abandoned')).toEqual([
+      { repo: 'demo', issue: 2, reason: 'restarted' },
+    ]);
+  });
+
+  it('is not redone while the work switch is off', async () => {
+    const t = await startRedo(config(), [1]);
+    gh.add({ title: '加 feature', labels: [LABELS.ready] });
+    await t.master.issues.poll();
+    const first = nth(t, 0);
+    await t.waitStatus(first.id, 'failed');
+    t.master.engine.setWorking(false);
+    await t.master.issues.sync();
+    await t.master.issues.poll();
+    expect(gh.get(1).comments.at(-1)).toContain('会自动重做');
+    expect(runsOf(t)).toHaveLength(1);
+
+    t.master.engine.setWorking(true);
+    await waitFor(() => runsOf(t).length === 2, 'the redo once work is on');
+    await t.waitStatus(nth(t, 1).id, 'completed');
+  });
+});
+
 describe('issues: texts', () => {
   const run = (patch: Partial<Run>): Run =>
     ({
@@ -1274,6 +1572,37 @@ describe('issues: texts', () => {
     expect(issueUpdate(run({ status: 'failed', error: '炸了' }), ctx).label).toBe(LABELS.failed);
   });
 
+  it('words a failed Run that is redone, and the end of its attempts', () => {
+    const failed = run({ status: 'failed', error: '测试没过' });
+    const redo = issueUpdate(failed, {
+      ...ctx,
+      failure: { kind: 'redo', attempt: 1, max: 3, budgetReached: false },
+    });
+    expect(redo).toMatchObject({ label: LABELS.running, close: null });
+    expect(redo.comment).toContain('Run 失败了（第 1/3 次尝试）：\n\n> 测试没过\n\n会自动重做');
+    expect(redo.comment).not.toContain(LABELS.ready);
+    const waiting = issueUpdate(failed, {
+      ...ctx,
+      failure: { kind: 'redo', attempt: 2, max: 3, budgetReached: true },
+    });
+    expect(waiting.comment).toContain('等明天预算恢复后再重做');
+
+    const failures = [
+      { runId: 'run_0', attempt: 1, stage: '编码', error: '第一次\n多行的错误' },
+      { runId: 'run_1', attempt: 2, stage: null, error: '测试没过' },
+    ];
+    const end = issueUpdate(failed, {
+      ...ctx,
+      failure: { kind: 'exhausted', attempt: 2, max: 2, failures },
+    });
+    expect(end).toMatchObject({ label: LABELS.failed, close: 'not_planned' });
+    expect(end.comment).toContain('- 第 1 次，Run `run_0`，在「编码」阶段：第一次 多行的错误\n');
+    expect(end.comment).toContain('- 第 2 次，Run `run_1`：测试没过');
+    expect(end.comment).toContain(`重新打开它并加上 \`${LABELS.ready}\``);
+    expect(isRetriesExhaustedComment(end.comment ?? '')).toBe(true);
+    expect(stripMarker(markComment(end.comment ?? ''))).not.toContain('<!--');
+  });
+
   describe('in English', () => {
     afterEach(() => setLang('zh'));
     const cjk = /[\u4e00-\u9fff]/;
@@ -1292,6 +1621,64 @@ describe('issues: texts', () => {
         'The Run failed:\n\n> boom\n\nTo redo it, add the `ares1:ready` label again.' +
           '\n\nDashboard: http://127.0.0.1:4870/#/runs/run_1',
       );
+    });
+
+    it('words redos and their end in English', () => {
+      setLang('en');
+      const failed = run({ status: 'failed', error: 'boom' });
+      const redo = issueUpdate(failed, {
+        ...ctx,
+        failure: { kind: 'redo', attempt: 1, max: 3, budgetReached: true },
+      });
+      expect(redo.comment).toBe(
+        'The Run failed (attempt 1 of 3):\n\n> boom\n\nIt is redone automatically, and the new Run is told why this one failed. ' +
+          "Today's automatic spending reached its limit (`daily_budget_usd`), so the redo waits for tomorrow's budget. " +
+          'To stop, close this issue.\n\nDashboard: http://127.0.0.1:4870/#/runs/run_1',
+      );
+      const failures = [
+        { runId: 'run_0', attempt: 1, stage: 'Coding', error: 'tests failed' },
+        { runId: 'run_1', attempt: 2, stage: null, error: 'boom' },
+      ];
+      const end = issueUpdate(failed, {
+        ...ctx,
+        failure: { kind: 'exhausted', attempt: 2, max: 2, failures },
+      });
+      expect(end.comment).toContain(
+        '### Failed 2 times, the most attempts allowed (`max_run_attempts: 2`): no more automatic redos',
+      );
+      expect(end.comment).toContain(
+        '- Attempt 1, Run `run_0`, in the "Coding" stage: tests failed',
+      );
+      const once = issueUpdate(failed, {
+        ...ctx,
+        failure: { kind: 'exhausted', attempt: 1, max: 1, failures: failures.slice(0, 1) },
+      });
+      expect(once.comment).toContain('### Failed once,');
+      const started = redoStartedComment({
+        runId: 'run_2',
+        attempt: 2,
+        max: 3,
+        templateName: 'Self-development',
+        dashboardUrl: ctx.dashboardUrl,
+      });
+      expect(started).toContain('Run `run_2` (attempt 2 of 3, template "Self-development")');
+      const closed: GhIssue = {
+        number: 4,
+        title: 'Add a thing',
+        body: '',
+        state: 'closed',
+        stateReason: 'not_planned',
+        labels: [LABELS.failed],
+        url: '',
+        comments: [markComment(end.comment ?? '')],
+      };
+      const digest = issueDigest([], [closed]);
+      expect(digest).toContain(
+        '- #4 Closed after repeated failures (not rejected by a human): Add a thing\n  Failures: ',
+      );
+      for (const text of [redo.comment, end.comment, once.comment, started, digest]) {
+        expect(text).not.toMatch(cjk);
+      }
     });
 
     it('writes proposals and label descriptions in English; labels stay the same', () => {

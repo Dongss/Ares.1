@@ -745,8 +745,8 @@ function FaqSection(props: { input: GuideInput; home: string; idle: string[] }) 
           {github && github.budget.dailyUsd !== null && (
             <li>
               {t({
-                zh: '今天的自动花费到了上限：当天不再自动侦察和自动采纳，第二天恢复。',
-                en: "Today's automatic spending hit the limit: no automatic scouting or accepting for the rest of the day; it resumes the next day.",
+                zh: '今天的自动花费到了上限：当天不再自动侦察、自动采纳和自动重做失败的 Run，第二天恢复。',
+                en: "Today's automatic spending hit the limit: no automatic scouting, accepting or redoing of failed Runs for the rest of the day; it resumes the next day.",
               })}
             </li>
           )}

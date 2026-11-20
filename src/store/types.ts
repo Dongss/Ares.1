@@ -124,6 +124,33 @@ export interface RunIssue {
   url: string;
   /** Accepted by the Master without a human. */
   auto: boolean;
+  /**
+   * Which attempt at the issue this Run is: 1 for a Run started by `ares1:ready` (added by a
+   * human or by auto-accept), one more for each automatic redo after a failure. Missing (= 1) in
+   * Runs created before failed Runs were redone.
+   */
+  attempt?: number;
+  /** The failed attempts at the issue before this one, oldest first; the agents are told. */
+  earlier?: FailedAttempt[];
+  /** What became of the issue after this Run failed; missing while it has not. */
+  redo?: RedoState;
+}
+
+/**
+ * After a Run from an issue failed. pending: it is redone once the work switch is on and the
+ * day's budget allows; redone: the next attempt was created; exhausted: no attempts were left, so
+ * the issue was closed; abandoned: a human closed the issue or started it over with
+ * `ares1:ready` meanwhile, so it is not redone.
+ */
+export type RedoState = 'pending' | 'redone' | 'exhausted' | 'abandoned';
+
+/** A failed Run of an issue, as the next attempts and the issue remember it. */
+export interface FailedAttempt {
+  runId: string;
+  attempt: number;
+  /** Name of the stage the Run failed in; null when it failed before any stage. */
+  stage: string | null;
+  error: string;
 }
 
 /**

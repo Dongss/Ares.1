@@ -72,6 +72,7 @@ const manualRepo: GitHubRepoStatus = {
   autoMerge: false,
   budget: { dailyUsd: null, spentToday: 0, reached: false },
   push: false,
+  maxRunAttempts: 3,
 };
 
 /** Everything handed over: idle scouts, any risk accepted, merged, pushed, upgraded. */
@@ -319,7 +320,9 @@ describe('scoutGuide', () => {
 
   it('lists the conditions with the current settings', () => {
     const g = scoutGuide(input(autoRepo), now);
-    expect(g.conditions).toContain('今天侦察和自动采纳的 Run 一共花费不到 $20.00（现在 $3.20）');
+    expect(g.conditions).toContain(
+      '今天侦察、自动采纳和自动重做的 Run 一共花费不到 $20.00（现在 $3.20）',
+    );
     expect(g.conditions).toContain(
       '不限间隔（interval_hours: 0）：上次侦察失败或没找到新需求也不额外等',
     );

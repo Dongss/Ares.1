@@ -213,10 +213,14 @@ export interface GitHubRepoStatus {
   };
   /** Runs from issues merge without approval. */
   autoMerge: boolean;
-  /** Today's spend on scouts and auto-accepted Runs; dailyUsd null = no limit. */
+  /**
+   * Today's spend on scouts, auto-accepted Runs and automatic redos; dailyUsd null = no limit.
+   */
   budget: { dailyUsd: number | null; spentToday: number; reached: boolean };
   /** The target branch is pushed to GitHub after merges. */
   push: boolean;
+  /** Runs an issue gets at most, the first included (`max_run_attempts`); 1 = never redone. */
+  maxRunAttempts: number;
 }
 
 /** GET /api/github */

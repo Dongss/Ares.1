@@ -14,6 +14,7 @@ import {
   type CheckResult,
   type EventRow,
   FINISHED_RUN_STATUSES,
+  type RedoState,
   type Repo,
   type Run,
   type RunIssue,
@@ -396,6 +397,36 @@ export class Store {
       number,
       ...FINISHED_RUN_STATUSES,
     );
+  }
+
+  /** The newest Run created from this issue, finished or not. */
+  latestRunForIssue(issuesRepo: string, number: number): Run | undefined {
+    return this.one<Run>(
+      'runs',
+      `SELECT * FROM runs WHERE json_extract(issue, '$.repo') = ? AND json_extract(issue, '$.number') = ?
+         ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+      issuesRepo,
+      number,
+    );
+  }
+
+  /** Failed Runs of the repo whose issue waits for them to be redone, oldest first. */
+  runsAwaitingRedo(repoId: string): Run[] {
+    return this.many<Run>(
+      'runs',
+      `SELECT * FROM runs WHERE repo_id = ? AND json_extract(issue, '$.redo') = 'pending'
+         ORDER BY created_at, rowid`,
+      repoId,
+    );
+  }
+
+  /** Record what became of the issue after the Run failed (leaves updated_at alone). */
+  setIssueRedo(id: string, redo: RedoState): void {
+    this.db
+      .prepare(
+        "UPDATE runs SET issue = json_set(issue, '$.redo', ?) WHERE id = ? AND issue IS NOT NULL",
+      )
+      .run(redo, id);
   }
 
   /** Record the Run status last reported on its issue (leaves updated_at alone). */

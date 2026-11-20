@@ -218,7 +218,8 @@ function NotConfigured() {
         max_risk: none       # 自动采纳到哪个风险等级：none / low / mid / high
       auto_merge: false      # 从 issue 来的 Run 合并前不再等你审批
       push: false            # 合并后自动推送到 GitHub
-      # daily_budget_usd: 20 # 每天自动花费的上限，不写 = 不限`,
+      # daily_budget_usd: 20 # 每天自动花费的上限，不写 = 不限
+      max_run_attempts: 3    # 一个 issue 最多跑几次 Run（含第一次），失败后自动重做`,
           en: `github:
   account: my-account        # optional: which gh account to use
   repos:
@@ -231,7 +232,8 @@ function NotConfigured() {
         max_risk: none       # highest risk accepted automatically: none / low / mid / high
       auto_merge: false      # Runs from issues merge without waiting for your approval
       push: false            # push to GitHub after merging
-      # daily_budget_usd: 20 # daily limit of automatic spend; omitted = no limit`,
+      # daily_budget_usd: 20 # daily limit of automatic spend; omitted = no limit
+      max_run_attempts: 3    # Runs an issue gets at most, the first included; failed ones are redone`,
         })}
       </pre>
     </section>

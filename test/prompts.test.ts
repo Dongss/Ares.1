@@ -11,7 +11,7 @@ import {
   taskPrompt,
 } from '../src/engine/prompts.js';
 import { setLang } from '../src/i18n.js';
-import type { AssessmentEntry, ReplyTimeoutEntry } from '../src/store/types.js';
+import type { AssessmentEntry, FailedAttempt, ReplyTimeoutEntry } from '../src/store/types.js';
 
 const ctx = (stage: Partial<StageDef> = {}): PromptContext => ({
   goal: '添加 feature.txt',
@@ -165,6 +165,35 @@ describe('prompts', () => {
     expect(text.startsWith('需求评估结论：没人回复，按评估的假设开工\n\n假设只改首页')).toBe(true);
     expect(text).toContain('#### 24 小时内没有人回复');
   });
+
+  it('tells the assessment and the coder why the earlier attempts failed', () => {
+    const earlierAttempts: FailedAttempt[] = [
+      { runId: 'run_a', attempt: 1, stage: '编码', error: '测试一直没过' },
+      { runId: 'run_b', attempt: 2, stage: null, error: `x${'很长'.repeat(1500)}` },
+    ];
+    const assess = assessPrompt(
+      { ...ctx({ id: 'assess', kind: 'assess' }), earlierAttempts },
+      [],
+      null,
+    );
+    const task = taskPrompt({ ...ctx(), earlierAttempts }, null, 'full');
+    for (const prompt of [assess, task]) {
+      expect(prompt).toContain(
+        '## 之前的尝试\n\n这个需求之前已经做过 2 次，都失败了，这是第 3 次。',
+      );
+      expect(prompt).toContain('### 第 1 次（Run run_a，失败在「编码」阶段）\n\n测试一直没过');
+      expect(prompt).toContain('### 第 2 次（Run run_b）');
+      // A long error is cut.
+      expect(prompt).not.toContain('很长'.repeat(1500));
+    }
+    expect(assess).toContain('需求本身有问题就指出来');
+    expect(task).toContain('换个做法避开同样的问题');
+    // A first attempt has no such section.
+    expect(taskPrompt(ctx(), null, 'full')).not.toContain('之前的尝试');
+    expect(assessPrompt(ctx({ id: 'assess', kind: 'assess' }), [], null)).not.toContain(
+      '之前的尝试',
+    );
+  });
 });
 
 describe('commitMessage', () => {
@@ -204,6 +233,9 @@ describe('prompts in English', () => {
     ...ctx(stage),
     goal: 'Add feature.txt',
   });
+  const earlier: FailedAttempt[] = [
+    { runId: 'run_a', attempt: 1, stage: 'Coding', error: 'tests kept failing' },
+  ];
 
   it('writes the task, rework, review and assessment prompts all in English', () => {
     setLang('en');
@@ -226,6 +258,12 @@ describe('prompts in English', () => {
         [{ role: 'timeout', hours: 2, at: '2026-11-20T00:00:00Z' }],
         'asked again',
       ),
+      redoTask: taskPrompt({ ...enCtx(), earlierAttempts: earlier }, null, 'full'),
+      redoAssess: assessPrompt(
+        { ...enCtx({ id: 'assess', kind: 'assess' }), earlierAttempts: earlier },
+        [],
+        null,
+      ),
     };
     for (const [name, prompt] of Object.entries(prompts)) {
       expect(prompt, name).not.toMatch(CJK);
@@ -242,6 +280,13 @@ describe('prompts in English', () => {
       'Nobody replied to the questions above within 2 hours, so you decide this round on your own, and ask is not allowed.',
     );
     expect(prompts.assessAlone).toContain('Write summary in English.');
+    expect(prompts.redoTask).toContain(
+      '## Earlier attempts\n\nThis requirement was attempted once before, and it failed; this is attempt 2.',
+    );
+    expect(prompts.redoTask).toContain(
+      '### Attempt 1 (Run run_a, failed in the "Coding" stage)\n\ntests kept failing',
+    );
+    expect(prompts.redoAssess).toContain('if the requirement itself is the problem, say so');
   });
 
   it('reports result problems and review issues in English, still parsed back', () => {

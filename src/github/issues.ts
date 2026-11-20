@@ -5,7 +5,13 @@ import { RISKS, type Risk } from '../config/schema.js';
 import { conclusionLabel, waitText } from '../engine/discussion.js';
 import { groupedTimeParts, minutes, type RunTimes, timeParts } from '../engine/times.js';
 import { join, t } from '../i18n.js';
-import type { DiscussionEntry, Run, RunStatus, ScoutProposal } from '../store/types.js';
+import type {
+  DiscussionEntry,
+  FailedAttempt,
+  Run,
+  RunStatus,
+  ScoutProposal,
+} from '../store/types.js';
 import type { LabelDef } from './client.js';
 
 export const LABELS = {
@@ -18,7 +24,10 @@ export const LABELS = {
   running: 'ares1:running',
   /** The Run waits for an approval or a reply to the assessment, is blocked or paused. */
   needsYou: 'ares1:needs-you',
-  /** The Run failed or was cancelled; add ares1:ready again to redo it. */
+  /**
+   * The Run was cancelled, or failed and is not redone (the attempts ran out); add ares1:ready
+   * again to redo it. A failed Run that is redone keeps ares1:running.
+   */
   failed: 'ares1:failed',
 } as const;
 
@@ -74,8 +83,8 @@ export function labelDefs(): LabelDef[] {
       name: LABELS.failed,
       color: 'b60205',
       description: t({
-        zh: 'Run 失败或被终止；重新加 ares1:ready 可重做',
-        en: 'The Run failed or was cancelled; add ares1:ready again to redo it',
+        zh: 'Run 被终止，或多次失败后不再自动重做；重新加 ares1:ready 可重做',
+        en: 'The Run was cancelled, or failed too often to be redone; add ares1:ready again to redo it',
       }),
     },
   ];
@@ -96,6 +105,12 @@ export const FOOTER_MARKER = '<!-- ares1:footer -->';
  */
 export const COMMENT_MARKER = '<!-- ares1 -->';
 
+/**
+ * In the comment that closes an issue after its Runs failed `max_run_attempts` times: tells the
+ * scout that no human turned the requirement down.
+ */
+export const RETRIES_EXHAUSTED_MARKER = '<!-- ares1:retries-exhausted -->';
+
 /** A comment body as the Master posts it: with the marker. */
 export function markComment(body: string): string {
   return `${body.trimEnd()}\n\n${COMMENT_MARKER}`;
@@ -105,9 +120,13 @@ export function isMasterComment(body: string): boolean {
   return body.includes(COMMENT_MARKER);
 }
 
-/** A comment body without the marker, e.g. to quote it. */
+export function isRetriesExhaustedComment(body: string): boolean {
+  return body.includes(RETRIES_EXHAUSTED_MARKER);
+}
+
+/** A comment body without the hidden markers, e.g. to quote it. */
 export function stripMarker(body: string): string {
-  return body.replaceAll(COMMENT_MARKER, '').trim();
+  return body.replaceAll(COMMENT_MARKER, '').replaceAll(RETRIES_EXHAUSTED_MARKER, '').trim();
 }
 
 /**
@@ -226,7 +245,77 @@ export interface IssueUpdateContext {
   pushed?: boolean;
   /** How long the Run took, split; for a completed Run. */
   times?: RunTimes;
+  /**
+   * For a failed Run: whether it is redone or its attempts ran out. Omitted = neither (the
+   * issue's repo is no longer configured), and a human redoes it with ares1:ready.
+   */
+  failure?: FailureOutcome;
 }
+
+/** What follows a failed Run of an issue. */
+export type FailureOutcome =
+  | {
+      kind: 'redo';
+      /** This Run's attempt, and how many the issue gets at most (`max_run_attempts`). */
+      attempt: number;
+      max: number;
+      /** Today's automatic spending reached its limit: the redo waits for the next day. */
+      budgetReached: boolean;
+    }
+  | {
+      kind: 'exhausted';
+      attempt: number;
+      max: number;
+      /** Every failed attempt, this Run's included, oldest first. */
+      failures: FailedAttempt[];
+    };
+
+/** A failed Run as the issue's next attempts remember it. */
+export function failedAttempt(run: Run, stage: string | null): FailedAttempt {
+  return {
+    runId: run.id,
+    attempt: run.issue?.attempt ?? 1,
+    stage,
+    error: run.error ?? noDetail(),
+  };
+}
+
+/** 「第 2/3 次尝试」, an attempt of the most an issue gets. */
+const attemptText = (attempt: number, max: number) =>
+  t({ zh: `第 ${attempt}/${max} 次尝试`, en: `attempt ${attempt} of ${max}` });
+
+/** One line per failed attempt: which Run, in which stage, why. */
+function failureLines(failures: readonly FailedAttempt[], max = 500): string {
+  return failures
+    .map((f) => {
+      const error = oneLine(f.error, max);
+      return t({
+        zh: `- 第 ${f.attempt} 次，Run \`${f.runId}\`${f.stage ? `，在「${f.stage}」阶段` : ''}：${error}`,
+        en: `- Attempt ${f.attempt}, Run \`${f.runId}\`${f.stage ? `, in the "${f.stage}" stage` : ''}: ${error}`,
+      });
+    })
+    .join('\n');
+}
+
+/** The comment that starts an automatic redo of a failed Run. */
+export function redoStartedComment(input: {
+  runId: string;
+  attempt: number;
+  max: number;
+  templateName: string;
+  dashboardUrl: string;
+}): string {
+  const link = dashboardLink(input.dashboardUrl, input.runId);
+  return t({
+    zh: `${brandName()}自动重做：Run \`${input.runId}\`（${attemptText(input.attempt, input.max)}，模板「${input.templateName}」），之前失败的原因会交给这次的 Agent。\n\n${link}`,
+    en: `${brandName()} is redoing it automatically: Run \`${input.runId}\` (${attemptText(input.attempt, input.max)}, template "${input.templateName}"); the agents are told why the earlier attempts failed.\n\n${link}`,
+  });
+}
+
+const oneLine = (text: string, max: number) => {
+  const line = text.replace(/\s+/g, ' ').trim();
+  return line.length > max ? `${line.slice(0, max)}…` : line;
+};
 
 const quote = (text: string, max = 800) => {
   const cut = text.length > max ? `${text.slice(0, max)}…` : text;
@@ -315,14 +404,7 @@ export function issueUpdate(run: Run, ctx: IssueUpdateContext): IssueUpdate {
       };
     }
     case 'failed':
-      return {
-        label: LABELS.failed,
-        comment: t({
-          zh: `Run 失败了：\n\n${quote(run.error ?? noDetail())}\n\n${redo}\n\n${link}`,
-          en: `The Run failed:\n\n${quote(run.error ?? noDetail())}\n\n${redo}\n\n${link}`,
-        }),
-        close: null,
-      };
+      return failedUpdate(run, ctx.failure, redo, link);
     case 'cancelled':
       return {
         label: LABELS.failed,
@@ -336,6 +418,65 @@ export function issueUpdate(run: Run, ctx: IssueUpdateContext): IssueUpdate {
       // The conclusion with its reason is posted with the discussion (`discussionComment`).
       return { label: null, comment: null, close: 'not_planned' };
   }
+}
+
+/**
+ * A failed Run: redone automatically (the issue stays ares1:running), or, once its attempts ran
+ * out, the issue is closed as not planned with the reason of every attempt.
+ */
+function failedUpdate(
+  run: Run,
+  failure: FailureOutcome | undefined,
+  redo: string,
+  link: string,
+): IssueUpdate {
+  const error = quote(run.error ?? noDetail());
+  if (!failure) {
+    return {
+      label: LABELS.failed,
+      comment: t({
+        zh: `Run 失败了：\n\n${error}\n\n${redo}\n\n${link}`,
+        en: `The Run failed:\n\n${error}\n\n${redo}\n\n${link}`,
+      }),
+      close: null,
+    };
+  }
+  const which = attemptText(failure.attempt, failure.max);
+  if (failure.kind === 'redo') {
+    const wait = failure.budgetReached
+      ? t({
+          zh: '今天的自动花费已达上限（`daily_budget_usd`），等明天预算恢复后再重做。',
+          en: "Today's automatic spending reached its limit (`daily_budget_usd`), so the redo waits for tomorrow's budget. ",
+        })
+      : '';
+    return {
+      label: LABELS.running,
+      comment: t({
+        zh: `Run 失败了（${which}）：\n\n${error}\n\n会自动重做：新的 Run 会带上这次的失败原因。${wait}不想再做就关闭这个 issue。\n\n${link}`,
+        en: `The Run failed (${which}):\n\n${error}\n\nIt is redone automatically, and the new Run is told why this one failed. ${wait}To stop, close this issue.\n\n${link}`,
+      }),
+      close: null,
+    };
+  }
+  const n = failure.attempt;
+  return {
+    label: LABELS.failed,
+    comment: [
+      t({
+        zh: `### 失败了 ${n} 次，达到尝试次数上限（\`max_run_attempts: ${failure.max}\`），不再自动重做`,
+        en: `### Failed ${n === 1 ? 'once' : `${n} times`}, the most attempts allowed (\`max_run_attempts: ${failure.max}\`): no more automatic redos`,
+      }),
+      t({ zh: '每次失败的原因：', en: 'Why each attempt failed:' }),
+      failureLines(failure.failures),
+      t({
+        zh: `这个 issue 关闭为 not planned，但这不等于不要这个需求：侦察会读到这些失败原因，可以换个思路重新提案。要按原样再做，重新打开它并加上 \`${LABELS.ready}\`。`,
+        en: `This issue is closed as not planned, which does not mean the requirement is unwanted: the scout reads these reasons and may propose it again with another approach. To redo it as it is, reopen it and add \`${LABELS.ready}\`.`,
+      }),
+      link,
+      RETRIES_EXHAUSTED_MARKER,
+    ].join('\n\n'),
+    close: 'not_planned',
+  };
 }
 
 export interface DiscussionCommentContext {

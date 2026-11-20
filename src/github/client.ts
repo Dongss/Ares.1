@@ -15,13 +15,6 @@ export interface GhIssue {
   comments: string[];
 }
 
-/** Whether an issue is open, and why it was closed. */
-export interface GhIssueState {
-  state: 'open' | 'closed';
-  /** "completed" / "not_planned" for closed issues. */
-  stateReason: string | null;
-}
-
 export interface LabelDef {
   name: string;
   color: string;
@@ -42,8 +35,8 @@ export interface GitHub {
     repo: string,
     issue: { title: string; body: string; labels: string[] },
   ): Promise<{ number: number; url: string }>;
-  /** Whether the issue is open or closed (and why). */
-  getIssue(repo: string, number: number): Promise<GhIssueState>;
+  /** The issue as it is now, without its comments. */
+  getIssue(repo: string, number: number): Promise<GhIssue>;
   getLabels(repo: string, number: number): Promise<string[]>;
   /** Replace all labels of the issue. */
   setLabels(repo: string, number: number, labels: string[]): Promise<void>;
@@ -57,6 +50,31 @@ export interface GitHub {
 }
 
 export class GhError extends Error {}
+
+/** An issue as `gh issue list/view --json` prints it. */
+interface RawIssue {
+  number: number;
+  title: string;
+  body?: string | null;
+  state: string;
+  stateReason?: string | null;
+  labels?: { name: string }[];
+  url: string;
+  comments?: { body: string }[];
+}
+
+function fromRaw(i: RawIssue): GhIssue {
+  return {
+    number: i.number,
+    title: i.title,
+    body: i.body ?? '',
+    state: i.state.toLowerCase() === 'open' ? 'open' : 'closed',
+    stateReason: i.stateReason ? i.stateReason.toLowerCase() : null,
+    labels: (i.labels ?? []).map((l) => l.name),
+    url: i.url,
+    comments: (i.comments ?? []).map((c) => c.body),
+  };
+}
 
 const TOKEN_TTL_MS = 10 * 60_000;
 
@@ -145,26 +163,7 @@ export class GhCli implements GitHub {
     const args = ['issue', 'list', '-R', repo, '--state', query.state];
     args.push('--limit', String(query.limit), '--json', fields.join(','));
     if (query.label) args.push('--label', query.label);
-    const raw = JSON.parse(await this.gh(args)) as {
-      number: number;
-      title: string;
-      body: string;
-      state: string;
-      stateReason?: string | null;
-      labels: { name: string }[];
-      url: string;
-      comments?: { body: string }[];
-    }[];
-    return raw.map((i) => ({
-      number: i.number,
-      title: i.title,
-      body: i.body ?? '',
-      state: i.state.toLowerCase() === 'open' ? 'open' : 'closed',
-      stateReason: i.stateReason ? i.stateReason.toLowerCase() : null,
-      labels: i.labels.map((l) => l.name),
-      url: i.url,
-      comments: (i.comments ?? []).map((c) => c.body),
-    }));
+    return (JSON.parse(await this.gh(args)) as RawIssue[]).map(fromRaw);
   }
 
   async createIssue(
@@ -186,14 +185,12 @@ export class GhCli implements GitHub {
     return { number, url };
   }
 
-  async getIssue(repo: string, number: number): Promise<GhIssueState> {
+  async getIssue(repo: string, number: number): Promise<GhIssue> {
+    const fields = 'number,title,body,state,stateReason,labels,url';
     const raw = JSON.parse(
-      await this.gh(['issue', 'view', String(number), '-R', repo, '--json', 'state,stateReason']),
-    ) as { state: string; stateReason?: string | null };
-    return {
-      state: raw.state.toLowerCase() === 'open' ? 'open' : 'closed',
-      stateReason: raw.stateReason ? raw.stateReason.toLowerCase() : null,
-    };
+      await this.gh(['issue', 'view', String(number), '-R', repo, '--json', fields]),
+    ) as RawIssue;
+    return fromRaw(raw);
   }
 
   async getLabels(repo: string, number: number): Promise<string[]> {

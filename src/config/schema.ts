@@ -53,10 +53,15 @@ export const GitHubRepoSchema = z.strictObject({
   /** Push the target branch to the GitHub repo after each merge. */
   push: z.boolean().default(false),
   /**
-   * Spend of a day (scouts + auto-accepted Runs) after which automatic scouting and
-   * auto-accepting stop until the next day; omitted = no limit.
+   * Spend of a day (scouts, auto-accepted Runs, automatic redos) after which automatic scouting,
+   * auto-accepting and redoing stop until the next day; omitted = no limit.
    */
   daily_budget_usd: z.number().positive().optional(),
+  /**
+   * Runs an issue gets at most, the first included: a failed Run is redone automatically until
+   * then; after that the issue is closed as not planned with the reasons. 1 = never redone.
+   */
+  max_run_attempts: z.number().int().min(1).default(3),
 });
 export type GitHubRepoConfig = z.infer<typeof GitHubRepoSchema>;
 

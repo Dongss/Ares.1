@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { FakeAdapter, type FakeContext, type FakeOutcome } from '../src/adapters/fake.js';
-import type { GhIssue, GhIssueState, GitHub, LabelDef } from '../src/github/client.js';
+import type { GhIssue, GitHub, LabelDef } from '../src/github/client.js';
 import { Master, type MasterOptions } from '../src/master.js';
 import type { Repo, Run, RunStatus } from '../src/store/types.js';
 
@@ -330,10 +330,9 @@ export class FakeGitHub implements GitHub {
     return { number: created.number, url: created.url };
   }
 
-  async getIssue(_repo: string, number: number): Promise<GhIssueState> {
+  async getIssue(_repo: string, number: number): Promise<GhIssue> {
     this.call(`getIssue #${number}`);
-    const { state, stateReason } = this.get(number);
-    return { state, stateReason };
+    return structuredClone({ ...this.get(number), comments: [] });
   }
 
   async getLabels(_repo: string, number: number): Promise<string[]> {

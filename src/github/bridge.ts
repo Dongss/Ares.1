@@ -32,6 +32,8 @@ import { GhCli, type GitHub } from './client.js';
 import {
   autoAcceptedComment,
   discussionComment,
+  type FailureOutcome,
+  failedAttempt,
   goalFromIssue,
   isAutoAcceptable,
   issueUpdate,
@@ -39,6 +41,7 @@ import {
   labelDefs,
   markComment,
   proposalBody,
+  redoStartedComment,
   repliesAfterMaster,
   withStatusLabel,
 } from './issues.js';
@@ -98,6 +101,8 @@ export function startOfToday(now = new Date()): string {
  * - intake: an open issue labeled ares1:ready becomes a Run;
  * - sync: the Run's progress shows on the issue (labels, comments, closed when merged);
  * - stop: a human closing the issue terminates its unfinished Run, and the issue is left alone;
+ * - redo: a failed Run is redone as a new Run told why it failed, up to `max_run_attempts` Runs
+ *   per issue and within the day's budget; then the issue is closed with every failure's reason;
  * - discussion: the requirement assessment's questions and conclusion are posted on the issue,
  *   and a human's replies there go back to the Run;
  * - scout: an AI reads the repo and its Run history and proposes issues, on demand or by itself
@@ -285,7 +290,10 @@ export class IssueBridge {
       }
       if (!(await this.cancelClosedIssueRuns())) failed = true;
       if (!(await this.syncRuns())) failed = true;
-      if (working) await each((name) => this.collectReplies(name));
+      if (working) {
+        await each((name) => this.collectReplies(name));
+        await each((name) => this.redoFailedRuns(name));
+      }
       await each((name) => this.pushTarget(name));
       if (working) await each((name) => this.maybeAutoScout(name));
       else {
@@ -300,11 +308,20 @@ export class IssueBridge {
     });
   }
 
-  /** Catch issues up with their Runs now. */
+  /** Catch issues up with their Runs now; a Run that just failed is redone right away. */
   sync(): Promise<void> {
     return this.serial(async () => {
-      if (!this.cfg.master.github || this.stopping) return;
+      const github = this.cfg.master.github;
+      if (!github || this.stopping) return;
       await this.syncRuns();
+      if (!this.deps.store.working) return;
+      for (const name of Object.keys(github.repos)) {
+        try {
+          await this.redoFailedRuns(name);
+        } catch (err) {
+          this.report(err);
+        }
+      }
     });
   }
 
@@ -366,11 +383,13 @@ export class IssueBridge {
           template: cfg.template,
           goal: goalFromIssue(issue),
           overrides,
+          // ares1:ready (again) starts the count of attempts over.
           issue: {
             repo: full,
             number: issue.number,
             url: issue.url,
             auto: issue.labels.includes(LABELS.auto),
+            attempt: 1,
           },
         });
         const templateName = template?.name ?? cfg.template;
@@ -526,11 +545,7 @@ export class IssueBridge {
     await this.syncDiscussion(run, issue);
     if (run.issueSynced === run.status) return;
     const repo = this.deps.store.getRepo(run.repoId);
-    let stageName: string | undefined;
-    if (run.currentStageRunId) {
-      const sr = this.deps.store.getStageRun(run.currentStageRunId);
-      stageName = run.template.stages.find((s) => s.id === sr.stageId)?.name ?? sr.stageId;
-    }
+    const stageName = this.stageNameOf(run);
     // The issue closes once the code is on GitHub; a failed push is retried on the next poll.
     let pushed = false;
     if (run.status === 'completed') {
@@ -540,12 +555,15 @@ export class IssueBridge {
         pushed = true;
       }
     }
+    const failure =
+      run.status === 'failed' ? this.failureOutcome(run, repo, stageName ?? null) : undefined;
     const update = issueUpdate(run, {
       dashboardUrl: this.dashboardUrl(),
       targetBranch: repo.targetBranch,
       stageName,
       pushed,
       times: run.status === 'completed' ? storedRunTimes(this.deps.store, run) : undefined,
+      failure,
     });
     const gh = this.gh();
     const current = await gh.getLabels(issue.repo, issue.number);
@@ -555,7 +573,136 @@ export class IssueBridge {
     }
     if (update.comment) await this.comment(issue.repo, issue.number, update.comment);
     if (update.close) await gh.close(issue.repo, issue.number, update.close);
-    this.deps.store.setIssueSynced(run.id, run.status);
+    const store = this.deps.store;
+    store.tx(() => {
+      store.setIssueSynced(run.id, run.status);
+      if (failure?.kind === 'exhausted') {
+        store.event(run.id, 'issue.retries_exhausted', {
+          repo: repo.name,
+          issue: issue.number,
+          attempts: failure.attempt,
+          maxAttempts: failure.max,
+          runIds: failure.failures.map((f) => f.runId),
+        });
+      }
+    });
+  }
+
+  /** Name of the stage the Run is in, or ended in. */
+  private stageNameOf(run: Run): string | undefined {
+    if (!run.currentStageRunId) return undefined;
+    const sr = this.deps.store.getStageRun(run.currentStageRunId);
+    return run.template.stages.find((s) => s.id === sr.stageId)?.name ?? sr.stageId;
+  }
+
+  /**
+   * What follows a failed Run of an issue: redone while the issue has attempts left
+   * (`max_run_attempts`), otherwise the issue is closed. Decided once and kept with the Run, so
+   * catching the issue up again after a GitHub error says the same. undefined when the repo is no
+   * longer configured for GitHub: the issue waits for a human then.
+   */
+  private failureOutcome(run: Run, repo: Repo, stage: string | null): FailureOutcome | undefined {
+    const issue = run.issue;
+    const cfg = this.cfg.master.github?.repos[repo.name];
+    if (!issue || !cfg) return undefined;
+    const attempt = issue.attempt ?? 1;
+    let redo = issue.redo;
+    if (!redo) {
+      redo = attempt < cfg.max_run_attempts ? 'pending' : 'exhausted';
+      this.deps.store.setIssueRedo(run.id, redo);
+    }
+    const max = Math.max(cfg.max_run_attempts, attempt);
+    if (redo === 'exhausted') {
+      const failures = [...(issue.earlier ?? []), failedAttempt(run, stage)];
+      return { kind: 'exhausted', attempt, max, failures };
+    }
+    return { kind: 'redo', attempt, max, budgetReached: this.overBudget(repo, cfg) };
+  }
+
+  /**
+   * Redo the repo's failed Runs whose issue is still open: a new Run, the next attempt, told why
+   * the earlier ones failed. Only once the failure is on the issue, so the comments come in
+   * order. Over today's budget the redos wait for the next day, which costs no attempt.
+   */
+  private async redoFailedRuns(name: string): Promise<void> {
+    const { repo, cfg } = this.repoSetup(name);
+    const store = this.deps.store;
+    for (const failed of store.runsAwaitingRedo(repo.id)) {
+      if (this.stopping) return;
+      const prev = failed.issue;
+      if (!prev || failed.issueSynced !== 'failed') continue;
+      if (store.latestRunForIssue(prev.repo, prev.number)?.id !== failed.id) {
+        // A human started the issue over with ares1:ready meanwhile.
+        this.abandonRedo(name, failed, prev, 'restarted');
+        continue;
+      }
+      if (this.overBudget(repo, cfg)) return;
+      const gh = this.gh();
+      const issue = await gh.getIssue(prev.repo, prev.number);
+      if (issue.state === 'closed') {
+        // Nobody wants it any more; the issue stays as the human left it.
+        this.abandonRedo(name, failed, prev, 'closed');
+        continue;
+      }
+      const template = this.cfg.templates.get(cfg.template);
+      const attempt = (prev.attempt ?? 1) + 1;
+      const max = Math.max(cfg.max_run_attempts, attempt);
+      // The goal is read from the issue again: a human may have made it clearer meanwhile.
+      const next = this.deps.engine.createRun({
+        repo: repo.name,
+        template: cfg.template,
+        goal: goalFromIssue(issue),
+        overrides: issueRunOverrides(template, cfg.auto_merge),
+        issue: {
+          repo: prev.repo,
+          number: prev.number,
+          url: issue.url,
+          auto: prev.auto,
+          attempt,
+          earlier: [
+            ...(prev.earlier ?? []),
+            failedAttempt(failed, this.stageNameOf(failed) ?? null),
+          ],
+        },
+      });
+      store.tx(() => {
+        store.setIssueRedo(failed.id, 'redone');
+        store.event(next.id, 'issue.redone', {
+          repo: name,
+          issue: prev.number,
+          attempt,
+          maxAttempts: max,
+          failedRunId: failed.id,
+        });
+      });
+      await this.comment(
+        prev.repo,
+        prev.number,
+        redoStartedComment({
+          runId: next.id,
+          attempt,
+          max,
+          templateName: template?.name ?? cfg.template,
+          dashboardUrl: this.dashboardUrl(),
+        }),
+      );
+      // The Run may have moved on already; the next sync reports where it is.
+      await gh.setLabels(prev.repo, prev.number, withStatusLabel(issue.labels, LABELS.running));
+      store.setIssueSynced(next.id, 'queued');
+    }
+  }
+
+  private abandonRedo(
+    name: string,
+    run: Run,
+    issue: RunIssue,
+    reason: 'closed' | 'restarted',
+  ): void {
+    const store = this.deps.store;
+    store.tx(() => {
+      store.setIssueRedo(run.id, 'abandoned');
+      store.event(run.id, 'issue.redo_abandoned', { repo: name, issue: issue.number, reason });
+    });
   }
 
   /** Post the discussion entries the issue does not have yet, one comment each, in order. */
@@ -614,7 +761,10 @@ export class IssueBridge {
 
   // ---- guardrails --------------------------------------------------------
 
-  /** Spend of today on this repo's scouts and auto-accepted Runs. */
+  /**
+   * Spend of today on what this repo did without a human: scouts, auto-accepted Runs and
+   * automatic redos of failed Runs.
+   */
   spentToday(repoId: string): number {
     const since = startOfToday();
     const scouts = this.deps.store
@@ -622,7 +772,7 @@ export class IssueBridge {
       .reduce((sum, s) => sum + (s.costUsd ?? 0), 0);
     const runs = this.deps.store
       .issueRunsSince(since)
-      .filter((r) => r.repoId === repoId && r.issue?.auto)
+      .filter((r) => r.repoId === repoId && (r.issue?.auto || (r.issue?.attempt ?? 1) > 1))
       .reduce((sum, r) => sum + r.costUsd, 0);
     return scouts + runs;
   }
@@ -976,6 +1126,7 @@ export class IssueBridge {
           reached: cfg.daily_budget_usd !== undefined && spent >= cfg.daily_budget_usd,
         },
         push: cfg.push,
+        maxRunAttempts: cfg.max_run_attempts,
       };
     });
     return {

@@ -1,7 +1,12 @@
 import { brandName } from '../brand.js';
 import type { AgentConfig, StageDef } from '../config/schema.js';
 import { join, t } from '../i18n.js';
-import type { AssessmentEntry, DiscussionEntry, ReplyTimeoutEntry } from '../store/types.js';
+import type {
+  AssessmentEntry,
+  DiscussionEntry,
+  FailedAttempt,
+  ReplyTimeoutEntry,
+} from '../store/types.js';
 import {
   assessmentRounds,
   conclusionLabel,
@@ -21,6 +26,48 @@ export interface PromptContext {
   /** Why this stage round exists (rolled back from a later stage / rejected). */
   stageFeedback: string | null;
   verifyCommands: string[];
+  /** Earlier Runs of the same issue that failed, oldest first; this Run redoes them. */
+  earlierAttempts?: readonly FailedAttempt[];
+}
+
+/** How much of each earlier failure's error goes into a prompt. */
+const MAX_EARLIER_ERROR = 2000;
+
+/**
+ * The earlier attempts at the same requirement and why they failed, so this one avoids the same
+ * problems. The assessment is also asked to say how; its summary reaches coding and review.
+ */
+function earlierAttemptsSection(
+  earlier: readonly FailedAttempt[] | undefined,
+  role: 'assess' | 'task',
+): string {
+  if (!earlier || earlier.length === 0) return '';
+  const n = earlier.length;
+  const advice =
+    role === 'assess'
+      ? t({
+          zh: '评估时想清楚这些失败的原因：需求本身有问题就指出来；需要换个做法才能避开，就把做法写进 summary，编码和评审会读到。',
+          en: 'When assessing, work out why these attempts failed: if the requirement itself is the problem, say so; if another approach avoids the failures, write it in summary, which coding and review read.',
+        })
+      : t({
+          zh: '动手前先想清楚这些失败的原因，换个做法避开同样的问题。',
+          en: 'Before you start, work out why these attempts failed, and take an approach that avoids the same problems.',
+        });
+  const entries = earlier.map((f) => {
+    const error =
+      f.error.length > MAX_EARLIER_ERROR ? `${f.error.slice(0, MAX_EARLIER_ERROR)}…` : f.error;
+    const head = t({
+      zh: `### 第 ${f.attempt} 次（Run ${f.runId}${f.stage ? `，失败在「${f.stage}」阶段` : ''}）`,
+      en: `### Attempt ${f.attempt} (Run ${f.runId}${f.stage ? `, failed in the "${f.stage}" stage` : ''})`,
+    });
+    return `${head}\n\n${error.trim()}`;
+  });
+  const intro = t({
+    zh: `这个需求之前已经做过 ${n} 次，都失败了，这是第 ${n + 1} 次。每次失败的原因如下。${advice}`,
+    en: `This requirement was attempted ${n === 1 ? 'once' : `${n} times`} before, and ${n === 1 ? 'it' : 'each'} failed; this is attempt ${n + 1}. Why each one failed is below. ${advice}`,
+  });
+  const heading = t({ zh: '## 之前的尝试', en: '## Earlier attempts' });
+  return `${heading}\n\n${intro}\n\n${entries.join('\n\n')}\n\n`;
 }
 
 type AgentPermission = AgentConfig['permission'];
@@ -114,7 +161,7 @@ export function taskPrompt(
         en: `## The previous attempt did not pass\n\n${feedback}\n\n`,
       })
     : '';
-  const rest = `${inputsSection(ctx.inputs)}${stageFeedback}${lastFeedback}`;
+  const rest = `${inputsSection(ctx.inputs)}${earlierAttemptsSection(ctx.earlierAttempts, 'task')}${stageFeedback}${lastFeedback}`;
   return t({
     zh: `你是${brandName()}调度的开发 Agent，正在仓库的一个独立工作目录（git worktree）中工作。
 
@@ -437,7 +484,8 @@ export function assessPrompt(
         en: `## The previous assessment did not complete\n\n${feedback}\n\n`,
       })
     : '';
-  const rest = `${requirements}${history}${inputsSection(ctx.inputs)}${notes}${lastFeedback}`;
+  const earlier = earlierAttemptsSection(ctx.earlierAttempts, 'assess');
+  const rest = `${requirements}${earlier}${history}${inputsSection(ctx.inputs)}${notes}${lastFeedback}`;
   const intro = t({
     zh: `你是${brandName()}的「需求评估」Agent。Run 开始编码之前，先判断下面这个需求是否合理、能不能开工。你只能读文件和搜索，不能修改任何文件，也不能执行命令。
 

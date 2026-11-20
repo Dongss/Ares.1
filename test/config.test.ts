@@ -8,6 +8,7 @@ import {
   defaultRollbackTarget,
   effectiveStage,
   failTarget,
+  GitHubRepoSchema,
   replyTimeoutHours,
   rollbackTarget,
   stageVerifyCommands,
@@ -155,6 +156,16 @@ upgrade: { auto: true }
     // Strict sections still reject typos: unlike the top level, they never ignored them.
     writeFile(paths.configFile, 'upgrade: { autto: true }\n');
     expect(() => loadConfig(paths, ['claude-code'])).toThrow(/autto/);
+  });
+
+  it('gives an issue 3 Runs by default, and at least 1', () => {
+    expect(GitHubRepoSchema.parse({ template: 'self-dev' }).max_run_attempts).toBe(3);
+    expect(GitHubRepoSchema.parse({ template: 'x', max_run_attempts: 1 }).max_run_attempts).toBe(1);
+    for (const bad of [0, 2.5, -1]) {
+      expect(GitHubRepoSchema.safeParse({ template: 'x', max_run_attempts: bad }).success).toBe(
+        false,
+      );
+    }
   });
 
   it('disables invalid agents and templates instead of failing', () => {
