@@ -17,8 +17,9 @@ import {
   repliesAfterMaster,
   withStatusLabel,
 } from '../src/github/issues.js';
+import { filedProposal, proposalsHoldingScout } from '../src/github/scout.js';
 import { setLang } from '../src/i18n.js';
-import type { AssessmentEntry, Run } from '../src/store/types.js';
+import type { AssessmentEntry, Run, ScoutProposal } from '../src/store/types.js';
 import {
   ASSESS_AGENTS_YAML,
   ASSESS_WORKFLOW_YAML,
@@ -319,6 +320,47 @@ describe('issues: scout', () => {
     const [scout] = t.master.store.listScouts();
     expect(scout?.trigger).toBe('auto');
     await scoutDone(t, scout?.id ?? '');
+  });
+
+  /** Auto scouting files max_proposals (3) proposals of size L, then finds nothing more. */
+  async function fileLargeProposals(maxRisk: 'none' | 'high') {
+    const t = await start(config({ auto: true, maxRisk, maxPerDay: null }));
+    let n = 0;
+    t.scripts.scout = () => ({
+      structured: {
+        proposals: n++ === 0 ? ['甲', '乙', '丙'].map((title) => proposal(title, 'low', 'L')) : [],
+      },
+      costUsd: 0.1,
+    });
+    await t.master.issues.poll();
+    await scoutDone(t, t.master.store.listScouts()[0]?.id ?? '');
+    expect([1, 2, 3].map((i) => gh.get(i).labels)).toEqual([
+      [LABELS.proposal],
+      [LABELS.proposal],
+      [LABELS.proposal],
+    ]);
+    await t.master.issues.poll();
+    return t;
+  }
+
+  it('keeps scouting while only proposals beyond auto-accept wait for a human', async () => {
+    const t = await fileLargeProposals('high');
+    const scouts = t.master.store.listScouts();
+    expect(scouts).toHaveLength(2);
+    expect(scouts.every((s) => s.trigger === 'auto')).toBe(true);
+    await scoutDone(t, scouts[0]?.id ?? '');
+    // The proposals of size L are left for a human, and the scout goes on.
+    expect(gh.get(1).labels).toEqual([LABELS.proposal]);
+    expect(t.master.store.listRuns()).toHaveLength(0);
+    await t.master.issues.poll();
+    expect(t.master.store.listScouts()).toHaveLength(3);
+    await scoutDone(t, t.master.store.listScouts()[0]?.id ?? '');
+  });
+
+  it('stops scouting on max_proposals waiting proposals when a human accepts them all', async () => {
+    const t = await fileLargeProposals('none');
+    expect(t.master.store.listScouts()).toHaveLength(1);
+    expect(t.master.issues.status().repos[0]?.scout?.waiting?.reason).toBe('有 3 条提案等你处理');
   });
 
   it('scouts again right away while it keeps finding work', async () => {
@@ -1095,6 +1137,49 @@ describe('issues: texts', () => {
     expect(isAutoAcceptable({ risk: 'high', size: 'S' }, 'high')).toBe(true);
     expect(isAutoAcceptable({ risk: 'low', size: 'L' }, 'high')).toBe(false);
     expect(isAutoAcceptable({ risk: 'low', size: 'S' }, 'none')).toBe(false);
+  });
+
+  it('counts toward max_proposals only the proposals auto-accept would take, or all without it', () => {
+    const issue = (number: number, labels: string[] = [LABELS.proposal]): GhIssue => ({
+      number,
+      title: `#${number}`,
+      body: '',
+      state: 'open',
+      stateReason: null,
+      labels,
+      url: '',
+      comments: [],
+    });
+    const filed = (
+      number: number,
+      risk: 'low' | 'mid' | 'high',
+      size: 'S' | 'M' | 'L',
+    ): ScoutProposal => ({
+      ...proposal(`#${number}`, risk, size),
+      category: 'improvement',
+      issue: { number, url: '', auto: false },
+    });
+    const scouts = [
+      { proposals: [filed(1, 'low', 'S'), filed(2, 'low', 'L')] },
+      { proposals: [filed(3, 'mid', 'M'), filed(4, 'high', 'S'), filed(5, 'low', 'M')] },
+    ];
+    const open = [
+      issue(1), // low S: auto-accept takes it once the daily limit allows
+      issue(2), // size L: left for a human
+      issue(3), // mid: beyond max_risk low
+      issue(4), // high
+      issue(5, [LABELS.proposal, LABELS.ready]), // accepted already
+      issue(6), // no scout record: counts, to stay safe
+      issue(7, ['bug']), // not a proposal
+    ];
+    const numbers = (maxRisk: 'none' | 'low' | 'mid' | 'high') =>
+      proposalsHoldingScout(open, scouts, maxRisk).map((i) => i.number);
+    expect(numbers('none')).toEqual([1, 2, 3, 4, 6]);
+    expect(numbers('low')).toEqual([1, 6]);
+    expect(numbers('mid')).toEqual([1, 3, 6]);
+    expect(numbers('high')).toEqual([1, 3, 4, 6]);
+    expect(filedProposal(scouts, 4)?.proposal).toBe(scouts[1]?.proposals[1]);
+    expect(filedProposal(scouts, 6)).toBeNull();
   });
 
   it('says on the issue what happened to the Run', () => {

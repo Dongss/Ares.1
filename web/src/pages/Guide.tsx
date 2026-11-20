@@ -734,8 +734,8 @@ function FaqSection(props: { input: GuideInput; home: string; idle: string[] }) 
           <li>
             {github && github.autoAccept.maxRisk !== 'none'
               ? t({
-                  zh: '提案在等你采纳：超出自动采纳风险或大小为 L 的提案要你加 ares1:ready；未处理的提案太多时也不会再侦察。',
-                  en: 'Proposals are waiting for you: those above the auto-accept risk or of size L need you to add ares1:ready; with too many untriaged proposals it does not scout either.',
+                  zh: '提案在等你采纳：超出自动采纳风险或大小为 L 的提案要你加 ares1:ready，它们不挡侦察，系统照常找活；在自动采纳范围内的提案因为当天的自动采纳数已满而攒多了时，才不再侦察。',
+                  en: 'Proposals are waiting for you: those above the auto-accept risk or of size L need you to add ares1:ready, but they do not hold the scout back and it keeps finding work; it stops scouting only when proposals within the auto-accept range pile up because the auto-accept count for the day is used up.',
                 })
               : t({
                   zh: '提案在等你采纳：现在所有提案都要你加 ares1:ready；未处理的提案太多时也不会再侦察。',

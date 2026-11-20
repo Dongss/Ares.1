@@ -2,6 +2,7 @@
 
 import { z } from 'zod';
 import { brandName } from '../brand.js';
+import type { Risk } from '../config/schema.js';
 import {
   deniedOperations,
   parseReport,
@@ -28,9 +29,9 @@ import {
 } from '../engine/times.js';
 import { join, t } from '../i18n.js';
 import type { Store } from '../store/store.js';
-import type { Attempt, CheckResult, Run, ScoutProposal, StageRun } from '../store/types.js';
+import type { Attempt, CheckResult, Run, Scout, ScoutProposal, StageRun } from '../store/types.js';
 import type { GhIssue } from './client.js';
-import { LABELS, stripMarker } from './issues.js';
+import { isAutoAcceptable, LABELS, stripMarker } from './issues.js';
 
 export const ProposalSchema = z.object({
   title: z.string().trim().min(1).max(120),
@@ -476,6 +477,39 @@ export function untriaged(open: GhIssue[]): GhIssue[] {
   return open.filter(
     (i) => i.labels.includes(LABELS.proposal) && !i.labels.some((l) => decided.includes(l)),
   );
+}
+
+/** The scout that filed an issue, and the proposal (the stored object) the issue came from. */
+export function filedProposal<S extends Pick<Scout, 'proposals'>>(
+  scouts: S[],
+  issue: number,
+): { scout: S; proposal: ScoutProposal } | null {
+  for (const scout of scouts) {
+    const proposal = scout.proposals.find((p) => p.issue?.number === issue);
+    if (proposal) return { scout, proposal };
+  }
+  return null;
+}
+
+/**
+ * Untriaged proposals that hold the automatic scout back once there are `max_proposals` of them.
+ * Without auto-accept, every one: a human decides them all. With it, only those auto-accept would
+ * take but has not yet (today's count is used up), and those without a scout record, to stay
+ * safe. Proposals beyond what auto-accept takes (size L, a higher risk) still wait for a human,
+ * but would otherwise stop the system for good, so they do not count; the scout sees them among
+ * the open issues and does not propose them again.
+ */
+export function proposalsHoldingScout(
+  open: GhIssue[],
+  scouts: Pick<Scout, 'proposals'>[],
+  maxRisk: Risk | 'none',
+): GhIssue[] {
+  const waiting = untriaged(open);
+  if (maxRisk === 'none') return waiting;
+  return waiting.filter((issue) => {
+    const filed = filedProposal(scouts, issue.number);
+    return !filed || isAutoAcceptable(filed.proposal, maxRisk);
+  });
 }
 
 export function scoutPrompt(input: {

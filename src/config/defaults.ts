@@ -35,7 +35,7 @@ defaults:
 #         agent: claude-reviewer # 只能用 claude-code 的 Agent，以只读方式运行
 #         auto: true             # 仓库没有未结束的 Run 时自动侦察；false = 只在看板上手动触发
 #         interval_hours: 0      # 两次自动侦察至少间隔几小时；0 = 不限
-#         max_proposals: 5       # 一次最多提几条；未处理的提案达到这个数就不再自动侦察
+#         max_proposals: 5       # 一次最多提几条；未处理的提案达到这个数就不再自动侦察（开了自动采纳时只算在采纳范围内的）
 #       auto_accept:
 #         max_risk: none         # 自动采纳到哪个风险等级：none（都由人采纳）/ low / mid / high
 #         # max_per_day: 3       # 每天最多自动采纳几条；不写 = 不限
@@ -79,7 +79,7 @@ defaults:
 #         agent: claude-reviewer # must be a claude-code agent; it runs read-only
 #         auto: true             # scout whenever the repo has no unfinished Run; false = only from the dashboard
 #         interval_hours: 0      # at least this many hours between automatic scouts; 0 = no minimum
-#         max_proposals: 5       # proposals per scout; no automatic scout while this many await a decision
+#         max_proposals: 5       # proposals per scout; no automatic scout while this many await a decision (with auto-accept on, only those within its range count)
 #       auto_accept:
 #         max_risk: none         # accept automatically up to this risk: none (a human accepts all) / low / mid / high
 #         # max_per_day: 3       # at most this many automatic accepts a day; omitted = no limit

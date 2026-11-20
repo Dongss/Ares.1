@@ -295,13 +295,20 @@ describe('scoutGuide', () => {
     expect(g.conditions).toContain(
       '不限间隔（interval_hours: 0）：上次侦察失败或没找到新需求也不额外等',
     );
-    expect(g.conditions).toContain('还没处理的提案少于 5 条（max_proposals）');
+    expect(g.conditions).toContain(
+      '在自动采纳范围内、还没采纳的提案少于 5 条（max_proposals）；超出范围的（风险更高或大小为 L）留给你处理，不挡侦察',
+    );
     expect(g.now).toBe('条件都满足，下次检查（每 5 分钟）时就会侦察。');
     expect(g.waiting).toBe(false);
 
     const p = scoutGuide(input(partialRepo), now);
     expect(p.conditions).toContain('距上次侦察满 6 小时（interval_hours）');
     expect(p.conditions).toContain('没设每日花费上限（daily_budget_usd），不受花费限制');
+
+    // Without auto-accept every untriaged proposal counts.
+    const m = scoutGuide(input({ ...manualRepo, scout }), now);
+    expect(m.conditions).toContain('还没处理的提案少于 5 条（max_proposals）');
+    expect(m.conditions.join('\n')).not.toContain('不挡侦察');
   });
 
   it('says why it does not scout right now', () => {
@@ -666,7 +673,7 @@ describe('in English', () => {
   it('says when and why it scouts, in English', () => {
     setLang('en');
     const now = new Date('2026-11-19T12:00:00');
-    for (const github of repos) {
+    for (const github of [...repos, { ...manualRepo, scout }]) {
       const g = scoutGuide(inputEn(github), now);
       for (const text of [...g.conditions, g.now]) expect(text).not.toMatch(CJK);
     }

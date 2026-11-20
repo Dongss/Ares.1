@@ -600,10 +600,15 @@ export function scoutGuide(
           zh: '不限间隔（interval_hours: 0）：上次侦察失败或没找到新需求也不额外等',
           en: 'No minimum interval (interval_hours: 0): no extra wait even if the last scout failed or found nothing new',
         }),
-    t({
-      zh: `还没处理的提案少于 ${scout.maxProposals} 条（max_proposals）`,
-      en: `Fewer than ${scout.maxProposals} proposals await triage (max_proposals)`,
-    }),
+    github.autoAccept.maxRisk === 'none'
+      ? t({
+          zh: `还没处理的提案少于 ${scout.maxProposals} 条（max_proposals）`,
+          en: `Fewer than ${scout.maxProposals} proposals await triage (max_proposals)`,
+        })
+      : t({
+          zh: `在自动采纳范围内、还没采纳的提案少于 ${scout.maxProposals} 条（max_proposals）；超出范围的（风险更高或大小为 L）留给你处理，不挡侦察`,
+          en: `Fewer than ${scout.maxProposals} proposals within the auto-accept range are still unaccepted (max_proposals); those beyond it (higher risk or size L) are left to you and do not hold the scout back`,
+        }),
   ];
   if (!scout.auto) {
     return {

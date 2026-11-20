@@ -42,8 +42,10 @@ import {
   withStatusLabel,
 } from './issues.js';
 import {
+  filedProposal,
   issueDigest,
   parseScoutReport,
+  proposalsHoldingScout,
   runDigest,
   scoutPrompt,
   scoutReportJsonSchema,
@@ -398,11 +400,12 @@ export class IssueBridge {
     const scouts = this.deps.store.listScouts({ repoId: repo.id, limit: 200 });
     for (const issue of untriaged(open).sort((a, b) => a.number - b.number)) {
       if (!this.mayAutoAccept(repo, cfg)) return;
-      const scout = scouts.find((s) => s.proposals.some((p) => p.issue?.number === issue.number));
-      const proposal = scout?.proposals.find((p) => p.issue?.number === issue.number);
-      if (!scout || !proposal?.issue || !isAutoAcceptable(proposal, cfg.auto_accept.max_risk)) {
+      const filed = filedProposal(scouts, issue.number);
+      const proposal = filed?.proposal;
+      if (!filed || !proposal?.issue || !isAutoAcceptable(proposal, cfg.auto_accept.max_risk)) {
         continue;
       }
+      const { scout } = filed;
       await this.gh().setLabels(full, issue.number, [
         ...withStatusLabel(issue.labels, LABELS.ready),
         LABELS.auto,
@@ -626,8 +629,9 @@ export class IssueBridge {
 
   /**
    * Scout by itself when there is nothing to do: the repo has no unfinished Run, few
-   * proposals wait for a human, the day's budget is not spent, and the configured interval since
-   * the last scout has passed (no extra wait after a scout that failed or found nothing).
+   * proposals hold it back (see proposalsHoldingScout), the day's budget is not spent, and the
+   * configured interval since the last scout has passed (no extra wait after a scout that failed
+   * or found nothing).
    * Records why it waits, for the dashboard.
    */
   private async maybeAutoScout(name: string): Promise<void> {
@@ -687,7 +691,8 @@ export class IssueBridge {
       label: LABELS.proposal,
       limit: 100,
     });
-    const pending = untriaged(open).length;
+    const scouts = this.deps.store.listScouts({ repoId: repo.id, limit: 200 });
+    const pending = proposalsHoldingScout(open, scouts, cfg.auto_accept.max_risk).length;
     if (pending >= scout.max_proposals) {
       return {
         reason: t({
