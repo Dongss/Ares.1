@@ -198,6 +198,9 @@ const moreText = (n: number) => t({ zh: `…另有 ${n} 条`, en: `…and ${n} m
 /** Must-fix issues listed per failed review round; more are only counted. */
 const MAX_MUST_ISSUES = 5;
 
+/** Suggestions listed per passed review round; more are only counted. */
+const MAX_SUGGESTIONS = 3;
+
 /** Denied operations listed per stage round; more are only counted. */
 const MAX_DENIED = 3;
 
@@ -279,12 +282,21 @@ function reworkLines(
 const roundName = (stageName: string, round: number) =>
   t({ zh: `${stageName}第 ${round} 轮`, en: `${stageName} round ${round}` });
 
-/** The review that failed a stage round, as the reviewer gave it; null if it cannot be read. */
-function failedReview(attempts: Attempt[]): ReviewReport | null {
+/**
+ * The review given in a stage round, as the last reviewer that finished gave it; null if none
+ * finished or its report cannot be read.
+ */
+function reviewOf(attempts: Attempt[]): ReviewReport | null {
   const attempt = attempts.findLast((a) => a.outcome === 'passed');
   if (!attempt) return null;
   const parsed = parseReport(ReviewReportSchema, attempt.structured, attempt.finalMessage ?? '');
   return parsed.ok ? parsed.value : null;
+}
+
+/** 「    - [src/a.ts] 没有处理空输入」, a review issue on its own line under its round. */
+function issueLine(issue: ReviewReport['issues'][number]): string {
+  const where = issue.file ? `[${issue.file}] ` : '';
+  return `    - ${oneLine(`${where}${issue.description}`, 150)}`;
 }
 
 /**
@@ -294,7 +306,7 @@ function failedReview(attempts: Attempt[]): ReviewReport | null {
 function failLines(sr: StageRun, stageName: string, attempts: Attempt[]): string[] {
   if (!sr.failReason) return [];
   const head = `  ${roundName(stageName, sr.round)}`;
-  const review = sr.failReason === 'review' ? failedReview(attempts) : null;
+  const review = sr.failReason === 'review' ? reviewOf(attempts) : null;
   if (review) {
     const must = review.issues.filter((i) => i.severity === 'must');
     const suggestions = review.issues.length - must.length;
@@ -305,10 +317,7 @@ function failLines(sr: StageRun, stageName: string, attempts: Attempt[]): string
         en: `${head} failed: ${must.length} must-fix${suggestions > 0 ? ` (and ${suggestions} suggestion${suggestions === 1 ? '' : 's'})` : ''}${summary ? `; summary: ${summary}` : ''}`,
       }),
     ];
-    for (const issue of must.slice(0, MAX_MUST_ISSUES)) {
-      const where = issue.file ? `[${issue.file}] ` : '';
-      lines.push(`    - ${oneLine(`${where}${issue.description}`, 150)}`);
-    }
+    for (const issue of must.slice(0, MAX_MUST_ISSUES)) lines.push(issueLine(issue));
     if (must.length > MAX_MUST_ISSUES) lines.push(`    ${moreText(must.length - MAX_MUST_ISSUES)}`);
     return lines;
   }
@@ -320,6 +329,28 @@ function failLines(sr: StageRun, stageName: string, attempts: Attempt[]): string
       en: `${head}: ${failText(sr.failReason)}: ${feedback}`,
     }),
   ];
+}
+
+/**
+ * The suggestions of a review round that passed. Reviewers leave improvements beyond the goal and
+ * polish of edge cases as suggestions on purpose, for later; they reach no issue, so unless the
+ * scout sees them here nobody picks them up again.
+ */
+function suggestionLines(sr: StageRun, stageName: string, attempts: Attempt[]): string[] {
+  if (sr.failReason) return [];
+  const suggestions = reviewOf(attempts)?.issues.filter((i) => i.severity === 'suggestion') ?? [];
+  const n = suggestions.length;
+  if (n === 0) return [];
+  const head = `  ${roundName(stageName, sr.round)}`;
+  const lines = [
+    t({
+      zh: `${head}通过，建议 ${n} 条：`,
+      en: `${head} passed, ${n} suggestion${n === 1 ? '' : 's'}:`,
+    }),
+  ];
+  for (const issue of suggestions.slice(0, MAX_SUGGESTIONS)) lines.push(issueLine(issue));
+  if (n > MAX_SUGGESTIONS) lines.push(`    ${moreText(n - MAX_SUGGESTIONS)}`);
+  return lines;
 }
 
 /** Where the requirement assessment stands, as it follows 「结论：」. */
@@ -484,14 +515,15 @@ export function runDigest(store: Store, repoId: string, limit = 15): string {
         if (c.passed || !c.attemptId) continue;
         failedChecks.set(c.attemptId, [...(failedChecks.get(c.attemptId) ?? []), c]);
       }
-      const name = (stageId: string) =>
-        run.template.stages.find((s) => s.id === stageId)?.name ?? stageId;
+      const stage = (stageId: string) => run.template.stages.find((s) => s.id === stageId);
+      const name = (stageId: string) => stage(stageId)?.name ?? stageId;
+      const trusted = trustedGoal(run);
       const rounds = new Map<string, number>();
       for (const sr of stageRuns) rounds.set(sr.stageId, (rounds.get(sr.stageId) ?? 0) + 1);
       const took = run.finishedAt ? tookText(storedRunTimes(store, run)) : '';
       const status = statusText(run.status);
       const date = run.createdAt.slice(0, 10);
-      const goal = trustedGoal(run)
+      const goal = trusted
         ? oneLine(run.goal.split('\n')[0] ?? '', 100)
         : t({
             zh: `#${run.issue?.number}（issue 的作者不是仓库成员，也没有人确认过，内容不列出）`,
@@ -539,6 +571,10 @@ export function runDigest(store: Store, repoId: string, limit = 15): string {
         const attempts = store.listTasks(sr.id).flatMap((task) => store.listAttempts(task.id));
         lines.push(...reworkLines(roundName(name(sr.stageId), sr.round), attempts, failedChecks));
         lines.push(...failLines(sr, name(sr.stageId), attempts));
+        // Reviewers read the goal: from an untrusted one, their suggestions may carry its text.
+        if (trusted && stage(sr.stageId)?.kind === 'review') {
+          lines.push(...suggestionLines(sr, name(sr.stageId), attempts));
+        }
       }
       return lines.join('\n');
     })
@@ -731,7 +767,7 @@ const scoutPromptZh = (input: ScoutPromptInput) =>
 - 提案要服务于 README.md 里的目标，不提和目标无关或背离目标的事。
 
 ## 线索（按价值从高到低）
-1. 下面附的最近 Run 记录：卡住、失败、返工多轮、评审反复提同类意见、费用或 Agent 执行用时异常，往往说明流程或代码有值得改进的地方。用时里「${part('approvalMs')}」「${part('blockedMs')}」「${part('pausedMs')}」的部分是在等人处理，「${part('queuedMs')}」的部分是在等别的 Run 做完（也包括停工、等升级、Master 没运行的时候），都不说明 Agent 慢。需求评估提了疑问、需求在讨论后改过或结论为不做，说明这条需求没写清楚或方向有偏差：留意其中的疑问和理由，新提案不要再犯。
+1. 下面附的最近 Run 记录：卡住、失败、返工多轮、评审反复提同类意见、费用或 Agent 执行用时异常，往往说明流程或代码有值得改进的地方。用时里「${part('approvalMs')}」「${part('blockedMs')}」「${part('pausedMs')}」的部分是在等人处理，「${part('queuedMs')}」的部分是在等别的 Run 做完（也包括停工、等升级、Master 没运行的时候），都不说明 Agent 慢。需求评估提了疑问、需求在讨论后改过或结论为不做，说明这条需求没写清楚或方向有偏差：留意其中的疑问和理由，新提案不要再犯。评审通过时给的建议是评审有意留到以后的改进（超出当时目标范围的缺陷、测试缺口、重复代码等），可以作为提案的来源，但要先到代码里核对它是否仍然存在、是否已经有 issue 覆盖。
 2. README.md 里的目标还没达到的地方，README.md、AGENTS.md 和代码不一致的地方，代码里的 TODO。
 3. 明显的缺陷、测试缺口、重复代码。
 
@@ -762,7 +798,7 @@ const scoutPromptEn = (input: ScoutPromptInput) =>
 - Proposals must serve the goals in README.md; do not propose anything unrelated to them or against them.
 
 ## Leads (most valuable first)
-1. The recent Runs below: Runs that got stuck, failed, needed many rounds of rework, drew the same kind of review comments again and again, or took unusual cost or agent time often point at something in the process or the code worth improving. In the times, "${part('approvalMs')}", "${part('blockedMs')}" and "${part('pausedMs')}" are time spent waiting for a human, and "${part('queuedMs')}" is time spent waiting for other Runs to finish (including while work is switched off, an upgrade is pending or the Master is not running): none of these mean the agents were slow. When the requirement assessment asked questions, the requirement was revised in the discussion, or the conclusion was to drop it, the requirement was unclear or off course: note the questions and reasons, and do not repeat those mistakes in new proposals.
+1. The recent Runs below: Runs that got stuck, failed, needed many rounds of rework, drew the same kind of review comments again and again, or took unusual cost or agent time often point at something in the process or the code worth improving. In the times, "${part('approvalMs')}", "${part('blockedMs')}" and "${part('pausedMs')}" are time spent waiting for a human, and "${part('queuedMs')}" is time spent waiting for other Runs to finish (including while work is switched off, an upgrade is pending or the Master is not running): none of these mean the agents were slow. When the requirement assessment asked questions, the requirement was revised in the discussion, or the conclusion was to drop it, the requirement was unclear or off course: note the questions and reasons, and do not repeat those mistakes in new proposals. The suggestions given by a review that passed are improvements the reviewer left for later on purpose (bugs beyond the goal of the time, gaps in tests, duplicated code and the like): they can be a source of proposals, but first check in the code that each one is still there and that no existing issue covers it.
 2. Goals in README.md not reached yet, places where README.md, AGENTS.md and the code disagree, TODOs in the code.
 3. Obvious bugs, gaps in tests, duplicated code.
 
