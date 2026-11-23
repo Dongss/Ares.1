@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { openSync } from 'node:fs';
+import { openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import type { Server } from 'node:http';
 import { join } from 'node:path';
 import { serve } from '@hono/node-server';
@@ -26,6 +26,7 @@ import { type Lang, lang, setLang } from './i18n.js';
 import { type SendNotice, SystemNotifier } from './notify/system.js';
 import { Store } from './store/store.js';
 import { copyUpgradeScript, type UpgradePlan, Upgrader } from './upgrade/upgrader.js';
+import { newId, nowIso, parseJson } from './util.js';
 import { git, revParse } from './workspace/git.js';
 
 /** CLIs with a built-in adapter. */
@@ -108,9 +109,56 @@ function launchUpgradeScript(paths: HomePaths, port: number, plan: UpgradePlan):
   ).unref();
 }
 
+/**
+ * A file in the data directory while a Master runs, removed when it closes. Still there when the
+ * next one starts, it tells that the last one ended without closing: crashed, killed (`kill -9`,
+ * out of memory), or the machine went down.
+ */
+export function runningFile(paths: HomePaths): string {
+  return join(paths.dataDir, 'master-running.json');
+}
+
+interface RunningMark {
+  pid?: unknown;
+  startedAt?: unknown;
+  /** Tells this Master's mark from one written by another Master on the same home since. */
+  token?: unknown;
+}
+
+/**
+ * Records `master.restarted` if the last Master on this home did not close, then leaves this
+ * one's mark. Returns the mark's token.
+ */
+function markRunning(paths: HomePaths, store: Store): string {
+  const file = runningFile(paths);
+  let previous: RunningMark | null = null;
+  try {
+    previous = parseJson<RunningMark>(readFileSync(file, 'utf8'), {});
+  } catch {}
+  if (previous) {
+    store.event(null, 'master.restarted', {
+      pid: typeof previous.pid === 'number' ? previous.pid : null,
+      startedAt: typeof previous.startedAt === 'string' ? previous.startedAt : null,
+    });
+  }
+  const token = newId('master');
+  writeFileSync(file, `${JSON.stringify({ pid: process.pid, startedAt: nowIso(), token })}\n`);
+  return token;
+}
+
+/** Removes this Master's mark: it closed. */
+function unmarkRunning(paths: HomePaths, token: string): void {
+  const file = runningFile(paths);
+  try {
+    if (parseJson<RunningMark>(readFileSync(file, 'utf8'), {}).token === token) rmSync(file);
+  } catch {}
+}
+
 /** Wires config, store, engine and API together. */
 export class Master {
   private server: Server | undefined;
+  /** Token of the mark this Master left in the data directory (`runningFile`). */
+  private runningToken: string | undefined;
 
   private constructor(
     readonly paths: HomePaths,
@@ -215,6 +263,8 @@ export class Master {
       platform: opts.platform,
     });
     master = new Master(paths, watcher, store, engine, issues, notifier, upgrader, app);
+    // Before the engine recovers the Runs the last Master left, so that the event comes first.
+    master.runningToken = markRunning(paths, store);
     notifier.start();
     await engine.start();
     await issues.start({ poll: opts.pollIssues !== false });
@@ -261,5 +311,6 @@ export class Master {
       });
     }
     this.store.close();
+    if (this.runningToken) unmarkRunning(this.paths, this.runningToken);
   }
 }

@@ -1254,5 +1254,12 @@ export function dataPaths(home: string): { path: string; what: string }[] {
       path: under(home, 'upgrade.log'),
       what: t({ zh: '自动升级脚本的日志', en: 'Log of the automatic upgrade script' }),
     },
+    {
+      path: under(home, 'keepalive.log'),
+      what: t({
+        zh: '保活脚本（scripts/keepalive.sh）启动 Master 和发现异常的记录',
+        en: 'When the keepalive script (scripts/keepalive.sh) started the Master or found it amiss',
+      }),
+    },
   ];
 }

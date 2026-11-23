@@ -793,6 +793,7 @@ describe('running the Master', () => {
     expect(paths).toContain('/h/data/ares1.db');
     expect(paths).toContain('/h/master.out');
     expect(paths).toContain('/h/upgrade.log');
+    expect(paths).toContain('/h/keepalive.log');
   });
 });
 

@@ -34,7 +34,8 @@ npm run test:real    # tests that call the real Claude Code and cursor-agent: co
 src/
   cli.ts              start command: parses --home / --port and starts the Master; everything else
                       happens on the dashboard
-  master.ts           wires config, store, engine, GitHub bridge, notifications, auto-upgrade and API
+  master.ts           wires config, store, engine, GitHub bridge, notifications, auto-upgrade and API;
+                      records master.restarted when the last Master did not close
   i18n.ts             language in use and t({ zh, en }) (shared by Master and dashboard)
   brand.ts            display name and slogan in each language (shared by Master and dashboard)
   util.ts             ids, time and other small helpers
@@ -97,6 +98,10 @@ src/
 scripts/
   self-upgrade.sh     auto-upgrade: pull, build, restart, watch the new version for a few minutes;
                       back to the old version on failure or when it crashes meanwhile
+  keepalive.sh        called by a timer (launchd, systemd, cron) every minute: starts the Master
+                      when it does not answer, unless an upgrade runs or a Master process of the
+                      same home is there (hung or starting); logs to keepalive.log, notifies when
+                      it cannot start it
 web/                  dashboard (React + Vite)
   src/App.tsx         top bar (navigation, work switch, notification switch, language switch)
                       and routing

@@ -25,7 +25,8 @@ node dist/cli.js      # 数据目录 ~/.ares1（或 $ARES1_HOME），端口 4870
 | `data/logs/`、`data/artifacts/` | Agent 的执行日志和产物 |
 | `data/agent-gh-config/` | 给 Agent 用的空 gh 配置目录，每次用之前清空（见「Agent 拿不到 GitHub 凭据」） |
 | `worktrees/` | 每个 Run 的工作目录 |
-| `master.out`、`upgrade.log` | 后台运行时的输出、自动升级的日志 |
+| `data/master-running.json` | Master 运行时的标记，正常停止时删掉（见「保活」） |
+| `master.out`、`upgrade.log`、`keepalive.log` | 后台运行时的输出、自动升级的日志、保活脚本的日志 |
 
 配置文件改动后会自动重新加载。改端口或 CLI 路径（`bins`）需要重启 Master。
 
@@ -308,9 +309,139 @@ Master 收到 SIGTERM 或 SIGINT 后停下工作、关闭服务和数据库，�
 - 这个仓库的侦察提示词里，「最近的 Run」前面会多出一节「Master 自动升级失败」，列出目标提交、失败消息和输出末尾（用户目录换成 `~`，因为提案会发到 GitHub），并要求侦察把修复作为最高优先级；如果输出表明是网络、npm 源这类环境问题，就不要硬提代码修复。修复合并后，下一次升级自然成功，这一节随之消失。
 - 其他仓库的侦察不受影响；不是从稳定副本运行（比如 `npm run dev`），或者 origin 和哪个仓库都对不上时，什么也不做。
 
+## 保活
+
+升级脚本只在观察期内看着 Master，观察期一过就退出了。之后 Master 崩溃、被 `kill -9`、被系统杀掉（比如内存不够），或者机器重启、用户注销，都没有人把它拉起来，系统就停转了。`scripts/keepalive.sh` 补上这一块：交给系统的定时机制每分钟调用一次，每次只检查一次就退出，Master 停了就把它启动起来。
+
+```bash
+scripts/keepalive.sh <安装目录> <数据目录> [<端口>] [<node 路径>] [<通知标题>]
+```
+
+- 安装目录：稳定副本，要已经构建过（有 `dist/cli.js`）。
+- 数据目录：和启动 Master 时的 `--home` 一样。Master 要用 `--home <数据目录>` 启动（本文的启动命令都是这样），脚本靠命令行里的 `dist/cli.js --home <数据目录>` 认出它。
+- 端口：不传或传空字符串时，读 `config.yaml` 顶层的 `port`，读不到就用 4870。
+- node 路径：不传时用 PATH 里的 `node`。脚本把它所在的目录放到 PATH 最前面再启动 Master，Master 和它启动的 Agent 用同一个 node。
+- 通知标题：系统通知的标题，默认 `Master`。
+- 日志和通知的语言按 `config.yaml` 的 `language`。
+
+每次调用按顺序判断：
+
+1. `http://127.0.0.1:<端口>/api/health` 有响应：什么也不做，退出 0，也不写日志，免得每分钟一行把日志撑大。
+2. 有正在进行的自动升级（有命令行里同时带 `self-upgrade.sh` 和这个数据目录的进程）：不插手，退出 0。升级脚本自己会停掉、启动或回退 Master，观察期也归它管，保活脚本这时再启动一个，就会有两个 Master 用同一个数据目录。升级脚本退出（观察期满，或者回退完）以后，保活脚本才接着看管。
+3. 另一次调用正在进行（数据目录里有 `keepalive.lock` 目录）：退出 0。所以连续或同时调用两次只会启动一个 Master。锁目录超过 5 分钟还在，说明是被强行结束的调用留下的，会被清掉。
+4. 有命令行带 `dist/cli.js --home <数据目录>` 的进程，但 health 没有响应（卡住了，或者还在启动）：不强行结束它，只在日志里记一笔，退出 0。真卡死了要你看 `master.out` 自己处理。
+5. 端口被别的进程占着（连得上，但不是 Master 的 health）：不启动，在日志里记一笔，发一条系统通知，退出 0。
+6. 其他情况：在安装目录里用和升级脚本一样的方式启动 Master（`nohup node dist/cli.js --home <数据目录> >> <数据目录>/master.out 2>&1 &`），最多等一分钟看 health 有没有响应。有响应就在 `keepalive.log` 里写一行带时间的记录（pid、几秒后有响应）。启动的 Master 退出了，或者一分钟内没有响应，也写一行，并发一条系统通知，脚本以退出码 1 结束；启动后没响应的进程不会被结束，下一次调用按第 4 条处理。
+
+只看端口不够：两个 Master 用同一个数据目录很危险。Master 启动时先恢复 Run 的状态、再监听端口，第二个实例在发现端口被占之前就已经改了数据库。所以只要有这个数据目录的 Master 进程（卡住的、正在启动的、手动启动的），保活脚本就不会再启动一个。
+
+系统通知和升级脚本一样：有 `osascript` 就用它，否则有 `notify-send` 就用它，都没有就不发。同一次停转只通知一次：数据目录里的 `keepalive.notified` 记着已经通知过，Master 重新有响应后删掉，之后再起不来会再通知。找不到安装目录、node 或 curl 时也记日志、发通知。
+
+所以：
+
+- Master 崩溃、被 `kill -9`、被系统杀掉之后，下一次调用（最多一分钟）就把它拉起来；机器重启或重新登录后，定时任务一跑也会把它拉起来。正在执行的 Run 由新启动的 Master 照常恢复。
+- 新启动的 Master 发现上一个是异常退出的，会在事件里记一条 `master.restarted`。Master 启动时在数据目录写 `data/master-running.json`（pid 和启动时间），正常停止（SIGTERM、Ctrl-C、交给自动升级）时删掉；启动时发现它还在，说明上一个没有正常停止（崩溃、`kill -9`、被系统杀掉、断电），事件数据里是上一个 Master 的 `pid` 和 `startedAt`。不管是保活脚本、升级脚本还是你自己启动的，都一样记。
+- 观察期内新版本崩溃仍由升级脚本回退；回退后旧版本也起不来时，升级脚本发通知后退出，之后保活脚本每分钟再试一次。
+- 想有意停掉 Master（比如下面的「手动升级」），要先停掉定时任务，否则一分钟内它又会被拉起来，做完再打开。
+
+下面的例子假设稳定副本在 `~/ares1-stable`、数据目录是 `~/.ares1`，换成你自己的路径。定时任务的 PATH 很短，例子里都显式设了 PATH，要包含 node、git、gh、claude、cursor-agent 所在的目录（用 `command -v node git gh claude cursor-agent` 查）；node 不在 PATH 里时，也可以作为第四个参数传进去。
+
+### macOS：launchd
+
+存成 `~/Library/LaunchAgents/com.ares1.keepalive.plist`。launchd 不展开 `~` 和 `$HOME`，路径要写全（下面的 `/Users/me` 换成你的用户目录）：
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ares1.keepalive</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/me/ares1-stable/scripts/keepalive.sh</string>
+    <string>/Users/me/ares1-stable</string>
+    <string>/Users/me/.ares1</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <!-- 必须为 true：否则脚本一结束，launchd 会把同一进程组里刚启动的 Master 一起杀掉 -->
+  <key>AbandonProcessGroup</key>
+  <true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/Users/me/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <!-- 脚本平时什么也不输出，只有参数错了才往这里写 -->
+  <key>StandardErrorPath</key>
+  <string>/Users/me/.ares1/keepalive.err</string>
+</dict>
+</plist>
+```
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ares1.keepalive.plist   # 打开
+launchctl bootout gui/$(id -u)/com.ares1.keepalive                                   # 停掉
+```
+
+LaunchAgent 在你登录后运行，机器重启后要登录才会把 Master 拉起来（可以打开自动登录）。
+
+### Linux：systemd timer
+
+用户级的单元，`~/.config/systemd/user/ares1-keepalive.service`：
+
+```ini
+[Unit]
+Description=Ares.1 keepalive
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash %h/ares1-stable/scripts/keepalive.sh %h/ares1-stable %h/.ares1
+# 必须设：否则脚本一结束，systemd 会把同一个 cgroup 里刚启动的 Master 一起清掉
+KillMode=process
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+```
+
+`~/.config/systemd/user/ares1-keepalive.timer`：
+
+```ini
+[Unit]
+Description=Ares.1 keepalive every minute
+
+[Timer]
+OnCalendar=minutely
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now ares1-keepalive.timer   # 打开
+loginctl enable-linger "$USER"                         # 注销后、开机还没登录时也运行
+systemctl --user stop ares1-keepalive.timer            # 停掉（disable 后开机也不再运行）
+```
+
+不打开 linger 的话，用户注销后用户级的 systemd 会停掉，定时任务不再运行。Master 留在 keepalive 服务的 cgroup 里，下一次触发时 systemd 会提示有残留的进程（`Found left-over process`），不影响运行。没有桌面会话时 `notify-send` 发不出去，看 `keepalive.log`。
+
+### Linux：cron
+
+没有 systemd 时用 cron（`crontab -e`），每分钟一次：
+
+```
+PATH=/usr/local/bin:/usr/bin:/bin
+* * * * * /bin/bash "$HOME/ares1-stable/scripts/keepalive.sh" "$HOME/ares1-stable" "$HOME/.ares1"
+```
+
+cron 不会在任务结束后结束它启动的进程。停掉时把这一行注释掉。机器重启后 cron 起来就会接着调用。
+
 ## 手动升级
 
-没有打开自动升级时，按下面的步骤升级。停止 Master 时，正在执行的 Run 会回到队首。
+没有打开自动升级时，按下面的步骤升级。停止 Master 时，正在执行的 Run 会回到队首。打开了保活的定时任务时，先停掉它（见上面的「保活」），升级完再打开，否则停掉的 Master 会在构建过程中被拉起来。
 
 ```bash
 pkill -f "dist/cli.js --home $HOME/.ares1"
