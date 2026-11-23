@@ -2,10 +2,15 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AGENT_GH_TOKEN } from '../src/adapters/process.js';
 import type { RunDetail } from '../src/api/types.js';
-import { acceptSplit, isAutoAcceptable, type ProposalKind } from '../src/config/flow.js';
+import {
+  acceptSplit,
+  isAutoAcceptable,
+  type ProposalKind,
+  scoutBackoff,
+} from '../src/config/flow.js';
 import { githubConfigKey } from '../src/config/load.js';
 import type { GhComment, GhIssue } from '../src/github/client.js';
 import {
@@ -31,7 +36,7 @@ import {
 } from '../src/github/issues.js';
 import { filedProposal, issueDigest, proposalsHoldingScout } from '../src/github/scout.js';
 import { setLang } from '../src/i18n.js';
-import type { AssessmentEntry, BlockKind, Run, ScoutProposal } from '../src/store/types.js';
+import type { AssessmentEntry, BlockKind, Run, Scout, ScoutProposal } from '../src/store/types.js';
 import {
   ASSESS_AGENTS_YAML,
   ASSESS_WORKFLOW_YAML,
@@ -797,6 +802,187 @@ describe('issues: scout', () => {
       await t.master.issues.poll();
       expect(waiting(t)?.reason).toBe('The last 2 scouts found nothing or failed; backing off');
       expect(waiting(t)?.reason).not.toMatch(/[一-鿿]/);
+    });
+  });
+
+  describe("waiting for the quota when the scout's agent hits a limit", () => {
+    afterEach(() => {
+      vi.useRealTimers();
+      setLang('zh');
+    });
+    const MIN = 60_000;
+    const QUOTA = '侦察遇到额度用尽或限流，等额度恢复';
+    const waiting = (t: Harness) => t.master.issues.status().repos[0]?.scout?.waiting;
+    /** `ms` after the scout ended, as ISO. */
+    const endPlus = (s: { endedAt: string | null }, ms: number) =>
+      new Date(Date.parse(s.endedAt ?? '') + ms).toISOString();
+    /** The scout's agent out of quota; `retryAt`: when the CLI says the quota comes back. */
+    const limited =
+      (retryAt?: string): Script =>
+      () => ({
+        status: 'failed',
+        error: 'You have hit your limit',
+        errorKind: 'rate_limited',
+        ...(retryAt ? { retryAt } : {}),
+        costUsd: 0.05,
+      });
+    const nothing: Script = () => ({ structured: { proposals: [] } });
+    const broken: Script = () => ({ structured: { proposals: [{ title: '缺字段' }] } });
+
+    /** Auto scouting on a repo whose last commit is old; the n-th scout does `scripts(n)`. */
+    async function autoScouts(scripts: (n: number) => Script, intervalHours = 0) {
+      const t = await start(config({ auto: true, intervalHours }));
+      oldTargetBranch(t);
+      let n = 0;
+      t.scripts.scout = (ctx) => scripts(++n)(ctx);
+      return t;
+    }
+    /** Poll; the automatic scout it started, once ended; undefined when none started. */
+    async function pollScout(t: Harness): Promise<Scout | undefined> {
+      const before = t.master.store.listScouts().length;
+      await t.master.issues.poll();
+      const scouts = t.master.store.listScouts();
+      if (scouts.length === before) return undefined;
+      expect(scouts[0]?.trigger).toBe('auto');
+      return scoutDone(t, scouts[0]?.id ?? '');
+    }
+    /** Poll; the automatic scout it started, once ended. */
+    async function pollNewScout(t: Harness): Promise<Scout> {
+      const scout = await pollScout(t);
+      if (!scout) throw new Error(`no automatic scout started: ${waiting(t)?.reason}`);
+      return scout;
+    }
+    const events = (t: Harness, type: string) =>
+      t.master.store.listEventsOfType(type, '1970-01-01T00:00:00.000Z').map((e) => e.data);
+
+    it('records the scout as rate-limited, not failed, and does not back off for it', async () => {
+      const t = await autoScouts(() => limited());
+      const scout = await pollNewScout(t);
+      expect(scout).toMatchObject({ status: 'rate_limited', costUsd: 0.05, proposals: [] });
+      expect(scout.error).toBe('侦察的 Agent 额度用尽或被限流：You have hit your limit');
+      expect(events(t, 'scout.failed')).toEqual([]);
+      expect(events(t, 'scout.rate_limited')).toEqual([{ scoutId: scout.id, repo: 'demo' }]);
+      expect(scoutBackoff(t.master.store.listScouts(), 5)).toBeNull();
+      // It waits for the quota, not for a back-off.
+      expect(await pollScout(t)).toBeUndefined();
+      expect(waiting(t)).toEqual({ reason: QUOTA, until: endPlus(scout, 5 * MIN) });
+    });
+
+    it("waits until the CLI's reset time plus a minute, then scouts at the next poll", async () => {
+      const resetAt = Date.now() + 30 * MIN;
+      const reset = new Date(resetAt).toISOString();
+      const t = await autoScouts((n) => (n === 1 ? limited(reset) : nothing));
+      const scout = await pollNewScout(t);
+      expect(scout.status).toBe('rate_limited');
+      expect(scout.error).toMatch(
+        /^侦察的 Agent 额度用尽或被限流，预计 \d{4}-\d\d-\d\d \d\d:\d\d 恢复：You have hit your limit$/,
+      );
+      expect(events(t, 'scout.rate_limited')).toEqual([
+        { scoutId: scout.id, repo: 'demo', retryAt: reset },
+      ]);
+      expect(await pollScout(t)).toBeUndefined();
+      const until = new Date(resetAt + MIN).toISOString();
+      expect(waiting(t)).toEqual({ reason: QUOTA, until });
+
+      vi.useFakeTimers({ toFake: ['Date'], shouldAdvanceTime: true });
+      vi.setSystemTime(resetAt + MIN - 1000);
+      expect(await pollScout(t)).toBeUndefined();
+      expect(waiting(t)).toEqual({ reason: QUOTA, until });
+      vi.setSystemTime(resetAt + MIN + 1000);
+      expect(await pollNewScout(t)).toMatchObject({ status: 'completed', trigger: 'auto' });
+    });
+
+    it('without a reset time waits 5, then 10 minutes for limits in a row', async () => {
+      const t = await autoScouts(() => limited());
+      const first = await pollNewScout(t);
+      expect(await pollScout(t)).toBeUndefined();
+      expect(waiting(t)).toEqual({ reason: QUOTA, until: endPlus(first, 5 * MIN) });
+
+      elapse(t, 5 * MIN);
+      const second = await pollNewScout(t);
+      expect(second.status).toBe('rate_limited');
+      expect(await pollScout(t)).toBeUndefined();
+      expect(waiting(t)).toEqual({ reason: QUOTA, until: endPlus(second, 10 * MIN) });
+      elapse(t, 9 * MIN);
+      expect(await pollScout(t)).toBeUndefined();
+      elapse(t, MIN);
+      expect((await pollNewScout(t)).status).toBe('rate_limited');
+      await t.master.issues.poll();
+      const third = t.master.store.listScouts()[0];
+      expect(waiting(t)).toEqual({ reason: QUOTA, until: endPlus(third ?? second, 20 * MIN) });
+      expect(t.master.store.listScouts().map((s) => s.status)).toEqual([
+        'rate_limited',
+        'rate_limited',
+        'rate_limited',
+      ]);
+    });
+
+    it('keeps the streak of scouts that found nothing or failed before the limit', async () => {
+      const scripts = [nothing, broken, limited()];
+      const t = await autoScouts((n) => scripts[n - 1] ?? nothing);
+      expect((await pollNewScout(t)).status).toBe('completed');
+      elapse(t, 5 * MIN);
+      expect((await pollNewScout(t)).status).toBe('failed');
+      // Backing off after 2 in a row; a scout started by hand hits the limit meanwhile.
+      const manual = await t.master.issues.startScout('demo', 'manual');
+      expect((await scoutDone(t, manual.id)).status).toBe('rate_limited');
+      expect(scoutBackoff(t.master.store.listScouts(), 5)?.count).toBe(2);
+      // The back-off ends after the wait for the quota, so it is what holds the scout.
+      expect(await pollScout(t)).toBeUndefined();
+      const failed = t.master.store.listScouts()[1];
+      expect(failed?.status).toBe('failed');
+      expect(waiting(t)).toEqual({
+        reason: '最近 2 次侦察没有找到需求或失败，退避中',
+        until: endPlus(failed ?? manual, 10 * MIN),
+      });
+      elapse(t, 10 * MIN);
+      expect((await pollNewScout(t)).status).toBe('completed');
+      await t.master.issues.poll();
+      expect(waiting(t)?.reason).toBe('最近 3 次侦察没有找到需求或失败，退避中');
+    });
+
+    it('lets a scout started by hand run meanwhile, which ends the wait', async () => {
+      const reset = new Date(Date.now() + 30 * MIN).toISOString();
+      const t = await autoScouts((n) => (n === 1 ? limited(reset) : nothing));
+      await pollNewScout(t);
+      expect(await pollScout(t)).toBeUndefined();
+      expect(waiting(t)?.reason).toBe(QUOTA);
+
+      const manual = await t.master.issues.startScout('demo', 'manual');
+      const found = await scoutDone(t, manual.id);
+      expect(found.status).toBe('completed');
+      // It found nothing: from now on only the back-off holds the scout, not the reset time.
+      await t.master.issues.poll();
+      expect(waiting(t)).toEqual({
+        reason: '最近 1 次侦察没有找到需求或失败，退避中',
+        until: endPlus(found, 5 * MIN),
+      });
+    });
+
+    it('does not count a rate-limited scout toward interval_hours', async () => {
+      const t = await autoScouts((n) => (n === 1 ? limited() : nothing), 2);
+      expect((await pollNewScout(t)).status).toBe('rate_limited');
+      expect(await pollScout(t)).toBeUndefined();
+      expect(waiting(t)?.reason).toBe(QUOTA);
+      elapse(t, 5 * MIN);
+      expect((await pollNewScout(t)).status).toBe('completed');
+      await t.master.issues.poll();
+      expect(waiting(t)?.reason).toBe('离上次侦察不到设定的间隔');
+    });
+
+    it('says why it waits in English', async () => {
+      const reset = new Date(Date.now() + 30 * MIN).toISOString();
+      const t = await autoScouts(() => limited(reset));
+      setLang('en'); // after the Master started: it applies config.yaml's language
+      const scout = await pollNewScout(t);
+      expect(scout.error).toMatch(
+        /^The scout's agent is out of quota or rate-limited; the quota is expected back at \d{4}-\d\d-\d\d \d\d:\d\d: You have hit your limit$/,
+      );
+      await t.master.issues.poll();
+      expect(waiting(t)?.reason).toBe(
+        'The scout ran out of quota or was rate-limited; waiting for the quota to come back',
+      );
+      expect(`${scout.error}\n${waiting(t)?.reason}`).not.toMatch(/[一-鿿]/);
     });
   });
 

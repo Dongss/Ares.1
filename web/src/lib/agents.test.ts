@@ -233,6 +233,7 @@ describe('isAgentPageEvent', () => {
       'run.status',
       'scout.completed',
       'scout.failed',
+      'scout.rate_limited',
       'config.reloaded',
     ]) {
       expect(isAgentPageEvent({ type }), type).toBe(true);

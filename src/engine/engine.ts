@@ -10,7 +10,14 @@ import type {
   RateLimitedWait,
   RunWorkspaceState,
 } from '../api/types.js';
-import { discussionReplyWait } from '../config/flow.js';
+import {
+  type Backoff,
+  backoffMs,
+  discussionReplyWait,
+  RATE_LIMIT_WAIT,
+  type RateLimitWait,
+  rateLimitDelayMs,
+} from '../config/flow.js';
 import type { HomePaths, LoadedConfig } from '../config/load.js';
 import {
   type AgentConfig,
@@ -110,52 +117,11 @@ export interface EngineDeps {
   dirtyTargetCheckMs?: number;
 }
 
-/** An exponential backoff: the first wait, doubled on each further retry up to the longest. */
-export interface Backoff {
-  firstMs: number;
-  maxMs: number;
-}
-
 /**
  * Waits before retrying an agent that errored: an error is often passing (a network hiccup, an
  * overloaded service), and retrying at once tends to hit it again.
  */
 export const AGENT_RETRY_BACKOFF: Backoff = { firstMs: 30_000, maxMs: 600_000 };
-
-/** The wait before the `retry`-th retry (1 = the first). */
-export function backoffMs(backoff: Backoff, retry: number): number {
-  return Math.min(backoff.firstMs * 2 ** Math.max(0, retry - 1), backoff.maxMs);
-}
-
-/**
- * How long a Run waits when its agent is out of quota or rate-limited: until the reset time the
- * CLI gave plus `marginMs` (clocks differ, and a quota may come back a little late); without
- * one, a backoff over the limits hit in a row.
- */
-export interface RateLimitWait extends Backoff {
-  marginMs: number;
-}
-
-/** 5, 10, 20, 40 minutes, then hourly; one more minute after a reset time the CLI gave. */
-export const RATE_LIMIT_WAIT: RateLimitWait = {
-  firstMs: 300_000,
-  maxMs: 3_600_000,
-  marginMs: 60_000,
-};
-
-/**
- * The wait of a Run whose agent hit a limit: until `resetAt` (epoch ms, from the CLI) plus the
- * margin when it is still ahead, else the backoff for the `inARow`-th limit in a row.
- */
-export function rateLimitDelayMs(
-  wait: RateLimitWait,
-  now: number,
-  resetAt: number | undefined,
-  inARow: number,
-): number {
-  if (resetAt !== undefined && resetAt > now) return resetAt - now + wait.marginMs;
-  return backoffMs(wait, inARow);
-}
 
 const LEVEL_RANK = { low: 0, mid: 1, high: 2 } as const;
 

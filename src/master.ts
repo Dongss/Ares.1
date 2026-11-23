@@ -10,6 +10,7 @@ import type { AgentAdapter } from './adapters/types.js';
 import { createApi } from './api/server.js';
 import { defaultWebDir } from './api/static.js';
 import { brandName } from './brand.js';
+import type { Backoff, RateLimitWait } from './config/flow.js';
 import {
   type HomePaths,
   homePaths,
@@ -18,7 +19,7 @@ import {
   loadConfig,
 } from './config/load.js';
 import { ConfigWatcher } from './config/watch.js';
-import { type Backoff, Engine, type RateLimitWait } from './engine/engine.js';
+import { Engine } from './engine/engine.js';
 import { IssueBridge } from './github/bridge.js';
 import type { GitHub } from './github/client.js';
 import { type Lang, lang, setLang } from './i18n.js';

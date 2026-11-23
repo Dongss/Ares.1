@@ -49,6 +49,20 @@ describe('issues display', () => {
         now,
       ),
     ).toBe('离上次侦察不到设定的间隔（18:00:00 之后）');
+    expect(
+      scoutWaitText(
+        {
+          reason: '侦察遇到额度用尽或限流，等额度恢复',
+          until: new Date('2026-11-20T09:01:00').toISOString(),
+        },
+        now,
+      ),
+    ).toBe('侦察遇到额度用尽或限流，等额度恢复（11-20 09:01 之后）');
+  });
+
+  it('shows a scout whose agent ran out of quota apart from a failed one', () => {
+    expect(SCOUT_STATUS.rate_limited).toMatchObject({ label: '额度用尽/限流', tone: 'attention' });
+    expect(SCOUT_STATUS.failed.tone).toBe('danger');
   });
 
   it('describes limits', () => {
@@ -181,6 +195,10 @@ describe('issues display in English', () => {
       ...Object.values(CATEGORY),
     ];
     for (const label of labels) expect(label).not.toMatch(cjk);
+    expect(SCOUT_STATUS.rate_limited).toMatchObject({
+      label: 'Out of quota / rate-limited',
+      tone: 'attention',
+    });
     expect(RISK.mid).toMatchObject({ label: 'Medium risk', tone: 'attention' });
     expect(CATEGORY.bug).toBe('Bug');
   });

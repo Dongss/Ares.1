@@ -234,7 +234,11 @@ export interface ReplyTimeoutEntry {
 
 export type DiscussionEntry = AssessmentEntry | ReplyEntry | ReplyTimeoutEntry;
 
-export type ScoutStatus = 'running' | 'completed' | 'failed' | 'interrupted';
+/**
+ * `rate_limited`: its agent ran out of quota or was rate-limited; not a failure, the automatic
+ * scout waits for the quota (see scoutLimitWait in src/config/flow.ts).
+ */
+export type ScoutStatus = 'running' | 'completed' | 'failed' | 'interrupted' | 'rate_limited';
 
 /** One issue proposed by a scout. */
 export interface ScoutProposal {

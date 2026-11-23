@@ -1,10 +1,12 @@
 import type { ConfigView, GitHubRepoStatus, UpgradeStatus } from '../../../src/api/types.js';
 import {
   type AutoAcceptRule,
+  backoffMs,
   budgetPauses,
   effectiveBudget,
   issueRunOverrides,
   MAX_SCOUT_BACKOFF_HOURS,
+  RATE_LIMIT_WAIT,
 } from '../../../src/config/flow.js';
 import { waitText } from '../../../src/engine/discussion.js';
 import { join, t } from '../../../src/i18n.js';
@@ -603,6 +605,22 @@ export interface ScoutGuide {
   waiting: boolean;
 }
 
+/**
+ * The condition of not waiting for the scout's agent's quota, with the waits of RATE_LIMIT_WAIT:
+ * "5、10、20、40 分钟，之后每次 1 小时".
+ */
+function scoutQuotaCondition(): string {
+  const w = RATE_LIMIT_WAIT;
+  const steps: string[] = [];
+  for (let k = 1; backoffMs(w, k) < w.maxMs; k++) steps.push(String(backoffMs(w, k) / 60_000));
+  const margin = w.marginMs / 60_000;
+  const hours = w.maxMs / 3_600_000;
+  return t({
+    zh: `不在等侦察的 Agent 恢复额度：额度用尽或被限流不算失败，也不计入退避；CLI 给了额度重置时间就等到那时再多等 ${margin} 分钟，没给就按连续被限流的次数等 ${join(steps)} 分钟，之后每次 ${hours} 小时`,
+    en: `Not waiting for the scout's agent's quota: running out of quota or being rate-limited is no failure and does not count toward the back-off; it waits until the reset time the CLI gave plus ${margin} ${margin === 1 ? 'minute' : 'minutes'}, or without one ${join(steps)} minutes for the limits in a row, then ${hours === 1 ? 'every hour' : `every ${hours} hours`}`,
+  });
+}
+
 /** When the Master scouts by itself, and why it does not right now. */
 export function scoutGuide(
   input: Pick<GuideInput, 'github' | 'pollMinutes'>,
@@ -662,6 +680,7 @@ export function scoutGuide(
       zh: `不在退避：侦察没找到需求或失败后先等 ${pollMinutes} 分钟，连续每多一次等待翻倍，最长 ${MAX_SCOUT_BACKOFF_HOURS} 小时；有侦察找到了需求，或目标分支有了新提交，就不再等`,
       en: `Not backing off: after a scout finds nothing or fails it waits ${pollMinutes} ${pollMinutes === 1 ? 'minute' : 'minutes'}, twice as long for each further one in a row, up to ${MAX_SCOUT_BACKOFF_HOURS} hours; a scout that finds work, or a new commit on the target branch, ends the wait`,
     }),
+    scoutQuotaCondition(),
     github.autoAccept.maxRisk === 'none'
       ? t({
           zh: `还没处理的提案加上卡住等人的 Run 少于 ${scout.maxProposals} 个（max_proposals）`,

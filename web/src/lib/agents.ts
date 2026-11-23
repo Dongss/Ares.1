@@ -147,8 +147,13 @@ export function agentTotals(agents: AgentSummary[]): {
 export function isAgentPageEvent(e: Pick<EventRow, 'type'>): boolean {
   return (
     /^(attempt|task|stage)\./.test(e.type) ||
-    ['run.blocked', 'run.status', 'scout.completed', 'scout.failed', 'config.reloaded'].includes(
-      e.type,
-    )
+    [
+      'run.blocked',
+      'run.status',
+      'scout.completed',
+      'scout.failed',
+      'scout.rate_limited',
+      'config.reloaded',
+    ].includes(e.type)
   );
 }

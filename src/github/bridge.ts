@@ -1,7 +1,7 @@
 import { readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { prepareAgentEnv } from '../adapters/process.js';
-import type { AgentAdapter, AgentExecution } from '../adapters/types.js';
+import type { AgentAdapter, AgentExecution, AgentResult } from '../adapters/types.js';
 import type { GitHubRepoStatus, GitHubStatus } from '../api/types.js';
 import { brandName } from '../brand.js';
 import {
@@ -9,6 +9,7 @@ import {
   issueRunOverrides,
   replyTimeoutHours,
   scoutBackoff,
+  scoutLimitWait,
   splitUnfinishedRuns,
 } from '../config/flow.js';
 import { githubConfigKey, type HomePaths, type LoadedConfig } from '../config/load.js';
@@ -73,6 +74,38 @@ import {
 /** Error of a scout cut short by the Master stopping. */
 const stoppedWhileScouting = () =>
   t({ zh: 'Master 在侦察过程中停止了', en: 'The Master stopped during the scout' });
+
+const pad = (n: number) => String(n).padStart(2, '0');
+
+/** "2026-11-23 14:05", in the Master's local time. */
+function localTime(ms: number): string {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/**
+ * Error of a scout whose agent ran out of quota or was rate-limited, with when the quota is
+ * expected back if the CLI said, and what the CLI said.
+ */
+function scoutLimitedText(resetAt: number | undefined, cliError: string | undefined): string {
+  const head =
+    resetAt === undefined
+      ? t({
+          zh: '侦察的 Agent 额度用尽或被限流',
+          en: "The scout's agent is out of quota or rate-limited",
+        })
+      : t({
+          zh: `侦察的 Agent 额度用尽或被限流，预计 ${localTime(resetAt)} 恢复`,
+          en: `The scout's agent is out of quota or rate-limited; the quota is expected back at ${localTime(resetAt)}`,
+        });
+  return cliError?.trim() ? t({ zh: `${head}：${cliError}`, en: `${head}: ${cliError}` }) : head;
+}
+
+/** Of two waits, the one that ends later. */
+function laterWait(a: ScoutWait | null, b: (ScoutWait & { until: string }) | null) {
+  if (!b) return a;
+  return a?.until && Date.parse(a.until) >= Date.parse(b.until) ? a : b;
+}
 
 const notRegistered = (name: string) =>
   t({
@@ -143,8 +176,9 @@ export function startOfToday(now = new Date()): string {
  *   and a human's replies there go back to the Run;
  * - scout: an AI reads the repo and its Run history and proposes issues, on demand or by itself
  *   whenever no Run of the repo goes on by itself (backing off while scouts find nothing or
- *   fail, and capping the proposals and stuck Runs left for a human); proposals up to
- *   the configured risk are accepted without a human.
+ *   fail, waiting for the quota when its agent ran out of it, and capping the proposals and
+ *   stuck Runs left for a human); proposals up to the configured risk are accepted without a
+ *   human.
  * Intake, auto-accept and automatic scouts only happen while the work switch is on.
  * GitHub is only a mirror: failures are reported and retried on the next poll, never block Runs.
  */
@@ -160,6 +194,12 @@ export class IssueBridge {
   private readonly scouting = new Map<string, ScoutEntry>();
   /** Why no automatic scout started at the last poll, per repo name. */
   private readonly scoutWaiting = new Map<string, ScoutWait | null>();
+  /**
+   * When the quota of the agent of the repo's latest rate-limited scout comes back (epoch ms), if
+   * the CLI said; per repo id. Kept in memory only, like the engine's waits for a Run's quota:
+   * after a restart the wait goes by the scouts in a row that hit a limit (see scoutLimitWait).
+   */
+  private readonly scoutLimitResets = new Map<string, number>();
   private lastPollAt: string | null = null;
   /** Target branch commit last pushed, per repo path. */
   private readonly pushed = new Map<string, string>();
@@ -899,9 +939,10 @@ export class IssueBridge {
    * Scout by itself when there is nothing to do: the repo has no Run that goes on by itself
    * (see splitUnfinishedRuns), the proposals that hold it back (see proposalsHoldingScout) and
    * the Runs stuck waiting for a human are fewer than max_proposals together, the day's budget is
-   * not spent, the configured interval since the last scout has passed, and it is not backing off
+   * not spent, the configured interval since the last scout has passed, it is not backing off
    * after scouts that found nothing or failed (see scoutBackoff: the wait doubles with each such
-   * scout in a row, and ends once a scout files an issue or the target branch gets a new commit).
+   * scout in a row, and ends once a scout files an issue or the target branch gets a new commit),
+   * and it is not waiting for the quota of an agent that ran out of it (see scoutLimitWait).
    * Records why it waits, for the dashboard.
    */
   private async maybeAutoScout(name: string): Promise<void> {
@@ -944,9 +985,12 @@ export class IssueBridge {
         }),
       };
     }
-    // Both the set interval and the back-off hold it; it waits for the later of the two.
+    // The set interval, the back-off and the wait for the agent's quota all hold it; it waits for
+    // the latest of them.
+    const scouts = store.listScouts({ repoId: repo.id, limit: 200 });
     let wait: ScoutWait | null = null;
-    const last = this.deps.store.listScouts({ repoId: repo.id, limit: 1 })[0];
+    // A scout whose agent hit a limit did nothing, so it takes up no interval.
+    const last = scouts.find((s) => s.status !== 'rate_limited');
     if (last && scout.interval_hours > 0) {
       const next = Date.parse(last.startedAt) + scout.interval_hours * 3_600_000;
       if (next > Date.now()) {
@@ -959,10 +1003,8 @@ export class IssueBridge {
         };
       }
     }
-    const backoff = await this.scoutBackoffWait(repo);
-    if (backoff && (!wait?.until || Date.parse(backoff.until) > Date.parse(wait.until))) {
-      wait = backoff;
-    }
+    wait = laterWait(wait, await this.scoutBackoffWait(repo, scouts));
+    wait = laterWait(wait, this.scoutQuotaWait(repo, scouts));
     if (wait) return wait;
     // Do not pile up work nobody has looked at: proposals and Runs stuck waiting for a human.
     const full = await this.issuesRepo(repo, cfg);
@@ -971,7 +1013,6 @@ export class IssueBridge {
       label: LABELS.proposal,
       limit: 100,
     });
-    const scouts = store.listScouts({ repoId: repo.id, limit: 200 });
     const pending = proposalsHoldingScout(open, scouts, cfg.auto_accept.max_risk).length;
     const stuck = runs.stuck.length;
     if (pending + stuck >= scout.max_proposals) {
@@ -980,10 +1021,31 @@ export class IssueBridge {
     return null;
   }
 
-  /** The back-off after scouts that found nothing or failed, if it holds the scout now. */
-  private async scoutBackoffWait(repo: Repo): Promise<(ScoutWait & { until: string }) | null> {
+  /**
+   * The wait for the quota after the scout's agent ran out of it or was rate-limited, if it holds
+   * the scout now (see scoutLimitWait). `scouts`: the repo's, newest first.
+   */
+  private scoutQuotaWait(repo: Repo, scouts: Scout[]): (ScoutWait & { until: string }) | null {
+    const limit = scoutLimitWait(scouts, this.scoutLimitResets.get(repo.id));
+    if (!limit || Date.parse(limit.until) <= Date.now()) return null;
+    return {
+      reason: t({
+        zh: '侦察遇到额度用尽或限流，等额度恢复',
+        en: 'The scout ran out of quota or was rate-limited; waiting for the quota to come back',
+      }),
+      until: limit.until,
+    };
+  }
+
+  /**
+   * The back-off after scouts that found nothing or failed, if it holds the scout now.
+   * `scouts`: the repo's, newest first.
+   */
+  private async scoutBackoffWait(
+    repo: Repo,
+    scouts: Scout[],
+  ): Promise<(ScoutWait & { until: string }) | null> {
     const pollMinutes = this.cfg.master.github?.poll_minutes ?? 5;
-    const scouts = this.deps.store.listScouts({ repoId: repo.id, limit: 100 });
     let backoff = scoutBackoff(scouts, pollMinutes);
     if (!backoff || Date.parse(backoff.until) <= Date.now()) return null;
     // Scouts that ran before the target branch's latest commit do not count: they did not see it.
@@ -1153,6 +1215,10 @@ export class IssueBridge {
       cost = result.costUsd ?? estimateCost(agent, result.usage) ?? null;
       store.updateScout(scout.id, { costUsd: cost });
       if (this.stopping) throw new Interrupted();
+      if (result.status !== 'completed' && result.errorKind === 'rate_limited') {
+        this.scoutRateLimited(scout, repo, result, cost);
+        return;
+      }
       if (result.status !== 'completed') {
         throw new Error(
           result.error ??
@@ -1167,6 +1233,7 @@ export class IssueBridge {
         scoutCfg.max_proposals,
       );
       const created = await this.fileProposals(scout, repo, cfg, proposals);
+      this.scoutLimitResets.delete(repo.id);
       store.tx(() => {
         store.updateScout(scout.id, { status: 'completed', proposals, endedAt: nowIso() });
         store.event(null, 'scout.completed', {
@@ -1181,6 +1248,7 @@ export class IssueBridge {
       if (created.some((p) => p.issue?.auto)) void this.poll();
     } catch (err) {
       const interrupted = err instanceof Interrupted || this.stopping;
+      if (!interrupted) this.scoutLimitResets.delete(repo.id);
       store.tx(() => {
         store.updateScout(scout.id, {
           status: interrupted ? 'interrupted' : 'failed',
@@ -1197,6 +1265,39 @@ export class IssueBridge {
     } finally {
       if (workdir) await dropWorktree(repo.path, workdir);
     }
+  }
+
+  /**
+   * The scout's agent ran out of quota or was rate-limited. That passes on its own and says
+   * nothing about the repo, so the scout has not failed and does not count toward the back-off;
+   * the automatic scout waits for the quota instead (see scoutLimitWait). The CLI's reset time is
+   * kept in memory only.
+   */
+  private scoutRateLimited(
+    scout: Scout,
+    repo: Repo,
+    result: AgentResult,
+    cost: number | null,
+  ): void {
+    const parsed = result.retryAt ? Date.parse(result.retryAt) : Number.NaN;
+    const resetAt = Number.isNaN(parsed) ? undefined : parsed;
+    if (resetAt === undefined) this.scoutLimitResets.delete(repo.id);
+    else this.scoutLimitResets.set(repo.id, resetAt);
+    const store = this.deps.store;
+    store.tx(() => {
+      store.updateScout(scout.id, {
+        status: 'rate_limited',
+        error: scoutLimitedText(resetAt, result.error),
+        costUsd: cost,
+        endedAt: nowIso(),
+      });
+      store.event(null, 'scout.rate_limited', {
+        scoutId: scout.id,
+        repo: repo.name,
+        // When the quota is expected back, if the CLI said.
+        ...(resetAt === undefined ? {} : { retryAt: new Date(resetAt).toISOString() }),
+      });
+    });
   }
 
   /** Create an issue per proposal; low-risk ones are auto-accepted within today's limits. */

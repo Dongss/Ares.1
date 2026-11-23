@@ -6,7 +6,10 @@ import {
   discussionReplyWait,
   issueRunOverrides,
   loopsExhausted,
+  RATE_LIMIT_WAIT,
+  rateLimitDelayMs,
   scoutBackoff,
+  scoutLimitWait,
   splitUnfinishedRuns,
 } from '../src/config/flow.js';
 import { ConfigError, homePaths, initHome, loadConfig } from '../src/config/load.js';
@@ -1032,6 +1035,78 @@ describe('scoutBackoff', () => {
   it('counts from the start of a scout that has no end', () => {
     const scouts = [{ ...scout(10, 'failed'), endedAt: null }];
     expect(scoutBackoff(scouts, 5)).toEqual({ count: 1, until: at(15) });
+  });
+
+  it('neither counts nor ends the streak at scouts whose agent hit a limit', () => {
+    const scouts = [
+      scout(60, 'rate_limited'),
+      scout(50, 'rate_limited'),
+      scout(40, 'failed'),
+      scout(30, 'rate_limited'),
+      scout(20, 'completed'),
+      scout(10, 'completed', filed),
+    ];
+    // The streak counted from the failure at 40, as if the limited scouts had not been.
+    expect(scoutBackoff(scouts, 5)).toEqual({ count: 2, until: at(41 + 10) });
+    expect(scoutBackoff([scout(10, 'rate_limited')], 5)).toBeNull();
+    expect(scoutBackoff([scout(20, 'rate_limited'), scout(10, 'completed', filed)], 5)).toBeNull();
+  });
+});
+
+describe('scoutLimitWait', () => {
+  const at = (min: number) => new Date(Date.UTC(2026, 10, 20, 0, min)).toISOString();
+  /** A scout that started at minute `min` and ran a minute. */
+  const scout = (min: number, status: Scout['status']) => ({
+    status,
+    startedAt: at(min),
+    endedAt: status === 'running' ? null : at(min + 1),
+  });
+  const limitedInARow = (n: number) =>
+    Array.from({ length: n }, (_, i) => scout(1000 - i * 100, 'rate_limited'));
+
+  it('waits only while the newest scout that ended hit a limit', () => {
+    expect(scoutLimitWait([])).toBeNull();
+    expect(scoutLimitWait([scout(10, 'completed')])).toBeNull();
+    expect(scoutLimitWait([scout(20, 'failed'), scout(10, 'rate_limited')])).toBeNull();
+    // A reset time left over from an older limit does not hold a scout that ended otherwise.
+    const after = [scout(20, 'completed'), scout(10, 'rate_limited')];
+    expect(scoutLimitWait(after, Date.parse(at(300)))).toBeNull();
+  });
+
+  it('waits until the reset time the CLI gave, plus a minute', () => {
+    const scouts = [scout(10, 'rate_limited'), scout(0, 'rate_limited')];
+    expect(scoutLimitWait(scouts, Date.parse(at(200)))).toEqual({ count: 2, until: at(201) });
+    // A reset time already past when the scout ended: as without one.
+    expect(scoutLimitWait(scouts, Date.parse(at(5)))).toEqual({ count: 2, until: at(11 + 10) });
+  });
+
+  it('without a reset time waits 5, 10, 20, 40 minutes, then hourly, over the limits in a row', () => {
+    const waits = [1, 2, 3, 4, 5, 6].map((n) => scoutLimitWait(limitedInARow(n)));
+    expect(waits.map((w) => w?.count)).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(waits.map((w) => w?.until)).toEqual([5, 10, 20, 40, 60, 60].map((m) => at(1001 + m)));
+    // The same rule as a Run whose agent hit a limit.
+    expect(waits.map((w) => Date.parse(w?.until ?? '') - Date.parse(at(1001)))).toEqual(
+      [1, 2, 3, 4, 5, 6].map((n) => rateLimitDelayMs(RATE_LIMIT_WAIT, 0, undefined, n)),
+    );
+  });
+
+  it('skips scouts the Master cut short or still running, and stops counting at any other', () => {
+    const scouts = [
+      scout(50, 'running'),
+      scout(40, 'interrupted'),
+      scout(30, 'rate_limited'),
+      scout(20, 'interrupted'),
+      scout(15, 'rate_limited'),
+      scout(10, 'failed'),
+      scout(5, 'rate_limited'),
+    ];
+    expect(scoutLimitWait(scouts)).toEqual({ count: 2, until: at(31 + 10) });
+    expect(scoutLimitWait([scout(10, 'interrupted')])).toBeNull();
+  });
+
+  it('counts from the start of a scout that has no end', () => {
+    const scouts = [{ ...scout(10, 'rate_limited'), endedAt: null }];
+    expect(scoutLimitWait(scouts)).toEqual({ count: 1, until: at(15) });
   });
 });
 

@@ -5,13 +5,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { FakeAdapter, type FakeContext, type FakeOutcome } from '../src/adapters/fake.js';
 import { AGENT_GH_TOKEN } from '../src/adapters/process.js';
 import type { AgentAdapter } from '../src/adapters/types.js';
-import {
-  AGENT_RETRY_BACKOFF,
-  backoffMs,
-  InvalidStateError,
-  RATE_LIMIT_WAIT,
-  rateLimitDelayMs,
-} from '../src/engine/engine.js';
+import { backoffMs, RATE_LIMIT_WAIT, rateLimitDelayMs } from '../src/config/flow.js';
+import { AGENT_RETRY_BACKOFF, InvalidStateError } from '../src/engine/engine.js';
 import { setLang } from '../src/i18n.js';
 import { noticeFor } from '../src/notify/notice.js';
 import { NotFoundError } from '../src/store/store.js';

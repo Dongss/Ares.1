@@ -1,6 +1,7 @@
 // How a workflow template flows: effective stage settings, verify commands and rollback targets;
 // also the overrides of Runs from issues, which proposals are accepted automatically, how long
-// the automatic scout backs off and which unfinished Runs it waits for.
+// the automatic scout backs off and which unfinished Runs it waits for, and how long a Run or a
+// scout waits for an agent that is out of quota or rate-limited.
 // Pure logic (type imports, src/i18n.ts, src/store/types.ts and src/engine/discussion.ts only),
 // so the dashboard shows the same rules the engine applies.
 
@@ -221,6 +222,81 @@ export function issueRunOverrides(
   return { stages: Object.fromEntries(merges.map((st) => [st.id, { gate: false }])) };
 }
 
+/** An exponential backoff: the first wait, doubled on each further retry up to the longest. */
+export interface Backoff {
+  firstMs: number;
+  maxMs: number;
+}
+
+/** The wait before the `retry`-th retry (1 = the first). */
+export function backoffMs(backoff: Backoff, retry: number): number {
+  return Math.min(backoff.firstMs * 2 ** Math.max(0, retry - 1), backoff.maxMs);
+}
+
+/**
+ * How long a Run or a scout waits when its agent is out of quota or rate-limited: until the reset
+ * time the CLI gave plus `marginMs` (clocks differ, and a quota may come back a little late);
+ * without one, a backoff over the limits hit in a row.
+ */
+export interface RateLimitWait extends Backoff {
+  marginMs: number;
+}
+
+/** 5, 10, 20, 40 minutes, then hourly; one more minute after a reset time the CLI gave. */
+export const RATE_LIMIT_WAIT: RateLimitWait = {
+  firstMs: 300_000,
+  maxMs: 3_600_000,
+  marginMs: 60_000,
+};
+
+/**
+ * The wait after an agent hit a limit at `now`: until `resetAt` (epoch ms, from the CLI) plus the
+ * margin when it is still ahead, else the backoff for the `inARow`-th limit in a row.
+ */
+export function rateLimitDelayMs(
+  wait: RateLimitWait,
+  now: number,
+  resetAt: number | undefined,
+  inARow: number,
+): number {
+  if (resetAt !== undefined && resetAt > now) return resetAt - now + wait.marginMs;
+  return backoffMs(wait, inARow);
+}
+
+export interface ScoutLimitWait {
+  /** Scouts in a row, counting back from the newest, whose agent hit a limit. */
+  count: number;
+  /** When the next automatic scout may start. */
+  until: string;
+}
+
+/**
+ * How long the automatic scout waits after its agent ran out of quota or was rate-limited: the
+ * same rule as a Run's (`rateLimitDelayMs`), counted from when the newest such scout ended. Until
+ * `resetAt` (epoch ms, the reset time the CLI gave for that scout) plus the margin; without one,
+ * 5, 10, 20, 40 minutes, then hourly over the scouts in a row that hit a limit. Only while the
+ * newest scout that was not cut short by the Master stopping (nor is still running) hit a limit;
+ * a scout that ends any other way ends the wait. `scouts` are newest first. null: no wait.
+ */
+export function scoutLimitWait(
+  scouts: Pick<Scout, 'status' | 'startedAt' | 'endedAt'>[],
+  resetAt?: number,
+  wait: RateLimitWait = RATE_LIMIT_WAIT,
+): ScoutLimitWait | null {
+  let count = 0;
+  let newest: (typeof scouts)[number] | undefined;
+  for (const s of scouts) {
+    if (s.status === 'interrupted' || s.status === 'running') continue;
+    if (s.status !== 'rate_limited') break;
+    count++;
+    newest ??= s;
+  }
+  if (!newest) return null;
+  const from = Date.parse(newest.endedAt ?? newest.startedAt);
+  const until = from + rateLimitDelayMs(wait, from, resetAt, count);
+  return { count, until: new Date(until).toISOString() };
+}
+
 /** The longest the automatic scout backs off after scouts that found nothing or failed. */
 export const MAX_SCOUT_BACKOFF_HOURS = 6;
 
@@ -241,6 +317,8 @@ export interface ScoutBackoff {
  * - So does a scout started before `changedAt` (the target branch's latest commit): it did not
  *   see the repo as it is now.
  * - A scout cut short by the Master stopping, or still running, neither counts nor ends it.
+ * - Nor does a scout whose agent ran out of quota or was rate-limited: it says nothing about the
+ *   repo, and waits for the quota apart (see scoutLimitWait).
  * `scouts` are newest first. null: no streak, no back-off.
  */
 export function scoutBackoff(
@@ -251,7 +329,9 @@ export function scoutBackoff(
   let count = 0;
   let newest: (typeof scouts)[number] | undefined;
   for (const s of scouts) {
-    if (s.status === 'interrupted' || s.status === 'running') continue;
+    if (s.status === 'interrupted' || s.status === 'running' || s.status === 'rate_limited') {
+      continue;
+    }
     if (Date.parse(s.startedAt) < changedAt) break;
     if (s.status === 'completed' && s.proposals.some((p) => p.issue)) break;
     count++;

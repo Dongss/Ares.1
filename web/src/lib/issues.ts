@@ -30,6 +30,7 @@ export const SCOUT_STATUS: Record<ScoutStatus, { readonly label: string; tone: T
   completed: badge('已完成', 'Done', 'success'),
   failed: badge('失败', 'Failed', 'danger'),
   interrupted: badge('被中断', 'Interrupted', 'muted'),
+  rate_limited: badge('额度用尽/限流', 'Out of quota / rate-limited', 'attention'),
 };
 
 export const RISK: Record<ScoutProposal['risk'], { readonly label: string; tone: Tone }> = {
