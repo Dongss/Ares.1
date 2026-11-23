@@ -33,9 +33,24 @@ export interface UpgraderDeps {
   busy: () => boolean;
   /** Start the upgrade script and stop this Master. */
   launch: (plan: UpgradePlan) => Promise<void>;
+  /** Whether the node this Master runs on is gone; default `execPathMissing`. */
+  nodeMissing?: () => boolean;
+  /** The current time in epoch milliseconds (tests move it on); default Date.now. */
+  now?: () => number;
+}
+
+/**
+ * Whether the node this process runs on is gone: a version manager (nvm) deletes a version's
+ * directory when it is uninstalled. The process keeps running, but whatever it starts that needs
+ * that node (npm, through a PATH that still leads there) no longer finds it.
+ */
+export function execPathMissing(): boolean {
+  return !existsSync(process.execPath);
 }
 
 const CHECK_EVERY_MS = 2 * 60_000;
+/** The longest wait before trying again a target whose upgrade failed for the environment. */
+const MAX_ENV_RETRY_MS = 60 * 60_000;
 const FAILED_KEY = 'upgrade.failed_to';
 /**
  * The commit the launched script was asked to upgrade to. A failed result is recorded against it
@@ -52,8 +67,35 @@ const UpgradeResultSchema = z.object({
   message: z.string().optional(),
   /** On failure, the end of the output that says why (the build's, or the new Master's). */
   detail: z.string().optional(),
+  /**
+   * The failure is the environment's, not the commit's: the script found no usable node, or no
+   * npm (the build exited with 127).
+   */
+  env: z.boolean().optional(),
 });
 type UpgradeResult = z.infer<typeof UpgradeResultSchema>;
+
+/**
+ * A target whose upgrade failed for the environment (`env` in the result): it is not given up like
+ * other failures, but tried again from `after` on, once the environment may be fixed. The wait
+ * doubles with each such failure of the same target (`failures`), from one check interval up to
+ * `MAX_ENV_RETRY_MS`, so that an environment that stays broken does not stop and rebuild the
+ * Master every few minutes.
+ */
+const ENV_RETRY_KEY = 'upgrade.env_retry';
+
+const EnvRetrySchema = z.object({
+  to: z.string(),
+  failures: z.number().int().positive(),
+  /** Not before this, in epoch milliseconds. */
+  after: z.number(),
+});
+type EnvRetry = z.infer<typeof EnvRetrySchema>;
+
+/** How long to wait before trying a target again after its `failures`-th environment failure. */
+export function envRetryDelayMs(failures: number): number {
+  return Math.min(CHECK_EVERY_MS * 2 ** Math.max(0, failures - 1), MAX_ENV_RETRY_MS);
+}
 
 /**
  * The last upgrade the script tried that failed, kept until an upgrade succeeds: the scout of the
@@ -125,7 +167,12 @@ function readResult(file: string): UpgradeResult {
  * minutes (ARES1_UPGRADE_WATCH in the environment sets the seconds): an exit with a non-zero code
  * meanwhile rolls back too, an exit with 0 (stopped on purpose, or handing over to the next
  * upgrade) does not. A target that failed once (pulling, building, starting it or keeping it
- * running) is not retried; a newer commit on origin is.
+ * running) is not retried; a newer commit on origin is. A failure the script puts down to the
+ * environment (no node or npm) is retried, after a wait (`ENV_RETRY_KEY`).
+ *
+ * The node this Master runs on may be deleted under it (`nodeMissing`; a version manager switched
+ * versions): then it restarts through the same script on the commit it runs, and the script finds
+ * the node to use.
  *
  * A failure found while watching comes after the new version already read the success the script
  * wrote before starting it, and cleared the planned target; the failure is then recorded against
@@ -176,6 +223,22 @@ export class Upgrader {
     this.soon = setTimeout(() => void this.check(), delayMs);
   }
 
+  private now(): number {
+    return (this.deps.now ?? Date.now)();
+  }
+
+  /** The target waiting to be tried again after failing for the environment, if any. */
+  private envRetry(): EnvRetry | null {
+    const value = this.deps.store.getSetting(ENV_RETRY_KEY);
+    if (!value) return null;
+    try {
+      const parsed = EnvRetrySchema.safeParse(JSON.parse(value));
+      return parsed.success ? parsed.data : null;
+    } catch {
+      return null;
+    }
+  }
+
   /** Report what the last upgrade script did, once. */
   private reportResult(): void {
     if (!existsSync(this.resultFile)) return;
@@ -185,6 +248,8 @@ export class Upgrader {
     store.tx(() => {
       const target = store.getSetting(TARGET_KEY);
       store.setSetting(TARGET_KEY, null);
+      const envBefore = this.envRetry();
+      store.setSetting(ENV_RETRY_KEY, null);
       if (result.ok) {
         store.setSetting(FAILED_KEY, null);
         store.setSetting(LAST_FAILURE_KEY, null);
@@ -192,7 +257,20 @@ export class Upgrader {
       } else {
         // Without a planned target, trust the script's `to` only if it moved past `from`.
         const failed = target ?? (result.to && result.to !== result.from ? result.to : '');
-        if (failed) store.setSetting(FAILED_KEY, failed);
+        // The environment's failure says nothing about the commit: try it again later.
+        let repeated = false;
+        if (result.env && failed) {
+          const failures = envBefore?.to === failed ? envBefore.failures + 1 : 1;
+          repeated = failures > 1;
+          const retry: EnvRetry = {
+            to: failed,
+            failures,
+            after: this.now() + envRetryDelayMs(failures),
+          };
+          store.setSetting(ENV_RETRY_KEY, JSON.stringify(retry));
+        } else if (failed) {
+          store.setSetting(FAILED_KEY, failed);
+        }
         const message = result.message || t({ zh: '升级失败', en: 'The upgrade failed' });
         const detail = result.detail?.trim() ? result.detail : null;
         const failure: UpgradeFailure = {
@@ -208,6 +286,9 @@ export class Upgrader {
           to: failed,
           message,
           ...(detail ? { detail } : {}),
+          // The same environment problem again: notified the first time (notice.ts).
+          ...(result.env ? { env: true } : {}),
+          ...(repeated ? { repeated: true } : {}),
         });
       }
     });
@@ -246,6 +327,7 @@ export class Upgrader {
     const { engine, store, installDir } = this.deps;
     if (this.launched) return;
     this.reportResult();
+    if ((this.deps.nodeMissing ?? execPathMissing)()) return this.restartForNode();
     const release = () => {
       if (engine.held) engine.hold(false);
     };
@@ -318,6 +400,21 @@ export class Upgrader {
         }),
       );
     }
+    const envRetry = this.envRetry();
+    if (envRetry?.to === to && envRetry.after > this.now()) {
+      release();
+      const after = new Date(envRetry.after);
+      const at = [after.getHours(), after.getMinutes()]
+        .map((n) => String(n).padStart(2, '0'))
+        .join(':');
+      return this.set(
+        'skipped',
+        t({
+          zh: `升级到 ${to.slice(0, 7)} 时找不到能用的 node 或 npm（运行环境的问题），${at} 之后再试`,
+          en: `Upgrading to ${to.slice(0, 7)} found no usable node or npm (a problem of the environment); trying again after ${at}`,
+        }),
+      );
+    }
     // Let the executing Run (and a scout) finish; start nothing new meanwhile.
     engine.hold(true);
     if (engine.activeRunId || this.deps.busy()) {
@@ -335,12 +432,18 @@ export class Upgrader {
       store.setSetting(TARGET_KEY, to);
       store.event(null, 'upgrade.started', { from, to });
     });
+    await this.handOver({ installDir, from, to, resultFile: this.resultFile });
+  }
+
+  /** Start the script (which stops this Master); a script that could not start is a problem. */
+  private async handOver(plan: UpgradePlan): Promise<void> {
+    const { engine, store } = this.deps;
     try {
-      await this.deps.launch({ installDir, from, to, resultFile: this.resultFile });
+      await this.deps.launch(plan);
     } catch (err) {
       this.launched = false;
       store.setSetting(TARGET_KEY, null);
-      release();
+      if (engine.held) engine.hold(false);
       this.problem(
         t({
           zh: `启动升级失败：${errorMessage(err)}`,
@@ -348,5 +451,54 @@ export class Upgrader {
         }),
       );
     }
+  }
+
+  /**
+   * The node this Master runs on is gone (a version manager deleted it): the commands it runs
+   * would no longer find node or npm, and nothing this process does brings them back. It restarts
+   * through the upgrade script on the commit it runs (`to` equals `from`); the script finds the
+   * node to use, builds and starts the Master, and rolls back like after a failed upgrade. Nothing
+   * is waited for, since no Run can pass its checks meanwhile: closing interrupts the executing
+   * Run and any scout, and the next Master recovers the Run like after any restart, and Runs
+   * blocked on the environment go on (`Engine.start`). Neither `upgrade.auto` nor the work switch
+   * matter: this keeps the Master running and does not change its version.
+   */
+  private async restartForNode(): Promise<void> {
+    const { engine, store, installDir } = this.deps;
+    const node = process.execPath;
+    if (!installDir) {
+      return this.problem(
+        t({
+          zh: `Master 正在用的 node（${node}）已经不存在了（比如换 Node 版本时被删掉），这个 Master 不是从构建产物（dist/cli.js）启动的，不能自己重启，请手动重启它`,
+          en: `The node this Master runs on (${node}) is gone (deleted when switching Node versions, say), and this Master was not started from a build (dist/cli.js), so it cannot restart itself; please restart it by hand`,
+        }),
+      );
+    }
+    let from: string;
+    try {
+      from = await revParse(installDir, 'HEAD');
+    } catch (err) {
+      return this.problem(
+        t({
+          zh: `Master 正在用的 node（${node}）已经不存在了，但读不出当前的提交，没法重启：${errorMessage(err)}`,
+          en: `The node this Master runs on (${node}) is gone, but the current commit could not be read, so it cannot restart: ${errorMessage(err)}`,
+        }),
+      );
+    }
+    if (this.launched) return;
+    this.launched = true;
+    engine.hold(true);
+    const message = t({
+      zh: `Master 正在用的 node（${node}）已经不存在了（比如换 Node 版本时被删掉），检查命令跑不了；正在找能用的 node，在当前版本 ${from.slice(0, 7)} 上重启，手上的 Run 重启后接着做`,
+      en: `The node this Master runs on (${node}) is gone (deleted when switching Node versions, say), so no checks can run; finding a usable node and restarting on the same version ${from.slice(0, 7)}, and the Runs in hand go on after the restart`,
+    });
+    this.set('upgrading', message);
+    console.warn(message);
+    store.tx(() => {
+      store.setSetting(TARGET_KEY, from);
+      store.event(null, 'master.node_missing', { node, commit: from });
+      store.event(null, 'upgrade.started', { from, to: from, reason: 'node_missing' });
+    });
+    await this.handOver({ installDir, from, to: from, resultFile: this.resultFile });
   }
 }

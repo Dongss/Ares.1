@@ -17,7 +17,7 @@ import {
   FINISHED_RUN_STATUSES,
   type Run,
 } from '../../../src/store/types.js';
-import { formatTime, type Tone } from './format.js';
+import { formatTime, missingCommandText, type Tone } from './format.js';
 
 export interface HomeGroups {
   /** Waiting for a human: approvals and blocked Runs, oldest first. */
@@ -279,6 +279,35 @@ export function eventText(event: Pick<EventRow, 'type' | 'data'>, now = new Date
     if (typeof agentId === 'string' && typeof retryAt === 'string') {
       return rateLimitText({ agentId, retryAt }, now);
     }
+  }
+  if (event.type === 'run.blocked' && event.data.kind === 'environment') {
+    const { missing } = event.data;
+    if (typeof missing === 'string') {
+      return t({
+        zh: `${missingCommandText(missing)}：命令没能运行，这不是代码的问题，不返工，也不消耗返工和重做次数；找到它或 Master 重启后自动接着做`,
+        en: `${missingCommandText(missing)}: the commands could not run, which is no fault of the code, so there is no rework and no rework or redo is used up; the Run goes on by itself once it is found or the Master restarts`,
+      });
+    }
+  }
+  if (event.type === 'environment.resumed') {
+    const { missing, reason } = event.data;
+    const what =
+      typeof missing === 'string' ? missing : t({ zh: '缺的命令', en: 'the missing program' });
+    return reason === 'restart'
+      ? t({
+          zh: `Master 重启了，在新的运行环境里重新运行之前因为找不到 ${what} 没能运行的命令`,
+          en: `The Master restarted, so the commands that could not find ${what} run again in its environment`,
+        })
+      : t({
+          zh: `运行环境里又能找到 ${what} 了，自动接着做`,
+          en: `${what} is found in the environment again, so the Run goes on by itself`,
+        });
+  }
+  if (event.type === 'task.verify_resumed') {
+    return t({
+      zh: 'Agent 的改动还在工作目录里，只重新运行检查命令',
+      en: "The agent's changes are still in the worktree, so only the verify commands run again",
+    });
   }
   const { reason, supersededBy } = event.data;
   if (reason === 'superseded' && typeof supersededBy === 'string') {

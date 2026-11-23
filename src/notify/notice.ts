@@ -32,8 +32,17 @@ export const BLOCK_KIND: Record<BlockKind, string> = localized<BlockKind, string
     zh: 'issue 作者不是仓库成员，等你确认需求',
     en: 'Issue by a non-member: confirm the requirement',
   },
+  environment: { zh: '运行环境缺少命令', en: 'Command missing from the environment' },
   error: { zh: 'Master 内部错误', en: 'Master internal error' },
 });
+
+/**
+ * Why a Run is blocked on the environment, naming the program that could not be found (the
+ * block's `missing`): 「运行环境里找不到 npm」.
+ */
+export function missingCommandText(missing: string): string {
+  return t({ zh: `运行环境里找不到 ${missing}`, en: `${missing} not found in the environment` });
+}
 
 /** The kinds of things a human is notified about. */
 export type NoticeKind =
@@ -78,11 +87,11 @@ export const NOTICE_KINDS: Record<NoticeKind, { label: string; when: string }> =
   blocked: {
     zh: {
       label: 'Run 卡住了',
-      when: 'Run 停下来等你处理，标题后面写着原因，例如目标分支有未提交的改动，或配置为等人时超出预算（on_budget_exceeded: pause）、返工次数用完仍未通过（on_exhausted: human）',
+      when: 'Run 停下来等你处理，标题后面写着原因，例如目标分支有未提交的改动、运行环境里找不到检查命令要用的程序（比如换 Node 版本后找不到 npm），或配置为等人时超出预算（on_budget_exceeded: pause）、返工次数用完仍未通过（on_exhausted: human）',
     },
     en: {
       label: 'Run is stuck',
-      when: 'A Run stopped and waits for you, with the reason after the title, e.g. uncommitted changes on the target branch, or, when set to wait for a human, over budget (on_budget_exceeded: pause) or still failing after all retries (on_exhausted: human)',
+      when: 'A Run stopped and waits for you, with the reason after the title, e.g. uncommitted changes on the target branch, a program the checks need missing from the environment (npm after switching Node versions, say), or, when set to wait for a human, over budget (on_budget_exceeded: pause) or still failing after all retries (on_exhausted: human)',
     },
   },
   failed: {
@@ -118,11 +127,11 @@ export const NOTICE_KINDS: Record<NoticeKind, { label: string; when: string }> =
   upgrade: {
     zh: {
       label: 'Master 自动升级失败',
-      when: '升级失败并已回退到旧版本，或安装目录有未提交的改动、与 origin 分叉，需要你处理',
+      when: '升级失败并已回退到旧版本，或安装目录有未提交的改动、与 origin 分叉，需要你处理；因为找不到 node 或 npm 而失败的，同一个提交反复失败时只通知第一次',
     },
     en: {
       label: 'Master auto-upgrade failed',
-      when: 'An upgrade failed and was rolled back, or the install directory has uncommitted changes or diverged from origin, and needs you',
+      when: 'An upgrade failed and was rolled back, or the install directory has uncommitted changes or diverged from origin, and needs you; when no node or npm was found, only the first of repeated failures of a commit is notified',
     },
   },
 });
@@ -166,6 +175,9 @@ export function noticeFor(event: EventRow, goal: string | undefined): Notice | n
     case 'run.blocked':
       // Questions about the requirement are a conversation, not a breakdown.
       if (event.data.kind === 'discussion') return run('discussion');
+      if (event.data.kind === 'environment' && typeof event.data.missing === 'string') {
+        return run('blocked', missingCommandText(event.data.missing));
+      }
       return run('blocked', BLOCK_KIND[event.data.kind as BlockKind]);
     case 'run.status':
       return event.data.status === 'failed' ? run('failed') : null;
@@ -192,6 +204,8 @@ export function noticeFor(event: EventRow, goal: string | undefined): Notice | n
         about: 'issues',
       };
     case 'upgrade.failed':
+      // The same environment problem failing the same target again: told the first time.
+      if (event.data.repeated === true) return null;
       return {
         kind: 'upgrade',
         title: titleOf('upgrade'),

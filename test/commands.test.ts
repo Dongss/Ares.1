@@ -1,7 +1,15 @@
+import { chmodSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { AGENT_GH_TOKEN, agentEnv } from '../src/adapters/process.js';
-import { formatCommandFailure, runCommand, runCommands } from '../src/verify/commands.js';
+import {
+  environmentProblem,
+  firstProgram,
+  formatCommandFailure,
+  missingProgram,
+  runCommand,
+  runCommands,
+} from '../src/verify/commands.js';
 import { readEnvFile, tmpDir } from './helpers.js';
 
 describe('runCommand', () => {
@@ -81,5 +89,82 @@ describe('runCommand', () => {
     const agent = await runCommand(fill, dir, { ...opts, env: agentEnv(base, join(dir, 'gh')) });
     expect(agent.passed).toBe(false);
     expect(agent.outputTail).not.toContain('leaked');
+  });
+});
+
+describe('firstProgram', () => {
+  it('finds the program a command line starts first', () => {
+    expect(firstProgram('npm test')).toBe('npm');
+    expect(firstProgram('  npm ci --no-audit && npm run build')).toBe('npm');
+    expect(firstProgram('CI=1 FOO=bar npx vitest run; echo done')).toBe('npx');
+    expect(firstProgram('env -i PATH=/x node --version | head')).toBe('node');
+    expect(firstProgram('exec pnpm lint')).toBe('pnpm');
+    expect(firstProgram('"npm" test')).toBe('npm');
+    expect(firstProgram('/usr/local/bin/npm test')).toBe('/usr/local/bin/npm');
+  });
+
+  it('gives up on what only the shell can tell', () => {
+    expect(firstProgram('cd web && npm test')).toBeNull();
+    expect(firstProgram('(cd web && npm test)')).toBeNull();
+    expect(firstProgram('if true; then npm test; fi')).toBeNull();
+    expect(firstProgram('$NPM test')).toBeNull();
+    expect(firstProgram('~/bin/check')).toBeNull();
+    expect(firstProgram('   ')).toBeNull();
+  });
+});
+
+describe('environmentProblem', () => {
+  /** A directory holding executable scripts `name` → body. */
+  function bin(scripts: Record<string, string>): string {
+    const dir = tmpDir('ares1-bin-');
+    for (const [name, body] of Object.entries(scripts)) {
+      writeFileSync(join(dir, name), body);
+      chmodSync(join(dir, name), 0o755);
+    }
+    return dir;
+  }
+
+  async function run(command: string, path: string) {
+    const dir = tmpDir();
+    const env = { ...process.env, PATH: path };
+    const result = await runCommand(command, dir, {
+      timeoutMs: 10_000,
+      logPath: join(dir, 'logs', 'verify.log'),
+      env,
+    });
+    return { result, env };
+  }
+
+  const system = '/usr/bin:/bin';
+
+  it('names the program the shell could not find (exit code 127)', async () => {
+    const { result, env } = await run('ares1-no-such-tool --check', system);
+    expect(result.exitCode).toBe(127);
+    expect(environmentProblem(result, env)).toBe('ares1-no-such-tool');
+    // An absolute path that is not there counts the same.
+    const gone = await run('/nowhere/bin/npm test', system);
+    expect(environmentProblem(gone.result, gone.env)).toBe('/nowhere/bin/npm');
+  });
+
+  it("names a script's missing interpreter, as npm's #!/usr/bin/env node with node gone", async () => {
+    const dir = bin({ 'fake-npm': '#!/usr/bin/env ares1-no-such-node\nconsole.log(1)\n' });
+    const { result, env } = await run('fake-npm test', `${dir}:${system}`);
+    expect(result.exitCode).toBe(127);
+    expect(environmentProblem(result, env)).toBe('ares1-no-such-node');
+    expect(missingProgram('fake-npm', env)).toBe('ares1-no-such-node');
+    expect(missingProgram('sh', env)).toBeNull();
+  });
+
+  it('leaves a 127 from inside a program that is there, or a relative path, to the code', async () => {
+    // e.g. an npm script calling a tool the repo does not install.
+    const inside = await run('sh -c "ares1-no-such-tool"', system);
+    expect(inside.result.exitCode).toBe(127);
+    expect(environmentProblem(inside.result, inside.env)).toBeNull();
+    const relative = await run('./scripts/check.sh', system);
+    expect(relative.result.exitCode).toBe(127);
+    expect(environmentProblem(relative.result, relative.env)).toBeNull();
+    // Other failures are the code's too.
+    const failed = await run('false', system);
+    expect(environmentProblem(failed.result, failed.env)).toBeNull();
   });
 });

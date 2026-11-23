@@ -425,6 +425,40 @@ describe('rate limits', () => {
   });
 });
 
+describe('a program missing from the environment', () => {
+  afterEach(() => setLang('zh'));
+  const blocked = { type: 'run.blocked', data: { kind: 'environment', missing: 'npm' } };
+
+  it('words the block and the resumption from their data', () => {
+    expect(eventText(blocked)).toBe(
+      '运行环境里找不到 npm：命令没能运行，这不是代码的问题，不返工，也不消耗返工和重做次数；找到它或 Master 重启后自动接着做',
+    );
+    expect(
+      eventText({ type: 'environment.resumed', data: { reason: 'found', missing: 'npm' } }),
+    ).toBe('运行环境里又能找到 npm 了，自动接着做');
+    expect(
+      eventText({ type: 'environment.resumed', data: { reason: 'restart', missing: 'npm' } }),
+    ).toBe('Master 重启了，在新的运行环境里重新运行之前因为找不到 npm 没能运行的命令');
+    // Other blocks only show their data.
+    expect(eventText({ type: 'run.blocked', data: { kind: 'budget' } })).toBeNull();
+  });
+
+  it('in English', () => {
+    setLang('en');
+    const texts = [
+      eventText(blocked),
+      eventText({ type: 'environment.resumed', data: { reason: 'found', missing: 'npm' } }),
+      eventText({ type: 'environment.resumed', data: { reason: 'restart' } }),
+      eventText({ type: 'task.verify_resumed', data: {} }),
+    ];
+    expect(texts[0]).toBe(
+      'npm not found in the environment: the commands could not run, which is no fault of the code, so there is no rework and no rework or redo is used up; the Run goes on by itself once it is found or the Master restarts',
+    );
+    expect(texts[1]).toBe('npm is found in the environment again, so the Run goes on by itself');
+    for (const text of texts) expect(text).not.toMatch(/[一-鿿]/);
+  });
+});
+
 describe('superseded workspaces', () => {
   afterEach(() => setLang('zh'));
   const superseded = { reason: 'superseded', supersededBy: 'run_ok' };

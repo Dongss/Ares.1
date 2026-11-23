@@ -25,7 +25,12 @@ import type { GitHub } from './github/client.js';
 import { type Lang, lang, setLang } from './i18n.js';
 import { type SendNotice, SystemNotifier } from './notify/system.js';
 import { backupRestoredNotice, Store } from './store/store.js';
-import { copyUpgradeScript, type UpgradePlan, Upgrader } from './upgrade/upgrader.js';
+import {
+  copyUpgradeScript,
+  execPathMissing,
+  type UpgradePlan,
+  Upgrader,
+} from './upgrade/upgrader.js';
 import { newId, nowIso, parseJson } from './util.js';
 import { git, revParse } from './workspace/git.js';
 
@@ -59,6 +64,11 @@ export interface MasterOptions {
   launchUpgrade?: (plan: UpgradePlan) => void;
   /** End the process after handing over to the upgrade script (default process.exit). */
   exit?: () => void;
+  /**
+   * Whether the node this Master runs on is gone, e.g. deleted by a version manager (tests
+   * replace it); default: `process.execPath` no longer exists.
+   */
+  nodeMissing?: () => boolean;
   /** Send a system notification (tests replace it); default: the platform's (notify/system.ts). */
   notice?: SendNotice;
   /**
@@ -84,9 +94,17 @@ export interface MasterOptions {
   language?: Lang;
 }
 
-/** Start scripts/self-upgrade.sh detached; it waits for this process to exit. */
+/**
+ * Start scripts/self-upgrade.sh detached; it waits for this process to exit. `process.execPath`
+ * may be gone (deleted by a version manager): the script then finds another node itself.
+ */
 function launchUpgradeScript(paths: HomePaths, port: number, plan: UpgradePlan): void {
-  // A copy, so that `git pull` does not rewrite the script while bash reads it.
+  // Copies, so that `git pull` does not rewrite the script while bash reads it. The script
+  // sources find-node.sh from its own directory, so that one goes first.
+  copyUpgradeScript(
+    join(plan.installDir, 'scripts', 'find-node.sh'),
+    join(paths.dataDir, 'find-node.sh'),
+  );
   const script = join(paths.dataDir, 'self-upgrade.sh');
   copyUpgradeScript(join(plan.installDir, 'scripts', 'self-upgrade.sh'), script);
   const log = openSync(join(paths.home, 'upgrade.log'), 'a');
@@ -209,6 +227,7 @@ export class Master {
       readOnlyClis,
     );
     const config = () => watcher.current;
+    const nodeMissing = opts.nodeMissing ?? execPathMissing;
     const engine = new Engine({
       store,
       paths,
@@ -218,6 +237,7 @@ export class Master {
       agentRetryBackoff: opts.agentRetryBackoff,
       rateLimitWait: opts.rateLimitWait,
       dirtyTargetCheckMs: opts.dirtyTargetCheckMs,
+      nodeMissing,
     });
     const installDir = opts.installDir ?? null;
     // Where the install directory pulls from tells which registered repo is the Master's source.
@@ -243,6 +263,8 @@ export class Master {
       config,
       installDir,
       busy: () => issues.scoutRunning,
+      nodeMissing,
+      now: opts.now,
       launch: async (plan) => {
         const launch =
           opts.launchUpgrade ?? ((p) => launchUpgradeScript(paths, master?.port ?? 0, p));

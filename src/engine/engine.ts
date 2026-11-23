@@ -52,7 +52,13 @@ import {
   type Task,
 } from '../store/types.js';
 import { errorMessage, newId, nowIso } from '../util.js';
-import { formatCommandFailure, runCommands } from '../verify/commands.js';
+import {
+  type CommandResult,
+  environmentProblem,
+  formatCommandFailure,
+  missingProgram,
+  runCommands,
+} from '../verify/commands.js';
 import {
   addExistingWorktree,
   addWorktree,
@@ -115,6 +121,11 @@ export interface EngineDeps {
    * are gone; default `DIRTY_TARGET_CHECK_MS`.
    */
   dirtyTargetCheckMs?: number;
+  /**
+   * Whether the node the Master runs on is gone (deleted by a version manager); checked before
+   * setup and verify commands run. Default: never.
+   */
+  nodeMissing?: () => boolean;
 }
 
 /**
@@ -158,6 +169,12 @@ const MAX_TIMER_MS = 3_600_000;
  * again whether a human has committed or discarded them, to go on merging by themselves.
  */
 export const DIRTY_TARGET_CHECK_MS = 60_000;
+
+/**
+ * How often Runs blocked on the environment (`environment`: a command could not find its
+ * program) look again whether the program is there, to go on by themselves.
+ */
+export const ENVIRONMENT_CHECK_MS = 60_000;
 
 /** Where an attempt's normalized events are kept (one JSON record per line), next to its raw log. */
 export function attemptEventsPath(logPath: string): string {
@@ -266,6 +283,10 @@ export class Engine {
   private dirtyTimer: ReturnType<typeof setTimeout> | undefined;
   /** The `checkDirtyTargets` in progress (or the last one); the next waits for it. */
   private dirtyCheck: Promise<unknown> = Promise.resolve();
+  /** Wakes `checkEnvironment` while Runs wait for a program missing from the environment. */
+  private envTimer: ReturnType<typeof setTimeout> | undefined;
+  /** `checkEnvironment({ all: true })` could not run yet (the work switch was off). */
+  private envAllPending = false;
   /**
    * Queued Runs whose agent was out of quota or rate-limited, by Run id: `kick` passes them by
    * until `until` (epoch ms). Kept in memory only: after a Master restart they just try again.
@@ -311,8 +332,11 @@ export class Engine {
       this.requeueHead(run.id, 'run.recovered');
     }
     // Discussions may have timed out while the Master was not running, and target branches may
-    // have been cleaned up.
+    // have been cleaned up. Runs blocked on the environment try again in this Master's: it may
+    // have been restarted on another node (after a version manager deleted the last one), or with
+    // another PATH.
     this.checkReplyTimeouts();
+    this.checkEnvironment({ all: true });
     this.kick();
     void this.checkDirtyTargets();
   }
@@ -324,6 +348,8 @@ export class Engine {
     this.replyTimer = undefined;
     clearTimeout(this.dirtyTimer);
     this.dirtyTimer = undefined;
+    clearTimeout(this.envTimer);
+    this.envTimer = undefined;
     clearTimeout(this.limitTimer);
     this.limitTimer = undefined;
     this.limitWaits.clear();
@@ -443,6 +469,7 @@ export class Engine {
     if (this.store.working !== on) this.store.setWorking(on);
     if (on) {
       this.checkReplyTimeouts();
+      this.checkEnvironment();
       this.kick();
       void this.checkDirtyTargets();
     }
@@ -1320,9 +1347,14 @@ export class Engine {
     }
   }
 
-  /** Create the Run's worktree + branch from the target branch and run setup commands. */
+  /**
+   * Create the Run's worktree + branch from the target branch and run setup commands. A setup
+   * command that fails for the environment blocks the Run (`environment`) without recording the
+   * worktree, so that going on starts over here.
+   */
   private async prepareWorkspace(run: Run, signal: AbortSignal): Promise<void> {
     const repo = this.store.getRepo(run.repoId);
+    if (repo.setupCommands.length > 0 && this.blockOnMissingNode(run)) return;
     const { path, branch } = this.newWorkspace(run.id);
     await removeWorktree(repo.path, path, branch); // leftovers of an interrupted attempt
     const base = await revParse(repo.path, repo.targetBranch);
@@ -1331,10 +1363,11 @@ export class Engine {
     this.store.event(run.id, 'workspace.created', { path, branch, base });
 
     if (repo.setupCommands.length > 0) {
+      const env = this.agentEnv();
       const results = await runCommands(repo.setupCommands, path, {
         timeoutMs: this.commandTimeoutMs(),
         logPath: join(this.runLogDir(run.id), 'setup.log'),
-        env: this.agentEnv(),
+        env,
         signal,
       });
       this.checkAbort(signal);
@@ -1350,6 +1383,8 @@ export class Engine {
         });
       }
       const failed = results.find((r) => !r.passed);
+      const missing = failed && environmentProblem(failed, env);
+      if (failed && missing) return this.blockOnEnvironment(run, failed, missing, 'setup');
       if (failed) {
         // Mostly passing or due to the environment (a registry down, a flaky install): end the
         // Run instead of waiting for a human, so that a Run from an issue is redone in a fresh
@@ -1452,6 +1487,11 @@ export class Engine {
         taskId: task.id,
       });
       return;
+    }
+    // Its agent finished before the Run was blocked on the environment: only the checks are left,
+    // and they need no agent or budget.
+    if (task.status === 'verifying' && eff.def.kind === 'agent') {
+      return this.resumeVerify(run, sr, eff, task, signal);
     }
     const agent = this.cfg.agents.get(task.agentId);
     const adapter = agent && this.deps.adapters.get(agent.cli);
@@ -1707,12 +1747,47 @@ export class Engine {
       if (unresolved !== null) return this.rework(run, eff, task, attempt, unresolved);
     }
 
-    // Layer 2: verify commands, after every task.
     this.store.updateTask(task.id, { status: 'verifying' });
-    const results = await runCommands(verify, workdir, {
+    return this.verifyTask(run, sr, eff, task, attempt, {
+      summary: report.value.summary,
+      finalMessage: result.finalMessage,
+      merge,
+      verify,
+      agent,
+      signal,
+    });
+  }
+
+  /**
+   * Layer 2 of an agent task whose agent has finished (status `verifying`): the verify commands,
+   * then the task's commit. A command that fails for the environment (`environmentProblem`), or a
+   * node gone from under the Master, blocks the Run instead of sending the task back: the agent's
+   * work stays in the worktree and the task stays `verifying`, so that once the Run goes on only
+   * these checks run again (`resumeVerify`).
+   */
+  private async verifyTask(
+    run: Run,
+    sr: StageRun,
+    eff: EffectiveStage,
+    task: Task,
+    attempt: Attempt,
+    done: {
+      summary: string;
+      finalMessage: string;
+      merge: ConflictMerge | null;
+      verify: string[];
+      agent: Pick<AgentConfig, 'id' | 'cli'>;
+      signal: AbortSignal;
+    },
+  ): Promise<void> {
+    const { merge, signal } = done;
+    const workdir = this.workdir(run);
+    if (done.verify.length > 0 && this.blockOnMissingNode(run, sr.id)) return;
+    const env = this.agentEnv();
+    const results = await runCommands(done.verify, workdir, {
       timeoutMs: this.commandTimeoutMs(),
       logPath: attempt.logPath.replace(/\.jsonl$/, '.verify.log'),
-      env: this.agentEnv(),
+      env,
       signal,
     });
     this.checkAbort(signal);
@@ -1728,7 +1803,11 @@ export class Engine {
       });
     }
     const failed = results.find((r) => !r.passed);
-    if (failed) return this.rework(run, eff, task, attempt, formatCommandFailure(failed));
+    if (failed) {
+      const missing = environmentProblem(failed, env);
+      if (missing) return this.blockOnEnvironment(run, failed, missing, 'verify', sr.id);
+      return this.rework(run, eff, task, attempt, formatCommandFailure(failed));
+    }
 
     // Passed: one commit per task, the merge commit when resolving a merge.
     const sha = await commitAll(
@@ -1737,9 +1816,9 @@ export class Engine {
         stageName: eff.def.name ?? eff.def.id,
         round: sr.round,
         goal: run.goal,
-        summary: report.value.summary,
+        summary: done.summary,
         runId: run.id,
-        agent,
+        agent: done.agent,
         attempt: this.store.getAttempt(attempt.id),
       }),
     );
@@ -1749,7 +1828,7 @@ export class Engine {
       this.store.updateTask(task.id, { status: 'passed', commitSha: sha, pendingFeedback: null });
       if (sha) this.store.updateRun(run.id, { headCommit: sha });
       for (const name of eff.def.outputs) {
-        this.saveArtifact(run, sr, name, 'output', result.finalMessage);
+        this.saveArtifact(run, sr, name, 'output', done.finalMessage);
       }
       if (merge) {
         // Like a merge stage's sync: the Run's changes are counted from this target commit on.
@@ -1760,6 +1839,61 @@ export class Engine {
         });
       }
       this.store.event(run.id, 'task.passed', { taskId: task.id, commit: sha });
+    });
+  }
+
+  /**
+   * An agent task left `verifying` because its Run was blocked on the environment: the agent's
+   * work is still in the worktree, so only the verify commands run again, with the report of the
+   * agent's last attempt. When that cannot be done (no finished attempt with a valid report, or
+   * the merge it resolved is no longer in progress), the task starts over from its base commit as
+   * after a pause, which uses up no rework.
+   */
+  private async resumeVerify(
+    run: Run,
+    sr: StageRun,
+    eff: EffectiveStage,
+    task: Task,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const workdir = this.workdir(run);
+    const attempt = this.store.listAttempts(task.id).at(-1);
+    const finished = attempt?.status === 'completed' && attempt.outcome === null;
+    const report = finished
+      ? parseReport(TaskReportSchema, attempt.structured, attempt.finalMessage ?? '')
+      : null;
+    let merge: ConflictMerge | null = null;
+    let usable = report?.ok === true;
+    if (usable && this.resolvesConflict(run, sr)) {
+      if (await isMerging(workdir))
+        merge = await this.conflictMerge(run, sr, task, workdir, signal);
+      else usable = false;
+      this.checkAbort(signal);
+    }
+    if (!attempt || !report?.ok || !usable) {
+      if (task.baseCommit) await resetHard(workdir, task.baseCommit);
+      this.checkAbort(signal);
+      this.store.tx(() => {
+        this.store.updateTask(task.id, {
+          status: 'pending',
+          sessionId: null,
+          sessionAgentId: null,
+          pendingFeedback: null,
+        });
+        this.store.event(run.id, 'task.discarded', { taskId: task.id });
+      });
+      return;
+    }
+    this.store.event(run.id, 'task.verify_resumed', { taskId: task.id, attemptId: attempt.id });
+    const repo = this.store.getRepo(run.repoId);
+    return this.verifyTask(run, sr, eff, task, attempt, {
+      summary: report.value.summary,
+      finalMessage: attempt.finalMessage ?? '',
+      merge,
+      verify: stageVerifyCommands(eff.def, repo.verifyCommands),
+      // The agent may be gone from agents.yaml since; it only names the commit's author line.
+      agent: this.cfg.agents.get(attempt.agentId) ?? { id: attempt.agentId, cli: 'unknown' },
+      signal,
     });
   }
 
@@ -2593,10 +2727,12 @@ export class Engine {
       else this.passStage(run, sr);
       return;
     }
+    if (this.blockOnMissingNode(run, sr.id)) return;
+    const env = this.agentEnv();
     const results = await runCommands(commands, workdir, {
       timeoutMs: this.commandTimeoutMs(),
       logPath: join(this.runLogDir(run.id), `command-${sr.id}.log`),
-      env: this.agentEnv(),
+      env,
       signal,
     });
     this.checkAbort(signal);
@@ -2606,18 +2742,14 @@ export class Engine {
       this.store.event(run.id, 'command.discarded_changes', { stageId: sr.stageId });
     }
     const failed = results.find((r) => !r.passed);
+    // Not the code's failure: the stage stays executing and runs its commands again later.
+    const missing = failed && environmentProblem(failed, env);
+    if (failed && missing) {
+      this.recordStageChecks(run, sr, results);
+      return this.blockOnEnvironment(run, failed, missing, 'verify', sr.id);
+    }
     this.store.tx(() => {
-      for (const r of results) {
-        this.store.addCheck({
-          runId: run.id,
-          stageRunId: sr.id,
-          attemptId: null,
-          kind: 'command',
-          name: r.command,
-          passed: r.passed,
-          detail: r.outputTail,
-        });
-      }
+      this.recordStageChecks(run, sr, results);
       if (failed) {
         this.store.updateStageRun(sr.id, {
           status: 'failed',
@@ -2677,26 +2809,34 @@ export class Engine {
     const head2 = await revParse(workdir, 'HEAD');
     if (synced || (run.headCommit !== null && head2 !== run.headCommit)) {
       const commands = stageVerifyCommands(eff.def, repo.verifyCommands);
+      // Blocked on the environment, the merge stage goes on later like after an interruption:
+      // a merge of the target branch made just now is given up and done again then.
+      const giveUpSync = async () => {
+        if (synced && run.headCommit) await resetHard(workdir, run.headCommit);
+      };
+      if (commands.length > 0 && this.deps.nodeMissing?.()) {
+        await giveUpSync();
+        this.checkAbort(signal);
+        if (this.blockOnMissingNode(run, sr.id)) return;
+      }
+      const env = this.agentEnv();
       const results = await runCommands(commands, workdir, {
         timeoutMs: this.commandTimeoutMs(),
         logPath: join(this.runLogDir(run.id), `merge-${sr.id}.log`),
-        env: this.agentEnv(),
+        env,
         signal,
       });
       this.checkAbort(signal);
       const failed = results.find((r) => !r.passed);
+      const missing = failed && environmentProblem(failed, env);
+      if (failed && missing) {
+        await giveUpSync();
+        this.checkAbort(signal);
+        this.recordStageChecks(run, sr, results);
+        return this.blockOnEnvironment(run, failed, missing, 'verify', sr.id);
+      }
       this.store.tx(() => {
-        for (const r of results) {
-          this.store.addCheck({
-            runId: run.id,
-            stageRunId: sr.id,
-            attemptId: null,
-            kind: 'command',
-            name: r.command,
-            passed: r.passed,
-            detail: r.outputTail,
-          });
-        }
+        this.recordStageChecks(run, sr, results);
         // Checked (passed or not): later work builds on this commit.
         this.store.updateRun(run.id, { headCommit: head2 });
         if (failed) {
@@ -2941,6 +3081,143 @@ export class Engine {
     this.store.tx(() => {
       this.setStatus(runId, 'blocked', { blocked: info });
       this.store.event(runId, 'run.blocked', { ...info });
+    });
+  }
+
+  /** A command stage's or merge stage's command results as checks (no attempt). */
+  private recordStageChecks(run: Run, sr: StageRun, results: readonly CommandResult[]): void {
+    this.store.tx(() => {
+      for (const r of results) {
+        this.store.addCheck({
+          runId: run.id,
+          stageRunId: sr.id,
+          attemptId: null,
+          kind: 'command',
+          name: r.command,
+          passed: r.passed,
+          detail: r.outputTail,
+        });
+      }
+    });
+  }
+
+  /**
+   * Before running setup or verify commands: when the node the Master runs on is gone (a version
+   * manager deleted it), they would only fail for want of node or npm. Blocks the Run on the
+   * environment instead, with that node as `missing`, and returns true; the upgrader restarts the
+   * Master on a node it finds (`Upgrader`), and the restarted Master's `start` lets the Run go on.
+   */
+  private blockOnMissingNode(run: Run, stageRunId?: string): boolean {
+    if (!this.deps.nodeMissing?.()) return false;
+    const node = process.execPath;
+    this.block(run.id, {
+      kind: 'environment',
+      message: t({
+        zh: `Master 正在用的 node（${node}）已经不存在了（比如换 Node 版本时被删掉），所以没有运行准备命令或检查命令，免得它们找不到 node、npm 而白白失败。这不是代码的问题：不返工，也不消耗返工和重做次数。Master 会自己找到能用的 node 并重启，重启后 Run 自动接着做。`,
+        en: `The node this Master runs on (${node}) is gone (deleted when switching Node versions, say), so no setup or verify commands were run: they would only fail for want of node and npm. That is no fault of the code, so there is no rework and no rework or redo is used up. The Master finds a usable node and restarts by itself, and the Run goes on after the restart.`,
+      }),
+      missing: node,
+      ...(stageRunId ? { stageRunId } : {}),
+    });
+    return true;
+  }
+
+  /**
+   * A command failed for the environment (`environmentProblem`): the program it starts first, or
+   * that program's interpreter, is not in PATH. Blocks the Run on it rather than sending the work
+   * back or failing the Run: the agents cannot change the Master's environment, and a redo would
+   * fail the same way. Whatever stage or task it was in stays where it is, to run the commands
+   * again once the Run goes on (`checkEnvironment`, `start`, or a retry by hand).
+   */
+  private blockOnEnvironment(
+    run: Run,
+    failed: CommandResult,
+    missing: string,
+    what: 'setup' | 'verify',
+    stageRunId?: string,
+  ): void {
+    const command =
+      what === 'setup'
+        ? t({ zh: `准备命令 \`${failed.command}\``, en: `the setup command \`${failed.command}\`` })
+        : t({
+            zh: `检查命令 \`${failed.command}\``,
+            en: `the verify command \`${failed.command}\``,
+          });
+    this.block(run.id, {
+      kind: 'environment',
+      message: t({
+        zh: `运行环境里找不到 \`${missing}\`：${command}的退出码是 127（找不到命令）。这是 Master 运行环境的问题，不是代码的问题：不返工，也不消耗返工和重做次数。装好 ${missing}，或者让 Master 的 PATH 里能找到它（比如换 Node 版本后重启 Master）之后，Run 会自己接着做：Master 大约每分钟查一次，重启后也会接着做；也可以在看板上重试。`,
+        en: `\`${missing}\` is not found in the environment: ${command} exited with 127 (command not found). That is a problem of the Master's environment, not of the code, so there is no rework and no rework or redo is used up. Once ${missing} is installed or the Master's PATH finds it (restart the Master after switching Node versions, say), the Run goes on by itself: the Master looks about every minute, and after a restart; you can also retry it on the dashboard.`,
+      }),
+      missing,
+      ...(stageRunId ? { stageRunId } : {}),
+    });
+    this.scheduleEnvironmentCheck();
+  }
+
+  /** Runs blocked because their commands could not find a program (`environment`). */
+  private environmentRuns(): Run[] {
+    return this.store
+      .listRuns({ status: 'blocked' })
+      .filter((r) => r.blocked?.kind === 'environment');
+  }
+
+  /**
+   * Runs blocked on the environment whose missing program is found again (installed meanwhile,
+   * or in the PATH of a restarted Master) go back to the head of the queue, to run the blocked
+   * commands again; with `all`, every such Run does (the Master just started, and its
+   * environment may differ in ways the program alone does not show). Not while the node the
+   * Master runs on is gone (it restarts soon), nor while the work switch is off; switching it on
+   * checks again. While such Runs are left, it checks again every `ENVIRONMENT_CHECK_MS`. Returns
+   * the Runs that went on.
+   */
+  checkEnvironment(opts: { all?: boolean } = {}): string[] {
+    clearTimeout(this.envTimer);
+    this.envTimer = undefined;
+    if (this.stopping) return [];
+    const resumed: string[] = [];
+    // A start while the switch is off: every such Run tries again once it is switched on.
+    const all = opts.all === true || this.envAllPending;
+    if (this.store.working && !this.deps.nodeMissing?.()) {
+      this.envAllPending = false;
+      for (const run of this.environmentRuns()) {
+        const missing = run.blocked?.missing;
+        // The commands' environment (`agentEnv`) has the Master's PATH.
+        if (!all && missing && missingProgram(missing, process.env) !== null) continue;
+        if (this.resumeEnvironment(run, all ? 'restart' : 'found')) resumed.push(run.id);
+      }
+    } else if (all) {
+      this.envAllPending = true;
+    }
+    if (resumed.length > 0) this.kick();
+    this.scheduleEnvironmentCheck();
+    return resumed;
+  }
+
+  /** Check again in `ENVIRONMENT_CHECK_MS` while some Run waits for a missing program. */
+  private scheduleEnvironmentCheck(): void {
+    if (this.stopping || this.envTimer || this.environmentRuns().length === 0) return;
+    const timer = setTimeout(() => this.checkEnvironment(), ENVIRONMENT_CHECK_MS);
+    timer.unref();
+    this.envTimer = timer;
+  }
+
+  /**
+   * Put a Run blocked on the environment back at the head of the queue, in one transaction;
+   * nothing changes when it was retried, cancelled or blocked on something else meanwhile.
+   */
+  private resumeEnvironment(run: Run, reason: 'restart' | 'found'): boolean {
+    const before = run.blocked;
+    if (!before) return false;
+    return this.store.tx(() => {
+      const current = this.store.getRun(run.id);
+      if (current.status !== 'blocked' || !sameBlock(current.blocked, before)) return false;
+      this.store.event(run.id, 'environment.resumed', {
+        reason,
+        ...(before.missing ? { missing: before.missing } : {}),
+      });
+      this.requeueHead(run.id, 'run.resumed');
+      return true;
     });
   }
 

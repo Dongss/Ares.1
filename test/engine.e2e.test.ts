@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -959,6 +959,146 @@ describe('engine: command stages', () => {
     expect(checksOf(run.id, 'e2e').map((c) => c.passed)).toEqual([true]);
     expect(existsSync(join(waiting.worktreePath as string, 'partial.txt'))).toBe(false);
     expect(h.fake.calls).toEqual([]);
+  });
+});
+
+describe('engine: a program missing from the environment', () => {
+  const MISSING = 'ares1-no-such-tool';
+
+  /** Puts an executable `name` that succeeds in PATH: the program installed. */
+  const install = (name: string) => {
+    const bin = tmpDir('ares1-tool-');
+    writeFile(join(bin, name), '#!/bin/sh\nexit 0\n');
+    chmodSync(join(bin, name), 0o755);
+    vi.stubEnv('PATH', `${bin}:${process.env.PATH}`);
+  };
+
+  it('blocks on the environment instead of reworking, and only checks again once it is found', async () => {
+    const sent: string[] = [];
+    h = await harness({
+      verifyCommands: [`${MISSING} --check`, 'grep -q ok feature.txt'],
+      config: 'notify:\n  system: true\n',
+      master: { notice: (title) => sent.push(title) },
+    });
+    const { store, engine } = h.master;
+    const run = h.run();
+    const blocked = await h.waitStatus(run.id, 'blocked');
+    expect(blocked.blocked).toMatchObject({ kind: 'environment', missing: MISSING });
+    expect(blocked.blocked?.message).toContain(
+      `运行环境里找不到 \`${MISSING}\`：检查命令 \`${MISSING} --check\`的退出码是 127`,
+    );
+    expect(sent.at(-1)).toBe(`Run 卡住了：运行环境里找不到 ${MISSING}`);
+    // No rework: the agent's work waits in the worktree for its checks.
+    const [task] = store.listRunTasks(run.id) as [Task];
+    expect(task).toMatchObject({ status: 'verifying', retries: 0 });
+    expect(store.listAttempts(task.id).map((a) => a.outcome)).toEqual([null]);
+    expect(readFileSync(join(blocked.worktreePath as string, 'feature.txt'), 'utf8')).toBe('ok\n');
+
+    // Still missing: nothing changes, and nobody is notified again.
+    const events = store.listEvents(run.id).length;
+    expect(engine.checkEnvironment()).toEqual([]);
+    expect(store.listEvents(run.id)).toHaveLength(events);
+    expect(sent.filter((s) => s.includes('卡住'))).toHaveLength(1);
+
+    install(MISSING);
+    expect(engine.checkEnvironment()).toEqual([run.id]);
+    await h.waitStatus(run.id, 'waiting_approval');
+    // Only the checks ran again: one coder execution, which passed, and no rework or retry used.
+    expect(h.fake.calls.filter((c) => c.model === 'coder')).toHaveLength(1);
+    const after = store.getTask(task.id);
+    expect(after).toMatchObject({ status: 'passed', retries: 0 });
+    expect(store.listAttempts(task.id).map((a) => a.outcome)).toEqual(['passed']);
+    expect(git(blocked.worktreePath as string, 'show', '--stat', 'HEAD')).toContain('feature.txt');
+    const types = store.listEvents(run.id).map((e) => e.type);
+    expect(types).toContain('environment.resumed');
+    expect(types).toContain('task.verify_resumed');
+    expect(types).not.toContain('run.retry');
+  });
+
+  it('goes on when the Master restarts', async () => {
+    const first = await harness({ verifyCommands: [`${MISSING} --check`] });
+    const run = first.run();
+    await first.waitStatus(run.id, 'blocked');
+    await first.close();
+
+    install(MISSING);
+    h = await harness({ home: first.home, repoDir: first.repoDir });
+    await h.waitStatus(run.id, 'waiting_approval');
+    expect(h.fake.calls.filter((c) => c.model === 'coder')).toEqual([]);
+    const resumed = h.master.store
+      .listEvents(run.id)
+      .filter((e) => e.type === 'environment.resumed');
+    expect(resumed.map((e) => e.data)).toEqual([{ reason: 'restart', missing: MISSING }]);
+  });
+
+  it('blocks rather than fails when a setup command is not found, and starts over once it is', async () => {
+    h = await harness({ setupCommands: [`${MISSING} ci`] });
+    const { store, engine } = h.master;
+    const run = h.run();
+    const blocked = await h.waitStatus(run.id, 'blocked');
+    expect(blocked).toMatchObject({
+      worktreePath: null,
+      error: null,
+      blocked: { kind: 'environment', missing: MISSING },
+    });
+    expect(blocked.blocked?.message).toContain(`准备命令 \`${MISSING} ci\``);
+    expect(h.fake.calls).toEqual([]);
+    // A retry by hand runs the setup again, which still cannot find it.
+    await engine.retry(run.id);
+    await waitFor(
+      () => store.listEvents(run.id).filter((e) => e.type === 'run.blocked').length === 2,
+      'the second block',
+    );
+    install(MISSING);
+    expect(engine.checkEnvironment()).toEqual([run.id]);
+    await h.waitStatus(run.id, 'waiting_approval');
+  });
+
+  it('runs a command stage again once the program is found', async () => {
+    h = await harness({
+      workflow: withCommandStage(`    verify:\n      commands: ["${MISSING} e2e"]\n`),
+    });
+    const run = h.run();
+    const blocked = await h.waitStatus(run.id, 'blocked');
+    expect(blocked.blocked).toMatchObject({ kind: 'environment', missing: MISSING });
+    const e2e = h.master.store.listStageRuns(run.id).find((sr) => sr.stageId === 'e2e');
+    expect(e2e?.status).toBe('executing');
+    install(MISSING);
+    expect(h.master.engine.checkEnvironment()).toEqual([run.id]);
+    await h.waitStatus(run.id, 'waiting_approval');
+    expect(h.fake.calls.map((c) => c.model)).toEqual(['coder', 'reviewer']);
+  });
+
+  it('says so in English', async () => {
+    setLang('en');
+    try {
+      h = await harness({ verifyCommands: [`${MISSING} --check`] });
+      const run = h.run();
+      const blocked = await h.waitStatus(run.id, 'blocked');
+      expect(blocked.blocked?.message).toContain(
+        `\`${MISSING}\` is not found in the environment: the verify command \`${MISSING} --check\` exited with 127`,
+      );
+      expect(blocked.blocked?.message).not.toMatch(/[一-鿿]/);
+      const event = h.master.store.listEvents(run.id).find((e) => e.type === 'run.blocked');
+      expect(noticeFor(event as never, run.goal)?.title).toBe(
+        `Run is stuck: ${MISSING} not found in the environment`,
+      );
+    } finally {
+      setLang('zh');
+    }
+  });
+
+  it('still reworks when the program is there and the 127 comes from inside it', async () => {
+    h = await harness({ verifyCommands: [`sh -c 'grep -q ok feature.txt || ${MISSING}'`] });
+    let calls = 0;
+    h.scripts.coder = (ctx) => {
+      writeFile(join(ctx.input.workdir, 'feature.txt'), ++calls === 1 ? 'wrong\n' : 'ok\n');
+      return done();
+    };
+    const run = h.run();
+    await h.waitStatus(run.id, 'waiting_approval');
+    expect(calls).toBe(2);
+    expect(h.master.store.listRunTasks(run.id)[0]?.retries).toBe(1);
   });
 });
 

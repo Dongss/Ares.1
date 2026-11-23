@@ -25,7 +25,16 @@
 # <language> (zh or en, config.yaml's language) picks the texts.
 # <target> is the commit the Master found on origin (already fetched); a failure is reported
 # against it, so that the Master does not try it again. Without it the script pulls instead and
-# reports whatever HEAD is.
+# reports whatever HEAD is. A <target> equal to <old commit> restarts the Master on the same
+# version, e.g. because the node it ran on was deleted.
+#
+# <node> is the old Master's node. A version manager (nvm) may have deleted it meanwhile, so
+# before building, starting and rolling back the script looks for the node to use (use_node from
+# find-node.sh, which the Master copies next to this copy): <node> while it works, else another
+# whose version package.json allows. Its directory goes first in PATH, so that npm is the one
+# that comes with it. When no node can be found, or npm cannot be (the build exits with 127), the
+# failure is the environment's, not the commit's: the result says so (`env`), and the Master
+# tries the same commit again later instead of giving it up.
 
 set -u
 # Variables are always written as ${name}: bash would read a following non-ASCII character
@@ -33,6 +42,13 @@ set -u
 
 dir=$1 home=$2 pid=$3 old=$4 result=$5 node=$6 port=$7 name=${8:-Master} lang=${9:-zh}
 target=${10:-}
+
+# Read whole now, before anything changes the install directory; the install directory's copy
+# only stands in for a missing one next to this script.
+# shellcheck source=find-node.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/find-node.sh" 2>/dev/null ||
+  . "${dir}/scripts/find-node.sh" 2>/dev/null ||
+  use_node() { [ -x "${node}" ]; }
 
 # How long the new Master is watched after it answered, in seconds.
 watch=${ARES1_UPGRADE_WATCH:-300}
@@ -66,14 +82,17 @@ captured() {
   return "${PIPESTATUS[0]}"
 }
 
-# Writes the result file from its arguments: <file> <ok> <from> <to> <message> [<detail file>].
-# The detail is the end of the detail file: its last lines, capped in length. node builds the
-# JSON, so that quotes, backslashes and line breaks in the output cannot break it; the values come
-# in as arguments, never as code.
+# Writes the result file from its arguments:
+# <file> <ok> <from> <to> <message> [<detail file>] [<env>].
+# The detail is the end of the detail file: its last lines, capped in length. <env> is true when
+# the failure is the environment's (no node or npm). node builds the JSON, so that quotes,
+# backslashes and line breaks in the output cannot break it; the values come in as arguments,
+# never as code.
 result_js='
 const fs = require("node:fs");
-const [file, ok, from, to, message, detailFile] = process.argv.slice(1);
+const [file, ok, from, to, message, detailFile, env] = process.argv.slice(1);
 const result = { ok: ok === "true", from, to, message };
+if (env === "true") result.env = true;
 let detail = "";
 try {
   if (detailFile) detail = fs.readFileSync(detailFile, "utf8");
@@ -90,12 +109,16 @@ if (detail.trim()) {
 fs.writeFileSync(file, JSON.stringify(result) + "\n");
 '
 
-write_result() { # ok to message [detail file]
+write_result() { # ok to message [detail file] [env]
   rm -f "${result}"
-  "${node}" -e "${result_js}" -- "${result}" "$1" "${old}" "$2" "$3" "${4:-}"
-  # If node could not write it, the next Master still learns how it went, without the detail.
+  "${node}" -e "${result_js}" -- "${result}" "$1" "${old}" "$2" "$3" "${4:-}" "${5:-}"
+  # If node could not write it (none was found, say), the next Master still learns how it went,
+  # without the detail.
+  local env_field=
+  [ "${5:-}" = true ] && env_field=',"env":true'
   [ -s "${result}" ] ||
-    printf '{"ok":%s,"from":"%s","to":"%s","message":"%s"}\n' "$1" "${old}" "$2" "$3" >"${result}"
+    printf '{"ok":%s,"from":"%s","to":"%s","message":"%s"%s}\n' "$1" "${old}" "$2" "$3" \
+      "${env_field}" >"${result}"
 }
 
 # Fast-forward only: to <target>, so that the commit started is the one the Master planned.
@@ -104,6 +127,39 @@ advance() {
 }
 
 build() { npm ci --no-audit --no-fund && npm run build; }
+
+# Set when the upgrade failed for want of node or npm rather than because of the commit.
+env_failed=
+
+# Finds the node for the version checked out now (find-node.sh); a missing one is the
+# environment's failure, said in the output kept for the result.
+node_ready() {
+  use_node "${node}" package.json && return 0
+  env_failed=true
+  {
+    pick "找不到能用的 node：${node} 不存在、不能执行或版本不满足要求，PATH、nvm 的默认版本和常见的安装位置里也没有${node_wanted:+满足 ${node_wanted} 的}可用的 node" \
+      "No usable node found: ${node} is missing, not executable or of the wrong version, and there is none${node_wanted:+ of ${node_wanted}} in PATH, nvm's default version or the usual places"
+    echo
+  } | tee -a "${out}"
+  return 1
+}
+
+# Builds with the npm next to the node found; without one (or when the build says a command was
+# not found, exit code 127) the failure is the environment's.
+build_new() {
+  if ! command -v npm >/dev/null 2>&1; then
+    env_failed=true
+    {
+      pick "找不到 npm（PATH：${PATH}）" "npm not found (PATH: ${PATH})"
+      echo
+    } | tee -a "${out}"
+    return 127
+  fi
+  captured build
+  local code=$?
+  [ "${code}" -eq 127 ] && env_failed=true
+  return "${code}"
+}
 
 # Starts the Master in the background of this shell, not of a subshell, so that it is this
 # script's child and `wait` can tell how it exited; its pid goes in ${started}.
@@ -139,8 +195,13 @@ watch_new() {
 }
 
 main() {
-  log "$(pick "开始升级（当前 ${old}），等待旧的 Master（pid ${pid}）退出" \
-    "Upgrading (now at ${old}), waiting for the old Master (pid ${pid}) to exit")"
+  if [ "${target}" = "${old}" ]; then
+    log "$(pick "在当前版本 ${old} 上重启 Master，等待旧的 Master（pid ${pid}）退出" \
+      "Restarting the Master on the same version ${old}, waiting for the old Master (pid ${pid}) to exit")"
+  else
+    log "$(pick "开始升级（当前 ${old}），等待旧的 Master（pid ${pid}）退出" \
+      "Upgrading (now at ${old}), waiting for the old Master (pid ${pid}) to exit")"
+  fi
   for _ in $(seq 1 120); do
     kill -0 "${pid}" 2>/dev/null || break
     sleep 1
@@ -158,7 +219,7 @@ main() {
     exit 1
   }
 
-  if captured advance && captured build; then
+  if captured advance && node_ready && build_new; then
     new=$(git rev-parse HEAD)
     # Written before starting, so the new Master finds it on startup. If the new Master exits
     # with an error later, a failure replaces it, which the Master started after the rollback
@@ -202,13 +263,27 @@ main() {
   else
     # Not HEAD: if the fast-forward failed, HEAD is still <old commit>.
     new=${target:-$(git rev-parse HEAD)}
-    msg=$(pick "拉取或构建 ${new:0:7} 失败，已回退到 ${old:0:7}" \
-      "Pulling or building ${new:0:7} failed; rolled back to ${old:0:7}")
+    if [ -n "${env_failed}" ]; then
+      msg=$(pick "构建 ${new:0:7} 时找不到能用的 node 或 npm（运行环境的问题，不是这个提交的问题，环境恢复后会再试），已回退到 ${old:0:7}" \
+        "Building ${new:0:7} found no usable node or npm (a problem of the environment, not of the commit; it is tried again once that is fixed); rolled back to ${old:0:7}")
+    else
+      msg=$(pick "拉取或构建 ${new:0:7} 失败，已回退到 ${old:0:7}" \
+        "Pulling or building ${new:0:7} failed; rolled back to ${old:0:7}")
+    fi
   fi
 
   log "${msg}"
-  write_result false "${new}" "${msg}" "${out}"
-  git reset -q --hard "${old}" && build
+  write_result false "${new}" "${msg}" "${out}" "${env_failed}"
+  git reset -q --hard "${old}"
+  reset=$?
+  # The node may have changed since it was looked for, and the old version may want another.
+  if ! use_node "${node}" package.json; then
+    log "$(pick "找不到能用的 node，回退后无法启动 Master" "No usable node found, so the Master cannot be started after the rollback")"
+    notify "$(pick "自动升级失败，回退后找不到能用的 node，Master 没能启动，请手动处理（日志：${home}/upgrade.log）" \
+      "Automatic upgrade failed and no usable node was found to start the Master after the rollback; please handle it by hand (log: ${home}/upgrade.log)")"
+    return
+  fi
+  [ "${reset}" -eq 0 ] && build
   start
   if healthy; then
     log "$(pick "已回退到 ${old}" "Rolled back to ${old}")"

@@ -343,6 +343,42 @@ describe('keepalive script', () => {
     expect(notifications(s)).toHaveLength(2);
   });
 
+  it('starts the Master with another node when the one given is gone, and logs it', async () => {
+    const s = await setup({ language: 'en' });
+    // What a version manager leaves behind after uninstalling the version.
+    const gone = join(tmpDir('ares1-nvm-'), 'v24.22.1', 'bin', 'node');
+    expect(await keepalive(s, ['', gone])).toEqual({ code: 0, stderr: '' });
+    const started = starts(s);
+    expect(started).toHaveLength(1);
+    expect(await health(s.port)).toBe(200);
+    // The node in PATH, whose directory went first in PATH.
+    const node = execFileSync('bash', ['-c', 'command -v node'], {
+      env: s.env,
+      encoding: 'utf8',
+    }).trim();
+    expect(started[0]?.path).toBe(dirname(node));
+    const version = execFileSync(node, ['--version'], { encoding: 'utf8' }).trim();
+    const lines = logLines(s);
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toBe(
+      `node ${gone} cannot be used (missing, not executable or not the version needed); using ${node} (${version}) instead`,
+    );
+    expect(lines[1]).toContain('The Master was not running; started it');
+    expect(notifications(s)).toEqual([]);
+  });
+
+  it('notifies when no node it can use is found', async () => {
+    const s = await setup();
+    writeFileSync(join(s.installDir, 'package.json'), '{"engines": {"node": ">=999"}}\n');
+    const gone = join(tmpDir('ares1-nvm-'), 'gone', 'node');
+    expect(await keepalive(s, ['', gone])).toMatchObject({ code: 1 });
+    expect(starts(s)).toEqual([]);
+    expect(logLines(s)).toEqual([
+      `找不到能用的 node（${gone}；PATH、nvm 的默认版本和常见的安装位置里也没有满足 >=999 的可用的 node）`,
+    ]);
+    expect(notifications(s)).toHaveLength(1);
+  });
+
   it('gives up without starting anything when the install directory is missing', async () => {
     const s = await setup();
     s.installDir = join(s.installDir, 'missing');

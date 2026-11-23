@@ -70,7 +70,7 @@ export const ATTEMPT_OUTCOME: Record<AttemptOutcome, { label: string; tone: Tone
   rate_limited: badge('额度用尽', 'Out of quota', 'attention'),
 };
 
-export { BLOCK_KIND } from '../../../src/notify/notice.js';
+export { BLOCK_KIND, missingCommandText } from '../../../src/notify/notice.js';
 
 /** Why a stage did not pass, in words (getters: read in the language in use). */
 export const FAIL_REASON: Record<StageFailReason, string> = {

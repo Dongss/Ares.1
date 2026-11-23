@@ -83,11 +83,14 @@ src/
                       (libnotify) on Linux, nothing elsewhere; which platforms are supported
   upgrade/
     upgrader.ts       the Master upgrades itself: finds a new version, waits for the work in hand,
-                      hands over to scripts/self-upgrade.sh, keeps the last failed upgrade
+                      hands over to scripts/self-upgrade.sh, keeps the last failed upgrade, retries
+                      a target that failed for the environment (no node or npm) after a wait;
+                      restarts on the same commit when the node it runs on is gone
     source.ts         which registered repo is the Master's own source (from the install
                       directory's origin), whose scout is shown failed upgrades
   workspace/git.ts    git: worktrees, commits, rollback, merge, fast-forward
-  verify/commands.ts  run check commands and setup commands
+  verify/commands.ts  run check commands and setup commands; whether a failed one failed for the
+                      environment (exit code 127, its first program not in PATH)
   api/
     server.ts         HTTP API (Hono) and SSE
     types.ts          API data types, shared by Master and dashboard
@@ -102,6 +105,10 @@ scripts/
                       when it does not answer, unless an upgrade runs or a Master process of the
                       same home is there (hung or starting); logs to keepalive.log, notifies when
                       it cannot start it
+  find-node.sh        the one place that finds the node to run the Master with (the given one,
+                      PATH, nvm's default version, the usual places; engines.node checked),
+                      sourced by self-upgrade.sh and keepalive.sh; the Master copies it next to
+                      its copy of self-upgrade.sh
 web/                  dashboard (React + Vite)
   src/App.tsx         top bar (navigation, work switch, notification switch, language switch)
                       and routing
@@ -149,6 +156,7 @@ test/
   - notification rules: `src/notify/notice.ts`
   - assessment conclusion rules: `src/engine/discussion.ts`
   - how a Run's time is split, and the names and groups of the parts: `src/engine/times.ts`
+  - how the scripts find the node to run the Master with: `scripts/find-node.sh`
   - the display name and slogan: `brandName()` / `brandSlogan()` / `brandTitle()` in `src/brand.ts`. Never write them as literals elsewhere. The exception is the `<title>` of `web/index.html`, a static file that keeps the Chinese title; a test keeps the two in sync.
 - Every comment the Master posts on an issue goes through `markComment` (`src/github/issues.ts`), which adds the hidden marker that tells it apart from human replies.
 - Every text the Master publishes on GitHub goes through `redactForGitHub` (`src/github/redact.ts`), which turns paths under the user's home directory into `~` so the system user name stays private: comments (in the bridge's `comment()`), the issues it creates, and the commit messages it makes (they may be pushed). Store the original text: the dashboard and logs keep the full paths.

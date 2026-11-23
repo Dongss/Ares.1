@@ -70,6 +70,13 @@ export type BlockKind =
    * the repo): it waits for a human to confirm its goal before any agent reads it.
    */
   | 'untrusted_issue'
+  /**
+   * A setup or verify command could not run because the Master's environment lacks the program
+   * it starts (exit code 127, the program not in PATH), or the node the Master runs on is gone: no
+   * fault of the code, so no rework, retry or redo is used up. Goes on by itself once the program
+   * is found again or the Master restarts; `missing` names the program.
+   */
+  | 'environment'
   | 'error';
 
 /** Why a Run is blocked; also tells `retry` what to redo. */
@@ -78,6 +85,8 @@ export interface BlockInfo {
   message: string;
   taskId?: string;
   stageRunId?: string;
+  /** `environment`: the program that could not be found, e.g. `npm`, or the Master's node. */
+  missing?: string;
 }
 
 export interface Run {

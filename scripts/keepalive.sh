@@ -5,10 +5,13 @@
 #
 #   keepalive.sh <install dir> <home> [<port>] [<node>] [<name>]
 #
-# <port> defaults to config.yaml's `port` (4870 without one). <node> defaults to the node in PATH;
-# its directory goes first in PATH, so that the Master and the agents it starts find the same one.
-# <name> is the notification title (the project's display name, default Master). config.yaml's
-# `language` (zh or en) picks the texts.
+# <port> defaults to config.yaml's `port` (4870 without one). <node> defaults to the node in PATH.
+# When it does not run (a version manager such as nvm deleted it), another node whose version the
+# install directory's package.json allows is used instead, and logged (use_node, find-node.sh): one
+# in PATH, nvm's default version, or one in the usual places. Its directory goes first in PATH, so
+# that the Master and the agents it starts find the same one. <name> is the notification title
+# (the project's display name, default Master). config.yaml's `language` (zh or en) picks the
+# texts.
 #
 # Two Masters on one home would both recover the same Runs, and the Master changes the database
 # before it listens, so a second one does harm before it finds the port taken. So nothing is
@@ -82,6 +85,14 @@ alert() {
   : >"${notified}"
   notify "$(pick "Master 停了，保活脚本没能把它启动起来：${1}（日志：${log_file}）" \
     "The Master is down and the keepalive script could not start it: ${1} (log: ${log_file})")"
+}
+
+# Finding node, shared with self-upgrade.sh; read whole now, as an upgrade may rewrite it later.
+# shellcheck source=find-node.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/find-node.sh" || {
+  alert "$(pick "找不到 $(dirname -- "${BASH_SOURCE[0]}")/find-node.sh" \
+    "$(dirname -- "${BASH_SOURCE[0]}")/find-node.sh not found")"
+  exit 1
 }
 
 # Asks /api/health. ${answer} is curl's exit code: 0 answered, 7 nothing listens on the port,
@@ -183,16 +194,11 @@ main() {
     exit 0
   fi
 
-  case "${node}" in
-    */*) ;;
-    *) node=$(command -v "${node:-node}" 2>/dev/null) || node= ;;
-  esac
-  if [ -z "${node}" ] || [ ! -x "${node}" ]; then
-    alert "$(pick "找不到 node（${node_arg:-PATH 里没有}）" "node not found (${node_arg:-not in PATH})")"
+  if ! use_node "${node}" "${dir}/package.json"; then
+    alert "$(pick "找不到能用的 node（${node_arg:-PATH 里没有}；PATH、nvm 的默认版本和常见的安装位置里也没有${node_wanted:+满足 ${node_wanted} 的}可用的 node）" \
+      "No usable node found (${node_arg:-not in PATH}; none${node_wanted:+ of ${node_wanted}} in PATH, nvm's default version or the usual places either)")"
     exit 1
   fi
-  PATH="$(dirname -- "${node}"):${PATH}"
-  export PATH
 
   cd "${dir}" 2>/dev/null || {
     alert "$(pick "找不到安装目录 ${dir}" "Install directory ${dir} not found")"

@@ -3,6 +3,7 @@ import {
   chmodSync,
   closeSync,
   copyFileSync,
+  existsSync,
   mkdirSync,
   openSync,
   readdirSync,
@@ -13,13 +14,25 @@ import {
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
+import type { MasterOptions } from '../src/master.js';
+import { noticeFor } from '../src/notify/notice.js';
 import { githubNameOf, isMasterSource } from '../src/upgrade/source.js';
 import {
   copyUpgradeScript,
+  envRetryDelayMs,
   lastUpgradeFailure,
   type UpgradePlan,
 } from '../src/upgrade/upgrader.js';
-import { git, type Harness, harness, initRepo, tmpDir, waitFor, writeFile } from './helpers.js';
+import {
+  done,
+  git,
+  type Harness,
+  harness,
+  initRepo,
+  tmpDir,
+  waitFor,
+  writeFile,
+} from './helpers.js';
 
 let h: Harness | undefined;
 
@@ -28,21 +41,33 @@ afterEach(async () => {
   h = undefined;
 });
 
-/** A Master "installed" in a clone of `origin`, with auto upgrade on. */
-async function installed(opts: { auto?: boolean } = {}) {
+/**
+ * A Master "installed" in a clone of `origin`, with auto upgrade on. `master` adds to its
+ * options, e.g. whether its node is gone (`nodeMissing`).
+ */
+async function installed(
+  opts: {
+    auto?: boolean;
+    master?: Partial<MasterOptions>;
+    verifyCommands?: string[];
+    config?: string;
+  } = {},
+) {
   const origin = initRepo();
   const installDir = join(tmpDir('ares1-install-'), 'stable');
   git(origin, 'clone', '-q', origin, installDir);
   const launches: UpgradePlan[] = [];
   let exits = 0;
   h = await harness({
-    config: `upgrade:\n  auto: ${opts.auto ?? true}\n`,
+    config: `upgrade:\n  auto: ${opts.auto ?? true}\n${opts.config ?? ''}`,
+    verifyCommands: opts.verifyCommands,
     master: {
       installDir,
       launchUpgrade: (plan) => launches.push(plan),
       exit: () => {
         exits++;
       },
+      ...opts.master,
     },
   });
   // The Master closes its database when it hands over, so collect events as they happen.
@@ -324,6 +349,155 @@ describe('upgrader', () => {
     await h.master.upgrader.check();
     expect(h.master.upgrader.status().state).toBe('unavailable');
   });
+
+  it('restarts on the commit it runs once its node is gone, without waiting for the Run', async () => {
+    let gone = false;
+    // Auto upgrade off: restarting keeps the Master running, it changes no version.
+    const { t, installDir, launches, exits, seen } = await installed({
+      auto: false,
+      master: { nodeMissing: () => gone },
+    });
+    const from = git(installDir, 'rev-parse', 'HEAD');
+    let started = false;
+    t.scripts.coder = async (ctx) => {
+      started = true;
+      await new Promise((resolve) => ctx.signal.addEventListener('abort', resolve));
+      return done();
+    };
+    const run = t.run();
+    await waitFor(() => started, 'coder to start');
+
+    gone = true;
+    await t.master.upgrader.check();
+    expect(launches).toEqual([
+      { installDir, from, to: from, resultFile: join(t.home, 'data', 'upgrade-result.json') },
+    ]);
+    expect(exits()).toBe(1);
+    const of = (type: string) => seen.filter((e) => e.type === type).map((e) => e.data);
+    expect(of('master.node_missing')).toEqual([{ node: process.execPath, commit: from }]);
+    expect(of('upgrade.started')).toEqual([{ from, to: from, reason: 'node_missing' }]);
+    // The Run was interrupted like on any restart, and waits in the queue for the next Master.
+    const statuses = seen
+      .filter((e) => e.type === 'run.status' && e.runId === run.id)
+      .map((e) => e.data.status);
+    expect(statuses.at(-1)).toBe('queued');
+    expect(seen.some((e) => e.type === 'run.interrupted' && e.runId === run.id)).toBe(true);
+  });
+
+  it('blocks a Run on the environment instead of running checks when the node is gone; the restarted Master goes on', async () => {
+    let gone = false;
+    const marker = join(tmpDir('ares1-marker-'), 'verified');
+    const first = await installed({
+      master: { nodeMissing: () => gone },
+      verifyCommands: [`touch ${marker}`, 'grep -q ok feature.txt'],
+    });
+    const coder = first.t.scripts.coder as NonNullable<typeof first.t.scripts.coder>;
+    first.t.scripts.coder = (ctx) => {
+      // nvm uninstalls the version the Master runs on while the agent works.
+      gone = true;
+      return coder(ctx);
+    };
+    const run = first.t.run();
+    // The block wakes the upgrader, which restarts the Master.
+    await waitFor(() => first.launches.length === 1, 'the restart', 10_000);
+    const from = git(first.installDir, 'rev-parse', 'HEAD');
+    expect(first.launches[0]).toMatchObject({ from, to: from });
+    const blocked = first.seen.find((e) => e.type === 'run.blocked' && e.runId === run.id);
+    expect(blocked?.data).toMatchObject({ kind: 'environment', missing: process.execPath });
+    expect(String(blocked?.data.message)).toContain(`Master 正在用的 node（${process.execPath}）`);
+    // No check ran, so none was failed and nothing was sent back to the agent.
+    expect(existsSync(marker)).toBe(false);
+    expect(first.seen.some((e) => e.type === 'task.rework')).toBe(false);
+
+    // The script found a node and started the next Master: the Run goes on with the checks only.
+    writeFile(
+      join(first.t.home, 'data', 'upgrade-result.json'),
+      JSON.stringify({ ok: true, from, to: from, message: '' }),
+    );
+    h = await harness({
+      home: first.t.home,
+      repoDir: first.t.repoDir,
+      config: 'upgrade:\n  auto: true\n',
+      master: { installDir: first.installDir, launchUpgrade: () => {}, exit: () => {} },
+    });
+    await h.waitStatus(run.id, 'waiting_approval');
+    expect(existsSync(marker)).toBe(true);
+    expect(h.fake.calls.filter((c) => c.model === 'coder')).toEqual([]);
+    const [task] = h.master.store.listRunTasks(run.id);
+    expect(task?.retries).toBe(0);
+    const types = h.master.store.listEvents(run.id).map((e) => e.type);
+    expect(types).toContain('environment.resumed');
+    expect(types).toContain('task.verify_resumed');
+    expect(eventsOf(h, 'upgrade.done')).toHaveLength(1);
+  });
+
+  it('tries a target that failed for the environment again after a wait, notifying once', async () => {
+    const origin = initRepo();
+    const installDir = join(tmpDir('ares1-install-'), 'stable');
+    git(origin, 'clone', '-q', origin, installDir);
+    const from = git(installDir, 'rev-parse', 'HEAD');
+    writeFile(join(origin, 'x.txt'), 'x\n');
+    git(origin, 'add', '-A');
+    git(origin, 'commit', '-q', '-m', 'x');
+    const to = git(origin, 'rev-parse', 'HEAD');
+    const home = tmpDir('ares1-home-');
+    const resultFile = join(home, 'data', 'upgrade-result.json');
+    const message = `构建 ${to.slice(0, 7)} 时找不到能用的 node 或 npm`;
+    let now = Date.parse('2026-11-23T10:00:00Z');
+    const launches: UpgradePlan[] = [];
+    const start = () =>
+      harness({
+        home,
+        config: 'upgrade:\n  auto: true\n',
+        master: {
+          installDir,
+          launchUpgrade: (p) => launches.push(p),
+          exit: () => {},
+          now: () => now,
+        },
+      });
+    const failedEvents = (t: Harness) =>
+      eventsOf(t, 'upgrade.failed').map((e) => JSON.parse(e.data) as Record<string, unknown>);
+
+    writeFile(resultFile, JSON.stringify({ ok: false, from, to, message, env: true }));
+    let t = await start();
+    expect(failedEvents(t)).toEqual([{ from, to, message, env: true }]);
+    // Not given up like a commit that failed: nothing records it as failed.
+    expect(t.master.store.getSetting('upgrade.failed_to')).toBeNull();
+    expect(lastUpgradeFailure(t.master.store)).toMatchObject({ to, message });
+
+    // Within a check interval, it waits.
+    await t.master.upgrader.check();
+    expect(t.master.upgrader.status().state).toBe('skipped');
+    expect(t.master.upgrader.status().message).toContain('运行环境的问题');
+    expect(t.master.engine.held).toBe(false);
+    expect(launches).toEqual([]);
+
+    // Then the same commit is tried again.
+    now += envRetryDelayMs(1);
+    await t.master.upgrader.check();
+    expect(launches).toEqual([expect.objectContaining({ from, to })]);
+    await t.close();
+
+    // Failing for the environment again: the wait doubles, and nobody is notified again.
+    writeFile(resultFile, JSON.stringify({ ok: false, from, to, message, env: true }));
+    t = await start();
+    h = t;
+    const [again] = failedEvents(t).slice(-1);
+    expect(again).toEqual({ from, to, message, env: true, repeated: true });
+    expect(noticeFor({ type: 'upgrade.failed', data: again ?? {} } as never, undefined)).toBeNull();
+    expect(
+      noticeFor({ type: 'upgrade.failed', data: failedEvents(t)[0] ?? {} } as never, undefined),
+    ).not.toBeNull();
+    now += envRetryDelayMs(1);
+    await t.master.upgrader.check();
+    expect(launches).toHaveLength(1);
+    now += envRetryDelayMs(2) - envRetryDelayMs(1);
+    await t.master.upgrader.check();
+    expect(launches).toHaveLength(2);
+    expect(envRetryDelayMs(2)).toBe(2 * envRetryDelayMs(1));
+    expect(envRetryDelayMs(30)).toBe(60 * 60_000);
+  });
 });
 
 describe('isMasterSource', () => {
@@ -470,12 +644,13 @@ describe('upgrade script', () => {
    * osascript for notifications, sleep so that waiting takes no time, and fake-node for the
    * Master the script starts. fake-node hands `-e` (writing the result file) to the real node.
    * Each stand-in does what `fakes` says, else succeeds silently; $FAKE_DIR is the directory they
-   * and the script's copy are in. `env` adds to the script's environment, where
-   * ARES1_UPGRADE_WATCH is unset unless it says otherwise.
+   * and the script's copy are in, next to a copy of find-node.sh as the Master puts it. `env` adds
+   * to the script's environment, where ARES1_UPGRADE_WATCH is unset unless it says otherwise.
+   * `node` is the old Master's node the script is given (default: fake-node).
    */
   function stableCopy(
     fakes: Record<string, string> = {},
-    opts: { env?: Record<string, string>; lang?: string } = {},
+    opts: { env?: Record<string, string>; lang?: string; node?: string } = {},
   ) {
     const origin = initRepo();
     const installDir = join(tmpDir('ares1-install-'), 'stable');
@@ -502,6 +677,7 @@ describe('upgrade script', () => {
     }
     const script = join(bin, 'self-upgrade.sh');
     copyFileSync(join(process.cwd(), 'scripts', 'self-upgrade.sh'), script);
+    copyFileSync(join(process.cwd(), 'scripts', 'find-node.sh'), join(bin, 'find-node.sh'));
     const home = tmpDir('ares1-home-');
     const result = join(home, 'result.json');
     const env = {
@@ -523,7 +699,7 @@ describe('upgrade script', () => {
           '999999', // no such process: nothing to wait for
           old,
           result,
-          join(bin, 'fake-node'),
+          opts.node ?? join(bin, 'fake-node'),
           '1',
           'Ares.1',
           opts.lang ?? 'en',
@@ -735,6 +911,61 @@ describe('upgrade script', () => {
     });
     expect(result.detail).toContain('Error: Cannot find module "./missing.js"');
     expect(result.detail).not.toContain('earlier run');
+  });
+
+  it("builds and starts with another node when the old Master's is gone, and logs it", () => {
+    // `node` in the stand-ins' directory, first in PATH: what nvm's new version would be.
+    const { installDir, bin, old, target, run, log } = stableCopy(
+      {
+        sleep: untilMasterExited,
+        node: fakeMaster('[ "$1" = --version ] && echo v26.1.0', 'exit 0'),
+        npm: 'command -v node > "$FAKE_DIR/npm-node"',
+      },
+      { node: join(tmpDir('ares1-nvm-'), 'v24.22.1', 'bin', 'node') },
+    );
+    expect(run(target)).toEqual({ ok: true, from: old, to: target, message: '' });
+    expect(git(installDir, 'rev-parse', 'HEAD')).toBe(target);
+    expect(log()).toMatch(
+      new RegExp(`node \\S+/v24\\.22\\.1/bin/node cannot be used .*; using ${bin}/node \\(`),
+    );
+    // npm ran with that node's directory first in PATH, and the Master was started with it.
+    expect(readFileSync(join(bin, 'npm-node'), 'utf8').trim()).toBe(join(bin, 'node'));
+    expect(readFileSync(join(bin, 'pid'), 'utf8').trim()).not.toBe('');
+  });
+
+  it('reports a failure for want of node as the environment’s, and starts nothing it cannot', () => {
+    const { installDir, home, old, target, run, log } = stableCopy(
+      {},
+      { node: join(tmpDir('ares1-nvm-'), 'gone', 'node') },
+    );
+    // No node anywhere is new enough: as if every node were gone.
+    writeFileSync(join(installDir, 'package.json'), '{"engines": {"node": ">=999"}}\n');
+    expect(run(target)).toEqual({
+      ok: false,
+      from: old,
+      to: target,
+      message: `Building ${short(target)} found no usable node or npm (a problem of the environment, not of the commit; it is tried again once that is fixed); rolled back to ${short(old)}`,
+      env: true,
+    });
+    expect(git(installDir, 'rev-parse', 'HEAD')).toBe(old);
+    expect(log()).toContain('No usable node found');
+    expect(log()).toContain('the Master cannot be started after the rollback');
+    // Nothing was started: no Master wrote its output.
+    expect(existsSync(join(home, 'master.out'))).toBe(false);
+  });
+
+  it('counts a build that cannot find a command (exit code 127) as the environment’s', () => {
+    const { old, target, run } = stableCopy({
+      npm: 'echo "sh: npm: command not found" >&2; exit 127',
+    });
+    expect(run(target)).toEqual({
+      ok: false,
+      from: old,
+      to: target,
+      message: expect.stringContaining('found no usable node or npm'),
+      detail: 'sh: npm: command not found',
+      env: true,
+    });
   });
 
   it('still reports the failure, without the output, when node cannot write the result', () => {
