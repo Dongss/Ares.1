@@ -499,6 +499,53 @@ describe('runDigest: suggestions of passed reviews', () => {
     expect(digest(h).split('\n')).toHaveLength(2);
   });
 
+  it('calls a round passed only once it has, not while it executes or waits for approval', async () => {
+    h = await harness();
+    h.scripts.reviewer = () =>
+      suggesting('可以合并', [{ file: 'src/a.ts', description: '空输入时可以给出更清楚的错误' }]);
+    // A gated review stops in waiting_approval after its reviewer reported.
+    const run = h.run('目标', { stages: { review: { gate: true } } });
+    await h.waitStatus(run.id, 'waiting_approval');
+    const store = h.master.store;
+    const review = store.listStageRuns(run.id).find((sr) => sr.stageId === 'review');
+    expect(review?.status).toBe('waiting_approval');
+    expect(review?.failReason).toBeNull();
+    expect(digest(h)).not.toContain('评审第 1 轮');
+
+    // The reviewer reported but the stage has not ended, or the Run was terminated right then.
+    store.updateStageRun(review?.id as string, { status: 'executing' });
+    expect(digest(h)).not.toContain('评审第 1 轮');
+    store.updateRun(run.id, { status: 'cancelled', finishedAt: new Date().toISOString() });
+    expect(digest(h)).not.toContain('评审第 1 轮');
+
+    // Once the round passed, its suggestions are listed as before.
+    store.updateStageRun(review?.id as string, { status: 'passed' });
+    expect(digest(h)).toContain(
+      '  评审第 1 轮通过，建议 1 条：\n    - [src/a.ts] 空输入时可以给出更清楚的错误',
+    );
+  });
+
+  it('lists the suggestions of a gated review once a human approved it', async () => {
+    h = await harness();
+    h.scripts.reviewer = () =>
+      suggesting('可以合并', [{ file: 'src/a.ts', description: '空输入时可以给出更清楚的错误' }]);
+    const run = h.run('目标', { stages: { review: { gate: true } } });
+    await h.waitStatus(run.id, 'waiting_approval');
+    expect(digest(h)).not.toContain('评审第 1 轮');
+
+    const store = h.master.store;
+    h.master.engine.approve(run.id);
+    await waitFor(
+      () => store.listStageRuns(run.id).some((sr) => sr.stageId === 'merge'),
+      'merge round',
+    );
+    await h.waitStatus(run.id, 'waiting_approval');
+    expect(digest(h).split('\n').slice(2)).toEqual([
+      '  评审第 1 轮通过，建议 1 条：',
+      '    - [src/a.ts] 空输入时可以给出更清楚的错误',
+    ]);
+  });
+
   it('keeps a failed review as before, its suggestions only counted', async () => {
     h = await harness();
     let reviews = 0;

@@ -334,10 +334,12 @@ function failLines(sr: StageRun, stageName: string, attempts: Attempt[]): string
 /**
  * The suggestions of a review round that passed. Reviewers leave improvements beyond the goal and
  * polish of edge cases as suggestions on purpose, for later; they reach no issue, so unless the
- * scout sees them here nobody picks them up again.
+ * scout sees them here nobody picks them up again. A round still executing or waiting for approval
+ * has not passed, even when its reviewer already reported: it may yet fail, or the Run may end
+ * there.
  */
 function suggestionLines(sr: StageRun, stageName: string, attempts: Attempt[]): string[] {
-  if (sr.failReason) return [];
+  if (sr.status !== 'passed') return [];
   const suggestions = reviewOf(attempts)?.issues.filter((i) => i.severity === 'suggestion') ?? [];
   const n = suggestions.length;
   if (n === 0) return [];
