@@ -815,6 +815,86 @@ stages:
     }
   });
 
+  /** Templates whose merge stage has no agent stage to go back to for a conflict, and one that has. */
+  const writeMergeTemplates = (workflowsDir: string) => {
+    writeFile(
+      join(workflowsDir, 'to-review.yaml'),
+      `id: to-review
+stages:
+  - id: implement
+    agent: claude-coder
+  - id: review
+    kind: review
+    agent: claude-reviewer
+  - id: merge
+    kind: merge
+    on_fail: review
+`,
+    );
+    writeFile(
+      join(workflowsDir, 'merge-only.yaml'),
+      `id: merge-only
+stages:
+  - id: merge
+    kind: merge
+`,
+    );
+    writeFile(
+      join(workflowsDir, 'to-coding.yaml'),
+      `id: to-coding
+stages:
+  - id: implement
+    agent: claude-coder
+  - id: review
+    kind: review
+    agent: claude-reviewer
+  - id: merge
+    kind: merge
+    on_fail: implement
+`,
+    );
+  };
+
+  it('warns when a merge conflict has no agent stage to resolve it', () => {
+    const paths = home();
+    writeMergeTemplates(paths.workflowsDir);
+    const cfg = loadConfig(paths, ['claude-code']);
+    for (const id of ['to-review', 'merge-only', 'to-coding']) {
+      expect(cfg.errors[`workflows/${id}.yaml`]).toBeUndefined();
+      expect(cfg.templates.has(id)).toBe(true);
+    }
+
+    const toReview = cfg.warnings['workflows/to-review.yaml'] ?? [];
+    expect(toReview).toEqual([
+      '阶段 merge：合并阶段失败时回退到的 review 不是 Agent 阶段。合并目标分支的最新代码发生冲突时，没有 Agent 能解决，Run 会直接结束、标为失败，从 issue 来的 Run 会在 max_run_attempts 的限制内基于目标分支的最新代码自动重做。想让 Agent 解决冲突，就把 on_fail 指向一个 Agent 阶段（kind: agent）',
+    ]);
+    expect(cfg.warnings['workflows/merge-only.yaml']).toEqual([
+      expect.stringMatching(/^阶段 merge：合并阶段失败时没有可回退的 Agent 阶段。合并目标分支/),
+    ]);
+    // Going back to an agent stage, explicitly or by default (the self-dev template): no warning.
+    expect(cfg.warnings['workflows/to-coding.yaml']).toBeUndefined();
+    expect(cfg.warnings['workflows/self-dev.yaml']).toBeUndefined();
+  });
+
+  it('warns when a merge conflict has no agent stage to resolve it in English too', () => {
+    setLang('en');
+    const paths = home();
+    writeMergeTemplates(paths.workflowsDir);
+    const cfg = loadConfig(paths, ['claude-code']);
+    expect(cfg.warnings['workflows/to-review.yaml']).toEqual([
+      'Stage merge: the merge stage goes back to review when it fails, which is not an agent stage. When merging the latest target branch runs into conflicts, no agent can resolve them, so the Run ends as failed, and a Run from an issue is redone on the latest target branch within max_run_attempts. To have an agent resolve conflicts, point on_fail at an agent stage (kind: agent)',
+    ]);
+    const mergeOnly = cfg.warnings['workflows/merge-only.yaml'] ?? [];
+    expect(mergeOnly).toEqual([
+      expect.stringMatching(/^Stage merge: the merge stage has no agent stage to go back to\. /),
+    ]);
+    for (const warning of [...(cfg.warnings['workflows/to-review.yaml'] ?? []), ...mergeOnly]) {
+      expect(warning).not.toMatch(/[一-鿿]/);
+    }
+    expect(cfg.warnings['workflows/to-coding.yaml']).toBeUndefined();
+    expect(cfg.warnings['workflows/self-dev.yaml']).toBeUndefined();
+  });
+
   it('resolves stage settings: system default → template → stage → run override', () => {
     const t: WorkflowTemplate = TemplateSchema.parse({
       id: 't',

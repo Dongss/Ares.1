@@ -157,7 +157,10 @@ function FlowStageBody({ stage, progress }: { stage: FlowStage; progress?: FlowP
                 zh: `回到「${stage.onConflict.name}」，由 Agent 解决`,
                 en: `Back to "${stage.onConflict.name}", where the agent resolves them`,
               })
-            : t({ zh: '等人解决', en: 'Wait for a human to resolve them' })}
+            : t({
+                zh: '没有 Agent 能解决：结束 Run，标为失败',
+                en: 'No agent can resolve them: the Run ends as failed',
+              })}
         </Line>
       )}
       {stage.gate && (

@@ -1981,6 +1981,59 @@ stages:
     expect(gh.get(1)).toMatchObject({ state: 'closed', stateReason: 'completed' });
   });
 
+  it('redoes a Run whose merge conflicted with no agent stage to resolve it, on the latest main', async () => {
+    // The merge waits for approval, so main can move on before the Run merges. It goes back to
+    // the assessment, which cannot change files.
+    const gated = REDO_WORKFLOW.replace(
+      'kind: merge\n',
+      'kind: merge\n    gate: true\n    on_fail: assess\n',
+    );
+    const t = await start(config(), gated);
+    t.scripts.assessor = () => assessment('go');
+    t.scripts.coder = (ctx) => {
+      writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+      return done('写了 feature.txt');
+    };
+    gh.add({ title: '加 feature', body: '写 feature.txt', labels: [LABELS.ready] });
+    await t.master.issues.poll();
+
+    // Meanwhile main gets a feature.txt of its own: the Run fails instead of waiting for a human
+    // to merge by hand, and is redone.
+    const first = nth(t, 0);
+    const waiting = await t.waitStatus(first.id, 'waiting_approval');
+    writeFile(join(t.repoDir, 'feature.txt'), 'from main\n');
+    git(t.repoDir, 'add', '-A');
+    git(t.repoDir, 'commit', '-q', '-m', 'main adds feature.txt');
+    const mainHead = git(t.repoDir, 'rev-parse', 'main');
+    t.master.engine.approve(first.id);
+    const failed = await t.waitStatus(first.id, 'failed');
+    expect(failed.blocked).toBeNull();
+    expect(failed.error).toContain('这些文件有冲突：\n- feature.txt\n');
+    await t.master.issues.sync();
+    expect(gh.get(1).comments.find((c) => c.includes('Run 失败了'))).toContain('第 1/3 次尝试');
+    expect(gh.get(1).labels).toEqual([LABELS.running]);
+    const second = nth(t, 1);
+    expect(second.issue?.earlier).toEqual([
+      {
+        runId: first.id,
+        attempt: 1,
+        stage: '合并',
+        error: expect.stringContaining('- feature.txt'),
+      },
+    ]);
+
+    // The redo works on the latest main from the start, so nothing conflicts any more.
+    const again = await t.waitStatus(second.id, 'waiting_approval');
+    expect(again.worktreePath).not.toBe(waiting.worktreePath);
+    expect(again.baseCommit).toBe(mainHead);
+    expect(callsOf(t, 'coder')[1]?.prompt).toContain('- feature.txt');
+    t.master.engine.approve(second.id);
+    await t.waitStatus(second.id, 'completed');
+    expect(git(t.repoDir, 'show', 'main:feature.txt')).toBe('ok');
+    await t.master.issues.sync();
+    expect(gh.get(1)).toMatchObject({ state: 'closed', stateReason: 'completed' });
+  });
+
   it('waits for the next day when the automatic spending is at its limit, costing no attempt', async () => {
     const t = await startRedo(config({ budget: 1 }), [1]);
     const spent = spendToday(t);

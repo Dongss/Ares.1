@@ -4,6 +4,7 @@ import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
 import { join as joinList, type Lang, setLang, t } from '../i18n.js';
 import { defaultAgentsYaml, defaultConfigYaml, defaultSelfDevYaml } from './defaults.js';
+import { conflictTarget, failTarget } from './flow.js';
 import {
   type AgentConfig,
   type AgentEntry,
@@ -563,6 +564,29 @@ export function validateTemplate(
       t({
         zh: `阶段 ${s.id}：reply_timeout_hours 只对需求评估阶段（kind: assess）有效，这里不起作用`,
         en: `Stage ${s.id}: reply_timeout_hours only applies to assess stages (kind: assess) and has no effect here`,
+      }),
+    );
+  }
+
+  // Only an agent can resolve a merge conflict. Without one to go back to, a conflict ends the
+  // Run, to be redone on the latest target branch: valid, but the template's author may expect
+  // the agent to resolve it.
+  for (const s of tpl.stages) {
+    if (s.kind !== 'merge' || conflictTarget(tpl, s.id) !== null) continue;
+    const back = failTarget(tpl, s.id);
+    // An on_fail naming no stage is already an error.
+    if (back === null || !ids.has(back)) continue;
+    const where =
+      back === s.id
+        ? t({ zh: '失败时没有可回退的 Agent 阶段', en: 'has no agent stage to go back to' })
+        : t({
+            zh: `失败时回退到的 ${back} 不是 Agent 阶段`,
+            en: `goes back to ${back} when it fails, which is not an agent stage`,
+          });
+    warnings.push(
+      t({
+        zh: `阶段 ${s.id}：合并阶段${where}。合并目标分支的最新代码发生冲突时，没有 Agent 能解决，Run 会直接结束、标为失败，从 issue 来的 Run 会在 max_run_attempts 的限制内基于目标分支的最新代码自动重做。想让 Agent 解决冲突，就把 on_fail 指向一个 Agent 阶段（kind: agent）`,
+        en: `Stage ${s.id}: the merge stage ${where}. When merging the latest target branch runs into conflicts, no agent can resolve them, so the Run ends as failed, and a Run from an issue is redone on the latest target branch within max_run_attempts. To have an agent resolve conflicts, point on_fail at an agent stage (kind: agent)`,
       }),
     );
   }

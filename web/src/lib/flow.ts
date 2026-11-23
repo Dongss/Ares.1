@@ -67,7 +67,7 @@ export interface FlowStage extends FlowStageRef {
   onFail: FlowStageRef | null;
   /**
    * Merge stages: the agent stage that resolves a conflict with the target branch
-   * (`conflictTarget`); null when a conflict waits for a human, and for other stages.
+   * (`conflictTarget`); null when a conflict ends the Run, and for other stages.
    */
   onConflict: FlowStageRef | null;
   /** Where the stage goes back to when the approval is rejected; null without a gate. */

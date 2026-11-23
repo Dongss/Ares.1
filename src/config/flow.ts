@@ -346,7 +346,8 @@ export function failTarget(template: WorkflowTemplate, stageId: string): string 
  * Where a merge stage goes when merging the target branch's latest code conflicts: its
  * `failTarget`, whose agent merges the target branch again and resolves the conflicts (rounds
  * count toward max_loops like any rollback). Only an agent stage can change files; for anything
- * else null: the Run waits for a human (`merge_conflict`).
+ * else null: the Run ends as failed, and a Run from an issue is redone on the latest target
+ * branch, where the conflicts are gone.
  */
 export function conflictTarget(template: WorkflowTemplate, stageId: string): string | null {
   if (template.stages.find((s) => s.id === stageId)?.kind !== 'merge') return null;
