@@ -128,6 +128,45 @@ describe('upgrader', () => {
     expect(launches).toEqual([]);
   });
 
+  it('does not retry a target it could not pull, until origin has a newer commit', async () => {
+    const first = await installed();
+    const { home } = first.t;
+    const from = git(first.installDir, 'rev-parse', 'HEAD');
+    const to = first.commit('new.txt');
+    await first.t.master.upgrader.check();
+    expect(first.launches).toHaveLength(1);
+    // The pull failed, so HEAD never moved: the script reports the old commit as `to`.
+    writeFile(
+      join(home, 'data', 'upgrade-result.json'),
+      JSON.stringify({ ok: false, from, to: from, message: '拉取失败，已回退' }),
+    );
+    const launches: UpgradePlan[] = [];
+    h = await harness({
+      home,
+      config: 'upgrade:\n  auto: true\n',
+      master: {
+        installDir: first.installDir,
+        launchUpgrade: (p) => launches.push(p),
+        exit: () => {},
+      },
+    });
+    const failed = eventsOf(h, 'upgrade.failed');
+    expect(failed).toHaveLength(1);
+    expect(JSON.parse(failed[0]?.data ?? '{}')).toMatchObject({ from, to });
+
+    await h.master.upgrader.check();
+    expect(h.master.upgrader.status()).toMatchObject({
+      state: 'skipped',
+      message: `升级到 ${to.slice(0, 7)} 失败过，等有新的提交再试`,
+    });
+    expect(h.master.engine.held).toBe(false);
+    expect(launches).toEqual([]);
+
+    const newer = first.commit('newer.txt');
+    await h.master.upgrader.check();
+    expect(launches).toEqual([expect.objectContaining({ from, to: newer })]);
+  });
+
   it('reports a successful upgrade on the next start', async () => {
     const home = tmpDir('ares1-home-');
     writeFile(
@@ -219,5 +258,63 @@ describe('upgrade script', () => {
     const notes = readFileSync(notified, 'utf8');
     expect(notes).toContain('Automatic upgrade failed: install directory');
     expect(notes).toContain('自动升级失败：找不到安装目录');
+  });
+
+  it('reports the planned target, not the old HEAD, when it cannot fast-forward', () => {
+    const origin = initRepo();
+    const installDir = join(tmpDir('ares1-install-'), 'stable');
+    git(origin, 'clone', '-q', origin, installDir);
+    const old = git(installDir, 'rev-parse', 'HEAD');
+    writeFile(join(origin, 'new.txt'), 'new\n');
+    git(origin, 'add', '-A');
+    git(origin, 'commit', '-q', '-m', 'new');
+    const target = git(origin, 'rev-parse', 'HEAD');
+    git(installDir, 'fetch', '-q', 'origin'); // as the Master does before launching
+    // An untracked file in the way of the new commit makes the fast-forward fail.
+    writeFileSync(join(installDir, 'new.txt'), 'local\n');
+
+    const bin = tmpDir('ares1-bin-');
+    // npm and curl stand in for the build and the health check, osascript for notifications,
+    // fake-node for the Master the script starts.
+    for (const cmd of ['npm', 'curl', 'osascript', 'fake-node']) {
+      writeFileSync(join(bin, cmd), '#!/bin/sh\nexit 0\n');
+      chmodSync(join(bin, cmd), 0o755);
+    }
+    const home = tmpDir('ares1-home-');
+    const result = join(home, 'result.json');
+    const run = (...extra: string[]) => {
+      execFileSync(
+        'bash',
+        [
+          join(process.cwd(), 'scripts', 'self-upgrade.sh'),
+          installDir,
+          home,
+          '999999', // no such process: nothing to wait for
+          old,
+          result,
+          join(bin, 'fake-node'),
+          '1',
+          'Ares.1',
+          'en',
+          ...extra,
+        ],
+        {
+          env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+        },
+      );
+      return JSON.parse(readFileSync(result, 'utf8')) as Record<string, unknown>;
+    };
+
+    expect(run(target)).toEqual({
+      ok: false,
+      from: old,
+      to: target,
+      message: `Pulling or building ${target.slice(0, 7)} failed; rolled back to ${old.slice(0, 7)}`,
+    });
+    expect(git(installDir, 'rev-parse', 'HEAD')).toBe(old);
+    // Without a target it pulls, and reports where HEAD is, as before.
+    expect(run()).toMatchObject({ ok: false, from: old, to: old });
   });
 });

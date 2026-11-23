@@ -36,6 +36,12 @@ export interface UpgraderDeps {
 
 const CHECK_EVERY_MS = 2 * 60_000;
 const FAILED_KEY = 'upgrade.failed_to';
+/**
+ * The commit the launched script was asked to upgrade to. A failed result is recorded against it
+ * rather than the script's `to`: when the pull fails, HEAD (and so `to`) is still the old commit,
+ * and recording that would retry the real target on every check.
+ */
+const TARGET_KEY = 'upgrade.target';
 
 /** How a finished upgrade went, written by the script. */
 interface UpgradeResult {
@@ -49,7 +55,8 @@ interface UpgradeResult {
  * Keeps the Master on the latest commit of its install directory's origin: when the stable
  * copy falls behind (a Run merged into the dev repo), it holds the queue, waits for the executing
  * Run and any scout, then hands over to scripts/self-upgrade.sh, which pulls, builds, restarts and
- * rolls back if the new version does not come up. A target that failed once is not retried.
+ * rolls back if the new version does not come up. A target that failed once (pulling, building
+ * or starting it) is not retried; a newer commit on origin is.
  */
 export class Upgrader {
   private timer: ReturnType<typeof setInterval> | undefined;
@@ -116,14 +123,18 @@ export class Upgrader {
     rmSync(this.resultFile, { force: true });
     const store = this.deps.store;
     store.tx(() => {
+      const target = store.getSetting(TARGET_KEY);
+      store.setSetting(TARGET_KEY, null);
       if (result.ok) {
         store.setSetting(FAILED_KEY, null);
         store.event(null, 'upgrade.done', { from: result.from, to: result.to });
       } else {
-        if (result.to) store.setSetting(FAILED_KEY, result.to);
+        // Without a planned target, trust the script's `to` only if it moved past `from`.
+        const failed = target ?? (result.to && result.to !== result.from ? result.to : '');
+        if (failed) store.setSetting(FAILED_KEY, failed);
         store.event(null, 'upgrade.failed', {
           from: result.from,
-          to: result.to,
+          to: failed,
           message: result.message ?? t({ zh: '升级失败', en: 'The upgrade failed' }),
         });
       }
@@ -248,11 +259,15 @@ export class Upgrader {
     }
     this.launched = true;
     this.set('upgrading', `${from.slice(0, 7)} → ${to.slice(0, 7)}`);
-    store.event(null, 'upgrade.started', { from, to });
+    store.tx(() => {
+      store.setSetting(TARGET_KEY, to);
+      store.event(null, 'upgrade.started', { from, to });
+    });
     try {
       await this.deps.launch({ installDir, from, to, resultFile: this.resultFile });
     } catch (err) {
       this.launched = false;
+      store.setSetting(TARGET_KEY, null);
       release();
       this.problem(
         t({

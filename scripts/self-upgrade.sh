@@ -5,19 +5,23 @@
 # so that `git pull` never rewrites the script while bash is reading it.
 #
 #   self-upgrade.sh <install dir> <home> <old pid> <old commit> <result file> <node> <port> \
-#                   [<name>] [<language>]
+#                   [<name>] [<language>] [<target>]
 #
-# Waits for the old Master to exit, pulls (fast-forward only), installs and builds, starts the new
+# Waits for the old Master to exit, fast-forwards to <target>, installs and builds, starts the new
 # Master and checks /api/health. If any step fails it goes back to <old commit>, builds and starts
 # that. The result file tells the next Master how it went; a system notification is sent only if
 # nothing could be started at all. <name> is the project's display name (src/brand.ts), used as
 # the notification title; <language> (zh or en, config.yaml's language) picks the texts.
+# <target> is the commit the Master found on origin (already fetched); a failure is reported
+# against it, so that the Master does not try it again. Without it the script pulls instead and
+# reports whatever HEAD is.
 
 set -u
 # Variables are always written as ${name}: bash would read a following non-ASCII character
 # (e.g. a Chinese parenthesis) as part of the name.
 
 dir=$1 home=$2 pid=$3 old=$4 result=$5 node=$6 port=$7 name=${8:-Master} lang=${9:-zh}
+target=${10:-}
 
 # The text of the Master's language: pick <zh> <en>.
 pick() { if [ "${lang}" = en ]; then printf '%s' "$2"; else printf '%s' "$1"; fi; }
@@ -31,6 +35,11 @@ notify() {
 
 write_result() { # ok to message
   printf '{"ok":%s,"from":"%s","to":"%s","message":"%s"}\n' "$1" "${old}" "$2" "$3" >"${result}"
+}
+
+# Fast-forward only: to <target>, so that the commit started is the one the Master planned.
+advance() {
+  if [ -n "${target}" ]; then git merge -q --ff-only "${target}"; else git pull --ff-only -q; fi
 }
 
 build() { npm ci --no-audit --no-fund && npm run build; }
@@ -67,7 +76,7 @@ cd "${dir}" || {
   exit 1
 }
 
-if git pull --ff-only -q && build; then
+if advance && build; then
   new=$(git rev-parse HEAD)
   # Written before starting, so the new Master finds it on startup.
   write_result true "${new}" ""
@@ -82,7 +91,8 @@ if git pull --ff-only -q && build; then
   msg=$(pick "新版本 ${new:0:7} 启动后没有响应，已回退到 ${old:0:7}" \
     "The new version ${new:0:7} did not respond after starting; rolled back to ${old:0:7}")
 else
-  new=$(git rev-parse HEAD)
+  # Not HEAD: if the fast-forward failed, HEAD is still <old commit>.
+  new=${target:-$(git rev-parse HEAD)}
   msg=$(pick "拉取或构建 ${new:0:7} 失败，已回退到 ${old:0:7}" \
     "Pulling or building ${new:0:7} failed; rolled back to ${old:0:7}")
 fi

@@ -96,6 +96,7 @@ function launchUpgradeScript(paths: HomePaths, port: number, plan: UpgradePlan):
       String(port),
       brandName(),
       lang(),
+      plan.to,
     ],
     { detached: true, stdio: ['ignore', log, log], env: process.env },
   ).unref();
