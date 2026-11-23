@@ -7,6 +7,7 @@ import { brandName } from '../brand.js';
 import {
   isAutoAcceptable,
   issueRunOverrides,
+  redoDueAt,
   replyTimeoutHours,
   scoutBackoff,
   scoutLimitWait,
@@ -130,6 +131,24 @@ function waitingForYouText(proposals: number, stuck: number): string {
   });
 }
 
+/**
+ * Why the automatic scout waits for work that goes on by itself: 「等 1 个未结束的 Run 做完，
+ * 另外有 2 个 issue 在等重做」. A part that is 0 is left out; null when both are.
+ */
+function busyText(moving: number, redo: number): string | null {
+  const runs = t({
+    zh: `等 ${moving} 个未结束的 Run 做完`,
+    en: `Waiting for ${moving} unfinished Run${moving === 1 ? '' : 's'} to finish`,
+  });
+  const issues = t({
+    zh: `有 ${redo} 个 issue 在等重做`,
+    en: `${redo} issue${redo === 1 ? '' : 's'} waiting to be redone`,
+  });
+  if (redo === 0) return moving === 0 ? null : runs;
+  if (moving === 0) return issues;
+  return t({ zh: `${runs}，另外${issues}`, en: `${runs}; ${issues}` });
+}
+
 /** A scout in progress: its agent once started, and the whole scout including the cleanup. */
 interface ScoutEntry {
   scoutId: string;
@@ -170,8 +189,9 @@ export function startOfToday(now = new Date()): string {
  * - intake: an open issue labeled ares1:ready becomes a Run;
  * - sync: the Run's progress shows on the issue (labels, comments, closed when merged);
  * - stop: a human closing the issue terminates its unfinished Run, and the issue is left alone;
- * - redo: a failed Run is redone as a new Run told why it failed, up to `max_run_attempts` Runs
- *   per issue and within the day's budget; then the issue is closed with every failure's reason;
+ * - redo: a failed Run is redone as a new Run told why it failed, after a wait that doubles with
+ *   each attempt (see redoDueAt), up to `max_run_attempts` Runs per issue and within the day's
+ *   budget; then the issue is closed with every failure's reason;
  * - discussion: the requirement assessment's questions and conclusion are posted on the issue,
  *   and a human's replies there go back to the Run;
  * - scout: an AI reads the repo and its Run history and proposes issues, on demand or by itself
@@ -185,6 +205,8 @@ export function startOfToday(now = new Date()): string {
 export class IssueBridge {
   private pollTimer: ReturnType<typeof setTimeout> | undefined;
   private syncTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Syncs when the earliest wait before redoing a failed Run ends. */
+  private redoTimer: ReturnType<typeof setTimeout> | undefined;
   private chain: Promise<void> = Promise.resolve();
   private client: { key: string; gh: GitHub } | undefined;
   /** gh's active account, for the client it was asked with. */
@@ -222,6 +244,11 @@ export class IssueBridge {
 
   private get cfg() {
     return this.deps.config();
+  }
+
+  /** How often the Master looks at GitHub (`poll_minutes`). */
+  private get pollMinutes(): number {
+    return this.cfg.master.github?.poll_minutes ?? 5;
   }
 
   private gh(): GitHub {
@@ -267,6 +294,7 @@ export class IssueBridge {
     this.deps.store.bus.off('event', this.onEvent);
     clearTimeout(this.pollTimer);
     clearTimeout(this.syncTimer);
+    clearTimeout(this.redoTimer);
     // Wait for the scouts to record the interruption and delete their temporary worktrees.
     await Promise.all(
       [...this.scouting.values()].map(async (s) => {
@@ -319,10 +347,7 @@ export class IssueBridge {
     clearTimeout(this.pollTimer);
     if (this.stopping) return;
     this.pollTimer = setTimeout(() => {
-      void this.poll().finally(() => {
-        const minutes = this.cfg.master.github?.poll_minutes ?? 5;
-        this.schedulePoll(minutes * 60_000);
-      });
+      void this.poll().finally(() => this.schedulePoll(this.pollMinutes * 60_000));
     }, delayMs);
   }
 
@@ -330,6 +355,32 @@ export class IssueBridge {
     clearTimeout(this.syncTimer);
     if (this.stopping) return;
     this.syncTimer = setTimeout(() => void this.sync(), 1_000);
+  }
+
+  /**
+   * Sync once the earliest wait before redoing a failed Run ends (see redoDueAt), so the redo
+   * does not also wait for the next poll. Waits held by the day's budget or the work switch are
+   * left to the polls. Set again after every sync and poll.
+   */
+  private scheduleRedo(): void {
+    clearTimeout(this.redoTimer);
+    this.redoTimer = undefined;
+    const github = this.cfg.master.github;
+    if (!github || this.stopping || !this.deps.store.working) return;
+    const now = Date.now();
+    let next: number | undefined;
+    for (const name of Object.keys(github.repos)) {
+      const repo = this.deps.store.findRepo(name);
+      if (!repo) continue;
+      for (const run of this.deps.store.runsAwaitingRedo(repo.id)) {
+        const due = redoDueAt(run, this.pollMinutes);
+        if (due !== null && due > now && (next === undefined || due < next)) next = due;
+      }
+    }
+    if (next === undefined) return;
+    // A second late, so the wait is surely over when the sync looks.
+    this.redoTimer = setTimeout(() => void this.sync(), next - now + 1_000);
+    this.redoTimer.unref();
   }
 
   /** Run `fn` after everything queued before it; GitHub calls never overlap. */
@@ -398,25 +449,31 @@ export class IssueBridge {
           });
         }
       }
+      this.scheduleRedo();
       this.lastPollAt = nowIso();
       if (!failed) this.lastError = null;
     });
   }
 
-  /** Catch issues up with their Runs now; a Run that just failed is redone right away. */
+  /**
+   * Catch issues up with their Runs now, and redo the failed Runs whose wait before the redo is
+   * over (see redoDueAt): a Run that just failed is not redone right away.
+   */
   sync(): Promise<void> {
     return this.serial(async () => {
       const github = this.cfg.master.github;
       if (!github || this.stopping) return;
       await this.syncRuns();
-      if (!this.deps.store.working) return;
-      for (const name of Object.keys(github.repos)) {
-        try {
-          await this.redoFailedRuns(name);
-        } catch (err) {
-          this.report(err);
+      if (this.deps.store.working) {
+        for (const name of Object.keys(github.repos)) {
+          try {
+            await this.redoFailedRuns(name);
+          } catch (err) {
+            this.report(err);
+          }
         }
       }
+      this.scheduleRedo();
     });
   }
 
@@ -678,6 +735,16 @@ export class IssueBridge {
     const store = this.deps.store;
     store.tx(() => {
       store.setIssueSynced(run.id, run.status);
+      if (failure?.kind === 'redo') {
+        // The failed Run's page learns when the next attempt starts.
+        store.event(run.id, 'issue.redo_scheduled', {
+          repo: repo.name,
+          issue: issue.number,
+          attempt: failure.attempt + 1,
+          maxAttempts: failure.max,
+          redoAt: new Date(failure.redoAt).toISOString(),
+        });
+      }
       if (failure?.kind === 'exhausted') {
         store.event(run.id, 'issue.retries_exhausted', {
           repo: repo.name,
@@ -718,13 +785,22 @@ export class IssueBridge {
       const failures = [...(issue.earlier ?? []), failedAttempt(run, stage)];
       return { kind: 'exhausted', attempt, max, failures };
     }
-    return { kind: 'redo', attempt, max, budgetReached: this.overBudget(repo, cfg) };
+    const redoAt = redoDueAt({ ...run, issue: { ...issue, redo } }, this.pollMinutes);
+    return {
+      kind: 'redo',
+      attempt,
+      max,
+      budgetReached: this.overBudget(repo, cfg),
+      redoAt: redoAt ?? Date.now(),
+    };
   }
 
   /**
    * Redo the repo's failed Runs whose issue is still open: a new Run, the next attempt, told why
    * the earlier ones failed. Only once the failure is on the issue, so the comments come in
-   * order. Over today's budget the redos wait for the next day, which costs no attempt.
+   * order, and once the wait after the failure is over (see redoDueAt), so a passing outage does
+   * not use up the attempts. Over today's budget the redos wait for the next day. Neither wait
+   * costs an attempt.
    */
   private async redoFailedRuns(name: string): Promise<void> {
     const { repo, cfg } = this.repoSetup(name);
@@ -738,6 +814,8 @@ export class IssueBridge {
         this.abandonRedo(name, failed, prev, 'restarted');
         continue;
       }
+      // Still waiting; the other issues' redos go on. A sync is set for when it ends.
+      if ((redoDueAt(failed, this.pollMinutes) ?? 0) > Date.now()) continue;
       if (this.overBudget(repo, cfg)) return;
       const gh = this.gh();
       const issue = await gh.getIssue(prev.repo, prev.number);
@@ -835,7 +913,7 @@ export class IssueBridge {
     const ctx = {
       dashboardUrl: this.dashboardUrl(),
       runId: run.id,
-      pollMinutes: this.cfg.master.github?.poll_minutes ?? 5,
+      pollMinutes: this.pollMinutes,
     };
     for (let i = run.issueDiscussionSynced; i < run.discussion.length; i++) {
       if (this.stopping) return;
@@ -936,8 +1014,8 @@ export class IssueBridge {
   }
 
   /**
-   * Scout by itself when there is nothing to do: the repo has no Run that goes on by itself
-   * (see splitUnfinishedRuns), the proposals that hold it back (see proposalsHoldingScout) and
+   * Scout by itself when there is nothing to do: the repo has no Run that goes on by itself and
+   * no issue waiting to be redone (see splitUnfinishedRuns), the proposals that hold it back (see proposalsHoldingScout) and
    * the Runs stuck waiting for a human are fewer than max_proposals together, the day's budget is
    * not spent, the configured interval since the last scout has passed, it is not backing off
    * after scouts that found nothing or failed (see scoutBackoff: the wait doubles with each such
@@ -965,15 +1043,8 @@ export class IssueBridge {
       store.listRuns({ repoId: repo.id }),
       (id) => store.getStageRun(id).stageId,
     );
-    const busy = runs.moving.length;
-    if (busy > 0) {
-      return {
-        reason: t({
-          zh: `等 ${busy} 个未结束的 Run 做完`,
-          en: `Waiting for ${busy} unfinished Run${busy === 1 ? '' : 's'} to finish`,
-        }),
-      };
-    }
+    const busy = busyText(runs.moving.length, runs.redo.length);
+    if (busy) return { reason: busy };
     if (this.deps.engine.held) {
       return { reason: t({ zh: '等 Master 升级', en: 'Waiting for the Master to upgrade' }) };
     }
@@ -1045,7 +1116,7 @@ export class IssueBridge {
     repo: Repo,
     scouts: Scout[],
   ): Promise<(ScoutWait & { until: string }) | null> {
-    const pollMinutes = this.cfg.master.github?.poll_minutes ?? 5;
+    const pollMinutes = this.pollMinutes;
     let backoff = scoutBackoff(scouts, pollMinutes);
     if (!backoff || Date.parse(backoff.until) <= Date.now()) return null;
     // Scouts that ran before the target branch's latest commit do not count: they did not see it.

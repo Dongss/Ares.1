@@ -47,8 +47,9 @@ src/
     flow.ts           effective stage settings, check commands, rollback targets, budgets,
                       which proposals are accepted automatically, the automatic scout's
                       back-off, how long a Run or a scout waits for an agent's quota (rate
-                      limits), which unfinished Runs go on by themselves and which only wait
-                      for a human (shared by engine, GitHub bridge and dashboard)
+                      limits), how long a failed Run of an issue waits before it is redone,
+                      which Runs go on by themselves (redos to come included) and which only
+                      wait for a human (shared by engine, GitHub bridge, API and dashboard)
     effort.ts         helpers for agent effort (shared by engine and dashboard)
   store/              SQLite store (node:sqlite): store.ts, migrations.ts, types.ts (entity types)
   adapters/           agent adapters: types.ts (common interface), process.ts (child processes,
@@ -131,7 +132,8 @@ test/
 - Each rule lives in one place, shared by engine and dashboard:
   - rollback targets, effective settings, which proposals are accepted automatically, the
     automatic scout's back-off, the waits for an agent's quota (rate limits) of Runs and scouts,
-    which unfinished Runs it waits for and the like: `src/config/flow.ts`
+    the wait before a failed Run of an issue is redone (`redoDelayMs` / `redoDueAt`), which
+    unfinished Runs and redos the scout waits for and the like: `src/config/flow.ts`
   - notification rules: `src/notify/notice.ts`
   - assessment conclusion rules: `src/engine/discussion.ts`
   - how a Run's time is split, and the names and groups of the parts: `src/engine/times.ts`

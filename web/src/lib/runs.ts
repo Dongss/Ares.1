@@ -250,6 +250,26 @@ export function rateLimitText(wait: RateLimitedWait, now = new Date()): string {
 }
 
 /**
+ * 「预计 14:05:00 自动重做，开始第 2 次尝试」: when the issue of a failed Run (its `attempt`) is
+ * redone as a new Run (`RunDetail.redoAt`). Once that time has passed, the redo starts at the next
+ * check, unless today's automatic spending is at its limit or the work switch is off.
+ */
+export function redoText(redoAt: string, attempt: number, now = new Date()): string {
+  const next = attempt + 1;
+  if (Date.parse(redoAt) <= now.getTime()) {
+    return t({
+      zh: `下一次检查时自动重做，开始第 ${next} 次尝试`,
+      en: `To be redone automatically at the next check, as attempt ${next}`,
+    });
+  }
+  const at = formatTime(redoAt, now);
+  return t({
+    zh: `预计 ${at} 自动重做，开始第 ${next} 次尝试`,
+    en: `To be redone automatically at ${at}, as attempt ${next}`,
+  });
+}
+
+/**
  * The event in words, for the events list, from its structured data; null for events that only
  * show their data.
  */

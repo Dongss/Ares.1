@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { isCostUnknown } from '../../../src/api/cost.js';
 import type { ConfigView, RunDetail } from '../../../src/api/types.js';
-import { effectiveBudget } from '../../../src/config/flow.js';
+import { effectiveBudget, REDO_BACKOFF_MAX_HOURS } from '../../../src/config/flow.js';
 import { t } from '../../../src/i18n.js';
 import type {
   Approval,
@@ -47,6 +47,7 @@ import {
   eventText,
   ignoredCommentsText,
   rateLimitText,
+  redoText,
   replyDeadlineOf,
   untrustedIssueText,
   workspaceLines,
@@ -67,7 +68,8 @@ export function RunDetailPage(props: {
 }) {
   const { id, config } = props;
   const detail = useResource(() => api.run(id), id);
-  useReloadOn(detail.reload, (e) => e.runId === id);
+  // A redo of this Run is an event of the new Run.
+  useReloadOn(detail.reload, (e) => e.runId === id || e.data.failedRunId === id);
   const [tab, setTab] = useState<Tab>('progress');
   const [commit, setCommit] = useState<string>();
   /** A stage round to scroll to in the timeline; `n` makes a repeated click scroll again. */
@@ -340,6 +342,17 @@ function RunActions(props: {
           <BlockedPanel detail={props.detail} config={props.config} onChanged={props.onChanged} />
         )}
       {run.status === 'failed' && run.error && <ErrorBox>{run.error}</ErrorBox>}
+      {props.detail.redoAt && (
+        <div className="panel">
+          <h2>{redoText(props.detail.redoAt, run.issue?.attempt ?? 1)}</h2>
+          <p>
+            {t({
+              zh: `两次尝试之间先等一会儿，免得一时的 API 或网络故障很快用完尝试次数（max_run_attempts）：等待从 poll_minutes 起，每失败一次翻倍，最长 ${REDO_BACKOFF_MAX_HOURS} 小时。今天的自动花费已达上限或工作开关关着时会等得更久。不想再做就关闭 issue。`,
+              en: `Attempts are spaced out so that a passing API or network outage does not use them up (max_run_attempts): the wait starts at poll_minutes and doubles with each failure, up to ${REDO_BACKOFF_MAX_HOURS} hours. It is longer while today's automatic spending is at its limit or the work switch is off. To stop, close the issue.`,
+            })}
+          </p>
+        </div>
+      )}
       {run.status === 'queued' && props.detail.rateLimited && (
         <div className="panel">
           <h2>{rateLimitText(props.detail.rateLimited)}</h2>

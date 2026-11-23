@@ -13,6 +13,7 @@ import {
   pageTitle,
   patchLineClass,
   rateLimitText,
+  redoText,
   replyDeadlineOf,
   splitPatch,
   untrustedIssueText,
@@ -391,6 +392,19 @@ describe('rate limits', () => {
     );
     expect(rateLimitText({ agentId: 'coder', retryAt: tomorrow }, now)).toBe(
       'Agent coder 额度用尽或被限流，预计 11-21 03:30 继续',
+    );
+  });
+
+  it('says when the issue of a failed Run is redone, and as which attempt', () => {
+    expect(redoText(today, 1, now)).toBe('预计 14:05:00 自动重做，开始第 2 次尝试');
+    expect(redoText(tomorrow, 2, now)).toBe('预计 11-21 03:30 自动重做，开始第 3 次尝试');
+    // The wait is over, but the budget or the work switch still holds it.
+    const past = new Date(2026, 10, 20, 8, 0, 0).toISOString();
+    expect(redoText(past, 1, now)).toBe('下一次检查时自动重做，开始第 2 次尝试');
+    setLang('en');
+    expect(redoText(today, 1, now)).toBe('To be redone automatically at 14:05:00, as attempt 2');
+    expect(redoText(past, 1, now)).toBe(
+      'To be redone automatically at the next check, as attempt 2',
     );
   });
 

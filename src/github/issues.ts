@@ -309,6 +309,8 @@ export interface IssueUpdateContext {
    * issue's repo is no longer configured), and a human redoes it with ares1:ready.
    */
   failure?: FailureOutcome;
+  /** Now, epoch ms, to say how long until a redo; omitted = the clock's. */
+  now?: number;
 }
 
 /** What follows a failed Run of an issue. */
@@ -320,6 +322,8 @@ export type FailureOutcome =
       max: number;
       /** Today's automatic spending reached its limit: the redo waits for the next day. */
       budgetReached: boolean;
+      /** When the next attempt starts at the earliest (`redoDueAt`), epoch ms. */
+      redoAt: number;
     }
   | {
       kind: 'exhausted';
@@ -337,6 +341,17 @@ export function failedAttempt(run: Run, stage: string | null): FailedAttempt {
     stage,
     error: run.error ?? noDetail(),
   };
+}
+
+const pad = (n: number) => String(n).padStart(2, '0');
+
+/** 「14:05 UTC+08:00」: the clock time in the Master's local time, with its offset from UTC. */
+export function clockText(ms: number): string {
+  const d = new Date(ms);
+  const offset = -d.getTimezoneOffset();
+  const sign = offset < 0 ? '-' : '+';
+  const abs = Math.abs(offset);
+  return `${pad(d.getHours())}:${pad(d.getMinutes())} UTC${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
 }
 
 /** 「第 2/3 次尝试」, an attempt of the most an issue gets. */
@@ -475,7 +490,7 @@ export function issueUpdate(run: Run, ctx: IssueUpdateContext): IssueUpdate {
       };
     }
     case 'failed':
-      return failedUpdate(run, ctx.failure, redo, link);
+      return failedUpdate(run, ctx.failure, redo, link, ctx.now ?? Date.now());
     case 'cancelled':
       return {
         label: LABELS.failed,
@@ -500,6 +515,7 @@ function failedUpdate(
   failure: FailureOutcome | undefined,
   redo: string,
   link: string,
+  now: number,
 ): IssueUpdate {
   const error = quote(run.error ?? noDetail());
   if (!failure) {
@@ -514,17 +530,26 @@ function failedUpdate(
   }
   const which = attemptText(failure.attempt, failure.max);
   if (failure.kind === 'redo') {
-    const wait = failure.budgetReached
+    // The comment is read later, possibly in another time zone: both how long and the clock time
+    // with its offset.
+    const m = minutes(failure.redoAt - now);
+    const at = clockText(failure.redoAt);
+    const next = attemptText(failure.attempt + 1, failure.max);
+    const when = t({
+      zh: `为了不让一时的 API 或网络故障很快用完尝试次数，先等一会儿：约 ${m} 分钟后（${at} 左右）开始${next}。`,
+      en: `So that a passing API or network outage does not use up the attempts, it waits a while first: ${next} starts in about ${m} minute${m === 1 ? '' : 's'}, around ${at}. `,
+    });
+    const budget = failure.budgetReached
       ? t({
-          zh: '今天的自动花费已达上限（`daily_budget_usd`），等明天预算恢复后再重做。',
-          en: "Today's automatic spending reached its limit (`daily_budget_usd`), so the redo waits for tomorrow's budget. ",
+          zh: '另外，今天的自动花费已达上限（`daily_budget_usd`），等明天预算恢复后才会重做。',
+          en: "Today's automatic spending has also reached its limit (`daily_budget_usd`), so the redo waits for tomorrow's budget. ",
         })
       : '';
     return {
       label: LABELS.running,
       comment: t({
-        zh: `Run 失败了（${which}）：\n\n${error}\n\n会自动重做：新的 Run 会带上这次的失败原因。${wait}不想再做就关闭这个 issue。\n\n${link}`,
-        en: `The Run failed (${which}):\n\n${error}\n\nIt is redone automatically, and the new Run is told why this one failed. ${wait}To stop, close this issue.\n\n${link}`,
+        zh: `Run 失败了（${which}）：\n\n${error}\n\n会自动重做：新的 Run 会带上这次的失败原因。${when}${budget}不想再做就关闭这个 issue。\n\n${link}`,
+        en: `The Run failed (${which}):\n\n${error}\n\nIt is redone automatically, and the new Run is told why this one failed. ${when}${budget}To stop, close this issue.\n\n${link}`,
       }),
       close: null,
     };

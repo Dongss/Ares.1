@@ -3,6 +3,7 @@ import { isAbsolute, resolve } from 'node:path';
 import { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
 import { z } from 'zod';
+import { redoDueAt } from '../config/flow.js';
 import type { LoadedConfig } from '../config/load.js';
 import type { ConfigStatus } from '../config/watch.js';
 import { type Engine, InvalidStateError, readAttemptEvents } from '../engine/engine.js';
@@ -235,6 +236,7 @@ export function createApi(deps: ApiDeps): Hono {
   app.get('/api/runs/:id', async (c) => {
     const id = c.req.param('id');
     const run = store.getRun(id);
+    const redoAt = redoDueAt(run, config().master.github?.poll_minutes ?? 5);
     return c.json({
       run,
       repo: store.getRepo(run.repoId),
@@ -247,6 +249,7 @@ export function createApi(deps: ApiDeps): Hono {
       times: storedRunTimes(store, run),
       ...(await engine.inspectWorkspace(run)),
       rateLimited: engine.rateLimited(run),
+      redoAt: redoAt === null ? null : new Date(redoAt).toISOString(),
     } satisfies RunDetail);
   });
 

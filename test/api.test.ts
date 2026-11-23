@@ -112,6 +112,7 @@ describe('HTTP API', () => {
     expect(detail.json.attempts).toHaveLength(2);
     expect(detail.json.worktreeExists).toBe(true);
     expect(detail.json.rateLimited).toBeNull();
+    expect(detail.json.redoAt).toBeNull();
     // The approval asked for is not decided yet, so it does not count.
     expect(detail.json.times).toMatchObject({ totalMs: null, approvalMs: 0 });
     expect(detail.json.times).toEqual(storedRunTimes(h.master.store, h.master.store.getRun(id)));
@@ -356,6 +357,29 @@ agents:
 
     expect((await call('POST', `/api/runs/${id}/cancel`)).json.status).toBe('cancelled');
     expect((await call('GET', `/api/runs/${id}`)).json.rateLimited).toBeNull();
+  });
+
+  it('says when the issue of a failed run is redone, only while it waits for that', async () => {
+    h = await harness();
+    const store = h.master.store;
+    store.setWorking(false);
+    const { id } = h.run('g');
+    const finishedAt = '2026-11-20T06:00:00.000Z';
+    const issue = { repo: 'me/demo', number: 1, url: '', auto: false, attempt: 2 };
+    store.updateRun(id, {
+      queuePos: null,
+      status: 'failed',
+      finishedAt,
+      issue: { ...issue, redo: 'pending' },
+    });
+    // The second failure waits twice poll_minutes (5 without a github section).
+    const detail = await call('GET', `/api/runs/${id}`);
+    expect(detail.json.redoAt).toBe('2026-11-20T06:10:00.000Z');
+
+    for (const redo of ['redone', 'exhausted', 'abandoned', undefined] as const) {
+      store.updateRun(id, { issue: { ...issue, redo } });
+      expect((await call('GET', `/api/runs/${id}`)).json.redoAt).toBeNull();
+    }
   });
 
   it('pauses, resumes and cancels', async () => {

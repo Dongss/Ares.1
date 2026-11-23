@@ -7,7 +7,10 @@ import {
   issueRunOverrides,
   loopsExhausted,
   RATE_LIMIT_WAIT,
+  REDO_BACKOFF_MAX_HOURS,
   rateLimitDelayMs,
+  redoDelayMs,
+  redoDueAt,
   scoutBackoff,
   scoutLimitWait,
   splitUnfinishedRuns,
@@ -30,6 +33,7 @@ import type {
   AssessmentEntry,
   BlockKind,
   DiscussionEntry,
+  RedoState,
   Run,
   RunStatus,
   Scout,
@@ -975,6 +979,52 @@ describe('issueRunOverrides', () => {
   });
 });
 
+describe('redo after a failure', () => {
+  const MIN = 60_000;
+  const MAX = REDO_BACKOFF_MAX_HOURS * 60 * MIN;
+
+  it('waits poll_minutes after the first failure and doubles the wait with each one after', () => {
+    expect(redoDelayMs(1, 5)).toBe(5 * MIN);
+    expect(redoDelayMs(2, 5)).toBe(10 * MIN);
+    expect(redoDelayMs(3, 5)).toBe(20 * MIN);
+    expect(redoDelayMs(4, 5)).toBe(40 * MIN);
+    expect(redoDelayMs(3, 1.5)).toBe(6 * MIN);
+  });
+
+  it('waits at most REDO_BACKOFF_MAX_HOURS', () => {
+    expect(REDO_BACKOFF_MAX_HOURS).toBe(2);
+    expect(redoDelayMs(5, 5)).toBe(80 * MIN);
+    expect(redoDelayMs(6, 5)).toBe(MAX);
+    expect(redoDelayMs(100, 5)).toBe(MAX);
+    expect(redoDelayMs(5_000, 5)).toBe(MAX);
+    // A poll interval longer than the cap is capped too.
+    expect(redoDelayMs(1, 180)).toBe(MAX);
+  });
+
+  it('counts from when the failed Run ended, only while its issue waits for the redo', () => {
+    const finishedAt = '2026-11-20T00:00:00.000Z';
+    const ended = Date.parse(finishedAt);
+    const failed = (attempt: number | undefined, redo?: RedoState) => ({
+      status: 'failed' as const,
+      finishedAt,
+      updatedAt: '2026-11-20T00:30:00.000Z',
+      issue: { repo: 'me/demo', number: 1, url: '', auto: false, attempt, redo },
+    });
+    expect(redoDueAt(failed(1, 'pending'), 5)).toBe(ended + 5 * MIN);
+    expect(redoDueAt(failed(2, 'pending'), 5)).toBe(ended + 10 * MIN);
+    // Runs from before attempts were counted are the first.
+    expect(redoDueAt(failed(undefined, 'pending'), 5)).toBe(ended + 5 * MIN);
+    expect(redoDueAt({ ...failed(1, 'pending'), finishedAt: null }, 5)).toBe(
+      Date.parse('2026-11-20T00:30:00.000Z') + 5 * MIN,
+    );
+    for (const redo of [undefined, 'redone', 'exhausted', 'abandoned'] as const) {
+      expect(redoDueAt(failed(1, redo), 5)).toBeNull();
+    }
+    expect(redoDueAt({ ...failed(1, 'pending'), status: 'cancelled' }, 5)).toBeNull();
+    expect(redoDueAt({ ...failed(1, 'pending'), issue: null }, 5)).toBeNull();
+  });
+});
+
 describe('scoutBackoff', () => {
   const MIN = 60_000;
   const at = (min: number) => new Date(Date.UTC(2026, 10, 20, 0, min)).toISOString();
@@ -1134,12 +1184,19 @@ describe('splitUnfinishedRuns', () => {
     });
   /** The stage runs of the fixtures: sr-assess belongs to the assess stage. */
   const stageIdOf = (id: string) => (id === 'sr-assess' ? 'assess' : undefined);
-  type Fixture = Pick<Run, 'status' | 'blocked' | 'discussion' | 'template'> & { id: string };
+  type Fixture = Pick<Run, 'status' | 'blocked' | 'discussion' | 'template' | 'issue'> & {
+    id: string;
+  };
   const run = (
     id: string,
     status: RunStatus,
     kind?: BlockKind,
-    opts: { hours?: number | null; discussion?: DiscussionEntry[]; stageRunId?: string } = {},
+    opts: {
+      hours?: number | null;
+      discussion?: DiscussionEntry[];
+      stageRunId?: string;
+      redo?: RedoState;
+    } = {},
   ): Fixture => ({
     id,
     status,
@@ -1148,6 +1205,7 @@ describe('splitUnfinishedRuns', () => {
       : null,
     discussion: opts.discussion ?? (kind === 'discussion' ? [ask] : []),
     template: template(opts.hours),
+    issue: { repo: 'me/demo', number: 1, url: '', auto: false, attempt: 1, redo: opts.redo },
   });
   const ids = (runs: Fixture[]) => runs.map((r) => r.id);
 
@@ -1171,6 +1229,25 @@ describe('splitUnfinishedRuns', () => {
     );
     expect(ids(moving)).toEqual(['queued', 'running']);
     expect(ids(stuck)).toEqual(['approval', 'paused', 'error', 'setup', 'budget', 'stranger']);
+  });
+
+  it('waits for failed Runs whose issue is to be redone, and never counts them as stuck', () => {
+    const { moving, redo, stuck } = splitUnfinishedRuns(
+      [
+        run('pending', 'failed', undefined, { redo: 'pending' }),
+        run('redone', 'failed', undefined, { redo: 'redone' }),
+        run('exhausted', 'failed', undefined, { redo: 'exhausted' }),
+        run('abandoned', 'failed', undefined, { redo: 'abandoned' }),
+        // Not caught up on the issue yet: nothing is decided about a redo.
+        run('unsynced', 'failed'),
+        { ...run('no-issue', 'failed'), issue: null },
+        run('queued', 'queued'),
+      ],
+      stageIdOf,
+    );
+    expect(ids(redo)).toEqual(['pending']);
+    expect(ids(moving)).toEqual(['queued']);
+    expect(ids(stuck)).toEqual([]);
   });
 
   it('lets a Run waiting for changes on its target branch to clear move on, as the engine does', () => {

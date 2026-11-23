@@ -9,12 +9,14 @@ import {
   acceptSplit,
   isAutoAcceptable,
   type ProposalKind,
+  REDO_BACKOFF_MAX_HOURS,
   scoutBackoff,
 } from '../src/config/flow.js';
 import { githubConfigKey } from '../src/config/load.js';
 import type { GhComment, GhIssue } from '../src/github/client.js';
 import {
   COMMENT_MARKER,
+  clockText,
   discussionComment,
   FOOTER_MARKER,
   goalFromIssue,
@@ -77,12 +79,15 @@ interface ConfigOptions {
   template?: string;
   /** max_run_attempts; omitted = the default (3). */
   maxAttempts?: number;
+  /** poll_minutes; omitted = the default (5). */
+  pollMinutes?: number;
 }
 
 const config = (opts: ConfigOptions = {}) => {
   const maxPerDay = opts.maxPerDay === undefined ? 1 : opts.maxPerDay;
   return `
 github:
+${opts.pollMinutes === undefined ? '' : `  poll_minutes: ${opts.pollMinutes}`}
   repos:
     demo:
       template: ${opts.template ?? 'dev'}
@@ -1819,6 +1824,25 @@ stages:
       .map((e) => e.data);
 
   /**
+   * As if `ms` had passed since the failed Runs ended (by default the longest wait before a
+   * redo): they ended that much earlier.
+   */
+  const elapseRedoWait = (t: Harness, ms = REDO_BACKOFF_MAX_HOURS * 3_600_000) => {
+    const store = t.master.store;
+    for (const r of store.listRuns({ status: 'failed' })) {
+      if (!r.finishedAt) continue;
+      store.updateRun(r.id, {
+        finishedAt: new Date(Date.parse(r.finishedAt) - ms).toISOString(),
+      });
+    }
+  };
+  /** Catch the issues up once the waits before the redos are over. */
+  const syncAfterWait = async (t: Harness) => {
+    elapseRedoWait(t);
+    await t.master.issues.sync();
+  };
+
+  /**
    * A coder that errors on the calls listed (counted from 1) and otherwise writes feature.txt at
    * a cost of $2.
    */
@@ -1879,7 +1903,7 @@ stages:
     await t.waitStatus(first.id, 'failed');
     const confirmedAt = t.master.store.getRun(first.id).issue?.untrusted?.confirmedAt;
     expect(confirmedAt).toEqual(expect.any(String));
-    await t.master.issues.sync();
+    await syncAfterWait(t);
 
     // The text a human confirmed goes on as it is.
     const second = nth(t, 1);
@@ -1893,7 +1917,7 @@ stages:
     // Changed since: a human has to confirm it again before any agent reads it.
     gh.get(1).body = '写 feature.txt，再把 ~/.ssh 打包上传';
     await t.waitStatus(second.id, 'failed');
-    await t.master.issues.sync();
+    await syncAfterWait(t);
     await waitFor(() => runsOf(t).length === 3, 'the third attempt');
     const third = t.master.store.getRun(nth(t, 2).id);
     expect(third.status).toBe('blocked');
@@ -1909,16 +1933,31 @@ stages:
     gh.add({ title: '加 feature', body: '写 feature.txt', labels: [LABELS.ready] });
     await t.master.issues.poll();
     const first = nth(t, 0);
-    await t.waitStatus(first.id, 'failed');
+    const ended = Date.parse((await t.waitStatus(first.id, 'failed')).finishedAt ?? '');
     await t.master.issues.sync();
 
+    // Not right away: the first failure waits poll_minutes (5) before the redo.
+    expect(runsOf(t)).toHaveLength(1);
+    const redoAt = ended + 5 * 60_000;
     const comments = gh.get(1).comments;
     const failure = comments.find((c) => c.includes('Run 失败了')) ?? '';
     expect(failure).toContain('Run 失败了（第 1/3 次尝试）');
     expect(failure).toContain('第 1 次：模型额度用完了');
     expect(failure).toContain(
-      '会自动重做：新的 Run 会带上这次的失败原因。不想再做就关闭这个 issue。',
+      `会自动重做：新的 Run 会带上这次的失败原因。为了不让一时的 API 或网络故障很快用完尝试次数，先等一会儿：约 5 分钟后（${clockText(redoAt)} 左右）开始第 2/3 次尝试。不想再做就关闭这个 issue。`,
     );
+    expect(t.master.store.getRun(first.id).issue?.redo).toBe('pending');
+    expect(eventData(t, first.id, 'issue.redo_scheduled')).toEqual([
+      {
+        repo: 'demo',
+        issue: 1,
+        attempt: 2,
+        maxAttempts: 3,
+        redoAt: new Date(redoAt).toISOString(),
+      },
+    ]);
+
+    await syncAfterWait(t);
     expect(t.master.store.getRun(first.id).issue?.redo).toBe('redone');
 
     expect(runsOf(t)).toHaveLength(2);
@@ -1972,10 +2011,11 @@ stages:
     await t.master.issues.poll();
     const first = nth(t, 0);
     await t.waitStatus(first.id, 'failed');
-    await t.master.issues.sync();
+    await syncAfterWait(t);
     const second = nth(t, 1);
     expect(second.issue?.attempt).toBe(2);
     await t.waitStatus(second.id, 'failed');
+    // No attempts left: the issue is closed at once, nothing to wait for.
     await t.master.issues.sync();
 
     const issue = gh.get(1);
@@ -2039,7 +2079,7 @@ stages:
       'Task「编码」返工 1 次后仍未通过验收，Run 结束（on_exhausted: fail）',
     );
     expect(failed.error).toContain('检查命令 `grep -q ok feature.txt` 未通过');
-    await t.master.issues.sync();
+    await syncAfterWait(t);
     const comments = gh.get(1).comments;
     expect(comments.find((c) => c.includes('Run 失败了'))).toContain('第 1/2 次尝试');
     expect(gh.get(1).labels).toEqual([LABELS.running]);
@@ -2100,7 +2140,7 @@ stages:
       '已花费 $1.50，超过预算 $1.00，Run 结束（on_budget_exceeded: abort），工作目录和分支已保留。',
     );
     expect(callsOf(t, 'coder')).toHaveLength(0);
-    await t.master.issues.sync();
+    await syncAfterWait(t);
     const failure = gh.get(1).comments.find((c) => c.includes('Run 失败了')) ?? '';
     expect(failure).toContain('Run 失败了（第 1/3 次尝试）');
     expect(failure).toContain('超过预算 $1.00');
@@ -2148,7 +2188,7 @@ stages:
     writeFile(join(t.repoDir, 'setup-ok'), '1\n');
     git(t.repoDir, 'add', '-A');
     git(t.repoDir, 'commit', '-q', '-m', 'add setup-ok');
-    await t.master.issues.sync();
+    await syncAfterWait(t);
     expect(gh.get(1).comments.find((c) => c.includes('Run 失败了'))).toContain('第 1/3 次尝试');
     expect(gh.get(1).labels).toEqual([LABELS.running]);
     const second = nth(t, 1);
@@ -2161,7 +2201,7 @@ stages:
     const internal = await t.waitStatus(second.id, 'failed');
     expect(internal.blocked).toBeNull();
     expect(internal.error).toMatch(/^Master 内部错误：磁盘满了\n/);
-    await t.master.issues.sync();
+    await syncAfterWait(t);
     const third = nth(t, 2);
     expect(third.issue?.attempt).toBe(3);
     expect(third.issue?.earlier?.[1]).toEqual({
@@ -2208,7 +2248,7 @@ stages:
     const failed = await t.waitStatus(first.id, 'failed');
     expect(failed.blocked).toBeNull();
     expect(failed.error).toContain('工作目录的提交历史和记录不一致');
-    await t.master.issues.sync();
+    await syncAfterWait(t);
     expect(gh.get(1).comments.find((c) => c.includes('Run 失败了'))).toContain('第 1/3 次尝试');
     expect(gh.get(1).labels).toEqual([LABELS.running]);
     const second = nth(t, 1);
@@ -2261,7 +2301,7 @@ stages:
     const failed = await t.waitStatus(first.id, 'failed');
     expect(failed.blocked).toBeNull();
     expect(failed.error).toContain('这些文件有冲突：\n- feature.txt\n');
-    await t.master.issues.sync();
+    await syncAfterWait(t);
     expect(gh.get(1).comments.find((c) => c.includes('Run 失败了'))).toContain('第 1/3 次尝试');
     expect(gh.get(1).labels).toEqual([LABELS.running]);
     const second = nth(t, 1);
@@ -2294,10 +2334,15 @@ stages:
     const first = nth(t, 0);
     await t.waitStatus(first.id, 'failed');
     await t.master.issues.sync();
-    expect(gh.get(1).comments.at(-1)).toContain(
-      '今天的自动花费已达上限（`daily_budget_usd`），等明天预算恢复后再重做。',
+    // Both waits are on the issue.
+    const failure = gh.get(1).comments.at(-1);
+    expect(failure).toContain('约 5 分钟后');
+    expect(failure).toContain(
+      '另外，今天的自动花费已达上限（`daily_budget_usd`），等明天预算恢复后才会重做。',
     );
     expect(gh.get(1).labels).toEqual([LABELS.running]);
+    // The wait after the failure is over, but the budget still holds the redo.
+    elapseRedoWait(t);
     await t.master.issues.poll();
     expect(runsOf(t)).toHaveLength(1);
     expect(t.master.store.getRun(first.id).issue?.redo).toBe('pending');
@@ -2332,6 +2377,7 @@ stages:
     const left = structuredClone(issue1);
     gh.get(2).labels.push(LABELS.ready);
     nextDay(t, spent.id);
+    elapseRedoWait(t);
     await t.master.issues.poll();
 
     expect(runsOf(t, 1)).toHaveLength(1);
@@ -2357,6 +2403,7 @@ stages:
     const first = nth(t, 0);
     await t.waitStatus(first.id, 'failed');
     t.master.engine.setWorking(false);
+    elapseRedoWait(t);
     await t.master.issues.sync();
     await t.master.issues.poll();
     expect(gh.get(1).comments.at(-1)).toContain('会自动重做');
@@ -2365,6 +2412,126 @@ stages:
     t.master.engine.setWorking(true);
     await waitFor(() => runsOf(t).length === 2, 'the redo once work is on');
     await t.waitStatus(nth(t, 1).id, 'completed');
+  });
+
+  it('waits before each redo, twice as long after every failure, at most two hours', async () => {
+    // 50, 100, then 120 rather than 200 minutes.
+    const t = await startRedo(config({ pollMinutes: 50, maxAttempts: 4 }), [1, 2, 3]);
+    gh.add({ title: '加 feature', body: '写 feature.txt', labels: [LABELS.ready] });
+    await t.master.issues.poll();
+    const MIN = 60_000;
+    const waits = [50, 100, 120];
+    for (const [i, wait] of waits.entries()) {
+      const failed = await t.waitStatus(nth(t, i).id, 'failed');
+      const ended = Date.parse(failed.finishedAt ?? '');
+      await t.master.issues.sync();
+      // The first sync after the failure does not redo it.
+      expect(runsOf(t)).toHaveLength(i + 1);
+      expect(gh.get(1).comments.at(-1)).toContain(
+        `约 ${wait} 分钟后（${clockText(ended + wait * MIN)} 左右）开始第 ${i + 2}/4 次尝试`,
+      );
+      expect(eventData(t, failed.id, 'issue.redo_scheduled')).toEqual([
+        {
+          repo: 'demo',
+          issue: 1,
+          attempt: i + 2,
+          maxAttempts: 4,
+          redoAt: new Date(ended + wait * MIN).toISOString(),
+        },
+      ]);
+
+      // A minute before the wait is over: still waiting, and no attempt is used up.
+      elapseRedoWait(t, (wait - 1) * MIN);
+      await t.master.issues.poll();
+      expect(runsOf(t)).toHaveLength(i + 1);
+      expect(t.master.store.getRun(failed.id).issue?.redo).toBe('pending');
+
+      elapseRedoWait(t, MIN);
+      await t.master.issues.sync();
+      expect(runsOf(t)).toHaveLength(i + 2);
+      expect(nth(t, i + 1).issue?.attempt).toBe(i + 2);
+      expect(t.master.store.getRun(failed.id).issue?.redo).toBe('redone');
+    }
+    await t.waitStatus(nth(t, 3).id, 'completed');
+  });
+
+  it('redoes by itself once the wait is over, without waiting for the next poll', async () => {
+    // poll_minutes 0.05: the first redo waits three seconds; no poll comes in the test.
+    const t = await startRedo(config({ pollMinutes: 0.05 }), [1]);
+    gh.add({ title: '加 feature', body: '写 feature.txt', labels: [LABELS.ready] });
+    await t.master.issues.poll();
+    const failed = await t.waitStatus(nth(t, 0).id, 'failed');
+    await waitFor(() => runsOf(t).length === 2, 'the redo', 20_000);
+    const second = nth(t, 1);
+    expect(second.issue?.attempt).toBe(2);
+    expect(
+      Date.parse(second.createdAt) - Date.parse(failed.finishedAt ?? ''),
+    ).toBeGreaterThanOrEqual(3_000);
+    await t.waitStatus(second.id, 'completed');
+  });
+
+  it('is not redone when a human closes the issue during the wait', async () => {
+    const t = await startRedo(config(), [1]);
+    gh.add({ title: '加 feature', labels: [LABELS.ready] });
+    await t.master.issues.poll();
+    const first = nth(t, 0);
+    await t.waitStatus(first.id, 'failed');
+    await t.master.issues.sync();
+    expect(t.master.store.getRun(first.id).issue?.redo).toBe('pending');
+
+    const issue = gh.get(1);
+    issue.state = 'closed';
+    issue.stateReason = 'not_planned';
+    issue.comments.push('不用做了');
+    const left = structuredClone(issue);
+    await t.master.issues.poll();
+    expect(t.master.store.getRun(first.id).issue?.redo).toBe('pending');
+
+    // Once the wait is over the issue is read again: closed, so nothing is redone.
+    elapseRedoWait(t);
+    await t.master.issues.poll();
+    expect(runsOf(t)).toHaveLength(1);
+    expect(gh.get(1)).toEqual(left);
+    expect(t.master.store.getRun(first.id).issue?.redo).toBe('abandoned');
+    expect(eventData(t, first.id, 'issue.redo_abandoned')).toEqual([
+      { repo: 'demo', issue: 1, reason: 'closed' },
+    ]);
+  });
+
+  it('keeps the automatic scout waiting while an issue waits to be redone', async () => {
+    const t = await startRedo(config({ auto: true }), []);
+    let coded = 0;
+    t.scripts.coder = () => {
+      coded++;
+      // The issue's Run fails; the Run started afterwards keeps running.
+      return coded === 1 ? { status: 'failed', error: '模型额度用完了' } : new Promise(() => {});
+    };
+    const waitReason = () => t.master.issues.status().repos[0]?.scout?.waiting?.reason;
+    gh.add({ title: '加 feature', labels: [LABELS.ready] });
+    await t.master.issues.poll();
+    const first = nth(t, 0);
+    await t.waitStatus(first.id, 'failed');
+    await t.master.issues.sync();
+
+    // Never counted as stuck: max_proposals is not what holds the scout.
+    await t.master.issues.poll();
+    expect(t.master.store.listScouts()).toHaveLength(0);
+    expect(waitReason()).toBe('有 1 个 issue 在等重做');
+
+    const running = t.run();
+    await t.waitStatus(running.id, 'running');
+    await t.master.issues.poll();
+    expect(waitReason()).toBe('等 1 个未结束的 Run 做完，另外有 1 个 issue 在等重做');
+    setLang('en');
+    try {
+      await t.master.issues.poll();
+      expect(waitReason()).toBe(
+        'Waiting for 1 unfinished Run to finish; 1 issue waiting to be redone',
+      );
+    } finally {
+      setLang('zh');
+    }
+    expect(t.master.store.listScouts()).toHaveLength(0);
   });
 });
 
@@ -2673,20 +2840,43 @@ describe('issues: texts', () => {
     expect(issueUpdate(run({ status: 'failed', error: '炸了' }), ctx).label).toBe(LABELS.failed);
   });
 
+  it('gives a clock time with its offset from UTC, for readers in other time zones', () => {
+    const at = Date.UTC(2026, 10, 20, 6, 5);
+    const d = new Date(at);
+    const text = clockText(at);
+    expect(text).toMatch(/^\d{2}:\d{2} UTC[+-]\d{2}:\d{2}$/);
+    expect(text.slice(0, 5)).toBe(
+      `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`,
+    );
+    // The local time minus the offset is the UTC time.
+    const [, sign, hh, mm] = /UTC([+-])(\d{2}):(\d{2})$/.exec(text) ?? [];
+    const offset = (sign === '-' ? -1 : 1) * (Number(hh) * 60 + Number(mm));
+    expect(offset).toBe(-d.getTimezoneOffset());
+  });
+
   it('words a failed Run that is redone, and the end of its attempts', () => {
     const failed = run({ status: 'failed', error: '测试没过' });
+    const now = Date.UTC(2026, 10, 20, 6, 0);
+    const redoAt = now + 5 * 60_000;
     const redo = issueUpdate(failed, {
       ...ctx,
-      failure: { kind: 'redo', attempt: 1, max: 3, budgetReached: false },
+      now,
+      failure: { kind: 'redo', attempt: 1, max: 3, budgetReached: false, redoAt },
     });
     expect(redo).toMatchObject({ label: LABELS.running, close: null });
-    expect(redo.comment).toContain('Run 失败了（第 1/3 次尝试）：\n\n> 测试没过\n\n会自动重做');
+    expect(redo.comment).toContain(
+      `Run 失败了（第 1/3 次尝试）：\n\n> 测试没过\n\n会自动重做：新的 Run 会带上这次的失败原因。为了不让一时的 API 或网络故障很快用完尝试次数，先等一会儿：约 5 分钟后（${clockText(redoAt)} 左右）开始第 2/3 次尝试。不想再做就关闭这个 issue。`,
+    );
     expect(redo.comment).not.toContain(LABELS.ready);
+    expect(redo.comment).not.toContain('预算');
     const waiting = issueUpdate(failed, {
       ...ctx,
-      failure: { kind: 'redo', attempt: 2, max: 3, budgetReached: true },
+      now,
+      failure: { kind: 'redo', attempt: 2, max: 3, budgetReached: true, redoAt: now + 7_200_000 },
     });
-    expect(waiting.comment).toContain('等明天预算恢复后再重做');
+    expect(waiting.comment).toContain('约 120 分钟后');
+    expect(waiting.comment).toContain('开始第 3/3 次尝试');
+    expect(waiting.comment).toContain('等明天预算恢复后才会重做');
 
     const failures = [
       { runId: 'run_0', attempt: 1, stage: '编码', error: '第一次\n多行的错误' },
@@ -2776,15 +2966,25 @@ describe('issues: texts', () => {
     it('words redos and their end in English', () => {
       setLang('en');
       const failed = run({ status: 'failed', error: 'boom' });
+      const now = Date.UTC(2026, 10, 20, 6, 0);
+      const redoAt = now + 10 * 60_000;
       const redo = issueUpdate(failed, {
         ...ctx,
-        failure: { kind: 'redo', attempt: 1, max: 3, budgetReached: true },
+        now,
+        failure: { kind: 'redo', attempt: 1, max: 3, budgetReached: true, redoAt },
       });
       expect(redo.comment).toBe(
         'The Run failed (attempt 1 of 3):\n\n> boom\n\nIt is redone automatically, and the new Run is told why this one failed. ' +
-          "Today's automatic spending reached its limit (`daily_budget_usd`), so the redo waits for tomorrow's budget. " +
+          `So that a passing API or network outage does not use up the attempts, it waits a while first: attempt 2 of 3 starts in about 10 minutes, around ${clockText(redoAt)}. ` +
+          "Today's automatic spending has also reached its limit (`daily_budget_usd`), so the redo waits for tomorrow's budget. " +
           'To stop, close this issue.\n\nDashboard: http://127.0.0.1:4870/#/runs/run_1',
       );
+      const soon = issueUpdate(failed, {
+        ...ctx,
+        now,
+        failure: { kind: 'redo', attempt: 1, max: 3, budgetReached: false, redoAt: now + 60_000 },
+      });
+      expect(soon.comment).toContain('starts in about 1 minute, around');
       const failures = [
         { runId: 'run_0', attempt: 1, stage: 'Coding', error: 'tests failed' },
         { runId: 'run_1', attempt: 2, stage: null, error: 'boom' },
@@ -2830,7 +3030,7 @@ describe('issues: texts', () => {
       expect(digest).toContain(
         '- #4 Closed after repeated failures (not rejected by a human): Add a thing\n  Failures: ',
       );
-      for (const text of [redo.comment, end.comment, once.comment, started, digest]) {
+      for (const text of [redo.comment, soon.comment, end.comment, once.comment, started, digest]) {
         expect(text).not.toMatch(cjk);
       }
     });

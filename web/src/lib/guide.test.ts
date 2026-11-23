@@ -568,6 +568,22 @@ describe('guardrails', () => {
     expect(rail(i, '升级失败自动回退')).toMatchObject({ on: true });
   });
 
+  it('says how long a failed Run waits before it is redone', () => {
+    expect(rail(input(manualRepo), '失败后重做的次数上限')?.text).toBe(
+      '从 issue 来的 Run 失败后自动重做，带上之前的失败原因；重做前先等 5 分钟，每失败一次等待翻倍，最长 2 小时，免得一时的 API 或网络故障很快用完次数；一个 issue 最多跑 3 次（max_run_attempts），用完后关闭为 not planned，并写明每次失败的原因',
+    );
+    setLang('en');
+    try {
+      const text = rail({ ...input(manualRepo), pollMinutes: 1 }, 'Limit on redoing failed Runs');
+      expect(text?.text).toContain(
+        'the redo waits 1 minute first, twice as long after each further failure, up to 2 hours',
+      );
+      expect(text?.text).not.toMatch(/[一-鿿]/);
+    } finally {
+      setLang('zh');
+    }
+  });
+
   it('tells a template without a merge approval from auto_merge', () => {
     const ungated = TemplateSchema.parse({
       ...template,

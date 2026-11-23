@@ -7,6 +7,8 @@ import {
   issueRunOverrides,
   MAX_SCOUT_BACKOFF_HOURS,
   RATE_LIMIT_WAIT,
+  REDO_BACKOFF_MAX_HOURS,
+  redoDelayMs,
 } from '../../../src/config/flow.js';
 import { waitText } from '../../../src/engine/discussion.js';
 import { join, t } from '../../../src/i18n.js';
@@ -1022,14 +1024,15 @@ export function guardrails(input: GuideInput, working: boolean | undefined): Gua
           },
     );
     const attempts = github.maxRunAttempts;
+    const first = redoDelayMs(1, input.pollMinutes) / 60_000;
     items.push({
       title: t({ zh: '失败后重做的次数上限', en: 'Limit on redoing failed Runs' }),
       on: true,
       text:
         attempts > 1
           ? t({
-              zh: `从 issue 来的 Run 失败后自动重做，带上之前的失败原因；一个 issue 最多跑 ${attempts} 次（max_run_attempts），用完后关闭为 not planned，并写明每次失败的原因`,
-              en: `A failed Run from an issue is redone automatically, told why the earlier attempts failed; an issue gets at most ${attempts} Runs (max_run_attempts), after which it is closed as not planned with the reason of every failure`,
+              zh: `从 issue 来的 Run 失败后自动重做，带上之前的失败原因；重做前先等 ${first} 分钟，每失败一次等待翻倍，最长 ${REDO_BACKOFF_MAX_HOURS} 小时，免得一时的 API 或网络故障很快用完次数；一个 issue 最多跑 ${attempts} 次（max_run_attempts），用完后关闭为 not planned，并写明每次失败的原因`,
+              en: `A failed Run from an issue is redone automatically, told why the earlier attempts failed; the redo waits ${first} minute${first === 1 ? '' : 's'} first, twice as long after each further failure, up to ${REDO_BACKOFF_MAX_HOURS} hours, so that a passing API or network outage does not use up the attempts; an issue gets at most ${attempts} Runs (max_run_attempts), after which it is closed as not planned with the reason of every failure`,
             })
           : t({
               zh: '失败的 Run 不重做（max_run_attempts: 1）：issue 关闭为 not planned，并写明失败原因',

@@ -1,7 +1,8 @@
 // How a workflow template flows: effective stage settings, verify commands and rollback targets;
 // also the overrides of Runs from issues, which proposals are accepted automatically, how long
-// the automatic scout backs off and which unfinished Runs it waits for, and how long a Run or a
-// scout waits for an agent that is out of quota or rate-limited.
+// the automatic scout backs off and which Runs it waits for, how long a failed Run of an issue
+// waits before it is redone, and how long a Run or a scout waits for an agent that is out of
+// quota or rate-limited.
 // Pure logic (type imports, src/i18n.ts, src/store/types.ts and src/engine/discussion.ts only),
 // so the dashboard shows the same rules the engine applies.
 
@@ -147,7 +148,7 @@ export function discussionReplyWait(
   return hours === null || deadline === null ? null : { deadline, hours };
 }
 
-/** A repo's unfinished Runs, by whether they go on without a human. */
+/** A repo's Runs that are not done with, by whether they go on without a human. */
 export interface UnfinishedRuns<R> {
   /**
    * They go on by themselves: queued, running, waiting for a reply to the assessment's
@@ -158,23 +159,32 @@ export interface UnfinishedRuns<R> {
    */
   moving: R[];
   /**
+   * Failed Runs whose issue waits to be redone (`awaitingRedo`): they go on by themselves too,
+   * as a new Run once the wait before the redo (`redoDueAt`) is over. Never stuck.
+   */
+  redo: R[];
+  /**
    * Only a human moves them on: every other blocked Run, paused Runs, Runs waiting for approval.
    */
   stuck: R[];
 }
 
 /**
- * Split a repo's Runs that have not finished by whether they go on without a human. The
- * automatic scout waits for the moving ones, as their results change what is worth doing next.
- * The stuck ones would hold it for good when nobody is there, so they count toward
- * `max_proposals` together with the proposals waiting for a human instead: work left for a human
- * is still capped, but no longer stops the repo. Finished Runs are left out.
+ * Split a repo's Runs that are not done with by whether they go on without a human. The
+ * automatic scout waits for the moving ones and for the redos to come, as their results change
+ * what is worth doing next. The stuck ones would hold it for good when nobody is there, so they
+ * count toward `max_proposals` together with the proposals waiting for a human instead: work left
+ * for a human is still capped, but no longer stops the repo. Other finished Runs are left out.
  */
 export function splitUnfinishedRuns<
-  R extends Pick<Run, 'status' | 'blocked' | 'discussion' | 'template'>,
+  R extends Pick<Run, 'status' | 'blocked' | 'discussion' | 'template' | 'issue'>,
 >(runs: readonly R[], stageIdOf: (stageRunId: string) => string | undefined): UnfinishedRuns<R> {
-  const split: UnfinishedRuns<R> = { moving: [], stuck: [] };
+  const split: UnfinishedRuns<R> = { moving: [], redo: [], stuck: [] };
   for (const run of runs) {
+    if (awaitingRedo(run)) {
+      split.redo.push(run);
+      continue;
+    }
     if (FINISHED_RUN_STATUSES.includes(run.status)) continue;
     const moving =
       run.status === 'queued' ||
@@ -231,6 +241,47 @@ export interface Backoff {
 /** The wait before the `retry`-th retry (1 = the first). */
 export function backoffMs(backoff: Backoff, retry: number): number {
   return Math.min(backoff.firstMs * 2 ** Math.max(0, retry - 1), backoff.maxMs);
+}
+
+/** The longest a failed Run of an issue waits before it is redone. */
+export const REDO_BACKOFF_MAX_HOURS = 2;
+
+/**
+ * How long the issue waits after its `attempt`-th Run (1 = the first) failed before the next
+ * attempt starts: poll_minutes × 2^(attempt-1), at most REDO_BACKOFF_MAX_HOURS. A passing outage
+ * of the agents' API or of the network fails every agent at once, retries and switching agents
+ * included; without a wait the attempts would be used up within minutes and the issue closed.
+ * A failure the code itself brings about every time only ends a little later: the attempts and
+ * their cost stay the same.
+ */
+export function redoDelayMs(attempt: number, pollMinutes: number): number {
+  return backoffMs(
+    { firstMs: pollMinutes * 60_000, maxMs: REDO_BACKOFF_MAX_HOURS * 3_600_000 },
+    attempt,
+  );
+}
+
+/**
+ * Whether the Run failed and its issue waits for it to be redone (the issue has attempts left,
+ * nobody closed it or started it over yet). Such a Run goes on by itself: the bridge redoes it
+ * once `redoDueAt` has passed, the day's budget allows and the work switch is on.
+ */
+export function awaitingRedo(run: Pick<Run, 'status' | 'issue'>): boolean {
+  return run.status === 'failed' && run.issue?.redo === 'pending';
+}
+
+/**
+ * When the failed Run's issue is redone, epoch ms: `redoDelayMs` for its attempt after it ended.
+ * Over the day's budget or with the work switch off it waits longer. Counted from the Run alone,
+ * so it holds across Master restarts. null when it does not wait for a redo (`awaitingRedo`).
+ */
+export function redoDueAt(
+  run: Pick<Run, 'status' | 'issue' | 'finishedAt' | 'updatedAt'>,
+  pollMinutes: number,
+): number | null {
+  if (!awaitingRedo(run)) return null;
+  const ended = Date.parse(run.finishedAt ?? run.updatedAt);
+  return ended + redoDelayMs(run.issue?.attempt ?? 1, pollMinutes);
 }
 
 /**

@@ -83,6 +83,13 @@ export interface RunDetail {
    * tries again.
    */
   rateLimited: RateLimitedWait | null;
+  /**
+   * The Run failed and its issue is redone as a new Run, at this time at the earliest (ISO;
+   * `redoDueAt`): the wait after a failure doubles with each attempt. Later when today's
+   * automatic spending reached its limit or the work switch is off. null when the issue is not
+   * waiting for a redo.
+   */
+  redoAt: string | null;
 }
 
 /** A Run waiting for its agent's quota: which agent hit the limit and when the Run goes on. */
