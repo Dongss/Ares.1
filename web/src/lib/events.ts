@@ -121,9 +121,22 @@ export function globalEventText(event: GlobalEvent, now = new Date()): string | 
         from.length > 0
           ? t({ zh: `，涉及 ${join(from)}`, en: `, from ${from.join(' and ')}` })
           : '';
+      // Run pages show the agent output from the kept condensed events, not from the raw logs.
+      // Scouts keep no such events and their raw output was never on the dashboard, so when only
+      // scouts are named, what stays is their record on the Issues page.
+      const kept =
+        runs === 0 && scouts > 0
+          ? t({
+              zh: '；「需求」页上的侦察记录不受影响',
+              en: '; the scouts on the Issues page are not affected',
+            })
+          : t({
+              zh: '；各 Run 详情页里的 Agent 输出不受影响',
+              en: "; the agent output on each Run's page is not affected",
+            });
       return t({
-        zh: `删除了${what}${size}${of}；Agent 的输出仍可从事件里看到`,
-        en: `Deleted ${what}${size}${of}; the agent output still shows from the events`,
+        zh: `删除了${what}${size}${of}${kept}`,
+        en: `Deleted ${what}${size}${of}${kept}`,
       });
     }
     case 'store.backup_restored': {

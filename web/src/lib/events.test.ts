@@ -58,17 +58,36 @@ const SAMPLES: [string, Record<string, unknown>][] = [
 describe('globalEventText', () => {
   it('says how many raw logs were pruned, how large, from how many Runs and scouts', () => {
     expect(text('logs.pruned', { runs: 3, scouts: 2, files: 12, bytes: 5 * 1024 * 1024 })).toBe(
-      '删除了 12 个超过保留期的原始日志（5.0 MB），涉及 3 个 Run、2 次侦察；Agent 的输出仍可从事件里看到',
+      '删除了 12 个超过保留期的原始日志（5.0 MB），涉及 3 个 Run、2 次侦察；各 Run 详情页里的 Agent 输出不受影响',
     );
     expect(text('logs.pruned', { runs: 1, scouts: 0, files: 2, bytes: 2048 })).toBe(
-      '删除了 2 个超过保留期的原始日志（2.0 KB），涉及 1 个 Run；Agent 的输出仍可从事件里看到',
+      '删除了 2 个超过保留期的原始日志（2.0 KB），涉及 1 个 Run；各 Run 详情页里的 Agent 输出不受影响',
     );
     setLang('en');
     expect(text('logs.pruned', { runs: 3, scouts: 2, files: 12, bytes: 5 * 1024 * 1024 })).toBe(
-      'Deleted 12 raw log files past retention (5.0 MB), from 3 Runs and 2 scouts; the agent output still shows from the events',
+      "Deleted 12 raw log files past retention (5.0 MB), from 3 Runs and 2 scouts; the agent output on each Run's page is not affected",
     );
     expect(text('logs.pruned', { runs: 1, scouts: 1, files: 1, bytes: 100 })).toBe(
-      'Deleted 1 raw log file past retention (100 B), from 1 Run and 1 scout; the agent output still shows from the events',
+      "Deleted 1 raw log file past retention (100 B), from 1 Run and 1 scout; the agent output on each Run's page is not affected",
+    );
+  });
+
+  it('does not say the agent output stays visible when only scouts were pruned', () => {
+    // Scouts keep no condensed events, so no Run page shows their output.
+    const data = { runs: 0, scouts: 2, files: 4, bytes: 2048 };
+    expect(text('logs.pruned', data)).toBe(
+      '删除了 4 个超过保留期的原始日志（2.0 KB），涉及 2 次侦察；「需求」页上的侦察记录不受影响',
+    );
+    expect(text('logs.pruned', data)).not.toMatch(/Agent 输出/);
+    setLang('en');
+    const en = text('logs.pruned', data);
+    expect(en).toBe(
+      'Deleted 4 raw log files past retention (2.0 KB), from 2 scouts; the scouts on the Issues page are not affected',
+    );
+    expect(en).not.toMatch(/agent output/i);
+    expect(en).not.toMatch(/[一-鿿]/);
+    expect(text('logs.pruned', { runs: 0, scouts: 1, files: 1, bytes: 100 })).toBe(
+      'Deleted 1 raw log file past retention (100 B), from 1 scout; the scouts on the Issues page are not affected',
     );
   });
 
@@ -184,7 +203,7 @@ describe('globalEventText', () => {
     }
     setLang('en');
     expect(text('logs.pruned', {})).toBe(
-      'Deleted raw logs past retention; the agent output still shows from the events',
+      "Deleted raw logs past retention; the agent output on each Run's page is not affected",
     );
     expect(text('github.error', {})).toBe('GitHub request failed');
     expect(text('scout.failed', {})).toBe('Scouting a repo failed');
