@@ -9,11 +9,14 @@ import {
   utimesSync,
   writeFileSync,
 } from 'node:fs';
-import { createServer, type Server } from 'node:http';
+import { createServer, type IncomingHttpHeaders, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { WebhookSchema } from '../src/config/schema.js';
+import { redactForGitHub } from '../src/github/redact.js';
 import { runningFile } from '../src/master.js';
+import { writeWebhookCurlFile } from '../src/notify/webhook.js';
 import { type Harness, harness, tmpDir } from './helpers.js';
 
 // scripts/keepalive.sh against a stand-in Master: an install directory whose dist/cli.js is a
@@ -22,6 +25,7 @@ import { type Harness, harness, tmpDir } from './helpers.js';
 // would show into a file, so that no real notification shows up.
 
 const script = join(process.cwd(), 'scripts', 'keepalive.sh');
+const webhookScript = join(process.cwd(), 'scripts', 'webhook.sh');
 
 /** The stand-in Master: FAKE_MASTER=crash makes it exit with code 3 before it listens. */
 const FAKE_CLI = `
@@ -185,9 +189,12 @@ function standIn(...args: string[]): ChildProcess {
 
 describe('keepalive script', () => {
   it('parses, is executable, and braces every variable', () => {
-    execFileSync('bash', ['-n', script]);
-    const source = readFileSync(script, 'utf8');
-    expect(source.match(/\$[A-Za-z_][A-Za-z0-9_]*/g) ?? []).toEqual([]);
+    // webhook.sh too, which it sources.
+    for (const file of [script, webhookScript]) {
+      execFileSync('bash', ['-n', file]);
+      const source = readFileSync(file, 'utf8');
+      expect(source.match(/\$[A-Za-z_][A-Za-z0-9_]*/g) ?? []).toEqual([]);
+    }
     // A timer may run it directly.
     expect(statSync(script).mode & 0o111).toBe(0o111);
   });
@@ -399,6 +406,213 @@ describe('keepalive script', () => {
     expect(outcome.stderr).toContain('Usage: keepalive.sh <install dir> <home>');
   });
 });
+
+interface Received {
+  url: string | undefined;
+  headers: IncomingHttpHeaders;
+  body: string;
+}
+
+/** A webhook receiver on 127.0.0.1 and a random port, answering every request with `status`. */
+async function hookServer(status = 200) {
+  const received: Received[] = [];
+  const server = createServer((req, res) => {
+    let body = '';
+    req.setEncoding('utf8');
+    req.on('data', (chunk: string) => {
+      body += chunk;
+    });
+    req.on('end', () => {
+      received.push({ url: req.url, headers: req.headers, body });
+      res.writeHead(status);
+      res.end();
+    });
+  });
+  servers.push(server);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as AddressInfo;
+  return { received, url: `http://127.0.0.1:${port}` };
+}
+
+/** The token the tests put in the webhook's address and headers: never to be logged. */
+const TOKEN = 'tk_secret_token';
+
+/** Leaves the settings of a webhook at `url` in the home, as a Master that ran with it does. */
+function leaveWebhook(s: Setup, url: string, format: 'json' | 'text' = 'json'): void {
+  writeWebhookCurlFile(
+    s.home,
+    WebhookSchema.parse({
+      url: `${url}/hook?auth=${TOKEN}`,
+      headers: { Authorization: `Bearer ${TOKEN}` },
+      format,
+    }),
+  );
+}
+
+/** What the script sends when it gives up on the missing install directory of `s`. */
+const missingDirMessage = (s: Setup) =>
+  `Master 停了，保活脚本没能把它启动起来：找不到安装目录 ${s.installDir}（日志：~/keepalive.log）`;
+
+/** Runs `code` in bash after sourcing webhook.sh, with `args` as $1...; resolves with stdout. */
+function sourced(code: string, args: string[], env: NodeJS.ProcessEnv): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      'bash',
+      ['-c', `. "$WEBHOOK_SH"\n${code}`, 'bash', ...args],
+      { env: { ...process.env, WEBHOOK_SH: webhookScript, ...env }, encoding: 'utf8' },
+      (err, stdout) => (err ? reject(err) : resolve(stdout)),
+    );
+  });
+}
+
+describe('keepalive script and the webhook', () => {
+  it('also POSTs to the webhook the last Master left, once per outage, with ~ for the home directory', async () => {
+    const s = await setup();
+    const hook = await hookServer();
+    leaveWebhook(s, hook.url);
+    s.installDir = join(s.installDir, 'missing');
+    // The data directory is the user's home directory here, so the log is under it.
+    const env = { HOME: s.home };
+    const args = ['', process.execPath, 'Ares.1'];
+    expect(await keepalive(s, args, env)).toEqual({ code: 1, stderr: '' });
+    expect(hook.received).toHaveLength(1);
+    const [request] = hook.received;
+    expect(request?.url).toBe(`/hook?auth=${TOKEN}`);
+    expect(request?.headers.authorization).toBe(`Bearer ${TOKEN}`);
+    expect(request?.headers['content-type']).toBe('application/json');
+    const body = missingDirMessage(s);
+    expect(JSON.parse(request?.body ?? '')).toEqual({
+      kind: 'master_down',
+      title: 'Ares.1',
+      body,
+      text: `Ares.1\n${body}`,
+      runId: null,
+      about: 'master',
+      eventType: 'keepalive.alert',
+      at: expect.stringMatching(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/),
+    });
+    expect(request?.body).not.toContain(s.home);
+    // The system notification stays on this machine, with the whole path.
+    expect(notifications(s)).toHaveLength(1);
+    expect(notifications(s)[0]).toContain(join(s.home, 'keepalive.log'));
+    expect(logLines(s)).toEqual([`找不到安装目录 ${s.installDir}`]);
+
+    // The same outage: logged again, not sent again.
+    expect(await keepalive(s, args, env)).toEqual({ code: 1, stderr: '' });
+    expect(hook.received).toHaveLength(1);
+    expect(notifications(s)).toHaveLength(1);
+    expect(logLines(s)).toHaveLength(2);
+  });
+
+  it('sends the title and the message as plain text with format: text', async () => {
+    const s = await setup();
+    const hook = await hookServer();
+    leaveWebhook(s, hook.url, 'text');
+    s.installDir = join(s.installDir, 'missing');
+    expect(await keepalive(s, ['', process.execPath, 'Ares.1'], { HOME: s.home })).toEqual({
+      code: 1,
+      stderr: '',
+    });
+    expect(hook.received).toHaveLength(1);
+    expect(hook.received[0]?.headers['content-type']).toBe('text/plain; charset=utf-8');
+    expect(hook.received[0]?.body).toBe(`Ares.1\n${missingDirMessage(s)}`);
+  });
+
+  it('sends nothing when no Master left webhook settings, and goes on as before', async () => {
+    const s = await setup();
+    const hook = await hookServer();
+    s.installDir = join(s.installDir, 'missing');
+    expect(await keepalive(s)).toEqual({ code: 1, stderr: '' });
+    expect(hook.received).toEqual([]);
+    expect(logLines(s)).toEqual([`找不到安装目录 ${s.installDir}`]);
+    expect(notifications(s)).toHaveLength(1);
+  });
+
+  it('logs a webhook that fails without its address, and exits as before', async () => {
+    const s = await setup({ language: 'en' });
+    const port = await freePort();
+    leaveWebhook(s, `http://127.0.0.1:${port}`);
+    s.installDir = join(s.installDir, 'missing');
+    expect(await keepalive(s)).toEqual({ code: 1, stderr: '' });
+    expect(logLines(s)).toEqual([
+      `Install directory ${s.installDir} not found`,
+      // Nothing listens: curl could not connect.
+      'Sending the webhook notification failed (curl exit code 7); not retrying',
+    ]);
+    const log = readFileSync(join(s.home, 'keepalive.log'), 'utf8');
+    expect(log).not.toContain(TOKEN);
+    expect(log).not.toContain(`127.0.0.1:${port}`);
+    expect(log).not.toMatch(chinese);
+    expect(notifications(s)).toHaveLength(1);
+
+    // A webhook that answers with an error fails too (curl -f).
+    const t = await setup({ language: 'en' });
+    const hook = await hookServer(500);
+    leaveWebhook(t, hook.url);
+    t.installDir = join(t.installDir, 'missing');
+    expect(await keepalive(t)).toEqual({ code: 1, stderr: '' });
+    expect(hook.received).toHaveLength(1);
+    expect(logLines(t)[1]).toBe(
+      'Sending the webhook notification failed (curl exit code 22); not retrying',
+    );
+  });
+
+  it('keeps the JSON valid whatever the message and the title hold', async () => {
+    const hook = await startHookIn();
+    const home = '/home/someone';
+    const message = `say "hi" \\ C:\\path\\to {"json": true}\nnext line\ttab\r\u0001\u001f end 中文 ${home}/x`;
+    const name = 'Ares "1" \\ x';
+    await sourced('webhook "$1" "$2"', [message, 'test.event'], {
+      HOME: home,
+      home: hook.home,
+      name,
+    });
+    expect(hook.received).toHaveLength(1);
+    const payload = JSON.parse(hook.received[0]?.body ?? '');
+    const body = message.replace(`${home}/x`, '~/x');
+    expect(payload).toMatchObject({
+      kind: 'master_down',
+      title: name,
+      body,
+      text: `${name}\n${body}`,
+      eventType: 'test.event',
+    });
+  });
+
+  it('puts ~ only where a path starts with the home directory, as the Master does', async () => {
+    const tilde = (text: string, home: string) =>
+      sourced('webhook_tilde "$1"; printf %s "$tilded"', [text], { HOME: home });
+    const texts = [
+      'x /home/me/a y',
+      '/home/me',
+      '（日志：/home/me/.ares1/keepalive.log）',
+      '/mnt/home/me/b, /home/me2/c, /home/me.bak/d and x/home/me',
+      '(/home/me) /home/me. a:/home/me/e /home/me//f',
+      'no home here',
+    ];
+    for (const text of texts) {
+      expect(await tilde(text, '/home/me')).toBe(redactForGitHub(text, '/home/me'));
+      // A trailing slash makes no difference.
+      expect(await tilde(text, '/home/me/')).toBe(redactForGitHub(text, '/home/me'));
+    }
+    // A home directory with characters special to patterns is plain text.
+    const odd = '/tmp/a*b[c]';
+    const text = `${odd}/x /tmp/aXbc/y ${odd}`;
+    expect(await tilde(text, odd)).toBe('~/x /tmp/aXbc/y ~');
+    expect(await tilde(text, odd)).toBe(redactForGitHub(text, odd));
+    // Nothing to hide without a home directory, or with / as one.
+    expect(await tilde('/home/me/x', '')).toBe('/home/me/x');
+    expect(await tilde('/home/me/x', '/')).toBe('/home/me/x');
+  });
+});
+
+/** A webhook receiver and a data directory whose webhook.curl leads to it. */
+async function startHookIn() {
+  const hook = await hookServer();
+  const home = tmpDir('ares1-home-');
+  writeWebhookCurlFile(home, WebhookSchema.parse({ url: `${hook.url}/hook` }));
+  return { ...hook, home };
+}
 
 describe('Master started after one that did not close', () => {
   let h: Harness | undefined;

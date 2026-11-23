@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import {
   chmodSync,
   closeSync,
@@ -11,11 +11,15 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
+import { WebhookSchema } from '../src/config/schema.js';
 import type { MasterOptions } from '../src/master.js';
 import { noticeFor } from '../src/notify/notice.js';
+import { writeWebhookCurlFile } from '../src/notify/webhook.js';
 import { githubNameOf, isMasterSource } from '../src/upgrade/source.js';
 import {
   copyUpgradeScript,
@@ -663,21 +667,90 @@ describe('upgrade script', () => {
     ]);
   });
 
+  it('also POSTs to the webhook the last Master left when it cannot find the install directory', async () => {
+    const received: { url?: string; auth?: string; body: string }[] = [];
+    const server = createServer((req, res) => {
+      let body = '';
+      req.setEncoding('utf8');
+      req.on('data', (chunk: string) => {
+        body += chunk;
+      });
+      req.on('end', () => {
+        received.push({ url: req.url, auth: req.headers.authorization, body });
+        res.end();
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const { port } = server.address() as AddressInfo;
+      const home = tmpDir('ares1-home-');
+      writeWebhookCurlFile(
+        home,
+        WebhookSchema.parse({
+          url: `http://127.0.0.1:${port}/hook`,
+          headers: { Authorization: 'Bearer tk' },
+        }),
+      );
+      const bin = tmpDir('ares1-bin-');
+      // Stands in for osascript, so that no real notification shows up.
+      writeFileSync(join(bin, 'osascript'), '#!/bin/sh\nexit 0\n');
+      chmodSync(join(bin, 'osascript'), 0o755);
+      const missing = join(bin, 'missing');
+      // Not execFileSync: the webhook's server answers in this process.
+      const code = await new Promise<number | string | null | undefined>((resolve) =>
+        execFile(
+          'bash',
+          [
+            join(process.cwd(), 'scripts', 'self-upgrade.sh'),
+            missing,
+            home,
+            '999999',
+            'abc1234',
+            join(bin, 'result.json'),
+            process.execPath,
+            '1',
+            'Ares.1',
+            'en',
+          ],
+          { env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, HOME: home } },
+          (err) => resolve(err?.code),
+        ),
+      );
+      expect(code).toBe(1);
+      expect(received).toHaveLength(1);
+      expect(received[0]).toMatchObject({ url: '/hook', auth: 'Bearer tk' });
+      const body = `Automatic upgrade failed: install directory ${missing} not found`;
+      expect(JSON.parse(received[0]?.body ?? '')).toEqual({
+        kind: 'master_down',
+        title: 'Ares.1',
+        body,
+        text: `Ares.1\n${body}`,
+        runId: null,
+        about: 'master',
+        eventType: 'upgrade.master_down',
+        at: expect.stringMatching(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/),
+      });
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   /**
    * A stable copy one commit behind origin, and a run of a copy of the script on it (as the
    * Master runs a copy) with stand-ins in PATH: npm and curl for the build and the health check,
    * osascript for notifications, sleep so that waiting takes no time, and fake-node for the
    * Master the script starts. fake-node hands `-e` (writing the result file) to the real node.
    * Each stand-in does what `fakes` says, else succeeds silently; $FAKE_DIR is the directory they
-   * and the script's copy are in, next to a copy of find-node.sh as the Master puts it. `env` adds
+   * and the script's copy are in, next to copies of find-node.sh and webhook.sh as the Master
+   * puts them. `env` adds
    * to the script's environment, where ARES1_UPGRADE_WATCH is unset unless it says otherwise.
    * `node` is the old Master's node the script is given (default: fake-node). The repository
    * has this repository's .gitignore, so that what the script leaves there is ignored as it
-   * would be in a real stable copy.
+   * would be in a real stable copy. `home` is the Master's data directory (default a new one).
    */
   function stableCopy(
     fakes: Record<string, string> = {},
-    opts: { env?: Record<string, string>; lang?: string; node?: string } = {},
+    opts: { env?: Record<string, string>; lang?: string; node?: string; home?: string } = {},
   ) {
     const origin = initRepo();
     copyFileSync(join(process.cwd(), '.gitignore'), join(origin, '.gitignore'));
@@ -707,8 +780,10 @@ describe('upgrade script', () => {
     }
     const script = join(bin, 'self-upgrade.sh');
     copyFileSync(join(process.cwd(), 'scripts', 'self-upgrade.sh'), script);
-    copyFileSync(join(process.cwd(), 'scripts', 'find-node.sh'), join(bin, 'find-node.sh'));
-    const home = tmpDir('ares1-home-');
+    for (const sourced of ['find-node.sh', 'webhook.sh']) {
+      copyFileSync(join(process.cwd(), 'scripts', sourced), join(bin, sourced));
+    }
+    const home = opts.home ?? tmpDir('ares1-home-');
     const result = join(home, 'result.json');
     const env = {
       ...Object.fromEntries(
@@ -941,6 +1016,67 @@ describe('upgrade script', () => {
     });
     expect(result.detail).toContain('Error: Cannot find module "./missing.js"');
     expect(result.detail).not.toContain('earlier run');
+  });
+
+  it('tells the webhook when the Master does not start after the rollback either', () => {
+    const home = tmpDir('ares1-home-');
+    const { bin, target, run, log } = stableCopy(
+      {
+        // /api/health never answers. The webhook's request (curl -K) is recorded instead of
+        // sent; it fails while $FAKE_DIR/webhook-fails is there.
+        curl: [
+          'for a in "$@"; do',
+          '  [ "$a" = -K ] || continue',
+          '  [ -e "$FAKE_DIR/webhook-fails" ] && exit 22',
+          '  printf "%s\\n" "$@" > "$FAKE_DIR/webhook-args"',
+          '  cat > "$FAKE_DIR/webhook-body"',
+          '  exit 0',
+          'done',
+          'exit 7',
+        ].join('\n'),
+      },
+      // The data directory is the user's home directory here.
+      { home, env: { HOME: home } },
+    );
+    // Without settings left by a Master, nothing is sent.
+    expect(run(target)).toMatchObject({ ok: false, to: target });
+    expect(log()).toContain('The Master did not start after the rollback either');
+    expect(existsSync(join(bin, 'webhook-args'))).toBe(false);
+
+    writeWebhookCurlFile(home, WebhookSchema.parse({ url: 'https://example.com/hook' }));
+    expect(run(target)).toMatchObject({ ok: false, to: target });
+    expect(readFileSync(join(bin, 'webhook-args'), 'utf8').trimEnd().split('\n')).toEqual([
+      '-fsS',
+      '--max-time',
+      '10',
+      '-K',
+      join(home, 'webhook.curl'),
+      '-o',
+      '/dev/null',
+      '--data-binary',
+      '@-',
+    ]);
+    const body =
+      'Automatic upgrade failed and the Master did not start after the rollback; please handle it by hand (log: ~/upgrade.log)';
+    expect(JSON.parse(readFileSync(join(bin, 'webhook-body'), 'utf8'))).toEqual({
+      kind: 'master_down',
+      title: 'Ares.1',
+      body,
+      text: `Ares.1\n${body}`,
+      runId: null,
+      about: 'master',
+      eventType: 'upgrade.master_down',
+      at: expect.stringMatching(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/),
+    });
+    expect(log()).not.toContain('webhook');
+
+    // A failure is logged with curl's exit code only, and the script ends as before.
+    writeFileSync(join(bin, 'webhook-fails'), '');
+    expect(run(target)).toMatchObject({ ok: false, to: target });
+    expect(log()).toContain(
+      'Sending the webhook notification failed (curl exit code 22); not retrying',
+    );
+    expect(log()).not.toContain('example.com');
   });
 
   it("builds and starts with another node when the old Master's is gone, and logs it", () => {

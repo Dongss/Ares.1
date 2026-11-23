@@ -825,6 +825,7 @@ describe('running the Master', () => {
     expect(paths).toContain('/h/master.out');
     expect(paths).toContain('/h/upgrade.log');
     expect(paths).toContain('/h/keepalive.log');
+    expect(paths).toContain('/h/webhook.curl');
   });
 
   it('says how long the raw agent output is kept', () => {

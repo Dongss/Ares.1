@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingHttpHeaders, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { homedir } from 'node:os';
@@ -16,13 +17,25 @@ import {
   systemNoticeSupported,
 } from '../src/notify/system.js';
 import {
+  escapeCurlConfigValue,
   type Fetch,
+  saveWebhookCurlFile,
   WEBHOOK_TIMEOUT_MS,
   WebhookNotifier,
+  webhookCurlConfig,
+  webhookCurlFile,
   webhookRequest,
+  writeWebhookCurlFile,
 } from '../src/notify/webhook.js';
 import type { EventRow } from '../src/store/types.js';
-import { blockOnAgentError, type Harness, harness, type Script } from './helpers.js';
+import {
+  blockOnAgentError,
+  type Harness,
+  harness,
+  type Script,
+  tmpDir,
+  writeFile,
+} from './helpers.js';
 
 /** An execFile that records its calls and answers each with `fail()`'s error, if any. */
 function fakeExecFile(fail: () => Error | null = () => null) {
@@ -688,5 +701,165 @@ describe('webhook notifications', () => {
       reason: 'HTTP 503 Service Unavailable',
       status: 503,
     });
+  });
+});
+
+describe('webhook settings for the scripts (webhook.curl)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    setLang('zh');
+  });
+
+  /** The webhook.curl files of `home`, temporary ones included. */
+  const curlFiles = (home: string) => readdirSync(home).filter((f) => f.startsWith('webhook.curl'));
+
+  it('is written at start, readable by its owner only, follows reloads and goes with the webhook', async () => {
+    const hook = await startHook();
+    h = await harness({ config: webhookYaml(hook.url), master: { watchConfig: false } });
+    const { configFile } = h.master.paths;
+    const file = webhookCurlFile(h.home);
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    expect(readFileSync(file, 'utf8')).toBe(
+      [
+        '# Written by the Master from notify.webhook in config.yaml, for keepalive.sh and',
+        '# self-upgrade.sh to notify when the Master is down; rewritten when the configuration changes.',
+        '# ares1-format: json',
+        `url = "${hook.url}/hook?auth=${TOKEN}"`,
+        'request = "POST"',
+        'globoff',
+        `header = "authorization: Bearer ${TOKEN}"`,
+        'header = "content-type: application/json"',
+        '',
+      ].join('\n'),
+    );
+
+    // Another address, other headers and another format, once the configuration is reloaded.
+    writeFile(
+      configFile,
+      'notify:\n  webhook:\n    url: https://ntfy.sh/topic\n    headers:\n      X-Title: Ares\n    format: text\n',
+    );
+    expect(h.master.configWatcher.reload()).toBe(true);
+    const text = readFileSync(file, 'utf8');
+    expect(text).toContain('# ares1-format: text\nurl = "https://ntfy.sh/topic"\n');
+    expect(text).toContain('header = "content-type: text/plain; charset=utf-8"\n');
+    expect(text).toContain('header = "x-title: Ares"\n');
+    expect(text).not.toContain(TOKEN);
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    expect(curlFiles(h.home)).toEqual(['webhook.curl']);
+
+    // A config.yaml that does not load keeps the configuration in use, and the file.
+    writeFile(configFile, 'notify: [\n');
+    expect(h.master.configWatcher.reload()).toBe(false);
+    expect(readFileSync(file, 'utf8')).toBe(text);
+
+    // Without a webhook there is nothing for the scripts to send to.
+    writeFile(configFile, 'language: zh\n');
+    expect(h.master.configWatcher.reload()).toBe(true);
+    expect(curlFiles(h.home)).toEqual([]);
+
+    // A Master that starts with one writes it again; one that starts without deletes it.
+    const { home } = h;
+    await h.close();
+    writeFile(configFile, webhookYaml(hook.url));
+    h = await harness({ home });
+    expect(curlFiles(home)).toEqual(['webhook.curl']);
+    await h.close();
+    // Closing leaves it: the scripts need it while no Master runs.
+    expect(curlFiles(home)).toEqual(['webhook.curl']);
+    writeFile(configFile, 'language: zh\n');
+    h = await harness({ home });
+    expect(curlFiles(home)).toEqual([]);
+  });
+
+  it('makes all of it 0600, even a temporary file left over or a umask that takes more', () => {
+    const home = tmpDir('ares1-curl-');
+    const webhook = WebhookSchema.parse({ url: 'https://example.com/hook' });
+    writeFileSync(`${webhookCurlFile(home)}.${process.pid}.tmp`, 'left over', { mode: 0o644 });
+    const umask = process.umask(0o277);
+    try {
+      writeWebhookCurlFile(home, webhook);
+    } finally {
+      process.umask(umask);
+    }
+    expect(statSync(webhookCurlFile(home)).mode & 0o777).toBe(0o600);
+    expect(curlFiles(home)).toEqual(['webhook.curl']);
+    // Deleting one that is not there is no error.
+    writeWebhookCurlFile(home, undefined);
+    writeWebhookCurlFile(home, undefined);
+    expect(curlFiles(home)).toEqual([]);
+  });
+
+  it('escapes values as curl reads them, so that curl sends what fetch would', async () => {
+    expect(escapeCurlConfigValue('a"b\\c\td\ne\rf\vg 中文')).toBe(
+      'a\\"b\\\\c\\td\\ne\\rf\\vg 中文',
+    );
+    const hook = await startHook();
+    const webhook = WebhookSchema.parse({
+      url: `${hook.url}/hook/[x]?q="a b"&r=c\\d`,
+      headers: {
+        'X-Quoted': 'say "hi" \\n C:\\path\tend',
+        'Content-Type': 'text/markdown',
+        'X-Empty': '',
+      },
+      format: 'text',
+    });
+    const config = webhookCurlConfig(webhook);
+    expect(config.split('\n').slice(2)).toEqual([
+      '# ares1-format: text',
+      `url = "${hook.url}/hook/[x]?q=%22a%20b%22&r=c\\\\d"`,
+      'request = "POST"',
+      'globoff',
+      'header = "content-type: text/markdown"',
+      'header = "x-empty;"',
+      'header = "x-quoted: say \\"hi\\" \\\\n C:\\\\path\\tend"',
+      '',
+    ]);
+
+    // Read back by curl, the request is the one the Master sends.
+    const home = tmpDir('ares1-curl-');
+    writeWebhookCurlFile(home, webhook);
+    await new Promise<void>((resolve, reject) =>
+      execFile(
+        'curl',
+        ['-fsS', '--max-time', '10', '-K', webhookCurlFile(home), '-o', '/dev/null'].concat([
+          '--data-binary',
+          'hello',
+        ]),
+        (err) => (err ? reject(err) : resolve()),
+      ),
+    );
+    const { url, headers } = new Request(webhook.url, {
+      method: 'POST',
+      headers: webhookRequest(
+        webhook,
+        { kind: 'scout', title: 't', body: 'b', runId: null, about: 'issues' },
+        { id: 1, runId: null, ts: '', type: 'scout.failed', data: {} },
+      ).headers,
+    });
+    expect(hook.received).toHaveLength(1);
+    const [received] = hook.received;
+    expect(received?.method).toBe('POST');
+    expect(`${hook.url}${received?.url}`).toBe(url);
+    expect(received?.body).toBe('hello');
+    for (const [name, value] of headers) expect(received?.headers[name]).toBe(value);
+    expect(received?.headers['x-quoted']).toBe('say "hi" \\n C:\\path\tend');
+    expect(received?.headers['x-empty']).toBe('');
+  });
+
+  it('logs when it cannot write the file, without its contents, and goes on', () => {
+    const logs: string[] = [];
+    const home = join(tmpDir('ares1-curl-'), 'missing');
+    const webhook = WebhookSchema.parse({
+      url: `https://example.com/hook?auth=${TOKEN}`,
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+    saveWebhookCurlFile(home, webhook, (m) => logs.push(m));
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatch(/^\[通知\] 无法更新保活和升级脚本用的 webhook 设置/);
+    expect(logs[0]).not.toContain(TOKEN);
+    setLang('en');
+    saveWebhookCurlFile(home, webhook, (m) => logs.push(m));
+    expect(logs[1]).toMatch(/^\[notify\] Could not update the webhook settings/);
+    expect(logs[1]).not.toMatch(/[一-鿿]/);
   });
 });

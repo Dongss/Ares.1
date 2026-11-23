@@ -1,9 +1,12 @@
+import { chmodSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import type { LoadedConfig } from '../config/load.js';
 import type { WebhookConfig } from '../config/schema.js';
 import { redactForGitHub } from '../github/redact.js';
 import { t } from '../i18n.js';
 import type { Store } from '../store/store.js';
 import type { EventRow } from '../store/types.js';
+import { errorMessage } from '../util.js';
 import { type Notice, type NoticeKind, noticeFor } from './notice.js';
 
 /** The part of the global fetch the notifier uses (tests may replace it). */
@@ -12,9 +15,16 @@ export type Fetch = (url: string, init: RequestInit) => Promise<Response>;
 /** A webhook that does not answer is given up on: the Master never waits for it. */
 export const WEBHOOK_TIMEOUT_MS = 10_000;
 
+/**
+ * The kinds of webhook notifications: those of the Master (notice.ts), and `master_down`, which
+ * only the scripts send (scripts/webhook.sh) when the Master is down and they cannot start it.
+ * The Master never makes that one itself, so it is not a NoticeKind.
+ */
+export type WebhookKind = NoticeKind | 'master_down';
+
 /** The JSON body of a webhook notification (`format: json`). */
 export interface WebhookPayload {
-  kind: NoticeKind;
+  kind: WebhookKind;
   title: string;
   body: string;
   /** "title\nbody": what services that show one text (a Slack incoming webhook) display. */
@@ -25,6 +35,18 @@ export interface WebhookPayload {
   eventType: string;
   /** When the event happened (ISO time). */
   at: string;
+}
+
+/**
+ * The request headers of a notification: the content type of the format, which a header
+ * configured with the same name (in any case) replaces, and the other configured headers.
+ */
+export function webhookHeaders(webhook: WebhookConfig): Headers {
+  const headers = new Headers({
+    'content-type': webhook.format === 'text' ? 'text/plain; charset=utf-8' : 'application/json',
+  });
+  for (const [name, value] of Object.entries(webhook.headers)) headers.set(name, value);
+  return headers;
 }
 
 /**
@@ -41,10 +63,7 @@ export function webhookRequest(
   const title = redactForGitHub(notice.title, home);
   const body = redactForGitHub(notice.body, home);
   const text = `${title}\n${body}`;
-  const headers = new Headers({
-    'content-type': webhook.format === 'text' ? 'text/plain; charset=utf-8' : 'application/json',
-  });
-  for (const [name, value] of Object.entries(webhook.headers)) headers.set(name, value);
+  const headers = webhookHeaders(webhook);
   if (webhook.format === 'text') return { headers, body: text };
   const payload: WebhookPayload = {
     kind: notice.kind,
@@ -57,6 +76,109 @@ export function webhookRequest(
     at: event.ts,
   };
   return { headers, body: JSON.stringify(payload) };
+}
+
+/**
+ * Where the Master leaves the webhook's settings for the scripts that notify when it is down
+ * (keepalive.sh and self-upgrade.sh, through scripts/webhook.sh): `<home>/webhook.curl`.
+ */
+export function webhookCurlFile(home: string): string {
+  return join(home, 'webhook.curl');
+}
+
+/** The escapes curl reads inside double quotes in a config file (`curl -K`). */
+const CURL_ESCAPES: Record<string, string> = {
+  '\\': '\\\\',
+  '"': '\\"',
+  '\t': '\\t',
+  '\n': '\\n',
+  '\r': '\\r',
+  '\v': '\\v',
+};
+
+/**
+ * A value as it goes between double quotes in a curl config file: backslashes and quotes
+ * escaped, and the line breaks and tabs curl knows written as \n, \r, \t and \v, so that the
+ * value stays on its line and reads back the same.
+ */
+export function escapeCurlConfigValue(value: string): string {
+  return value.replace(/[\\"\t\n\r\v]/g, (c) => CURL_ESCAPES[c] ?? c);
+}
+
+/** The comment line of webhookCurlConfig that tells the scripts the format, e.g. `json`. */
+export const WEBHOOK_FORMAT_COMMENT = '# ares1-format:';
+
+/**
+ * The webhook's settings as a curl config file (`curl -K`): the address, a POST, and one line
+ * per request header, merged as webhookRequest merges them; the format is in a comment line
+ * (WEBHOOK_FORMAT_COMMENT), which curl skips. The scripts add the body, the timeout and where
+ * the answer goes. The address is written as fetch requests it (parsed, so with spaces and
+ * quotes percent-encoded), which curl would otherwise refuse or send differently.
+ */
+export function webhookCurlConfig(webhook: WebhookConfig): string {
+  const quoted = (value: string) => `"${escapeCurlConfigValue(value)}"`;
+  const lines = [
+    '# Written by the Master from notify.webhook in config.yaml, for keepalive.sh and',
+    '# self-upgrade.sh to notify when the Master is down; rewritten when the configuration changes.',
+    `${WEBHOOK_FORMAT_COMMENT} ${webhook.format}`,
+    `url = ${quoted(URL.parse(webhook.url)?.href ?? webhook.url)}`,
+    'request = "POST"',
+    // Brackets and braces in the address are part of it, not a pattern of addresses.
+    'globoff',
+  ];
+  for (const [name, value] of webhookHeaders(webhook)) {
+    // curl drops a header given as "Name:" with nothing after it; "Name;" sends it empty.
+    lines.push(`header = ${quoted(value ? `${name}: ${value}` : `${name};`)}`);
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+/**
+ * Leaves the webhook's settings in `<home>/webhook.curl` (webhookCurlConfig), or deletes the file
+ * when there is no webhook. Only its owner may read it: the address and the headers may carry
+ * tokens. Written to a temporary file that is renamed over it, so that a script never reads half
+ * of it. Throws when it cannot.
+ */
+export function writeWebhookCurlFile(home: string, webhook: WebhookConfig | undefined): void {
+  const file = webhookCurlFile(home);
+  if (!webhook) {
+    rmSync(file, { force: true });
+    return;
+  }
+  const tmp = `${file}.${process.pid}.tmp`;
+  try {
+    // Created anew, so that it never has the wider mode of one left over.
+    rmSync(tmp, { force: true });
+    writeFileSync(tmp, webhookCurlConfig(webhook), { mode: 0o600, flag: 'wx' });
+    // The umask may have taken away the owner's bits, which the scripts need.
+    chmodSync(tmp, 0o600);
+    renameSync(tmp, file);
+  } catch (err) {
+    rmSync(tmp, { force: true });
+    throw err;
+  }
+}
+
+/**
+ * writeWebhookCurlFile at start and after each reload of the configuration. A failure is logged,
+ * without the file's contents, and the Master goes on: only the scripts' webhook notifications
+ * miss it.
+ */
+export function saveWebhookCurlFile(
+  home: string,
+  webhook: WebhookConfig | undefined,
+  log: (message: string) => void = (message) => console.warn(message),
+): void {
+  try {
+    writeWebhookCurlFile(home, webhook);
+  } catch (err) {
+    log(
+      t({
+        zh: `[通知] 无法更新保活和升级脚本用的 webhook 设置（${webhookCurlFile(home)}）：${errorMessage(err)}`,
+        en: `[notify] Could not update the webhook settings the keepalive and upgrade scripts use (${webhookCurlFile(home)}): ${errorMessage(err)}`,
+      }),
+    );
+  }
 }
 
 /** Why a request failed, without the address or the headers (they may carry tokens). */

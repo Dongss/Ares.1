@@ -33,7 +33,9 @@
 #
 # The result file tells the next Master how it went, on failure with the end of the output that
 # says why (`detail`: what pulling and building printed, or what the new Master printed before it
-# was stopped or exited); a system notification is sent only if nothing could be started at all.
+# was stopped or exited); a human is notified only if nothing could be started at all: by a
+# system notification, and to the webhook of config.yaml when the last Master that ran left its
+# settings (webhook.sh, which the Master copies next to this copy as it does find-node.sh).
 # <name> is the project's display name (src/brand.ts), used as the notification title;
 # <language> (zh or en, config.yaml's language) picks the texts.
 # <target> is the commit the Master found on origin (already fetched); a failure is reported
@@ -62,6 +64,11 @@ target=${10:-}
 . "$(dirname -- "${BASH_SOURCE[0]}")/find-node.sh" 2>/dev/null ||
   . "${dir}/scripts/find-node.sh" 2>/dev/null ||
   use_node() { [ -x "${node}" ]; }
+# Likewise the webhook notification; without it only the system notification is sent.
+# shellcheck source=webhook.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/webhook.sh" 2>/dev/null ||
+  . "${dir}/scripts/webhook.sh" 2>/dev/null ||
+  webhook() { :; }
 
 # How long the new Master is watched after it answered, in seconds.
 watch=${ARES1_UPGRADE_WATCH:-300}
@@ -82,6 +89,12 @@ notify() {
   elif command -v notify-send >/dev/null 2>&1; then
     notify-send --app-name "${name}" "${name}" "$1" >/dev/null 2>&1 || true
   fi
+}
+
+# No Master runs and the script could not start one: a system notification, and the webhook.
+master_down() {
+  notify "$1"
+  webhook "$1" upgrade.master_down
 }
 
 # What pulling and building print, kept for the result's detail besides going to the log.
@@ -259,7 +272,7 @@ main() {
   fi
 
   cd "${dir}" || {
-    notify "$(pick "自动升级失败：找不到安装目录 ${dir}" \
+    master_down "$(pick "自动升级失败：找不到安装目录 ${dir}" \
       "Automatic upgrade failed: install directory ${dir} not found")"
     exit 1
   }
@@ -333,7 +346,7 @@ main() {
   # The node may have changed since it was looked for, and the old version may want another.
   if ! use_node "${node}" package.json; then
     log "$(pick "找不到能用的 node，回退后无法启动 Master" "No usable node found, so the Master cannot be started after the rollback")"
-    notify "$(pick "自动升级失败，回退后找不到能用的 node，Master 没能启动，请手动处理（日志：${home}/upgrade.log）" \
+    master_down "$(pick "自动升级失败，回退后找不到能用的 node，Master 没能启动，请手动处理（日志：${home}/upgrade.log）" \
       "Automatic upgrade failed and no usable node was found to start the Master after the rollback; please handle it by hand (log: ${home}/upgrade.log)")"
     return
   fi
@@ -348,7 +361,7 @@ main() {
     log "$(pick "已回退到 ${old}" "Rolled back to ${old}")"
   else
     log "$(pick "回退后 Master 也没能启动" "The Master did not start after the rollback either")"
-    notify "$(pick "自动升级失败，回退后 Master 也没能启动，请手动处理（日志：${home}/upgrade.log）" \
+    master_down "$(pick "自动升级失败，回退后 Master 也没能启动，请手动处理（日志：${home}/upgrade.log）" \
       "Automatic upgrade failed and the Master did not start after the rollback; please handle it by hand (log: ${home}/upgrade.log)")"
   fi
 }

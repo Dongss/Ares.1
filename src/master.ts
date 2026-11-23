@@ -25,7 +25,7 @@ import type { GitHub } from './github/client.js';
 import { type Lang, lang, setLang, t } from './i18n.js';
 import { RawLogPruner } from './logs/prune.js';
 import { type SendNotice, SystemNotifier } from './notify/system.js';
-import { WebhookNotifier } from './notify/webhook.js';
+import { saveWebhookCurlFile, WebhookNotifier } from './notify/webhook.js';
 import { backupRestoredNotice, Store } from './store/store.js';
 import {
   copyUpgradeScript,
@@ -105,11 +105,10 @@ export interface MasterOptions {
  */
 function launchUpgradeScript(paths: HomePaths, port: number, plan: UpgradePlan): void {
   // Copies, so that `git pull` does not rewrite the script while bash reads it. The script
-  // sources find-node.sh from its own directory, so that one goes first.
-  copyUpgradeScript(
-    join(plan.installDir, 'scripts', 'find-node.sh'),
-    join(paths.dataDir, 'find-node.sh'),
-  );
+  // sources find-node.sh and webhook.sh from its own directory, so those go first.
+  for (const sourced of ['find-node.sh', 'webhook.sh']) {
+    copyUpgradeScript(join(plan.installDir, 'scripts', sourced), join(paths.dataDir, sourced));
+  }
   const script = join(paths.dataDir, 'self-upgrade.sh');
   copyUpgradeScript(join(plan.installDir, 'scripts', 'self-upgrade.sh'), script);
   const log = openSync(join(paths.home, 'upgrade.log'), 'a');
@@ -215,6 +214,8 @@ export class Master {
       ? opts.adapters.filter((a) => a.supportsReadOnly).map((a) => a.cli)
       : BUILTIN_READ_ONLY_CLIS;
     const initial = loadConfig(paths, knownClis, readOnlyClis);
+    // For the scripts that notify when this Master is down (keepalive.sh, self-upgrade.sh).
+    saveWebhookCurlFile(paths.home, initial.master.notify.webhook);
     const adapters = new Map((opts.adapters ?? builtin(initial.master)).map((a) => [a.cli, a]));
     const store = new Store(paths.dbFile);
     if (store.restoredBackup) console.warn(backupRestoredNotice(store.restoredBackup));
@@ -224,6 +225,8 @@ export class Master {
       initial,
       (change) => {
         if (change.type === 'reloaded') {
+          // A reload that failed keeps the configuration in use, and so the file.
+          saveWebhookCurlFile(paths.home, change.config.master.notify.webhook);
           store.event(null, 'config.reloaded', {
             errors: Object.keys(change.config.errors).length,
           });

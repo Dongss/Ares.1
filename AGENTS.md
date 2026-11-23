@@ -92,7 +92,10 @@ src/
     webhook.ts        notifications the Master POSTs to notify.webhook in config.yaml (JSON or
                       text, home directory as ~, 10 s timeout, no retry; the first failure of a
                       streak, or of another address, is logged and recorded as the global event
-                      notify.webhook_failed, told again after a notification got through)
+                      notify.webhook_failed, told again after a notification got through); the
+                      webhook's settings as a curl config file, <home>/webhook.curl (0600, written
+                      atomically at start and on each reload, deleted without a webhook), for the
+                      scripts to notify when the Master is down
   upgrade/
     upgrader.ts       the Master upgrades itself: finds a new version, waits for the work in hand,
                       hands over to scripts/self-upgrade.sh, keeps the last failed upgrade, retries
@@ -119,15 +122,20 @@ src/
 scripts/
   self-upgrade.sh     auto-upgrade: pull, build, restart, watch the new version for a few minutes;
                       back to the old version on failure or when it crashes meanwhile, with the
-                      node_modules from before the upgrade (moved aside, so nothing to download)
+                      node_modules from before the upgrade (moved aside, so nothing to download);
+                      when no Master could be started, a system notification and the webhook
   keepalive.sh        called by a timer (launchd, systemd, cron) every minute: starts the Master
                       when it does not answer, unless an upgrade runs or a Master process of the
-                      same home is there (hung or starting); logs to keepalive.log, notifies when
-                      it cannot start it
+                      same home is there (hung or starting); logs to keepalive.log, notifies (a
+                      system notification and the webhook) once per outage when it cannot start it
   find-node.sh        the one place that finds the node to run the Master with (the given one,
                       PATH, nvm's default version, the usual places; engines.node checked),
                       sourced by self-upgrade.sh and keepalive.sh; the Master copies it next to
                       its copy of self-upgrade.sh
+  webhook.sh          the one place the scripts POST to the webhook (kind master_down) with the
+                      settings the last Master left in <home>/webhook.curl: curl only, no node or
+                      jq; home directory as ~; a failure logs curl's exit code only. Sourced and
+                      copied like find-node.sh
 web/                  dashboard (React + Vite)
   src/App.tsx         top bar (navigation, work switch, notification switch, language switch)
                       and routing
@@ -180,9 +188,11 @@ test/
   - assessment conclusion rules: `src/engine/discussion.ts`
   - how a Run's time is split, and the names and groups of the parts: `src/engine/times.ts`
   - how the scripts find the node to run the Master with: `scripts/find-node.sh`
+  - how the scripts send to the webhook when the Master is down: `scripts/webhook.sh`, reading
+    the curl config file `webhookCurlConfig` (`src/notify/webhook.ts`) writes
   - the display name and slogan: `brandName()` / `brandSlogan()` / `brandTitle()` in `src/brand.ts`. Never write them as literals elsewhere. The exception is the `<title>` of `web/index.html`, a static file that keeps the Chinese title; a test keeps the two in sync.
 - Every comment the Master posts on an issue goes through `markComment` (`src/github/issues.ts`), which adds the hidden marker that tells it apart from human replies.
-- Every text the Master publishes on GitHub goes through `redactForGitHub` (`src/github/redact.ts`), which turns paths under the user's home directory into `~` so the system user name stays private: comments (in the bridge's `comment()`), the issues it creates, and the commit messages it makes (they may be pushed). The notifications it POSTs to a webhook (`src/notify/webhook.ts`) go through it too. Store the original text: the dashboard and logs keep the full paths.
+- Every text the Master publishes on GitHub goes through `redactForGitHub` (`src/github/redact.ts`), which turns paths under the user's home directory into `~` so the system user name stays private: comments (in the bridge's `comment()`), the issues it creates, and the commit messages it makes (they may be pushed). The notifications it POSTs to a webhook (`src/notify/webhook.ts`) go through it too, and `scripts/webhook.sh` does the same in bash (`webhook_tilde`) for what the scripts send. Store the original text: the dashboard and logs keep the full paths.
 - Anybody can write on a public repo. Text read from GitHub (issues, comments) goes into an agent's prompt only when `isTrusted` (`src/github/issues.ts`) trusts its author: the repo's owner, members and collaborators, and the account the Master acts as. A Run from an issue by anyone else waits for a human to confirm its goal (`untrusted_issue`).
 - Agents and the commands run on their work (setup and verify commands) get no GitHub credentials, so they cannot read untrusted comments themselves or act as the accounts logged in on the machine. Start them only with `prepareAgentEnv` (`src/adapters/process.ts`), the one place that defines their environment; the Master's own GitHub and git calls keep the credentials.
 - No natively compiled dependencies (e.g. better-sqlite3): keep `npm install` simple.

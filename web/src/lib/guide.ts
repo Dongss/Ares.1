@@ -1279,5 +1279,12 @@ export function dataPaths(home: string): { path: string; what: string }[] {
         en: 'When the keepalive script (scripts/keepalive.sh) started the Master or found it amiss',
       }),
     },
+    {
+      path: under(home, 'webhook.curl'),
+      what: t({
+        zh: '配置了 notify.webhook 时，Master 留给保活和升级脚本的 webhook 设置：Master 停了、起不来时它们也发到 webhook。里面有地址和请求头（可能带 token），只有你能读',
+        en: 'With notify.webhook set, the webhook settings the Master leaves for the keepalive and upgrade scripts, so that they reach the webhook too when the Master is down and cannot be started. It holds the address and headers (maybe a token) and only you can read it',
+      }),
+    },
   ];
 }

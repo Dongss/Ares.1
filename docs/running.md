@@ -27,8 +27,9 @@ node dist/cli.js      # 数据目录 ~/.ares1（或 $ARES1_HOME），端口 4870
 | `data/agent-gh-config/` | 给 Agent 用的空 gh 配置目录，每次用之前清空（见「Agent 拿不到 GitHub 凭据」） |
 | `worktrees/` | 每个 Run 的工作目录 |
 | `data/master-running.json` | Master 运行时的标记，正常停止时删掉（见「保活」） |
-| `data/self-upgrade.sh`、`data/find-node.sh` | 自动升级时从安装目录复制过来的升级脚本和找 node 的脚本（见「稳定副本和自动升级」） |
+| `data/self-upgrade.sh`、`data/find-node.sh`、`data/webhook.sh` | 自动升级时从安装目录复制过来的升级脚本、找 node 的脚本和发 webhook 通知的脚本（见「稳定副本和自动升级」） |
 | `master.out`、`upgrade.log`、`keepalive.log` | 后台运行时的输出、自动升级的日志、保活脚本的日志 |
+| `webhook.curl` | 配置了 `notify.webhook` 时，Master 留给保活脚本和升级脚本的 webhook 设置，权限 0600（见「通知」的「webhook」） |
 
 配置文件改动后会自动重新加载。改端口或 CLI 路径（`bins`）需要重启 Master。
 
@@ -344,7 +345,7 @@ notify:
 
 在 macOS 和 Linux 上打开 `notify.system` 后，`/api/health` 的 `systemNotify` 为 `true`，看板不再重复发浏览器通知；在不支持的平台上它为 `false`，看板照常由浏览器发，不会因为打开了这个设置反而什么都收不到。系统通知发送失败（比如 Linux 上没装 `notify-send`，或者没有桌面会话）不影响 Master，只在 Master 的输出里记一次原因（以 `[通知]` 开头，英文为 `[notify]`），之后的失败不再记。
 
-自动升级脚本（`scripts/self-upgrade.sh`）在 Master 一个都没能启动时（找不到安装目录，或者回退后旧版本也没能启动）也发一条系统通知：有 `osascript` 就用它，否则有 `notify-send` 就用它，两个都没有就不发。这时 Master 不在运行，webhook 也就发不出去。
+自动升级脚本（`scripts/self-upgrade.sh`）在 Master 一个都没能启动时（找不到安装目录，回退后找不到能用的 node，或者回退后旧版本也没能启动）也发一条系统通知：有 `osascript` 就用它，否则有 `notify-send` 就用它，两个都没有就不发。这时 Master 不在运行，自己发不了 webhook，所以升级脚本和保活脚本（见「保活」）会自己把这条通知也发到配置的 webhook（见下面「webhook」里的「Master 停了、起不来时」）。这些脚本发的系统通知不受 `notify.system` 开关影响。
 
 ### webhook
 
@@ -378,12 +379,18 @@ notify:
   }
   ```
 
-  `kind` 是通知的种类（`approval`、`discussion`、`blocked`、`failed`、`proposals`、`scout`、`github`、`upgrade`），`title`、`body` 是通知的标题和正文（按 `language` 的语言），`text` 是「标题\n正文」，`runId` 是相关的 Run（没有时为 `null`），`about` 说明点开该去哪里（`run` 是 Run 详情页，`issues` 是「需求」页，`master` 没有特定页面），`eventType` 是引起通知的事件类型，`at` 是事件发生的时间。Slack 的入站 webhook 会显示 `text`、忽略其他字段，可以直接接。
+  `kind` 是通知的种类（`approval`、`discussion`、`blocked`、`failed`、`proposals`、`scout`、`github`、`upgrade`，以及只由脚本在 Master 停了、起不来时发的 `master_down`，见下面），`title`、`body` 是通知的标题和正文（按 `language` 的语言），`text` 是「标题\n正文」，`runId` 是相关的 Run（没有时为 `null`），`about` 说明点开该去哪里（`run` 是 Run 详情页，`issues` 是「需求」页，`master` 没有特定页面），`eventType` 是引起通知的事件类型，`at` 是事件发生的时间。Slack 的入站 webhook 会显示 `text`、忽略其他字段，可以直接接。
 - `format: text`：`Content-Type: text/plain; charset=utf-8`，正文就是「标题\n正文」，适合 ntfy 这类直接显示正文的服务。
 - 飞书、钉钉的机器人 webhook 要求固定的消息格式，不能直接接：要经过一层转发（自己的小服务把正文改成它们要的格式），或者先发到 ntfy 这类服务。
 - 发出去的标题、正文和 `text` 都先把用户目录下的路径换成 `~`（和发到 GitHub 的文字一样，见「发到 GitHub 的文字不带用户目录」），不把系统用户名发给外部服务。
 - `/api/health` 的 `webhookNotify` 只说明有没有配 webhook，不返回地址和请求头；看板的「说明」页和顶栏的通知开关会提一句已配置 webhook。
 - 失败时：地址返回的不是 2xx（比如 500）、连不上或 10 秒内没有响应都算失败。不重试，不影响 Master。一串连续的失败只记第一次：在 Master 的输出里记一行原因（以 `[通知]` 开头，英文为 `[notify]`），同时在事件列表里记一条全局事件 `notify.webhook_failed`（看板「事件」页能看到，标成红色；见上面的「全局事件」），数据是 `{ reason, status }`：`reason` 是 HTTP 状态码或错误信息，`status` 是 HTTP 状态码（没有响应时为 `null`）。两处都不写地址和请求头，免得把里面的 token 记下来。之后连续的失败不再记；有一条通知发送成功后，下次再失败重新记一次（webhook 恢复后又坏掉，人回来时在「事件」页能看到）；改了 `notify.webhook.url`（配置重新加载后）再失败时也重新记一次。这条事件本身不发通知（不发系统通知，也不再发到 webhook），免得失败了再发、再失败。
+- Master 停了、起不来时：这时 Master 自己发不了，由脚本发。保活脚本（见「保活」）在 Master 停了、它没能启动起来时，自动升级脚本在 Master 一个都没能启动时（见上面的系统通知），除了系统通知，也把同一条通知 POST 到 webhook。
+  - 脚本不读 `config.yaml`，用的是 Master 写下的设置：Master 启动时、每次配置重新加载成功后，把 webhook 的地址、请求头（和上面一样，默认的 `Content-Type` 被同名的覆盖）和 `format` 写进数据目录的 `webhook.curl`（curl 能直接读的配置文件，先写临时文件再改名，脚本不会读到写了一半的）；去掉 `webhook` 后删掉这个文件，重新加载失败、沿用旧配置时不动它。所以脚本用的是最近一次运行的 Master 写下的设置：Master 一次都没运行过（没写过这个文件），或者停机期间才改了 `config.yaml`，都不会生效，要等 Master 再运行一次。
+  - `webhook.curl` 里有地址和请求头，可能带 token，所以权限是 0600，只有你能读。Master 正常停止时不删它，脚本正是要在 Master 不在运行时用它。
+  - 每条通知 POST 一次，用 `curl`（`-K webhook.curl`，最多等 10 秒），不需要 node 和 jq（这时可能正是 node 找不到）；没有这个文件或者没有 `curl` 就不发，其他照旧。保活脚本和系统通知一样，同一次停转只发一次。
+  - `format: json` 时字段和上面一样：`kind` 是 `master_down`，`title` 是通知标题（展示名），`body` 是系统通知里的那句话，`text` 是「标题\n正文」，`runId` 为 `null`，`about` 是 `master`，`eventType` 保活脚本是 `keepalive.alert`、升级脚本是 `upgrade.master_down`，`at` 是发送的时间（精确到秒，比如 `2026-11-23T08:00:00Z`）。`format: text` 时正文是「标题\n正文」。正文里以用户目录开头的路径同样换成 `~`。
+  - 失败时（不是 2xx、连不上或 10 秒内没有响应）不重试，不影响脚本的退出码，只在各自的日志里记一行（保活脚本在 `keepalive.log`，升级脚本在 `upgrade.log`），只写 curl 的退出码（比如 7 是连不上，22 是返回了错误状态码，28 是超时），不写地址和请求头。
 
 ## 稳定副本和自动升级
 
@@ -445,8 +452,8 @@ Master 收到 SIGTERM 或 SIGINT 后停下工作、关闭服务和数据库，�
   4. 常见的安装位置：`/opt/homebrew/bin`、`/usr/local/bin`（环境变量 `ARES1_NODE_DIRS` 可以换成别的目录，用冒号分隔）。
 
   版本只认 `>=X`、`>=X.Y`、`>=X.Y.Z` 这种写法，别的写法（或者没写）就只要求能执行。找到后把它所在的目录放到 PATH 最前面，`npm` 和新启动的 Master 都用这一套，Master 再启动的 Agent 和命令也一样。换用了别的 node 时，`upgrade.log` 里会写一行，说明原来那个为什么用不了、换成了哪个路径、什么版本。
-- 都找不到时：构建前找不到，就按环境问题记为升级失败（见上面），回退；回退前也找不到，脚本没法启动 Master，就记日志、发一条系统通知后退出，这时要你手动处理（装了保活的话，保活脚本每分钟用同样的办法再找一次）。
-- 升级脚本复制到数据目录运行（`data/self-upgrade.sh`），`find-node.sh` 也一起复制过去（`data/find-node.sh`），脚本从自己所在的目录读它，不从安装目录读，免得拉取时被改写。
+- 都找不到时：构建前找不到，就按环境问题记为升级失败（见上面），回退；回退前也找不到，脚本没法启动 Master，就记日志、发一条系统通知（配了 webhook 的话也发到 webhook，见「通知」的「webhook」）后退出，这时要你手动处理（装了保活的话，保活脚本每分钟用同样的办法再找一次）。
+- 升级脚本复制到数据目录运行（`data/self-upgrade.sh`），`find-node.sh` 和发 webhook 通知的 `webhook.sh` 也一起复制过去（`data/find-node.sh`、`data/webhook.sh`），脚本从自己所在的目录读它们，不从安装目录读，免得拉取时被改写。
 
 所以换 Node 版本后什么都不用做：几分钟内 Master 会自己换到新的 node 上重启，卡住的 Run 接着做。只要新的 node 能被上面的办法找到：最稳的是让 nvm 的默认版本（`nvm alias default <版本>`）指向装好的、满足 `engines` 的版本。
 
@@ -480,7 +487,7 @@ scripts/keepalive.sh <安装目录> <数据目录> [<端口>] [<node 路径>] [<
 - 数据目录：和启动 Master 时的 `--home` 一样。Master 要用 `--home <数据目录>` 启动（本文的启动命令都是这样），脚本靠命令行里的 `dist/cli.js --home <数据目录>` 认出它。
 - 端口：不传或传空字符串时，读 `config.yaml` 顶层的 `port`，读不到就用 4870。
 - node 路径：不传（或传空字符串）时用 PATH 里的 `node`。给定的 node 不存在、不能执行，或者版本不满足安装目录 `package.json` 里的 `engines.node` 时，脚本用和升级脚本一样的办法（`scripts/find-node.sh`，见「换 Node 版本时」）换一个：PATH 里的其他 `node`、nvm 的默认版本、常见的安装位置，并在 `keepalive.log` 里写一行换成了哪个。脚本把最后用的 node 所在的目录放到 PATH 最前面再启动 Master，Master 和它启动的 Agent 用同一个 node。
-- 通知标题：系统通知的标题，默认 `Master`。
+- 通知标题：系统通知和 webhook 通知的标题，默认 `Master`。
 - 日志和通知的语言按 `config.yaml` 的 `language`。
 
 每次调用按顺序判断：
@@ -494,7 +501,7 @@ scripts/keepalive.sh <安装目录> <数据目录> [<端口>] [<node 路径>] [<
 
 只看端口不够：两个 Master 用同一个数据目录很危险。Master 启动时先恢复 Run 的状态、再监听端口，第二个实例在发现端口被占之前就已经改了数据库。所以只要有这个数据目录的 Master 进程（卡住的、正在启动的、手动启动的），保活脚本就不会再启动一个。
 
-系统通知和升级脚本一样：有 `osascript` 就用它，否则有 `notify-send` 就用它，都没有就不发。同一次停转只通知一次：数据目录里的 `keepalive.notified` 记着已经通知过，Master 重新有响应后删掉，之后再起不来会再通知。找不到安装目录、能用的 node 或 curl 时也记日志、发通知。
+系统通知和升级脚本一样：有 `osascript` 就用它，否则有 `notify-send` 就用它，都没有就不发。配置了 `notify.webhook` 时，同一条通知也 POST 到 webhook（`kind` 为 `master_down`，`eventType` 为 `keepalive.alert`），用的是最近一次运行的 Master 留在数据目录 `webhook.curl` 里的设置，人不在这台机器前、或者在没有桌面的服务器上也能收到；发送失败只在 `keepalive.log` 里记一行 curl 的退出码（见「通知」的「webhook」）。同一次停转只通知一次（系统通知和 webhook 都是）：数据目录里的 `keepalive.notified` 记着已经通知过，Master 重新有响应后删掉，之后再起不来会再通知。找不到安装目录、能用的 node 或 curl 时也记日志、发通知（找不到 curl 时发不了 webhook）。
 
 所以：
 
@@ -591,7 +598,7 @@ loginctl enable-linger "$USER"                         # 注销后、开机还�
 systemctl --user stop ares1-keepalive.timer            # 停掉（disable 后开机也不再运行）
 ```
 
-不打开 linger 的话，用户注销后用户级的 systemd 会停掉，定时任务不再运行。Master 留在 keepalive 服务的 cgroup 里，下一次触发时 systemd 会提示有残留的进程（`Found left-over process`），不影响运行。没有桌面会话时 `notify-send` 发不出去，看 `keepalive.log`。
+不打开 linger 的话，用户注销后用户级的 systemd 会停掉，定时任务不再运行。Master 留在 keepalive 服务的 cgroup 里，下一次触发时 systemd 会提示有残留的进程（`Found left-over process`），不影响运行。没有桌面会话时 `notify-send` 发不出去，看 `keepalive.log`；想在别处收到 Master 停了的通知，配置 `notify.webhook`（见「通知」的「webhook」）。
 
 ### Linux：cron
 

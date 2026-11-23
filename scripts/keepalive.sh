@@ -26,7 +26,9 @@
 # Otherwise the Master is started in the install directory the way self-upgrade.sh starts it, and
 # given up to a minute to answer /api/health. Each start, and anything amiss, gets a line with the
 # time in <home>/keepalive.log; a Master that answers gets none, so calls every minute do not grow
-# it. A Master that cannot be started is notified once, until it answers again.
+# it. A Master that cannot be started is notified once, until it answers again: by a system
+# notification, and to the webhook of config.yaml when the last Master that ran left its settings
+# (webhook.sh).
 
 set -u
 # Variables are always written as ${name}: bash would read a following non-ASCII character
@@ -78,13 +80,22 @@ notify() {
   fi
 }
 
-# Something a human has to look at: logged each time, notified once until the Master answers.
+# The webhook notification, shared with self-upgrade.sh; read whole now, as find-node.sh. Without
+# it only the system notification is sent.
+# shellcheck source=webhook.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/webhook.sh" 2>/dev/null || webhook() { :; }
+
+# Something a human has to look at: logged each time, notified once until the Master answers,
+# also to the webhook.
 alert() {
   log "${1}"
   [ -e "${notified}" ] && return
   : >"${notified}"
-  notify "$(pick "Master 停了，保活脚本没能把它启动起来：${1}（日志：${log_file}）" \
-    "The Master is down and the keepalive script could not start it: ${1} (log: ${log_file})")"
+  local message
+  message=$(pick "Master 停了，保活脚本没能把它启动起来：${1}（日志：${log_file}）" \
+    "The Master is down and the keepalive script could not start it: ${1} (log: ${log_file})")
+  notify "${message}"
+  webhook "${message}" keepalive.alert
 }
 
 # Finding node, shared with self-upgrade.sh; read whole now, as an upgrade may rewrite it later.
