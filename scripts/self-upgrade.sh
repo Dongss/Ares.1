@@ -18,6 +18,19 @@
 # deliberate stop (SIGTERM or Ctrl-C, or the new Master handing over to the next upgrade) and ends
 # the watch without rolling back, as does a new Master still running at its end.
 # If any step fails it goes back to <old commit>, builds and starts that, without watching it.
+#
+# `npm ci` deletes node_modules before it installs, so with the npm registry down (or the network,
+# or a proxy) the new version cannot be installed and the old one, rolled back to, would have no
+# dependencies left to start with. So before pulling, the script renames node_modules to
+# node_modules.ares1-prev (a rename, not a copy; ignored by git), and a rollback renames it back
+# and only runs `npm run build`, rebuilding the old version's dist with the dependencies it had,
+# without downloading anything. Only without that backup (no node_modules before the upgrade)
+# does a rollback install with `npm ci` as before. The backup is deleted once the watch ends with
+# the new Master still running. It is kept when the new Master exits with code 0: that may be the
+# new Master handing over to the next upgrade, whose script may already have renamed
+# node_modules to the same name. The next upgrade deletes a backup left over before it makes its
+# own.
+#
 # The result file tells the next Master how it went, on failure with the end of the output that
 # says why (`detail`: what pulling and building printed, or what the new Master printed before it
 # was stopped or exited); a system notification is sent only if nothing could be started at all.
@@ -128,6 +141,38 @@ advance() {
 
 build() { npm ci --no-audit --no-fund && npm run build; }
 
+# Where node_modules from before the upgrade waits in the install directory, for a rollback.
+# The repository's .gitignore lists it; the script never changes .gitignore, which would leave
+# the install directory with local changes.
+prev=node_modules.ares1-prev
+# Set when this run moved node_modules to ${prev}, so that a rollback never puts back a backup
+# some earlier run left behind.
+backed_up=
+
+# Moves node_modules aside before anything can delete it. A backup an earlier upgrade left
+# behind goes first; if it cannot be removed, or node_modules cannot be moved, nothing is backed
+# up (renaming onto an existing directory would move node_modules into it) and the upgrade goes
+# on as without one.
+back_up_deps() {
+  rm -rf "${prev}"
+  [ -d node_modules ] || return 0
+  [ -e "${prev}" ] && return 0
+  mv node_modules "${prev}" && backed_up=true
+}
+
+# Puts back the node_modules back_up_deps moved aside, in place of whatever the new version
+# installed (perhaps half of it); ${restored} is set when it did.
+restore_deps() {
+  restored=
+  [ -n "${backed_up}" ] && [ -d "${prev}" ] || return 0
+  rm -rf node_modules
+  [ -e node_modules ] && return 0
+  mv "${prev}" node_modules || return 0
+  restored=true
+  log "$(pick "放回了升级前的依赖（node_modules），不重新安装" \
+    "Put back the dependencies from before the upgrade (node_modules) instead of installing them again")"
+}
+
 # Set when the upgrade failed for want of node or npm rather than because of the commit.
 env_failed=
 
@@ -219,6 +264,10 @@ main() {
     exit 1
   }
 
+  # Before advance and node_ready too: a rollback after either of them failing then needs no
+  # download either. node_modules is not tracked, so moving it changes nothing for git.
+  back_up_deps
+
   if captured advance && node_ready && build_new; then
     new=$(git rev-parse HEAD)
     # Written before starting, so the new Master finds it on startup. If the new Master exits
@@ -234,6 +283,8 @@ main() {
         "The new version ${new} is up (pid ${newpid}), watching it for ${watch} seconds")"
       watch_new "${newpid}"
       if [ -z "${code}" ]; then
+        # The new version runs on its own dependencies; the old ones are not needed any more.
+        rm -rf "${prev}"
         log "$(pick "已升级到 ${new}（pid ${newpid}）" "Upgraded to ${new} (pid ${newpid})")"
         exit 0
       fi
@@ -276,6 +327,9 @@ main() {
   write_result false "${new}" "${msg}" "${out}" "${env_failed}"
   git reset -q --hard "${old}"
   reset=$?
+  # Whether or not the reset worked, and before looking for node: even a Master the script
+  # cannot start now (keepalive.sh only runs node) needs its dependencies in place.
+  restore_deps
   # The node may have changed since it was looked for, and the old version may want another.
   if ! use_node "${node}" package.json; then
     log "$(pick "找不到能用的 node，回退后无法启动 Master" "No usable node found, so the Master cannot be started after the rollback")"
@@ -283,7 +337,12 @@ main() {
       "Automatic upgrade failed and no usable node was found to start the Master after the rollback; please handle it by hand (log: ${home}/upgrade.log)")"
     return
   fi
-  [ "${reset}" -eq 0 ] && build
+  # The old version's dist is rebuilt; with its dependencies put back that needs no download.
+  # If the build fails, the Master is started all the same; if it does not come up, the
+  # notification below says so.
+  if [ "${reset}" -eq 0 ]; then
+    if [ -n "${restored}" ]; then npm run build; else build; fi
+  fi
   start
   if healthy; then
     log "$(pick "已回退到 ${old}" "Rolled back to ${old}")"

@@ -646,13 +646,18 @@ describe('upgrade script', () => {
    * Each stand-in does what `fakes` says, else succeeds silently; $FAKE_DIR is the directory they
    * and the script's copy are in, next to a copy of find-node.sh as the Master puts it. `env` adds
    * to the script's environment, where ARES1_UPGRADE_WATCH is unset unless it says otherwise.
-   * `node` is the old Master's node the script is given (default: fake-node).
+   * `node` is the old Master's node the script is given (default: fake-node). The repository
+   * has this repository's .gitignore, so that what the script leaves there is ignored as it
+   * would be in a real stable copy.
    */
   function stableCopy(
     fakes: Record<string, string> = {},
     opts: { env?: Record<string, string>; lang?: string; node?: string } = {},
   ) {
     const origin = initRepo();
+    copyFileSync(join(process.cwd(), '.gitignore'), join(origin, '.gitignore'));
+    git(origin, 'add', '-A');
+    git(origin, 'commit', '-q', '-m', 'gitignore');
     const installDir = join(tmpDir('ares1-install-'), 'stable');
     git(origin, 'clone', '-q', origin, installDir);
     const old = git(installDir, 'rev-parse', 'HEAD');
@@ -977,5 +982,135 @@ describe('upgrade script', () => {
       to: target,
       message: `Pulling or building ${target.slice(0, 7)} failed; rolled back to ${old.slice(0, 7)}`,
     });
+  });
+
+  /** Where the script keeps node_modules from before the upgrade. */
+  const prev = 'node_modules.ares1-prev';
+  const ci = 'ci --no-audit --no-fund';
+
+  /**
+   * An npm that appends its arguments to $FAKE_DIR/npm-calls, then runs `onCi` for `npm ci` and
+   * `onBuild` for `npm run build`, in the directory the script runs it in (the install
+   * directory); otherwise it succeeds.
+   */
+  const recordingNpm = (onCi: string, onBuild = ':') =>
+    [
+      'echo "$*" >> "$FAKE_DIR/npm-calls"',
+      'if [ "$1" = ci ]; then',
+      onCi,
+      'elif [ "$1 $2" = "run build" ]; then',
+      onBuild,
+      'fi',
+      'exit 0',
+    ].join('\n');
+  /** An npm ci that installs the new version's dependencies. */
+  const installsNew = 'rm -rf node_modules; mkdir node_modules; echo new > node_modules/marker';
+  /** What npm was run with, one call per item. */
+  const npmCalls = (bin: string) =>
+    readFileSync(join(bin, 'npm-calls'), 'utf8').trimEnd().split('\n');
+  const marker = (dir: string) => readFileSync(join(dir, 'marker'), 'utf8');
+
+  it('puts back the dependencies from before the upgrade, without npm ci, when the registry is down', () => {
+    // npm ci deletes node_modules first, then cannot download anything.
+    const { installDir, bin, old, target, run, log } = stableCopy({
+      npm: recordingNpm('rm -rf node_modules; echo "npm error code ECONNREFUSED" >&2; exit 1'),
+    });
+    writeFile(join(installDir, 'node_modules', 'marker'), 'old\n');
+    // Left behind by an earlier upgrade: replaced, never put back.
+    writeFile(join(installDir, prev, 'stale'), 'stale\n');
+    expect(run(target)).toEqual({
+      ok: false,
+      from: old,
+      to: target,
+      message: `Pulling or building ${short(target)} failed; rolled back to ${short(old)}`,
+      detail: 'npm error code ECONNREFUSED',
+    });
+    expect(git(installDir, 'rev-parse', 'HEAD')).toBe(old);
+    expect(marker(join(installDir, 'node_modules'))).toBe('old\n');
+    expect(existsSync(join(installDir, 'node_modules', 'stale'))).toBe(false);
+    expect(existsSync(join(installDir, prev))).toBe(false);
+    // Only the upgrade ran npm ci; the rollback only rebuilt the old version's dist.
+    expect(npmCalls(bin)).toEqual([ci, 'run build']);
+    expect(log()).toContain('Put back the dependencies from before the upgrade (node_modules)');
+    expect(log()).toContain(`Rolled back to ${old}`);
+    expect(log()).not.toMatch(chinese);
+  });
+
+  it('puts back the old dependencies in place of the new ones when the new version crashes', () => {
+    const { installDir, bin, old, target, run } = stableCopy(
+      {
+        npm: recordingNpm(installsNew),
+        sleep: untilMasterExited,
+        'fake-node': fakeMaster('exit 3'),
+      },
+      { lang: 'zh' },
+    );
+    writeFile(join(installDir, 'node_modules', 'marker'), 'old\n');
+    expect(run(target)).toMatchObject({ ok: false, to: target });
+    expect(git(installDir, 'rev-parse', 'HEAD')).toBe(old);
+    expect(marker(join(installDir, 'node_modules'))).toBe('old\n');
+    expect(existsSync(join(installDir, prev))).toBe(false);
+    expect(npmCalls(bin)).toEqual([ci, 'run build', 'run build']);
+  });
+
+  it('still starts the old version when rebuilding it after the rollback fails', () => {
+    const { installDir, home, bin, old, target, run, log } = stableCopy({
+      npm: recordingNpm('rm -rf node_modules; exit 1', 'exit 2'),
+    });
+    writeFile(join(installDir, 'node_modules', 'marker'), 'old\n');
+    expect(run(target)).toMatchObject({ ok: false, to: target });
+    expect(marker(join(installDir, 'node_modules'))).toBe('old\n');
+    expect(npmCalls(bin)).toEqual([ci, 'run build']);
+    // Started all the same: it wrote to master.out and answered.
+    expect(existsSync(join(home, 'master.out'))).toBe(true);
+    expect(log()).toContain(`Rolled back to ${old}`);
+  });
+
+  it('deletes the backup once the watch is over while the new version still runs', () => {
+    const { installDir, bin, target, old, run } = stableCopy(
+      {
+        npm: recordingNpm(installsNew),
+        sleep: untilMasterStarted,
+        'fake-node': fakeMaster('exec /bin/sleep 30'),
+      },
+      { env: { ARES1_UPGRADE_WATCH: '15' } },
+    );
+    writeFile(join(installDir, 'node_modules', 'marker'), 'old\n');
+    try {
+      expect(run(target)).toEqual({ ok: true, from: old, to: target, message: '' });
+      expect(marker(join(installDir, 'node_modules'))).toBe('new\n');
+      expect(existsSync(join(installDir, prev))).toBe(false);
+      expect(git(installDir, 'status', '--porcelain')).toBe('');
+    } finally {
+      try {
+        process.kill(Number(readFileSync(join(bin, 'pid'), 'utf8')), 'SIGKILL');
+      } catch {}
+    }
+  });
+
+  it('keeps the backup, ignored by git, when the new version exits with code 0', () => {
+    // It may have handed over to the next upgrade, whose script may have made a backup by now.
+    const { installDir, target, run } = stableCopy({
+      npm: recordingNpm(installsNew),
+      sleep: untilMasterExited,
+      'fake-node': fakeMaster('exit 0'),
+    });
+    writeFile(join(installDir, 'node_modules', 'marker'), 'old\n');
+    expect(run(target)).toMatchObject({ ok: true, to: target });
+    expect(marker(join(installDir, prev))).toBe('old\n');
+    expect(marker(join(installDir, 'node_modules'))).toBe('new\n');
+    expect(git(installDir, 'status', '--porcelain')).toBe('');
+  });
+
+  it('installs with npm ci on rollback when there was no node_modules to keep', () => {
+    // Only the new commit, which adds new.txt, fails to install.
+    const { installDir, bin, old, target, run, log } = stableCopy({
+      npm: recordingNpm('if [ -e new.txt ]; then exit 1; fi'),
+    });
+    expect(run(target)).toMatchObject({ ok: false, to: target });
+    expect(git(installDir, 'rev-parse', 'HEAD')).toBe(old);
+    expect(npmCalls(bin)).toEqual([ci, ci, 'run build']);
+    expect(existsSync(join(installDir, prev))).toBe(false);
+    expect(log()).not.toContain('Put back');
   });
 });

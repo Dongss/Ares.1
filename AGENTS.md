@@ -101,7 +101,8 @@ src/
     static.ts         serves the built dashboard
 scripts/
   self-upgrade.sh     auto-upgrade: pull, build, restart, watch the new version for a few minutes;
-                      back to the old version on failure or when it crashes meanwhile
+                      back to the old version on failure or when it crashes meanwhile, with the
+                      node_modules from before the upgrade (moved aside, so nothing to download)
   keepalive.sh        called by a timer (launchd, systemd, cron) every minute: starts the Master
                       when it does not answer, unless an upgrade runs or a Master process of the
                       same home is there (hung or starting); logs to keepalive.log, notifies when

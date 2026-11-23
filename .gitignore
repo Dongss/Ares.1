@@ -1,4 +1,6 @@
 node_modules/
+# Where the automatic upgrade keeps node_modules from before it, for a rollback
+/node_modules.ares1-prev
 dist/
 coverage/
 *.log
