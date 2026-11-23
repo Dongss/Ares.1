@@ -1,6 +1,10 @@
 import type { RateLimitedWait, RunDetail, RunSummary } from '../../../src/api/types.js';
 import { brandTitle } from '../../../src/brand.js';
-import { discussionReplyWait } from '../../../src/config/flow.js';
+import {
+  discussionReplyWait,
+  RAW_LOG_KEEP_DAYS,
+  runRawLogsExpired,
+} from '../../../src/config/flow.js';
 import {
   conclusionLabel,
   conclusionOf,
@@ -266,6 +270,22 @@ export function redoText(redoAt: string, attempt: number, now = new Date()): str
   return t({
     zh: `预计 ${at} 自动重做，开始第 ${next} 次尝试`,
     en: `To be redone automatically at ${at}, as attempt ${next}`,
+  });
+}
+
+/**
+ * Why the raw logs of the Run's executions can no longer be opened: the Master deletes them once
+ * the Run ended over RAW_LOG_KEEP_DAYS ago (`runRawLogsExpired`); the agent output still shows
+ * from the events kept beside them. null while they are kept.
+ */
+export function rawLogPrunedText(
+  run: Pick<Run, 'status' | 'issue' | 'finishedAt'>,
+  now = new Date(),
+): string | null {
+  if (!runRawLogsExpired(run, now.getTime())) return null;
+  return t({
+    zh: `原始日志已超过保留期（Run 结束 ${RAW_LOG_KEEP_DAYS} 天后）被删除`,
+    en: `The raw log was deleted once past retention (${RAW_LOG_KEEP_DAYS} days after the Run ended)`,
   });
 }
 

@@ -9,10 +9,12 @@ import type {
   ConfigView,
   KeptWorkspace,
   LiveAgentEvent,
+  RawLogMissing,
   RunSummary,
   StatsView,
 } from '../src/api/types.js';
 import { storedRunTimes } from '../src/engine/times.js';
+import { setLang } from '../src/i18n.js';
 import type { Attempt, EventRow, Run, RunStatus } from '../src/store/types.js';
 import {
   ASSESS_AGENTS_YAML,
@@ -36,6 +38,7 @@ import {
 
 let h: Harness | undefined;
 afterEach(async () => {
+  setLang('zh');
   await h?.close();
   h = undefined;
 });
@@ -110,6 +113,56 @@ describe('HTTP API', () => {
     // Elsewhere the Master cannot send them, so the dashboard keeps sending its own.
     expect(await systemNotify('win32', true)).toBe(false);
     expect(await systemNotify('linux', false)).toBe(false);
+  });
+
+  it('tells a raw log deleted past retention from a missing one, and keeps the events', async () => {
+    h = await harness();
+    const { store, logPruner } = h.master;
+    const id = h.run('加功能').id;
+    await h.waitStatus(id, 'waiting_approval');
+    expect((await call('POST', `/api/runs/${id}/approve`, { comment: 'ok' })).status).toBe(200);
+    await h.waitStatus(id, 'completed');
+    const attempts = store.listRunAttempts(id);
+    const [attempt] = attempts;
+    if (!attempt) throw new Error('no attempt');
+    const events = await call('GET', `/api/attempts/${attempt.id}/events`);
+    expect((events.json as AgentEventRecord[]).length).toBeGreaterThan(0);
+    const rawFiles = attempts
+      .flatMap((a) => [a.logPath, `${a.logPath}.stderr`])
+      .filter((f) => existsSync(f));
+    expect(rawFiles).toContain(attempt.logPath);
+
+    // Ended a day ago: kept.
+    const daysAgo = (days: number) => new Date(Date.now() - days * 86_400_000).toISOString();
+    store.updateRun(id, { finishedAt: daysAgo(1) });
+    expect(logPruner.prune().files).toBe(0);
+    expect((await call('GET', `/api/attempts/${attempt.id}/log`)).status).toBe(200);
+
+    store.updateRun(id, { finishedAt: daysAgo(31) });
+    expect(logPruner.prune()).toMatchObject({ runs: 1, scouts: 0, files: rawFiles.length });
+    expect(existsSync(attempt.logPath)).toBe(false);
+    // The dashboard shows the agent output from the events, which stay.
+    expect(await call('GET', `/api/attempts/${attempt.id}/events`)).toEqual(events);
+    const pruned = await call('GET', `/api/attempts/${attempt.id}/log`);
+    expect(pruned.status).toBe(404);
+    expect(pruned.json).toEqual({
+      error: '原始日志已超过保留期（Run 结束 30 天后）被删除，Agent 输出仍可在 Run 详情页查看',
+      pruned: true,
+    } satisfies RawLogMissing);
+    setLang('en');
+    const prunedEn = await call('GET', `/api/attempts/${attempt.id}/log?download`);
+    expect(prunedEn).toMatchObject({ status: 404, json: { pruned: true } });
+    expect(prunedEn.json.error).not.toMatch(/[一-鿿]/);
+    setLang('zh');
+
+    // Gone while its Run is within retention: missing, not pruned.
+    store.updateRun(id, { finishedAt: daysAgo(1) });
+    const missing = await call('GET', `/api/attempts/${attempt.id}/log`);
+    expect(missing.status).toBe(404);
+    expect(missing.json).toEqual({
+      error: '日志文件不存在',
+      pruned: false,
+    } satisfies RawLogMissing);
   });
 
   it('drives a run: inspect, approve', async () => {

@@ -23,6 +23,7 @@ import { Engine } from './engine/engine.js';
 import { IssueBridge } from './github/bridge.js';
 import type { GitHub } from './github/client.js';
 import { type Lang, lang, setLang } from './i18n.js';
+import { RawLogPruner } from './logs/prune.js';
 import { type SendNotice, SystemNotifier } from './notify/system.js';
 import { backupRestoredNotice, Store } from './store/store.js';
 import {
@@ -76,7 +77,10 @@ export interface MasterOptions {
    * tests change it. Where they are not, the dashboard sends its own.
    */
   platform?: NodeJS.Platform;
-  /** The engine's clock for reply timeouts, in epoch milliseconds (tests move it on). */
+  /**
+   * The clock for reply timeouts and for the retention of raw agent logs, in epoch milliseconds
+   * (tests move it on).
+   */
   now?: () => number;
   /** How long the engine waits before retrying an agent that errored (tests shorten it). */
   agentRetryBackoff?: Backoff;
@@ -186,6 +190,7 @@ export class Master {
     readonly issues: IssueBridge,
     readonly notifier: SystemNotifier,
     readonly upgrader: Upgrader,
+    readonly logPruner: RawLogPruner,
     readonly app: Hono,
   ) {}
 
@@ -284,14 +289,17 @@ export class Master {
       configStatus: () => watcher.status(),
       webDir: opts.webDir ?? defaultWebDir(),
       platform: opts.platform,
+      now: opts.now,
     });
-    master = new Master(paths, watcher, store, engine, issues, notifier, upgrader, app);
+    const logPruner = new RawLogPruner(store, opts.now);
+    master = new Master(paths, watcher, store, engine, issues, notifier, upgrader, logPruner, app);
     // Before the engine recovers the Runs the last Master left, so that the event comes first.
     master.runningToken = markRunning(paths, store);
     notifier.start();
     await engine.start();
     await issues.start({ poll: opts.pollIssues !== false });
     upgrader.start({ timer: opts.upgradeTimer !== false });
+    logPruner.start();
     if (opts.watchConfig !== false) watcher.start();
     return master;
   }
@@ -323,6 +331,7 @@ export class Master {
   private async doClose(): Promise<void> {
     this.configWatcher.stop();
     this.upgrader.stop();
+    this.logPruner.stop();
     this.notifier.stop();
     await this.issues.stop();
     await this.engine.stop();

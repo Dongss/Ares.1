@@ -7,6 +7,7 @@ import {
   issueRunOverrides,
   MAX_SCOUT_BACKOFF_HOURS,
   RATE_LIMIT_WAIT,
+  RAW_LOG_KEEP_DAYS,
   REDO_BACKOFF_MAX_HOURS,
   redoDelayMs,
 } from '../../../src/config/flow.js';
@@ -1231,8 +1232,8 @@ export function dataPaths(home: string): { path: string; what: string }[] {
     {
       path: under(home, 'data/logs/'),
       what: t({
-        zh: '每次 Agent 执行的原始输出和事件，侦察的在 scouts/',
-        en: "Raw output and events of each agent execution; the scouts' are in scouts/",
+        zh: `每次 Agent 执行的原始输出和事件，侦察的在 scouts/；Run 或侦察结束 ${RAW_LOG_KEEP_DAYS} 天后自动删掉原始输出（.jsonl 和 .stderr），事件、检查和命令的日志一直保留`,
+        en: `Raw output and events of each agent execution; the scouts' are in scouts/. The raw output (.jsonl and .stderr) is deleted automatically ${RAW_LOG_KEEP_DAYS} days after its Run or scout ended; events and the logs of checks and commands are kept`,
       }),
     },
     {

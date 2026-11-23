@@ -1059,8 +1059,11 @@ export class Store {
     return this.getScout(id);
   }
 
-  /** Newest first; `since` (ISO time) limits to scouts started from then on. */
-  listScouts(filter: { repoId?: string; since?: string; limit?: number } = {}): Scout[] {
+  /**
+   * Newest first; `since` (ISO time) limits to scouts started from then on. At most `limit`
+   * (default 50); null = all of them.
+   */
+  listScouts(filter: { repoId?: string; since?: string; limit?: number | null } = {}): Scout[] {
     const where: string[] = [];
     const params: SQLInputValue[] = [];
     if (filter.repoId) {
@@ -1076,7 +1079,8 @@ export class Store {
       'scouts',
       `SELECT * FROM scouts ${clause} ORDER BY started_at DESC, rowid DESC LIMIT ?`,
       ...params,
-      filter.limit ?? 50,
+      // SQLite takes a negative limit as none.
+      filter.limit === null ? -1 : (filter.limit ?? 50),
     );
   }
 

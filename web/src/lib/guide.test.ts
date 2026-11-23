@@ -774,6 +774,8 @@ describe('idleReasons', () => {
 });
 
 describe('running the Master', () => {
+  afterEach(() => setLang('zh'));
+
   it('quotes paths only when needed', () => {
     expect(shellQuote('/Users/me/.ares1')).toBe('/Users/me/.ares1');
     expect(shellQuote('/Users/me/my dir')).toBe(`'/Users/me/my dir'`);
@@ -794,6 +796,14 @@ describe('running the Master', () => {
     expect(paths).toContain('/h/master.out');
     expect(paths).toContain('/h/upgrade.log');
     expect(paths).toContain('/h/keepalive.log');
+  });
+
+  it('says how long the raw agent output is kept', () => {
+    const logs = dataPaths('/h/').find((p) => p.path === '/h/data/logs/');
+    expect(logs?.what).toContain('30 天后自动删掉原始输出');
+    setLang('en');
+    const en = dataPaths('/h/').find((p) => p.path === '/h/data/logs/');
+    expect(en?.what).toContain('deleted automatically 30 days after its Run or scout ended');
   });
 });
 

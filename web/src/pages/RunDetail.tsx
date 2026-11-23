@@ -48,6 +48,7 @@ import {
   eventText,
   ignoredCommentsText,
   rateLimitText,
+  rawLogPrunedText,
   redoText,
   replyDeadlineOf,
   untrustedIssueText,
@@ -929,6 +930,7 @@ function TaskBlock(props: { detail: RunDetail; task: Task; onShowCommit: (sha: s
   const status = TASK_STATUS[task.status];
   const attempts = detail.attempts.filter((a) => a.taskId === task.id);
   const commit = task.commitSha;
+  const rawLogPruned = rawLogPrunedText(detail.run);
   return (
     <div className="task">
       <div className="task-head">
@@ -960,13 +962,20 @@ function TaskBlock(props: { detail: RunDetail; task: Task; onShowCommit: (sha: s
           attempt={a}
           checks={detail.checks.filter((c) => c.attemptId === a.id)}
           latest={i === attempts.length - 1}
+          rawLogPruned={rawLogPruned}
         />
       ))}
     </div>
   );
 }
 
-function AttemptBlock(props: { attempt: Attempt; checks: CheckResult[]; latest: boolean }) {
+function AttemptBlock(props: {
+  attempt: Attempt;
+  checks: CheckResult[];
+  latest: boolean;
+  /** Why the raw log is gone (`rawLogPrunedText`); null while it is kept. */
+  rawLogPruned: string | null;
+}) {
   const { attempt, checks } = props;
   const status = ATTEMPT_STATUS[attempt.status];
   const outcome = attempt.outcome ? ATTEMPT_OUTCOME[attempt.outcome] : undefined;
@@ -1004,10 +1013,16 @@ function AttemptBlock(props: { attempt: Attempt; checks: CheckResult[]; latest: 
       {checks.length > 0 && <CheckList checks={checks} />}
       <AgentOutput attemptId={attempt.id} live={live} />
       <div className="attempt-links">
-        <a href={urls.log(attempt.id)} target="_blank" rel="noreferrer">
-          {t({ zh: '原始日志', en: 'Raw log' })}
-        </a>
-        <a href={urls.log(attempt.id, true)}>{t({ zh: '下载', en: 'Download' })}</a>
+        {props.rawLogPruned ? (
+          <span className="muted">{props.rawLogPruned}</span>
+        ) : (
+          <>
+            <a href={urls.log(attempt.id)} target="_blank" rel="noreferrer">
+              {t({ zh: '原始日志', en: 'Raw log' })}
+            </a>
+            <a href={urls.log(attempt.id, true)}>{t({ zh: '下载', en: 'Download' })}</a>
+          </>
+        )}
         <span className="muted">
           {t({
             zh: `tokens：输入 ${formatTokens(attempt.inputTokens)} · 输出 ${formatTokens(attempt.outputTokens)} · 缓存 ${formatTokens(attempt.cachedTokens)}`,

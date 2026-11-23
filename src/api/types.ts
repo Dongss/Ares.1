@@ -40,6 +40,17 @@ export interface LiveAgentEvent extends AgentEventRecord {
   attemptId: string;
 }
 
+/** 404 body of GET /api/attempts/:id/log when the raw log of an execution is not there. */
+export interface RawLogMissing {
+  error: string;
+  /**
+   * Deleted by the Master once its Run had ended over RAW_LOG_KEEP_DAYS ago
+   * (`runRawLogsExpired` in src/config/flow.ts); the execution's events are still there. false:
+   * missing for another reason.
+   */
+  pruned: boolean;
+}
+
 /** GET /api/runs items. */
 export type RunSummary = Omit<Run, 'template'> & {
   templateName: string;

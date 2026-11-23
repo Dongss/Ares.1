@@ -22,7 +22,8 @@ node dist/cli.js      # 数据目录 ~/.ares1（或 $ARES1_HOME），端口 4870
 | `agents.yaml` | Agent 定义（CLI + 模型 + 运行参数） |
 | `workflows/` | 流程模板 |
 | `data/ares1.db` | 运行状态（SQLite），升级迁移前自动备份成 `ares1.db.bak-v<版本>-<时间>`，只保留最近 5 份，更早的在迁移成功后自动删掉；旧版本遇到比自己新的库时恢复备份，较新的库改名成 `ares1.db.newer-v<版本>-<时间>` 留着（见「稳定副本和自动升级」） |
-| `data/logs/`、`data/artifacts/` | Agent 的执行日志和产物 |
+| `data/logs/` | 执行日志：`<Run id>/` 下每次 Agent 执行的原始输出（`<执行 id>.jsonl` 和 `.jsonl.stderr`）、看板展示用的精简事件（`.events.jsonl`）、检查命令的输出（`.verify.log`），以及 `setup.log`、`command-*.log`、`merge-*.log`；`scouts/` 下是侦察的原始输出。原始输出在 Run 或侦察结束 30 天后自动删掉，其余一直保留（见下面「原始日志的保留期」） |
+| `data/artifacts/` | 评审意见等产物 |
 | `data/agent-gh-config/` | 给 Agent 用的空 gh 配置目录，每次用之前清空（见「Agent 拿不到 GitHub 凭据」） |
 | `worktrees/` | 每个 Run 的工作目录 |
 | `data/master-running.json` | Master 运行时的标记，正常停止时删掉（见「保活」） |
@@ -30,6 +31,17 @@ node dist/cli.js      # 数据目录 ~/.ares1（或 $ARES1_HOME），端口 4870
 | `master.out`、`upgrade.log`、`keepalive.log` | 后台运行时的输出、自动升级的日志、保活脚本的日志 |
 
 配置文件改动后会自动重新加载。改端口或 CLI 路径（`bins`）需要重启 Master。
+
+### 原始日志的保留期
+
+Agent CLI 的原始输出（stream-json）带着工具调用的完整结果：读到的文件内容、测试输出等等，Master 一直运转就会一直变大。看板展示 Agent 输出用的是另存的精简事件（`.events.jsonl`），原始输出只用于下载排查，所以 Master 只保留 30 天：
+
+- Master 启动时清理一次，之后每天一次。
+- Run 结束（完成、失败、取消或评估后不做）超过 30 天，删掉它每次 Agent 执行的原始输出 `<执行 id>.jsonl` 和 `<执行 id>.jsonl.stderr`。执行中、排队、等审批、卡住、暂停的 Run 不论多旧都不碰；失败后等着重做的 Run 也不碰。时间按 Run 的结束时间算，没有结束时间的不碰。
+- 侦察结束超过 30 天，删掉它的 `scouts/<侦察 id>.jsonl` 和 `.stderr`。正在进行的侦察不碰。
+- 一直保留：`.events.jsonl`（看板上照常能看历史 Run 的 Agent 输出）、`.verify.log`、`setup.log`、`command-*.log`、`merge-*.log` 和 `data/artifacts/` 里的产物，以及数据库里的全部记录（统计、侦察提示词都不受影响）。Master 按数据库里每次执行记下的路径逐个删除，不按目录或通配符删。
+- 有文件被删掉时，事件列表里记一条全局事件 `logs.pruned`，数据是 `{ runs, scouts, files, bytes }`：涉及的 Run 数、侦察数、删掉的文件数和它们删除前的总字节数。什么都没删时不记，所以重复清理不会重复记事件。文件已经不在不算错误；删不掉的文件在 Master 的输出（`master.out`）里记一行原因（每个文件只记一次），不影响别的文件，下一轮再试。
+- 原始输出被删掉后，Run 详情页每次执行下面的「原始日志」「下载」换成「原始日志已超过保留期（Run 结束 30 天后）被删除」，Agent 输出照常从事件展示。API `GET /api/attempts/:id/log` 这时返回 404，数据是 `{ "error": "…", "pruned": true }`；原始输出因为别的原因不在时也是 404，但 `pruned` 为 `false`。
 
 默认配置只有给 Ares.1 开发自己用的 `self-dev` 模板。给别的项目配置时，可以参考 [`docs/examples/`](examples/README.md)：一组完整的 `config.yaml`、`agents.yaml` 和几种场景的流程模板（轻量、严格、带 E2E、交叉评审），每一项都有注释，目录结构和数据目录一样，可以直接复制过来改；那里还写了 npm、pnpm、Python、Go、Rust 项目登记仓库时检查命令和准备命令怎么填。
 

@@ -50,7 +50,8 @@ src/
                       back-off, how long a Run or a scout waits for an agent's quota (rate
                       limits), how long a failed Run of an issue waits before it is redone,
                       which Runs go on by themselves (redos to come included) and which only
-                      wait for a human (shared by engine, GitHub bridge, API and dashboard)
+                      wait for a human, how long raw agent logs are kept (`RAW_LOG_KEEP_DAYS`)
+                      (shared by engine, GitHub bridge, API and dashboard)
     effort.ts         helpers for agent effort (shared by engine and dashboard)
   store/              SQLite store (node:sqlite): store.ts, migrations.ts, types.ts (entity types)
   adapters/           agent adapters: types.ts (common interface), process.ts (child processes,
@@ -88,6 +89,8 @@ src/
                       restarts on the same commit when the node it runs on is gone
     source.ts         which registered repo is the Master's own source (from the install
                       directory's origin), whose scout is shown failed upgrades
+  logs/prune.ts       deletes the raw agent output (CLI stream and stderr) of Runs and scouts past
+                      retention, at start and daily; records logs.pruned
   workspace/git.ts    git: worktrees, commits, rollback, merge, fast-forward
   verify/commands.ts  run check commands and setup commands; whether a failed one failed for the
                       environment (exit code 127, its first program not in PATH), and whether a
@@ -154,7 +157,8 @@ test/
   - rollback targets, effective settings, which proposals are accepted automatically, the
     automatic scout's back-off, the waits for an agent's quota (rate limits) of Runs and scouts,
     the wait before a failed Run of an issue is redone (`redoDelayMs` / `redoDueAt`), which
-    unfinished Runs and redos the scout waits for and the like: `src/config/flow.ts`
+    unfinished Runs and redos the scout waits for, which raw agent logs are past retention
+    (`runRawLogsExpired` / `scoutRawLogExpired`) and the like: `src/config/flow.ts`
   - notification rules: `src/notify/notice.ts`
   - assessment conclusion rules: `src/engine/discussion.ts`
   - how a Run's time is split, and the names and groups of the parts: `src/engine/times.ts`

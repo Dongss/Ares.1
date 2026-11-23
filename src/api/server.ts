@@ -3,7 +3,7 @@ import { isAbsolute, resolve } from 'node:path';
 import { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
 import { z } from 'zod';
-import { redoDueAt } from '../config/flow.js';
+import { RAW_LOG_KEEP_DAYS, redoDueAt, runRawLogsExpired } from '../config/flow.js';
 import type { LoadedConfig } from '../config/load.js';
 import type { ConfigStatus } from '../config/watch.js';
 import { type Engine, InvalidStateError, readAttemptEvents } from '../engine/engine.js';
@@ -27,6 +27,7 @@ import type {
   HealthView,
   KeptWorkspace,
   LiveAgentEvent,
+  RawLogMissing,
   RunDetail,
   RunSummary,
   StatsView,
@@ -50,6 +51,8 @@ export interface ApiDeps {
   configStatus?: () => ConfigStatus;
   /** Platform the Master runs on, for whether it sends system notifications (tests change it). */
   platform?: NodeJS.Platform;
+  /** The clock, in epoch milliseconds, e.g. for whether raw logs are past retention. */
+  now?: () => number;
 }
 
 class BadRequestError extends Error {}
@@ -119,6 +122,7 @@ async function body<T>(
 export function createApi(deps: ApiDeps): Hono {
   const { store, engine, issues, upgrader, version, config, configStatus, webDir } = deps;
   const platform = deps.platform ?? process.platform;
+  const now = deps.now ?? Date.now;
   const startedAt = new Date().toISOString();
   const status =
     configStatus ?? (() => ({ loadedAt: startedAt, reloadError: null, restartNeeded: [] }));
@@ -367,7 +371,17 @@ export function createApi(deps: ApiDeps): Hono {
   app.get('/api/attempts/:id/log', (c) => {
     const attempt = store.getAttempt(c.req.param('id'));
     if (!existsSync(attempt.logPath)) {
-      throw new NotFoundError(t({ zh: '日志文件不存在', en: 'The log file does not exist' }));
+      const pruned = runRawLogsExpired(store.getRun(attempt.runId), now());
+      const missing: RawLogMissing = {
+        error: pruned
+          ? t({
+              zh: `原始日志已超过保留期（Run 结束 ${RAW_LOG_KEEP_DAYS} 天后）被删除，Agent 输出仍可在 Run 详情页查看`,
+              en: `The raw log was deleted once past retention (${RAW_LOG_KEEP_DAYS} days after the Run ended); the agent output is still on the Run page`,
+            })
+          : t({ zh: '日志文件不存在', en: 'The log file does not exist' }),
+        pruned,
+      };
+      return c.json(missing, 404);
     }
     if (c.req.query('download') !== undefined) {
       c.header('content-disposition', `attachment; filename="${attempt.id}.jsonl"`);

@@ -13,6 +13,7 @@ import {
   pageTitle,
   patchLineClass,
   rateLimitText,
+  rawLogPrunedText,
   redoText,
   replyDeadlineOf,
   splitPatch,
@@ -526,5 +527,28 @@ describe('workspaces of attempts before the last when an issue used up its attem
       "The issue used up its attempts, so only the last one, Run run_last, keeps its working directory and branch, but this Run's could not be removed automatically; clean them up by hand on the Workspaces page",
     );
     for (const text of [removed, failed]) expect(text).not.toMatch(/[一-鿿]/);
+  });
+});
+
+describe('raw logs past retention', () => {
+  afterEach(() => setLang('zh'));
+  const now = new Date('2026-12-31T00:00:00.000Z');
+  const daysAgo = (days: number) => new Date(now.getTime() - days * 86_400_000).toISOString();
+
+  it('says the raw logs are gone once the Run ended over 30 days ago', () => {
+    const old = run('old', 'completed', { finishedAt: daysAgo(31) });
+    expect(rawLogPrunedText(old, now)).toBe('原始日志已超过保留期（Run 结束 30 天后）被删除');
+    expect(rawLogPrunedText(run('recent', 'failed', { finishedAt: daysAgo(1) }), now)).toBeNull();
+    // Not finished, however old: the raw logs stay.
+    for (const status of ['running', 'blocked', 'waiting_approval', 'paused'] as const) {
+      expect(rawLogPrunedText(run(status, status, { finishedAt: daysAgo(90) }), now)).toBeNull();
+    }
+  });
+
+  it('in English', () => {
+    setLang('en');
+    const text = rawLogPrunedText(run('old', 'cancelled', { finishedAt: daysAgo(40) }), now);
+    expect(text).toBe('The raw log was deleted once past retention (30 days after the Run ended)');
+    expect(text).not.toMatch(/[一-鿿]/);
   });
 });

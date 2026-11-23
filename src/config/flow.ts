@@ -1,8 +1,8 @@
 // How a workflow template flows: effective stage settings, verify commands and rollback targets;
 // also the overrides of Runs from issues, which proposals are accepted automatically, how long
 // the automatic scout backs off and which Runs it waits for, how long a failed Run of an issue
-// waits before it is redone, and how long a Run or a scout waits for an agent that is out of
-// quota or rate-limited.
+// waits before it is redone, how long a Run or a scout waits for an agent that is out of
+// quota or rate-limited, and how long the raw output of agents is kept.
 // Pure logic (type imports, src/i18n.ts, src/store/types.ts and src/engine/discussion.ts only),
 // so the dashboard shows the same rules the engine applies.
 
@@ -403,6 +403,40 @@ export function scoutBackoff(
   );
   const from = Date.parse(newest.endedAt ?? newest.startedAt);
   return { count, until: new Date(from + delay).toISOString() };
+}
+
+/**
+ * Days the raw output of agents (the CLI's stream: `<attempt>.jsonl` and its `.stderr` for a
+ * Run's executions, `scouts/<scout>.jsonl` for a scout) is kept after the Run or scout ended. It
+ * holds whole tool results (files read, test output) and grows without end on a Master that never
+ * stops, while the dashboard shows agent output from the normalized events kept next to it.
+ */
+export const RAW_LOG_KEEP_DAYS = 30;
+
+/** Whether something that ended at `endedAt` (ISO time) did so over RAW_LOG_KEEP_DAYS before `now`. */
+function endedBeforeRawLogKeep(endedAt: string | null, now: number): boolean {
+  if (!endedAt) return false;
+  const ended = Date.parse(endedAt);
+  return Number.isFinite(ended) && ended < now - RAW_LOG_KEEP_DAYS * 86_400_000;
+}
+
+/**
+ * Whether the raw logs of a Run's executions are past retention at `now` (epoch ms), so the Master
+ * deletes them: the Run finished (completed, failed, cancelled or dropped) over RAW_LOG_KEEP_DAYS
+ * ago. Never while it may still go on: queued, running, waiting for approval, blocked, paused, or
+ * failed and waiting for its issue to be redone (`awaitingRedo`), however old.
+ */
+export function runRawLogsExpired(
+  run: Pick<Run, 'status' | 'issue' | 'finishedAt'>,
+  now: number,
+): boolean {
+  if (!FINISHED_RUN_STATUSES.includes(run.status) || awaitingRedo(run)) return false;
+  return endedBeforeRawLogKeep(run.finishedAt, now);
+}
+
+/** Whether a scout's raw log is past retention at `now`: it ended over RAW_LOG_KEEP_DAYS ago. */
+export function scoutRawLogExpired(scout: Pick<Scout, 'status' | 'endedAt'>, now: number): boolean {
+  return scout.status !== 'running' && endedBeforeRawLogKeep(scout.endedAt, now);
 }
 
 function stripUndefined<T extends object>(obj: T | undefined): Partial<T> {
