@@ -466,7 +466,7 @@ describe('runDigest: suggestions of passed reviews', () => {
 
   it('lists the suggestions of a passed review with their files, up to three of them', async () => {
     h = await harness();
-    const long = `把重复的解析逻辑抽成一个函数，${'说明'.repeat(100)}`;
+    const long = `把重复的解析逻辑抽成一个函数，${'说明'.repeat(250)}`;
     h.scripts.reviewer = () =>
       suggesting('可以合并', [
         { file: 'src/a.ts', description: '空输入时可以给出更清楚的错误' },
@@ -483,11 +483,46 @@ describe('runDigest: suggestions of passed reviews', () => {
       '  评审第 1 轮通过，建议 5 条：',
       '    - [src/a.ts] 空输入时可以给出更清楚的错误',
       '    - 补一个 超时的测试',
-      `    - ${`[src/b.ts] ${long}`.slice(0, 150)}…`,
+      `    - ${`[src/b.ts] ${long}`.slice(0, 400)}…`,
       '    …另有 2 条',
     ]);
     expect(text).not.toContain('第四条建议');
     expect(text).not.toContain('第五条建议');
+  });
+
+  it('keeps up to 400 characters of each review issue, so the fix at its end is not cut off', async () => {
+    h = await harness();
+    // Reviewers describe what they saw first and how to fix it last.
+    const must = `${'空输入会让解析抛错，'.repeat(27)}改法：先判断输入是否为空。`;
+    const fix = `${'评审者的改动没有丢弃，'.repeat(26)}改法：在检查工作目录之前先丢弃评审者的改动。`;
+    const tooLong = `${'很长的建议'.repeat(90)}结尾`;
+    expect(must.length).toBeGreaterThan(280);
+    expect(fix.length).toBeGreaterThan(290);
+    expect(tooLong.length).toBeGreaterThan(400);
+    let reviews = 0;
+    h.scripts.reviewer = () => {
+      reviews++;
+      if (reviews > 1) {
+        return suggesting('改好了', [
+          { file: 'src/b.ts', description: fix },
+          { description: tooLong },
+        ]);
+      }
+      const issues = [{ severity: 'must', file: 'src/a.ts', description: must }];
+      return { structured: { summary: '有一处要改', issues } };
+    };
+    const run = h.run();
+    await h.waitStatus(run.id, 'waiting_approval');
+
+    const lines = digest(h).split('\n');
+    const at = lines.findIndex((l) => l.startsWith('  评审第 1 轮'));
+    expect(lines.slice(at)).toEqual([
+      '  评审第 1 轮未通过：必须修改 1 条；总结：有一处要改',
+      `    - [src/a.ts] ${must}`,
+      '  评审第 2 轮通过，建议 2 条：',
+      `    - [src/b.ts] ${fix}`,
+      `    - ${tooLong.slice(0, 400)}…`,
+    ]);
   });
 
   it('adds no line for a passed review without suggestions', async () => {

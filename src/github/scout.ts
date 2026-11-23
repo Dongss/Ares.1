@@ -201,6 +201,14 @@ const MAX_MUST_ISSUES = 5;
 /** Suggestions listed per passed review round; more are only counted. */
 const MAX_SUGGESTIONS = 3;
 
+/**
+ * Characters kept of each review issue listed (must-fix or suggestion), its file included. This
+ * line is the only text of the review the scout sees, and reviewers usually describe what they saw
+ * first and how to fix it last, so a short cut drops exactly the fix. With at most
+ * MAX_MUST_ISSUES and MAX_SUGGESTIONS listed per round, the prompt stays bounded.
+ */
+const REVIEW_ISSUE_CHARS = 400;
+
 /** Denied operations listed per stage round; more are only counted. */
 const MAX_DENIED = 3;
 
@@ -296,7 +304,7 @@ function reviewOf(attempts: Attempt[]): ReviewReport | null {
 /** 「    - [src/a.ts] 没有处理空输入」, a review issue on its own line under its round. */
 function issueLine(issue: ReviewReport['issues'][number]): string {
   const where = issue.file ? `[${issue.file}] ` : '';
-  return `    - ${oneLine(`${where}${issue.description}`, 150)}`;
+  return `    - ${oneLine(`${where}${issue.description}`, REVIEW_ISSUE_CHARS)}`;
 }
 
 /**
