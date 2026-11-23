@@ -1,8 +1,9 @@
 import { chmodSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { ClaudeCodeAdapter, resetTime, StreamJsonParser } from '../src/adapters/claude-code.js';
+import { ClaudeCodeAdapter, StreamJsonParser } from '../src/adapters/claude-code.js';
 import { AGENT_GH_TOKEN, agentEnv } from '../src/adapters/process.js';
+import { resetTime } from '../src/adapters/rate-limit.js';
 import type { AgentEvent, StartInput } from '../src/adapters/types.js';
 import { setLang } from '../src/i18n.js';
 import { tmpDir, writeFile } from './helpers.js';
@@ -283,6 +284,45 @@ describe('StreamJsonParser: rate limits', () => {
       errorKind: 'rate_limited',
       retryAt: AT,
     });
+  });
+
+  it('without a limit event, takes the error text of a failed result for a rate limit', () => {
+    const api = parse(
+      result({
+        is_error: true,
+        result: 'API Error: 429 {"type":"error","error":{"type":"rate_limit_error"}}',
+      }),
+    );
+    expect(api).toMatchObject({ status: 'failed', errorKind: 'rate_limited' });
+    expect(api.error).toContain('rate_limit_error');
+    expect(api).not.toHaveProperty('retryAt');
+
+    // The old format with the reset time in epoch seconds.
+    const reset = Math.floor(Date.now() / 1000) + 3600;
+    const old = parse(result({ is_error: true, result: `Claude AI usage limit reached|${reset}` }));
+    expect(old).toMatchObject({
+      status: 'failed',
+      error: `Claude AI usage limit reached|${reset}`,
+      errorKind: 'rate_limited',
+      retryAt: new Date(reset * 1000).toISOString(),
+    });
+
+    // A limit event wins over the text.
+    const both = parse(
+      limit({ status: 'rejected', resetsAt: SECONDS }),
+      result({ is_error: true, result: `Claude AI usage limit reached|${reset}` }),
+    );
+    expect(both.retryAt).toBe(AT);
+  });
+
+  it('does not take other failures, or a finished turn that talks about limits, for one', () => {
+    const failed = parse(result({ is_error: true, result: 'There is an issue with the model' }));
+    expect(failed.status).toBe('failed');
+    expect(failed).not.toHaveProperty('errorKind');
+
+    const finished = parse(result({ result: 'Handled the rate limit (HTTP 429) with a retry' }));
+    expect(finished.status).toBe('completed');
+    expect(finished).not.toHaveProperty('errorKind');
   });
 
   it('keeps the latest reset time of the limits hit', () => {

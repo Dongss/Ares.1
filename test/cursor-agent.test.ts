@@ -22,6 +22,15 @@ process.stdin.on('end', () => {
     process.stderr.write('Cannot use this model: ' + at('--model') + '. Available models: auto\\n');
     process.exit(1);
   }
+  if (input.includes('MODE=stderr429')) {
+    process.stderr.write('Error: request failed with HTTP 429 Too Many Requests\\n');
+    process.exit(1);
+  }
+  if (input.includes('MODE=stderrlimit')) {
+    const reset = /AT=(\\S+)/.exec(input)[1];
+    process.stderr.write("You've hit your usage limit. It resets at " + reset + '.\\n');
+    process.exit(1);
+  }
   out({ type: 'system', subtype: 'init', apiKeySource: 'login', session_id: sid, model: 'Grok 4.7 256K High', permissionMode: 'default' });
   out({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: input }] }, session_id: sid });
   out({ type: 'thinking', subtype: 'delta', text: 'hmm', session_id: sid });
@@ -33,14 +42,20 @@ process.stdin.on('end', () => {
   out({ type: 'tool_call', subtype: 'started', call_id: 'c1', tool_call: { editToolCall: { args: { path: '/w/a.txt', streamContent: 'x' } } }, session_id: sid });
   out({ type: 'tool_call', subtype: 'started', call_id: 'c2', tool_call: { shellToolCall: { args: { command: 'npm test', workingDirectory: '' } } }, session_id: sid });
   out({ type: 'tool_call', subtype: 'completed', call_id: 'c1', tool_call: { editToolCall: { args: {}, result: { success: {} } } }, session_id: sid });
-  out({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'all done' }] }, session_id: sid });
+  // TALK: the agent's own reply talks about rate limits.
+  const last = input.includes('TALK') ? 'Hit a rate limit (HTTP 429, usage limit reached), retried.' : 'all done';
+  out({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: last }] }, session_id: sid });
   if (input.includes('MODE=error')) {
     out({ type: 'result', subtype: 'error', is_error: true, result: 'usage limit reached', session_id: sid });
     return;
   }
+  if (input.includes('MODE=fail')) {
+    out({ type: 'result', subtype: 'error', is_error: true, result: 'Internal server error', session_id: sid });
+    return;
+  }
   out({
     type: 'result', subtype: 'success', is_error: false, duration_ms: 10,
-    result: '先写文件。all done', session_id: sid,
+    result: '先写文件。' + last, session_id: sid,
     usage: { inputTokens: 100, outputTokens: 20, cacheReadTokens: 50, cacheWriteTokens: 5, reasoningTokens: 7 },
   });
 });
@@ -153,19 +168,55 @@ describe('CursorAgentAdapter', () => {
     expect(result.sessionId).toBe('chat-9');
   });
 
-  it('reports error results as failed with the CLI message', async () => {
+  it('reports an exhausted quota in an error result as a rate limit, with the CLI message', async () => {
     const { adapter, input } = setup();
     const result = await adapter.start(input('MODE=error')).result;
     expect(result.status).toBe('failed');
     expect(result.error).toBe('usage limit reached');
+    expect(result.errorKind).toBe('rate_limited');
+    expect(result).not.toHaveProperty('retryAt');
   });
 
-  it('reports an unknown model (exit 1, stderr only) as failed', async () => {
+  it('reports a rate limit on stderr without a result (exit 1), with its reset time', async () => {
+    const { adapter, input } = setup();
+    const r429 = await adapter.start(input('MODE=stderr429')).result;
+    expect(r429).toMatchObject({ status: 'failed', errorKind: 'rate_limited', exitCode: 1 });
+    expect(r429.error).toBe('Error: request failed with HTTP 429 Too Many Requests');
+    expect(r429).not.toHaveProperty('retryAt');
+
+    const at = new Date(Math.ceil(Date.now() / 1000) * 1000 + 3_600_000).toISOString();
+    const limit = await adapter.start(input(`MODE=stderrlimit AT=${at}`)).result;
+    expect(limit).toMatchObject({
+      status: 'failed',
+      errorKind: 'rate_limited',
+      retryAt: at,
+      exitCode: 1,
+    });
+    expect(limit.error).toBe(`You've hit your usage limit. It resets at ${at}.`);
+  });
+
+  it('reports an unknown model (exit 1, stderr only) as failed, not as a rate limit', async () => {
     const { adapter, input } = setup();
     const result = await adapter.start(input('MODE=badmodel')).result;
     expect(result.status).toBe('failed');
     expect(result.error).toContain('Cannot use this model: grok-4.7-high');
     expect(result.exitCode).toBe(1);
+    expect(result).not.toHaveProperty('errorKind');
+  });
+
+  it("does not take the agent's own talk of rate limits for one", async () => {
+    const { adapter, input } = setup();
+    // A finished turn whose replies (and so the joined result) mention a rate limit.
+    const ok = await adapter.start(input('MODE=ok TALK')).result;
+    expect(ok.status).toBe('completed');
+    expect(ok.finalMessage).toContain('rate limit');
+    expect(ok).not.toHaveProperty('errorKind');
+
+    // A failed turn: only the CLI's error text counts, not what the agent wrote before.
+    const failed = await adapter.start(input('MODE=fail TALK')).result;
+    expect(failed.status).toBe('failed');
+    expect(failed.error).toBe('Internal server error');
+    expect(failed).not.toHaveProperty('errorKind');
   });
 
   it('can be stopped, and times out', async () => {

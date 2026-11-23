@@ -1,5 +1,6 @@
 import { t } from '../i18n.js';
 import { runProcess } from './process.js';
+import { rateLimitFromText } from './rate-limit.js';
 import { summarizeToolInput } from './tool-summary.js';
 import {
   type AgentAdapter,
@@ -46,7 +47,10 @@ export class CursorAgentAdapter implements AgentAdapter {
     });
 
     const result = proc.done.then((outcome): AgentResult => {
-      const base = parser.toResult(outcome.exitCode);
+      const parsed = parser.toResult(outcome.exitCode);
+      // Not started, stopped or timed out: a limit the CLI reported on the way is not why it ended.
+      const { errorKind: _kind, retryAt: _at, ...ended } = parsed;
+      const base = outcome.ended === 'exit' ? parsed : ended;
       if (outcome.ended === 'spawn_error') {
         return {
           ...base,
@@ -62,15 +66,19 @@ export class CursorAgentAdapter implements AgentAdapter {
         return { ...base, status: 'timeout', error: t({ zh: '执行超时', en: 'Timed out' }) };
       }
       if (base.status === 'failed' && !base.error) {
-        // e.g. an unknown model: exit code 1, nothing on stdout, the reason on stderr.
+        // No result: e.g. an unknown model or an exhausted quota, exit code 1, nothing on
+        // stdout, the reason on stderr.
+        const stderr = outcome.stderrTail.trim();
+        const limit = rateLimitFromText(stderr);
         return {
           ...base,
           error:
-            outcome.stderrTail.trim() ||
+            stderr ||
             t({
               zh: `进程退出码 ${outcome.exitCode}，没有输出结果`,
               en: `The process exited with code ${outcome.exitCode} and no result`,
             }),
+          ...(limit ? { errorKind: 'rate_limited' as const, ...limit } : {}),
         };
       }
       return base;
@@ -176,6 +184,9 @@ export class CursorStreamParser {
       };
     }
     const failed = r.is_error === true || (r.subtype !== undefined && r.subtype !== 'success');
+    // cursor-agent has no rate limit event: only the CLI's own error text of a failed turn
+    // tells. The agent's replies are never looked at, they may well talk about rate limits.
+    const limit = failed ? rateLimitFromText(r.result) : undefined;
     return {
       status: failed ? 'failed' : 'completed',
       sessionId: r.session_id ?? this.sessionId,
@@ -191,6 +202,7 @@ export class CursorStreamParser {
       error: failed
         ? r.result || t({ zh: `失败（${r.subtype}）`, en: `Failed (${r.subtype})` })
         : undefined,
+      ...(limit ? { errorKind: 'rate_limited' as const, ...limit } : {}),
     };
   }
 }

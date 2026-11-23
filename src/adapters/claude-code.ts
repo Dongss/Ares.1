@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { t } from '../i18n.js';
 import { runProcess } from './process.js';
+import { rateLimitFromText, resetTime } from './rate-limit.js';
 import { summarizeToolInput } from './tool-summary.js';
 import {
   type AgentAdapter,
@@ -196,13 +197,19 @@ export class StreamJsonParser {
     }
   }
 
-  /** Marks a failure as a rate limit when a limit was hit on the way, with its reset time. */
-  private limitFields(): Pick<AgentResult, 'errorKind' | 'retryAt'> {
-    if (!this.rateLimited) return {};
-    return {
-      errorKind: 'rate_limited',
-      ...(this.resetAt !== undefined ? { retryAt: new Date(this.resetAt).toISOString() } : {}),
-    };
+  /**
+   * Marks a failure as a rate limit when a limit was hit on the way, with its reset time. Without
+   * a rate limit event, the CLI's error text of the failed result may still say so.
+   */
+  private limitFields(errorText?: string): Pick<AgentResult, 'errorKind' | 'retryAt'> {
+    if (this.rateLimited) {
+      return {
+        errorKind: 'rate_limited',
+        ...(this.resetAt !== undefined ? { retryAt: new Date(this.resetAt).toISOString() } : {}),
+      };
+    }
+    const limit = rateLimitFromText(errorText);
+    return limit ? { errorKind: 'rate_limited', ...limit } : {};
   }
 
   toResult(exitCode: number | null): AgentResult {
@@ -227,6 +234,8 @@ export class StreamJsonParser {
       cachedTokens: r.usage?.cache_read_input_tokens ?? 0,
     };
     const failed = r.is_error === true || (r.subtype !== undefined && r.subtype !== 'success');
+    // The CLI's own error text; only that of a failed turn is looked at for a rate limit.
+    const errorText = failed ? [r.result, ...(r.errors ?? [])].filter(Boolean).join('\n') : '';
     return {
       status: failed ? 'failed' : 'completed',
       sessionId: r.session_id ?? this.sessionId,
@@ -239,28 +248,10 @@ export class StreamJsonParser {
       ),
       exitCode,
       error: failed
-        ? [r.result, ...(r.errors ?? [])].filter(Boolean).join('\n') ||
-          t({ zh: `失败（${r.subtype}）`, en: `Failed (${r.subtype})` })
+        ? errorText || t({ zh: `失败（${r.subtype}）`, en: `Failed (${r.subtype})` })
         : undefined,
       // A limit hit on the way does not matter once the turn finished.
-      ...(failed ? this.limitFields() : {}),
+      ...(failed ? this.limitFields(errorText) : {}),
     };
   }
-}
-
-/**
- * A reset time as the CLI writes it, in epoch milliseconds: epoch seconds or milliseconds (a
- * number below 1e12 is taken as seconds, which reaches to the year 33658), or an ISO time.
- */
-export function resetTime(value: unknown): number | undefined {
-  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
-    return value < 1e12 ? value * 1000 : value;
-  }
-  if (typeof value === 'string' && value.trim()) {
-    const n = Number(value);
-    if (Number.isFinite(n)) return resetTime(n);
-    const ms = Date.parse(value);
-    return Number.isNaN(ms) ? undefined : ms;
-  }
-  return undefined;
 }

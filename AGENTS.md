@@ -55,7 +55,8 @@ src/
   adapters/           agent adapters: types.ts (common interface), process.ts (child processes,
                       process groups and the environment of agents: no GitHub credentials),
                       claude-code.ts, cursor-agent.ts, fake.ts (fake agent for tests),
-                      tool-summary.ts
+                      rate-limit.ts (a CLI's error text → out of quota / rate-limited, and the
+                      reset time), tool-summary.ts
   engine/
     engine.ts         workflow engine: queue, state machine, checks, rework, agent errors (retry
                       with backoff, switching agents), rollback, approvals, merge, recovery after
