@@ -4,7 +4,7 @@ import { formatBytes, formatTime, shortSha, type Tone } from './format.js';
 import { href } from './router.js';
 
 // The Events page: events the Master records outside any Run (restarts, pruned logs, a restored
-// database, upgrades, configuration reloads, GitHub errors, scouts...).
+// database, upgrades, configuration reloads, GitHub errors, webhook failures, scouts...).
 
 type GlobalEvent = Pick<EventRow, 'type' | 'data'>;
 
@@ -191,6 +191,11 @@ export function globalEventText(event: GlobalEvent, now = new Date()): string | 
         zh: `访问 GitHub 出错${withMessage(d.message)}`,
         en: `GitHub request failed${withMessage(d.message)}`,
       });
+    case 'notify.webhook_failed':
+      return t({
+        zh: `webhook 通知发送失败${withMessage(d.reason)}；之后的失败不再记录，直到有通知发送成功`,
+        en: `A webhook notification could not be sent${withMessage(d.reason)}; later failures are not recorded until one gets through`,
+      });
     case 'github.pushed': {
       const branch = str(d.branch);
       const head = str(d.head);
@@ -324,6 +329,7 @@ export function globalEventText(event: GlobalEvent, now = new Date()): string | 
 export function globalEventTone(event: GlobalEvent): Tone {
   switch (event.type) {
     case 'github.error':
+    case 'notify.webhook_failed':
     case 'config.reload_failed':
     case 'upgrade.failed':
     case 'scout.failed':

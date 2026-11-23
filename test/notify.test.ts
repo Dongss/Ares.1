@@ -15,7 +15,12 @@ import {
   noticeScript,
   systemNoticeSupported,
 } from '../src/notify/system.js';
-import { WEBHOOK_TIMEOUT_MS, WebhookNotifier, webhookRequest } from '../src/notify/webhook.js';
+import {
+  type Fetch,
+  WEBHOOK_TIMEOUT_MS,
+  WebhookNotifier,
+  webhookRequest,
+} from '../src/notify/webhook.js';
 import type { EventRow } from '../src/store/types.js';
 import { blockOnAgentError, type Harness, harness, type Script } from './helpers.js';
 
@@ -453,8 +458,9 @@ describe('webhook notifications', () => {
     expect(JSON.parse(json.body).body).toBe('~/x 和 /home/someone2/y');
   });
 
-  it('logs a failing webhook once per address, without its token, and never throws', async () => {
+  it('logs and records a failing webhook once per address, without its token, and never throws', async () => {
     h = await harness();
+    const failures = () => h?.master.store.listEventsOfType('notify.webhook_failed', '') ?? [];
     const failing = await startHook({ status: () => 500 });
     const dead = await deadUrl();
     let url: string | undefined = `${failing.url}/hook?auth=${TOKEN}`;
@@ -479,6 +485,9 @@ describe('webhook notifications', () => {
       expect(failing.received).toHaveLength(3);
       expect(logs).toHaveLength(1);
       expect(logs[0]).toMatch(/^\[通知\] webhook 通知发送失败：HTTP 500/);
+      expect(failures().map((e) => [e.runId, e.data])).toEqual([
+        [null, { reason: 'HTTP 500 Internal Server Error', status: 500 }],
+      ]);
 
       // Another address (the configuration was reloaded): its failure is logged again, once.
       url = `${dead}/hook?auth=${TOKEN}`;
@@ -487,19 +496,116 @@ describe('webhook notifications', () => {
       await notifier.idle();
       expect(logs).toHaveLength(2);
       expect(logs[1]).toContain('ECONNREFUSED');
+      expect(failures()).toHaveLength(2);
+      expect(failures()[1]?.data).toMatchObject({ status: null });
+      expect(String(failures()[1]?.data.reason)).toContain('ECONNREFUSED');
 
       // Without a webhook, nothing is sent.
       url = undefined;
       fail();
       await notifier.idle();
       expect(failing.received).toHaveLength(3);
-      for (const log of logs) {
-        expect(log).not.toContain(TOKEN);
-        expect(log).not.toContain('/hook');
+      for (const text of [...logs, ...failures().map((e) => JSON.stringify(e.data))]) {
+        expect(text).not.toContain(TOKEN);
+        expect(text).not.toContain('/hook');
       }
     } finally {
       notifier.stop();
     }
+  });
+
+  it('tells each streak of failures once: again after one got through, never notifying of it', async () => {
+    const notices: string[] = [];
+    h = await harness({
+      config: 'notify:\n  system: true\n',
+      master: { notice: (title) => notices.push(title) },
+    });
+    const store = h.master.store;
+    let url = `https://hooks.example.com/hook?auth=${TOKEN}`;
+    // What the webhook answers to each request, in order.
+    const answers: (() => Response)[] = [];
+    const requested: string[] = [];
+    const fetch: Fetch = async (to) => {
+      requested.push(to);
+      const answer = answers.shift();
+      if (!answer) throw new Error('no answer planned');
+      return answer();
+    };
+    const ok = () => new Response('ok');
+    const status = (code: number, text: string) => () =>
+      new Response('no', { status: code, statusText: text });
+    const refused = (): Response => {
+      throw Object.assign(new TypeError('fetch failed'), {
+        cause: Object.assign(new Error(`connect ECONNREFUSED ${url}`), { code: 'ECONNREFUSED' }),
+      });
+    };
+    const logs: string[] = [];
+    const notifier = new WebhookNotifier(
+      store,
+      withWebhook(
+        () => h?.master.config as LoadedConfig,
+        () => ({ url, headers: { Authorization: `Bearer ${TOKEN}` } }),
+      ),
+      { fetch, log: (m) => logs.push(m) },
+    );
+    const failures = () => store.listEventsOfType('notify.webhook_failed', '');
+    // One notification each, sent one after the other so that the answers come in order.
+    const notify = async (...next: (() => Response)[]) => {
+      for (const answer of next) {
+        answers.push(answer);
+        store.event(null, 'scout.failed', scoutFailed(SCOUT_FAILURE_NOTIFY_AFTER));
+        await notifier.idle();
+      }
+    };
+    notifier.start();
+    try {
+      // Failures in a row: told once, whatever the reason.
+      await notify(status(500, 'Internal Server Error'), status(502, 'Bad Gateway'), refused);
+      expect(failures().map((e) => [e.runId, e.data])).toEqual([
+        [null, { reason: 'HTTP 500 Internal Server Error', status: 500 }],
+      ]);
+      expect(logs).toHaveLength(1);
+
+      // It came back, then broke again: told again, in the log and on the Events page.
+      await notify(ok, ok, refused, status(500, 'Internal Server Error'));
+      expect(failures()).toHaveLength(2);
+      expect(failures()[1]?.data).toEqual({
+        reason: 'fetch failed (connect ECONNREFUSED ***)',
+        status: null,
+      });
+      expect(logs).toHaveLength(2);
+      expect(logs[1]).toBe(
+        '[通知] webhook 通知发送失败：fetch failed (connect ECONNREFUSED ***)。之后的失败不再记录，直到有通知发送成功。',
+      );
+
+      // Another address failing is told again, still within the streak.
+      url = `https://other.example.com/hook?auth=${TOKEN}`;
+      await notify(status(404, 'Not Found'), status(404, 'Not Found'));
+      expect(failures().map((e) => e.data.status)).toEqual([500, null, 404]);
+      expect(logs).toHaveLength(3);
+
+      // The recorded failures notified nobody: no system notification, no POST to the webhook.
+      expect(requested).toHaveLength(9);
+      expect(notices).toEqual(Array(9).fill('侦察连续失败：demo'));
+      for (const e of failures()) expect(noticeFor(e, undefined)).toBeNull();
+      for (const text of [...logs, ...failures().map((e) => JSON.stringify(e.data))]) {
+        expect(text).not.toContain(TOKEN);
+        expect(text).not.toContain('example.com');
+      }
+    } finally {
+      notifier.stop();
+    }
+  });
+
+  it('never notifies of a failed webhook, so a failure cannot set off another POST', () => {
+    const event: EventRow = {
+      id: 1,
+      runId: null,
+      ts: '2026-11-23T00:00:00.000Z',
+      type: 'notify.webhook_failed',
+      data: { reason: 'HTTP 500 Internal Server Error', status: 500 },
+    };
+    expect(noticeFor(event, undefined)).toBeNull();
   });
 
   it('gives up on a webhook that does not answer', async () => {
@@ -520,7 +626,7 @@ describe('webhook notifications', () => {
       await notifier.idle();
       expect(hanging.received).toHaveLength(1);
       expect(logs).toEqual([
-        '[通知] webhook 通知发送失败：0.05 秒内没有响应。之后的失败不再记录，改了 notify.webhook.url 后重新记录。',
+        '[通知] webhook 通知发送失败：0.05 秒内没有响应。之后的失败不再记录，直到有通知发送成功。',
       ]);
     } finally {
       notifier.stop();
@@ -545,6 +651,7 @@ describe('webhook notifications', () => {
     const notifyLogs = warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('[通知]'));
     expect(notifyLogs).toHaveLength(1);
     expect(notifyLogs[0]).toContain('webhook');
+    expect(h.master.store.listEventsOfType('notify.webhook_failed', '')).toHaveLength(1);
   });
 
   it('sends nothing without a webhook', async () => {
@@ -574,8 +681,12 @@ describe('webhook notifications', () => {
     });
     const logs = warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('webhook'));
     expect(logs).toEqual([
-      '[notify] Sending a webhook notification failed: HTTP 503 Service Unavailable. Later failures are not logged until notify.webhook.url changes.',
+      '[notify] Sending a webhook notification failed: HTTP 503 Service Unavailable. Later failures are not logged until a notification gets through.',
     ]);
     expect(logs[0]).not.toMatch(/[一-鿿]/);
+    expect(h.master.store.listEventsOfType('notify.webhook_failed', '')[0]?.data).toEqual({
+      reason: 'HTTP 503 Service Unavailable',
+      status: 503,
+    });
   });
 });

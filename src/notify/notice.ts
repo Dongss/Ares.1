@@ -238,6 +238,8 @@ export function noticeFor(event: EventRow, goal: string | undefined): Notice | n
         about: 'master',
       };
     default:
+      // notify.webhook_failed among them: notifying of it would POST to the failing webhook
+      // again, and fail again.
       return null;
   }
 }

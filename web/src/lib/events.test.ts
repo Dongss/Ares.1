@@ -38,6 +38,8 @@ const SAMPLES: [string, Record<string, unknown>][] = [
   ['config.reloaded', { errors: 2 }],
   ['config.reload_failed', { message: 'agents.yaml: bad indent' }],
   ['github.error', { message: 'HTTP 502' }],
+  ['notify.webhook_failed', { reason: 'HTTP 500 Internal Server Error', status: 500 }],
+  ['notify.webhook_failed', { reason: 'fetch failed (connect ECONNREFUSED ***)', status: null }],
   ['github.pushed', { repo: 'demo', branch: 'main', head: 'abcdef1234567890' }],
   ['issue.auto_accepted', { repo: 'demo', issue: 12 }],
   ['scout.started', { scoutId: 's-1', repo: 'demo', trigger: 'auto' }],
@@ -160,6 +162,25 @@ describe('globalEventText', () => {
     expect(text('upgrade.failed', { message: 'dirty' })).toBe('The upgrade failed: dirty');
   });
 
+  it('says a webhook notification failed, why, and that it is told once until one gets through', () => {
+    const data = { reason: 'HTTP 500 Internal Server Error', status: 500 };
+    expect(text('notify.webhook_failed', data)).toBe(
+      'webhook 通知发送失败：HTTP 500 Internal Server Error；之后的失败不再记录，直到有通知发送成功',
+    );
+    expect(text('notify.webhook_failed', {})).toBe(
+      'webhook 通知发送失败；之后的失败不再记录，直到有通知发送成功',
+    );
+    setLang('en');
+    const en = text('notify.webhook_failed', data);
+    expect(en).toBe(
+      'A webhook notification could not be sent: HTTP 500 Internal Server Error; later failures are not recorded until one gets through',
+    );
+    expect(en).not.toMatch(/[一-鿿]/);
+    expect(text('notify.webhook_failed', { reason: null, status: null })).toBe(
+      'A webhook notification could not be sent; later failures are not recorded until one gets through',
+    );
+  });
+
   it('counts what a scout proposed, with English plurals', () => {
     const data = { repo: 'demo', created: 3, auto: 1, pending: 2 };
     expect(text('scout.completed', data)).toBe(
@@ -219,7 +240,13 @@ describe('globalEventText', () => {
 
 describe('globalEventTone', () => {
   it('marks errors red and what is worth a look orange', () => {
-    for (const type of ['github.error', 'config.reload_failed', 'upgrade.failed', 'scout.failed']) {
+    for (const type of [
+      'github.error',
+      'notify.webhook_failed',
+      'config.reload_failed',
+      'upgrade.failed',
+      'scout.failed',
+    ]) {
       expect(globalEventTone(ev(type)), type).toBe('danger');
     }
     for (const type of ['master.restarted', 'master.node_missing', 'store.backup_restored']) {

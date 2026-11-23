@@ -90,8 +90,9 @@ src/
     system.ts         system notifications sent by the Master: osascript on macOS, notify-send
                       (libnotify) on Linux, nothing elsewhere; which platforms are supported
     webhook.ts        notifications the Master POSTs to notify.webhook in config.yaml (JSON or
-                      text, home directory as ~, 10 s timeout, no retry, a failure logged once
-                      per address)
+                      text, home directory as ~, 10 s timeout, no retry; the first failure of a
+                      streak, or of another address, is logged and recorded as the global event
+                      notify.webhook_failed, told again after a notification got through)
   upgrade/
     upgrader.ts       the Master upgrades itself: finds a new version, waits for the work in hand,
                       hands over to scripts/self-upgrade.sh, keeps the last failed upgrade, retries

@@ -45,12 +45,12 @@ Agent CLI 的原始输出（stream-json）带着工具调用的完整结果：�
 
 ### 全局事件
 
-Master 把不属于任何 Run 的事记成全局事件（事件的 Run 为空）：上一个 Master 异常退出（`master.restarted`）、清理原始日志（`logs.pruned`）、恢复数据库备份（`store.backup_restored`）、node 不见了（`master.node_missing`）、打开或关闭工作开关（`master.working`）、配置重新加载（`config.reloaded`、`config.reload_failed`）、访问 GitHub 出错（`github.error`）、推送目标分支（`github.pushed`）、自动采纳提案（`issue.auto_accepted`）、侦察（`scout.started`、`scout.completed`、`scout.failed`、`scout.rate_limited`）和升级（`upgrade.started`、`upgrade.done`、`upgrade.failed`）。这篇文档里说「事件列表里记一条」这些事件的地方，都指这里。
+Master 把不属于任何 Run 的事记成全局事件（事件的 Run 为空）：上一个 Master 异常退出（`master.restarted`）、清理原始日志（`logs.pruned`）、恢复数据库备份（`store.backup_restored`）、node 不见了（`master.node_missing`）、打开或关闭工作开关（`master.working`）、配置重新加载（`config.reloaded`、`config.reload_failed`）、访问 GitHub 出错（`github.error`）、webhook 通知发送失败（`notify.webhook_failed`）、推送目标分支（`github.pushed`）、自动采纳提案（`issue.auto_accepted`）、侦察（`scout.started`、`scout.completed`、`scout.failed`、`scout.rate_limited`）和升级（`upgrade.started`、`upgrade.done`、`upgrade.failed`）。这篇文档里说「事件列表里记一条」这些事件的地方，都指这里。
 
 Master 大部分时间没人看着，人回来时在看板的「事件」页查这段时间发生过什么：
 
 - 最新的在前，每页 200 条，底部「加载更早的」往前翻；有新的全局事件时自动刷新。
-- 每条有时间、类型和一句说明：比如删了几个原始日志、多大，上一个 Master 的 pid 和启动时间，恢复了哪个备份、较新的库移到了哪里。出错的（`github.error`、`config.reload_failed`、`upgrade.failed`、`scout.failed`）标成红色，值得留意的（`master.restarted`、`master.node_missing`、`store.backup_restored`，有无效配置项的 `config.reloaded`）标成橙色。升级失败带着脚本输出末尾时可以展开看。鼠标悬停在说明上能看到原始数据。
+- 每条有时间、类型和一句说明：比如删了几个原始日志、多大，上一个 Master 的 pid 和启动时间，恢复了哪个备份、较新的库移到了哪里。出错的（`github.error`、`notify.webhook_failed`、`config.reload_failed`、`upgrade.failed`、`scout.failed`）标成红色，值得留意的（`master.restarted`、`master.node_missing`、`store.backup_restored`，有无效配置项的 `config.reloaded`）标成橙色。升级失败带着脚本输出末尾时可以展开看。鼠标悬停在说明上能看到原始数据。
 - 侦察和自动采纳的事件带着去「需求」页的链接。
 - 看板还不认识的事件类型（以后新加的）照样列出，显示类型名和原始数据。
 - 每个 Run 自己的事件不在这里，在 Run 详情页。
@@ -383,7 +383,7 @@ notify:
 - 飞书、钉钉的机器人 webhook 要求固定的消息格式，不能直接接：要经过一层转发（自己的小服务把正文改成它们要的格式），或者先发到 ntfy 这类服务。
 - 发出去的标题、正文和 `text` 都先把用户目录下的路径换成 `~`（和发到 GitHub 的文字一样，见「发到 GitHub 的文字不带用户目录」），不把系统用户名发给外部服务。
 - `/api/health` 的 `webhookNotify` 只说明有没有配 webhook，不返回地址和请求头；看板的「说明」页和顶栏的通知开关会提一句已配置 webhook。
-- 失败时：地址返回的不是 2xx（比如 500）、连不上或 10 秒内没有响应都算失败。不重试，不影响 Master，只在 Master 的输出里记一次原因（以 `[通知]` 开头，英文为 `[notify]`，写明 HTTP 状态码或错误信息，不写地址和请求头，免得把里面的 token 记下来），之后的失败不再记；改了 `notify.webhook.url`（配置重新加载后）再失败时重新记一次。
+- 失败时：地址返回的不是 2xx（比如 500）、连不上或 10 秒内没有响应都算失败。不重试，不影响 Master。一串连续的失败只记第一次：在 Master 的输出里记一行原因（以 `[通知]` 开头，英文为 `[notify]`），同时在事件列表里记一条全局事件 `notify.webhook_failed`（看板「事件」页能看到，标成红色；见上面的「全局事件」），数据是 `{ reason, status }`：`reason` 是 HTTP 状态码或错误信息，`status` 是 HTTP 状态码（没有响应时为 `null`）。两处都不写地址和请求头，免得把里面的 token 记下来。之后连续的失败不再记；有一条通知发送成功后，下次再失败重新记一次（webhook 恢复后又坏掉，人回来时在「事件」页能看到）；改了 `notify.webhook.url`（配置重新加载后）再失败时也重新记一次。这条事件本身不发通知（不发系统通知，也不再发到 webhook），免得失败了再发、再失败。
 
 ## 稳定副本和自动升级
 

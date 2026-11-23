@@ -86,7 +86,8 @@ github:
 notify:
   system: true                 # 默认 false
   # 人不在这台机器前也想收到（比如 Master 跑在没有桌面的服务器上）：把同样的通知 POST 到这个地址。
-  # 不写 = 不发；和 system 互不影响。失败不重试，只在 Master 的输出里记一次原因。正文格式见 docs/running.md
+  # 不写 = 不发；和 system 互不影响。失败不重试，连续失败时在 Master 的输出和看板「事件」页记一次原因，
+  # 有通知发送成功后再失败时重新记。正文格式见 docs/running.md
   # webhook:
   #   url: https://ntfy.sh/<你的主题>   # 必填，只能是 http:// 或 https:// 开头；地址里不能带用户名和密码
   #   headers:                         # 可选：额外的请求头，比如鉴权

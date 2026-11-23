@@ -92,16 +92,28 @@ function failureReason(err: unknown, webhook: WebhookConfig, timeoutMs: number):
   return reason;
 }
 
+/** Why a request failed: words without the address or the headers, and the HTTP status if any. */
+interface Failure {
+  reason: string;
+  status: number | null;
+}
+
 /**
  * Notifications POSTed to the address in `notify.webhook` (config.yaml), so that a human is
  * reached even away from this machine or on a server without a desktop: only when a human is
  * needed (see notice.ts). Read on every event, so a reloaded configuration applies at once.
- * A failure is never retried, never throws and never stops the Master; it is logged once per
- * address, so that a dead webhook does not fill the log with one line per notification.
+ * A failure is never retried, never throws and never stops the Master. It is logged and
+ * recorded as the global event notify.webhook_failed (on the Events page, where a human coming
+ * back sees that notifications stopped) once per streak of failures: a dead webhook does not
+ * fill the log with one line per notification, and one that comes back and breaks again is told
+ * again. That event notifies nobody (see noticeFor), so a failure cannot set off another POST.
  */
 export class WebhookNotifier {
-  /** The address whose failure was logged last; another address is logged again. */
-  private loggedUrl: string | undefined;
+  /**
+   * The address whose failure was told in the current streak of failures; cleared when a
+   * notification gets through, so another address or a new streak is told again.
+   */
+  private failingUrl: string | undefined;
   private readonly pending = new Set<Promise<void>>();
   private readonly fetch: Fetch;
   private readonly log: (message: string) => void;
@@ -148,37 +160,58 @@ export class WebhookNotifier {
   /** Never rejects: every failure ends in `failed`. */
   private async post(webhook: WebhookConfig, notice: Notice, event: EventRow): Promise<void> {
     try {
-      const { headers, body } = webhookRequest(webhook, notice, event, this.home);
-      const response = await this.fetch(webhook.url, {
-        method: 'POST',
-        headers,
-        body,
-        signal: AbortSignal.timeout(this.timeoutMs),
-      });
-      // Nothing is read from the answer; let the connection go.
-      await response.body?.cancel().catch(() => {});
-      if (!response.ok) {
-        const status = `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ''}`;
-        this.failed(webhook, status);
+      const failure = await this.send(webhook, notice, event).catch(
+        (err: unknown): Failure => ({
+          reason: failureReason(err, webhook, this.timeoutMs),
+          status: null,
+        }),
+      );
+      if (failure) {
+        this.failed(webhook, failure);
+      } else {
+        // It got through: the next failure starts a new streak, told again.
+        this.failingUrl = undefined;
       }
-    } catch (err) {
-      try {
-        this.failed(webhook, failureReason(err, webhook, this.timeoutMs));
-      } catch {
-        // Logging must not fail the Master either.
-      }
+    } catch {
+      // Logging and recording must not fail the Master either: the store is closed when the
+      // Master stopped while the request was out.
     }
   }
 
-  private failed(webhook: WebhookConfig, reason: string): void {
-    if (this.loggedUrl === webhook.url) return;
-    this.loggedUrl = webhook.url;
+  /** null when the webhook took the notification; throws when it gave no answer. */
+  private async send(
+    webhook: WebhookConfig,
+    notice: Notice,
+    event: EventRow,
+  ): Promise<Failure | null> {
+    const { headers, body } = webhookRequest(webhook, notice, event, this.home);
+    const response = await this.fetch(webhook.url, {
+      method: 'POST',
+      headers,
+      body,
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+    // Nothing is read from the answer; let the connection go.
+    await response.body?.cancel().catch(() => {});
+    if (response.ok) return null;
+    return {
+      reason: `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ''}`,
+      status: response.status,
+    };
+  }
+
+  /** The first failure of a streak (or of another address) is logged and recorded; later ones not. */
+  private failed(webhook: WebhookConfig, { reason, status }: Failure): void {
+    if (this.failingUrl === webhook.url) return;
+    this.failingUrl = webhook.url;
     this.log(
       t({
-        zh: `[通知] webhook 通知发送失败：${reason}。之后的失败不再记录，改了 notify.webhook.url 后重新记录。`,
-        en: `[notify] Sending a webhook notification failed: ${reason}. Later failures are not logged until notify.webhook.url changes.`,
+        zh: `[通知] webhook 通知发送失败：${reason}。之后的失败不再记录，直到有通知发送成功。`,
+        en: `[notify] Sending a webhook notification failed: ${reason}. Later failures are not logged until a notification gets through.`,
       }),
     );
+    // The reason names neither the address nor the headers: they may carry tokens.
+    this.store.tx(() => this.store.event(null, 'notify.webhook_failed', { reason, status }));
   }
 
   /** Resolves when the requests sent so far have ended (tests wait for it). */
