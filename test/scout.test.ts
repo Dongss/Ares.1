@@ -456,6 +456,115 @@ describe('runDigest', () => {
   });
 });
 
+describe('runDigest: terminated Runs', () => {
+  afterEach(() => setLang('zh'));
+
+  /** The lines of the Run's entry in the digest, its heading first. */
+  function entry(text: string, runId: string): string[] {
+    const lines = text.split('\n');
+    const at = lines.findIndex((l) => l.startsWith(`- ${runId} `) || l.startsWith(`- ${runId}（`));
+    expect(at).toBeGreaterThanOrEqual(0);
+    const next = lines.findIndex((l, i) => i > at && l.startsWith('- '));
+    return lines.slice(at, next === -1 ? undefined : next);
+  }
+
+  /**
+   * A Run terminated while it waits for the merge approval, with the events the Master records
+   * when it terminates the Run on its own; none when a human terminated it on the dashboard.
+   */
+  async function terminated(
+    hh: Harness,
+    goal: string,
+    events: [string, Record<string, unknown>][] = [],
+  ): Promise<Run> {
+    const run = hh.run(goal);
+    await hh.waitStatus(run.id, 'waiting_approval');
+    await hh.master.engine.cancel(run.id);
+    for (const [type, data] of events) hh.master.store.event(run.id, type, data);
+    return run;
+  }
+
+  const closed = (stateReason: string | null): [string, Record<string, unknown>] => [
+    'run.issue_closed',
+    { repo: 'me/demo', issue: 7, stateReason },
+  ];
+
+  it('says why each Run was terminated, and nothing more for the others', async () => {
+    h = await harness();
+    const rejected = await terminated(h, '加 a.txt', [closed('not_planned')]);
+    const doneElsewhere = await terminated(h, '加 b.txt', [closed('completed')]);
+    const justClosed = await terminated(h, '加 c.txt', [closed(null)]);
+    const byHand = await terminated(h, '加 d.txt');
+    // As when the issue was edited: the workspace is removed after the Run was started over.
+    const changed = await terminated(h, '加 e.txt', [
+      ['run.goal_changed', { repo: 'me/demo', issue: 7, newRun: 'run-next' }],
+      ['workspace.removed', { reason: 'goal_changed', newRun: 'run-next' }],
+    ]);
+    const waiting = h.run('加 f.txt');
+    await h.waitStatus(waiting.id, 'waiting_approval');
+
+    const text = digest(h);
+    const reasons: [Run, string][] = [
+      [rejected, '  终止：issue 被人关闭为不做'],
+      [doneElsewhere, '  终止：issue 被人关闭（已完成）'],
+      [justClosed, '  终止：issue 被人关闭'],
+      [byHand, '  终止：人在看板上终止'],
+      [changed, '  终止：issue 的标题或正文被人改了，已按新内容重开为 run-next'],
+    ];
+    for (const [run, line] of reasons) {
+      const lines = entry(text, run.id);
+      expect(lines[0]).toContain('（已终止，');
+      expect(lines.filter((l) => l.startsWith('  终止：'))).toEqual([line]);
+    }
+    // Not terminated: the heading and the rounds, as before.
+    const lines = entry(text, waiting.id);
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toBe(`- ${waiting.id}（等待审批，${waiting.createdAt.slice(0, 10)}）加 f.txt`);
+    expect(text.split('\n').filter((l) => l.startsWith('  终止：'))).toHaveLength(5);
+  });
+
+  it('says why in English', async () => {
+    setLang('en');
+    h = await harness({
+      workflow: `
+id: dev
+stages:
+  - id: implement
+    name: Implement
+    agent: coder
+  - id: merge
+    name: Merge
+    kind: merge
+    gate: true
+    on_reject: implement
+`,
+    });
+    const rejected = await terminated(h, 'Add a.txt', [closed('not_planned')]);
+    const doneElsewhere = await terminated(h, 'Add b.txt', [closed('completed')]);
+    const justClosed = await terminated(h, 'Add c.txt', [closed(null)]);
+    const byHand = await terminated(h, 'Add d.txt');
+    const changed = await terminated(h, 'Add e.txt', [
+      ['run.goal_changed', { repo: 'me/demo', issue: 7, newRun: 'run-next' }],
+    ]);
+
+    const text = digest(h);
+    const reasons: [Run, string][] = [
+      [rejected, '  Terminated: the issue was closed as not planned'],
+      [doneElsewhere, '  Terminated: the issue was closed as completed'],
+      [justClosed, '  Terminated: the issue was closed'],
+      [byHand, '  Terminated: by a human on the dashboard'],
+      [
+        changed,
+        "  Terminated: the issue's title or body was edited, so it was started over from the new text as run-next",
+      ],
+    ];
+    for (const [run, line] of reasons) {
+      expect(entry(text, run.id).filter((l) => l.startsWith('  Terminated: '))).toEqual([line]);
+    }
+    expect(text).not.toMatch(/[一-鿿]/);
+  });
+});
+
 describe('runDigest: requirement assessment', () => {
   const start = () => harness({ agents: ASSESS_AGENTS_YAML, workflow: ASSESS_WORKFLOW_YAML });
 

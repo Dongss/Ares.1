@@ -29,7 +29,15 @@ import {
 } from '../engine/times.js';
 import { join, t } from '../i18n.js';
 import type { Store } from '../store/store.js';
-import type { Attempt, CheckResult, Run, Scout, ScoutProposal, StageRun } from '../store/types.js';
+import type {
+  Attempt,
+  CheckResult,
+  EventRow,
+  Run,
+  Scout,
+  ScoutProposal,
+  StageRun,
+} from '../store/types.js';
 import type { UpgradeFailure } from '../upgrade/upgrader.js';
 import type { GhAuthored, GhIssue } from './client.js';
 import { isRetriesExhaustedComment, isTrusted, LABELS, stripMarker } from './issues.js';
@@ -426,6 +434,44 @@ function trustedGoal(run: Run): boolean {
   return !untrusted || untrusted.confirmedAt !== null;
 }
 
+/**
+ * Events the Master records on a Run it terminated on its own, by type, with the reason each
+ * gives. A Master-initiated termination of a new kind adds its event here.
+ */
+const TERMINATION_REASONS: Record<string, (data: EventRow['data']) => string> = {
+  'run.issue_closed': ({ stateReason }) => {
+    if (stateReason === 'completed') {
+      return t({ zh: 'issue 被人关闭（已完成）', en: 'the issue was closed as completed' });
+    }
+    if (stateReason === 'not_planned') {
+      return t({ zh: 'issue 被人关闭为不做', en: 'the issue was closed as not planned' });
+    }
+    return t({ zh: 'issue 被人关闭', en: 'the issue was closed' });
+  },
+  'run.goal_changed': ({ newRun }) =>
+    typeof newRun === 'string'
+      ? t({
+          zh: `issue 的标题或正文被人改了，已按新内容重开为 ${newRun}`,
+          en: `the issue's title or body was edited, so it was started over from the new text as ${newRun}`,
+        })
+      : t({
+          zh: 'issue 的标题或正文被人改了，已按新内容重开',
+          en: `the issue's title or body was edited, so it was started over from the new text`,
+        }),
+};
+
+/**
+ * Why a cancelled Run was terminated: the reason of the last event the Master recorded when it
+ * terminated the Run on its own, otherwise a human terminated it on the dashboard.
+ */
+function terminationReason(events: EventRow[]): string {
+  const event = events.findLast((e) => Object.hasOwn(TERMINATION_REASONS, e.type));
+  const reason = event && TERMINATION_REASONS[event.type];
+  return reason
+    ? reason(event.data)
+    : t({ zh: '人在看板上终止', en: 'by a human on the dashboard' });
+}
+
 /** Recent Runs of the repo, with what went wrong in them: the scout's best evidence. */
 export function runDigest(store: Store, repoId: string, limit = 15): string {
   const runs = store.listRuns({ repoId }).slice(0, limit);
@@ -481,6 +527,12 @@ export function runDigest(store: Store, repoId: string, limit = 15): string {
       }
       if (run.error) {
         lines.push(`  ${t({ zh: '错误', en: 'Error' })}${colon()}${oneLine(run.error, 300)}`);
+      }
+      // Terminated is a strong lead: a human changed course, turned the requirement down, or it
+      // was done some other way.
+      if (run.status === 'cancelled') {
+        const reason = terminationReason(store.listEvents(run.id));
+        lines.push(`  ${t({ zh: '终止', en: 'Terminated' })}${colon()}${reason}`);
       }
       lines.push(...discussionLines(run));
       for (const sr of stageRuns) {
