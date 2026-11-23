@@ -10,6 +10,7 @@ import {
   redoDueAt,
   replyTimeoutHours,
   scoutBackoff,
+  scoutFailureStreak,
   scoutLimitWait,
   splitUnfinishedRuns,
 } from '../config/flow.js';
@@ -1364,6 +1365,14 @@ export class IssueBridge {
           scoutId: scout.id,
           repo: repo.name,
           message: errorMessage(err),
+          // The failures in a row so far, this one included, so that a scout that keeps failing
+          // is notified (see noticeFor). A scout the Master cut short did not fail: no streak,
+          // or it would repeat the count of the failures before it.
+          ...(interrupted
+            ? {}
+            : {
+                streak: scoutFailureStreak(store.listScouts({ repoId: repo.id, limit: 200 })),
+              }),
         });
       });
     } finally {

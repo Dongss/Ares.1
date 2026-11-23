@@ -531,6 +531,7 @@ describe('notifications', () => {
       ['blocked', ev('run.blocked', { kind: 'merge_conflict' })],
       ['failed', ev('run.status', { status: 'failed' })],
       ['proposals', ev('scout.completed', { pending: 2 }, null)],
+      ['scout', ev('scout.failed', { repo: 'demo', message: 'x', streak: 3 }, null)],
       ['github', ev('github.error', { message: 'x' }, null)],
       ['upgrade', ev('upgrade.failed', { message: 'x' }, null)],
     ];

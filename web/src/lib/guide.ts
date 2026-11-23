@@ -783,6 +783,11 @@ function noticeHandling(kind: NoticeKind): string {
         zh: '去 GitHub 看 ares1:proposal 的 issue：要做就加 ares1:ready，不做就关闭为 not planned 并写一句理由',
         en: 'Look at the ares1:proposal issues on GitHub: to do one, add ares1:ready; otherwise close it as not planned with a one-line reason',
       });
+    case 'scout':
+      return t({
+        zh: '去「需求」页看这个仓库侦察的错误和日志，常见原因是 Agent 配置失效、超时或输出不符合约定；修好后自动侦察照常继续，也可以点「让 AI 找活」马上试一次',
+        en: 'See the repo\'s scout errors and logs on the Issues page; common causes are a broken agent config, a timeout or output not in the agreed format. Once fixed, automatic scouting goes on as before; click "Let the AI find work" to try right away',
+      });
     case 'github':
       return t({
         zh: '看「需求」页的错误信息，多半是 gh 没登录、网络不通或推送不能快进；修好后下次检查会自动重试',

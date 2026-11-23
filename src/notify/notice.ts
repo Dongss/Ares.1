@@ -1,6 +1,7 @@
 // When a human needs to know: shared by the Master's system notifications and the
 // dashboard's browser notifications. Pure; the dashboard imports this file.
 
+import { SCOUT_FAILURE_NOTIFY_AFTER } from '../config/flow.js';
 import { type Lang, t } from '../i18n.js';
 import type { BlockKind, EventRow } from '../store/types.js';
 
@@ -51,6 +52,7 @@ export type NoticeKind =
   | 'blocked'
   | 'failed'
   | 'proposals'
+  | 'scout'
   | 'github'
   | 'upgrade';
 
@@ -114,6 +116,16 @@ export const NOTICE_KINDS: Record<NoticeKind, { label: string; when: string }> =
       when: 'The scout proposed something that cannot be accepted automatically (too large, or above the auto-accept risk level)',
     },
   },
+  scout: {
+    zh: {
+      label: '侦察连续失败',
+      when: `一个仓库的侦察（自动或手动）连续失败 ${SCOUT_FAILURE_NOTIFY_AFTER} 次，例如 Agent 出错或超时、输出不符合约定、建临时工作目录失败，标题后面写着仓库名；额度用尽或限流、被 Master 停止的不算，也不打断计数。同一串连续失败只通知一次，有侦察正常结束后重新计数`,
+    },
+    en: {
+      label: 'Scout keeps failing',
+      when: `Scouts of a repo (automatic or by hand) failed ${SCOUT_FAILURE_NOTIFY_AFTER} times in a row, e.g. an agent error or timeout, output not in the agreed format, or no temporary working directory, with the repo after the title; scouts out of quota, rate-limited or stopped by the Master neither count nor end the streak. Each streak is notified once; a scout that ends normally starts the count over`,
+    },
+  },
   github: {
     zh: {
       label: 'GitHub 访问失败',
@@ -160,7 +172,8 @@ const firstLine = (text: string, max: number) => {
 /**
  * The notification for an event, or null when nobody has to act. Only things that wait for a
  * human: approvals, stuck or failed Runs, proposals the Master may not accept by itself, and
- * failures of the Master's own automation (GitHub, upgrades). Finished Runs are not announced.
+ * failures of the Master's own automation (GitHub, upgrades, a scout that keeps failing).
+ * Finished Runs are not announced.
  */
 export function noticeFor(event: EventRow, goal: string | undefined): Notice | null {
   const runId = event.runId;
@@ -195,6 +208,17 @@ export function noticeFor(event: EventRow, goal: string | undefined): Notice | n
         about: 'issues',
       };
     }
+    case 'scout.failed':
+      // A single failure only backs off; told once, when the failures in a row reach the
+      // threshold. Events from before the streak was recorded have none and are not told.
+      if (event.data.streak !== SCOUT_FAILURE_NOTIFY_AFTER) return null;
+      return {
+        kind: 'scout',
+        title: titleOf('scout', String(event.data.repo ?? '')),
+        body: firstLine(String(event.data.message ?? ''), 200),
+        runId: null,
+        about: 'issues',
+      };
     case 'github.error':
       return {
         kind: 'github',

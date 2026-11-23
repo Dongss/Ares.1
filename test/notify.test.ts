@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { SCOUT_FAILURE_NOTIFY_AFTER } from '../src/config/flow.js';
 import { setLang } from '../src/i18n.js';
 import { BLOCK_KIND, NOTICE_KINDS, noticeFor } from '../src/notify/notice.js';
 import {
@@ -147,6 +148,54 @@ describe('system notifications', () => {
     const run = h.run('添加 feature.txt', blockOnAgentError());
     await h.waitStatus(run.id, 'blocked');
     expect(sent).toEqual([]);
+  });
+});
+
+describe('a scout that keeps failing', () => {
+  afterEach(() => setLang('zh'));
+  const failed = (data: Record<string, unknown>) => ({
+    id: 7,
+    runId: null,
+    ts: '2026-11-19T00:00:00.000Z',
+    type: 'scout.failed',
+    data: { scoutId: 'scout_1', repo: 'demo', message: '侦察结果不符合约定\n细节', ...data },
+  });
+
+  it('is notified once, when the failures in a row reach the threshold', () => {
+    expect(SCOUT_FAILURE_NOTIFY_AFTER).toBe(3);
+    expect(noticeFor(failed({ streak: 3 }), undefined)).toEqual({
+      kind: 'scout',
+      title: '侦察连续失败：demo',
+      body: '侦察结果不符合约定',
+      runId: null,
+      about: 'issues',
+    });
+    for (const streak of [0, 1, 2, 4, 10]) {
+      expect(noticeFor(failed({ streak }), undefined)).toBeNull();
+    }
+    // Events from before the streak was recorded, and scouts the Master cut short, have none.
+    expect(noticeFor(failed({}), undefined)).toBeNull();
+    expect(noticeFor(failed({ streak: '3' }), undefined)).toBeNull();
+  });
+
+  it('cuts a long error to its first line of 200 characters', () => {
+    const notice = noticeFor(failed({ streak: 3, message: `  ${'x'.repeat(300)}\nmore` }), 'g');
+    expect(notice?.body).toBe(`${'x'.repeat(200)}…`);
+  });
+
+  it('is told in English without Chinese', () => {
+    setLang('en');
+    const notice = noticeFor(
+      failed({ streak: 3, message: 'The scout did not end normally (timeout)\ndetails' }),
+      undefined,
+    );
+    expect(notice).toMatchObject({
+      kind: 'scout',
+      title: 'Scout keeps failing: demo',
+      body: 'The scout did not end normally (timeout)',
+    });
+    const text = `${notice?.title}\n${notice?.body}\n${NOTICE_KINDS.scout.when}`;
+    expect(text).not.toMatch(/[一-鿿]/);
   });
 });
 

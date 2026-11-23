@@ -45,6 +45,15 @@ describe('noticeFor automation', () => {
       noticeFor(ev('scout.completed', { created: 3, auto: 3, pending: 0 }, null), undefined),
     ).toBeNull();
     expect(noticeFor(ev('scout.failed', { message: '超时' }, null), undefined)).toBeNull();
+    // A scout that keeps failing: told at the third failure in a row.
+    const failing = { repo: 'demo', message: '超时\n详情' };
+    expect(noticeFor(ev('scout.failed', { ...failing, streak: 2 }, null), undefined)).toBeNull();
+    expect(noticeFor(ev('scout.failed', { ...failing, streak: 3 }, null), undefined)).toEqual({
+      title: '侦察连续失败：demo',
+      body: '超时',
+      href: '#/issues',
+      tag: 'ares1-event-42',
+    });
     // Out of quota passes on its own: the automatic scout waits for it, nobody needs to act.
     const limited = { scoutId: 's', repo: 'demo', retryAt: '2026-11-19T01:00:00.000Z' };
     expect(noticeFor(ev('scout.rate_limited', limited, null), undefined)).toBeNull();

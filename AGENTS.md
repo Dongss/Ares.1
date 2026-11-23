@@ -47,7 +47,8 @@ src/
     watch.ts          reload config when its files change
     flow.ts           effective stage settings, check commands, rollback targets, budgets,
                       which proposals are accepted automatically, the automatic scout's
-                      back-off, how long a Run or a scout waits for an agent's quota (rate
+                      back-off, how many scouts in a row failed (when a human is notified),
+                      how long a Run or a scout waits for an agent's quota (rate
                       limits), how long a failed Run of an issue waits before it is redone,
                       which Runs go on by themselves (redos to come included) and which only
                       wait for a human, how long raw agent logs are kept (`RAW_LOG_KEEP_DAYS`)

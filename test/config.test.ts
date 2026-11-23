@@ -12,6 +12,7 @@ import {
   redoDelayMs,
   redoDueAt,
   scoutBackoff,
+  scoutFailureStreak,
   scoutLimitWait,
   splitUnfinishedRuns,
 } from '../src/config/flow.js';
@@ -1209,6 +1210,38 @@ describe('scoutBackoff', () => {
     expect(scoutBackoff(scouts, 5)).toEqual({ count: 2, until: at(41 + 10) });
     expect(scoutBackoff([scout(10, 'rate_limited')], 5)).toBeNull();
     expect(scoutBackoff([scout(20, 'rate_limited'), scout(10, 'completed', filed)], 5)).toBeNull();
+  });
+});
+
+describe('scoutFailureStreak', () => {
+  const scouts = (...statuses: Scout['status'][]) => statuses.map((status) => ({ status }));
+
+  it('is 0 without scouts, or when the newest that ended completed', () => {
+    expect(scoutFailureStreak([])).toBe(0);
+    expect(scoutFailureStreak(scouts('completed', 'failed', 'failed'))).toBe(0);
+    expect(scoutFailureStreak(scouts('running', 'completed', 'failed'))).toBe(0);
+  });
+
+  it('counts failures in a row from the newest, up to a completed scout', () => {
+    expect(scoutFailureStreak(scouts('failed'))).toBe(1);
+    expect(scoutFailureStreak(scouts('failed', 'failed', 'failed'))).toBe(3);
+    expect(scoutFailureStreak(scouts('failed', 'failed', 'completed', 'failed'))).toBe(2);
+  });
+
+  it('skips scouts still running, cut short by the Master, or that hit a limit', () => {
+    const mixed = scouts(
+      'running',
+      'failed',
+      'rate_limited',
+      'interrupted',
+      'failed',
+      'rate_limited',
+      'failed',
+      'completed',
+      'failed',
+    );
+    expect(scoutFailureStreak(mixed)).toBe(3);
+    expect(scoutFailureStreak(scouts('rate_limited', 'interrupted', 'running'))).toBe(0);
   });
 });
 

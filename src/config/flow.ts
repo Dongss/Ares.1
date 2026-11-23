@@ -406,6 +406,32 @@ export function scoutBackoff(
 }
 
 /**
+ * Scouts failed in a row at which a human is notified: once per streak, when it reaches this many.
+ * A single failure only backs off (see scoutBackoff); a scout that keeps failing (its agent's
+ * config broken, its output not matching the format) would otherwise dry up the repo's new
+ * requirements without anybody knowing.
+ */
+export const SCOUT_FAILURE_NOTIFY_AFTER = 3;
+
+/**
+ * How many scouts in a row failed, counting back from the newest (started by hand or not). A
+ * completed scout ends the streak, whether it filed an issue or not: finding nothing is not
+ * failing. Scouts cut short by the Master stopping, still running, or whose agent ran out of quota
+ * or was rate-limited neither count nor end it, as in scoutBackoff. `scouts` are newest first.
+ */
+export function scoutFailureStreak(scouts: Pick<Scout, 'status'>[]): number {
+  let count = 0;
+  for (const s of scouts) {
+    if (s.status === 'interrupted' || s.status === 'running' || s.status === 'rate_limited') {
+      continue;
+    }
+    if (s.status !== 'failed') break;
+    count++;
+  }
+  return count;
+}
+
+/**
  * Days the raw output of agents (the CLI's stream: `<attempt>.jsonl` and its `.stderr` for a
  * Run's executions, `scouts/<scout>.jsonl` for a scout) is kept after the Run or scout ended. It
  * holds whole tool results (files read, test output) and grows without end on a Master that never

@@ -1221,6 +1221,55 @@ describe('issues: scout', () => {
     await expect(t.master.issues.startScout('demo', 'manual')).resolves.toBeDefined();
   });
 
+  it('counts scouts failed in a row, and notifies once when they reach 3', async () => {
+    const sent: string[] = [];
+    gh = new FakeGitHub();
+    const t = await harness({
+      agents: AGENTS,
+      config: `${config()}notify:\n  system: true\n`,
+      github: gh,
+      master: { notice: (title, body) => sent.push(`${title}|${body}`) },
+    });
+    h = t;
+    const broken: Script = () => ({ structured: { proposals: [{ title: '缺字段' }] } });
+    const limited: Script = () => ({
+      status: 'failed',
+      error: 'You have hit your limit',
+      errorKind: 'rate_limited',
+    });
+    const nothing: Script = () => ({ structured: { proposals: [] } });
+    const scripts = [broken, broken, limited, broken, broken, nothing, broken];
+    let n = 0;
+    t.scripts.scout = (ctx) => (scripts[n++] ?? nothing)(ctx);
+    const statuses: string[] = [];
+    for (const _ of scripts) {
+      const scout = await t.master.issues.startScout('demo', 'manual');
+      statuses.push((await scoutDone(t, scout.id)).status);
+      // Told at the third failure: the scout that hit a limit between them neither counts nor
+      // ends the streak.
+      expect(sent).toHaveLength(statuses.length >= 4 ? 1 : 0);
+    }
+    expect(statuses).toEqual([
+      'failed',
+      'failed',
+      'rate_limited',
+      'failed',
+      'failed',
+      'completed',
+      'failed',
+    ]);
+    const failed = t.master.store
+      .listEventsOfType('scout.failed', '1970-01-01T00:00:00.000Z')
+      .map((e) => e.data);
+    // A scout that ended normally, though it found nothing, starts the count over.
+    expect(failed.map((d) => d.streak)).toEqual([1, 2, 3, 4, 1]);
+    expect(failed[2]).toMatchObject({ repo: 'demo', streak: 3 });
+    expect(failed[2]?.message).toContain('侦察结果不符合约定');
+    // Told once for the streak, not again at the fourth failure.
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatch(/^侦察连续失败：demo\|侦察结果不符合约定/);
+  });
+
   it("reads the target branch's latest commit, not the main worktree, and leaves the repo as it was", async () => {
     const t = await start();
     const repoDir = t.repoDir;
@@ -1302,6 +1351,10 @@ describe('issues: scout', () => {
       status: 'interrupted',
       error: 'Master 在侦察过程中停止了',
     });
+    // Cut short, not failed: no streak, so it is never notified as a failure.
+    const [event] = second.master.store.listEventsOfType('scout.failed', '1970-01-01T00:00:00Z');
+    expect(event?.data).toMatchObject({ scoutId: scout.id });
+    expect(event?.data).not.toHaveProperty('streak');
   });
 
   it('cleans up temporary worktrees a previous Master left behind', async () => {
