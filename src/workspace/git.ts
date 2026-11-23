@@ -186,6 +186,26 @@ export async function resetHard(cwd: string, ref: string): Promise<void> {
   await git(cwd, ['clean', '-fdq']);
 }
 
+/**
+ * Put a worktree back on `branch` at `commit`, whatever was done there meanwhile: when another
+ * branch or a detached HEAD (a rebase, say, which is given up) is checked out, `branch` is checked
+ * out again, recreated if it was deleted; then `resetHard`, which also drops the commits the
+ * branch got past `commit`.
+ */
+export async function restoreTo(cwd: string, branch: string, commit: string): Promise<void> {
+  if ((await currentBranch(cwd).catch(() => null)) !== branch) {
+    await gitOk(cwd, ['rebase', '--quit']);
+    await git(cwd, ['checkout', '-f', '-q', '-B', branch, commit]);
+  }
+  await resetHard(cwd, commit);
+}
+
+/** Commits reachable from `to` but not from `from` (`git rev-list from..to`), newest first. */
+export async function commitsBetween(cwd: string, from: string, to: string): Promise<string[]> {
+  const out = await git(cwd, ['rev-list', `${from}..${to}`]);
+  return out.split('\n').filter(Boolean);
+}
+
 export function isAncestor(repo: string, ancestor: string, descendant: string): Promise<boolean> {
   return gitOk(repo, ['merge-base', '--is-ancestor', ancestor, descendant]);
 }

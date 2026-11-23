@@ -65,6 +65,7 @@ import {
   addWorktree,
   branchExists,
   commitAll,
+  commitsBetween,
   conflictedFiles,
   currentBranch,
   diffStat,
@@ -78,6 +79,7 @@ import {
   mergeOrAbort,
   removeWorktree,
   resetHard,
+  restoreTo,
   revParse,
   startMerge,
   targetCheckoutDirty,
@@ -252,6 +254,29 @@ interface WorkspaceProblem {
   reason: 'missing' | 'wrong_branch' | 'diverged';
   message: string;
 }
+
+/**
+ * What a stage that must not change the work (a review, commands) left in the worktree and the
+ * Master dropped (`discardStageWork`), as the stage's event records it.
+ */
+type DiscardedWork = {
+  /** The commit the stage started on, which the worktree is back on. */
+  fromHead: string;
+  /**
+   * Where the Run's branch was when the stage ended: fromHead when it had not moved, null when it
+   * was deleted.
+   */
+  toHead: string | null;
+  /** Commits the branch had got past fromHead, newest first (`git rev-list fromHead..toHead`). */
+  discardedCommits: string[];
+  /** Whether uncommitted changes were dropped. */
+  uncommitted: boolean;
+  /**
+   * What was checked out instead of the Run's branch: another branch, or null for a detached
+   * HEAD. Absent when the Run's branch was checked out.
+   */
+  checkedOut?: string | null;
+};
 
 /** Thrown inside a drive loop when the Run is being paused / cancelled / shut down. */
 class Aborted extends Error {}
@@ -2121,10 +2146,16 @@ export class Engine {
       signal,
     });
 
-    // A reviewer must not change code; drop anything it left behind.
-    if (await hasChanges(workdir)) {
-      await resetHard(workdir, 'HEAD');
-      this.store.event(run.id, 'review.changes_discarded', { attemptId: attempt.id });
+    // A reviewer must not change code; drop anything it left behind, its commits too, which
+    // would otherwise be merged unreviewed.
+    const discarded = await this.discardStageWork(run, head);
+    if (discarded) {
+      this.store.tx(() => {
+        this.store.event(run.id, 'review.changes_discarded', {
+          attemptId: attempt.id,
+          ...discarded,
+        });
+      });
     }
     this.checkAbort(signal);
 
@@ -2819,8 +2850,9 @@ export class Engine {
    * for its approval. When one fails, the stage fails with the command and the end of its output,
    * and `rollback` goes to `failTarget` (`on_fail` or the nearest earlier agent stage) with that as
    * feedback, counted toward max_loops like a review sending the work back. Whatever the commands
-   * left in the worktree is discarded, so that an agent going on from here does not commit it
-   * with its work. Interrupted (a pause, a restart), the stage runs its commands again.
+   * left in the worktree is discarded, commits they made included (`discardStageWork`), so that
+   * an agent going on from here does not commit it with its work and the merge does not take it
+   * in. Interrupted (a pause, a restart), the stage runs its commands again.
    */
   private async executeCommandStage(
     run: Run,
@@ -2840,6 +2872,8 @@ export class Engine {
       return;
     }
     if (this.blockOnMissingNode(run, sr.id)) return;
+    const before = await revParse(workdir, 'HEAD');
+    this.checkAbort(signal);
     const env = this.agentEnv();
     const results = await runCommands(commands, workdir, {
       timeoutMs: this.commandTimeoutMs(),
@@ -2847,12 +2881,17 @@ export class Engine {
       env,
       signal,
     });
-    this.checkAbort(signal);
-    if (await hasChanges(workdir)) {
-      await resetHard(workdir, 'HEAD');
-      this.checkAbort(signal);
-      this.store.event(run.id, 'command.discarded_changes', { stageId: sr.stageId });
+    // Also when interrupted: the commands run again later from the same commit.
+    const discarded = await this.discardStageWork(run, before);
+    if (discarded) {
+      this.store.tx(() => {
+        this.store.event(run.id, 'command.discarded_changes', {
+          stageId: sr.stageId,
+          ...discarded,
+        });
+      });
     }
+    this.checkAbort(signal);
     const failed = results.find((r) => !r.passed);
     // Not the code's failure: the stage stays executing and runs its commands again later.
     const missing = failed && environmentProblem(failed, env);
@@ -3165,6 +3204,40 @@ export class Engine {
         this.store.event(run.id, 'merge.unchecked_discarded', { head, to: run.headCommit });
       }
     }
+  }
+
+  /**
+   * After a stage that must not change the work (a review, commands): put the Run's worktree
+   * back on its branch at `from`, the commit the stage started on, when anything changed there.
+   * Uncommitted changes go, and so do commits made on the branch: the merge stage only runs the
+   * checks again on commits added on top, so a reviewer's own commit would otherwise be merged
+   * unreviewed. Another branch or a detached HEAD checked out is left for the Run's branch
+   * (commits made there are never merged). Returns what was dropped, for the stage's event, or
+   * null when nothing was.
+   */
+  private async discardStageWork(run: Run, from: string): Promise<DiscardedWork | null> {
+    const workdir = this.workdir(run);
+    const { branch } = run;
+    if (!branch) {
+      // Never the case: a Run gets its worktree and branch together.
+      if (!(await hasChanges(workdir))) return null;
+      await resetHard(workdir, from);
+      return { fromHead: from, toHead: from, discardedCommits: [], uncommitted: true };
+    }
+    const checkedOut = await currentBranch(workdir).catch(() => null);
+    const toHead = await revParse(workdir, `refs/heads/${branch}`).catch(() => null);
+    const uncommitted = await hasChanges(workdir);
+    if (checkedOut === branch && toHead === from && !uncommitted) return null;
+    const discardedCommits =
+      toHead && toHead !== from ? await commitsBetween(workdir, from, toHead) : [];
+    await restoreTo(workdir, branch, from);
+    return {
+      fromHead: from,
+      toHead,
+      discardedCommits,
+      uncommitted,
+      ...(checkedOut === branch ? {} : { checkedOut }),
+    };
   }
 
   private setStatus(runId: string, status: RunStatus, patch: Partial<Run> = {}): Run {

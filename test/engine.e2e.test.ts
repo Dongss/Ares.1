@@ -782,6 +782,70 @@ describe('engine: command stages', () => {
     expect(git(h.repoDir, 'ls-tree', '--name-only', 'main')).not.toContain('e2e-report.txt');
   });
 
+  it('drops commits the commands made; whether the stage passes is up to their exit codes', async () => {
+    // Fails until the coder writes "fixed", committing a report either way.
+    const command =
+      'grep -q fixed feature.txt; s=$?; echo report > cmd.txt && git add -A && git -c user.name=cmd -c user.email=cmd@example.com commit -q -m cmd && exit $s';
+    h = await harness({
+      workflow: withCommandStage(`    verify:\n      commands: [${JSON.stringify(command)}]\n`),
+    });
+    let round = 0;
+    const sawReport: boolean[] = [];
+    h.scripts.coder = (ctx) => {
+      round++;
+      sawReport.push(existsSync(join(ctx.input.workdir, 'cmd.txt')));
+      writeFile(join(ctx.input.workdir, 'feature.txt'), round === 1 ? 'ok\n' : 'ok fixed\n');
+      return done();
+    };
+    const run = h.run();
+    const waiting = await h.waitStatus(run.id, 'waiting_approval');
+    expect(stagesOf(run.id)).toEqual([
+      ['implement', 'passed'],
+      ['review', 'passed'],
+      ['e2e', 'failed'],
+      ['implement', 'passed'],
+      ['review', 'passed'],
+      ['e2e', 'passed'],
+      ['merge', 'waiting_approval'],
+    ]);
+    // The coder went on from its own commit, without the commands' one.
+    expect(sawReport).toEqual([false, false]);
+    const worktree = waiting.worktreePath as string;
+    expect(git(worktree, 'rev-parse', 'HEAD')).toBe(waiting.headCommit);
+    expect(git(worktree, 'symbolic-ref', '--short', 'HEAD')).toBe(waiting.branch);
+    expect(existsSync(join(worktree, 'cmd.txt'))).toBe(false);
+
+    const discarded = store()
+      .listEvents(run.id)
+      .filter((e) => e.type === 'command.discarded_changes')
+      .map((e) => e.data);
+    expect(discarded).toHaveLength(2);
+    // The second time, on the coder's second commit, which is the one merged.
+    expect(discarded[1]?.fromHead).toBe(waiting.headCommit);
+    for (const data of discarded) {
+      const commits = data.discardedCommits as string[];
+      expect(commits).toHaveLength(1);
+      expect(data).toEqual({
+        stageId: 'e2e',
+        fromHead: expect.any(String),
+        toHead: commits[0],
+        discardedCommits: commits,
+        uncommitted: false,
+      });
+      expect(git(h.repoDir, 'log', '-1', '--format=%s', commits[0] as string)).toBe('cmd');
+      expect(git(h.repoDir, 'rev-parse', `${commits[0]}^`)).toBe(data.fromHead);
+    }
+
+    h.master.engine.approve(run.id);
+    await h.waitStatus(run.id, 'completed');
+    expect(git(h.repoDir, 'show', 'main:feature.txt')).toBe('ok fixed');
+    expect(git(h.repoDir, 'ls-tree', '--name-only', 'main')).not.toContain('cmd.txt');
+    const merged = git(h.repoDir, 'log', '--format=%H', 'main').split('\n');
+    for (const data of discarded) {
+      expect(merged).not.toContain((data.discardedCommits as string[])[0]);
+    }
+  });
+
   it("runs the repo's verify commands when it names none, and passes when there are none", async () => {
     h = await harness({
       workflow: withCommandStage(''),
@@ -959,6 +1023,156 @@ describe('engine: command stages', () => {
     expect(checksOf(run.id, 'e2e').map((c) => c.passed)).toEqual([true]);
     expect(existsSync(join(waiting.worktreePath as string, 'partial.txt'))).toBe(false);
     expect(h.fake.calls).toEqual([]);
+  });
+});
+
+describe('engine: a reviewer does not change the work', () => {
+  const store = () => (h as Harness).master.store;
+  const discardedOf = (runId: string) =>
+    store()
+      .listEvents(runId)
+      .filter((e) => e.type === 'review.changes_discarded')
+      .map((e) => e.data);
+  const reviewAttempt = (runId: string) =>
+    store()
+      .listRunAttempts(runId)
+      .find((a) => a.agentId === 'reviewer')?.id;
+  /** The worktree is on the Run's branch at the commit the coder made, with nothing else. */
+  const expectCoderWork = (waiting: Run) => {
+    const worktree = waiting.worktreePath as string;
+    expect(git(worktree, 'symbolic-ref', '--short', 'HEAD')).toBe(waiting.branch);
+    expect(git(worktree, 'rev-parse', 'HEAD')).toBe(waiting.headCommit);
+    expect(git(worktree, 'log', '--format=%s', `${waiting.baseCommit}..HEAD`)).toBe(
+      '编码: 添加 feature.txt',
+    );
+    expect(git(worktree, 'status', '--porcelain')).toBe('');
+    expect(readFileSync(join(worktree, 'feature.txt'), 'utf8')).toBe('ok\n');
+  };
+  const approveAndMerge = async (runId: string) => {
+    h?.master.engine.approve(runId);
+    await h?.waitStatus(runId, 'completed');
+    const repoDir = (h as Harness).repoDir;
+    expect(git(repoDir, 'show', 'main:feature.txt')).toBe('ok');
+    expect(git(repoDir, 'ls-tree', '--name-only', 'main').split('\n')).toEqual([
+      'README.md',
+      'feature.txt',
+    ]);
+    return git(repoDir, 'log', '--format=%H', 'main').split('\n');
+  };
+
+  it('drops a commit the reviewer made, which is then not merged', async () => {
+    h = await harness();
+    let commit = '';
+    h.scripts.reviewer = (ctx) => {
+      const wd = ctx.input.workdir;
+      writeFile(join(wd, 'feature.txt'), 'changed by the reviewer\n');
+      writeFile(join(wd, 'reviewer.txt'), 'unreviewed\n');
+      git(wd, 'add', '-A');
+      git(wd, 'commit', '-q', '-m', 'reviewer');
+      commit = git(wd, 'rev-parse', 'HEAD');
+      return review();
+    };
+    const run = h.run();
+    const waiting = await h.waitStatus(run.id, 'waiting_approval');
+    expectCoderWork(waiting);
+    expect(discardedOf(run.id)).toEqual([
+      {
+        attemptId: reviewAttempt(run.id),
+        fromHead: waiting.headCommit,
+        toHead: commit,
+        discardedCommits: [commit],
+        uncommitted: false,
+      },
+    ]);
+    expect(await approveAndMerge(run.id)).not.toContain(commit);
+  });
+
+  it('drops what the reviewer left uncommitted', async () => {
+    h = await harness();
+    h.scripts.reviewer = (ctx) => {
+      writeFile(join(ctx.input.workdir, 'feature.txt'), 'changed by the reviewer\n');
+      writeFile(join(ctx.input.workdir, 'reviewer.txt'), 'unreviewed\n');
+      return review();
+    };
+    const run = h.run();
+    const waiting = await h.waitStatus(run.id, 'waiting_approval');
+    expectCoderWork(waiting);
+    expect(discardedOf(run.id)).toEqual([
+      {
+        attemptId: reviewAttempt(run.id),
+        fromHead: waiting.headCommit,
+        toHead: waiting.headCommit,
+        discardedCommits: [],
+        uncommitted: true,
+      },
+    ]);
+    await approveAndMerge(run.id);
+  });
+
+  it("switches back to the Run's branch when the reviewer checked out another one", async () => {
+    h = await harness();
+    let onRunBranch = '';
+    let onOtherBranch = '';
+    h.scripts.reviewer = (ctx) => {
+      const wd = ctx.input.workdir;
+      writeFile(join(wd, 'reviewer.txt'), 'unreviewed\n');
+      git(wd, 'add', '-A');
+      git(wd, 'commit', '-q', '-m', 'reviewer on the Run branch');
+      onRunBranch = git(wd, 'rev-parse', 'HEAD');
+      git(wd, 'checkout', '-q', '-b', 'reviewer-branch');
+      writeFile(join(wd, 'other.txt'), 'elsewhere\n');
+      git(wd, 'add', '-A');
+      git(wd, 'commit', '-q', '-m', 'reviewer on another branch');
+      onOtherBranch = git(wd, 'rev-parse', 'HEAD');
+      writeFile(join(wd, 'left.txt'), 'uncommitted\n');
+      return review();
+    };
+    const run = h.run();
+    const waiting = await h.waitStatus(run.id, 'waiting_approval');
+    expectCoderWork(waiting);
+    expect(discardedOf(run.id)).toEqual([
+      {
+        attemptId: reviewAttempt(run.id),
+        fromHead: waiting.headCommit,
+        toHead: onRunBranch,
+        discardedCommits: [onRunBranch],
+        uncommitted: true,
+        checkedOut: 'reviewer-branch',
+      },
+    ]);
+    // What the reviewer committed on its own branch stays there, never merged.
+    expect(git(h.repoDir, 'rev-parse', 'reviewer-branch')).toBe(onOtherBranch);
+    const merged = await approveAndMerge(run.id);
+    expect(merged).not.toContain(onRunBranch);
+    expect(merged).not.toContain(onOtherBranch);
+  });
+
+  it('goes back to the Run branch from a detached HEAD, also when the review failed', async () => {
+    h = await harness();
+    let calls = 0;
+    h.scripts.reviewer = (ctx) => {
+      calls++;
+      if (calls > 1) return review();
+      const wd = ctx.input.workdir;
+      writeFile(join(wd, 'reviewer.txt'), 'unreviewed\n');
+      git(wd, 'add', '-A');
+      git(wd, 'commit', '-q', '-m', 'reviewer');
+      git(wd, 'checkout', '-q', '--detach', 'HEAD~1');
+      return { status: 'failed', error: 'crashed' };
+    };
+    const run = h.run();
+    const waiting = await h.waitStatus(run.id, 'waiting_approval');
+    expectCoderWork(waiting);
+    const discarded = discardedOf(run.id);
+    expect(discarded).toHaveLength(1);
+    expect(discarded[0]).toMatchObject({
+      fromHead: waiting.headCommit,
+      uncommitted: false,
+      checkedOut: null,
+    });
+    expect(discarded[0]?.discardedCommits).toEqual([discarded[0]?.toHead]);
+    expect(calls).toBe(2);
+    await approveAndMerge(run.id);
   });
 });
 
