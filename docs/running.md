@@ -106,7 +106,7 @@ Run 的目标是建 Run 时从 issue 读的标题和正文。Run 还没进入合
 - 旧 Run 被终止，事件列表里记一条 `run.goal_changed`（数据里有 `repo`、`issue` 和新 Run 的 id `newRun`）。这不算失败，也不算人终止的：issue 不会打上 `ares1:failed`，也没有「Run 已终止」的评论，标签保持 `ares1:running`。
 - 按新内容新建一个 Run，模板和 `auto_merge` 的设置和加 `ares1:ready` 时一样，从头开始（流程里有需求评估的话重新评估）。它沿用旧 Run 是第几次尝试和之前几次失败的原因，不多算一次，不占 `max_run_attempts`。
 - issue 上发一条评论，写明内容改了、终止了哪个旧 Run、按新内容开始了哪个 Run，附上看板链接。
-- 旧 Run 的工作目录和分支马上自动删掉，Run 的记录、日志和产物都保留。删掉时在旧 Run 上记一条 `workspace.removed`（数据里有路径、分支、`reason: goal_changed` 和 `newRun`）；删不掉时记一条 `workspace.cleanup_failed`（数据里有 `reason`、`newRun` 和 `error`），新 Run 不受影响，剩下的要手动清理。
+- 旧 Run 的工作目录和分支马上自动删掉，Run 的记录、日志和产物都保留。删掉时在旧 Run 上记一条 `workspace.removed`（数据里有路径、分支、`reason: goal_changed` 和 `newRun`）；删不掉时记一条 `workspace.cleanup_failed`（数据里有 `reason`、`newRun` 和 `error`），新 Run 不受影响。删不掉的、或者 Master 还没来得及删就停了的，之后会再补删（见下面的「补删遗留的工作目录」）。
 - 只比较标题和正文：正文首尾的空白和侦察提案的页脚不算，改标签、写评论都不会重来。需求评估改写过的目标只记在讨论记录里，不影响比较。
 - 暂停的、卡住等人的、等需求评估回复的 Run 也会重来：等回复时改 issue，往往就是在回答问题。
 
@@ -136,9 +136,22 @@ github:
 - 用完 `max_run_attempts` 次后不再重做：评论列出每次失败的原因，issue 打上 `ares1:failed`，关闭为 not planned。这不等于不要这个需求：侦察读到这类 issue 时知道它不是人拒绝的，可以换个思路重新提案。要按原样再做，重新打开 issue 并加上 `ares1:ready`。工作目录和分支只保留最后一次尝试的，更早几次的自动删掉（见下面）。
 - 人加 `ares1:ready` 开始的 Run 是第 1 次；之后重新加 `ares1:ready`，次数从头算。等待重做期间关闭 issue，到时间后就不再重做（事件列表里记一条 `issue.redo_abandoned`），issue 保持你留下的样子。
 - 被终止的 Run（人在看板上终止，或者关闭了 issue）不重做，issue 打上 `ares1:failed`，等你决定。
-- 重做成功合并后（同一 issue 的 Run 完成时），这个 issue 之前失败的 Run 的工作目录和分支会自动删掉：失败原因已经记在 Run 的 `error` 和 issue 评论里，代码以完成的那次为准，留着只会占磁盘（每个工作目录都带着准备命令装的依赖）。Run 的记录、日志和产物都保留。每删掉一个，就在那个 Run 的事件列表里记一条 `workspace.removed`，数据里有路径、分支、`reason: superseded` 和完成的 Run 的 id（`supersededBy`）。删不掉时（比如分支在别处检出）在那个 Run 上记一条 `workspace.cleanup_failed`（数据里有 `reason`、`supersededBy` 和 `error`），接着删下一个，完成的 Run 不受影响，剩下的要手动清理。
-- issue 用完 `max_run_attempts` 被关闭后，只保留最后一次失败的 Run 的工作目录和分支，留给人看现场；更早几次失败的 Run 的工作目录和分支自动删掉：最后一次已经带上了前几次的失败原因，前几次的原因也记在各自 Run 的 `error` 和 issue 评论里。这样每个失败关闭的 issue 只占一份磁盘。Run 的记录、日志和产物都保留。每删掉一个，就在那个 Run 的事件列表里记一条 `workspace.removed`，数据里有路径、分支、`reason: retries_exhausted` 和保留的最后一次 Run 的 id（`keptRun`）。删不掉时在那个 Run 上记一条 `workspace.cleanup_failed`（数据里有 `reason`、`keptRun` 和 `error`），接着删下一个，issue 的关闭和评论不受影响、不会重复，剩下的要手动清理。
+- 重做成功合并后（同一 issue 的 Run 完成时），这个 issue 之前失败的 Run 的工作目录和分支会自动删掉：失败原因已经记在 Run 的 `error` 和 issue 评论里，代码以完成的那次为准，留着只会占磁盘（每个工作目录都带着准备命令装的依赖）。Run 的记录、日志和产物都保留。每删掉一个，就在那个 Run 的事件列表里记一条 `workspace.removed`，数据里有路径、分支、`reason: superseded` 和完成的 Run 的 id（`supersededBy`）。删不掉时（比如分支在别处检出）在那个 Run 上记一条 `workspace.cleanup_failed`（数据里有 `reason`、`supersededBy` 和 `error`），接着删下一个，完成的 Run 不受影响，删不掉的之后再补删（见下面的「补删遗留的工作目录」）。
+- issue 用完 `max_run_attempts` 被关闭后，只保留最后一次失败的 Run 的工作目录和分支，留给人看现场；更早几次失败的 Run 的工作目录和分支自动删掉：最后一次已经带上了前几次的失败原因，前几次的原因也记在各自 Run 的 `error` 和 issue 评论里。这样每个失败关闭的 issue 只占一份磁盘。Run 的记录、日志和产物都保留。每删掉一个，就在那个 Run 的事件列表里记一条 `workspace.removed`，数据里有路径、分支、`reason: retries_exhausted` 和保留的最后一次 Run 的 id（`keptRun`）。删不掉时在那个 Run 上记一条 `workspace.cleanup_failed`（数据里有 `reason`、`keptRun` 和 `error`），接着删下一个，issue 的关闭和评论不受影响、不会重复，删不掉的之后再补删（见下面的「补删遗留的工作目录」）。
 - 被终止的 Run（因为 issue 改过而自动终止的除外，见上面的「Run 期间改了 issue」）、不是从 issue 来的 Run 和最终失败关闭的 issue 最后一次尝试的 Run 仍然保留，要在看板上手动清理（「工作区」页或 Run 详情页）。
+
+### 补删遗留的工作目录
+
+上面三处自动删除（重做成功后删之前失败的尝试，重做次数用完后只留最后一次，issue 改过后删旧 Run 的）都只在那一刻做一次。Master 在那之前崩溃、被升级重启或正在关闭，或者那次 git 删除失败，工作目录和分支就会留下来；没人照看时它们会越积越多（每个都带着依赖），所以 Master 会再补删：
+
+- 时机：Master 启动、恢复完上次没做完的 Run 之后补删一次，之后每天和原始日志的清理（见上面的「原始日志的保留期」）一起补删一次。补删不占执行位，有 Run 正在执行时照样进行，只动下面这些失败或终止的 Run 自己的工作目录和分支。Master 关闭时做完手上这一个就停，剩下的下次再补。
+- 补删哪些：工作目录或分支还在，而且满足下面任一条的 Run，删除原因和当时那次一样：
+  - 失败的 Run，同一 issue 之后有 Run 完成了：`reason: superseded`，`supersededBy` 是它之后第一个完成的 Run。
+  - 失败的 Run，同一 issue 最新的 Run 也失败了，并且次数已经用完（`issue.redo` 为 `exhausted`，或者记过 `issue.retries_exhausted`）：除最新的这个外都删，`reason: retries_exhausted`，`keptRun` 是最新的这个。
+  - 失败的 Run，出现在另一个 Run 的 `issue.retries_exhausted` 的 `runIds` 里（不是记这条事件的 Run 自己）：`reason: retries_exhausted`，`keptRun` 是记这条事件的 Run。issue 用完次数后被人重新加 `ares1:ready`、新的 Run 还在做时，也照样删掉这些更早的尝试。
+  - 因为 issue 改过而被终止的 Run（记过 `run.goal_changed`）：`reason: goal_changed`，`newRun` 取那条事件里的。
+- 不碰：人在看板上终止的 Run、关闭 issue 终止的 Run、还没结束的 Run（排队、执行中、等审批、卡住、暂停）、失败后还要重做的 Run、每个 issue 最后一次失败的 Run，以及不是从 issue 来的 Run。
+- 记录：删掉时照旧在那个 Run 上记一条 `workspace.removed`（数据和当时那次一样：路径、分支、`reason` 和对应的 Run id）。已经记过 `workspace.cleanup_failed` 的 Run 照样再试，还是删不掉就再记一条 `workspace.cleanup_failed`，接着删下一个，不影响 Master。已经删掉或者本来就不在的不再处理，所以重复补删不会重复记事件。补删整体出错（比如读数据库失败）只在 Master 的输出里打一行警告，下一轮再试。
 
 ### 只信任仓库成员写的内容
 

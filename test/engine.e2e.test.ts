@@ -4012,4 +4012,225 @@ github:
     expect(gh.get(1).comments).toHaveLength(comments);
     expect(eventData(t, first.id, 'workspace.cleanup_failed')).toHaveLength(1);
   });
+
+  /** Close the Master and open another on the same home, repo and GitHub. */
+  const restart = async (t: Harness) => {
+    await t.close();
+    h = await harness({
+      config: CONFIG,
+      github: gh,
+      workflow: WORKFLOW,
+      home: t.home,
+      repoDir: t.repoDir,
+    });
+    return h;
+  };
+  const removedAtStart = (t: Harness, runIds: string[]) =>
+    waitFor(
+      () => runIds.every((id) => eventData(t, id, 'workspace.removed').length > 0),
+      'the leftover workspaces to be removed',
+    );
+
+  it('removes at the next start the failed attempt a redo completed after, when the Master stopped first', async () => {
+    const t = await start();
+    const { engine, issues, store } = t.master;
+    let calls = 0;
+    t.scripts.coder = (ctx) => {
+      if (++calls === 1) return { status: 'failed', error: '模型额度用完了' };
+      writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+      return done('写了 feature.txt');
+    };
+    gh.add({ title: '加 feature', labels: [LABELS.ready] });
+    await issues.poll();
+    const first = await t.waitStatus(nth(t, 1, 0).id, 'failed');
+    await issues.sync();
+    // The Master stops the moment the redo completes, before it removes the earlier attempt.
+    store.bus.on('event', (e) => {
+      if (e.type === 'run.status' && e.data.status === 'completed') void engine.stop();
+    });
+    await redo(t);
+    const second = await completed(t, nth(t, 1, 1).id);
+    expect(second.status).toBe('completed');
+    expect(kept(t, first)).toEqual({ worktree: true, branch: true });
+    expect(eventData(t, first.id, 'workspace.removed')).toEqual([]);
+
+    const next = await restart(t);
+    await removedAtStart(next, [first.id]);
+    expect(kept(next, first)).toEqual({ worktree: false, branch: false });
+    expect(eventData(next, first.id, 'workspace.removed')).toEqual([
+      {
+        path: first.worktreePath,
+        branch: first.branch,
+        reason: 'superseded',
+        supersededBy: second.id,
+      },
+    ]);
+    expect(next.master.store.getRun(first.id)).toMatchObject({
+      status: 'failed',
+      error: first.error,
+    });
+  });
+
+  it('keeps only the last attempt at the next start when the issue was caught up but nothing removed', async () => {
+    const t = await start();
+    const { engine, issues, store } = t.master;
+    t.scripts.coder = () => ({ status: 'failed', error: '模型额度用完了' });
+    // The Master stops right after the issue is caught up, before it removes anything.
+    const removal = vi.spyOn(engine, 'removeExhaustedAttempts').mockResolvedValue();
+    gh.add({ title: '加 feature', labels: [LABELS.ready] });
+    await issues.poll();
+    const [first, second, last] = (await failAllAttempts(t, 1, 0)) as [Run, Run, Run];
+    expect(removal).toHaveBeenCalledTimes(1);
+    expect(store.getRun(last.id).issueSynced).toBe('failed');
+    expect(gh.get(1)).toMatchObject({ state: 'closed', stateReason: 'not_planned' });
+    for (const run of [first, second, last]) {
+      expect(kept(t, run)).toEqual({ worktree: true, branch: true });
+    }
+
+    const next = await restart(t);
+    await removedAtStart(next, [first.id, second.id]);
+    for (const run of [first, second]) {
+      expect(kept(next, run)).toEqual({ worktree: false, branch: false });
+      expect(eventData(next, run.id, 'workspace.removed')).toEqual([
+        {
+          path: run.worktreePath,
+          branch: run.branch,
+          reason: 'retries_exhausted',
+          keptRun: last.id,
+        },
+      ]);
+    }
+    expect(kept(next, last)).toEqual({ worktree: true, branch: true });
+    expect(eventData(next, last.id, 'workspace.removed')).toEqual([]);
+  });
+
+  it('removes the worktree of a Run terminated for a changed issue that was not removed then', async () => {
+    const t = await start();
+    const { engine, issues, store } = t.master;
+    // Every Run keeps coding until it is stopped.
+    let calls = 0;
+    t.scripts.coder = () => {
+      calls++;
+      return new Promise(() => {});
+    };
+    // The Master stops after the comment, before it removes the old Run's worktree.
+    const removal = vi.spyOn(engine, 'removeGoalChangedWorkspace').mockResolvedValue();
+    gh.add({ title: '加 feature', body: '旧写法照旧能用', labels: [LABELS.ready] });
+    await issues.poll();
+    await waitFor(() => calls === 1, 'the coder');
+    await issues.sync();
+    const old = store.getRun(nth(t, 1, 0).id);
+    gh.get(1).body = '不保留旧写法';
+    await issues.poll();
+    const changed = nth(t, 1, 1);
+    expect(store.getRun(old.id).status).toBe('cancelled');
+    expect(removal).toHaveBeenCalledWith(old.id, changed.id);
+    expect(kept(t, old)).toEqual({ worktree: true, branch: true });
+    // The new Run executes meanwhile.
+    await waitFor(() => calls === 2, 'the new Run to code');
+    const running = store.getRun(changed.id);
+    expect(running.status).toBe('running');
+
+    await engine.sweepLeftoverWorkspaces();
+    expect(kept(t, old)).toEqual({ worktree: false, branch: false });
+    expect(eventData(t, old.id, 'workspace.removed')).toEqual([
+      { path: old.worktreePath, branch: old.branch, reason: 'goal_changed', newRun: changed.id },
+    ]);
+    // The executing Run is not touched.
+    expect(store.getRun(changed.id).status).toBe('running');
+    expect(kept(t, running)).toEqual({ worktree: true, branch: true });
+    expect(eventData(t, changed.id, 'workspace.removed')).toEqual([]);
+  });
+
+  it('leaves Runs a human terminated, unfinished Runs and last attempts alone, and records each removal once', async () => {
+    const t = await start();
+    const { engine, issues, store } = t.master;
+    let coder: 'hang' | 'fail' = 'fail';
+    let hangs = 0;
+    t.scripts.coder = () => {
+      if (coder === 'fail') return { status: 'failed', error: '模型额度用完了' };
+      hangs++;
+      return new Promise(() => {});
+    };
+
+    // #1 uses up its attempts; the first one's branch is checked out elsewhere, so its removal
+    // fails and is recorded.
+    gh.add({ title: '用完重做次数', labels: [LABELS.ready] });
+    await issues.poll();
+    const blocked = await t.waitStatus(nth(t, 1, 0).id, 'failed');
+    const elsewhere = join(tmpDir(), 'elsewhere');
+    git(t.repoDir, 'worktree', 'add', '-q', '-f', elsewhere, blocked.branch as string);
+    const [, , last] = (await failAllAttempts(t, 1, 0)) as [Run, Run, Run];
+    expect(eventData(t, blocked.id, 'workspace.cleanup_failed')).toHaveLength(1);
+    // #2: a human terminates its Run, then starts the issue over; the new Run fails, its redo
+    // still to come.
+    coder = 'hang';
+    gh.add({ title: '人终止过', labels: [LABELS.ready] });
+    await issues.poll();
+    await waitFor(() => hangs === 1, 'the coder');
+    const cancelled = await engine.cancel(nth(t, 2, 0).id);
+    await issues.sync();
+    coder = 'fail';
+    gh.get(2).labels.push(LABELS.ready);
+    await issues.poll();
+    const pending = await t.waitStatus(nth(t, 2, 1).id, 'failed');
+    await issues.sync();
+    expect(store.getRun(pending.id).issue?.redo).toBe('pending');
+    // #3 executes meanwhile.
+    coder = 'hang';
+    gh.add({ title: '还在做', labels: [LABELS.ready] });
+    await issues.poll();
+    await waitFor(() => hangs === 2, 'the coder of #3');
+    const running = store.getRun(nth(t, 3, 0).id);
+    expect(running.status).toBe('running');
+
+    const untouched = [last, cancelled, pending, running];
+    const counts = () =>
+      [blocked, ...untouched].map((r) => [
+        eventData(t, r.id, 'workspace.removed').length,
+        eventData(t, r.id, 'workspace.cleanup_failed').length,
+      ]);
+    const check = () => {
+      for (const run of untouched) {
+        expect(kept(t, store.getRun(run.id))).toEqual({ worktree: true, branch: true });
+        expect(eventData(t, run.id, 'workspace.removed')).toEqual([]);
+        expect(eventData(t, run.id, 'workspace.cleanup_failed')).toEqual([]);
+      }
+      expect(store.getRun(running.id).status).toBe('running');
+    };
+
+    // Still checked out elsewhere: tried again, recorded again, nothing thrown.
+    await engine.sweepLeftoverWorkspaces();
+    expect(eventData(t, blocked.id, 'workspace.cleanup_failed')).toEqual([
+      expect.objectContaining({ reason: 'retries_exhausted', keptRun: last.id }),
+      {
+        reason: 'retries_exhausted',
+        keptRun: last.id,
+        error: expect.stringContaining(`分支 ${blocked.branch}`),
+      },
+    ]);
+    expect(eventData(t, blocked.id, 'workspace.removed')).toEqual([]);
+    check();
+
+    // Free again: removed this time.
+    git(t.repoDir, 'worktree', 'remove', '--force', elsewhere);
+    await engine.sweepLeftoverWorkspaces();
+    expect(kept(t, blocked)).toEqual({ worktree: false, branch: false });
+    expect(eventData(t, blocked.id, 'workspace.removed')).toEqual([
+      {
+        path: blocked.worktreePath,
+        branch: blocked.branch,
+        reason: 'retries_exhausted',
+        keptRun: last.id,
+      },
+    ]);
+    check();
+
+    // Nothing left: calling it again records nothing more.
+    const before = counts();
+    await engine.sweepLeftoverWorkspaces();
+    await engine.sweepLeftoverWorkspaces();
+    expect(counts()).toEqual(before);
+    check();
+  });
 });

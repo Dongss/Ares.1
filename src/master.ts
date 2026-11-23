@@ -22,7 +22,7 @@ import { ConfigWatcher } from './config/watch.js';
 import { Engine } from './engine/engine.js';
 import { IssueBridge } from './github/bridge.js';
 import type { GitHub } from './github/client.js';
-import { type Lang, lang, setLang } from './i18n.js';
+import { type Lang, lang, setLang, t } from './i18n.js';
 import { RawLogPruner } from './logs/prune.js';
 import { type SendNotice, SystemNotifier } from './notify/system.js';
 import { backupRestoredNotice, Store } from './store/store.js';
@@ -32,7 +32,7 @@ import {
   type UpgradePlan,
   Upgrader,
 } from './upgrade/upgrader.js';
-import { newId, nowIso, parseJson } from './util.js';
+import { errorMessage, newId, nowIso, parseJson } from './util.js';
 import { git, revParse } from './workspace/git.js';
 
 /** CLIs with a built-in adapter. */
@@ -291,7 +291,18 @@ export class Master {
       platform: opts.platform,
       now: opts.now,
     });
-    const logPruner = new RawLogPruner(store, opts.now);
+    // Leftover worktrees of failed and cancelled Runs go with the raw logs: at start, once the
+    // engine has recovered the Runs, and then daily.
+    const logPruner = new RawLogPruner(store, opts.now, () => {
+      engine.sweepLeftoverWorkspaces().catch((err) => {
+        console.warn(
+          t({
+            zh: `[工作目录] 补删失败尝试和改过需求的旧 Run 留下的工作目录失败：${errorMessage(err)}`,
+            en: `[workspaces] Could not remove the leftover working directories of failed attempts and of Runs whose issue changed: ${errorMessage(err)}`,
+          }),
+        );
+      });
+    });
     master = new Master(paths, watcher, store, engine, issues, notifier, upgrader, logPruner, app);
     // Before the engine recovers the Runs the last Master left, so that the event comes first.
     master.runningToken = markRunning(paths, store);

@@ -51,7 +51,9 @@ src/
                       how long a Run or a scout waits for an agent's quota (rate
                       limits), how long a failed Run of an issue waits before it is redone,
                       which Runs go on by themselves (redos to come included) and which only
-                      wait for a human, how long raw agent logs are kept (`RAW_LOG_KEEP_DAYS`)
+                      wait for a human, how long raw agent logs are kept (`RAW_LOG_KEEP_DAYS`),
+                      which worktrees of failed or cancelled Runs of issues are left over for the
+                      Master to remove (`leftoverWorkspaces`)
                       (shared by engine, GitHub bridge, API and dashboard)
     effort.ts         helpers for agent effort (shared by engine and dashboard)
   store/              SQLite store (node:sqlite): store.ts, migrations.ts, types.ts (entity types)
@@ -63,7 +65,8 @@ src/
   engine/
     engine.ts         workflow engine: queue, state machine, checks, rework, agent errors (retry
                       with backoff, switching agents), rollback, approvals, merge, recovery after
-                      restart
+                      restart, removing the worktrees of superseded, exhausted and goal-changed
+                      Runs (and again later what was left over: `sweepLeftoverWorkspaces`)
     prompts.ts        prompts for the assess, coding and review agents
     contracts.ts      agents' structured output: contract and validation
     discussion.ts     how an assessment's conclusion and discussion are found and named
@@ -93,7 +96,8 @@ src/
     source.ts         which registered repo is the Master's own source (from the install
                       directory's origin), whose scout is shown failed upgrades
   logs/prune.ts       deletes the raw agent output (CLI stream and stderr) of Runs and scouts past
-                      retention, at start and daily; records logs.pruned
+                      retention, at start and daily; records logs.pruned; each round also starts
+                      the engine's sweep of leftover worktrees (wired in master.ts)
   workspace/git.ts    git: worktrees, commits, rollback, merge, fast-forward
   verify/commands.ts  run check commands and setup commands; whether a failed one failed for the
                       environment (exit code 127, its first program not in PATH), and whether a
@@ -161,7 +165,9 @@ test/
     automatic scout's back-off, the waits for an agent's quota (rate limits) of Runs and scouts,
     the wait before a failed Run of an issue is redone (`redoDelayMs` / `redoDueAt`), which
     unfinished Runs and redos the scout waits for, which raw agent logs are past retention
-    (`runRawLogsExpired` / `scoutRawLogExpired`) and the like: `src/config/flow.ts`
+    (`runRawLogsExpired` / `scoutRawLogExpired`), which worktrees of failed or cancelled Runs
+    are left over for the Master to remove (`leftoverWorkspaces`) and the like:
+    `src/config/flow.ts`
   - notification rules: `src/notify/notice.ts`
   - assessment conclusion rules: `src/engine/discussion.ts`
   - how a Run's time is split, and the names and groups of the parts: `src/engine/times.ts`

@@ -2,13 +2,14 @@
 // also the overrides of Runs from issues, which proposals are accepted automatically, how long
 // the automatic scout backs off and which Runs it waits for, how long a failed Run of an issue
 // waits before it is redone, how long a Run or a scout waits for an agent that is out of
-// quota or rate-limited, and how long the raw output of agents is kept.
+// quota or rate-limited, how long the raw output of agents is kept, and which worktrees of
+// failed or cancelled Runs of issues are left over for the Master to remove.
 // Pure logic (type imports, src/i18n.ts, src/store/types.ts and src/engine/discussion.ts only),
 // so the dashboard shows the same rules the engine applies.
 
 import { replyDeadline } from '../engine/discussion.js';
 import { t } from '../i18n.js';
-import { FINISHED_RUN_STATUSES, type Run, type Scout } from '../store/types.js';
+import { type EventRow, FINISHED_RUN_STATUSES, type Run, type Scout } from '../store/types.js';
 import type { Escalate, RunOverrides, StageDef, WorkflowTemplate } from './schema.js';
 
 /** Risk of a proposal, ordered; auto-accept takes everything up to a chosen level. */
@@ -463,6 +464,111 @@ export function runRawLogsExpired(
 /** Whether a scout's raw log is past retention at `now`: it ended over RAW_LOG_KEEP_DAYS ago. */
 export function scoutRawLogExpired(scout: Pick<Scout, 'status' | 'endedAt'>, now: number): boolean {
   return scout.status !== 'running' && endedBeforeRawLogKeep(scout.endedAt, now);
+}
+
+/**
+ * Why the Master removes the worktree and branch a failed or cancelled Run of an issue kept, as
+ * its `workspace.removed` event records it: a later Run of the issue completed (`supersededBy`),
+ * the issue used up its attempts and only its last attempt (`keptRun`) keeps them, or a human
+ * changed the issue and a new Run (`newRun`) does the changed requirement instead.
+ */
+export type LeftoverWorkspaceReason =
+  | { reason: 'superseded'; supersededBy: string }
+  | { reason: 'retries_exhausted'; keptRun: string }
+  | { reason: 'goal_changed'; newRun: string };
+
+/** The events `leftoverWorkspaces` reads; other types are passed by. */
+export const LEFTOVER_WORKSPACE_EVENTS = [
+  'workspace.removed',
+  'issue.retries_exhausted',
+  'run.goal_changed',
+] as const;
+
+/**
+ * The worktrees and branches of failed or cancelled Runs of issues that nobody needs any more,
+ * oldest Run first. They are removed once, right when it is decided (a redo completed, the issue
+ * used up its attempts, the issue was changed), and kept when the Master stopped before that or the
+ * removal failed: so the Master looks for them again at start and daily, as nothing else would
+ * while nobody is around, and every one keeps its dependencies.
+ *
+ * `runs` are oldest first (creation order); `events` are those of LEFTOVER_WORKSPACE_EVENTS. A Run
+ * is listed when it is not recorded as removed and:
+ * - failed, and a later Run of its issue completed: `superseded` by the first of those;
+ * - failed, and the newest Run of its issue failed with its attempts used up (its redo is
+ *   `exhausted`, or it recorded `issue.retries_exhausted`): `retries_exhausted`, kept by that one;
+ * - failed, and named in the `runIds` of another Run's `issue.retries_exhausted`:
+ *   `retries_exhausted`, kept by that Run (what removing them right then would have done);
+ * - cancelled because a human changed its issue (`run.goal_changed`): `goal_changed`, the new Run
+ *   from the event.
+ *
+ * Never: a Run a human cancelled (they may still want to look), Runs that may go on (any other
+ * status), the last failed attempt of an issue, or Runs not from an issue. Whether the worktree
+ * or branch is still there is for the caller to find out.
+ */
+export function leftoverWorkspaces(
+  runs: readonly Pick<Run, 'id' | 'status' | 'issue'>[],
+  events: readonly Pick<EventRow, 'runId' | 'type' | 'data'>[],
+): { runId: string; why: LeftoverWorkspaceReason }[] {
+  const removed = new Set<string>();
+  /** Earlier attempt → the Run that recorded `issue.retries_exhausted` naming it. */
+  const exhaustedBy = new Map<string, string>();
+  const exhausted = new Set<string>();
+  const goalChanged = new Map<string, string>();
+  for (const e of events) {
+    if (!e.runId) continue;
+    if (e.type === 'workspace.removed') removed.add(e.runId);
+    if (e.type === 'issue.retries_exhausted') {
+      exhausted.add(e.runId);
+      const ids = Array.isArray(e.data.runIds) ? e.data.runIds : [];
+      for (const id of ids) {
+        if (typeof id === 'string' && id !== e.runId) exhaustedBy.set(id, e.runId);
+      }
+    }
+    if (e.type === 'run.goal_changed' && typeof e.data.newRun === 'string') {
+      goalChanged.set(e.runId, e.data.newRun);
+    }
+  }
+  const byIssue = new Map<string, Pick<Run, 'id' | 'status' | 'issue'>[]>();
+  for (const run of runs) {
+    if (!run.issue) continue;
+    const key = `${run.issue.repo}#${run.issue.number}`;
+    const list = byIssue.get(key);
+    if (list) list.push(run);
+    else byIssue.set(key, [run]);
+  }
+  const leftovers: { runId: string; why: LeftoverWorkspaceReason }[] = [];
+  for (const issueRuns of byIssue.values()) {
+    const newest = issueRuns[issueRuns.length - 1];
+    const kept =
+      newest?.status === 'failed' &&
+      (newest.issue?.redo === 'exhausted' || exhausted.has(newest.id))
+        ? newest.id
+        : undefined;
+    const found: { runId: string; why: LeftoverWorkspaceReason }[] = [];
+    // Newest first, so the first completed Run after each one is known when it is reached.
+    let completedAfter: string | undefined;
+    for (let i = issueRuns.length - 1; i >= 0; i--) {
+      const run = issueRuns[i] as Pick<Run, 'id' | 'status' | 'issue'>;
+      if (run.status === 'completed') {
+        completedAfter = run.id;
+        continue;
+      }
+      if (removed.has(run.id)) continue;
+      let why: LeftoverWorkspaceReason | undefined;
+      if (run.status === 'failed') {
+        const keptBy = exhaustedBy.get(run.id);
+        if (completedAfter) why = { reason: 'superseded', supersededBy: completedAfter };
+        else if (kept && kept !== run.id) why = { reason: 'retries_exhausted', keptRun: kept };
+        else if (keptBy) why = { reason: 'retries_exhausted', keptRun: keptBy };
+      } else if (run.status === 'cancelled') {
+        const newRun = goalChanged.get(run.id);
+        if (newRun) why = { reason: 'goal_changed', newRun };
+      }
+      if (why) found.push({ runId: run.id, why });
+    }
+    leftovers.push(...found.reverse());
+  }
+  return leftovers;
 }
 
 function stripUndefined<T extends object>(obj: T | undefined): Partial<T> {

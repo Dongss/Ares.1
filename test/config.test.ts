@@ -5,6 +5,7 @@ import {
   budgetPauses,
   discussionReplyWait,
   issueRunOverrides,
+  leftoverWorkspaces,
   loopsExhausted,
   RATE_LIMIT_WAIT,
   REDO_BACKOFF_MAX_HOURS,
@@ -1160,6 +1161,131 @@ describe('redo after a failure', () => {
     }
     expect(redoDueAt({ ...failed(1, 'pending'), status: 'cancelled' }, 5)).toBeNull();
     expect(redoDueAt({ ...failed(1, 'pending'), issue: null }, 5)).toBeNull();
+  });
+});
+
+describe('leftoverWorkspaces', () => {
+  type IssueRun = Pick<Run, 'id' | 'status' | 'issue'>;
+  const run = (id: string, status: RunStatus, number: number | null, redo?: RedoState) =>
+    ({
+      id,
+      status,
+      issue:
+        number === null
+          ? null
+          : { repo: 'me/demo', number, url: '', auto: false, attempt: 1, redo },
+    }) satisfies IssueRun;
+  const event = (runId: string, type: string, data: Record<string, unknown> = {}) => ({
+    runId,
+    type,
+    data,
+  });
+
+  it('lists the failed attempts a later Run of the issue completed after', () => {
+    const runs = [
+      run('a1', 'failed', 1, 'redone'),
+      run('a2', 'failed', 1, 'redone'),
+      run('a3', 'completed', 1),
+      // Failed after the completion: a redo is still to come, nothing supersedes it.
+      run('a4', 'failed', 1, 'pending'),
+      run('a5', 'completed', 1),
+      // Another issue completed: not this one's.
+      run('b1', 'failed', 2, 'pending'),
+      run('c1', 'completed', 3),
+    ];
+    expect(leftoverWorkspaces(runs, [])).toEqual([
+      { runId: 'a1', why: { reason: 'superseded', supersededBy: 'a3' } },
+      { runId: 'a2', why: { reason: 'superseded', supersededBy: 'a3' } },
+      { runId: 'a4', why: { reason: 'superseded', supersededBy: 'a5' } },
+    ]);
+  });
+
+  it('keeps only the last attempt once the newest Run of the issue used up its attempts', () => {
+    const runs = [
+      run('a1', 'failed', 1, 'redone'),
+      run('a2', 'cancelled', 1),
+      run('a3', 'failed', 1, 'redone'),
+      run('a4', 'failed', 1, 'exhausted'),
+      // Recorded issue.retries_exhausted: its redo state does not matter then.
+      run('b1', 'failed', 2, 'redone'),
+      run('b2', 'failed', 2),
+      // The newest still goes on, or failed with a redo to come: nothing yet.
+      run('c1', 'failed', 3, 'exhausted'),
+      run('c2', 'running', 3),
+      run('d1', 'failed', 4, 'redone'),
+      run('d2', 'failed', 4, 'pending'),
+    ];
+    const events = [event('b2', 'issue.retries_exhausted', { runIds: ['b1', 'b2'] })];
+    expect(leftoverWorkspaces(runs, events)).toEqual([
+      { runId: 'a1', why: { reason: 'retries_exhausted', keptRun: 'a4' } },
+      { runId: 'a3', why: { reason: 'retries_exhausted', keptRun: 'a4' } },
+      { runId: 'b1', why: { reason: 'retries_exhausted', keptRun: 'b2' } },
+    ]);
+  });
+
+  it('lists the attempts an issue.retries_exhausted named even after the issue started over', () => {
+    const runs = [
+      run('a1', 'failed', 1, 'redone'),
+      run('a2', 'failed', 1, 'redone'),
+      run('a3', 'failed', 1, 'exhausted'),
+      // A human started the issue over with ares1:ready; the new Run still goes on.
+      run('a4', 'running', 1),
+    ];
+    const events = [event('a3', 'issue.retries_exhausted', { runIds: ['a1', 'a2', 'a3'] })];
+    expect(leftoverWorkspaces(runs, events)).toEqual([
+      { runId: 'a1', why: { reason: 'retries_exhausted', keptRun: 'a3' } },
+      { runId: 'a2', why: { reason: 'retries_exhausted', keptRun: 'a3' } },
+    ]);
+    // Used up again: everything before the newest goes, the earlier last attempt too.
+    const again = [...runs.slice(0, 3), run('a4', 'failed', 1, 'exhausted')];
+    expect(leftoverWorkspaces(again, events)).toEqual([
+      { runId: 'a1', why: { reason: 'retries_exhausted', keptRun: 'a4' } },
+      { runId: 'a2', why: { reason: 'retries_exhausted', keptRun: 'a4' } },
+      { runId: 'a3', why: { reason: 'retries_exhausted', keptRun: 'a4' } },
+    ]);
+  });
+
+  it('lists the Runs terminated because their issue changed, not those a human terminated', () => {
+    const runs = [
+      run('a1', 'cancelled', 1),
+      run('a2', 'cancelled', 1),
+      run('a3', 'queued', 1),
+      run('b1', 'cancelled', 2),
+    ];
+    const events = [
+      event('a2', 'run.goal_changed', { repo: 'me/demo', issue: 1, newRun: 'a3' }),
+      // Not a Run of an issue: nothing to go by.
+      event('x1', 'run.goal_changed', { newRun: 'x2' }),
+    ];
+    expect(leftoverWorkspaces(runs, events)).toEqual([
+      { runId: 'a2', why: { reason: 'goal_changed', newRun: 'a3' } },
+    ]);
+  });
+
+  it('passes by what was removed, Runs not from an issue and every other status', () => {
+    const runs = [
+      run('a1', 'failed', 1, 'redone'),
+      run('a2', 'failed', 1, 'redone'),
+      run('a3', 'cancelled', 1),
+      run('a4', 'completed', 1),
+      run('l1', 'failed', null),
+      run('l2', 'completed', null),
+      ...(['queued', 'running', 'paused', 'blocked', 'waiting_approval', 'dropped'] as const).map(
+        (status, i) => run(`s${i}`, status, 9),
+      ),
+      run('s9', 'completed', 9),
+    ];
+    const events = [
+      event('a1', 'workspace.removed', { reason: 'superseded', supersededBy: 'a4' }),
+      event('a3', 'run.goal_changed', { newRun: 'a4' }),
+      event('a3', 'workspace.removed', { reason: 'goal_changed', newRun: 'a4' }),
+      // Other events and events without a Run change nothing.
+      event('a2', 'workspace.cleanup_failed', { reason: 'superseded', supersededBy: 'a4' }),
+      { runId: null, type: 'workspace.removed', data: {} },
+    ];
+    expect(leftoverWorkspaces(runs, events)).toEqual([
+      { runId: 'a2', why: { reason: 'superseded', supersededBy: 'a4' } },
+    ]);
   });
 });
 

@@ -204,6 +204,19 @@ describe('pruning raw logs', () => {
     expect(prunedEvents().map((e) => e.data)).toEqual([{ runs: 1, scouts: 0, files: 3, bytes }]);
   });
 
+  it('starts the other housekeeping of a round after the raw logs', () => {
+    const { s, run } = setup();
+    const old = run('completed', daysAgo(31));
+    const rounds: boolean[] = [];
+    const pruner = new RawLogPruner(
+      s,
+      () => NOW,
+      () => rounds.push(old.raw.every((f) => !existsSync(f))),
+    );
+    pruner.start({ timer: false });
+    expect(rounds).toEqual([true]);
+  });
+
   it('keeps a directory where a log path points to one', () => {
     const { s, logsDir, scout, pruner } = setup();
     const sc = scout('completed', daysAgo(31), false);

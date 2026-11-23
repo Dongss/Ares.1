@@ -622,6 +622,14 @@ export class Store {
     );
   }
 
+  /** Every Run created from an issue, oldest first. */
+  issueRuns(): Run[] {
+    return this.many<Run>(
+      'runs',
+      'SELECT * FROM runs WHERE issue IS NOT NULL ORDER BY created_at, rowid',
+    );
+  }
+
   /** Failed Runs of the repo whose issue waits for them to be redone, oldest first. */
   runsAwaitingRedo(repoId: string): Run[] {
     return this.many<Run>(

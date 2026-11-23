@@ -14,6 +14,9 @@ import {
   type Backoff,
   backoffMs,
   discussionReplyWait,
+  LEFTOVER_WORKSPACE_EVENTS,
+  type LeftoverWorkspaceReason,
+  leftoverWorkspaces,
   RATE_LIMIT_WAIT,
   type RateLimitWait,
   rateLimitDelayMs,
@@ -285,15 +288,9 @@ export class InvalidStateError extends Error {}
 
 /**
  * Why a kept worktree and branch were removed, as their `workspace.removed` event records it: by
- * a human, because a later Run of the same issue completed (`supersededBy`), because the issue
- * used up its attempts and only its last attempt (`keptRun`) keeps them, or because a human
- * changed the issue and a new Run (`newRun`) does the changed requirement instead.
+ * a human, or automatically (`LeftoverWorkspaceReason`).
  */
-type KeptWorkspaceRemoval =
-  | { manual: true }
-  | { reason: 'superseded'; supersededBy: string }
-  | { reason: 'retries_exhausted'; keptRun: string }
-  | { reason: 'goal_changed'; newRun: string };
+type KeptWorkspaceRemoval = { manual: true } | LeftoverWorkspaceReason;
 
 const IN_FLIGHT_TASK = new Set<Task['status']>(['running', 'verifying']);
 
@@ -309,6 +306,8 @@ export class Engine {
   private holding = false;
   /** Workspace cleanups in progress, by Run id; a second request joins the first. */
   private readonly cleanups = new Map<string, Promise<Run>>();
+  /** The `sweepLeftoverWorkspaces` in progress; a second call joins it, `stop` waits for it. */
+  private sweeping: Promise<void> | undefined;
   /** Wakes `checkReplyTimeouts` at the next discussion's deadline. */
   private replyTimer: ReturnType<typeof setTimeout> | undefined;
   /** Wakes `checkDirtyTargets` while Runs wait for their target branch's changes to clear. */
@@ -385,6 +384,11 @@ export class Engine {
     clearTimeout(this.limitTimer);
     this.limitTimer = undefined;
     this.limitWaits.clear();
+    // A sweep ends after the removal in progress; the store must stay open until it has.
+    await Promise.all([this.stopActive(), this.sweeping?.catch(() => {})]);
+  }
+
+  private async stopActive(): Promise<void> {
     const active = this.active;
     if (!active) return;
     await this.interrupt();
@@ -1228,6 +1232,46 @@ export class Engine {
    */
   removeGoalChangedWorkspace(runId: string, newRunId: string): Promise<void> {
     return this.removeKeptWorkspaceOrRecord(runId, { reason: 'goal_changed', newRun: newRunId });
+  }
+
+  /**
+   * Removes again what the removals above leave behind when the Master stopped before them
+   * (crashed, restarted for an upgrade, shutting down) or a removal failed: the worktrees and
+   * branches `leftoverWorkspaces` names that are still there, each with the reason it would have
+   * been removed for. Called after the Runs are recovered at start and then daily, since nothing
+   * else would remove them while nobody is around. A Run that already recorded
+   * `workspace.cleanup_failed` is tried again; a removal that fails again is recorded again and
+   * passed by. Nothing left is fine, so calling it again records nothing more.
+   *
+   * Like `removeExhaustedAttempts` it does not hold the execution slot: it only touches failed
+   * and cancelled Runs' own worktrees and branches, never an executing Run's. Ends after the
+   * removal in progress when the engine stops. A call while one is in progress joins it.
+   */
+  sweepLeftoverWorkspaces(): Promise<void> {
+    this.sweeping ??= this.sweepLeftoverWorkspacesNow().finally(() => {
+      this.sweeping = undefined;
+    });
+    return this.sweeping;
+  }
+
+  private async sweepLeftoverWorkspacesNow(): Promise<void> {
+    if (this.stopping) return;
+    const events = LEFTOVER_WORKSPACE_EVENTS.flatMap((type) =>
+      this.store.listEventsOfType(type, ''),
+    );
+    const leftovers = leftoverWorkspaces(this.store.issueRuns(), events);
+    if (leftovers.length === 0) return;
+    // One git call per repo tells which are still there, rather than one per Run.
+    const states = await this.inspectWorkspaces(leftovers.map((l) => this.store.getRun(l.runId)));
+    for (const { runId, why } of leftovers) {
+      if (this.stopping) return;
+      const state = states.get(runId);
+      if (!state?.worktreeExists && !state?.branchExists) continue;
+      // Read right before: the removal would record any other status as a failure.
+      const status = this.store.getRun(runId).status;
+      if (status !== 'failed' && status !== 'cancelled') continue;
+      await this.removeKeptWorkspaceOrRecord(runId, why);
+    }
   }
 
   /** `removeKeptWorkspace` done automatically: a failure is recorded on the Run, not thrown. */

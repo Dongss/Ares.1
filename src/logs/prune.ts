@@ -1,7 +1,8 @@
 // Deletes the raw output of agents once it is past retention (`runRawLogsExpired`,
 // `scoutRawLogExpired` in src/config/flow.ts), so that a Master that never stops does not fill
 // the disk. Only the raw stream and its stderr go: the normalized events the dashboard shows,
-// verify, setup, command and merge logs and artifacts stay.
+// verify, setup, command and merge logs and artifacts stay. Each round can do more housekeeping
+// of the kind (the Master removes leftover worktrees with it), given as `onRound`.
 
 import { rmSync, statSync } from 'node:fs';
 import { runRawLogsExpired, scoutRawLogExpired } from '../config/flow.js';
@@ -38,12 +39,17 @@ export class RawLogPruner {
   constructor(
     private readonly store: Store,
     private readonly now: () => number = Date.now,
+    /**
+     * Started after the raw logs in each round, at start and then about daily, and not waited
+     * for; it reports its own failures.
+     */
+    private readonly onRound?: () => void,
   ) {}
 
   start(opts: { timer?: boolean } = {}): void {
-    this.safePrune();
+    this.round();
     if (opts.timer === false) return;
-    this.timer = setInterval(() => this.safePrune(), PRUNE_RAW_LOGS_EVERY_MS);
+    this.timer = setInterval(() => this.round(), PRUNE_RAW_LOGS_EVERY_MS);
     this.timer.unref();
   }
 
@@ -80,6 +86,11 @@ export class RawLogPruner {
     }
     if (pruned.files > 0) this.store.event(null, 'logs.pruned', { ...pruned });
     return pruned;
+  }
+
+  private round(): void {
+    this.safePrune();
+    this.onRound?.();
   }
 
   /** A round that cannot fail the Master: a broken one is reported and tried again next time. */
