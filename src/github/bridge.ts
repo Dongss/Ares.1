@@ -22,6 +22,7 @@ import { NotFoundError, type Store } from '../store/store.js';
 import {
   type DiscussionEntry,
   type EventRow,
+  type FailedAttempt,
   FINISHED_RUN_STATUSES,
   type Repo,
   type Run,
@@ -755,6 +756,27 @@ export class IssueBridge {
         });
       }
     });
+    if (failure?.kind === 'exhausted') await this.removeExhaustedAttempts(run, failure.failures);
+  }
+
+  /**
+   * The issue is closed after its last attempt: only that Run keeps its worktree and branch.
+   * After the issue is caught up, so a removal that goes wrong costs no second comment; each
+   * failed removal is recorded on its Run by the engine.
+   */
+  private async removeExhaustedAttempts(run: Run, failures: FailedAttempt[]): Promise<void> {
+    const earlier = failures.map((f) => f.runId).filter((id) => id !== run.id);
+    if (earlier.length === 0) return;
+    try {
+      await this.deps.engine.removeExhaustedAttempts(run.id, earlier);
+    } catch (err) {
+      console.warn(
+        t({
+          zh: `没能删除 Run ${run.id} 之前几次失败尝试的工作目录：${errorMessage(err)}`,
+          en: `Could not remove the working directories of the failed attempts before Run ${run.id}: ${errorMessage(err)}`,
+        }),
+      );
+    }
   }
 
   /** Name of the stage the Run is in, or ended in. */

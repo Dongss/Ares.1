@@ -260,9 +260,13 @@ export class InvalidStateError extends Error {}
 
 /**
  * Why a kept worktree and branch were removed, as their `workspace.removed` event records it: by
- * a human, or because a later Run of the same issue completed (`supersededBy`).
+ * a human, because a later Run of the same issue completed (`supersededBy`), or because the issue
+ * used up its attempts and only its last attempt (`keptRun`) keeps them.
  */
-type KeptWorkspaceRemoval = { manual: true } | { reason: 'superseded'; supersededBy: string };
+type KeptWorkspaceRemoval =
+  | { manual: true }
+  | { reason: 'superseded'; supersededBy: string }
+  | { reason: 'retries_exhausted'; keptRun: string };
 
 const IN_FLIGHT_TASK = new Set<Task['status']>(['running', 'verifying']);
 
@@ -1156,6 +1160,45 @@ export class Engine {
    */
   cleanupWorkspace(runId: string): Promise<Run> {
     return this.removeKeptWorkspace(runId, { manual: true });
+  }
+
+  /**
+   * Once an issue used up its attempts and was closed, only its last attempt (`keptRunId`) keeps
+   * its worktree and branch: that one is there for a human to look at, and the earlier attempts'
+   * reasons are in their error and on the issue. Without this every issue closed as failed would
+   * keep one worktree per attempt (dependencies included) for good while nobody is around.
+   * Removes the worktrees and branches of `earlierRunIds` that are still failed and come from the
+   * same issue; cancelled Runs stay, a human ended them and may still want to look. A removal that
+   * fails is recorded on that Run and passed by. Nothing left to remove is fine, so calling it
+   * again does no harm.
+   *
+   * Unlike the removal of superseded attempts this does not hold the execution slot: it is called
+   * from the GitHub bridge while another Run may execute, and is as safe as a removal by hand
+   * (`cleanupWorkspace`). It only touches each failed Run's own worktree and branch, never the
+   * executing Run's, and git's own locks keep concurrent commands from corrupting the repo; a
+   * removal that loses a race for a lock only ends up recorded as `workspace.cleanup_failed`.
+   */
+  async removeExhaustedAttempts(keptRunId: string, earlierRunIds: string[]): Promise<void> {
+    const issue = this.store.getRun(keptRunId).issue;
+    if (!issue) return;
+    const why = { reason: 'retries_exhausted', keptRun: keptRunId } as const;
+    const failed = this.store.issueRunsWithStatus(issue.repo, issue.number, 'failed');
+    const wanted = new Set(earlierRunIds);
+    for (const { id: runId } of failed) {
+      if (runId === keptRunId || !wanted.has(runId)) continue;
+      // Started again by a human while earlier removals ran: no longer a kept failure.
+      if (this.store.getRun(runId).status !== 'failed') continue;
+      try {
+        await this.removeKeptWorkspace(runId, why);
+      } catch (err) {
+        this.store.tx(() => {
+          this.store.event(runId, 'workspace.cleanup_failed', {
+            ...why,
+            error: errorMessage(err).trim(),
+          });
+        });
+      }
+    }
   }
 
   /**

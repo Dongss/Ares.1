@@ -12,7 +12,7 @@ import {
   rateLimitDelayMs,
 } from '../src/config/flow.js';
 import { AGENT_RETRY_BACKOFF, InvalidStateError } from '../src/engine/engine.js';
-import { LABELS } from '../src/github/issues.js';
+import { LABELS, RETRIES_EXHAUSTED_MARKER } from '../src/github/issues.js';
 import { setLang } from '../src/i18n.js';
 import { noticeFor } from '../src/notify/notice.js';
 import { NotFoundError } from '../src/store/store.js';
@@ -3511,7 +3511,7 @@ describe('engine: workspace consistency', () => {
   });
 });
 
-describe('engine: workspaces of superseded attempts', () => {
+describe('engine: workspaces of superseded and exhausted attempts', () => {
   /** Coding → merge without approval; an agent error ends the Run as failed at once. */
   const WORKFLOW = `
 id: dev
@@ -3675,5 +3675,127 @@ github:
     expect(eventData(t, second.id, 'run.status').at(-1)).toEqual({ status: 'completed' });
     await issues.sync();
     expect(gh.get(1)).toMatchObject({ state: 'closed', stateReason: 'completed' });
+  });
+
+  /** Fail every attempt the issue gets (`max_run_attempts`, 3 by default); oldest first. */
+  const failAllAttempts = async (t: Harness, n: number, from: number): Promise<Run[]> => {
+    const attempts: Run[] = [];
+    for (let i = from; i < from + 3; i++) {
+      attempts.push(await t.waitStatus(nth(t, n, i).id, 'failed'));
+      await redo(t);
+    }
+    return attempts;
+  };
+
+  it("keeps only the last attempt's worktree and branch once an issue used up its attempts", async () => {
+    const t = await start();
+    const { engine, issues, store } = t.master;
+    let coder: 'hang' | 'fail' = 'hang';
+    t.scripts.coder = () => {
+      if (coder === 'hang') return new Promise(() => {});
+      return { status: 'failed', error: '模型额度用完了' };
+    };
+
+    // #1: a human cancels the first Run and starts the issue over with ares1:ready.
+    gh.add({ title: '加 feature', labels: [LABELS.ready] });
+    await issues.poll();
+    await waitFor(() => t.fake.calls.length === 1, 'the coder');
+    await engine.cancel(nth(t, 1, 0).id);
+    await issues.sync();
+    coder = 'fail';
+    gh.get(1).labels.push(LABELS.ready);
+    // #2: another issue whose Run fails too, closed before it is redone.
+    gh.add({ title: '另一个需求', labels: [LABELS.ready] });
+    await issues.poll();
+    const other = await t.waitStatus(nth(t, 2, 0).id, 'failed');
+    // And a failed Run that does not come from an issue.
+    const loose = await t.waitStatus(t.run('不是从 issue 来的').id, 'failed');
+    await issues.sync();
+    gh.get(2).state = 'closed';
+    const [first, second, last] = (await failAllAttempts(t, 1, 1)) as [Run, Run, Run];
+
+    expect(last.issue?.attempt).toBe(3);
+    expect(gh.get(1)).toMatchObject({ state: 'closed', stateReason: 'not_planned' });
+    expect(eventData(t, last.id, 'issue.retries_exhausted')).toEqual([
+      expect.objectContaining({ runIds: [first.id, second.id, last.id] }),
+    ]);
+    // The last attempt keeps its worktree and branch for a human to look at.
+    expect(kept(t, last)).toEqual({ worktree: true, branch: true });
+    expect(eventData(t, last.id, 'workspace.removed')).toEqual([]);
+    // The earlier ones are gone, records, logs and artifacts kept.
+    for (const run of [first, second]) {
+      expect(kept(t, run)).toEqual({ worktree: false, branch: false });
+      expect(git(t.repoDir, 'worktree', 'list', '--porcelain')).not.toContain(run.branch);
+      expect(eventData(t, run.id, 'workspace.removed')).toEqual([
+        {
+          path: run.worktreePath,
+          branch: run.branch,
+          reason: 'retries_exhausted',
+          keptRun: last.id,
+        },
+      ]);
+      expect(store.getRun(run.id)).toMatchObject({ status: 'failed', error: run.error });
+      const attempts = store.listRunAttempts(run.id);
+      expect(attempts.length).toBeGreaterThan(0);
+      for (const a of attempts) expect(existsSync(a.logPath)).toBe(true);
+    }
+    // The cancelled Run of the issue, another issue's and one not from an issue stay as they are.
+    const cancelled = store.getRun(nth(t, 1, 0).id);
+    expect(cancelled.status).toBe('cancelled');
+    for (const run of [cancelled, other, loose]) {
+      expect(kept(t, run)).toEqual({ worktree: true, branch: true });
+      expect(eventData(t, run.id, 'workspace.removed')).toEqual([]);
+    }
+    // Even when named, they are not the issue's failed attempts.
+    await engine.removeExhaustedAttempts(last.id, [cancelled.id, other.id, loose.id, last.id]);
+    for (const run of [cancelled, other, loose, last]) {
+      expect(kept(t, run)).toEqual({ worktree: true, branch: true });
+    }
+
+    // Catching up again: no second comment, nothing more removed or recorded.
+    const comments = gh.get(1).comments.length;
+    await issues.sync();
+    await engine.removeExhaustedAttempts(last.id, [first.id, second.id]);
+    expect(gh.get(1).comments).toHaveLength(comments);
+    for (const run of [first, second]) {
+      expect(eventData(t, run.id, 'workspace.removed')).toHaveLength(1);
+      expect(eventData(t, run.id, 'workspace.cleanup_failed')).toEqual([]);
+    }
+  });
+
+  it('records an earlier attempt it cannot clean up and still closes the issue once', async () => {
+    const t = await start();
+    const { issues, store } = t.master;
+    t.scripts.coder = () => ({ status: 'failed', error: '模型额度用完了' });
+    gh.add({ title: '加 feature', labels: [LABELS.ready] });
+    await issues.poll();
+    const first = await t.waitStatus(nth(t, 1, 0).id, 'failed');
+    // Its branch is checked out elsewhere too, so git refuses to delete it.
+    const elsewhere = join(tmpDir(), 'elsewhere');
+    git(t.repoDir, 'worktree', 'add', '-q', '-f', elsewhere, first.branch as string);
+    const [, second, last] = (await failAllAttempts(t, 1, 0)) as [Run, Run, Run];
+
+    expect(eventData(t, first.id, 'workspace.removed')).toEqual([]);
+    expect(eventData(t, first.id, 'workspace.cleanup_failed')).toEqual([
+      {
+        reason: 'retries_exhausted',
+        keptRun: last.id,
+        error: expect.stringContaining(`分支 ${first.branch}`),
+      },
+    ]);
+    expect(kept(t, first)).toEqual({ worktree: false, branch: true });
+    expect(store.getRun(first.id).status).toBe('failed');
+    // The next one is removed all the same, the last one kept.
+    expect(kept(t, second)).toEqual({ worktree: false, branch: false });
+    expect(kept(t, last)).toEqual({ worktree: true, branch: true });
+
+    const issue = gh.get(1);
+    expect(issue).toMatchObject({ state: 'closed', stateReason: 'not_planned' });
+    const exhausted = issue.comments.filter((c) => c.includes(RETRIES_EXHAUSTED_MARKER));
+    expect(exhausted).toHaveLength(1);
+    const comments = issue.comments.length;
+    await issues.sync();
+    expect(gh.get(1).comments).toHaveLength(comments);
+    expect(eventData(t, first.id, 'workspace.cleanup_failed')).toHaveLength(1);
   });
 });

@@ -492,3 +492,39 @@ describe('superseded workspaces', () => {
     for (const text of [removed, failed]) expect(text).not.toMatch(/[一-鿿]/);
   });
 });
+
+describe('workspaces of attempts before the last when an issue used up its attempts', () => {
+  afterEach(() => setLang('zh'));
+  const exhausted = { reason: 'retries_exhausted', keptRun: 'run_last' };
+
+  it('words the removal of an earlier attempt and its failure from their data', () => {
+    const removed = { path: '/w/run_a', branch: 'ares1/run_a', ...exhausted };
+    expect(eventText({ type: 'workspace.removed', data: removed })).toBe(
+      'issue 用完了重做次数，只保留最后一次尝试 run_last 的工作目录和分支，自动删掉了这次的',
+    );
+    expect(
+      eventText({ type: 'workspace.cleanup_failed', data: { ...exhausted, error: 'x' } }),
+    ).toBe(
+      'issue 用完了重做次数，只保留最后一次尝试 run_last 的工作目录和分支，但没能自动删掉这次的，请在「工作区」页手动清理',
+    );
+    // Without the kept Run: only the data.
+    const partial = { reason: 'retries_exhausted' };
+    expect(eventText({ type: 'workspace.removed', data: partial })).toBeNull();
+  });
+
+  it('in English', () => {
+    setLang('en');
+    const removed = eventText({ type: 'workspace.removed', data: exhausted });
+    expect(removed).toBe(
+      "The issue used up its attempts, so only the last one, Run run_last, keeps its working directory and branch; this Run's were removed automatically",
+    );
+    const failed = eventText({
+      type: 'workspace.cleanup_failed',
+      data: { ...exhausted, error: 'x' },
+    });
+    expect(failed).toBe(
+      "The issue used up its attempts, so only the last one, Run run_last, keeps its working directory and branch, but this Run's could not be removed automatically; clean them up by hand on the Workspaces page",
+    );
+    for (const text of [removed, failed]) expect(text).not.toMatch(/[一-鿿]/);
+  });
+});

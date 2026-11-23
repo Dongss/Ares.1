@@ -324,6 +324,21 @@ export function eventText(event: Pick<EventRow, 'type' | 'data'>, now = new Date
       });
     }
   }
+  const { keptRun } = event.data;
+  if (reason === 'retries_exhausted' && typeof keptRun === 'string') {
+    if (event.type === 'workspace.removed') {
+      return t({
+        zh: `issue 用完了重做次数，只保留最后一次尝试 ${keptRun} 的工作目录和分支，自动删掉了这次的`,
+        en: `The issue used up its attempts, so only the last one, Run ${keptRun}, keeps its working directory and branch; this Run's were removed automatically`,
+      });
+    }
+    if (event.type === 'workspace.cleanup_failed') {
+      return t({
+        zh: `issue 用完了重做次数，只保留最后一次尝试 ${keptRun} 的工作目录和分支，但没能自动删掉这次的，请在「工作区」页手动清理`,
+        en: `The issue used up its attempts, so only the last one, Run ${keptRun}, keeps its working directory and branch, but this Run's could not be removed automatically; clean them up by hand on the Workspaces page`,
+      });
+    }
+  }
   return null;
 }
 
