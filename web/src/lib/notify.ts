@@ -1,3 +1,4 @@
+import { t } from '../../../src/i18n.js';
 import { noticeFor as sharedNotice } from '../../../src/notify/notice.js';
 import type { EventRow } from '../../../src/store/types.js';
 import { href } from './router.js';
@@ -24,6 +25,17 @@ export function noticeFor(event: EventRow, goal: string | undefined): Notice | n
   if (!n) return null;
   const to = n.runId ? href.run(n.runId) : n.about === 'issues' ? href.issues : href.home;
   return { title: n.title, body: n.body, href: to, tag: `ares1-event-${event.id}` };
+}
+
+/**
+ * Said where the dashboard explains notifications when the Master also POSTs them to a webhook
+ * (notify.webhook). The webhook does not replace the browser's, which stay as they are.
+ */
+export function webhookNote(): string {
+  return t({
+    zh: '已配置 webhook（config.yaml 的 notify.webhook），需要人处理时 Master 也会 POST 到配置的地址。',
+    en: 'A webhook is set (notify.webhook in config.yaml): when you are needed, the Master also POSTs to its address.',
+  });
 }
 
 /** The user's choice in this browser; null until they chose. */

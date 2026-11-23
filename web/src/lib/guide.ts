@@ -17,6 +17,7 @@ import { NOTICE_KINDS, type NoticeKind } from '../../../src/notify/notice.js';
 import { buildFlow, type FlowStage } from './flow.js';
 import { formatCost, formatMinutes, type Tone } from './format.js';
 import { acceptRanges, afterChinese, beforeChinese, scoutWaitText } from './issues.js';
+import { webhookNote } from './notify.js';
 
 // The guide page: how the self-hosting loop works under the current configuration.
 // Every sentence that depends on the configuration is worded here, from the API's views, so the
@@ -822,8 +823,8 @@ export function noticeRows(): NoticeRow[] {
 }
 
 /** How notifications reach you now. */
-export function notifyChannel(systemNotify: boolean): string {
-  return systemNotify
+export function notifyChannel(systemNotify: boolean, webhookNotify = false): string {
+  const channel = systemNotify
     ? t({
         zh: 'Master 直接发系统通知（config.yaml 的 notify.system: true；macOS 用通知中心，Linux 用 notify-send，没装 libnotify 就收不到），不用开着看板；看板不再重复发。',
         en: 'The Master sends system notifications itself (notify.system: true in config.yaml; Notification Center on macOS, notify-send on Linux, which needs libnotify installed), so the dashboard need not be open; the dashboard does not send them again.',
@@ -832,6 +833,13 @@ export function notifyChannel(systemNotify: boolean): string {
         zh: '现在由浏览器发通知：要开着至少一个看板标签页（可以在后台），并在顶栏打开「通知」。想不开看板也收到，在 config.yaml 里设 notify.system: true：macOS 用通知中心；Linux 需要 notify-send（libnotify）；其他平台不支持，仍由浏览器发通知。',
         en: 'The browser sends notifications now: keep at least one dashboard tab open (it can be in the background) and turn on notifications in the top bar. To get them without the dashboard, set notify.system: true in config.yaml: Notification Center on macOS; on Linux it needs notify-send (libnotify); other platforms are not supported, and the browser keeps sending them.',
       });
+  const webhook = webhookNotify
+    ? webhookNote()
+    : t({
+        zh: '不在这台机器前（比如 Master 跑在没有桌面的服务器上）也想收到，在 config.yaml 里配 notify.webhook，把通知 POST 到 ntfy 一类服务或你自己的地址。',
+        en: 'To be reached away from this machine (say, with the Master on a server without a desktop), set notify.webhook in config.yaml to POST notifications to a service such as ntfy or an address of your own.',
+      });
+  return `${channel}${t({ zh: '', en: ' ' })}${webhook}`;
 }
 
 /** The labels the Master puts on issues; ares1:auto as auto_accept is set now. */

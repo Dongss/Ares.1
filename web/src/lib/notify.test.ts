@@ -1,6 +1,20 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
+import { setLang } from '../../../src/i18n.js';
 import type { EventRow } from '../../../src/store/types.js';
-import { noticeFor, notifyState } from './notify.js';
+import { noticeFor, notifyState, webhookNote } from './notify.js';
+
+describe('webhookNote', () => {
+  afterEach(() => setLang('zh'));
+
+  it('says the Master also POSTs to the configured webhook, in the language in use', () => {
+    expect(webhookNote()).toBe(
+      '已配置 webhook（config.yaml 的 notify.webhook），需要人处理时 Master 也会 POST 到配置的地址。',
+    );
+    setLang('en');
+    expect(webhookNote()).toContain('the Master also POSTs to its address');
+    expect(webhookNote()).not.toMatch(/[一-鿿]/);
+  });
+});
 
 const ev = (type: string, data: Record<string, unknown> = {}, runId: string | null = 'run-1') =>
   ({ id: 42, runId, ts: '2026-11-19T00:00:00.000Z', type, data }) satisfies EventRow;

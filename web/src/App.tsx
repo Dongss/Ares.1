@@ -112,7 +112,7 @@ export function App() {
           </NavLink>
         </nav>
         <WorkToggle work={work} />
-        <NotifyToggle notifications={notifications} />
+        <NotifyToggle notifications={notifications} webhook={work.webhookNotify} />
         <LangToggle
           language={language}
           onSwitch={(l) => {
@@ -128,7 +128,7 @@ export function App() {
       </header>
       <main key={language}>
         <WorkOffBanner work={work} />
-        <NotifyBanner notifications={notifications} />
+        <NotifyBanner notifications={notifications} webhook={work.webhookNotify} />
         {config.data?.reloadError && (
           <ErrorBox>
             {t({

@@ -25,6 +25,7 @@ import type { GitHub } from './github/client.js';
 import { type Lang, lang, setLang, t } from './i18n.js';
 import { RawLogPruner } from './logs/prune.js';
 import { type SendNotice, SystemNotifier } from './notify/system.js';
+import { WebhookNotifier } from './notify/webhook.js';
 import { backupRestoredNotice, Store } from './store/store.js';
 import {
   copyUpgradeScript,
@@ -189,6 +190,7 @@ export class Master {
     readonly engine: Engine,
     readonly issues: IssueBridge,
     readonly notifier: SystemNotifier,
+    readonly webhook: WebhookNotifier,
     readonly upgrader: Upgrader,
     readonly logPruner: RawLogPruner,
     readonly app: Hono,
@@ -260,6 +262,7 @@ export class Master {
       masterOrigin,
     });
     const notifier = new SystemNotifier(store, config, opts.notice);
+    const webhook = new WebhookNotifier(store, config);
     let master: Master | undefined;
     const upgrader = new Upgrader({
       store,
@@ -303,10 +306,22 @@ export class Master {
         );
       });
     });
-    master = new Master(paths, watcher, store, engine, issues, notifier, upgrader, logPruner, app);
+    master = new Master(
+      paths,
+      watcher,
+      store,
+      engine,
+      issues,
+      notifier,
+      webhook,
+      upgrader,
+      logPruner,
+      app,
+    );
     // Before the engine recovers the Runs the last Master left, so that the event comes first.
     master.runningToken = markRunning(paths, store);
     notifier.start();
+    webhook.start();
     await engine.start();
     await issues.start({ poll: opts.pollIssues !== false });
     upgrader.start({ timer: opts.upgradeTimer !== false });
@@ -344,6 +359,7 @@ export class Master {
     this.upgrader.stop();
     this.logPruner.stop();
     this.notifier.stop();
+    this.webhook.stop();
     await this.issues.stop();
     await this.engine.stop();
     const server = this.server;

@@ -209,6 +209,11 @@ export interface HealthView {
   working: boolean;
   /** The Master sends system notifications itself; the dashboard then stays quiet. */
   systemNotify: boolean;
+  /**
+   * The Master also POSTs notifications to a webhook (notify.webhook); the dashboard still sends
+   * its own. Never the address or headers.
+   */
+  webhookNotify: boolean;
   /** Commit of the running Master's install directory; the dashboard reloads when it changes. */
   version: string | null;
 }

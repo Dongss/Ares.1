@@ -326,10 +326,10 @@ Agent 出错且重试、换 Agent 都用完，Agent 不可用且没有可换的 
 
 侦察失败（Agent 出错或超时、输出不符合约定、建临时工作目录失败等）时，事件列表里记一条 `scout.failed`（看板「事件」页能看到，标成红色），数据里有 `scoutId`、`repo`、`message`（错误信息）和 `streak`：这个仓库从最近一次侦察往回数连续失败的次数（包括这一次；自动和手动触发的都算）。额度用尽或被限流的、被 Master 停止打断的、还在进行的侦察既不计数，也不打断计数；正常结束的侦察（哪怕没找到需求）让计数从头开始。`streak` 正好到 3 时通知一次「侦察连续失败：<仓库名>」，正文是错误信息的第一行，点开是「需求」页；之后接着失败不再通知，直到有侦察正常结束、又连续失败 3 次。被 Master 停止打断的侦察也记 `scout.failed`，但不带 `streak`，不通知。
 
-通知有两条通道，用同一套规则（`src/notify/notice.ts`）：
+通知有三条通道，用同一套规则（`src/notify/notice.ts`）：
 
 - 浏览器：在看板顶栏打开「通知」，由浏览器发，要开着至少一个看板标签页（可以在后台）。
-- 系统通知：Master 自己发，不用开着看板。在 `config.yaml` 里打开：
+- 系统通知：Master 自己发，不用开着看板，但要人在这台机器前。在 `config.yaml` 里打开：
 
 ```yaml
 notify:
@@ -344,7 +344,46 @@ notify:
 
 在 macOS 和 Linux 上打开 `notify.system` 后，`/api/health` 的 `systemNotify` 为 `true`，看板不再重复发浏览器通知；在不支持的平台上它为 `false`，看板照常由浏览器发，不会因为打开了这个设置反而什么都收不到。系统通知发送失败（比如 Linux 上没装 `notify-send`，或者没有桌面会话）不影响 Master，只在 Master 的输出里记一次原因（以 `[通知]` 开头，英文为 `[notify]`），之后的失败不再记。
 
-自动升级脚本（`scripts/self-upgrade.sh`）在 Master 一个都没能启动时（找不到安装目录，或者回退后旧版本也没能启动）也发一条系统通知：有 `osascript` 就用它，否则有 `notify-send` 就用它，两个都没有就不发。
+自动升级脚本（`scripts/self-upgrade.sh`）在 Master 一个都没能启动时（找不到安装目录，或者回退后旧版本也没能启动）也发一条系统通知：有 `osascript` 就用它，否则有 `notify-send` 就用它，两个都没有就不发。这时 Master 不在运行，webhook 也就发不出去。
+
+### webhook
+
+第三条通道：Master 把通知 POST 到 `config.yaml` 里配置的地址，人不在这台机器前也能收到，适合 Master 跑在没有桌面的 Linux 服务器上，或者人离开了电脑。可以接 [ntfy](https://ntfy.sh)、Slack 的入站 webhook，或者你自己的服务：
+
+```yaml
+notify:
+  webhook:
+    url: https://ntfy.sh/<你的主题>     # 必填，只能是 http:// 或 https:// 开头的地址
+    headers:                           # 可选：额外的请求头，比如鉴权；和默认的请求头同名时覆盖默认值
+      Authorization: Bearer <你的 token>
+    format: json                       # 可选：json（默认）/ text
+```
+
+- 不写 `webhook` 就不发，和以前一样。它和 `notify.system` 互不影响，配了就发，不需要打开 `system`；浏览器通知也照常可以开，不去重。
+- 地址里不能带用户名和密码（`https://user:pass@...`），要鉴权就写在 `headers` 里（比如 `Authorization`），或者用服务自己的写法（比如 ntfy 地址后面的 `?auth=`）。请求头的值不能有换行。地址或请求头不合法时 `config.yaml` 无效，和其他配置错误一样处理。
+- 每次有事件都读当前的配置，改了 `config.yaml` 保存后立即生效，不用重启。
+- 发什么：和其他通道一样，只在需要人处理时发（见上面），Run 完成等不需要人处理的事件不发。每条通知 POST 一次。
+- `format: json`（默认）：`Content-Type: application/json`，正文是
+
+  ```json
+  {
+    "kind": "blocked",
+    "title": "Run 卡住了：Agent 执行出错",
+    "body": "Run 的需求的第一行",
+    "text": "Run 卡住了：Agent 执行出错\nRun 的需求的第一行",
+    "runId": "run_…",
+    "about": "run",
+    "eventType": "run.blocked",
+    "at": "2026-11-23T08:00:00.000Z"
+  }
+  ```
+
+  `kind` 是通知的种类（`approval`、`discussion`、`blocked`、`failed`、`proposals`、`scout`、`github`、`upgrade`），`title`、`body` 是通知的标题和正文（按 `language` 的语言），`text` 是「标题\n正文」，`runId` 是相关的 Run（没有时为 `null`），`about` 说明点开该去哪里（`run` 是 Run 详情页，`issues` 是「需求」页，`master` 没有特定页面），`eventType` 是引起通知的事件类型，`at` 是事件发生的时间。Slack 的入站 webhook 会显示 `text`、忽略其他字段，可以直接接。
+- `format: text`：`Content-Type: text/plain; charset=utf-8`，正文就是「标题\n正文」，适合 ntfy 这类直接显示正文的服务。
+- 飞书、钉钉的机器人 webhook 要求固定的消息格式，不能直接接：要经过一层转发（自己的小服务把正文改成它们要的格式），或者先发到 ntfy 这类服务。
+- 发出去的标题、正文和 `text` 都先把用户目录下的路径换成 `~`（和发到 GitHub 的文字一样，见「发到 GitHub 的文字不带用户目录」），不把系统用户名发给外部服务。
+- `/api/health` 的 `webhookNotify` 只说明有没有配 webhook，不返回地址和请求头；看板的「说明」页和顶栏的通知开关会提一句已配置 webhook。
+- 失败时：地址返回的不是 2xx（比如 500）、连不上或 10 秒内没有响应都算失败。不重试，不影响 Master，只在 Master 的输出里记一次原因（以 `[通知]` 开头，英文为 `[notify]`，写明 HTTP 状态码或错误信息，不写地址和请求头，免得把里面的 token 记下来），之后的失败不再记；改了 `notify.webhook.url`（配置重新加载后）再失败时重新记一次。
 
 ## 稳定副本和自动升级
 

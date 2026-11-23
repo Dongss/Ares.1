@@ -146,6 +146,7 @@ describe('CLI smoke test', () => {
       activeRun: null,
       working: expect.any(Boolean),
       systemNotify: false,
+      webhookNotify: false,
     });
     expect(health.version === null || typeof health.version === 'string', m.output()).toBe(true);
 

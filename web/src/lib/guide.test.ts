@@ -518,6 +518,7 @@ describe('scoutGuide', () => {
 });
 
 describe('notifications', () => {
+  afterEach(() => setLang('zh'));
   const ev = (type: string, data: Record<string, unknown> = {}, runId: string | null = 'r') =>
     ({ id: 1, runId, ts: '2026-11-19T00:00:00.000Z', type, data }) satisfies EventRow;
 
@@ -590,6 +591,27 @@ describe('notifications', () => {
     }
     // Where the Master cannot send them, the browser still does.
     expect(notifyChannel(false)).toContain('其他平台不支持，仍由浏览器发通知');
+  });
+
+  it('says a webhook is set, or how to be reached away from this machine', () => {
+    for (const system of [true, false]) {
+      expect(notifyChannel(system, true)).toContain(
+        '已配置 webhook（config.yaml 的 notify.webhook），需要人处理时 Master 也会 POST 到配置的地址',
+      );
+      expect(notifyChannel(system, false)).toContain('配 notify.webhook');
+      expect(notifyChannel(system, false)).not.toContain('已配置 webhook');
+    }
+    // The browser's notifications are still offered next to the webhook.
+    expect(notifyChannel(false, true)).toContain('现在由浏览器发通知');
+    setLang('en');
+    for (const [system, webhook] of [
+      [true, true],
+      [false, false],
+    ] as const) {
+      const text = notifyChannel(system, webhook);
+      expect(text).toContain(webhook ? 'A webhook is set' : 'set notify.webhook');
+      expect(text).not.toMatch(/[一-鿿]/);
+    }
   });
 });
 

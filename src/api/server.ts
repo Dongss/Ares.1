@@ -165,6 +165,8 @@ export function createApi(deps: ApiDeps): Hono {
     working: store.working,
     // Only where the Master can send them: elsewhere the dashboard keeps sending its own.
     systemNotify: config().master.notify.system && systemNoticeSupported(platform),
+    // Only whether there is one: the address and headers may carry tokens.
+    webhookNotify: config().master.notify.webhook !== undefined,
     version,
   });
 

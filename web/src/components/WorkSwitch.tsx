@@ -6,7 +6,8 @@ import { useAction, useReloadOn, useResource } from '../lib/hooks.js';
 /** The work switch: off = queued Runs wait, no issues are taken, no automatic scouts. */
 export function useWorkSwitch() {
   const health = useResource(() => api.health(), 'health');
-  useReloadOn(health.reload, (e) => e.type === 'master.working');
+  // A reloaded config.yaml may have changed how notifications are sent.
+  useReloadOn(health.reload, (e) => e.type === 'master.working' || e.type === 'config.reloaded');
   // After the Master upgraded itself this page is outdated: load the new one.
   const firstVersion = useRef<string | null | undefined>(undefined);
   const version = health.data?.version;
@@ -22,6 +23,7 @@ export function useWorkSwitch() {
   return {
     working: health.data?.working,
     systemNotify: health.data?.systemNotify ?? false,
+    webhookNotify: health.data?.webhookNotify ?? false,
     busy: action.busy,
     error: action.error,
     set,

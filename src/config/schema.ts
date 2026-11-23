@@ -72,6 +72,50 @@ export const GitHubSchema = z.strictObject({
 });
 export type GitHubConfig = z.infer<typeof GitHubSchema>;
 
+/** Notifications POSTed to an address of the user's (ntfy, a Slack incoming webhook, ...). */
+export const WebhookSchema = z.strictObject({
+  /** Only http and https: the Master sends nothing anywhere else. */
+  url: z
+    .url({
+      protocol: /^https?$/,
+      error: () =>
+        t({
+          zh: '应为 http:// 或 https:// 开头的地址',
+          en: 'should be an http:// or https:// URL',
+        }),
+    })
+    // fetch refuses such URLs, and would put the whole address in its error message.
+    .refine(
+      (url) => {
+        // An address that does not parse is already reported above.
+        const parsed = URL.parse(url);
+        return !parsed?.username && !parsed?.password;
+      },
+      {
+        error: () =>
+          t({
+            zh: '地址里不能带用户名和密码，请放到 headers 的 Authorization 里',
+            en: 'the address cannot carry a user name and password; put them in an Authorization header',
+          }),
+      },
+    ),
+  /** Extra request headers, e.g. for authorization; they override the defaults. */
+  headers: z
+    .record(
+      // zod reports a bad key as an invalid key at its path, so no message of its own.
+      z.string().regex(/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/),
+      // fetch would refuse it, with the value (maybe a token) in its error message.
+      z.string().regex(/^[^\r\n\0]*$/, {
+        error: () =>
+          t({ zh: '请求头的值不能有换行', en: 'a header value cannot contain line breaks' }),
+      }),
+    )
+    .default({}),
+  /** json = { kind, title, body, text, ... }; text = "title\nbody" as plain text. */
+  format: z.enum(['json', 'text']).default('json'),
+});
+export type WebhookConfig = z.infer<typeof WebhookSchema>;
+
 export const MasterConfigSchema = z.object({
   /**
    * Language of what the Master writes (issue comments, notifications, prompts to agents and
@@ -91,8 +135,15 @@ export const MasterConfigSchema = z.object({
     .prefault({}),
   /** Omitted = no GitHub integration. */
   github: GitHubSchema.optional(),
-  /** System notifications sent by the Master itself, when a human is needed. */
-  notify: z.strictObject({ system: z.boolean().default(false) }).prefault({}),
+  /** Notifications sent by the Master itself, when a human is needed. */
+  notify: z
+    .strictObject({
+      /** System notifications of the platform the Master runs on. */
+      system: z.boolean().default(false),
+      /** Omitted = no webhook. Independent of `system`. */
+      webhook: WebhookSchema.optional(),
+    })
+    .prefault({}),
   /** Upgrade the Master's own install directory when its git origin moves on. */
   upgrade: z.strictObject({ auto: z.boolean().default(false) }).prefault({}),
 });

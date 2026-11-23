@@ -85,9 +85,13 @@ src/
     redact.ts         text before it is published on GitHub: the user's home directory → ~
     scout.ts          the AI scout's prompt, output format and Run summary
   notify/
-    notice.ts         which events notify people (shared by system notifications and dashboard)
+    notice.ts         which events notify people (shared by system notifications, the webhook
+                      and dashboard)
     system.ts         system notifications sent by the Master: osascript on macOS, notify-send
                       (libnotify) on Linux, nothing elsewhere; which platforms are supported
+    webhook.ts        notifications the Master POSTs to notify.webhook in config.yaml (JSON or
+                      text, home directory as ~, 10 s timeout, no retry, a failure logged once
+                      per address)
   upgrade/
     upgrader.ts       the Master upgrades itself: finds a new version, waits for the work in hand,
                       hands over to scripts/self-upgrade.sh, keeps the last failed upgrade, retries
@@ -177,7 +181,7 @@ test/
   - how the scripts find the node to run the Master with: `scripts/find-node.sh`
   - the display name and slogan: `brandName()` / `brandSlogan()` / `brandTitle()` in `src/brand.ts`. Never write them as literals elsewhere. The exception is the `<title>` of `web/index.html`, a static file that keeps the Chinese title; a test keeps the two in sync.
 - Every comment the Master posts on an issue goes through `markComment` (`src/github/issues.ts`), which adds the hidden marker that tells it apart from human replies.
-- Every text the Master publishes on GitHub goes through `redactForGitHub` (`src/github/redact.ts`), which turns paths under the user's home directory into `~` so the system user name stays private: comments (in the bridge's `comment()`), the issues it creates, and the commit messages it makes (they may be pushed). Store the original text: the dashboard and logs keep the full paths.
+- Every text the Master publishes on GitHub goes through `redactForGitHub` (`src/github/redact.ts`), which turns paths under the user's home directory into `~` so the system user name stays private: comments (in the bridge's `comment()`), the issues it creates, and the commit messages it makes (they may be pushed). The notifications it POSTs to a webhook (`src/notify/webhook.ts`) go through it too. Store the original text: the dashboard and logs keep the full paths.
 - Anybody can write on a public repo. Text read from GitHub (issues, comments) goes into an agent's prompt only when `isTrusted` (`src/github/issues.ts`) trusts its author: the repo's owner, members and collaborators, and the account the Master acts as. A Run from an issue by anyone else waits for a human to confirm its goal (`untrusted_issue`).
 - Agents and the commands run on their work (setup and verify commands) get no GitHub credentials, so they cannot read untrusted comments themselves or act as the accounts logged in on the machine. Start them only with `prepareAgentEnv` (`src/adapters/process.ts`), the one place that defines their environment; the Master's own GitHub and git calls keep the credentials.
 - No natively compiled dependencies (e.g. better-sqlite3): keep `npm install` simple.

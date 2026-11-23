@@ -183,6 +183,70 @@ upgrade: { auto: true }
     expect(() => loadConfig(paths, ['claude-code'])).toThrow(/autto/);
   });
 
+  it('takes a webhook with an http or https address, JSON by default', () => {
+    const paths = home();
+    expect(loadConfig(paths, ['claude-code']).master.notify).toEqual({ system: false });
+    writeFile(paths.configFile, 'notify:\n  webhook:\n    url: https://ntfy.sh/my-topic\n');
+    const cfg = loadConfig(paths, ['claude-code'], ['claude-code']);
+    expect(cfg.master.notify).toEqual({
+      system: false,
+      webhook: { url: 'https://ntfy.sh/my-topic', headers: {}, format: 'json' },
+    });
+    expect(cfg.warnings).toEqual({});
+    writeFile(
+      paths.configFile,
+      `notify:
+  system: true
+  webhook:
+    url: http://127.0.0.1:8080/hook
+    headers: { Authorization: Bearer tk_1, X-Priority: high }
+    format: text
+`,
+    );
+    expect(loadConfig(paths, ['claude-code']).master.notify).toEqual({
+      system: true,
+      webhook: {
+        url: 'http://127.0.0.1:8080/hook',
+        headers: { Authorization: 'Bearer tk_1', 'X-Priority': 'high' },
+        format: 'text',
+      },
+    });
+  });
+
+  it('rejects a webhook address that is not http or https, or carries credentials', () => {
+    const paths = home();
+    const invalid = (webhook: string) => {
+      writeFile(paths.configFile, `notify:\n  webhook: ${webhook}\n`);
+      try {
+        loadConfig(paths, ['claude-code']);
+      } catch (err) {
+        expect(err).toBeInstanceOf(ConfigError);
+        return (err as Error).message;
+      }
+      throw new Error(`accepted ${webhook}`);
+    };
+    for (const url of ['ftp://example.com/x', 'file:///etc/passwd', 'not a url', 'ntfy.sh/x']) {
+      expect(invalid(`{ url: "${url}" }`)).toContain(
+        'notify.webhook.url: 应为 http:// 或 https:// 开头的地址',
+      );
+    }
+    const credentials = invalid('{ url: "https://me:secret@example.com/x" }');
+    expect(credentials).toContain('notify.webhook.url: 地址里不能带用户名和密码');
+    expect(credentials).not.toContain('secret');
+    expect(invalid('{}')).toContain('notify.webhook.url');
+    expect(invalid('{ url: "https://example.com", format: xml }')).toContain(
+      'notify.webhook.format',
+    );
+    expect(invalid('{ url: "https://example.com", method: PUT }')).toContain('method');
+    expect(invalid('{ url: "https://example.com", headers: { "a b": x } }')).toContain(
+      'notify.webhook.headers.a b',
+    );
+    // The value is not repeated in the message: it may be a token.
+    const value = invalid('{ url: "https://example.com", headers: { X-Token: "tk\\nsecret" } }');
+    expect(value).toContain('请求头的值不能有换行');
+    expect(value).not.toContain('secret');
+  });
+
   it('sets the interval between automatic scouts in minutes; the old key in hours is an error', () => {
     const paths = home();
     const scoutConfig = (scout: string) => `github:

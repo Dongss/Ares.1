@@ -115,6 +115,22 @@ describe('HTTP API', () => {
     expect(await systemNotify('linux', false)).toBe(false);
   });
 
+  it('reports whether a webhook is set, never its address or headers', async () => {
+    h = await harness();
+    expect((await call('GET', '/api/health')).json.webhookNotify).toBe(false);
+    await h.close();
+    h = undefined;
+    h = await harness({
+      config:
+        'notify:\n  webhook:\n    url: https://ntfy.sh/topic-tk_secret\n    headers: { Authorization: Bearer tk_hidden }\n',
+      master: { platform: 'win32' },
+    });
+    const health = await call('GET', '/api/health');
+    expect(health.json).toMatchObject({ webhookNotify: true, systemNotify: false });
+    expect(health.text).not.toContain('ntfy');
+    expect(health.text).not.toContain('tk_');
+  });
+
   it('tells a raw log deleted past retention from a missing one, and keeps the events', async () => {
     h = await harness();
     const { store, logPruner } = h.master;

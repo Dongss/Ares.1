@@ -116,7 +116,12 @@ export function GuidePage(props: {
     cycle: <CycleSection input={input} />,
     scout: <ScoutSection input={input} />,
     you: <YouSection input={input} home={home} working={working} />,
-    notify: <NotifySection systemNotify={health.data.systemNotify} />,
+    notify: (
+      <NotifySection
+        systemNotify={health.data.systemNotify}
+        webhookNotify={health.data.webhookNotify}
+      />
+    ),
     labels: <LabelsSection autoAccept={input.github?.autoAccept ?? null} />,
     guards: <GuardsSection input={input} working={working} />,
     faq: (
@@ -597,7 +602,13 @@ function YouSection(props: { input: GuideInput; home: string; working: boolean }
   );
 }
 
-function NotifySection({ systemNotify }: { systemNotify: boolean }) {
+function NotifySection({
+  systemNotify,
+  webhookNotify,
+}: {
+  systemNotify: boolean;
+  webhookNotify: boolean;
+}) {
   return (
     <>
       <p>
@@ -606,7 +617,7 @@ function NotifySection({ systemNotify }: { systemNotify: boolean }) {
           en: 'You are notified only when you need to do something; finished Runs and scouts are handled automatically and do not notify.',
         })}
       </p>
-      <p className="guide-now">{notifyChannel(systemNotify)}</p>
+      <p className="guide-now">{notifyChannel(systemNotify, webhookNotify)}</p>
       <div className="table-wrap">
         <table className="table">
           <thead>
