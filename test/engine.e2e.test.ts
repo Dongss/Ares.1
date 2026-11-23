@@ -1243,6 +1243,44 @@ describe('engine: a reviewer does not change the work', () => {
         },
       ]);
     };
+    /**
+     * The first reviewer, after its commit on the Run's branch, also checks out another branch
+     * and commits there. Returns that commit, once made.
+     */
+    const switchesBranch = (h1: Harness, opts: { uncommitted?: boolean } = {}) => {
+      const reviewer = h1.scripts.reviewer as Script;
+      let commit = '';
+      h1.scripts.reviewer = (ctx) => {
+        const working = reviewer(ctx);
+        const wd = ctx.input.workdir;
+        git(wd, 'checkout', '-q', '-b', 'reviewer-branch');
+        writeFile(join(wd, 'other.txt'), 'elsewhere\n');
+        git(wd, 'add', '-A');
+        git(wd, 'commit', '-q', '-m', 'reviewer on another branch');
+        commit = git(wd, 'rev-parse', 'HEAD');
+        if (opts.uncommitted) writeFile(join(wd, 'left.txt'), 'uncommitted\n');
+        return working;
+      };
+      return () => commit;
+    };
+    /**
+     * A git lock left in the worktree, as by a git process that died: nothing can be checked out
+     * there until it goes. Returns its path.
+     */
+    const lockWorktree = (worktree: string) => {
+      const lock = join(git(worktree, 'rev-parse', '--absolute-git-dir'), 'index.lock');
+      writeFile(lock, '');
+      return lock;
+    };
+    const deferredOf = (runId: string) =>
+      store()
+        .listEvents(runId)
+        .filter((e) => e.type === 'review.discard_deferred')
+        .map((e) => e.data);
+    const reviewTask = (runId: string) =>
+      store()
+        .listRunAttempts(runId)
+        .find((a) => a.agentId === 'reviewer')?.taskId;
 
     it('drops the commit the reviewer made when the Master restarts', async () => {
       const first = await harness();
@@ -1265,21 +1303,10 @@ describe('engine: a reviewer does not change the work', () => {
     it('drops it after a crash, also when the reviewer checked out another branch', async () => {
       const first = await harness();
       const { reviewed, next } = reviewers(first);
-      const reviewer = first.scripts.reviewer as Script;
-      let onOtherBranch = '';
-      first.scripts.reviewer = (ctx) => {
-        const working = reviewer(ctx);
-        const wd = ctx.input.workdir;
-        git(wd, 'checkout', '-q', '-b', 'reviewer-branch');
-        writeFile(join(wd, 'other.txt'), 'elsewhere\n');
-        git(wd, 'add', '-A');
-        git(wd, 'commit', '-q', '-m', 'reviewer on another branch');
-        onOtherBranch = git(wd, 'rev-parse', 'HEAD');
-        writeFile(join(wd, 'left.txt'), 'uncommitted\n');
-        return working;
-      };
+      const otherCommit = switchesBranch(first, { uncommitted: true });
       const { run, coded } = await startReview(first);
-      await waitFor(() => onOtherBranch !== '', 'the reviewer to switch branches');
+      await waitFor(() => otherCommit() !== '', 'the reviewer to switch branches');
+      const onOtherBranch = otherCommit();
       // A crash: the database still says "running" when the next Master opens it.
       expect(first.master.store.getRun(run.id).status).toBe('running');
 
@@ -1290,10 +1317,80 @@ describe('engine: a reviewer does not change the work', () => {
       expectCoderWork(waiting);
       expect(reviewed).toEqual([coded]);
       expect(git(h.repoDir, 'rev-parse', 'reviewer-branch')).toBe(onOtherBranch);
+      expect(deferredOf(run.id)).toEqual([]);
       const merged = await approveAndMerge(run.id);
       expect(merged).not.toContain(committed);
       expect(merged).not.toContain(onOtherBranch);
       // The "crashed" first Master is left as is; its hanging fake reviewer never resolves.
+    });
+
+    it('puts it back before checking the worktree when that failed as the Master stopped', async () => {
+      const first = await harness();
+      const { reviewed, next } = reviewers(first);
+      const otherCommit = switchesBranch(first);
+      const { run, coded } = await startReview(first);
+      await waitFor(() => otherCommit() !== '', 'the reviewer to switch branches');
+      const onOtherBranch = otherCommit();
+      const worktree = first.master.store.getRun(run.id).worktreePath as string;
+      const lock = lockWorktree(worktree);
+      // An upgrade stops the Master; switching back to the Run's branch fails meanwhile.
+      await first.close();
+      expect(git(worktree, 'symbolic-ref', '--short', 'HEAD')).toBe('reviewer-branch');
+      rmSync(lock);
+
+      h = await harness({ home: first.home, repoDir: first.repoDir });
+      next(h);
+      const waiting = await h.waitStatus(run.id, 'waiting_approval');
+      expect(waiting.error).toBeNull();
+      // The failure was recorded, and the Run put the worktree back before checking it, instead
+      // of failing because it was not on the Run's branch.
+      const deferred = deferredOf(run.id);
+      expect(deferred).toEqual([
+        { taskId: reviewTask(run.id), baseCommit: coded, error: expect.any(String) },
+      ]);
+      expect(deferred[0]?.error).toContain('index.lock');
+      const types = store()
+        .listEvents(run.id)
+        .map((e) => e.type)
+        .filter((type) => type.startsWith('review.'));
+      expect(types).toEqual(['review.discard_deferred', 'review.changes_discarded']);
+      expectDropped(run.id, coded, { checkedOut: 'reviewer-branch' });
+      expectCoderWork(waiting);
+      // The review ran again on the coder's work only.
+      expect(reviewed).toEqual([coded]);
+      expect(git(h.repoDir, 'rev-parse', 'reviewer-branch')).toBe(onOtherBranch);
+      const merged = await approveAndMerge(run.id);
+      expect(merged).not.toContain(committed);
+      expect(merged).not.toContain(onOtherBranch);
+    });
+
+    it('ends the Run with the reason when the worktree cannot be put back then either', async () => {
+      h = await harness();
+      const { reviewed, next } = reviewers(h);
+      const otherCommit = switchesBranch(h);
+      const { run, coded } = await startReview(h);
+      await waitFor(() => otherCommit() !== '', 'the reviewer to switch branches');
+      next(h);
+      const worktree = store().getRun(run.id).worktreePath as string;
+      lockWorktree(worktree);
+      const paused = await h.master.engine.pause(run.id);
+      expect(paused.status).toBe('paused');
+      const [deferred] = deferredOf(run.id);
+      expect(deferred).toMatchObject({ taskId: reviewTask(run.id), baseCommit: coded });
+      const error = deferred?.error as string;
+      expect(error).toContain('index.lock');
+
+      // The lock is still there when the Run goes on.
+      h.master.engine.resume(run.id);
+      const failed = await h.waitStatus(run.id, 'failed');
+      expect(failed.error).toBe(
+        `没能把工作目录放回 Run 的分支 ${failed.branch} 上评审开始时的提交：${error}\n` +
+          `工作目录当前不在 Run 的分支 ${failed.branch} 上（现在是 reviewer-branch）\n` +
+          'Run 结束，工作目录和分支已保留。',
+      );
+      expect(discardedOf(run.id)).toEqual([]);
+      expect(reviewed).toEqual([]);
+      expect(git(worktree, 'symbolic-ref', '--short', 'HEAD')).toBe('reviewer-branch');
     });
 
     it('drops it when the Run is paused, and the review starts again on resume', async () => {
@@ -1333,6 +1430,9 @@ describe('engine: a reviewer does not change the work', () => {
         .listEvents(run.id)
         .map((e) => e.type);
       expect(types.filter((type) => type === 'run.workspace_restored')).toHaveLength(1);
+      expect(deferredOf(run.id)).toEqual([
+        { taskId: reviewTask(run.id), baseCommit: coded, error: `工作目录 ${worktree} 不存在了` },
+      ]);
       expectDropped(run.id, coded);
       expectCoderWork(waiting);
       expect(reviewed).toEqual([coded]);

@@ -329,6 +329,12 @@ export function eventText(event: Pick<EventRow, 'type' | 'data'>, now = new Date
       en: "The agent's changes are still in the worktree, so only the verify commands run again",
     });
   }
+  if (event.type === 'review.discard_deferred') {
+    return t({
+      zh: '评审中途停下时，没能丢掉评审者留下的改动、把工作目录放回评审开始时的提交；Run 再拿到执行位时先补做，再检查工作目录、重新评审',
+      en: 'When the review stopped halfway, what the reviewer left could not be dropped to put the working directory back where the review started; the Run does it first when it next gets the execution slot, before its working directory is checked and the review runs again',
+    });
+  }
   const { reason, supersededBy } = event.data;
   if (reason === 'superseded' && typeof supersededBy === 'string') {
     if (event.type === 'workspace.removed') {

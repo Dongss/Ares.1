@@ -569,6 +569,30 @@ describe('a Run started over because its issue changed', () => {
   });
 });
 
+describe('a review stopped halfway whose work could not be put back', () => {
+  afterEach(() => setLang('zh'));
+  const deferred = {
+    type: 'review.discard_deferred',
+    data: { taskId: 'task_r', baseCommit: 'abc123', error: 'git checkout failed' },
+  };
+
+  it('says the Run puts it back before its worktree is checked', () => {
+    expect(eventText(deferred)).toBe(
+      '评审中途停下时，没能丢掉评审者留下的改动、把工作目录放回评审开始时的提交；Run 再拿到执行位时先补做，再检查工作目录、重新评审',
+    );
+    expect(eventText({ type: 'review.changes_discarded', data: {} })).toBeNull();
+  });
+
+  it('in English', () => {
+    setLang('en');
+    const text = eventText(deferred);
+    expect(text).toBe(
+      'When the review stopped halfway, what the reviewer left could not be dropped to put the working directory back where the review started; the Run does it first when it next gets the execution slot, before its working directory is checked and the review runs again',
+    );
+    expect(text).not.toMatch(/[一-鿿]/);
+  });
+});
+
 describe('raw logs past retention', () => {
   afterEach(() => setLang('zh'));
   const now = new Date('2026-12-31T00:00:00.000Z');

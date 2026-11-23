@@ -1037,17 +1037,25 @@ export class Engine {
    * that was only deleted (cleaning up the disk, say) comes back from the Run's branch, as a
    * human's retry would bring it back. Otherwise the worktree can no longer be trusted (history
    * rewritten, another branch checked out, the branch gone too): the Run ends as failed instead
-   * of waiting for a human, and a Run from an issue is redone in a fresh worktree.
+   * of waiting for a human, and a Run from an issue is redone in a fresh worktree. A Run in a
+   * review first has its worktree put back where the review started (`redoStoppedReviewDiscard`),
+   * as the review would before it runs again; when that fails, the reason goes with the error.
    */
   private async checkWorkspace(runId: string, signal: AbortSignal): Promise<boolean> {
     const run = this.store.getRun(runId);
+    const undiscarded = await this.redoStoppedReviewDiscard(run, signal);
     const problem = await this.workspaceProblem(run);
     this.checkAbort(signal);
     if (!problem) return true;
     const why =
       problem.reason === 'missing'
         ? await this.restoreMissingWorkspace(run, problem, signal)
-        : problem.message;
+        : undiscarded === null
+          ? problem.message
+          : t({
+              zh: `没能把工作目录放回 Run 的分支 ${run.branch} 上评审开始时的提交：${undiscarded}\n${problem.message}`,
+              en: `The working directory could not be put back on the Run's branch ${run.branch} at the commit the review started on: ${undiscarded}\n${problem.message}`,
+            });
     if (why === null) return true;
     const state = await this.inspectWorkspace(run);
     this.checkAbort(signal);
@@ -2168,8 +2176,9 @@ export class Engine {
     let head = task.baseCommit;
     if (head) {
       // Started before: a stop in the middle of the review normally put the work back there
-      // (`discardInFlight`); when it could not (the worktree was gone, say), what that reviewer
-      // left goes now, before this one looks.
+      // (`discardInFlight`), or getting the execution slot again did (`checkWorkspace`); when
+      // neither could (the worktree was gone, say), what that reviewer left goes now, before this
+      // one looks.
       await this.discardReviewWork(run, task, head);
     } else {
       // Recorded before the reviewer runs, so that what it leaves behind can be dropped also when
@@ -3225,17 +3234,22 @@ export class Engine {
    * Undo whatever was in progress (pause / shutdown / crash recovery). A review stopped halfway
    * goes back on the Run's branch to the commit it started on, as when a review ends
    * (`discardReviewWork`): a commit its reviewer made would otherwise stay on the branch, be
-   * taken for the work under review by the next review and be merged with it.
+   * taken for the work under review by the next review and be merged with it. When that fails
+   * (the worktree is gone, the Run's branch is checked out elsewhere, a git lock...), the failure
+   * is recorded with the task (`review.discard_deferred`) instead of stopping the Master's start
+   * or shutdown, and the Run does it when it next gets the execution slot: before its worktree is
+   * checked (`checkWorkspace`), so that a reviewer's checkout of another branch does not fail the
+   * Run, or, for a deleted worktree, once it is back and before the review runs again
+   * (`runReviewTask`).
    */
   private async discardInFlight(run: Run): Promise<void> {
     for (const task of this.store.listRunTasks(run.id)) {
       if (!IN_FLIGHT_TASK.has(task.status)) continue;
       const path = run.worktreePath;
+      let deferred: string | null = null;
       if (path && task.baseCommit) {
         if (this.stageKindOf(run, task) !== 'review') await resetHard(path, task.baseCommit);
-        // When this cannot be done (the worktree is gone, say), the review does it before it runs
-        // again (`runReviewTask`), where a failure stops only this Run and not the Master's start.
-        else await this.discardReviewWork(run, task, task.baseCommit).catch(() => {});
+        else deferred = await this.discardStoppedReview(run, task, path, task.baseCommit);
       }
       this.store.tx(() => {
         this.store.updateTask(task.id, {
@@ -3246,6 +3260,13 @@ export class Engine {
           pendingFeedback: null,
         });
         this.store.event(run.id, 'task.discarded', { taskId: task.id });
+        if (deferred !== null) {
+          this.store.event(run.id, 'review.discard_deferred', {
+            taskId: task.id,
+            baseCommit: task.baseCommit,
+            error: deferred,
+          });
+        }
       });
     }
     // Also gives up a merge started for an agent (`conflictMerge`) before the agent ran, which
@@ -3319,6 +3340,49 @@ export class Engine {
         ...discarded,
       });
     });
+  }
+
+  /**
+   * Put back the work of a review stopped halfway (`discardReviewWork`); returns why that could
+   * not be done, or null when it was.
+   */
+  private async discardStoppedReview(
+    run: Run,
+    task: Task,
+    path: string,
+    from: string,
+  ): Promise<string | null> {
+    // git would only say it cannot start (spawn ENOENT) in a directory that is gone.
+    if (!existsSync(path)) {
+      return t({ zh: `工作目录 ${path} 不存在了`, en: `The working directory ${path} is gone` });
+    }
+    try {
+      await this.discardReviewWork(run, task, from);
+      return null;
+    } catch (err) {
+      return errorMessage(err).trim();
+    }
+  }
+
+  /**
+   * When a Run in a review gets the execution slot: put its worktree back on the Run's branch at
+   * the commit the review started on, before the worktree is checked against the records
+   * (`checkWorkspace`). Putting back the work of a review stopped halfway may have failed then
+   * (`review.discard_deferred`); a reviewer that checked out another branch would otherwise fail
+   * the Run as not on its branch, before the review could put it back itself (`runReviewTask`).
+   * Nothing left over changes nothing, so it needs no record of that failure. A deleted worktree
+   * is left for `restoreMissingWorkspace`. Returns why it failed, or null.
+   */
+  private async redoStoppedReviewDiscard(run: Run, signal: AbortSignal): Promise<string | null> {
+    const path = run.worktreePath;
+    if (!path || !run.headCommit || !run.currentStageRunId || !existsSync(path)) return null;
+    const task = this.store
+      .listTasks(run.currentStageRunId)
+      .find((candidate) => candidate.status === 'pending' && candidate.baseCommit);
+    if (!task?.baseCommit || this.stageKindOf(run, task) !== 'review') return null;
+    const failed = await this.discardStoppedReview(run, task, path, task.baseCommit);
+    this.checkAbort(signal);
+    return failed;
   }
 
   /** The kind of the stage the task belongs to in the Run's workflow. */
