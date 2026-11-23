@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { copyFileSync, existsSync, readFileSync, renameSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
 import type { UpgradeStatus } from '../api/types.js';
@@ -83,6 +83,23 @@ export function lastUpgradeFailure(store: Store): UpgradeFailure | null {
   }
 }
 
+/**
+ * Puts a copy of the upgrade script at `dest` by renaming a fresh copy over it, never by writing
+ * into it. An earlier script may still be running from `dest`: it watches the new Master for a
+ * few minutes, and that Master may start the next upgrade meanwhile. bash reads its script as it
+ * goes, so the file it has open must not change; after a rename it keeps reading the old one.
+ */
+export function copyUpgradeScript(source: string, dest: string): void {
+  const tmp = `${dest}.${process.pid}.tmp`;
+  try {
+    copyFileSync(source, tmp);
+    renameSync(tmp, dest);
+  } catch (err) {
+    rmSync(tmp, { force: true });
+    throw err;
+  }
+}
+
 /** The script's result file; one that cannot be read counts as a failed upgrade. */
 function readResult(file: string): UpgradeResult {
   try {
@@ -104,8 +121,15 @@ function readResult(file: string): UpgradeResult {
  * Keeps the Master on the latest commit of its install directory's origin: when the stable
  * copy falls behind (a Run merged into the dev repo), it holds the queue, waits for the executing
  * Run and any scout, then hands over to scripts/self-upgrade.sh, which pulls, builds, restarts and
- * rolls back if the new version does not come up. A target that failed once (pulling, building
- * or starting it) is not retried; a newer commit on origin is.
+ * rolls back if the new version does not come up. Once it answers, the script watches it for five
+ * minutes (ARES1_UPGRADE_WATCH in the environment sets the seconds): an exit with a non-zero code
+ * meanwhile rolls back too, an exit with 0 (stopped on purpose, or handing over to the next
+ * upgrade) does not. A target that failed once (pulling, building, starting it or keeping it
+ * running) is not retried; a newer commit on origin is.
+ *
+ * A failure found while watching comes after the new version already read the success the script
+ * wrote before starting it, and cleared the planned target; the failure is then recorded against
+ * the script's `to`, which is past `from`.
  */
 export class Upgrader {
   private timer: ReturnType<typeof setInterval> | undefined;

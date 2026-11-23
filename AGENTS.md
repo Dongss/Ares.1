@@ -93,7 +93,8 @@ src/
     cost.ts           whether a cost is unknown (shared by Master and dashboard)
     static.ts         serves the built dashboard
 scripts/
-  self-upgrade.sh     auto-upgrade: pull, build, restart; back to the old version on failure
+  self-upgrade.sh     auto-upgrade: pull, build, restart, watch the new version for a few minutes;
+                      back to the old version on failure or when it crashes meanwhile
 web/                  dashboard (React + Vite)
   src/App.tsx         top bar (navigation, work switch, notification switch, language switch)
                       and routing

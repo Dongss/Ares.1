@@ -522,34 +522,50 @@ describe('issues: scout', () => {
 
   /**
    * A Master running from a clone of `source` (its stable copy), started after an upgrade failed
-   * with output that has the home directory in it, and the prompt of a scout of demo.
+   * with output that has the home directory in it, and the prompt of a scout of demo. With
+   * `crashedAfterSuccess` the new version came up and read the success first, then crashed while
+   * the upgrade script watched it.
    */
-  async function afterFailedUpgrade(opts: { demoIsSource: boolean }) {
+  async function afterFailedUpgrade(opts: {
+    demoIsSource: boolean;
+    crashedAfterSuccess?: boolean;
+  }) {
     const repoDir = initRepo();
     const source = opts.demoIsSource ? repoDir : initRepo();
     const installDir = join(tmpDir('ares1-install-'), 'stable');
     git(source, 'clone', '-q', source, installDir);
     const home = tmpDir('ares1-home-');
+    const from = git(installDir, 'rev-parse', 'HEAD');
     const failed = 'c'.repeat(40);
+    const resultFile = join(home, 'data', 'upgrade-result.json');
+    gh = new FakeGitHub();
+    const start = () =>
+      harness({
+        home,
+        repoDir,
+        agents: AGENTS,
+        config: config(),
+        github: gh,
+        master: { installDir, launchUpgrade: () => {}, exit: () => {} },
+      });
+    if (opts.crashedAfterSuccess) {
+      writeFile(resultFile, JSON.stringify({ ok: true, from, to: failed, message: '' }));
+      await (await start()).close();
+    }
+    const message = opts.crashedAfterSuccess
+      ? `新版本 ${failed.slice(0, 7)} 启动后 1 分钟内退出（退出码 1），已回退到 ${from.slice(0, 7)}`
+      : `拉取或构建 ${failed.slice(0, 7)} 失败`;
     writeFile(
-      join(home, 'data', 'upgrade-result.json'),
+      resultFile,
       JSON.stringify({
         ok: false,
-        from: git(installDir, 'rev-parse', 'HEAD'),
+        from,
         to: failed,
-        message: `拉取或构建 ${failed.slice(0, 7)} 失败`,
+        message,
         detail: `> tsc\n${join(homedir(), 'ares1-stable', 'src', 'a.ts')}(3,1): error TS1005: "," expected.`,
       }),
     );
-    gh = new FakeGitHub();
-    h = await harness({
-      home,
-      repoDir,
-      agents: AGENTS,
-      config: config(),
-      github: gh,
-      master: { installDir, launchUpgrade: () => {}, exit: () => {} },
-    });
+    h = await start();
     const t = h;
     t.scripts.scout = () => ({ structured: { proposals: [] } });
     const scoutPromptNow = async () => {
@@ -557,7 +573,7 @@ describe('issues: scout', () => {
       await scoutDone(t, scout.id);
       return t.fake.calls.at(-1)?.prompt ?? '';
     };
-    return { t, home, failed, scoutPromptNow };
+    return { t, home, from, failed, scoutPromptNow };
   }
 
   it("shows the Master's failed upgrade to the scout of its own repo, until one succeeds", async () => {
@@ -582,6 +598,21 @@ describe('issues: scout', () => {
   it("does not show the Master's failed upgrade to the scouts of other repos", async () => {
     const { scoutPromptNow } = await afterFailedUpgrade({ demoIsSource: false });
     expect(await scoutPromptNow()).not.toContain('自动升级失败');
+  });
+
+  it('shows a new version that crashed after it had already reported its success', async () => {
+    const { from, failed, scoutPromptNow } = await afterFailedUpgrade({
+      demoIsSource: true,
+      crashedAfterSuccess: true,
+    });
+    const prompt = await scoutPromptNow();
+    expect(prompt).toContain('## Master 自动升级失败');
+    expect(prompt).toContain(`目标分支上的提交 ${failed}`);
+    expect(prompt).toContain(`已回退到 ${from.slice(0, 7)} 继续运行`);
+    expect(prompt).toContain(
+      `- 失败消息：新版本 ${failed.slice(0, 7)} 启动后 1 分钟内退出（退出码 1），已回退到 ${from.slice(0, 7)}`,
+    );
+    expect(prompt).toContain('~/ares1-stable/src/a.ts(3,1): error TS1005: "," expected.');
   });
 
   it('stops auto-accepting once the daily budget is spent', async () => {

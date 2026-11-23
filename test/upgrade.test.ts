@@ -1,10 +1,24 @@
 import { execFileSync } from 'node:child_process';
-import { chmodSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  closeSync,
+  copyFileSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { githubNameOf, isMasterSource } from '../src/upgrade/source.js';
-import { lastUpgradeFailure, type UpgradePlan } from '../src/upgrade/upgrader.js';
+import {
+  copyUpgradeScript,
+  lastUpgradeFailure,
+  type UpgradePlan,
+} from '../src/upgrade/upgrader.js';
 import { git, type Harness, harness, initRepo, tmpDir, waitFor, writeFile } from './helpers.js';
 
 let h: Harness | undefined;
@@ -167,6 +181,54 @@ describe('upgrader', () => {
     const newer = first.commit('newer.txt');
     await h.master.upgrader.check();
     expect(launches).toEqual([expect.objectContaining({ from, to: newer })]);
+  });
+
+  it('records a failure found while the script watched the new version, after its success', async () => {
+    const first = await installed();
+    const { home } = first.t;
+    const from = git(first.installDir, 'rev-parse', 'HEAD');
+    const to = first.commit('new.txt');
+    await first.t.master.upgrader.check();
+    expect(first.launches).toHaveLength(1);
+    const resultFile = join(home, 'data', 'upgrade-result.json');
+    const launches: UpgradePlan[] = [];
+    const start = () =>
+      harness({
+        home,
+        config: 'upgrade:\n  auto: true\n',
+        master: {
+          installDir: first.installDir,
+          launchUpgrade: (p) => launches.push(p),
+          exit: () => {},
+        },
+      });
+
+    // The new version starts and reads the success the script wrote before starting it; that
+    // clears the planned target and any earlier failure.
+    writeFile(resultFile, JSON.stringify({ ok: true, from, to, message: '' }));
+    const upgraded = await start();
+    expect(eventsOf(upgraded, 'upgrade.done')).toHaveLength(1);
+    await upgraded.close();
+
+    // It crashes while the script watches it; the script rolls back and leaves a failure for
+    // the old version, which it starts again.
+    const message = `新版本 ${to.slice(0, 7)} 启动后 1 分钟内退出（退出码 1），已回退到 ${from.slice(0, 7)}`;
+    const detail = 'TypeError: boom';
+    writeFile(resultFile, JSON.stringify({ ok: false, from, to, message, detail }));
+    h = await start();
+    const failed = eventsOf(h, 'upgrade.failed');
+    expect(failed).toHaveLength(1);
+    expect(JSON.parse(failed[0]?.data ?? '{}')).toEqual({ from, to, message, detail });
+    expect(lastUpgradeFailure(h.master.store)).toMatchObject({ from, to, message, detail });
+    expect(h.master.store.getSetting('upgrade.failed_to')).toBe(to);
+
+    // And it does not try that commit again.
+    await h.master.upgrader.check();
+    expect(h.master.upgrader.status()).toMatchObject({
+      state: 'skipped',
+      message: `升级到 ${to.slice(0, 7)} 失败过，等有新的提交再试`,
+    });
+    expect(launches).toEqual([]);
   });
 
   it('reports a successful upgrade on the next start', async () => {
@@ -368,13 +430,18 @@ describe('upgrade script', () => {
   });
 
   /**
-   * A stable copy one commit behind origin, and a run of the script on it with stand-ins in
-   * PATH: npm and curl for the build and the health check, osascript for notifications, sleep so
-   * that waiting takes no time, and fake-node for the Master the script starts. fake-node hands
-   * `-e` (writing the result file) to the real node. Each stand-in does what `fakes` says, else
-   * succeeds silently.
+   * A stable copy one commit behind origin, and a run of a copy of the script on it (as the
+   * Master runs a copy) with stand-ins in PATH: npm and curl for the build and the health check,
+   * osascript for notifications, sleep so that waiting takes no time, and fake-node for the
+   * Master the script starts. fake-node hands `-e` (writing the result file) to the real node.
+   * Each stand-in does what `fakes` says, else succeeds silently; $FAKE_DIR is the directory they
+   * and the script's copy are in. `env` adds to the script's environment, where
+   * ARES1_UPGRADE_WATCH is unset unless it says otherwise.
    */
-  function stableCopy(fakes: Record<string, string> = {}) {
+  function stableCopy(
+    fakes: Record<string, string> = {},
+    opts: { env?: Record<string, string>; lang?: string } = {},
+  ) {
     const origin = initRepo();
     const installDir = join(tmpDir('ares1-install-'), 'stable');
     git(origin, 'clone', '-q', origin, installDir);
@@ -398,13 +465,24 @@ describe('upgrade script', () => {
       writeFileSync(join(bin, cmd), `#!/bin/sh\n${body}\n`);
       chmodSync(join(bin, cmd), 0o755);
     }
+    const script = join(bin, 'self-upgrade.sh');
+    copyFileSync(join(process.cwd(), 'scripts', 'self-upgrade.sh'), script);
     const home = tmpDir('ares1-home-');
     const result = join(home, 'result.json');
+    const env = {
+      ...Object.fromEntries(
+        Object.entries(process.env).filter(([key]) => key !== 'ARES1_UPGRADE_WATCH'),
+      ),
+      PATH: `${bin}:${process.env.PATH}`,
+      FAKE_DIR: bin,
+      ...opts.env,
+    };
+    let output = '';
     const run = (...extra: string[]) => {
-      execFileSync(
+      output = execFileSync(
         'bash',
         [
-          join(process.cwd(), 'scripts', 'self-upgrade.sh'),
+          script,
           installDir,
           home,
           '999999', // no such process: nothing to wait for
@@ -413,20 +491,160 @@ describe('upgrade script', () => {
           join(bin, 'fake-node'),
           '1',
           'Ares.1',
-          'en',
+          opts.lang ?? 'en',
           ...extra,
         ],
-        {
-          env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
-          encoding: 'utf8',
-          stdio: ['ignore', 'pipe', 'pipe'],
-        },
+        { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
       );
       // Parsing fails the test if the file is not valid JSON.
       return JSON.parse(readFileSync(result, 'utf8')) as Record<string, unknown>;
     };
-    return { installDir, home, old, target, run };
+    /** What the last run logged. */
+    const log = () => output;
+    return { installDir, home, bin, old, target, run, log };
   }
+
+  /**
+   * fake-node standing in for a Master: it leaves its pid in $FAKE_DIR/pid, then runs `lines`.
+   */
+  const fakeMaster = (...lines: string[]) =>
+    [
+      `if [ "$1" = -e ]; then exec '${process.execPath}' "$@"; fi`,
+      'echo $$ > "$FAKE_DIR/pid"',
+      ...lines,
+    ].join('\n');
+
+  /** A sleep that returns once the Master fakeMaster started has written its pid. */
+  const untilMasterStarted = 'while [ ! -s "$FAKE_DIR/pid" ]; do /bin/sleep 0.01; done';
+
+  /** A sleep that returns once the Master fakeMaster started has exited. */
+  const untilMasterExited = [
+    'while [ ! -s "$FAKE_DIR/pid" ]; do /bin/sleep 0.01; done',
+    'while kill -0 "$(cat "$FAKE_DIR/pid")" 2>/dev/null; do /bin/sleep 0.01; done',
+  ].join('\n');
+
+  const short = (commit: string) => commit.slice(0, 7);
+  const chinese = /[一-鿿]/;
+
+  it('rolls back when the new version exits with an error after it answered', () => {
+    const { installDir, home, old, target, run, log } = stableCopy({
+      sleep: untilMasterExited,
+      'fake-node': fakeMaster(
+        `echo "TypeError: Cannot read properties of undefined (reading 'poll')"`,
+        'exit 3',
+      ),
+    });
+    writeFileSync(join(home, 'master.out'), 'output of an earlier run\n');
+    const result = run(target);
+    expect(result).toMatchObject({
+      ok: false,
+      from: old,
+      to: target,
+      message: `The new version ${short(target)} exited within 1 minute of starting (exit code 3); rolled back to ${short(old)}`,
+    });
+    // What this start printed, not what earlier runs left in master.out.
+    expect(result.detail).toBe("TypeError: Cannot read properties of undefined (reading 'poll')");
+    expect(git(installDir, 'rev-parse', 'HEAD')).toBe(old);
+    expect(log()).toContain(`watching it for 300 seconds`);
+    expect(log()).toContain(`Rolled back to ${old}`);
+    expect(log()).not.toMatch(chinese);
+  });
+
+  it('counts the minutes until the new version exited, and a signal as a crash', () => {
+    // sleep counts the looks; the new Master is killed by a signal during the 15th (75 seconds).
+    const { installDir, bin, old, target, run } = stableCopy(
+      {
+        sleep: [
+          'echo x >> "$FAKE_DIR/looks"',
+          '[ $(wc -l < "$FAKE_DIR/looks") -ge 15 ] || exit 0',
+          untilMasterExited,
+        ].join('\n'),
+        'fake-node': fakeMaster(
+          "echo 'Error: the scout failed'",
+          'while [ $(wc -l < "$FAKE_DIR/looks") -lt 15 ]; do /bin/sleep 0.01; done',
+          'kill -9 $$',
+        ),
+      },
+      { lang: 'zh' },
+    );
+    writeFileSync(join(bin, 'looks'), '');
+    expect(run(target)).toMatchObject({
+      ok: false,
+      to: target,
+      message: `新版本 ${short(target)} 启动后 2 分钟内退出（退出码 137），已回退到 ${short(old)}`,
+      detail: 'Error: the scout failed',
+    });
+    expect(git(installDir, 'rev-parse', 'HEAD')).toBe(old);
+  });
+
+  it('does not roll back when the new version exits with code 0', () => {
+    // Stopped on purpose (SIGTERM), or handed over to the next upgrade.
+    const { installDir, target, old, run, log } = stableCopy({
+      sleep: untilMasterExited,
+      'fake-node': fakeMaster('exit 0'),
+    });
+    expect(run(target)).toEqual({ ok: true, from: old, to: target, message: '' });
+    expect(git(installDir, 'rev-parse', 'HEAD')).toBe(target);
+    expect(log()).toContain('exited cleanly (exit code 0, stopped on purpose); not rolling back');
+    expect(log()).not.toContain('Rolled back');
+  });
+
+  it('ends once the watch is over while the new version still runs', () => {
+    const { installDir, bin, target, old, run, log } = stableCopy(
+      { sleep: untilMasterStarted, 'fake-node': fakeMaster('exec /bin/sleep 30') },
+      { env: { ARES1_UPGRADE_WATCH: '15' } },
+    );
+    try {
+      expect(run(target)).toEqual({ ok: true, from: old, to: target, message: '' });
+      expect(git(installDir, 'rev-parse', 'HEAD')).toBe(target);
+      expect(log()).toContain('watching it for 15 seconds');
+      expect(log()).toContain(`Upgraded to ${target}`);
+      // Still running: the script left it alone.
+      const pid = Number(readFileSync(join(bin, 'pid'), 'utf8'));
+      expect(() => process.kill(pid, 0)).not.toThrow();
+    } finally {
+      try {
+        process.kill(Number(readFileSync(join(bin, 'pid'), 'utf8')), 'SIGKILL');
+      } catch {}
+    }
+  });
+
+  it('reads all of itself before it starts, so a copy written over it meanwhile changes nothing', () => {
+    // The Master renames each new copy over the old one; this is what writing into it would do.
+    const { installDir, old, target, run, log } = stableCopy({
+      sleep: [
+        `printf 'echo overwritten\\nexit 9\\n' > "$FAKE_DIR/self-upgrade.sh"`,
+        untilMasterExited,
+      ].join('\n'),
+      // Crashes once the script has been written over, so that it rolls back after that.
+      'fake-node': fakeMaster(
+        'until grep -q overwritten "$FAKE_DIR/self-upgrade.sh"; do /bin/sleep 0.01; done',
+        'exit 1',
+      ),
+    });
+    expect(run(target)).toMatchObject({ ok: false, to: target });
+    expect(git(installDir, 'rev-parse', 'HEAD')).toBe(old);
+    expect(log()).toContain(`Rolled back to ${old}`);
+    expect(log()).not.toContain('overwritten');
+  });
+
+  it('puts a new copy of the script in place without changing the one a running script reads', () => {
+    const dir = tmpDir('ares1-script-');
+    const dest = join(dir, 'data', 'self-upgrade.sh');
+    mkdirSync(join(dir, 'data'));
+    writeFileSync(join(dir, 'first.sh'), 'first\n');
+    writeFileSync(join(dir, 'second.sh'), 'second\n');
+    copyUpgradeScript(join(dir, 'first.sh'), dest);
+    const running = openSync(dest, 'r');
+    try {
+      copyUpgradeScript(join(dir, 'second.sh'), dest);
+      expect(readFileSync(running, 'utf8')).toBe('first\n');
+    } finally {
+      closeSync(running);
+    }
+    expect(readFileSync(dest, 'utf8')).toBe('second\n');
+    expect(readdirSync(join(dir, 'data'))).toEqual(['self-upgrade.sh']);
+  });
 
   it('reports the planned target, not the old HEAD, when it cannot fast-forward', () => {
     const { installDir, old, target, run } = stableCopy();

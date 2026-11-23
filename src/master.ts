@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { copyFileSync, openSync } from 'node:fs';
+import { openSync } from 'node:fs';
 import type { Server } from 'node:http';
 import { join } from 'node:path';
 import { serve } from '@hono/node-server';
@@ -25,7 +25,7 @@ import type { GitHub } from './github/client.js';
 import { type Lang, lang, setLang } from './i18n.js';
 import { type SendNotice, SystemNotifier } from './notify/system.js';
 import { Store } from './store/store.js';
-import { type UpgradePlan, Upgrader } from './upgrade/upgrader.js';
+import { copyUpgradeScript, type UpgradePlan, Upgrader } from './upgrade/upgrader.js';
 import { git, revParse } from './workspace/git.js';
 
 /** CLIs with a built-in adapter. */
@@ -82,7 +82,7 @@ export interface MasterOptions {
 function launchUpgradeScript(paths: HomePaths, port: number, plan: UpgradePlan): void {
   // A copy, so that `git pull` does not rewrite the script while bash reads it.
   const script = join(paths.dataDir, 'self-upgrade.sh');
-  copyFileSync(join(plan.installDir, 'scripts', 'self-upgrade.sh'), script);
+  copyUpgradeScript(join(plan.installDir, 'scripts', 'self-upgrade.sh'), script);
   const log = openSync(join(paths.home, 'upgrade.log'), 'a');
   spawn(
     'bash',
