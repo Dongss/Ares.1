@@ -10,6 +10,7 @@ import { type Engine, InvalidStateError, readAttemptEvents } from '../engine/eng
 import { storedRunTimes } from '../engine/times.js';
 import type { IssueBridge } from '../github/bridge.js';
 import { t } from '../i18n.js';
+import { systemNoticeSupported } from '../notify/system.js';
 import { ConflictError, NotFoundError, type Store } from '../store/store.js';
 import type { EventRow, RunStatus } from '../store/types.js';
 import type { Upgrader } from '../upgrade/upgrader.js';
@@ -47,6 +48,8 @@ export interface ApiDeps {
   webDir?: string;
   /** Reload status of the configuration; omitted = loaded once at startup. */
   configStatus?: () => ConfigStatus;
+  /** Platform the Master runs on, for whether it sends system notifications (tests change it). */
+  platform?: NodeJS.Platform;
 }
 
 class BadRequestError extends Error {}
@@ -115,6 +118,7 @@ async function body<T>(
  */
 export function createApi(deps: ApiDeps): Hono {
   const { store, engine, issues, upgrader, version, config, configStatus, webDir } = deps;
+  const platform = deps.platform ?? process.platform;
   const startedAt = new Date().toISOString();
   const status =
     configStatus ?? (() => ({ loadedAt: startedAt, reloadError: null, restartNeeded: [] }));
@@ -136,7 +140,8 @@ export function createApi(deps: ApiDeps): Hono {
     ok: true,
     activeRun: engine.activeRunId ?? null,
     working: store.working,
-    systemNotify: config().master.notify.system,
+    // Only where the Master can send them: elsewhere the dashboard keeps sending its own.
+    systemNotify: config().master.notify.system && systemNoticeSupported(platform),
     version,
   });
 

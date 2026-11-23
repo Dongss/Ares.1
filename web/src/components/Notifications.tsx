@@ -49,8 +49,8 @@ export function NotifyToggle({ notifications }: { notifications: Notifications }
       <span
         className="notify-toggle"
         title={t({
-          zh: '需要你处理时，Master 会直接发系统通知（config.yaml 的 notify.system）',
-          en: 'The Master sends system notifications itself when you are needed (notify.system in config.yaml)',
+          zh: '需要你处理时，Master 会直接发系统通知（config.yaml 的 notify.system）：macOS 用通知中心，Linux 用 notify-send（需要装 libnotify）',
+          en: 'The Master sends system notifications itself when you are needed (notify.system in config.yaml): Notification Center on macOS, notify-send on Linux (libnotify must be installed)',
         })}
       >
         {t({ zh: '通知：系统', en: 'Notifications: system' })}

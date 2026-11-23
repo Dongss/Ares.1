@@ -574,6 +574,16 @@ describe('notifications', () => {
     expect(notifyChannel(true)).toContain('Master 直接发系统通知');
     expect(notifyChannel(false)).toContain('浏览器');
   });
+
+  it('says which platforms send system notifications and what Linux needs', () => {
+    for (const on of [true, false]) {
+      expect(notifyChannel(on)).toContain('macOS 用通知中心');
+      expect(notifyChannel(on)).toContain('notify-send');
+      expect(notifyChannel(on)).toContain('libnotify');
+    }
+    // Where the Master cannot send them, the browser still does.
+    expect(notifyChannel(false)).toContain('其他平台不支持，仍由浏览器发通知');
+  });
 });
 
 describe('guardrails', () => {
@@ -906,6 +916,8 @@ describe('in English', () => {
     for (const row of noticeRows()) expect(row.handle).not.toMatch(CJK);
     expect(notifyChannel(true)).not.toMatch(CJK);
     expect(notifyChannel(false)).not.toMatch(CJK);
+    expect(notifyChannel(true)).toContain('notify-send on Linux');
+    expect(notifyChannel(false)).toContain('other platforms are not supported');
     for (const p of dataPaths('/h')) expect(p.what).not.toMatch(CJK);
     expect(startCommand(null, '/h')).toContain('cd <stable copy directory>');
   });

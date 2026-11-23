@@ -45,9 +45,14 @@ pick() { if [ "${lang}" = en ]; then printf '%s' "$2"; else printf '%s' "$1"; fi
 
 log() { echo "[$(date '+%F %T')] $*"; }
 
+# A system notification: osascript on macOS, notify-send (libnotify) on Linux, else nothing.
 notify() {
-  osascript -e "display notification \"$1\" with title \"${name}\" sound name \"default\"" \
-    >/dev/null 2>&1 || true
+  if command -v osascript >/dev/null 2>&1; then
+    osascript -e "display notification \"$1\" with title \"${name}\" sound name \"default\"" \
+      >/dev/null 2>&1 || true
+  elif command -v notify-send >/dev/null 2>&1; then
+    notify-send --app-name "${name}" "${name}" "$1" >/dev/null 2>&1 || true
+  fi
 }
 
 # What pulling and building print, kept for the result's detail besides going to the log.

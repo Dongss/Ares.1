@@ -78,7 +78,8 @@ src/
     scout.ts          the AI scout's prompt, output format and Run summary
   notify/
     notice.ts         which events notify people (shared by system notifications and dashboard)
-    system.ts         system notifications sent by the Master (macOS)
+    system.ts         system notifications sent by the Master: osascript on macOS, notify-send
+                      (libnotify) on Linux, nothing elsewhere; which platforms are supported
   upgrade/
     upgrader.ts       the Master upgrades itself: finds a new version, waits for the work in hand,
                       hands over to scripts/self-upgrade.sh, keeps the last failed upgrade

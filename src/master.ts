@@ -58,8 +58,13 @@ export interface MasterOptions {
   launchUpgrade?: (plan: UpgradePlan) => void;
   /** End the process after handing over to the upgrade script (default process.exit). */
   exit?: () => void;
-  /** Send a system notification (tests replace it). */
+  /** Send a system notification (tests replace it); default: the platform's (notify/system.ts). */
   notice?: SendNotice;
+  /**
+   * Platform the API reports system notifications as supported on (default process.platform);
+   * tests change it. Where they are not, the dashboard sends its own.
+   */
+  platform?: NodeJS.Platform;
   /** The engine's clock for reply timeouts, in epoch milliseconds (tests move it on). */
   now?: () => number;
   /** How long the engine waits before retrying an agent that errored (tests shorten it). */
@@ -207,6 +212,7 @@ export class Master {
       config,
       configStatus: () => watcher.status(),
       webDir: opts.webDir ?? defaultWebDir(),
+      platform: opts.platform,
     });
     master = new Master(paths, watcher, store, engine, issues, notifier, upgrader, app);
     notifier.start();

@@ -94,6 +94,24 @@ describe('HTTP API', () => {
     expect((await call('GET', '/api/runs')).json).toEqual([]);
   });
 
+  it('reports system notifications only when enabled and the platform supports them', async () => {
+    const systemNotify = async (platform: NodeJS.Platform, on: boolean) => {
+      h = await harness({
+        config: on ? 'notify:\n  system: true\n' : undefined,
+        master: { platform },
+      });
+      const health = await call('GET', '/api/health');
+      await h.close();
+      h = undefined;
+      return health.json.systemNotify;
+    };
+    expect(await systemNotify('darwin', true)).toBe(true);
+    expect(await systemNotify('linux', true)).toBe(true);
+    // Elsewhere the Master cannot send them, so the dashboard keeps sending its own.
+    expect(await systemNotify('win32', true)).toBe(false);
+    expect(await systemNotify('linux', false)).toBe(false);
+  });
+
   it('drives a run: inspect, approve', async () => {
     h = await harness();
     const id = h.run('加功能').id;

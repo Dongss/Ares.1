@@ -429,6 +429,41 @@ describe('upgrade script', () => {
     expect(notes).toContain('自动升级失败：找不到安装目录');
   });
 
+  it('notifies through notify-send where there is no osascript', () => {
+    const bin = tmpDir('ares1-bin-');
+    const notified = join(bin, 'notified');
+    // Stands in for notify-send, writing one argument per line.
+    writeFileSync(join(bin, 'notify-send'), `#!/bin/sh\nprintf '%s\\n' "$@" >> '${notified}'\n`);
+    chmodSync(join(bin, 'notify-send'), 0o755);
+    // Only the stand-in is in PATH, so osascript is not found even on macOS.
+    const bash = execFileSync('bash', ['-c', 'command -v bash'], { encoding: 'utf8' }).trim();
+    expect(() =>
+      execFileSync(
+        bash,
+        [
+          join(process.cwd(), 'scripts', 'self-upgrade.sh'),
+          join(bin, 'missing'), // no install directory: the script gives up right away
+          bin,
+          '999999',
+          'abc1234',
+          join(bin, 'result.json'),
+          process.execPath,
+          '1',
+          'Ares.1',
+          'en',
+        ],
+        { env: { ...process.env, PATH: bin }, stdio: 'ignore' },
+      ),
+    ).toThrow();
+    expect(readFileSync(notified, 'utf8').split('\n')).toEqual([
+      '--app-name',
+      'Ares.1',
+      'Ares.1',
+      `Automatic upgrade failed: install directory ${join(bin, 'missing')} not found`,
+      '',
+    ]);
+  });
+
   /**
    * A stable copy one commit behind origin, and a run of a copy of the script on it (as the
    * Master runs a copy) with stand-ins in PATH: npm and curl for the build and the health check,

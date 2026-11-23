@@ -45,6 +45,7 @@ defaults:
 #       max_run_attempts: 3      # 一个 issue 最多跑几次 Run（含第一次）：失败后自动重做，带上失败原因；用完就关闭 issue 并写明每次的原因；1 = 不重做
 
 # 需要人处理时（Run 卡住或失败、等审批、提案等人决定、推送或升级失败），Master 直接发系统通知
+# macOS 用通知中心；Linux 需要 notify-send（libnotify）；其他平台不支持，仍由浏览器发通知
 # notify:
 #   system: true
 
@@ -89,7 +90,8 @@ defaults:
 #       daily_budget_usd: 20     # optional: stop automatic actions once the day's scouts, auto-accepted Runs and automatic redos cost this much; omitted = no limit
 #       max_run_attempts: 3      # Runs an issue gets at most, the first included: a failed Run is redone automatically with its reason; once they are used up, the issue is closed with every reason; 1 = never redone
 
-# When a human is needed (a Run is stuck or failed, an approval or a proposal waits, a push or upgrade failed), the Master sends a system notification
+# When a human is needed (a Run is stuck or failed, an approval or a proposal waits, a push or upgrade failed), the Master sends a system notification:
+# Notification Center on macOS; on Linux it needs notify-send (libnotify); other platforms are not supported, and the browser keeps sending them
 # notify:
 #   system: true
 

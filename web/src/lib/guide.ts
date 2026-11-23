@@ -815,12 +815,12 @@ export function noticeRows(): NoticeRow[] {
 export function notifyChannel(systemNotify: boolean): string {
   return systemNotify
     ? t({
-        zh: 'Master 直接发系统通知（config.yaml 的 notify.system: true），不用开着看板；看板不再重复发。',
-        en: 'The Master sends system notifications itself (notify.system: true in config.yaml), so the dashboard need not be open; the dashboard does not send them again.',
+        zh: 'Master 直接发系统通知（config.yaml 的 notify.system: true；macOS 用通知中心，Linux 用 notify-send，没装 libnotify 就收不到），不用开着看板；看板不再重复发。',
+        en: 'The Master sends system notifications itself (notify.system: true in config.yaml; Notification Center on macOS, notify-send on Linux, which needs libnotify installed), so the dashboard need not be open; the dashboard does not send them again.',
       })
     : t({
-        zh: '现在由浏览器发通知：要开着至少一个看板标签页（可以在后台），并在顶栏打开「通知」。想不开看板也收到，在 config.yaml 里设 notify.system: true（macOS 通知中心）。',
-        en: 'The browser sends notifications now: keep at least one dashboard tab open (it can be in the background) and turn on notifications in the top bar. To get them without the dashboard, set notify.system: true in config.yaml (macOS Notification Center).',
+        zh: '现在由浏览器发通知：要开着至少一个看板标签页（可以在后台），并在顶栏打开「通知」。想不开看板也收到，在 config.yaml 里设 notify.system: true：macOS 用通知中心；Linux 需要 notify-send（libnotify）；其他平台不支持，仍由浏览器发通知。',
+        en: 'The browser sends notifications now: keep at least one dashboard tab open (it can be in the background) and turn on notifications in the top bar. To get them without the dashboard, set notify.system: true in config.yaml: Notification Center on macOS; on Linux it needs notify-send (libnotify); other platforms are not supported, and the browser keeps sending them.',
       });
 }
 
