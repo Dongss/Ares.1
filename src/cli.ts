@@ -89,21 +89,31 @@ async function main(): Promise<void> {
     }),
   );
 
+  // The upgrade script tells a deliberate stop (exit code 0) from a crash (anything else, rolled
+  // back), so the exit code must be decided here and never left to an unhandled rejection.
   let closing = false;
-  const shutdown = async (signal: string) => {
+  const shutdown = (signal: string) => {
     if (closing) return;
     closing = true;
-    console.log(
-      t({
-        zh: `收到 ${signal}，正在停止（正在执行的 Run 会回到队首）…`,
-        en: `Got ${signal}, stopping (the executing Run goes back to the head of the queue)…`,
-      }),
+    const stop = async () => {
+      console.log(
+        t({
+          zh: `收到 ${signal}，正在停止（正在执行的 Run 会回到队首）…`,
+          en: `Got ${signal}, stopping (the executing Run goes back to the head of the queue)…`,
+        }),
+      );
+      await master.close();
+    };
+    stop().then(
+      () => process.exit(0),
+      (err: unknown) => {
+        console.error(t({ zh: '停止时出错：', en: 'Stopping failed:' }), err);
+        process.exit(1);
+      },
     );
-    await master.close();
-    process.exit(0);
   };
-  process.on('SIGINT', () => void shutdown('SIGINT'));
-  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
 
 main().catch((err: unknown) => {

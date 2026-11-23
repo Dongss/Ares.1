@@ -159,6 +159,7 @@ test/
 - Pure dashboard logic (`web/src/lib/`) has a `*.test.ts` next to it. API changes are tested in `test/api.test.ts`.
 - Tests run in Chinese by default. To test English, call `setLang('en')` and reset it with `afterEach(() => setLang('zh'))`. Check that English output has no Chinese characters left.
 - Temporary directories go in the system temp directory (`tmpDir()`), never in the repository.
+- `test/cli.smoke.test.ts` starts the Master as a separate process through the CLI (`dist/cli.js` when built, otherwise `src/cli.ts` through tsx) on an empty home, checks `/api/health` and the dashboard, and expects exit code 0 after SIGTERM. It is the safety net before automatic upgrades: the other tests open the Master in-process, so keep it passing whenever startup or shutdown changes.
 
 ## Documents
 
