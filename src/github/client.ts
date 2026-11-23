@@ -197,9 +197,21 @@ export class GhCli implements GitHub {
     const out = await this.gh(['api', 'graphql', '--input', '-'], {
       stdin: JSON.stringify({ query, variables }),
     });
-    const res = JSON.parse(out) as { data?: T | null; errors?: { message?: string }[] };
-    if (res.errors?.length || !res.data) {
-      const detail = res.errors?.map((e) => e.message ?? '').join('; ') || out.slice(0, 300);
+    let res: { data?: T | null; errors?: { message?: string }[] } | null;
+    try {
+      res = JSON.parse(out);
+    } catch {
+      // A proxy's HTML page or a gh warning instead of the answer: still a GitHub failure, so
+      // callers that handle GhError keep working.
+      throw new GhError(
+        t({
+          zh: `gh api graphql 返回的不是 JSON：${out.slice(0, 300)}`,
+          en: `gh api graphql returned no JSON: ${out.slice(0, 300)}`,
+        }),
+      );
+    }
+    if (!res || res.errors?.length || !res.data) {
+      const detail = res?.errors?.map((e) => e.message ?? '').join('; ') || out.slice(0, 300);
       throw new GhError(
         t({ zh: `gh api graphql 失败：${detail}`, en: `gh api graphql failed: ${detail}` }),
       );
