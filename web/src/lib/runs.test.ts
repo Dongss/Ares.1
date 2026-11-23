@@ -530,6 +530,45 @@ describe('workspaces of attempts before the last when an issue used up its attem
   });
 });
 
+describe('a Run started over because its issue changed', () => {
+  afterEach(() => setLang('zh'));
+  const changed = { repo: 'me/demo', issue: 7, newRun: 'run_new' };
+  const goalChanged = { reason: 'goal_changed', newRun: 'run_new' };
+
+  it('words the termination and the removal of its workspace from their data', () => {
+    expect(eventText({ type: 'run.goal_changed', data: changed })).toBe(
+      'issue 的标题或正文改了，这次 Run 按的是旧内容，已自动终止；按新内容开始了 Run run_new',
+    );
+    const removed = { path: '/w/run_a', branch: 'ares1/run_a', ...goalChanged };
+    expect(eventText({ type: 'workspace.removed', data: removed })).toBe(
+      'issue 改过后由 Run run_new 按新内容重做，自动删掉了这次 Run 的工作目录和分支',
+    );
+    expect(
+      eventText({ type: 'workspace.cleanup_failed', data: { ...goalChanged, error: 'x' } }),
+    ).toBe(
+      'issue 改过后由 Run run_new 按新内容重做，但没能自动删掉这次 Run 的工作目录和分支，请在「工作区」页手动清理',
+    );
+    // Without the new Run: only the data.
+    expect(eventText({ type: 'run.goal_changed', data: { repo: 'me/demo', issue: 7 } })).toBeNull();
+    expect(eventText({ type: 'workspace.removed', data: { reason: 'goal_changed' } })).toBeNull();
+  });
+
+  it('in English', () => {
+    setLang('en');
+    const texts = [
+      eventText({ type: 'run.goal_changed', data: changed }),
+      eventText({ type: 'workspace.removed', data: goalChanged }),
+      eventText({ type: 'workspace.cleanup_failed', data: { ...goalChanged, error: 'x' } }),
+    ];
+    expect(texts).toEqual([
+      "The issue's title or body changed, so this Run, which worked from the old text, was terminated automatically; Run run_new started on the new one",
+      "Run run_new redoes the changed issue from the start, so this Run's working directory and branch were removed automatically",
+      "Run run_new redoes the changed issue from the start, but this Run's working directory and branch could not be removed automatically; clean them up by hand on the Workspaces page",
+    ]);
+    for (const text of texts) expect(text).not.toMatch(/[一-鿿]/);
+  });
+});
+
 describe('raw logs past retention', () => {
   afterEach(() => setLang('zh'));
   const now = new Date('2026-12-31T00:00:00.000Z');

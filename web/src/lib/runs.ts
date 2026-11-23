@@ -344,6 +344,27 @@ export function eventText(event: Pick<EventRow, 'type' | 'data'>, now = new Date
       });
     }
   }
+  const { newRun } = event.data;
+  if (event.type === 'run.goal_changed' && typeof newRun === 'string') {
+    return t({
+      zh: `issue 的标题或正文改了，这次 Run 按的是旧内容，已自动终止；按新内容开始了 Run ${newRun}`,
+      en: `The issue's title or body changed, so this Run, which worked from the old text, was terminated automatically; Run ${newRun} started on the new one`,
+    });
+  }
+  if (reason === 'goal_changed' && typeof newRun === 'string') {
+    if (event.type === 'workspace.removed') {
+      return t({
+        zh: `issue 改过后由 Run ${newRun} 按新内容重做，自动删掉了这次 Run 的工作目录和分支`,
+        en: `Run ${newRun} redoes the changed issue from the start, so this Run's working directory and branch were removed automatically`,
+      });
+    }
+    if (event.type === 'workspace.cleanup_failed') {
+      return t({
+        zh: `issue 改过后由 Run ${newRun} 按新内容重做，但没能自动删掉这次 Run 的工作目录和分支，请在「工作区」页手动清理`,
+        en: `Run ${newRun} redoes the changed issue from the start, but this Run's working directory and branch could not be removed automatically; clean them up by hand on the Workspaces page`,
+      });
+    }
+  }
   const { keptRun } = event.data;
   if (reason === 'retries_exhausted' && typeof keptRun === 'string') {
     if (event.type === 'workspace.removed') {

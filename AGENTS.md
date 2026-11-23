@@ -74,7 +74,9 @@ src/
                       (shared by scout summaries, issue completion comments and the Run page)
   github/
     client.ts         GitHub through the gh CLI (FakeGitHub in tests)
-    bridge.ts         polling, Runs from issues, progress on issues, auto-accept, push, auto-scout
+    bridge.ts         polling, Runs from issues (terminated when a human closes the issue, started
+                      over when a human edits it before the merge), progress on issues,
+                      auto-accept, push, auto-scout
     issues.ts         labels, issue texts (assessment questions and conclusions, hidden comment
                       markers), Run status ↔ issue (pure functions)
     redact.ts         text before it is published on GitHub: the user's home directory → ~

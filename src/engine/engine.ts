@@ -260,13 +260,15 @@ export class InvalidStateError extends Error {}
 
 /**
  * Why a kept worktree and branch were removed, as their `workspace.removed` event records it: by
- * a human, because a later Run of the same issue completed (`supersededBy`), or because the issue
- * used up its attempts and only its last attempt (`keptRun`) keeps them.
+ * a human, because a later Run of the same issue completed (`supersededBy`), because the issue
+ * used up its attempts and only its last attempt (`keptRun`) keeps them, or because a human
+ * changed the issue and a new Run (`newRun`) does the changed requirement instead.
  */
 type KeptWorkspaceRemoval =
   | { manual: true }
   | { reason: 'superseded'; supersededBy: string }
-  | { reason: 'retries_exhausted'; keptRun: string };
+  | { reason: 'retries_exhausted'; keptRun: string }
+  | { reason: 'goal_changed'; newRun: string };
 
 const IN_FLIGHT_TASK = new Set<Task['status']>(['running', 'verifying']);
 
@@ -1188,16 +1190,35 @@ export class Engine {
       if (runId === keptRunId || !wanted.has(runId)) continue;
       // Started again by a human while earlier removals ran: no longer a kept failure.
       if (this.store.getRun(runId).status !== 'failed') continue;
-      try {
-        await this.removeKeptWorkspace(runId, why);
-      } catch (err) {
-        this.store.tx(() => {
-          this.store.event(runId, 'workspace.cleanup_failed', {
-            ...why,
-            error: errorMessage(err).trim(),
-          });
+      await this.removeKeptWorkspaceOrRecord(runId, why);
+    }
+  }
+
+  /**
+   * A human changed the title or body of the issue of `runId` before it merged, so the GitHub
+   * bridge terminated it and `newRunId` does the changed requirement from the start: nothing on
+   * the old worktree and branch is of use any more, and a human did not end it to look at it.
+   * A removal that fails is recorded on the old Run; the new Run is not affected. Called from the
+   * bridge while another Run may execute, as safe as `removeExhaustedAttempts`.
+   */
+  removeGoalChangedWorkspace(runId: string, newRunId: string): Promise<void> {
+    return this.removeKeptWorkspaceOrRecord(runId, { reason: 'goal_changed', newRun: newRunId });
+  }
+
+  /** `removeKeptWorkspace` done automatically: a failure is recorded on the Run, not thrown. */
+  private async removeKeptWorkspaceOrRecord(
+    runId: string,
+    why: Exclude<KeptWorkspaceRemoval, { manual: true }>,
+  ): Promise<void> {
+    try {
+      await this.removeKeptWorkspace(runId, why);
+    } catch (err) {
+      this.store.tx(() => {
+        this.store.event(runId, 'workspace.cleanup_failed', {
+          ...why,
+          error: errorMessage(err).trim(),
         });
-      }
+      });
     }
   }
 
@@ -3085,17 +3106,10 @@ export class Engine {
     for (const earlier of failed) {
       // Shutting down: the rest stay for a human to clean up.
       this.checkAbort(signal);
-      const why = { reason: 'superseded', supersededBy: run.id } as const;
-      try {
-        await this.removeKeptWorkspace(earlier.id, why);
-      } catch (err) {
-        this.store.tx(() => {
-          this.store.event(earlier.id, 'workspace.cleanup_failed', {
-            ...why,
-            error: errorMessage(err).trim(),
-          });
-        });
-      }
+      await this.removeKeptWorkspaceOrRecord(earlier.id, {
+        reason: 'superseded',
+        supersededBy: run.id,
+      });
     }
   }
 

@@ -524,7 +524,8 @@ function YouSection(props: { input: GuideInput; home: string; working: boolean }
                   ? `Master 每 ${input.pollMinutes} 分钟查一次`
                   : '接入 GitHub 后 Master 会定时查看'}
                 ，工作中时就建 Run。写清楚为什么、要做什么和验收标准，Agent
-                就照着做。看板不提供手动建 Run，需求只从 GitHub issue 来。
+                就照着做。开工后、合并之前想改需求，直接改 issue 的标题或正文，Master
+                下次检查时终止旧 Run，按新内容重来。看板不提供手动建 Run，需求只从 GitHub issue 来。
               </>
             ),
             en: (
@@ -535,8 +536,10 @@ function YouSection(props: { input: GuideInput; home: string; working: boolean }
                   ? `The Master checks every ${input.pollMinutes} minutes`
                   : 'Once GitHub is set up, the Master checks regularly'}{' '}
                 and creates a Run while working. Say why, what to do and how to tell it is done, and
-                the agents follow it. The dashboard does not create Runs by hand: requirements only
-                come from GitHub issues.
+                the agents follow it. To change the requirement after work started, before it
+                merges, just edit the issue's title or body: at its next check the Master cancels
+                the old Run and starts over on the new text. The dashboard does not create Runs by
+                hand: requirements only come from GitHub issues.
               </>
             ),
           })}

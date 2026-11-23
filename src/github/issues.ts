@@ -386,6 +386,23 @@ export function redoStartedComment(input: {
   });
 }
 
+/**
+ * The comment that says a human's change to the issue's title or body ended its Run, and a new
+ * Run does the changed requirement.
+ */
+export function goalChangedComment(input: {
+  oldRunId: string;
+  runId: string;
+  templateName: string;
+  dashboardUrl: string;
+}): string {
+  const link = dashboardLink(input.dashboardUrl, input.runId);
+  return t({
+    zh: `issue 的标题或正文改了：${brandName()}终止了按旧内容做的 Run \`${input.oldRunId}\`，按新内容开始了 Run \`${input.runId}\`（模板「${input.templateName}」）。\n\n${link}`,
+    en: `The issue's title or body changed: ${brandName()} terminated Run \`${input.oldRunId}\`, which worked from the old text, and started Run \`${input.runId}\` (template "${input.templateName}") on the new one.\n\n${link}`,
+  });
+}
+
 const oneLine = (text: string, max: number) => {
   const line = text.replace(/\s+/g, ' ').trim();
   return line.length > max ? `${line.slice(0, max)}…` : line;

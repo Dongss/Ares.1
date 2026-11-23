@@ -43,12 +43,13 @@ import {
   revParse,
   git as runGit,
 } from '../workspace/git.js';
-import { GhCli, type GitHub } from './client.js';
+import { GhCli, type GhIssue, type GitHub } from './client.js';
 import {
   autoAcceptedComment,
   discussionComment,
   type FailureOutcome,
   failedAttempt,
+  goalChangedComment,
   goalFromIssue,
   issueUpdate,
   isTrusted,
@@ -417,9 +418,9 @@ export class IssueBridge {
 
   /**
    * One round: accept proposals the settings allow, start Runs for ready issues, terminate Runs
-   * whose issue a human closed, catch issues up, pass on replies to the assessments' questions,
-   * start a scout where the repo is idle. With the work switch off only the terminating and the
-   * catching up happen: neither starts new work.
+   * whose issue a human closed and start over those whose issue a human changed, catch issues up,
+   * pass on replies to the assessments' questions, start a scout where the repo is idle. With the
+   * work switch off only the terminating and the catching up happen: neither starts new work.
    */
   poll(): Promise<void> {
     return this.serial(async () => {
@@ -441,7 +442,7 @@ export class IssueBridge {
         await each((name) => this.acceptBacklog(name));
         await each((name) => this.intake(name));
       }
-      if (!(await this.cancelClosedIssueRuns())) failed = true;
+      if (!(await this.followIssues())) failed = true;
       if (!(await this.syncRuns())) failed = true;
       if (working) {
         await each((name) => this.collectReplies(name));
@@ -534,21 +535,17 @@ export class IssueBridge {
       if (this.stopping) return;
       let run = this.deps.store.unfinishedRunForIssue(full, issue.number);
       if (!run) {
-        const template = this.cfg.templates.get(cfg.template);
-        // L2: no approval before merging; other gates of the template stay.
-        const overrides = issueRunOverrides(template, cfg.auto_merge);
         // Only people allowed to triage can add ares1:ready, but anybody may have written the
         // issue, and may edit it after the label was added.
         const untrusted = isTrusted(issue, await this.masterLogin())
           ? undefined
           : untrustedAuthor(issue, null);
-        run = this.deps.engine.createRun({
-          repo: repo.name,
-          template: cfg.template,
-          goal: goalFromIssue(issue),
-          overrides,
+        run = this.createIssueRun(
+          repo,
+          cfg,
+          goalFromIssue(issue),
           // ares1:ready (again) starts the count of attempts over.
-          issue: {
+          {
             repo: full,
             number: issue.number,
             url: issue.url,
@@ -556,9 +553,9 @@ export class IssueBridge {
             attempt: 1,
             ...(untrusted ? { untrusted } : {}),
           },
-          confirmGoal: untrusted ? untrustedGoalMessage(issue) : undefined,
-        });
-        const templateName = template?.name ?? cfg.template;
+          untrusted ? untrustedGoalMessage(issue) : undefined,
+        );
+        const templateName = this.templateName(cfg);
         const runUrl = `${this.dashboardUrl()}/#/runs/${run.id}`;
         await this.comment(
           full,
@@ -573,6 +570,33 @@ export class IssueBridge {
       await gh.setLabels(full, issue.number, withStatusLabel(issue.labels, LABELS.running));
       this.deps.store.setIssueSynced(run.id, 'queued');
     }
+  }
+
+  /**
+   * A Run of an issue: with the repo's template, and without approval before merging when
+   * `auto_merge` is on (the other gates of the template stay). Every Run from an issue is created
+   * here, whether a human added ares1:ready, a failed one is redone, or the issue was changed.
+   */
+  private createIssueRun(
+    repo: Repo,
+    cfg: GitHubRepoConfig,
+    goal: string,
+    issue: RunIssue,
+    confirmGoal?: string,
+  ): Run {
+    return this.deps.engine.createRun({
+      repo: repo.name,
+      template: cfg.template,
+      goal,
+      overrides: issueRunOverrides(this.cfg.templates.get(cfg.template), cfg.auto_merge),
+      issue,
+      confirmGoal,
+    });
+  }
+
+  /** Name of the repo's template, as the comments on its issues give it. */
+  private templateName(cfg: GitHubRepoConfig): string {
+    return this.cfg.templates.get(cfg.template)?.name ?? cfg.template;
   }
 
   /**
@@ -636,11 +660,13 @@ export class IssueBridge {
   }
 
   /**
-   * A human closed the issue (completed or not planned): nobody wants the work any more, so its
-   * unfinished Run is terminated. Returns false when some issue could not be read or its Run not
-   * terminated (retried on the next poll); the Run stays as it is then.
+   * Follow what humans do to the issues of unfinished Runs. A human closed the issue (completed or
+   * not planned): nobody wants the work any more, so its Run is terminated. A human changed its
+   * title or body: the Run is started over on the new text (`restartForChangedIssue`). Returns
+   * false when some issue could not be read or its Run not terminated (retried on the next poll);
+   * the Run stays as it is then.
    */
-  private async cancelClosedIssueRuns(): Promise<boolean> {
+  private async followIssues(): Promise<boolean> {
     let ok = true;
     const unfinished = this.deps.store
       .listRuns()
@@ -650,14 +676,112 @@ export class IssueBridge {
       const issue = run.issue;
       if (!issue) continue;
       try {
-        const { state, stateReason } = await this.gh().getIssue(issue.repo, issue.number);
-        if (state === 'closed') await this.cancelForClosedIssue(run.id, issue, stateReason);
+        const latest = await this.gh().getIssue(issue.repo, issue.number);
+        if (latest.state === 'closed') {
+          await this.cancelForClosedIssue(run.id, issue, latest.stateReason);
+        } else {
+          await this.restartForChangedIssue(run, latest);
+        }
       } catch (err) {
         ok = false;
         this.report(err);
       }
     }
     return ok;
+  }
+
+  /**
+   * A human changed the title or body of the issue after its Run was created. The goal was read
+   * once, when the Run was created, so the Run would do the old requirement through to the merge
+   * while nobody is around. It is terminated instead, and a new Run does the changed one from the
+   * start, as the same attempt: a change is no failure, so it uses up none of
+   * `max_run_attempts`. The old Run's worktree and branch are removed, nobody needs them.
+   *
+   * Left alone, as before: Runs of issues by people the Master does not trust (their goal stays as
+   * it was when the Run was created, and a human confirms it), Runs that merge or wait for the
+   * approval to merge (too late to start over; the change does not go into them either), and
+   * everything while the work switch is off (nothing new starts then; the first poll after it is
+   * on does it).
+   */
+  private async restartForChangedIssue(stale: Run, latest: GhIssue): Promise<void> {
+    const prev = stale.issue;
+    if (!prev || prev.untrusted || !this.deps.store.working) return;
+    const goal = goalFromIssue(latest);
+    // The engine keeps the goal trimmed.
+    if (goal.trim() === stale.goal) return;
+    const store = this.deps.store;
+    const repo = store.getRepo(stale.repoId);
+    const cfg = this.cfg.master.github?.repos[repo.name];
+    // The new Run could not be created: the old one goes on rather than leave the issue without.
+    if (
+      !cfg ||
+      this.cfg.errors[githubConfigKey(repo.name)] ||
+      !this.cfg.templates.has(cfg.template)
+    ) {
+      return;
+    }
+    if (!isTrusted(latest, await this.masterLogin()) || this.stopping) return;
+    // Read again right before terminating it: the Run may have moved on while GitHub answered.
+    // Nothing is awaited between this check and the engine stopping it.
+    const run = store.getRun(stale.id);
+    if (FINISHED_RUN_STATUSES.includes(run.status) || this.merging(run)) return;
+    try {
+      await this.deps.engine.cancel(run.id);
+    } catch (err) {
+      // It finished meanwhile; it is caught up on the issue as usual.
+      if (err instanceof InvalidStateError) return;
+      throw err;
+    }
+    // Created before the old Run is marked caught up, so a crash in between leaves the issue
+    // with an unfinished Run rather than none.
+    const next = this.createIssueRun(repo, cfg, goal, {
+      repo: prev.repo,
+      number: prev.number,
+      url: prev.url,
+      auto: prev.auto,
+      attempt: prev.attempt ?? 1,
+      ...(prev.earlier ? { earlier: prev.earlier } : {}),
+    });
+    store.tx(() => {
+      // Terminated on purpose: no ares1:failed, no comment saying it was terminated.
+      const old = store.getRun(run.id);
+      store.setIssueSynced(old.id, old.status);
+      store.setIssueDiscussionSynced(old.id, old.discussion.length);
+      store.event(old.id, 'run.goal_changed', {
+        repo: prev.repo,
+        issue: prev.number,
+        newRun: next.id,
+      });
+      store.setIssueSynced(next.id, 'queued');
+    });
+    try {
+      await this.comment(
+        prev.repo,
+        prev.number,
+        goalChangedComment({
+          oldRunId: run.id,
+          runId: next.id,
+          templateName: this.templateName(cfg),
+          dashboardUrl: this.dashboardUrl(),
+        }),
+      );
+      // The Run may have moved on already; the next sync reports where it is.
+      await this.gh().setLabels(
+        prev.repo,
+        prev.number,
+        withStatusLabel(latest.labels, LABELS.running),
+      );
+    } finally {
+      // A removal that fails is recorded on the old Run by the engine.
+      await this.deps.engine.removeGoalChangedWorkspace(run.id, next.id);
+    }
+  }
+
+  /** The Run merges, or waits for the approval to merge: too late to start it over. */
+  private merging(run: Run): boolean {
+    if (!run.currentStageRunId) return false;
+    const sr = this.deps.store.getStageRun(run.currentStageRunId);
+    return run.template.stages.find((s) => s.id === sr.stageId)?.kind === 'merge';
   }
 
   /**
@@ -852,7 +976,6 @@ export class IssueBridge {
         this.abandonRedo(name, failed, prev, 'closed');
         continue;
       }
-      const template = this.cfg.templates.get(cfg.template);
       const attempt = (prev.attempt ?? 1) + 1;
       const max = Math.max(cfg.max_run_attempts, attempt);
       // The goal is read from the issue again: a human may have made it clearer meanwhile.
@@ -866,12 +989,11 @@ export class IssueBridge {
           confirmed && goal.trim() === failed.goal ? confirmed : null,
         );
       }
-      const next = this.deps.engine.createRun({
-        repo: repo.name,
-        template: cfg.template,
+      const next = this.createIssueRun(
+        repo,
+        cfg,
         goal,
-        overrides: issueRunOverrides(template, cfg.auto_merge),
-        issue: {
+        {
           repo: prev.repo,
           number: prev.number,
           url: issue.url,
@@ -883,9 +1005,8 @@ export class IssueBridge {
           ],
           ...(untrusted ? { untrusted } : {}),
         },
-        confirmGoal:
-          untrusted && untrusted.confirmedAt === null ? untrustedGoalMessage(issue) : undefined,
-      });
+        untrusted && untrusted.confirmedAt === null ? untrustedGoalMessage(issue) : undefined,
+      );
       store.tx(() => {
         store.setIssueRedo(failed.id, 'redone');
         store.event(next.id, 'issue.redone', {
@@ -903,7 +1024,7 @@ export class IssueBridge {
           runId: next.id,
           attempt,
           max,
-          templateName: template?.name ?? cfg.template,
+          templateName: this.templateName(cfg),
           dashboardUrl: this.dashboardUrl(),
         }),
       );

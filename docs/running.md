@@ -99,6 +99,23 @@ stages:
 
 侦察的 Agent 额度用尽或被限流（怎么识别见下面的「Agent 出错时」）不算失败，和 Run 遇到限流的处理一致（见下面的「Agent 出错时」）：侦察记为「额度用尽/限流」（`rate_limited`），`error` 里写明预计什么时候恢复额度（CLI 给了重置时间时），费用照常记录，事件列表里记一条 `scout.rate_limited`（数据里有 `scoutId`、`repo`，CLI 给了重置时间时还有 `retryAt`），不发系统通知。这样的侦察既不计入上面的连续次数，也不打断已有的连续计数，也不占用 `interval_minutes` 的间隔（间隔从最近一次没被限流的侦察开始时间算起）。最近一次侦察（被 Master 停止打断的不算）被限流时，自动侦察先等额度恢复：CLI 给了额度重置时间就等到那时再多等 1 分钟，没给就从那次侦察结束时起，按连续被限流的侦察次数等 5、10、20、40 分钟，之后每次 1 小时。到时间后的下一轮检查就会侦察。这个等待和退避、`interval_minutes` 同时生效，取最晚的时间，看板上写明「侦察遇到额度用尽或限流，等额度恢复」和预计时间。重置时间只记在内存里，Master 重启后按没给重置时间的规则等。在看板上手动触发侦察不受这个等待限制；手动侦察正常结束或失败后，等待就解除了。
 
+### Run 期间改了 issue
+
+Run 的目标是建 Run 时从 issue 读的标题和正文。Run 还没进入合并阶段时你改了 issue 的标题或正文，Master 在下一轮检查时发现内容变了，就自动按新内容重来。你只需要改 issue，不用手动终止再重新加 `ares1:ready`，没人在场时旧 Run 也不会按过时的需求一路合并进去：
+
+- 旧 Run 被终止，事件列表里记一条 `run.goal_changed`（数据里有 `repo`、`issue` 和新 Run 的 id `newRun`）。这不算失败，也不算人终止的：issue 不会打上 `ares1:failed`，也没有「Run 已终止」的评论，标签保持 `ares1:running`。
+- 按新内容新建一个 Run，模板和 `auto_merge` 的设置和加 `ares1:ready` 时一样，从头开始（流程里有需求评估的话重新评估）。它沿用旧 Run 是第几次尝试和之前几次失败的原因，不多算一次，不占 `max_run_attempts`。
+- issue 上发一条评论，写明内容改了、终止了哪个旧 Run、按新内容开始了哪个 Run，附上看板链接。
+- 旧 Run 的工作目录和分支马上自动删掉，Run 的记录、日志和产物都保留。删掉时在旧 Run 上记一条 `workspace.removed`（数据里有路径、分支、`reason: goal_changed` 和 `newRun`）；删不掉时记一条 `workspace.cleanup_failed`（数据里有 `reason`、`newRun` 和 `error`），新 Run 不受影响，剩下的要手动清理。
+- 只比较标题和正文：正文首尾的空白和侦察提案的页脚不算，改标签、写评论都不会重来。需求评估改写过的目标只记在讨论记录里，不影响比较。
+- 暂停的、卡住等人的、等需求评估回复的 Run 也会重来：等回复时改 issue，往往就是在回答问题。
+
+这几种情况不重来，和以前一样：
+
+- Run 已经进入合并阶段：正在合并，或在等合并前的审批。issue 的改动也不会追加到这个 Run 上。在等合并审批时驳回，Run 回到编码等阶段后，下一轮检查就会按新内容重来；也可以终止它，再给 issue 重新加 `ares1:ready`。
+- issue 的作者不受信任（见下面的「只信任仓库成员写的内容」）：目标仍然固定在建 Run 的那一刻，由人确认。
+- 工作开关关着：不重来，打开后的下一轮检查再处理。
+
 ### Run 失败后自动重做
 
 从 issue 来的 Run 失败后（`failed`，比如 Agent 出错且重试、换 Agent 都用完，返工或回退次数用完，超出 Run 预算（默认），准备命令失败，Master 内部错误，合并时 git 因冲突以外的原因失败，合并冲突但没有 Agent 阶段能解决，工作目录与记录不一致；不包括被终止的），Master 不等人，自动再开一个 Run 重做。次数上限是 `github.repos.<name>.max_run_attempts`：
@@ -121,7 +138,7 @@ github:
 - 被终止的 Run（人在看板上终止，或者关闭了 issue）不重做，issue 打上 `ares1:failed`，等你决定。
 - 重做成功合并后（同一 issue 的 Run 完成时），这个 issue 之前失败的 Run 的工作目录和分支会自动删掉：失败原因已经记在 Run 的 `error` 和 issue 评论里，代码以完成的那次为准，留着只会占磁盘（每个工作目录都带着准备命令装的依赖）。Run 的记录、日志和产物都保留。每删掉一个，就在那个 Run 的事件列表里记一条 `workspace.removed`，数据里有路径、分支、`reason: superseded` 和完成的 Run 的 id（`supersededBy`）。删不掉时（比如分支在别处检出）在那个 Run 上记一条 `workspace.cleanup_failed`（数据里有 `reason`、`supersededBy` 和 `error`），接着删下一个，完成的 Run 不受影响，剩下的要手动清理。
 - issue 用完 `max_run_attempts` 被关闭后，只保留最后一次失败的 Run 的工作目录和分支，留给人看现场；更早几次失败的 Run 的工作目录和分支自动删掉：最后一次已经带上了前几次的失败原因，前几次的原因也记在各自 Run 的 `error` 和 issue 评论里。这样每个失败关闭的 issue 只占一份磁盘。Run 的记录、日志和产物都保留。每删掉一个，就在那个 Run 的事件列表里记一条 `workspace.removed`，数据里有路径、分支、`reason: retries_exhausted` 和保留的最后一次 Run 的 id（`keptRun`）。删不掉时在那个 Run 上记一条 `workspace.cleanup_failed`（数据里有 `reason`、`keptRun` 和 `error`），接着删下一个，issue 的关闭和评论不受影响、不会重复，剩下的要手动清理。
-- 被终止的 Run、不是从 issue 来的 Run 和最终失败关闭的 issue 最后一次尝试的 Run 仍然保留，要在看板上手动清理（「工作区」页或 Run 详情页）。
+- 被终止的 Run（因为 issue 改过而自动终止的除外，见上面的「Run 期间改了 issue」）、不是从 issue 来的 Run 和最终失败关闭的 issue 最后一次尝试的 Run 仍然保留，要在看板上手动清理（「工作区」页或 Run 详情页）。
 
 ### 只信任仓库成员写的内容
 
