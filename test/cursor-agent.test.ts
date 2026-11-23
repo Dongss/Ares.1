@@ -1,6 +1,6 @@
 import { chmodSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { CursorAgentAdapter } from '../src/adapters/cursor-agent.js';
 import { AGENT_GH_TOKEN, agentEnv } from '../src/adapters/process.js';
 import type { AgentEvent, StartInput } from '../src/adapters/types.js';
@@ -127,11 +127,15 @@ describe('CursorAgentAdapter', () => {
       { type: 'tool', name: 'Shell', summary: 'npm test' },
       { type: 'message', text: 'all done' },
     ]);
-    expect(
-      readFileSync(join(dir, 'logs', 'a.jsonl'), 'utf8')
-        .trim()
-        .split('\n'),
-    ).toHaveLength(9);
+    // Raw output is kept on disk. The result does not wait for the log file to be flushed, so
+    // under load the file may still be catching up when it arrives.
+    await vi.waitFor(() =>
+      expect(
+        readFileSync(join(dir, 'logs', 'a.jsonl'), 'utf8')
+          .trim()
+          .split('\n'),
+      ).toHaveLength(9),
+    );
   });
 
   it('starts the CLI with the environment it is given: the agent one has no GitHub access', async () => {

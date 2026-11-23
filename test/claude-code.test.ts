@@ -1,6 +1,6 @@
 import { chmodSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { ClaudeCodeAdapter, StreamJsonParser } from '../src/adapters/claude-code.js';
 import { AGENT_GH_TOKEN, agentEnv } from '../src/adapters/process.js';
 import { resetTime } from '../src/adapters/rate-limit.js';
@@ -132,12 +132,15 @@ describe('ClaudeCodeAdapter', () => {
       { type: 'tool', name: 'Write', summary: 'a.txt' },
       { type: 'message', text: 'all done' },
     ]);
-    // Raw output is kept on disk.
-    expect(
-      readFileSync(join(dir, 'logs', 'a.jsonl'), 'utf8')
-        .trim()
-        .split('\n'),
-    ).toHaveLength(4);
+    // Raw output is kept on disk. The result does not wait for the log file to be flushed, so
+    // under load the file may still be catching up when it arrives.
+    await vi.waitFor(() =>
+      expect(
+        readFileSync(join(dir, 'logs', 'a.jsonl'), 'utf8')
+          .trim()
+          .split('\n'),
+      ).toHaveLength(4),
+    );
   });
 
   it('passes the effort as --effort', async () => {
