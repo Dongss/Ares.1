@@ -1397,8 +1397,22 @@ export class IssueBridge {
           limit: SCOUT_RECENT_CLOSED,
           comments: true,
         }),
-        // Rejections stay counterexamples however long ago they were made.
-        gh.listNotPlannedIssues(scout.issuesRepo, { limit: SCOUT_NOT_PLANNED }),
+        // Rejections stay counterexamples however long ago they were made. Only extra ones: the
+        // latest closed issues hold the recent rejections already, so when the search fails (it
+        // has rate limits and an index of its own) the scout goes on without them, not fails.
+        gh
+          .listNotPlannedIssues(scout.issuesRepo, { limit: SCOUT_NOT_PLANNED })
+          .catch((err: unknown) => {
+            this.report(
+              new Error(
+                t({
+                  zh: `侦察 ${repo.name} 时搜索被关闭为不做的 issue 失败，这次只用最近关闭的 issue：${errorMessage(err)}`,
+                  en: `Searching the issues closed as not planned for the scout of ${repo.name} failed; this scout uses only the recently closed issues: ${errorMessage(err)}`,
+                }),
+              ),
+            );
+            return null;
+          }),
       ]);
       const prompt = scoutPrompt({
         repoName: repo.name,

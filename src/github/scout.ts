@@ -591,16 +591,17 @@ export function runDigest(store: Store, repoId: string, limit = 15): string {
  *
  * `closed` are the latest closed issues; `notPlanned` are issues closed as not planned, however
  * old. Those not among `closed` get a section of their own, so that old rejections and their
- * reasons stay in sight without crowding the recent ones.
+ * reasons stay in sight without crowding the recent ones. `notPlanned` is null when they could
+ * not be fetched: the scout is told that only the recent rejections are in sight.
  */
 export function issueDigest(
   open: GhIssue[],
   closed: GhIssue[],
   master: string | null,
-  notPlanned: GhIssue[] = [],
+  notPlanned: GhIssue[] | null = [],
 ): string {
   const recent = new Set(closed.map((i) => i.number));
-  const older = notPlanned.filter((i) => !recent.has(i.number));
+  const older = (notPlanned ?? []).filter((i) => !recent.has(i.number));
   const trusted = <T extends GhAuthored>(items: T[]) => items.filter((i) => isTrusted(i, master));
   const labels = (i: GhIssue) => {
     const ours = i.labels.filter((l) => l.startsWith('ares1:'));
@@ -617,6 +618,15 @@ export function issueDigest(
     t({ zh: '### 最近关闭', en: '### Recently closed' }),
     closedLines.join('\n') || none,
   ];
+  if (!notPlanned) {
+    sections.push(
+      '',
+      t({
+        zh: '（更早被关闭为不做的 issue 这次没能取到，上面只列出了最近关闭的。更早被拒绝过的需求不在这里：提出的需求如果可能早就被拒绝过，要多加小心。）',
+        en: '(Older issues closed as not planned could not be fetched this time; only the recently closed ones are listed above. Requirements turned down earlier are not here, so be careful with any proposal that may have been rejected before.)',
+      }),
+    );
+  }
   // Nothing older (a young repo): no section saying so.
   if (olderLines.length) {
     sections.push(

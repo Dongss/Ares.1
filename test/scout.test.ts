@@ -1184,3 +1184,46 @@ describe('issueDigest: older issues closed as not planned', () => {
     );
   });
 });
+
+describe('issueDigest: older issues closed as not planned could not be fetched', () => {
+  afterEach(() => setLang('zh'));
+
+  const reason = { body: '不需要，太复杂', author: 'me', authorAssociation: 'MEMBER' };
+  const open = [issue(3, '开着的', { state: 'open', stateReason: null })];
+  const closed = [issue(2, '最近拒掉的', { stateReason: 'not_planned', comments: [reason] })];
+
+  it('says so after the recent ones, and is unchanged when they were fetched', () => {
+    const fetched = issueDigest(open, closed, 'me', []);
+    // Without the list, as before it could fail.
+    expect(issueDigest(open, closed, 'me')).toBe(fetched);
+    expect(issueDigest(open, closed, 'me', null)).toBe(
+      `${fetched}\n\n（更早被关闭为不做的 issue 这次没能取到，上面只列出了最近关闭的。更早被拒绝过的需求不在这里：提出的需求如果可能早就被拒绝过，要多加小心。）`,
+    );
+    expect(fetched).toBe(
+      [
+        '### 未关闭',
+        '- #3 开着的',
+        '',
+        '### 最近关闭',
+        '- #2 不做：最近拒掉的\n  理由：不需要，太复杂',
+      ].join('\n'),
+    );
+  });
+
+  it('says so in English', () => {
+    setLang('en');
+    const digest = issueDigest([], [issue(4, 'Finished')], 'me', null);
+    expect(digest).toBe(
+      [
+        '### Open',
+        '(none)',
+        '',
+        '### Recently closed',
+        '- #4 Done: Finished',
+        '',
+        '(Older issues closed as not planned could not be fetched this time; only the recently closed ones are listed above. Requirements turned down earlier are not here, so be careful with any proposal that may have been rejected before.)',
+      ].join('\n'),
+    );
+    expect(digest).not.toMatch(/[一-鿿]/);
+  });
+});

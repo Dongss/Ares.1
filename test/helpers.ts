@@ -313,13 +313,16 @@ export class FakeGitHub implements GitHub {
   readonly calls: string[] = [];
   /** When set, every call throws this message. */
   failWith: string | null = null;
+  /** Calls named as in `calls` (e.g. "list not_planned") that throw the message given. */
+  readonly failing = new Map<string, string>();
   /** The account the Master acts as: it writes the Master's comments and issues. */
   master: FakeAuthor = OWNER;
   private next = 1;
 
   private call(what: string): void {
     this.calls.push(what);
-    if (this.failWith) throw new Error(this.failWith);
+    const message = this.failWith ?? this.failing.get(what);
+    if (message) throw new Error(message);
   }
 
   /** An issue written by a human, the repo's owner unless `author` says otherwise. */

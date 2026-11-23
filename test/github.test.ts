@@ -11,6 +11,7 @@ import {
   type ProposalKind,
   REDO_BACKOFF_MAX_HOURS,
   scoutBackoff,
+  scoutFailureStreak,
 } from '../src/config/flow.js';
 import { githubConfigKey } from '../src/config/load.js';
 import type { GhComment, GhIssue } from '../src/github/client.js';
@@ -568,6 +569,84 @@ describe('issues: scout', () => {
     const listed = [...prompt.matchAll(/^- #(\d+) /gm)].map((m) => Number(m[1]));
     expect(listed).toHaveLength(34);
     expect(new Set(listed).size).toBe(listed.length);
+  });
+
+  it('goes on with the recently closed issues when the search for older rejections fails', async () => {
+    const t = await start();
+    const store = t.master.store;
+    // #1–#35, all closed: #6–#35 are the latest 30, #1 was rejected before them.
+    for (let n = 1; n <= 35; n++) {
+      const closed = gh.add({ title: `需求 ${n}` });
+      closed.state = 'closed';
+      closed.stateReason = n === 1 || n === 20 ? 'not_planned' : 'completed';
+    }
+    gh.commentAs(1, OWNER, '不需要，太复杂');
+    gh.commentAs(20, OWNER, '重复了');
+    // One failed scout before: a scout that goes on without the search ends the streak.
+    t.scripts.scout = () => ({ structured: { proposals: [{ title: '缺字段' }] } });
+    const broken = await t.master.issues.startScout('demo', 'manual');
+    expect((await scoutDone(t, broken.id)).status).toBe('failed');
+    const streak = () => scoutFailureStreak(store.listScouts({ repoId: t.repo.id, limit: 200 }));
+    expect(streak()).toBe(1);
+
+    gh.failing.set('list not_planned', 'API rate limit exceeded for search');
+    t.scripts.scout = () => ({ structured: { proposals: [proposal('新的需求', 'high')] } });
+    const scout = await t.master.issues.startScout('demo', 'manual');
+    const done = await scoutDone(t, scout.id);
+    expect(gh.calls).toContain('list not_planned');
+    expect(done.status).toBe('completed');
+    expect(done.proposals.map((p) => p.issue?.number)).toEqual([36]);
+    expect(gh.get(36).title).toBe('新的需求');
+    expect(streak()).toBe(0);
+    expect(store.listEventsOfType('scout.failed', '1970-01-01T00:00:00.000Z')).toHaveLength(1);
+    const errors = store
+      .listEventsOfType('github.error', '1970-01-01T00:00:00.000Z')
+      .map((e) => e.data.message);
+    expect(errors).toEqual([
+      '侦察 demo 时搜索被关闭为不做的 issue 失败，这次只用最近关闭的 issue：API rate limit exceeded for search',
+    ]);
+
+    // The latest 30 as always, with the recent rejection; the older one is out of sight, and the
+    // scout is told so.
+    const prompt = t.fake.calls.at(-1)?.prompt ?? '';
+    expect(prompt).toContain('### 最近关闭\n- #35 已完成：需求 35\n');
+    expect(prompt).toContain('- #20 不做：需求 20\n  理由：重复了');
+    expect(prompt).toContain(
+      '- #6 已完成：需求 6\n\n（更早被关闭为不做的 issue 这次没能取到，上面只列出了最近关闭的。',
+    );
+    expect(prompt).not.toContain('### 更早被关闭为不做的');
+    expect(prompt).not.toMatch(/^- #1 /m);
+    expect(prompt).not.toContain('不需要，太复杂');
+
+    // The search works again: the older rejection is back, and no word of a failure.
+    gh.failing.clear();
+    t.scripts.scout = () => ({ structured: { proposals: [] } });
+    const next = await t.master.issues.startScout('demo', 'manual');
+    expect((await scoutDone(t, next.id)).status).toBe('completed');
+    const again = t.fake.calls.at(-1)?.prompt ?? '';
+    expect(again).toContain('### 更早被关闭为不做的\n- #1 不做：需求 1\n  理由：不需要，太复杂');
+    expect(again).not.toContain('没能取到');
+  });
+
+  it('still fails the scout when listing the open or the latest closed issues fails', async () => {
+    const t = await start();
+    const store = t.master.store;
+    t.scripts.scout = () => ({ structured: { proposals: [proposal('新的需求', 'high')] } });
+    for (const call of ['list open', 'list closed']) {
+      gh.failing.clear();
+      gh.failing.set(call, `GitHub 不可用（${call}）`);
+      const scout = await t.master.issues.startScout('demo', 'manual');
+      const done = await scoutDone(t, scout.id);
+      expect(done.status).toBe('failed');
+      expect(done.error).toContain(`GitHub 不可用（${call}）`);
+    }
+    // The scout's agent never ran, and nothing was filed.
+    expect(t.fake.calls).toHaveLength(0);
+    expect(gh.issues.size).toBe(0);
+    const failed = store
+      .listEventsOfType('scout.failed', '1970-01-01T00:00:00.000Z')
+      .map((e) => e.data.streak);
+    expect(failed).toEqual([1, 2]);
   });
 
   /**
