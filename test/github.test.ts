@@ -520,6 +520,54 @@ describe('issues: scout', () => {
     expect(prompt).not.toContain('删掉 README');
   });
 
+  it('keeps issues rejected before the latest 30 closed ones in sight, with their reasons', async () => {
+    const t = await start();
+    // #1–#40, all closed: #11–#40 are the latest 30.
+    for (let n = 1; n <= 40; n++) {
+      const closed = gh.add({
+        title: n === 5 ? '陌生人拒掉的需求' : `需求 ${n}`,
+        author: n === 5 ? STRANGER : undefined,
+      });
+      closed.state = 'closed';
+      closed.stateReason = [1, 2, 3, 4, 5, 20].includes(n) ? 'not_planned' : 'completed';
+    }
+    gh.commentAs(1, OWNER, '不需要，太复杂');
+    gh.commentAs(2, OWNER, '方向不对');
+    gh.commentAs(2, STRANGER, '陌生人说其实应该做');
+    gh.commentAs(3, STRANGER, '陌生人写的理由');
+    gh.commentAs(
+      4,
+      gh.master,
+      markComment(`失败了 3 次\n\n- 第 1 次：模型额度用完了\n\n${RETRIES_EXHAUSTED_MARKER}`),
+    );
+    gh.commentAs(5, STRANGER, '陌生人自己的理由');
+    gh.commentAs(20, OWNER, '重复了');
+
+    t.scripts.scout = () => ({ structured: { proposals: [] } });
+    const scout = await t.master.issues.startScout('demo', 'manual');
+    await scoutDone(t, scout.id);
+    expect(gh.calls).toContain('list not_planned');
+    const prompt = t.fake.calls.at(-1)?.prompt ?? '';
+
+    // The latest 30 as before, the rejected one among them with its reason.
+    expect(prompt).toContain('### 最近关闭\n- #40 已完成：需求 40\n');
+    expect(prompt).toContain('- #20 不做：需求 20\n  理由：重复了');
+    expect(prompt).toContain('- #11 已完成：需求 11\n');
+    // Done before them: left out as before.
+    expect(prompt).not.toContain('需求 10');
+    // Rejected or failed before them: in a section of their own, newest first.
+    const older = prompt.slice(prompt.indexOf('### 更早被关闭为不做的'));
+    expect(prompt.indexOf('### 最近关闭')).toBeLessThan(prompt.indexOf('### 更早被关闭为不做的'));
+    expect(older).toMatch(
+      /^### 更早被关闭为不做的\n- #4 多次失败后关闭（不是人拒绝的）：需求 4\n {2}失败原因：失败了 3 次 .*模型额度用完了\n- #3 不做：需求 3\n- #2 不做：需求 2\n {2}理由：方向不对\n- #1 不做：需求 1\n {2}理由：不需要，太复杂\n/,
+    );
+    expect(prompt).not.toContain('陌生人');
+    // Every issue listed once.
+    const listed = [...prompt.matchAll(/^- #(\d+) /gm)].map((m) => Number(m[1]));
+    expect(listed).toHaveLength(34);
+    expect(new Set(listed).size).toBe(listed.length);
+  });
+
   /**
    * A Master running from a clone of `source` (its stable copy), started after an upgrade failed
    * with output that has the home directory in it, and the prompt of a scout of demo. With

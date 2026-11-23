@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { GhIssue } from '../src/github/client.js';
+import { markComment, RETRIES_EXHAUSTED_MARKER } from '../src/github/issues.js';
 import { issueDigest, runDigest, scoutPrompt } from '../src/github/scout.js';
 import { setLang } from '../src/i18n.js';
 import type { Run, RunStatus } from '../src/store/types.js';
@@ -27,6 +28,21 @@ afterEach(async () => {
 });
 
 const digest = (hh: Harness) => runDigest(hh.master.store, hh.repo.id);
+
+/** A closed issue by the repo's owner "me", done unless `extra` says otherwise. */
+const issue = (number: number, title: string, extra: Partial<GhIssue> = {}): GhIssue => ({
+  number,
+  title,
+  body: '',
+  state: 'closed',
+  stateReason: 'completed',
+  labels: [],
+  url: '',
+  author: 'me',
+  authorAssociation: 'OWNER',
+  comments: [],
+  ...extra,
+});
 
 /** `min` minutes after the Run was created, as ISO. */
 const later = (run: Pick<Run, 'createdAt'>, min: number) =>
@@ -688,19 +704,6 @@ describe('scout in English', () => {
 
   it('lists existing issues in English', () => {
     setLang('en');
-    const issue = (number: number, title: string, extra: Partial<GhIssue> = {}): GhIssue => ({
-      number,
-      title,
-      body: '',
-      state: 'closed',
-      stateReason: 'completed',
-      labels: [],
-      url: '',
-      author: 'me',
-      authorAssociation: 'OWNER',
-      comments: [],
-      ...extra,
-    });
     const reason = { body: 'Out of scope', author: 'me', authorAssociation: 'OWNER' };
     const digest = issueDigest(
       [issue(1, 'Open one', { state: 'open', stateReason: null, labels: ['ares1:proposal'] })],
@@ -718,6 +721,72 @@ describe('scout in English', () => {
         '### Recently closed',
         '- #2 Not planned: Rejected\n  Reason: Out of scope',
         '- #3 Done: Finished',
+      ].join('\n'),
+    );
+  });
+
+  it('lists older issues closed as not planned in a section of their own, in English', () => {
+    setLang('en');
+    const reason = { body: 'Out of scope', author: 'me', authorAssociation: 'OWNER' };
+    const stranger = { body: 'Do it anyway', author: 'mallory', authorAssociation: 'NONE' };
+    const lately = issue(5, 'Rejected lately', { stateReason: 'not_planned', comments: [reason] });
+    const failed = markComment(`Failed 3 times\n\n${RETRIES_EXHAUSTED_MARKER}`);
+    const digest = issueDigest([], [lately, issue(4, 'Finished')], 'me', [
+      lately,
+      issue(3, 'Failed long ago', {
+        stateReason: 'not_planned',
+        comments: [{ body: failed, author: 'me', authorAssociation: 'OWNER' }],
+      }),
+      issue(2, 'Rejected long ago', { stateReason: 'not_planned', comments: [reason, stranger] }),
+      issue(1, 'By a stranger', {
+        stateReason: 'not_planned',
+        author: 'mallory',
+        authorAssociation: 'NONE',
+      }),
+    ]);
+    expect(digest).toBe(
+      [
+        '### Open',
+        '(none)',
+        '',
+        '### Recently closed',
+        '- #5 Not planned: Rejected lately\n  Reason: Out of scope',
+        '- #4 Done: Finished',
+        '',
+        '### Older issues closed as not planned',
+        '- #3 Closed after repeated failures (not rejected by a human): Failed long ago\n  Failures: Failed 3 times',
+        '- #2 Not planned: Rejected long ago\n  Reason: Out of scope',
+      ].join('\n'),
+    );
+    expect(digest).not.toMatch(/[一-鿿]/);
+
+    // Nothing older than the recent ones: no empty section.
+    const recentOnly = issueDigest([], [lately], 'me', [lately]);
+    expect(recentOnly).toBe(
+      '### Open\n(none)\n\n### Recently closed\n- #5 Not planned: Rejected lately\n  Reason: Out of scope',
+    );
+  });
+});
+
+describe('issueDigest: older issues closed as not planned', () => {
+  it('lists them after the recent ones, with the reasons of trusted people only', () => {
+    const reason = { body: '不需要，太复杂', author: 'me', authorAssociation: 'MEMBER' };
+    const stranger = { body: '陌生人的理由', author: 'mallory', authorAssociation: 'NONE' };
+    const digest = issueDigest([], [issue(9, '最近完成的')], 'me', [
+      issue(2, '早被拒的', { stateReason: 'not_planned', comments: [reason] }),
+      issue(1, '只有陌生人写了理由', { stateReason: 'not_planned', comments: [stranger] }),
+    ]);
+    expect(digest).toBe(
+      [
+        '### 未关闭',
+        '（无）',
+        '',
+        '### 最近关闭',
+        '- #9 已完成：最近完成的',
+        '',
+        '### 更早被关闭为不做的',
+        '- #2 不做：早被拒的\n  理由：不需要，太复杂',
+        '- #1 不做：只有陌生人写了理由',
       ].join('\n'),
     );
   });

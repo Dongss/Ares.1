@@ -77,6 +77,11 @@ import {
 const stoppedWhileScouting = () =>
   t({ zh: 'Master 在侦察过程中停止了', en: 'The Master stopped during the scout' });
 
+/** How many of the latest closed issues the scout sees, done or not. */
+const SCOUT_RECENT_CLOSED = 30;
+/** How many issues closed as not planned the scout sees besides, with their reasons. */
+const SCOUT_NOT_PLANNED = 300;
+
 const pad = (n: number) => String(n).padStart(2, '0');
 
 /** "2026-11-23 14:05", in the Master's local time. */
@@ -1263,15 +1268,21 @@ export class IssueBridge {
         );
       }
       const gh = this.gh();
-      const [open, closed] = await Promise.all([
+      const [open, closed, notPlanned] = await Promise.all([
         gh.listIssues(scout.issuesRepo, { state: 'open', limit: 100 }),
-        gh.listIssues(scout.issuesRepo, { state: 'closed', limit: 30, comments: true }),
+        gh.listIssues(scout.issuesRepo, {
+          state: 'closed',
+          limit: SCOUT_RECENT_CLOSED,
+          comments: true,
+        }),
+        // Rejections stay counterexamples however long ago they were made.
+        gh.listNotPlannedIssues(scout.issuesRepo, { limit: SCOUT_NOT_PLANNED }),
       ]);
       const prompt = scoutPrompt({
         repoName: repo.name,
         max: scoutCfg.max_proposals,
         runs: runDigest(store, repo.id),
-        issues: issueDigest(open, closed, await this.masterLogin()),
+        issues: issueDigest(open, closed, await this.masterLogin(), notPlanned),
         upgrade: this.upgradeFailureFor(repo, scout.issuesRepo),
       });
       // Read the target branch as committed, like a Run does, not whatever the main worktree has

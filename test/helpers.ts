@@ -407,6 +407,15 @@ export class FakeGitHub implements GitHub {
       .map((i) => this.view(i, q.comments === true));
   }
 
+  async listNotPlannedIssues(_repo: string, q: { limit: number }): Promise<GhIssue[]> {
+    this.call('list not_planned');
+    return [...this.issues.values()]
+      .filter((i) => i.state === 'closed' && i.stateReason === 'not_planned')
+      .sort((a, b) => b.number - a.number)
+      .slice(0, q.limit)
+      .map((i) => this.view(i, true));
+  }
+
   async createIssue(
     _repo: string,
     issue: { title: string; body: string; labels: string[] },

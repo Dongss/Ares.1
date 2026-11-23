@@ -44,10 +44,16 @@ export interface GitHub {
   viewer(): Promise<string>;
   /** Create the labels, or update their color and description. */
   ensureLabels(repo: string, labels: readonly LabelDef[]): Promise<void>;
+  /** Newest first: one page, so at most `limit` and never more than 100. */
   listIssues(
     repo: string,
     query: { state: 'open' | 'closed'; label?: string; limit: number; comments?: boolean },
   ): Promise<GhIssue[]>;
+  /**
+   * Issues closed as not planned, newest first, with their comments: at most `limit`, over as
+   * many pages as that takes.
+   */
+  listNotPlannedIssues(repo: string, query: { limit: number }): Promise<GhIssue[]>;
   createIssue(
     repo: string,
     issue: { title: string; body: string; labels: string[] },
@@ -100,6 +106,13 @@ const ISSUE_FRAGMENT = `fragment issue on Issue {
     nodes { body author { login } authorAssociation }
   }
 }`;
+
+/** A page of a GraphQL search for issues (see ISSUE_FRAGMENT). */
+interface SearchPage {
+  pageInfo?: { hasNextPage: boolean; endCursor: string | null } | null;
+  /** Results that are no issue (none with `is:issue`) come back as empty objects. */
+  nodes?: (RawIssue | null)[] | null;
+}
 
 /** The most a GraphQL connection returns at once. */
 const MAX_PAGE = 100;
@@ -285,6 +298,43 @@ export class GhCli implements GitHub {
       },
     );
     return (data.repository?.issues.nodes ?? []).map(fromRaw);
+  }
+
+  async listNotPlannedIssues(repo: string, query: { limit: number }): Promise<GhIssue[]> {
+    const { owner, name } = repoParts(repo);
+    const limit = Math.max(query.limit, 0);
+    // A search, so that only these issues come with their comments, not every closed one.
+    const q = `repo:${owner}/${name} is:issue is:closed reason:"not planned" sort:created-desc`;
+    const found: GhIssue[] = [];
+    let after: string | null = null;
+    // The search returns only such issues, so the pages needed are known; one more covers the
+    // few a stale search index may still list after they were reopened. Never page on and on.
+    const maxPages = Math.ceil(limit / MAX_PAGE) + 1;
+    for (let page = 0; page < maxPages && found.length < limit; page++) {
+      const data: { search: SearchPage } = await this.graphql<{ search: SearchPage }>(
+        `query($q: String!, $first: Int!, $after: String, $withComments: Boolean!) {
+          search(query: $q, type: ISSUE, first: $first, after: $after) {
+            pageInfo { hasNextPage endCursor }
+            nodes { ...issue }
+          }
+        }
+        ${ISSUE_FRAGMENT}`,
+        { q, first: Math.min(limit - found.length, MAX_PAGE), after, withComments: true },
+      );
+      for (const raw of data.search.nodes ?? []) {
+        if (typeof raw?.number !== 'number') continue;
+        const issue = fromRaw(raw);
+        // Pages of a search can overlap when issues change meanwhile.
+        const seen = found.some((i) => i.number === issue.number);
+        if (!seen && issue.state === 'closed' && issue.stateReason === 'not_planned') {
+          found.push(issue);
+        }
+      }
+      const next = data.search.pageInfo;
+      if (!next?.hasNextPage || !next.endCursor || next.endCursor === after) break;
+      after = next.endCursor;
+    }
+    return found.slice(0, limit);
   }
 
   async createIssue(

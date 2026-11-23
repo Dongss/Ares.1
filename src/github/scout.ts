@@ -498,44 +498,71 @@ export function runDigest(store: Store, repoId: string, limit = 15): string {
  * Anybody can open an issue or comment on a public repo, so only issues and comments written by
  * people the Master trusts (`isTrusted`, the Master itself included) are listed; `master` is the
  * login the Master acts as.
+ *
+ * `closed` are the latest closed issues; `notPlanned` are issues closed as not planned, however
+ * old. Those not among `closed` get a section of their own, so that old rejections and their
+ * reasons stay in sight without crowding the recent ones.
  */
-export function issueDigest(open: GhIssue[], closed: GhIssue[], master: string | null): string {
+export function issueDigest(
+  open: GhIssue[],
+  closed: GhIssue[],
+  master: string | null,
+  notPlanned: GhIssue[] = [],
+): string {
+  const recent = new Set(closed.map((i) => i.number));
+  const older = notPlanned.filter((i) => !recent.has(i.number));
   const trusted = <T extends GhAuthored>(items: T[]) => items.filter((i) => isTrusted(i, master));
   const labels = (i: GhIssue) => {
     const ours = i.labels.filter((l) => l.startsWith('ares1:'));
     return ours.length ? ` [${ours.join(', ')}]` : '';
   };
   const openLines = trusted(open).map((i) => `- #${i.number}${labels(i)} ${i.title}`);
-  const closedLines = trusted(closed).map((i) => {
-    const comments = trusted(i.comments).map((c) => c.body);
-    // Closed by the Master after every attempt failed: not a human's rejection.
-    const exhausted = comments.findLast(isRetriesExhaustedComment);
-    if (i.stateReason === 'not_planned' && exhausted && exhausted === comments.at(-1)) {
-      const head = t({
-        zh: '多次失败后关闭（不是人拒绝的）',
-        en: 'Closed after repeated failures (not rejected by a human)',
-      });
-      const reasons = `${t({ zh: '失败原因', en: 'Failures' })}${colon()}${oneLine(stripMarker(exhausted), 800)}`;
-      return `- #${i.number} ${head}${colon()}${i.title}\n  ${reasons}`;
-    }
-    if (i.stateReason === 'not_planned') {
-      const last = comments.at(-1);
-      const reason = last && stripMarker(last);
-      const why = reason
-        ? `\n  ${t({ zh: '理由', en: 'Reason' })}${colon()}${oneLine(reason, 300)}`
-        : '';
-      return `- #${i.number} ${t({ zh: '不做', en: 'Not planned' })}${colon()}${i.title}${why}`;
-    }
-    return `- #${i.number} ${t({ zh: '已完成', en: 'Done' })}${colon()}${i.title}`;
-  });
+  const closedLines = trusted(closed).map((i) => closedIssueLine(i, master));
+  const olderLines = trusted(older).map((i) => closedIssueLine(i, master));
   const none = t({ zh: '（无）', en: '(none)' });
-  return [
+  const sections = [
     t({ zh: '### 未关闭', en: '### Open' }),
     openLines.join('\n') || none,
     '',
     t({ zh: '### 最近关闭', en: '### Recently closed' }),
     closedLines.join('\n') || none,
-  ].join('\n');
+  ];
+  // Nothing older (a young repo): no section saying so.
+  if (olderLines.length) {
+    sections.push(
+      '',
+      t({ zh: '### 更早被关闭为不做的', en: '### Older issues closed as not planned' }),
+      olderLines.join('\n'),
+    );
+  }
+  return sections.join('\n');
+}
+
+/**
+ * A closed issue in the scout's list: done, rejected by a human with the reason, or closed by
+ * the Master after every attempt failed. Only comments by people the Master trusts count.
+ */
+function closedIssueLine(i: GhIssue, master: string | null): string {
+  const comments = i.comments.filter((c) => isTrusted(c, master)).map((c) => c.body);
+  // Closed by the Master after every attempt failed: not a human's rejection.
+  const exhausted = comments.findLast(isRetriesExhaustedComment);
+  if (i.stateReason === 'not_planned' && exhausted && exhausted === comments.at(-1)) {
+    const head = t({
+      zh: '多次失败后关闭（不是人拒绝的）',
+      en: 'Closed after repeated failures (not rejected by a human)',
+    });
+    const reasons = `${t({ zh: '失败原因', en: 'Failures' })}${colon()}${oneLine(stripMarker(exhausted), 800)}`;
+    return `- #${i.number} ${head}${colon()}${i.title}\n  ${reasons}`;
+  }
+  if (i.stateReason === 'not_planned') {
+    const last = comments.at(-1);
+    const reason = last && stripMarker(last);
+    const why = reason
+      ? `\n  ${t({ zh: '理由', en: 'Reason' })}${colon()}${oneLine(reason, 300)}`
+      : '';
+    return `- #${i.number} ${t({ zh: '不做', en: 'Not planned' })}${colon()}${i.title}${why}`;
+  }
+  return `- #${i.number} ${t({ zh: '已完成', en: 'Done' })}${colon()}${i.title}`;
 }
 
 /** Proposals a human still has to look at. */

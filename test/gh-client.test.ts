@@ -244,6 +244,119 @@ describe('GhCli reads issues through GraphQL', () => {
     });
   });
 
+  it('listNotPlannedIssues searches page by page, with comments, up to the limit', async () => {
+    const rejected = { ...OWNER_ISSUE, state: 'CLOSED', stateReason: 'NOT_PLANNED' };
+    const page = (nodes: unknown[], endCursor: string | null, hasNextPage = true) =>
+      gql({ search: { pageInfo: { hasNextPage, endCursor }, nodes } });
+    const gh = fakeGh([
+      page(
+        [
+          rejected,
+          // Reopened since the search index saw it, done, and a result that is no issue.
+          { ...OWNER_ISSUE, number: 6, state: 'OPEN', stateReason: 'REOPENED' },
+          { ...OWNER_ISSUE, number: 5, state: 'CLOSED', stateReason: 'COMPLETED' },
+          {},
+        ],
+        'cursor-1',
+      ),
+      // The next page overlaps the first one.
+      page([rejected, GHOST_ISSUE], null, false),
+    ]);
+    const cli = new GhCli(gh.bin);
+
+    const issues = await cli.listNotPlannedIssues('acme/widgets', { limit: 50 });
+    expect(issues).toEqual([
+      {
+        number: 7,
+        title: 'Add tests',
+        body: 'Please add tests',
+        state: 'closed',
+        stateReason: 'not_planned',
+        labels: ['ares1:ready', 'bug'],
+        url: URL_7,
+        author: 'alice',
+        authorAssociation: 'OWNER',
+        comments: OWNER_COMMENTS,
+      },
+      {
+        number: 8,
+        title: 'From a deleted account',
+        body: '',
+        state: 'closed',
+        stateReason: 'not_planned',
+        labels: [],
+        url: 'https://github.com/acme/widgets/issues/8',
+        author: null,
+        authorAssociation: 'NONE',
+        comments: [],
+      },
+    ]);
+
+    const [first, second, ...more] = gh.calls().map(request);
+    expect(more).toEqual([]);
+    expect(first?.query).toContain('search(query: $q, type: ISSUE, first: $first, after: $after)');
+    expect(first?.query).toContain('pageInfo { hasNextPage endCursor }');
+    expect(first?.query).toContain('fragment issue on Issue');
+    expect(first?.query).toContain('comments(last: 100) @include(if: $withComments)');
+    const q = 'repo:acme/widgets is:issue is:closed reason:"not planned" sort:created-desc';
+    expect(first?.variables).toEqual({ q, first: 50, after: null, withComments: true });
+    // The second page starts after the first and asks only for what is still missing.
+    expect(second?.variables).toEqual({ q, first: 49, after: 'cursor-1', withComments: true });
+  });
+
+  it('listNotPlannedIssues stops paging at the limit, or when the pages lead nowhere', async () => {
+    const rejected = (number: number) => ({
+      ...GHOST_ISSUE,
+      number,
+      url: `https://github.com/acme/widgets/issues/${number}`,
+    });
+    const reopened = { ...GHOST_ISSUE, state: 'OPEN', stateReason: 'REOPENED' };
+    const page = (nodes: unknown[], endCursor: string | null) =>
+      gql({ search: { pageInfo: { hasNextPage: true, endCursor }, nodes } });
+    const gh = fakeGh([
+      // Enough at once: no second page, though GitHub has one.
+      page([rejected(9), rejected(8)], 'a'),
+      // Pages that keep coming without a single such issue: one page more than the limit needs.
+      page([reopened], 'b1'),
+      page([reopened], 'b2'),
+      // The same cursor again: no endless paging, and the last page is never asked for.
+      page([rejected(9)], 'c'),
+      page([rejected(8)], 'c'),
+      page([rejected(7)], 'c'),
+    ]);
+    const cli = new GhCli(gh.bin);
+
+    const two = await cli.listNotPlannedIssues('acme/widgets', { limit: 2 });
+    expect(two.map((i) => i.number)).toEqual([9, 8]);
+    expect(gh.calls()).toHaveLength(1);
+    expect(request(gh.calls()[0] as GhCall).variables).toMatchObject({ first: 2, after: null });
+
+    expect(await cli.listNotPlannedIssues('acme/widgets', { limit: 1 })).toEqual([]);
+    expect(
+      gh
+        .calls()
+        .slice(1)
+        .map((c) => request(c).variables.after),
+    ).toEqual([null, 'b1']);
+
+    const same = await cli.listNotPlannedIssues('acme/widgets', { limit: 300 });
+    expect(same.map((i) => i.number)).toEqual([9, 8]);
+    // Pages of at most 100.
+    expect(
+      gh
+        .calls()
+        .slice(3)
+        .map((c) => request(c).variables),
+    ).toMatchObject([
+      { first: 100, after: null },
+      { first: 100, after: 'c' },
+    ]);
+
+    // Nothing asked for: no call at all.
+    expect(await cli.listNotPlannedIssues('acme/widgets', { limit: 0 })).toEqual([]);
+    expect(gh.calls()).toHaveLength(5);
+  });
+
   it('getIssue asks for one issue without its comments', async () => {
     const gh = fakeGh([
       gql({
@@ -393,6 +506,7 @@ describe('GhCli failures', () => {
     for (const repo of ['widgets', 'acme/widgets/extra', '/widgets', 'acme/']) {
       expect((await ghError(cli.getIssue(repo, 1))).message).toBe(`仓库名应为 owner/name：${repo}`);
       await ghError(cli.listIssues(repo, { state: 'open', limit: 1 }));
+      await ghError(cli.listNotPlannedIssues(repo, { limit: 1 }));
     }
     expect(gh.calls()).toEqual([]);
   });
