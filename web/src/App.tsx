@@ -1,6 +1,6 @@
 import { type ReactNode, useEffect, useState } from 'react';
 import type { ConfigView, RunSummary } from '../../src/api/types.js';
-import { brandName, brandSlogan } from '../../src/brand.js';
+import { brandName } from '../../src/brand.js';
 import { join, LANG_NAMES, type Lang, lang, t } from '../../src/i18n.js';
 import type { Repo } from '../../src/store/types.js';
 import { NotifyBanner, NotifyToggle } from './components/Notifications.js';
@@ -78,8 +78,7 @@ export function App() {
     <div className="app">
       <header className="topbar">
         <a className="brand" href={href.home}>
-          <span className="brand-name">{brandName()}</span>
-          <span className="brand-slogan">{brandSlogan()}</span>
+          {brandName()}
         </a>
         <nav>
           <NavLink to={href.home} active={route.name === 'home'}>
