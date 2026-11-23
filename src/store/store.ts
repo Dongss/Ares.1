@@ -1,8 +1,9 @@
 import { EventEmitter } from 'node:events';
-import { existsSync } from 'node:fs';
+import { copyFileSync, existsSync, readdirSync, renameSync, rmSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 import { t } from '../i18n.js';
-import { newId, nowIso } from '../util.js';
+import { errorMessage, newId, nowIso } from '../util.js';
 import { MIGRATIONS } from './migrations.js';
 import {
   type AgentAttemptTotals,
@@ -53,6 +54,141 @@ export interface StoreEvents {
   event: [EventRow];
 }
 
+/** A database newer than this Master, replaced by the backup taken before it was migrated. */
+export interface BackupRestore {
+  /** The backup copied into place. */
+  backup: string;
+  /** Where the newer database went; its -wal and -shm, if any, carry the same suffixes. */
+  movedTo: string;
+  /** Version of the newer database. */
+  fromVersion: number;
+  /** Version of the backup: the one this Master supports. */
+  toVersion: number;
+}
+
+/** SQLite's files beside a database, which belong to it. */
+const SIDECARS = ['-wal', '-shm'] as const;
+
+/** A time for file names; in name order these sort by time. */
+const fileStamp = () => nowIso().replace(/[:.]/g, '-');
+
+function openDatabase(file: string): DatabaseSync {
+  const db = new DatabaseSync(file);
+  db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
+  return db;
+}
+
+function userVersion(db: DatabaseSync): number {
+  return (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version;
+}
+
+function removeDatabase(file: string): void {
+  for (const suffix of ['', ...SIDECARS]) rmSync(file + suffix, { force: true });
+}
+
+/** Name prefix of the backups taken before migrating a database of `version`. */
+function backupPrefix(file: string, version: number): string {
+  // The dash after the number keeps v1 from matching v10.
+  return `${basename(file)}.bak-v${version}-`;
+}
+
+/** The newest backup of `file` taken before migrating it from exactly `version`, or null. */
+function findBackup(file: string, version: number): string | null {
+  const dir = dirname(file);
+  const prefix = backupPrefix(file, version);
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return null;
+  }
+  const last = names
+    .filter((n) => n.startsWith(prefix) && !SIDECARS.some((s) => n.endsWith(s)))
+    .sort()
+    .at(-1);
+  return last === undefined ? null : join(dir, last);
+}
+
+function newerError(file: string, version: number): Error {
+  const supported = MIGRATIONS.length;
+  const dir = dirname(file);
+  const name = basename(file);
+  const pattern = `${backupPrefix(file, supported)}*`;
+  return new Error(
+    t({
+      zh: `数据库版本（${version}）比当前 Master 支持的（${supported}）更新，${dir} 里也没有升到更新版本之前的备份（${pattern}）可以自动恢复。请升级 Master，或者从 ${dir} 里形如 ${name}.bak-v<版本>-<时间> 的备份中挑一份版本不超过 ${supported} 的，把 ${name} 及其 -wal、-shm 移开后，复制成 ${name}`,
+      en: `The database version (${version}) is newer than this Master supports (${supported}), and ${dir} has no backup taken before it was migrated past that (${pattern}) to restore automatically. Upgrade the Master, or pick a backup of version ${supported} or older among the ${name}.bak-v<version>-<time> files in ${dir}, move ${name} and its -wal and -shm files away, and copy the backup to ${name}`,
+    }),
+  );
+}
+
+/**
+ * The database is newer than this Master: an upgrade was rolled back after the new version had
+ * migrated it, or an older version was started by hand. Puts back the newest backup taken right
+ * before it was migrated past this version, and keeps the newer database beside it, renamed, to
+ * be recovered after upgrading again. Without such a backup, throws and leaves every file as it was.
+ */
+function restoreBackup(file: string, version: number): BackupRestore {
+  const toVersion = MIGRATIONS.length;
+  const backup = findBackup(file, toVersion);
+  if (!backup) throw newerError(file, version);
+  const stamp = fileStamp();
+  const failed = (err: unknown) =>
+    new Error(
+      t({
+        zh: `数据库版本（${version}）比当前 Master 支持的（${toVersion}）更新，恢复备份 ${backup} 失败：${errorMessage(err)}`,
+        en: `The database version (${version}) is newer than this Master supports (${toVersion}), and restoring the backup ${backup} failed: ${errorMessage(err)}`,
+      }),
+    );
+  // Copy and check the backup before anything moves, so that a bad one changes nothing.
+  const copy = `${file}.restoring-${stamp}`;
+  try {
+    copyFileSync(backup, copy);
+    const db = new DatabaseSync(copy);
+    let got: number;
+    try {
+      got = userVersion(db);
+    } finally {
+      db.close();
+    }
+    if (got !== toVersion) {
+      throw new Error(
+        t({
+          zh: `备份的版本是 ${got}，不是 ${toVersion}`,
+          en: `the backup is version ${got}, not ${toVersion}`,
+        }),
+      );
+    }
+  } catch (err) {
+    removeDatabase(copy);
+    throw failed(err);
+  }
+  const movedTo = `${file}.newer-v${version}-${stamp}`;
+  const moved: string[] = [];
+  try {
+    for (const suffix of ['', ...SIDECARS]) {
+      if (!existsSync(file + suffix)) continue;
+      renameSync(file + suffix, movedTo + suffix);
+      moved.push(suffix);
+    }
+    renameSync(copy, file);
+  } catch (err) {
+    // Without its database the next start would begin from an empty one: put it back.
+    for (const suffix of moved) renameSync(movedTo + suffix, file + suffix);
+    removeDatabase(copy);
+    throw failed(err);
+  }
+  return { backup, movedTo, fromVersion: version, toVersion };
+}
+
+/** The line the Master prints when it put a backup back. */
+export function backupRestoredNotice(r: BackupRestore): string {
+  return t({
+    zh: `[数据库] 数据库版本（${r.fromVersion}）比当前 Master 支持的（${r.toVersion}）更新，多半是升级回退到了旧版本：已恢复迁移前的备份 ${r.backup}，较新的数据库移到了 ${r.movedTo}，以后再升级时可以从那里找回`,
+    en: `[database] The database (version ${r.fromVersion}) is newer than this Master supports (version ${r.toVersion}), most likely because an upgrade was rolled back: restored the backup taken before the migration, ${r.backup}; the newer database was moved to ${r.movedTo}, where it can be recovered after upgrading again`,
+  });
+}
+
 /**
  * Persistent state. Synchronous on purpose: node:sqlite is synchronous and the
  * Master is a single process, so every method is atomic with respect to the event loop.
@@ -61,31 +197,30 @@ export class Store {
   readonly db: DatabaseSync;
   /** Emits every appended event, for live views. */
   readonly bus = new EventEmitter<StoreEvents>();
+  /** Set when the database was newer than this Master and the backup from before was put back. */
+  readonly restoredBackup: BackupRestore | null = null;
 
   constructor(file: string) {
     const isNew = file === ':memory:' || !existsSync(file);
-    this.db = new DatabaseSync(file);
-    this.db.exec(
-      'PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;',
-    );
+    this.db = openDatabase(file);
+    const version = userVersion(this.db);
+    if (version > MIGRATIONS.length) {
+      this.db.close();
+      this.restoredBackup = restoreBackup(file, version);
+      this.db = openDatabase(file);
+    }
     this.migrate(file, isNew);
+    if (this.restoredBackup) this.event(null, 'store.backup_restored', { ...this.restoredBackup });
   }
 
   /** Apply pending migrations; back the database up first unless it is brand new. */
   private migrate(file: string, isNew: boolean): void {
-    const row = this.db.prepare('PRAGMA user_version').get() as { user_version: number };
-    const current = row.user_version;
-    if (current > MIGRATIONS.length) {
-      throw new Error(
-        t({
-          zh: `数据库版本（${current}）比当前 Master 支持的（${MIGRATIONS.length}）更新，请升级 Master 或恢复旧的数据库备份`,
-          en: `The database version (${current}) is newer than this Master supports (${MIGRATIONS.length}); upgrade the Master or restore an older database backup`,
-        }),
-      );
-    }
+    const current = userVersion(this.db);
+    if (current > MIGRATIONS.length) throw newerError(file, current);
     if (current === MIGRATIONS.length) return;
     if (!isNew && current > 0) {
-      const backup = `${file}.bak-v${current}-${nowIso().replace(/[:.]/g, '-')}`;
+      // A Master rolled back to this version finds it here; see restoreBackup.
+      const backup = `${file}.bak-v${current}-${fileStamp()}`;
       this.db.exec(`VACUUM INTO '${backup.replace(/'/g, "''")}'`);
     }
     for (let v = current; v < MIGRATIONS.length; v++) {

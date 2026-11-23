@@ -1,12 +1,13 @@
-import { readdirSync } from 'node:fs';
+import { copyFileSync, existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { TemplateSchema } from '../src/config/schema.js';
+import { setLang } from '../src/i18n.js';
 import { MIGRATIONS } from '../src/store/migrations.js';
-import { Store } from '../src/store/store.js';
+import { type BackupRestore, backupRestoredNotice, Store } from '../src/store/store.js';
 import type { Attempt, Scout } from '../src/store/types.js';
-import { tmpDir } from './helpers.js';
+import { type Harness, harness, tmpDir } from './helpers.js';
 
 const template = TemplateSchema.parse({ id: 't', stages: [{ id: 'a', agent: 'x' }] });
 
@@ -67,15 +68,6 @@ describe('store', () => {
     });
     store.close();
     expect(readdirSync(dir).filter((f) => f.includes('.bak-v1-'))).toHaveLength(1);
-  });
-
-  it('refuses a database written by a newer Master', () => {
-    const file = join(tmpDir('ares1-db-'), 'ares1.db');
-    new Store(file).close();
-    const db = new DatabaseSync(file);
-    db.exec(`PRAGMA user_version = ${MIGRATIONS.length + 1}`);
-    db.close();
-    expect(() => new Store(file)).toThrow(/比当前 Master 支持的/);
   });
 
   it('round-trips JSON and boolean columns', () => {
@@ -248,5 +240,221 @@ describe('store', () => {
     expect(store.agentScoutTotals()).toEqual([
       { agentId: 's', scouts: 4, costUsd: 0.4, costUnknown: 1, lastAt: last.startedAt },
     ]);
+  });
+});
+
+describe('a database written by a newer Master', () => {
+  afterEach(() => setLang('zh'));
+
+  const N = MIGRATIONS.length;
+  const CJK = /[　-〿一-鿿＀-￯]/;
+
+  function addRepo(store: Store, name: string) {
+    store.createRepo({
+      name,
+      path: `/tmp/${name}`,
+      targetBranch: 'main',
+      verifyCommands: [],
+      setupCommands: [],
+      mergeMode: 'direct',
+    });
+  }
+
+  /** A database of this version with these repos, closed. */
+  function current(file: string, ...repos: string[]) {
+    const store = new Store(file);
+    for (const name of repos) addRepo(store, name);
+    store.close();
+  }
+
+  function vacuumInto(file: string, to: string) {
+    const db = new DatabaseSync(file);
+    db.exec(`VACUUM INTO '${to}'`);
+    db.close();
+  }
+
+  /** Version and repos of a database file, read without the Store. */
+  function inspect(file: string) {
+    const db = new DatabaseSync(file);
+    try {
+      return {
+        version: (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+        repos: (db.prepare('SELECT name FROM repos ORDER BY name').all() as { name: string }[]).map(
+          (r) => r.name,
+        ),
+      };
+    } finally {
+      db.close();
+    }
+  }
+
+  /**
+   * A newer Master migrates the database past this version, adds repo `newer` and crashes with
+   * those writes still in the WAL.
+   */
+  function migrateAndCrash(file: string) {
+    const scratch = join(tmpDir('ares1-crash-'), 'ares1.db');
+    copyFileSync(file, scratch);
+    const store = new Store(scratch);
+    store.db.exec('PRAGMA wal_autocheckpoint = 0');
+    addRepo(store, 'newer');
+    store.db.exec(`PRAGMA user_version = ${N + 1}`);
+    for (const suffix of ['', '-wal', '-shm']) copyFileSync(scratch + suffix, file + suffix);
+    store.close();
+  }
+
+  function openError(file: string): Error | null {
+    try {
+      new Store(file).close();
+      return null;
+    } catch (err) {
+      return err as Error;
+    }
+  }
+
+  it('puts back the newest backup taken before it was migrated past this version', () => {
+    const dir = tmpDir('ares1-db-');
+    const file = join(dir, 'ares1.db');
+    current(file, 'kept');
+    vacuumInto(file, `${file}.bak-v${N}-2026-11-19T08-00-00-000Z`);
+    current(file, 'later');
+    const backup = `${file}.bak-v${N}-2026-11-20T08-00-00-000Z`;
+    vacuumInto(file, backup);
+    // Names that sort after it but are not backups of this version.
+    writeFileSync(`${backup}-wal`, 'not a backup');
+    writeFileSync(`${file}.bak-v${N}0-2026-11-21T08-00-00-000Z`, 'not a backup');
+    migrateAndCrash(file);
+    expect(existsSync(`${file}-wal`)).toBe(true);
+
+    const store = new Store(file);
+    expect(store.findRepo('kept')).toBeDefined();
+    expect(store.findRepo('later')).toBeDefined();
+    // Neither the newer database nor its WAL left behind under the name.
+    expect(store.findRepo('newer')).toBeUndefined();
+    const restored = store.restoredBackup as BackupRestore;
+    expect(restored).toEqual({
+      backup,
+      movedTo: expect.stringMatching(/\.newer-v\d+-\d{4}-\d\d-\d\dT\d\d-\d\d-\d\d-\d{3}Z$/),
+      fromVersion: N + 1,
+      toVersion: N,
+    });
+    expect(restored.movedTo.startsWith(`${file}.newer-v${N + 1}-`)).toBe(true);
+    expect(store.listEventsOfType('store.backup_restored', '').map((e) => e.data)).toEqual([
+      { ...restored },
+    ]);
+    store.close();
+
+    const files = readdirSync(dir);
+    expect(files).not.toContain('ares1.db-wal');
+    expect(files).not.toContain('ares1.db-shm');
+    expect(files.filter((f) => f.includes('.restoring-'))).toEqual([]);
+    expect(existsSync(backup)).toBe(true);
+    // The newer database is all there, its last writes included.
+    expect(inspect(restored.movedTo)).toEqual({
+      version: N + 1,
+      repos: ['kept', 'later', 'newer'],
+    });
+
+    // Opening it again is as usual.
+    const again = new Store(file);
+    expect(again.restoredBackup).toBeNull();
+    expect(again.findRepo('later')).toBeDefined();
+    expect(again.listEventsOfType('store.backup_restored', '')).toHaveLength(1);
+    again.close();
+    expect(readdirSync(dir).filter((f) => f.includes('.newer-v'))).toHaveLength(1);
+  });
+
+  it('refuses it, leaving the files as they were, without a backup of exactly this version', () => {
+    const dir = tmpDir('ares1-db-');
+    const file = join(dir, 'ares1.db');
+    current(file, 'kept');
+    vacuumInto(file, `${file}.bak-v1-2026-11-20T08-00-00-000Z`);
+    vacuumInto(file, `${file}.bak-v${N}0-2026-11-20T08-00-00-000Z`);
+    const store = new Store(file);
+    addRepo(store, 'newer');
+    store.db.exec(`PRAGMA user_version = ${N + 1}`);
+    store.close();
+    const files = readdirSync(dir).sort();
+    const bytes = readFileSync(file);
+
+    const err = openError(file);
+    expect(err?.message).toMatch(/比当前 Master 支持的/);
+    expect(err?.message).toContain(dir);
+    expect(err?.message).toContain(`ares1.db.bak-v${N}-*`);
+    expect(readdirSync(dir).sort()).toEqual(files);
+    expect(readFileSync(file).equals(bytes)).toBe(true);
+    expect(inspect(file)).toEqual({ version: N + 1, repos: ['kept', 'newer'] });
+  });
+
+  it('refuses a backup that is not the version its name says, changing nothing', () => {
+    const dir = tmpDir('ares1-db-');
+    const file = join(dir, 'ares1.db');
+    current(file, 'kept');
+    const backup = `${file}.bak-v${N}-2026-11-20T08-00-00-000Z`;
+    vacuumInto(file, backup);
+    const db = new DatabaseSync(backup);
+    db.exec(`PRAGMA user_version = ${N + 2}`);
+    db.close();
+    migrateAndCrash(file);
+
+    expect(openError(file)?.message).toContain(`恢复备份 ${backup} 失败`);
+    expect(readdirSync(dir).filter((f) => /\.(newer|restoring)-/.test(f))).toEqual([]);
+    expect(inspect(file)).toEqual({ version: N + 1, repos: ['kept', 'newer'] });
+  });
+
+  it('explains itself in English too', () => {
+    setLang('en');
+    const dir = tmpDir('ares1-db-');
+    const file = join(dir, 'ares1.db');
+    current(file);
+    const db = new DatabaseSync(file);
+    db.exec(`PRAGMA user_version = ${N + 1}`);
+    db.close();
+    const message = openError(file)?.message ?? '';
+    expect(message).toContain('is newer than this Master supports');
+    expect(message).toContain(`ares1.db.bak-v${N}-*`);
+    expect(message).not.toMatch(CJK);
+
+    const restored = { backup: '/b', movedTo: '/m', fromVersion: N + 1, toVersion: N };
+    const notice = backupRestoredNotice(restored);
+    expect(notice).toContain('restored the backup taken before the migration, /b');
+    expect(notice).toContain('/m');
+    expect(notice).not.toMatch(CJK);
+    setLang('zh');
+    expect(backupRestoredNotice(restored)).toContain('已恢复迁移前的备份 /b');
+  });
+
+  it('says so in the Master output', async () => {
+    setLang('en');
+    const first = await harness();
+    const { home } = first;
+    const file = first.master.paths.dbFile;
+    await first.close();
+    const backup = `${file}.bak-v${N}-2026-11-20T08-00-00-000Z`;
+    vacuumInto(file, backup);
+    migrateAndCrash(file);
+
+    const printed: string[] = [];
+    const warn = vi.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => {
+      printed.push(args.map(String).join(' '));
+    });
+    let h: Harness;
+    try {
+      h = await harness({ home });
+    } finally {
+      warn.mockRestore();
+    }
+    try {
+      const restored = h.master.store.restoredBackup as BackupRestore;
+      expect(restored).toMatchObject({ backup, fromVersion: N + 1, toVersion: N });
+      const lines = printed.filter((l) => l.includes(backup));
+      expect(lines).toEqual([backupRestoredNotice(restored)]);
+      expect(lines[0]).toContain(restored.movedTo);
+      expect(lines[0]).not.toMatch(CJK);
+      expect(h.master.store.findRepo('demo')).toBeDefined();
+      expect(h.master.store.findRepo('newer')).toBeUndefined();
+    } finally {
+      await h.close();
+    }
   });
 });

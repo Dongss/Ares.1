@@ -24,7 +24,7 @@ import { IssueBridge } from './github/bridge.js';
 import type { GitHub } from './github/client.js';
 import { type Lang, lang, setLang } from './i18n.js';
 import { type SendNotice, SystemNotifier } from './notify/system.js';
-import { Store } from './store/store.js';
+import { backupRestoredNotice, Store } from './store/store.js';
 import { copyUpgradeScript, type UpgradePlan, Upgrader } from './upgrade/upgrader.js';
 import { newId, nowIso, parseJson } from './util.js';
 import { git, revParse } from './workspace/git.js';
@@ -192,6 +192,7 @@ export class Master {
     const initial = loadConfig(paths, knownClis, readOnlyClis);
     const adapters = new Map((opts.adapters ?? builtin(initial.master)).map((a) => [a.cli, a]));
     const store = new Store(paths.dbFile);
+    if (store.restoredBackup) console.warn(backupRestoredNotice(store.restoredBackup));
     const watcher = new ConfigWatcher(
       paths,
       knownClis,
