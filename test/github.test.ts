@@ -548,8 +548,11 @@ describe('issues: scout', () => {
 
     t.scripts.scout = () => ({ structured: { proposals: [] } });
     const scout = await t.master.issues.startScout('demo', 'manual');
-    await scoutDone(t, scout.id);
+    expect((await scoutDone(t, scout.id)).status).toBe('completed');
     expect(gh.calls).toContain('list not_planned');
+    expect(
+      t.master.store.listEventsOfType('github.error', '1970-01-01T00:00:00.000Z'),
+    ).toHaveLength(0);
     const prompt = t.fake.calls.at(-1)?.prompt ?? '';
 
     // The latest 30 as before, the rejected one among them with its reason.
@@ -626,6 +629,34 @@ describe('issues: scout', () => {
     const again = t.fake.calls.at(-1)?.prompt ?? '';
     expect(again).toContain('### 更早被关闭为不做的\n- #1 不做：需求 1\n  理由：不需要，太复杂');
     expect(again).not.toContain('没能取到');
+    expect(store.listEventsOfType('github.error', '1970-01-01T00:00:00.000Z')).toHaveLength(1);
+  });
+
+  it('records no search failure when listing the issues fails too and the scout fails', async () => {
+    const t = await start();
+    const store = t.master.store;
+    t.scripts.scout = () => ({ structured: { proposals: [proposal('新的需求', 'high')] } });
+    for (const call of ['list open', 'list closed']) {
+      gh.failing.clear();
+      gh.failing.set(call, `GitHub 不可用（${call}）`);
+      gh.failing.set('list not_planned', 'GitHub 不可用（search）');
+      const scout = await t.master.issues.startScout('demo', 'manual');
+      const done = await scoutDone(t, scout.id);
+      expect(gh.calls).toContain('list not_planned');
+      expect(done.status).toBe('failed');
+      expect(done.error).toContain(`GitHub 不可用（${call}）`);
+    }
+    // Only the scout failures, which notify people once enough come in a row; the search's
+    // failure is not a word of its own.
+    expect(t.fake.calls).toHaveLength(0);
+    const failed = store
+      .listEventsOfType('scout.failed', '1970-01-01T00:00:00.000Z')
+      .map((e) => e.data.streak);
+    expect(failed).toEqual([1, 2]);
+    const errors = store
+      .listEventsOfType('github.error', '1970-01-01T00:00:00.000Z')
+      .map((e) => String(e.data.message));
+    expect(errors.filter((m) => m.includes('搜索被关闭为不做的 issue 失败'))).toEqual([]);
   });
 
   it('still fails the scout when listing the open or the latest closed issues fails', async () => {

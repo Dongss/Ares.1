@@ -1408,30 +1408,37 @@ export class IssueBridge {
         );
       }
       const gh = this.gh();
-      const [open, closed, notPlanned] = await Promise.all([
+      // Rejections stay counterexamples however long ago they were made. Only extra ones: the
+      // latest closed issues hold the recent rejections already, so when the search fails (it
+      // has rate limits and an index of its own) the scout goes on without them, not fails.
+      // Sent along with the two lists but settled into a value, so that its failure is reported
+      // only once both lists came back: when they fail too the scout fails, the note that it goes
+      // on with the recently closed issues would be false, and as a github.error it would notify
+      // people at once, past the rule that only scouts failing several times in a row do.
+      const searched = gh.listNotPlannedIssues(scout.issuesRepo, { limit: SCOUT_NOT_PLANNED }).then(
+        (issues) => ({ ok: true as const, issues }),
+        (err: unknown) => ({ ok: false as const, err }),
+      );
+      const [open, closed] = await Promise.all([
         gh.listIssues(scout.issuesRepo, { state: 'open', limit: 100 }),
         gh.listIssues(scout.issuesRepo, {
           state: 'closed',
           limit: SCOUT_RECENT_CLOSED,
           comments: true,
         }),
-        // Rejections stay counterexamples however long ago they were made. Only extra ones: the
-        // latest closed issues hold the recent rejections already, so when the search fails (it
-        // has rate limits and an index of its own) the scout goes on without them, not fails.
-        gh
-          .listNotPlannedIssues(scout.issuesRepo, { limit: SCOUT_NOT_PLANNED })
-          .catch((err: unknown) => {
-            this.report(
-              new Error(
-                t({
-                  zh: `侦察 ${repo.name} 时搜索被关闭为不做的 issue 失败，这次只用最近关闭的 issue：${errorMessage(err)}`,
-                  en: `Searching the issues closed as not planned for the scout of ${repo.name} failed; this scout uses only the recently closed issues: ${errorMessage(err)}`,
-                }),
-              ),
-            );
-            return null;
-          }),
       ]);
+      const search = await searched;
+      const notPlanned = search.ok ? search.issues : null;
+      if (!search.ok) {
+        this.report(
+          new Error(
+            t({
+              zh: `侦察 ${repo.name} 时搜索被关闭为不做的 issue 失败，这次只用最近关闭的 issue：${errorMessage(search.err)}`,
+              en: `Searching the issues closed as not planned for the scout of ${repo.name} failed; this scout uses only the recently closed issues: ${errorMessage(search.err)}`,
+            }),
+          ),
+        );
+      }
       const prompt = scoutPrompt({
         repoName: repo.name,
         max: scoutCfg.max_proposals,
