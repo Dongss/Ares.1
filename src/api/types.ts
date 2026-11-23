@@ -226,7 +226,8 @@ export interface GitHubRepoStatus {
     agent: string;
     /** Scouts on its own when the repo is idle. */
     auto: boolean;
-    intervalHours: number;
+    /** At least this many minutes between automatic scouts; 0 = no minimum. */
+    intervalMinutes: number;
     maxProposals: number;
     running: boolean;
     lastAt: string | null;

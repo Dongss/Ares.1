@@ -37,7 +37,7 @@ github:
       scout:                   # AI 侦察：读代码、文档和 Run 记录，把发现的需求提成带 ares1:proposal 标签的 issue；不写 = 不侦察
         agent: claude-reviewer # 只能用 claude-code 的 Agent，以只读方式运行
         auto: true             # true（默认）= 仓库没有会自己往下走的 Run 时自动侦察；false = 只在看板上手动触发
-        interval_hours: 6      # 两次自动侦察至少间隔几小时，默认 0（不限）。没找到需求或失败后另有退避，最长 6 小时
+        interval_minutes: 360  # 两次自动侦察至少间隔几分钟，默认 0（不限）。没找到需求或失败后另有退避，最长 6 小时
         max_proposals: 3       # 一次最多提几条，默认 5（1 到 20）；等你处理的提案加上卡住的 Run 达到这个数就不再自动侦察
       auto_accept:             # 不经过人，自动给提案加上 ares1:ready
         max_risk: low          # 自动采纳到哪个风险等级：none（默认，都由人采纳）/ low / mid / high；大小为 L 的提案总是等人
@@ -74,7 +74,7 @@ github:
       template: cross-review
       scout:
         agent: claude-reviewer
-        # auto、interval_hours、max_proposals 不写，用默认值：自动侦察、不限间隔、一次最多 5 条
+        # auto、interval_minutes、max_proposals 不写，用默认值：自动侦察、不限间隔、一次最多 5 条
       auto_accept:
         max_risk: mid          # 中低风险的提案自动采纳
         # max_per_day 不写 = 每天不限

@@ -138,6 +138,23 @@ export function formatDuration(ms: number): string {
   return t({ zh: `${h} 小时 ${m % 60} 分`, en: `${h}h ${m % 60}m` });
 }
 
+/**
+ * A configured interval in minutes, in words: "15 分钟" / "15 minutes", "6 小时" / "6 hours",
+ * "1 小时 30 分钟" / "1 hour 30 minutes". Fractions are rounded to whole minutes, except below
+ * one minute where the value is shown as is.
+ */
+export function formatMinutes(minutes: number): string {
+  const minuteText = (n: number) =>
+    t({ zh: `${n} 分钟`, en: `${n} ${n === 1 ? 'minute' : 'minutes'}` });
+  if (minutes < 1) return minuteText(minutes);
+  const total = Math.round(minutes);
+  if (total < 60) return minuteText(total);
+  const h = Math.floor(total / 60);
+  const m = total % 60;
+  const hours = t({ zh: `${h} 小时`, en: `${h} ${h === 1 ? 'hour' : 'hours'}` });
+  return m === 0 ? hours : `${hours} ${minuteText(m)}`;
+}
+
 /** Duration between two ISO times; an open end means "until now". */
 export function formatSpan(start: string, end: string | null, now = Date.now()): string {
   const to = end ? Date.parse(end) : now;

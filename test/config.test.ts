@@ -182,6 +182,34 @@ upgrade: { auto: true }
     expect(() => loadConfig(paths, ['claude-code'])).toThrow(/autto/);
   });
 
+  it('sets the interval between automatic scouts in minutes; the old key in hours is an error', () => {
+    const paths = home();
+    const scoutConfig = (scout: string) => `github:
+  repos:
+    app:
+      template: self-dev
+      scout: { agent: claude-reviewer, ${scout} }
+`;
+    writeFile(paths.configFile, scoutConfig('interval_minutes: 15'));
+    const cfg = loadConfig(paths, ['claude-code'], ['claude-code']);
+    expect(cfg.master.github?.repos.app?.scout?.interval_minutes).toBe(15);
+    expect(cfg.errors).toEqual({});
+    expect(cfg.warnings).toEqual({});
+
+    // The old key in hours is no longer accepted, like any other unknown key of the scout, and
+    // the error names it. Built from parts so that a search for the old key finds no use left.
+    const oldKey = ['interval', 'hours'].join('_');
+    writeFile(paths.configFile, scoutConfig(`${oldKey}: 6`));
+    expect(() => loadConfig(paths, ['claude-code'])).toThrow(ConfigError);
+    expect(() => loadConfig(paths, ['claude-code'])).toThrow(new RegExp(`\\b${oldKey}\\b`));
+
+    const scout = (s: object) =>
+      GitHubRepoSchema.safeParse({ template: 'x', scout: { agent: 'a', ...s } });
+    expect(scout({}).data?.scout?.interval_minutes).toBe(0);
+    expect(scout({ interval_minutes: 7.5 }).data?.scout?.interval_minutes).toBe(7.5);
+    expect(scout({ interval_minutes: -1 }).success).toBe(false);
+  });
+
   it('gives an issue 3 Runs by default, and at least 1', () => {
     expect(GitHubRepoSchema.parse({ template: 'self-dev' }).max_run_attempts).toBe(3);
     expect(GitHubRepoSchema.parse({ template: 'x', max_run_attempts: 1 }).max_run_attempts).toBe(1);

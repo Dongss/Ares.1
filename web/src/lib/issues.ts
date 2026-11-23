@@ -10,7 +10,7 @@ import {
 } from '../../../src/config/flow.js';
 import { join, t } from '../../../src/i18n.js';
 import type { RunIssue, ScoutProposal, ScoutStatus } from '../../../src/store/types.js';
-import { formatCost, formatTime, type Tone } from './format.js';
+import { formatCost, formatMinutes, formatTime, type Tone } from './format.js';
 
 // Display helpers for GitHub issues and AI scouts. Labels are getters, so they are picked in
 // the language in use when read, not when this module is imported.
@@ -82,10 +82,10 @@ export function issueRef(issue: RunIssue): string {
  */
 export function scoutPlan(scout: NonNullable<GitHubRepoStatus['scout']>): string {
   if (!scout.auto) return t({ zh: '只在这里手动触发', en: 'Only when started here' });
-  const h = scout.intervalHours;
+  const m = scout.intervalMinutes;
   const gap =
-    h > 0
-      ? t({ zh: `，至少间隔 ${h} 小时`, en: `, at least ${h} ${h === 1 ? 'hour' : 'hours'} apart` })
+    m > 0
+      ? t({ zh: `，至少间隔 ${formatMinutes(m)}`, en: `, at least ${formatMinutes(m)} apart` })
       : '';
   return t({
     zh: `没有在进行中的 Run 时自动侦察（只等人的 Run 不挡）${gap}`,

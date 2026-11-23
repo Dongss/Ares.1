@@ -26,16 +26,18 @@ describe('issues display', () => {
     const scout = {
       agent: 'a',
       auto: true,
-      intervalHours: 0,
+      intervalMinutes: 0,
       maxProposals: 5,
       running: false,
       lastAt: null,
       waiting: null,
     };
     expect(scoutPlan(scout)).toBe('没有在进行中的 Run 时自动侦察（只等人的 Run 不挡）');
-    expect(scoutPlan({ ...scout, intervalHours: 6 })).toBe(
+    expect(scoutPlan({ ...scout, intervalMinutes: 360 })).toBe(
       '没有在进行中的 Run 时自动侦察（只等人的 Run 不挡），至少间隔 6 小时',
     );
+    expect(scoutPlan({ ...scout, intervalMinutes: 15 })).toMatch(/，至少间隔 15 分钟$/);
+    expect(scoutPlan({ ...scout, intervalMinutes: 90 })).toMatch(/，至少间隔 1 小时 30 分钟$/);
     expect(scoutPlan({ ...scout, auto: false })).toBe('只在这里手动触发');
     const now = new Date('2026-11-19T12:00:00');
     expect(scoutWaitText(null, now)).toBeNull();
@@ -135,7 +137,7 @@ describe('issues display in English', () => {
   const scout = {
     agent: 'a',
     auto: true,
-    intervalHours: 1,
+    intervalMinutes: 60,
     maxProposals: 5,
     running: false,
     lastAt: null,
@@ -147,7 +149,15 @@ describe('issues display in English', () => {
     expect(scoutPlan(scout)).toBe(
       'Scouts by itself when no Run is in progress (Runs waiting only for you do not hold it back), at least 1 hour apart',
     );
-    expect(scoutPlan({ ...scout, intervalHours: 6 })).toContain('at least 6 hours apart');
+    expect(scoutPlan({ ...scout, intervalMinutes: 360 })).toContain('at least 6 hours apart');
+    expect(scoutPlan({ ...scout, intervalMinutes: 1 })).toMatch(/, at least 1 minute apart$/);
+    expect(scoutPlan({ ...scout, intervalMinutes: 15 })).toMatch(/, at least 15 minutes apart$/);
+    expect(scoutPlan({ ...scout, intervalMinutes: 90 })).toMatch(
+      /, at least 1 hour 30 minutes apart$/,
+    );
+    for (const intervalMinutes of [0, 1, 15, 60, 90, 360]) {
+      expect(scoutPlan({ ...scout, intervalMinutes })).not.toMatch(cjk);
+    }
     expect(scoutPlan({ ...scout, auto: false })).toBe('Only when started here');
     expect(budgetText({ dailyUsd: null, spentToday: 21, reached: false })).toBe(
       '$21.00 (no limit)',

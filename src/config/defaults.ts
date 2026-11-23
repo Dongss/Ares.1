@@ -34,7 +34,7 @@ defaults:
 #       scout:                   # AI 侦察：读代码、文档和 Run 记录，提 issue
 #         agent: claude-reviewer # 只能用 claude-code 的 Agent，以只读方式运行
 #         auto: true             # 仓库没有会自己往下走的 Run 时自动侦察（只等人的 Run 不挡，计入 max_proposals）；false = 只在看板上手动触发
-#         interval_hours: 0      # 两次自动侦察至少间隔几小时；0 = 不限（侦察没找到需求或失败后另会退避，最长 6 小时；遇到额度用尽或限流则等额度恢复）
+#         interval_minutes: 0    # 两次自动侦察至少间隔几分钟；0 = 不限（侦察没找到需求或失败后另会退避，最长 6 小时；遇到额度用尽或限流则等额度恢复）
 #         max_proposals: 5       # 一次最多提几条；未处理的提案加上只等人的 Run 达到这个数就不再自动侦察（开了自动采纳时提案只算在采纳范围内的）
 #       auto_accept:
 #         max_risk: none         # 自动采纳到哪个风险等级：none（都由人采纳）/ low / mid / high
@@ -80,7 +80,7 @@ defaults:
 #       scout:                   # AI scout: reads code, docs and Run records, files issues
 #         agent: claude-reviewer # must be a claude-code agent; it runs read-only
 #         auto: true             # scout whenever no Run of the repo goes on by itself (Runs only a human moves on count toward max_proposals instead); false = only from the dashboard
-#         interval_hours: 0      # at least this many hours between automatic scouts; 0 = no minimum (scouts that find nothing or fail still back off, up to 6 hours; out of quota or rate-limited, it waits for the quota)
+#         interval_minutes: 0    # at least this many minutes between automatic scouts; 0 = no minimum (scouts that find nothing or fail still back off, up to 6 hours; out of quota or rate-limited, it waits for the quota)
 #         max_proposals: 5       # proposals per scout; no automatic scout while this many proposals and Runs stuck waiting for a human await you (with auto-accept on, only proposals within its range count)
 #       auto_accept:
 #         max_risk: none         # accept automatically up to this risk: none (a human accepts all) / low / mid / high

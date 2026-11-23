@@ -7,6 +7,7 @@ import {
   formatAttemptCost,
   formatCost,
   formatDuration,
+  formatMinutes,
   formatRunCost,
   formatRunTime,
   formatTime,
@@ -64,6 +65,19 @@ describe('format helpers', () => {
     expect(formatDuration(192_000)).toBe('3 分 12 秒');
     expect(formatDuration(3_900_000)).toBe('1 小时 5 分');
     expect(formatDuration(-5)).toBe('0 秒');
+  });
+
+  it('formats intervals in minutes with the unit that reads best', () => {
+    expect(formatMinutes(15)).toBe('15 分钟');
+    expect(formatMinutes(59)).toBe('59 分钟');
+    expect(formatMinutes(60)).toBe('1 小时');
+    expect(formatMinutes(360)).toBe('6 小时');
+    expect(formatMinutes(90)).toBe('1 小时 30 分钟');
+    expect(formatMinutes(121)).toBe('2 小时 1 分钟');
+    // Fractions round to whole minutes; below a minute the value is kept.
+    expect(formatMinutes(15.4)).toBe('15 分钟');
+    expect(formatMinutes(59.6)).toBe('1 小时');
+    expect(formatMinutes(0.5)).toBe('0.5 分钟');
   });
 
   describe('run time', () => {
@@ -317,6 +331,20 @@ describe('format helpers in English', () => {
     expect(formatDuration(5_000)).toBe('5s');
     expect(formatDuration(903_000)).toBe('15m 3s');
     expect(formatDuration(57_060_000)).toBe('15h 51m');
+    const intervals = {
+      1: '1 minute',
+      15: '15 minutes',
+      60: '1 hour',
+      360: '6 hours',
+      61: '1 hour 1 minute',
+      90: '1 hour 30 minutes',
+      121: '2 hours 1 minute',
+      150: '2 hours 30 minutes',
+      0.5: '0.5 minutes',
+    };
+    for (const [minutes, text] of Object.entries(intervals)) {
+      expect(formatMinutes(Number(minutes))).toBe(text);
+    }
     expect(formatRunCost(0, true)).toBe('cost unknown');
     expect(formatRunCost(1.5, true)).toBe('$1.50 + unknown');
     expect(formatAttemptCost({ costUsd: null, status: 'completed' })).toBe('cost unknown');

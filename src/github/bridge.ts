@@ -1090,8 +1090,8 @@ export class IssueBridge {
     let wait: ScoutWait | null = null;
     // A scout whose agent hit a limit did nothing, so it takes up no interval.
     const last = scouts.find((s) => s.status !== 'rate_limited');
-    if (last && scout.interval_hours > 0) {
-      const next = Date.parse(last.startedAt) + scout.interval_hours * 3_600_000;
+    if (last && scout.interval_minutes > 0) {
+      const next = Date.parse(last.startedAt) + scout.interval_minutes * 60_000;
       if (next > Date.now()) {
         wait = {
           reason: t({
@@ -1468,7 +1468,7 @@ export class IssueBridge {
           ? {
               agent: cfg.scout.agent,
               auto: cfg.scout.auto,
-              intervalHours: cfg.scout.interval_hours,
+              intervalMinutes: cfg.scout.interval_minutes,
               maxProposals: cfg.scout.max_proposals,
               running,
               lastAt: last?.startedAt ?? null,

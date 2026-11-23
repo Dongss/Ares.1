@@ -68,7 +68,8 @@ const AGENTS = `${ASSESS_AGENTS_YAML}
 interface ConfigOptions {
   /** Automatic scouting; off unless a test is about it. */
   auto?: boolean;
-  intervalHours?: number;
+  /** scout.interval_minutes; omitted = 0 (no minimum). */
+  intervalMinutes?: number;
   maxRisk?: 'none' | 'low' | 'mid' | 'high';
   /** null = no daily limit. */
   maxPerDay?: number | null;
@@ -94,7 +95,7 @@ ${opts.pollMinutes === undefined ? '' : `  poll_minutes: ${opts.pollMinutes}`}
       scout:
         agent: scout
         auto: ${opts.auto ?? false}
-        interval_hours: ${opts.intervalHours ?? 0}
+        interval_minutes: ${opts.intervalMinutes ?? 0}
         max_proposals: 3
       auto_accept:
         max_risk: ${opts.maxRisk ?? 'low'}
@@ -852,8 +853,8 @@ describe('issues: scout', () => {
       await scoutDone(t, scouts[0]?.id ?? '');
     });
 
-    it('waits for the later of the back-off and interval_hours', async () => {
-      const t = await start(config({ auto: true, intervalHours: 1 }));
+    it('waits for the later of the back-off and interval_minutes', async () => {
+      const t = await start(config({ auto: true, intervalMinutes: 60 }));
       oldTargetBranch(t);
       t.scripts.scout = nothing;
       await t.master.issues.poll();
@@ -865,7 +866,7 @@ describe('issues: scout', () => {
         await t.master.issues.poll();
         await scoutDone(t, t.master.store.listScouts()[0]?.id ?? '');
       }
-      // 6 in a row: 5 min × 2^5 = 160 min, more than the hour of interval_hours.
+      // 6 in a row: 5 min × 2^5 = 160 min, more than the 60 minutes of interval_minutes.
       await t.master.issues.poll();
       const last = t.master.store.listScouts()[0];
       expect(last?.id).not.toBe(first.id);
@@ -914,8 +915,8 @@ describe('issues: scout', () => {
     const broken: Script = () => ({ structured: { proposals: [{ title: '缺字段' }] } });
 
     /** Auto scouting on a repo whose last commit is old; the n-th scout does `scripts(n)`. */
-    async function autoScouts(scripts: (n: number) => Script, intervalHours = 0) {
-      const t = await start(config({ auto: true, intervalHours }));
+    async function autoScouts(scripts: (n: number) => Script, intervalMinutes = 0) {
+      const t = await start(config({ auto: true, intervalMinutes }));
       oldTargetBranch(t);
       let n = 0;
       t.scripts.scout = (ctx) => scripts(++n)(ctx);
@@ -1043,8 +1044,8 @@ describe('issues: scout', () => {
       });
     });
 
-    it('does not count a rate-limited scout toward interval_hours', async () => {
-      const t = await autoScouts((n) => (n === 1 ? limited() : nothing), 2);
+    it('does not count a rate-limited scout toward interval_minutes', async () => {
+      const t = await autoScouts((n) => (n === 1 ? limited() : nothing), 120);
       expect((await pollNewScout(t)).status).toBe('rate_limited');
       expect(await pollScout(t)).toBeUndefined();
       expect(waiting(t)?.reason).toBe(QUOTA);
@@ -1070,8 +1071,8 @@ describe('issues: scout', () => {
     });
   });
 
-  it('waits interval_hours between automatic scouts', async () => {
-    const t = await start(config({ auto: true, intervalHours: 2 }));
+  it('waits interval_minutes between automatic scouts', async () => {
+    const t = await start(config({ auto: true, intervalMinutes: 120 }));
     let n = 0;
     t.scripts.scout = () =>
       ++n === 1
@@ -1085,7 +1086,7 @@ describe('issues: scout', () => {
     let waiting = t.master.issues.status().repos[0]?.scout?.waiting;
     expect(waiting?.reason).toBe('离上次侦察不到设定的间隔');
     expect(waiting?.until).toBe(
-      new Date(Date.parse(failed.startedAt) + 2 * 3_600_000).toISOString(),
+      new Date(Date.parse(failed.startedAt) + 120 * 60_000).toISOString(),
     );
 
     // A scout started by hand also counts, and finding work does not shorten the wait.
@@ -1096,9 +1097,36 @@ describe('issues: scout', () => {
     expect(t.master.store.listScouts()).toHaveLength(2);
     waiting = t.master.issues.status().repos[0]?.scout?.waiting;
     expect(waiting?.reason).toBe('离上次侦察不到设定的间隔');
-    expect(waiting?.until).toBe(
-      new Date(Date.parse(found.startedAt) + 2 * 3_600_000).toISOString(),
-    );
+    expect(waiting?.until).toBe(new Date(Date.parse(found.startedAt) + 120 * 60_000).toISOString());
+  });
+
+  it('scouts again at the first check once interval_minutes have passed', async () => {
+    const MIN = 60_000;
+    const t = await start(config({ auto: true, intervalMinutes: 15 }));
+    // Every scout finds work, so no back-off holds the next one: only the interval does.
+    t.scripts.scout = () => ({ structured: { proposals: [proposal('有活', 'mid')] } });
+    await t.master.issues.poll();
+    const first = await scoutDone(t, t.master.store.listScouts()[0]?.id ?? '');
+    expect(first.proposals[0]?.issue?.number).toBe(1);
+    const waiting = () => t.master.issues.status().repos[0]?.scout?.waiting;
+
+    // Within 15 minutes of the last scout's start no automatic scout starts.
+    for (const ms of [0, 10 * MIN, 4 * MIN]) {
+      elapse(t, ms);
+      await t.master.issues.poll();
+      expect(t.master.store.listScouts()).toHaveLength(1);
+      expect(waiting()?.reason).toBe('离上次侦察不到设定的间隔');
+    }
+    const startedAt = t.master.store.getScout(first.id).startedAt;
+    expect(waiting()?.until).toBe(new Date(Date.parse(startedAt) + 15 * MIN).toISOString());
+
+    // The check after the 15 minutes scouts.
+    elapse(t, MIN);
+    await t.master.issues.poll();
+    const scouts = t.master.store.listScouts();
+    expect(scouts).toHaveLength(2);
+    expect(scouts[0]?.trigger).toBe('auto');
+    await scoutDone(t, scouts[0]?.id ?? '');
   });
 
   it('waits for unfinished Runs of the repo before scouting', async () => {

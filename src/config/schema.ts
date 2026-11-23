@@ -30,8 +30,8 @@ export const GitHubRepoSchema = z.strictObject({
       agent: z.string().min(1),
       /** Scout on its own whenever the repo is idle; false = only from the dashboard. */
       auto: z.boolean().default(true),
-      /** At least this many hours between automatic scouts; 0 = no minimum. */
-      interval_hours: z.number().min(0).default(0),
+      /** At least this many minutes between automatic scouts; 0 = no minimum. */
+      interval_minutes: z.number().min(0).default(0),
       /** Proposals per scout; no automatic scout while this many proposals await triage. */
       max_proposals: z.number().int().min(1).max(20).default(5),
     })

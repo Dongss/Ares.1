@@ -55,7 +55,7 @@ const config = {
 const scout: NonNullable<GitHubRepoStatus['scout']> = {
   agent: 'claude-reviewer',
   auto: true,
-  intervalHours: 0,
+  intervalMinutes: 0,
   maxProposals: 5,
   running: false,
   lastAt: null,
@@ -89,7 +89,7 @@ const autoRepo: GitHubRepoStatus = {
 /** Some of it: low risk accepted, merge still approved, pushed, no upgrades. */
 const partialRepo: GitHubRepoStatus = {
   ...manualRepo,
-  scout: { ...scout, intervalHours: 6 },
+  scout: { ...scout, intervalMinutes: 360 },
   autoAccept: { maxRisk: 'low', maxPerDay: 3, usedToday: 1 },
   push: true,
 };
@@ -170,7 +170,9 @@ describe('the cycle', () => {
     expect(steps.run?.actors).toContain('human');
     expect(steps.push?.actors).toEqual(['master']);
     expect(steps.upgrade?.actors).toEqual(['human']);
-    expect(steps.rescout?.text).toContain('两次至少隔 6 小时');
+    expect(steps.rescout?.text).toContain('两次至少隔 6 小时，');
+    const short = byId(input({ ...partialRepo, scout: { ...scout, intervalMinutes: 15 } }));
+    expect(short.rescout?.text).toContain('两次至少隔 15 分钟，');
   });
 
   it('says when scouting is manual, or the Master cannot upgrade itself', () => {
@@ -444,7 +446,7 @@ describe('scoutGuide', () => {
     expect(g.conditions).toContain(
       '今天侦察、自动采纳和自动重做的 Run 一共花费不到 $20.00（现在 $3.20）',
     );
-    expect(g.conditions).toContain('不限间隔（interval_hours: 0）');
+    expect(g.conditions).toContain('不限间隔（interval_minutes: 0）');
     expect(g.conditions).toContain(
       '不在退避：侦察没找到需求或失败后先等 5 分钟，连续每多一次等待翻倍，最长 6 小时；有侦察找到了需求，或目标分支有了新提交，就不再等',
     );
@@ -461,7 +463,11 @@ describe('scoutGuide', () => {
     expect(g.waiting).toBe(false);
 
     const p = scoutGuide(input(partialRepo), now);
-    expect(p.conditions).toContain('距上次侦察满 6 小时（interval_hours）');
+    expect(p.conditions).toContain('距上次侦察满 6 小时（interval_minutes）');
+    const interval = (intervalMinutes: number) =>
+      scoutGuide(input({ ...partialRepo, scout: { ...scout, intervalMinutes } }), now).conditions;
+    expect(interval(15)).toContain('距上次侦察满 15 分钟（interval_minutes）');
+    expect(interval(90)).toContain('距上次侦察满 1 小时 30 分钟（interval_minutes）');
     expect(p.conditions).toContain('没设每日花费上限（daily_budget_usd），不受花费限制');
     expect(p.conditions).toContain(
       '在自动采纳范围内、还没采纳的提案加上卡住等人的 Run 少于 5 个（max_proposals）；L 级提案和风险中、高的提案留给你处理，不挡侦察',
@@ -953,6 +959,22 @@ describe('in English', () => {
     expect(
       scoutGuide({ ...inputEn(autoRepo), pollMinutes: 1 }, now).conditions.join('\n'),
     ).toContain('waits 1 minute,');
+    const interval = (intervalMinutes: number) =>
+      scoutGuide(inputEn({ ...partialRepo, scout: { ...scout, intervalMinutes } }), now);
+    expect(interval(0).conditions).toContain('No minimum interval (interval_minutes: 0)');
+    for (const [minutes, text] of [
+      [1, '1 minute'],
+      [15, '15 minutes'],
+      [360, '6 hours'],
+      [90, '1 hour 30 minutes'],
+    ] as const) {
+      const g = interval(minutes);
+      expect(g.conditions).toContain(`At least ${text} since the last scout (interval_minutes)`);
+      for (const c of g.conditions) expect(c).not.toMatch(CJK);
+    }
+    const steps = byId(inputEn({ ...partialRepo, scout: { ...scout, intervalMinutes: 90 } }));
+    expect(steps.rescout?.text).toContain(', at least 1 hour 30 minutes apart,');
+    expect(steps.rescout?.text).not.toMatch(CJK);
   });
 
   it("recognizes the scout's reasons in the Master's language, whatever the dashboard's", () => {

@@ -15,7 +15,7 @@ import { waitText } from '../../../src/engine/discussion.js';
 import { join, t } from '../../../src/i18n.js';
 import { NOTICE_KINDS, type NoticeKind } from '../../../src/notify/notice.js';
 import { buildFlow, type FlowStage } from './flow.js';
-import { formatCost, type Tone } from './format.js';
+import { formatCost, formatMinutes, type Tone } from './format.js';
 import { acceptRanges, afterChinese, beforeChinese, scoutWaitText } from './issues.js';
 
 // The guide page: how the self-hosting loop works under the current configuration.
@@ -434,10 +434,14 @@ export function cycleSteps(input: GuideInput, rule?: AutoAcceptRule): CycleStep[
           ['ai'],
           t({
             zh: `仓库没有在进行中的 Run 时（只等人的 Run 不挡），下次检查（每 ${pollMinutes} 分钟）就再侦察${
-              scout.intervalHours > 0 ? `，两次至少隔 ${scout.intervalHours} 小时` : ''
+              scout.intervalMinutes > 0
+                ? `，两次至少隔 ${formatMinutes(scout.intervalMinutes)}`
+                : ''
             }，参考新的 Run 记录和被拒的 issue`,
             en: `When the repo has no Run in progress (Runs waiting only for you do not hold it back), it scouts again at the next check (every ${pollMinutes} minutes)${
-              scout.intervalHours > 0 ? `, at least ${scout.intervalHours} hours apart` : ''
+              scout.intervalMinutes > 0
+                ? `, at least ${formatMinutes(scout.intervalMinutes)} apart`
+                : ''
             }, taking new Runs and rejected issues into account`,
           }),
         )
@@ -698,14 +702,14 @@ export function scoutGuide(
           zh: `今天侦察、自动采纳和自动重做的 Run 一共花费不到 ${formatCost(budget.dailyUsd)}（现在 ${formatCost(budget.spentToday)}）`,
           en: `Today's scouts, auto-accepted Runs and automatic redos have spent less than ${formatCost(budget.dailyUsd)} in total (now ${formatCost(budget.spentToday)})`,
         }),
-    scout.intervalHours > 0
+    scout.intervalMinutes > 0
       ? t({
-          zh: `距上次侦察满 ${scout.intervalHours} 小时（interval_hours）`,
-          en: `At least ${scout.intervalHours} hours since the last scout (interval_hours)`,
+          zh: `距上次侦察满 ${formatMinutes(scout.intervalMinutes)}（interval_minutes）`,
+          en: `At least ${formatMinutes(scout.intervalMinutes)} since the last scout (interval_minutes)`,
         })
       : t({
-          zh: '不限间隔（interval_hours: 0）',
-          en: 'No minimum interval (interval_hours: 0)',
+          zh: '不限间隔（interval_minutes: 0）',
+          en: 'No minimum interval (interval_minutes: 0)',
         }),
     t({
       zh: `不在退避：侦察没找到需求或失败后先等 ${pollMinutes} 分钟，连续每多一次等待翻倍，最长 ${MAX_SCOUT_BACKOFF_HOURS} 小时；有侦察找到了需求，或目标分支有了新提交，就不再等`,
