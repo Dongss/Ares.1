@@ -240,6 +240,12 @@ class Aborted extends Error {}
 
 export class InvalidStateError extends Error {}
 
+/**
+ * Why a kept worktree and branch were removed, as their `workspace.removed` event records it: by
+ * a human, or because a later Run of the same issue completed (`supersededBy`).
+ */
+type KeptWorkspaceRemoval = { manual: true } | { reason: 'superseded'; supersededBy: string };
+
 const IN_FLIGHT_TASK = new Set<Task['status']>(['running', 'verifying']);
 
 /**
@@ -324,6 +330,8 @@ export class Engine {
     const active = this.active;
     if (!active) return;
     await this.interrupt();
+    // It may have finished meanwhile, e.g. completed while removing superseded workspaces.
+    if (FINISHED_RUN_STATUSES.includes(this.store.getRun(active.runId).status)) return;
     await this.discardInFlight(this.store.getRun(active.runId));
     this.requeueHead(active.runId, 'run.interrupted');
   }
@@ -1117,18 +1125,26 @@ export class Engine {
   /**
    * Remove the worktree and branch a failed / cancelled Run kept for inspection, on a
    * human's request. The Run's records, logs and artifacts stay. Nothing left to remove is fine.
-   * Concurrent requests for the same Run share one removal (and one `workspace.removed` event).
    */
   cleanupWorkspace(runId: string): Promise<Run> {
+    return this.removeKeptWorkspace(runId, { manual: true });
+  }
+
+  /**
+   * Remove the worktree and branch a failed / cancelled Run kept, recording why in its
+   * `workspace.removed` event. Concurrent removals of the same Run (by hand, or as a superseded
+   * attempt) share one removal and one event.
+   */
+  private removeKeptWorkspace(runId: string, why: KeptWorkspaceRemoval): Promise<Run> {
     let pending = this.cleanups.get(runId);
     if (!pending) {
-      pending = this.removeKeptWorkspace(runId).finally(() => this.cleanups.delete(runId));
+      pending = this.removeKeptWorkspaceNow(runId, why).finally(() => this.cleanups.delete(runId));
       this.cleanups.set(runId, pending);
     }
     return pending;
   }
 
-  private async removeKeptWorkspace(runId: string): Promise<Run> {
+  private async removeKeptWorkspaceNow(runId: string, why: KeptWorkspaceRemoval): Promise<Run> {
     const run = this.store.getRun(runId);
     if (run.status !== 'failed' && run.status !== 'cancelled') {
       throw new InvalidStateError(
@@ -1160,7 +1176,7 @@ export class Engine {
       );
     }
     this.store.tx(() => {
-      this.store.event(runId, 'workspace.removed', { path, branch, manual: true });
+      this.store.event(runId, 'workspace.removed', { path, branch, ...why });
     });
     return this.store.getRun(runId);
   }
@@ -1298,7 +1314,7 @@ export class Engine {
       case 'waiting_approval':
         return this.afterApproval(run, sr, eff);
       case 'passed':
-        return this.advance(run, sr);
+        return this.advance(run, sr, signal);
       case 'failed':
         return this.rollback(run, sr);
     }
@@ -2490,7 +2506,7 @@ export class Engine {
     this.store.event(run.id, 'stage.passed', { stageId: sr.stageId, round: sr.round });
   }
 
-  private async advance(run: Run, sr: StageRun): Promise<void> {
+  private async advance(run: Run, sr: StageRun, signal: AbortSignal): Promise<void> {
     const stages = run.template.stages;
     const idx = stages.findIndex((s) => s.id === sr.stageId);
     const next = stages[idx + 1];
@@ -2498,7 +2514,7 @@ export class Engine {
       this.startStage(run, next.id, null);
       return;
     }
-    await this.complete(run);
+    await this.complete(run, signal);
   }
 
   /**
@@ -2817,9 +2833,39 @@ export class Engine {
     });
   }
 
-  private async complete(run: Run): Promise<void> {
+  private async complete(run: Run, signal: AbortSignal): Promise<void> {
     await this.removeMergedWorkspace(run);
     this.setStatus(run.id, 'completed', { finishedAt: nowIso() });
+    await this.removeSupersededWorkspaces(run, signal);
+  }
+
+  /**
+   * Once a Run of an issue completed, the worktrees and branches the issue's failed Runs kept are
+   * of no more use: why they failed is in their error and on the issue, and the code is the
+   * completed Run's. Without this every failed attempt would keep its worktree (dependencies
+   * included) for good while nobody is around. Cancelled Runs stay: a human ended them and may
+   * still want to look. A removal that fails is recorded on that Run and passed by; the completed
+   * Run stays completed. Holds the execution slot meanwhile, so the next Run's git commands do
+   * not race with the removals.
+   */
+  private async removeSupersededWorkspaces(run: Run, signal: AbortSignal): Promise<void> {
+    if (!run.issue) return;
+    const failed = this.store.issueRunsWithStatus(run.issue.repo, run.issue.number, 'failed');
+    for (const earlier of failed) {
+      // Shutting down: the rest stay for a human to clean up.
+      this.checkAbort(signal);
+      const why = { reason: 'superseded', supersededBy: run.id } as const;
+      try {
+        await this.removeKeptWorkspace(earlier.id, why);
+      } catch (err) {
+        this.store.tx(() => {
+          this.store.event(earlier.id, 'workspace.cleanup_failed', {
+            ...why,
+            error: errorMessage(err).trim(),
+          });
+        });
+      }
+    }
   }
 
   /** Remove the Run's worktree and branch once nothing on them is missing from the target. */

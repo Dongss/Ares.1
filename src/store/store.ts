@@ -410,6 +410,18 @@ export class Store {
     );
   }
 
+  /** The Runs created from this issue that have the given status, oldest first. */
+  issueRunsWithStatus(issuesRepo: string, number: number, status: RunStatus): Run[] {
+    return this.many<Run>(
+      'runs',
+      `SELECT * FROM runs WHERE json_extract(issue, '$.repo') = ? AND json_extract(issue, '$.number') = ?
+         AND status = ? ORDER BY created_at, rowid`,
+      issuesRepo,
+      number,
+      status,
+    );
+  }
+
   /** Failed Runs of the repo whose issue waits for them to be redone, oldest first. */
   runsAwaitingRedo(repoId: string): Run[] {
     return this.many<Run>(

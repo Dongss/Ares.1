@@ -104,6 +104,7 @@ github:
 - 用完 `max_run_attempts` 次后不再重做：评论列出每次失败的原因，issue 打上 `ares1:failed`，关闭为 not planned。这不等于不要这个需求：侦察读到这类 issue 时知道它不是人拒绝的，可以换个思路重新提案。要按原样再做，重新打开 issue 并加上 `ares1:ready`。
 - 人加 `ares1:ready` 开始的 Run 是第 1 次；之后重新加 `ares1:ready`，次数从头算。等待重做期间关闭 issue，到时间后就不再重做（事件列表里记一条 `issue.redo_abandoned`），issue 保持你留下的样子。
 - 被终止的 Run（人在看板上终止，或者关闭了 issue）不重做，issue 打上 `ares1:failed`，等你决定。
+- 重做成功合并后（同一 issue 的 Run 完成时），这个 issue 之前失败的 Run 的工作目录和分支会自动删掉：失败原因已经记在 Run 的 `error` 和 issue 评论里，代码以完成的那次为准，留着只会占磁盘（每个工作目录都带着准备命令装的依赖）。Run 的记录、日志和产物都保留。每删掉一个，就在那个 Run 的事件列表里记一条 `workspace.removed`，数据里有路径、分支、`reason: superseded` 和完成的 Run 的 id（`supersededBy`）。删不掉时（比如分支在别处检出）在那个 Run 上记一条 `workspace.cleanup_failed`（数据里有 `reason`、`supersededBy` 和 `error`），接着删下一个，完成的 Run 不受影响，剩下的要手动清理。被终止的 Run、不是从 issue 来的 Run 和最终失败关闭的 issue 的 Run 仍然保留，要在看板上手动清理（「工作区」页或 Run 详情页）。
 
 ### 只信任仓库成员写的内容
 
@@ -233,7 +234,7 @@ Run 卡住（`blocked`）、已暂停或等审批时会让出执行位，排队�
 
 目标分支有未提交的改动时，Run 也会卡住（`target_dirty`），但不用你做任何决定：合并阶段要快进目标分支，而目标分支在某个目录里检出、且有已跟踪文件的改动没提交（未跟踪的文件不算），快进会动到这些改动，所以先停下，并照常发「Run 卡住了」的通知。之后 Master 大约每分钟复查一次，你提交或丢弃这些改动后，Run 会自己回到队首接着合并：重新同步目标分支，有新提交时重跑检查，再快进。不用去看板点重试（点了也行，会立刻继续）。改动还在时复查什么都不改，也不会重复通知；工作开关关着时不会自动继续，打开时马上查一次。自举时 Master 正是往开发仓库的 `main` 合并，在那里随手改了文件，处理掉就行。这种 Run 算作会自己往下走，不计入 `scout.max_proposals`。
 
-Agent 出错且重试、换 Agent 都用完，Agent 不可用且没有可换的 Agent（或配置为 `on_agent_error: retry`），返工或回退用完，超出预算（默认；配置为 `on_budget_exceeded: pause` 时才等人），准备命令失败，Master 内部错误，合并时 git 因冲突以外的原因失败，合并冲突但没有 Agent 阶段能解决，工作目录与记录不一致（工作目录只是被删了的除外，见下面）时，Run 不等人，直接结束、标为失败。工作目录和分支保留，Master 接着做别的；从 issue 来的 Run 按 `max_run_attempts` 自动重做（见上面的「Run 失败后自动重做」），重做时失败原因会交给新 Run 的 Agent。
+Agent 出错且重试、换 Agent 都用完，Agent 不可用且没有可换的 Agent（或配置为 `on_agent_error: retry`），返工或回退用完，超出预算（默认；配置为 `on_budget_exceeded: pause` 时才等人），准备命令失败，Master 内部错误，合并时 git 因冲突以外的原因失败，合并冲突但没有 Agent 阶段能解决，工作目录与记录不一致（工作目录只是被删了的除外，见下面）时，Run 不等人，直接结束、标为失败。工作目录和分支保留（同一 issue 之后有 Run 完成时自动删掉），Master 接着做别的；从 issue 来的 Run 按 `max_run_attempts` 自动重做（见上面的「Run 失败后自动重做」），重做时失败原因会交给新 Run 的 Agent。
 
 - 超出预算：模板或 Run 设了 `budget_usd` 时，Master 每次启动 Agent 之前检查花费，越过预算的那次执行照常检查和提交，之后不再开始新的执行。默认（`on_budget_exceeded: abort`）Run 结束、标为失败，`error` 写明已花费多少、预算多少。重做的 Run 从零算花费，总花费仍然有界：每个 Run 受 `budget_usd` 限制，次数受 `max_run_attempts` 限制，当天的总花费受 `daily_budget_usd` 限制。配置为 `on_budget_exceeded: pause` 时 Run 卡住（超出预算），在看板上填一个更高的预算后重试，从停下的地方接着做；配置页会对这个设置给出警告，`on_agent_error: human`、`on_exhausted: human` 也一样。
 - 准备命令失败：`error` 里写明是哪条准备命令、退出码或超时，以及输出的末尾。准备命令失败多半是偶发的或者和环境有关（依赖源连不上、安装中途出错等），重做时会在新的工作目录里重新运行。

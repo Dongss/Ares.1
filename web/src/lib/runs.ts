@@ -280,6 +280,21 @@ export function eventText(event: Pick<EventRow, 'type' | 'data'>, now = new Date
       return rateLimitText({ agentId, retryAt }, now);
     }
   }
+  const { reason, supersededBy } = event.data;
+  if (reason === 'superseded' && typeof supersededBy === 'string') {
+    if (event.type === 'workspace.removed') {
+      return t({
+        zh: `同一 issue 的 Run ${supersededBy} 已完成，自动删掉了这次失败留下的工作目录和分支`,
+        en: `Run ${supersededBy} of the same issue completed, so the working directory and branch this failed Run kept were removed automatically`,
+      });
+    }
+    if (event.type === 'workspace.cleanup_failed') {
+      return t({
+        zh: `同一 issue 的 Run ${supersededBy} 已完成，但没能自动删掉这次失败留下的工作目录和分支，请在「工作区」页手动清理`,
+        en: `Run ${supersededBy} of the same issue completed, but the working directory and branch this failed Run kept could not be removed automatically; clean them up by hand on the Workspaces page`,
+      });
+    }
+  }
   return null;
 }
 

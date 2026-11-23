@@ -5,8 +5,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { FakeAdapter, type FakeContext, type FakeOutcome } from '../src/adapters/fake.js';
 import { AGENT_GH_TOKEN } from '../src/adapters/process.js';
 import type { AgentAdapter } from '../src/adapters/types.js';
-import { backoffMs, RATE_LIMIT_WAIT, rateLimitDelayMs } from '../src/config/flow.js';
+import {
+  backoffMs,
+  RATE_LIMIT_WAIT,
+  REDO_BACKOFF_MAX_HOURS,
+  rateLimitDelayMs,
+} from '../src/config/flow.js';
 import { AGENT_RETRY_BACKOFF, InvalidStateError } from '../src/engine/engine.js';
+import { LABELS } from '../src/github/issues.js';
 import { setLang } from '../src/i18n.js';
 import { noticeFor } from '../src/notify/notice.js';
 import { NotFoundError } from '../src/store/store.js';
@@ -16,6 +22,7 @@ import {
   ASSESS_WORKFLOW_YAML,
   assessment,
   done,
+  FakeGitHub,
   git,
   type Harness,
   harness,
@@ -3207,5 +3214,172 @@ describe('engine: workspace consistency', () => {
         expect(error).not.toMatch(/[一-鿿]/);
       }
     });
+  });
+});
+
+describe('engine: workspaces of superseded attempts', () => {
+  /** Coding → merge without approval; an agent error ends the Run as failed at once. */
+  const WORKFLOW = `
+id: dev
+name: 测试流程
+defaults:
+  escalate:
+    max_retries: 0
+    on_agent_error: retry
+stages:
+  - id: implement
+    name: 编码
+    kind: agent
+    agent: coder
+  - id: merge
+    name: 合并
+    kind: merge
+`;
+  const CONFIG = `
+github:
+  repos:
+    demo:
+      template: dev
+`;
+  let gh: FakeGitHub;
+  const start = async () => {
+    gh = new FakeGitHub();
+    h = await harness({ config: CONFIG, github: gh, workflow: WORKFLOW });
+    return h;
+  };
+
+  /** The Runs of issue #n, oldest first. */
+  const runsOf = (t: Harness, n: number) =>
+    t.master.store
+      .listRuns()
+      .filter((r) => r.issue?.number === n)
+      .reverse();
+  const nth = (t: Harness, n: number, i: number) => {
+    const run = runsOf(t, n)[i];
+    if (!run) throw new Error(`no run ${i} for #${n}`);
+    return run;
+  };
+  const eventData = (t: Harness, runId: string, type: string) =>
+    t.master.store
+      .listEvents(runId)
+      .filter((e) => e.type === type)
+      .map((e) => e.data);
+  /** Redo the failed Runs of the issues, as if the longest wait before a redo had passed. */
+  const redo = async (t: Harness) => {
+    const { store } = t.master;
+    for (const r of store.listRuns({ status: 'failed' })) {
+      if (!r.finishedAt) continue;
+      const ms = REDO_BACKOFF_MAX_HOURS * 3_600_000;
+      store.updateRun(r.id, { finishedAt: new Date(Date.parse(r.finishedAt) - ms).toISOString() });
+    }
+    await t.master.issues.sync();
+  };
+  /** Completed, and done with what follows: the execution slot is free again. */
+  const completed = async (t: Harness, runId: string) => {
+    await t.waitStatus(runId, 'completed');
+    await waitFor(() => t.master.engine.activeRunId === undefined, 'the execution slot');
+    return t.master.store.getRun(runId);
+  };
+  /** Whether the Run's worktree and branch are still there. */
+  const kept = (t: Harness, run: Run) => ({
+    worktree: existsSync(run.worktreePath as string),
+    branch: git(t.repoDir, 'branch', '--list', run.branch as string) !== '',
+  });
+
+  it("removes the worktrees and branches of an issue's failed attempts once a redo completes", async () => {
+    const t = await start();
+    const { engine, issues, store } = t.master;
+    let coder: 'hang' | 'fail' | 'ok' = 'hang';
+    t.scripts.coder = (ctx) => {
+      if (coder === 'hang') return new Promise(() => {});
+      if (coder === 'fail') return { status: 'failed', error: '模型额度用完了' };
+      writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+      return done('写了 feature.txt');
+    };
+
+    // #1: a human cancels the first Run and starts the issue over with ares1:ready.
+    gh.add({ title: '加 feature', body: '写 feature.txt', labels: [LABELS.ready] });
+    await issues.poll();
+    await waitFor(() => t.fake.calls.length === 1, 'the coder');
+    await engine.cancel(nth(t, 1, 0).id);
+    await issues.sync();
+    coder = 'fail';
+    gh.get(1).labels.push(LABELS.ready);
+    // #2: another issue whose Run fails too, closed before it is redone.
+    gh.add({ title: '另一个需求', labels: [LABELS.ready] });
+    await issues.poll();
+    const first = await t.waitStatus(nth(t, 1, 1).id, 'failed');
+    const other = await t.waitStatus(nth(t, 2, 0).id, 'failed');
+    // And a failed Run that does not come from an issue.
+    const loose = await t.waitStatus(t.run('不是从 issue 来的').id, 'failed');
+    await issues.sync();
+    gh.get(2).state = 'closed';
+    coder = 'ok';
+    await redo(t);
+
+    const second = nth(t, 1, 2);
+    expect(second.issue?.attempt).toBe(2);
+    const cancelled = store.getRun(nth(t, 1, 0).id);
+    expect(cancelled.status).toBe('cancelled');
+    for (const run of [first, other, loose, cancelled]) {
+      expect(kept(t, run)).toEqual({ worktree: true, branch: true });
+    }
+    expect((await completed(t, second.id)).status).toBe('completed');
+
+    // The failed attempt it superseded is gone, records and events kept.
+    expect(kept(t, first)).toEqual({ worktree: false, branch: false });
+    expect(git(t.repoDir, 'worktree', 'list', '--porcelain')).not.toContain(first.branch);
+    expect(eventData(t, first.id, 'workspace.removed')).toEqual([
+      {
+        path: first.worktreePath,
+        branch: first.branch,
+        reason: 'superseded',
+        supersededBy: second.id,
+      },
+    ]);
+    expect(store.getRun(first.id)).toMatchObject({ status: 'failed', error: first.error });
+    // The cancelled Run of the issue, another issue's and one not from an issue stay as they are.
+    for (const run of [cancelled, other, loose]) {
+      expect(kept(t, run)).toEqual({ worktree: true, branch: true });
+      expect(eventData(t, run.id, 'workspace.removed')).toEqual([]);
+    }
+    // The completed Run's own workspace went once merged, as always.
+    expect(eventData(t, second.id, 'workspace.removed')).toEqual([{}]);
+    expect(git(t.repoDir, 'show', 'main:feature.txt')).toBe('ok');
+  });
+
+  it('records a failed attempt it cannot clean up and leaves the redo completed', async () => {
+    const t = await start();
+    const { issues, store } = t.master;
+    let calls = 0;
+    t.scripts.coder = (ctx) => {
+      if (++calls === 1) return { status: 'failed', error: '模型额度用完了' };
+      writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+      return done('写了 feature.txt');
+    };
+    gh.add({ title: '加 feature', labels: [LABELS.ready] });
+    await issues.poll();
+    const first = await t.waitStatus(nth(t, 1, 0).id, 'failed');
+    // Its branch is checked out elsewhere too, so git refuses to delete it.
+    const elsewhere = join(tmpDir(), 'elsewhere');
+    git(t.repoDir, 'worktree', 'add', '-q', '-f', elsewhere, first.branch as string);
+    await issues.sync();
+    await redo(t);
+
+    const second = nth(t, 1, 1);
+    expect((await completed(t, second.id)).status).toBe('completed');
+    expect(eventData(t, first.id, 'workspace.removed')).toEqual([]);
+    expect(eventData(t, first.id, 'workspace.cleanup_failed')).toEqual([
+      {
+        reason: 'superseded',
+        supersededBy: second.id,
+        error: expect.stringContaining(`分支 ${first.branch}`),
+      },
+    ]);
+    expect(kept(t, first)).toEqual({ worktree: false, branch: true });
+    expect(store.getRun(first.id).status).toBe('failed');
+    expect(eventData(t, second.id, 'run.status').at(-1)).toEqual({ status: 'completed' });
+    await issues.sync();
+    expect(gh.get(1)).toMatchObject({ state: 'closed', stateReason: 'completed' });
   });
 });

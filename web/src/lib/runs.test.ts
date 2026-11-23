@@ -424,3 +424,37 @@ describe('rate limits', () => {
     expect(text).not.toMatch(/[一-鿿]/);
   });
 });
+
+describe('superseded workspaces', () => {
+  afterEach(() => setLang('zh'));
+  const superseded = { reason: 'superseded', supersededBy: 'run_ok' };
+
+  it('words the removal of a failed attempt and its failure from their data', () => {
+    const removed = { path: '/w/run_a', branch: 'ares1/run_a', ...superseded };
+    expect(eventText({ type: 'workspace.removed', data: removed })).toBe(
+      '同一 issue 的 Run run_ok 已完成，自动删掉了这次失败留下的工作目录和分支',
+    );
+    expect(
+      eventText({ type: 'workspace.cleanup_failed', data: { ...superseded, error: 'x' } }),
+    ).toBe(
+      '同一 issue 的 Run run_ok 已完成，但没能自动删掉这次失败留下的工作目录和分支，请在「工作区」页手动清理',
+    );
+    // Removed by hand or after a merge: only the data.
+    const manual = { path: '/w/run_a', branch: 'ares1/run_a', manual: true };
+    expect(eventText({ type: 'workspace.removed', data: manual })).toBeNull();
+    expect(eventText({ type: 'workspace.removed', data: {} })).toBeNull();
+  });
+
+  it('in English', () => {
+    setLang('en');
+    const removed = eventText({ type: 'workspace.removed', data: superseded });
+    expect(removed).toBe(
+      'Run run_ok of the same issue completed, so the working directory and branch this failed Run kept were removed automatically',
+    );
+    const failed = eventText({ type: 'workspace.cleanup_failed', data: superseded });
+    expect(failed).toBe(
+      'Run run_ok of the same issue completed, but the working directory and branch this failed Run kept could not be removed automatically; clean them up by hand on the Workspaces page',
+    );
+    for (const text of [removed, failed]) expect(text).not.toMatch(/[一-鿿]/);
+  });
+});
