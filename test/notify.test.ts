@@ -815,13 +815,13 @@ describe('webhook settings for the scripts (webhook.curl)', () => {
       '',
     ]);
 
-    // Read back by curl, the request is the one the Master sends.
+    // Read back by curl as scripts/webhook.sh calls it, the request is the one the Master sends.
     const home = tmpDir('ares1-curl-');
     writeWebhookCurlFile(home, webhook);
     await new Promise<void>((resolve, reject) =>
       execFile(
         'curl',
-        ['-fsS', '--max-time', '10', '-K', webhookCurlFile(home), '-o', '/dev/null'].concat([
+        ['-q', '-fsS', '--max-time', '10', '-K', webhookCurlFile(home), '-o', '/dev/null'].concat([
           '--data-binary',
           'hello',
         ]),

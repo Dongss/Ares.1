@@ -560,7 +560,7 @@ describe('keepalive script and the webhook', () => {
   it('keeps the JSON valid whatever the message and the title hold', async () => {
     const hook = await startHookIn();
     const home = '/home/someone';
-    const message = `say "hi" \\ C:\\path\\to {"json": true}\nnext line\ttab\r\u0001\u001f end 中文 ${home}/x`;
+    const message = `say "hi" \\ C:\\path\\to {"json": true}\nnext line\ttab\r\u0001\u001f\u007f end 中文 ${home}/x`;
     const name = 'Ares "1" \\ x';
     await sourced('webhook "$1" "$2"', [message, 'test.event'], {
       HOME: home,
@@ -575,6 +575,30 @@ describe('keepalive script and the webhook', () => {
       title: name,
       body,
       text: `${name}\n${body}`,
+      eventType: 'test.event',
+    });
+  });
+
+  it("sends with the Master's settings only, whatever the user's .curlrc says", async () => {
+    const hook = await startHookIn();
+    // curl looks for its config in $CURL_HOME, $XDG_CONFIG_HOME and $HOME: all lead here, so
+    // without -q it would find this one wherever it looks first.
+    const user = tmpDir('ares1-user-');
+    writeFileSync(join(user, '.curlrc'), 'header = "X-From-Curlrc: 1"\n');
+    writeFileSync(join(user, 'curlrc'), 'header = "X-From-Curlrc: 1"\n');
+    // The message holds no path, so the new HOME changes nothing in it.
+    await sourced('webhook "$1" "$2"', ['The Master is down', 'test.event'], {
+      HOME: user,
+      CURL_HOME: user,
+      XDG_CONFIG_HOME: user,
+      home: hook.home,
+      name: 'Ares.1',
+    });
+    expect(hook.received).toHaveLength(1);
+    expect(hook.received[0]?.headers).not.toHaveProperty('x-from-curlrc');
+    expect(JSON.parse(hook.received[0]?.body ?? '')).toMatchObject({
+      kind: 'master_down',
+      body: 'The Master is down',
       eventType: 'test.event',
     });
   });

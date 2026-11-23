@@ -388,7 +388,7 @@ notify:
 - Master 停了、起不来时：这时 Master 自己发不了，由脚本发。保活脚本（见「保活」）在 Master 停了、它没能启动起来时，自动升级脚本在 Master 一个都没能启动时（见上面的系统通知），除了系统通知，也把同一条通知 POST 到 webhook。
   - 脚本不读 `config.yaml`，用的是 Master 写下的设置：Master 启动时、每次配置重新加载成功后，把 webhook 的地址、请求头（和上面一样，默认的 `Content-Type` 被同名的覆盖）和 `format` 写进数据目录的 `webhook.curl`（curl 能直接读的配置文件，先写临时文件再改名，脚本不会读到写了一半的）；去掉 `webhook` 后删掉这个文件，重新加载失败、沿用旧配置时不动它。所以脚本用的是最近一次运行的 Master 写下的设置：Master 一次都没运行过（没写过这个文件），或者停机期间才改了 `config.yaml`，都不会生效，要等 Master 再运行一次。
   - `webhook.curl` 里有地址和请求头，可能带 token，所以权限是 0600，只有你能读。Master 正常停止时不删它，脚本正是要在 Master 不在运行时用它。
-  - 每条通知 POST 一次，用 `curl`（`-K webhook.curl`，最多等 10 秒），不需要 node 和 jq（这时可能正是 node 找不到）；没有这个文件或者没有 `curl` 就不发，其他照旧。保活脚本和系统通知一样，同一次停转只发一次。
+  - 每条通知 POST 一次，用 `curl`（`-q -K webhook.curl`，最多等 10 秒），不需要 node 和 jq（这时可能正是 node 找不到）；没有这个文件或者没有 `curl` 就不发，其他照旧。`-q` 让 curl 不读你自己的 curl 配置（`~/.curlrc`，或者 `$CURL_HOME`、`$XDG_CONFIG_HOME` 下的），只用 Master 写下的设置：那里的代理、`--trace`、额外请求头之类的设置不会改变这次发送，也不会把地址和请求头写进跟踪文件。保活脚本和系统通知一样，同一次停转只发一次。
   - `format: json` 时字段和上面一样：`kind` 是 `master_down`，`title` 是通知标题（展示名），`body` 是系统通知里的那句话，`text` 是「标题\n正文」，`runId` 为 `null`，`about` 是 `master`，`eventType` 保活脚本是 `keepalive.alert`、升级脚本是 `upgrade.master_down`，`at` 是发送的时间（精确到秒，比如 `2026-11-23T08:00:00Z`）。`format: text` 时正文是「标题\n正文」。正文里以用户目录开头的路径同样换成 `~`。
   - 失败时（不是 2xx、连不上或 10 秒内没有响应）不重试，不影响脚本的退出码，只在各自的日志里记一行（保活脚本在 `keepalive.log`，升级脚本在 `upgrade.log`），只写 curl 的退出码（比如 7 是连不上，22 是返回了错误状态码，28 是超时），不写地址和请求头。
 

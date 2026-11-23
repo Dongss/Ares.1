@@ -57,9 +57,10 @@ webhook_tilde() {
   tilded=${out}${rest}
 }
 
-# Prints text $1 as a JSON string, quotes included: quotes, backslashes, line breaks, tabs and
-# the other control characters escaped. Byte by byte, so that any text (Chinese too) gives valid
-# JSON whatever the locale.
+# Prints text $1 as a JSON string, quotes included: quotes, backslashes and the control
+# characters 0x01-0x1f (line breaks and tabs among them) escaped; bash strings hold no 0x00. DEL
+# (0x7f) is left as it is: JSON only requires escaping below 0x20, and JSON.stringify leaves it
+# too. Byte by byte, so that any text (Chinese too) gives valid JSON whatever the locale.
 webhook_json() {
   printf '%s\n' "${1}" | LC_ALL=C awk '
     BEGIN {
@@ -86,6 +87,10 @@ webhook_json() {
 # Master sends (WebhookPayload in src/notify/webhook.ts) with kind master_down and about master;
 # with format: text it is "title\nmessage". A failure gets a line in the log with curl's exit code
 # only (what curl says may name the address), is not retried and changes nothing for the caller.
+# curl reads the user's own config (~/.curlrc, or the one under ${CURL_HOME} or ${XDG_CONFIG_HOME})
+# before anything else, and -K does not skip it. -q, which curl only takes as its first argument,
+# does: only the settings the Master left are used, so a proxy, a trace, extra headers or the like
+# set there can neither change the request nor write its address and headers (tokens) to a file.
 webhook() {
   local file=${home}/webhook.curl format title body text payload code
   [ -f "${file}" ] || return 0
@@ -109,7 +114,7 @@ webhook() {
     payload=${payload},'"at":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}'
   fi
   printf '%s' "${payload}" |
-    curl -fsS --max-time 10 -K "${file}" -o /dev/null --data-binary @- >/dev/null 2>&1
+    curl -q -fsS --max-time 10 -K "${file}" -o /dev/null --data-binary @- >/dev/null 2>&1
   code=$?
   [ "${code}" -eq 0 ] && return 0
   log "$(pick "webhook 通知发送失败（curl 退出码 ${code}），不重试" \

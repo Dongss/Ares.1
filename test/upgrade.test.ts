@@ -1046,6 +1046,8 @@ describe('upgrade script', () => {
     writeWebhookCurlFile(home, WebhookSchema.parse({ url: 'https://example.com/hook' }));
     expect(run(target)).toMatchObject({ ok: false, to: target });
     expect(readFileSync(join(bin, 'webhook-args'), 'utf8').trimEnd().split('\n')).toEqual([
+      // First, as curl only takes it there: the user's .curlrc is not read.
+      '-q',
       '-fsS',
       '--max-time',
       '10',
