@@ -92,6 +92,67 @@ function backupPrefix(file: string, version: number): string {
   return `${basename(file)}.bak-v${version}-`;
 }
 
+/**
+ * How many backups taken before migrations to keep. A Master rolled back after an upgrade needs
+ * only the newest; a few more are enough to look into or recover from several bad upgrades in a
+ * row. Each is a full copy of the database, and a self-developing Master can upgrade a dozen times
+ * a day, so keeping every one would fill the disk.
+ */
+export const KEEP_BACKUPS = 5;
+
+const byCodeUnits = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+
+/** Matches exactly the names of the backups of `file`; group 1 is the time in the name. */
+function backupPattern(file: string): RegExp {
+  const name = basename(file).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`^${name}\\.bak-v\\d+-(\\d{4}-\\d\\d-\\d\\dT\\d\\d-\\d\\d-\\d\\d-\\d{3}Z)$`);
+}
+
+/**
+ * Deletes the backups of `file` but the newest KEEP_BACKUPS, `fresh` (the one just taken) always
+ * among those kept. Anything else beside the database stays: sidecars, renamed databases, copies
+ * people made. Failing to delete is only a warning: the database itself is fine.
+ */
+function pruneBackups(file: string, fresh: string): void {
+  const dir = dirname(file);
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch (err) {
+    console.warn(
+      t({
+        zh: `[数据库] 读取 ${dir} 失败，没有清理旧的迁移前备份：${errorMessage(err)}`,
+        en: `[database] Could not read ${dir} to delete old backups taken before migrations: ${errorMessage(err)}`,
+      }),
+    );
+    return;
+  }
+  const pattern = backupPattern(file);
+  const freshName = basename(fresh);
+  const older = names
+    .filter((name) => name !== freshName)
+    .flatMap((name) => {
+      const stamp = pattern.exec(name)?.[1];
+      return stamp === undefined ? [] : [{ name, stamp }];
+    })
+    // Newest first by the time in the name: modification times change when files are copied, and
+    // in name order v10 comes before v9.
+    .sort((a, b) => byCodeUnits(b.stamp, a.stamp) || byCodeUnits(b.name, a.name));
+  for (const { name } of older.slice(KEEP_BACKUPS - 1)) {
+    const path = join(dir, name);
+    try {
+      rmSync(path);
+    } catch (err) {
+      console.warn(
+        t({
+          zh: `[数据库] 删除旧的迁移前备份 ${path} 失败：${errorMessage(err)}`,
+          en: `[database] Could not delete ${path}, an old backup taken before a migration: ${errorMessage(err)}`,
+        }),
+      );
+    }
+  }
+}
+
 /** The newest backup of `file` taken before migrating it from exactly `version`, or null. */
 function findBackup(file: string, version: number): string | null {
   const dir = dirname(file);
@@ -218,9 +279,10 @@ export class Store {
     const current = userVersion(this.db);
     if (current > MIGRATIONS.length) throw newerError(file, current);
     if (current === MIGRATIONS.length) return;
+    let backup: string | null = null;
     if (!isNew && current > 0) {
       // A Master rolled back to this version finds it here; see restoreBackup.
-      const backup = `${file}.bak-v${current}-${fileStamp()}`;
+      backup = `${file}.bak-v${current}-${fileStamp()}`;
       this.db.exec(`VACUUM INTO '${backup.replace(/'/g, "''")}'`);
     }
     for (let v = current; v < MIGRATIONS.length; v++) {
@@ -229,6 +291,9 @@ export class Store {
         this.db.exec(`PRAGMA user_version = ${v + 1}`);
       });
     }
+    // Only once the migrations went through: starts failing halfway would each take a backup of
+    // the half-migrated database and could push out the one a rolled-back Master needs.
+    if (backup) pruneBackups(file, backup);
   }
 
   close(): void {

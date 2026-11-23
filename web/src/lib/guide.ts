@@ -1224,8 +1224,8 @@ export function dataPaths(home: string): { path: string; what: string }[] {
     {
       path: under(home, 'data/ares1.db'),
       what: t({
-        zh: '运行状态（SQLite），升级迁移前自动备份',
-        en: 'Run state (SQLite), backed up automatically before a migration',
+        zh: '运行状态（SQLite），升级迁移前自动备份，只保留最近 5 份',
+        en: 'Run state (SQLite), backed up automatically before a migration; the 5 latest backups are kept',
       }),
     },
     {

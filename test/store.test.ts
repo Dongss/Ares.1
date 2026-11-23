@@ -1,11 +1,24 @@
-import { copyFileSync, existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { TemplateSchema } from '../src/config/schema.js';
 import { setLang } from '../src/i18n.js';
 import { MIGRATIONS } from '../src/store/migrations.js';
-import { type BackupRestore, backupRestoredNotice, Store } from '../src/store/store.js';
+import {
+  type BackupRestore,
+  backupRestoredNotice,
+  KEEP_BACKUPS,
+  Store,
+} from '../src/store/store.js';
 import type { Attempt, Scout } from '../src/store/types.js';
 import { type Harness, harness, tmpDir } from './helpers.js';
 
@@ -240,6 +253,158 @@ describe('store', () => {
     expect(store.agentScoutTotals()).toEqual([
       { agentId: 's', scouts: 4, costUsd: 0.4, costUnknown: 1, lastAt: last.startedAt },
     ]);
+  });
+});
+
+describe('old backups taken before migrations', () => {
+  afterEach(() => setLang('zh'));
+
+  const CJK = /[　-〿一-鿿＀-￯]/;
+  const BACKUP = /^ares1\.db\.bak-v\d+-/;
+
+  /** A database of version 1, which the Store migrates and backs up. */
+  function oldDatabase(file: string) {
+    const db = new DatabaseSync(file);
+    db.exec(MIGRATIONS[0] as string);
+    db.exec('PRAGMA user_version = 1');
+    db.close();
+  }
+
+  /**
+   * Seven earlier backups. Their times in the name, oldest first, differ from both name order
+   * (v10 < v2 < v9) and modification order (the oldest was touched last).
+   */
+  function earlierBackups(dir: string) {
+    const names = [
+      'ares1.db.bak-v9-2026-11-01T08-00-00-000Z',
+      'ares1.db.bak-v2-2026-11-02T08-00-00-000Z',
+      'ares1.db.bak-v3-2026-11-03T08-00-00-000Z',
+      'ares1.db.bak-v4-2026-11-04T08-00-00-000Z',
+      'ares1.db.bak-v5-2026-11-05T08-00-00-000Z',
+      'ares1.db.bak-v6-2026-11-06T08-00-00-000Z',
+      'ares1.db.bak-v10-2026-11-07T08-00-00-000Z',
+    ];
+    names.forEach((name, i) => {
+      const path = join(dir, name);
+      writeFileSync(path, 'an old backup');
+      const time = new Date(Date.UTC(2026, 10, 20 - i));
+      utimesSync(path, time, time);
+    });
+    return names;
+  }
+
+  /** Names beside the database that are not its backups, however much they look like one. */
+  const OTHERS = [
+    'ares1.db.bak-v3-2026-10-01T08-00-00-000Z-wal',
+    'ares1.db.bak-v3-2026-10-01T08-00-00-000Z.copy',
+    'ares1.db.bak-v3-before-the-fix',
+    'ares1.db.bak-v-2026-10-01T08-00-00-000Z',
+    'ares1.db.newer-v99-2026-10-01T08-00-00-000Z',
+    'ares1.db.restoring-2026-10-01T08-00-00-000Z',
+    'ares1xdb.bak-v3-2026-10-01T08-00-00-000Z',
+    'other.db.bak-v3-2026-10-01T08-00-00-000Z',
+    'my-ares1.db.bak-v3-2026-10-01T08-00-00-000Z',
+    'notes.txt',
+  ];
+
+  it(`keeps only the newest ${KEEP_BACKUPS}, the new one included, and nothing else is touched`, () => {
+    const dir = tmpDir('ares1-db-');
+    const file = join(dir, 'ares1.db');
+    oldDatabase(file);
+    const earlier = earlierBackups(dir);
+    for (const name of OTHERS) writeFileSync(join(dir, name), 'not a backup');
+
+    const warn = vi.spyOn(console, 'warn');
+    try {
+      new Store(file).close();
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+
+    const files = readdirSync(dir);
+    const backups = files.filter((f) => BACKUP.test(f) && !OTHERS.includes(f));
+    const fresh = backups.filter((f) => !earlier.includes(f));
+    expect(fresh).toHaveLength(1);
+    expect(fresh[0]).toMatch(/^ares1\.db\.bak-v1-\d{4}-\d\d-\d\dT\d\d-\d\d-\d\d-\d{3}Z$/);
+    expect(backups.sort()).toEqual([...fresh, ...earlier.slice(-(KEEP_BACKUPS - 1))].sort());
+    for (const name of OTHERS) expect(files).toContain(name);
+  });
+
+  it('keeps the new one even when the clock says the others are newer', () => {
+    const dir = tmpDir('ares1-db-');
+    const file = join(dir, 'ares1.db');
+    oldDatabase(file);
+    const future = Array.from(
+      { length: 6 },
+      (_, i) => `ares1.db.bak-v1-2999-01-0${i + 1}T00-00-00-000Z`,
+    );
+    for (const name of future) writeFileSync(join(dir, name), 'an old backup');
+
+    new Store(file).close();
+    const backups = readdirSync(dir).filter((f) => BACKUP.test(f));
+    expect(backups).toHaveLength(KEEP_BACKUPS);
+    expect(backups.filter((f) => !future.includes(f))).toHaveLength(1);
+  });
+
+  it('leaves them alone when nothing is migrated', () => {
+    const dir = tmpDir('ares1-db-');
+    const file = join(dir, 'ares1.db');
+    const earlier = earlierBackups(dir);
+    const warn = vi.spyOn(console, 'warn');
+    try {
+      // A new database is not backed up, nor is one already at the latest version.
+      new Store(file).close();
+      new Store(file).close();
+      // Neither is a database in memory.
+      new Store(':memory:').close();
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+    expect(
+      readdirSync(dir)
+        .filter((f) => BACKUP.test(f))
+        .sort(),
+    ).toEqual([...earlier].sort());
+  });
+
+  it('only warns when one cannot be deleted, and deletes the rest', () => {
+    for (const lang of ['zh', 'en'] as const) {
+      setLang(lang);
+      const dir = tmpDir('ares1-db-');
+      const file = join(dir, 'ares1.db');
+      oldDatabase(file);
+      const earlier = earlierBackups(dir);
+      // Named like the oldest backup, but a directory with a file in it: deleting it fails.
+      const stuck = 'ares1.db.bak-v1-2026-10-01T08-00-00-000Z';
+      mkdirSync(join(dir, stuck));
+      writeFileSync(join(dir, stuck, 'inside'), 'x');
+
+      const printed: string[] = [];
+      const warn = vi.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => {
+        printed.push(args.map(String).join(' '));
+      });
+      try {
+        new Store(file).close();
+      } finally {
+        warn.mockRestore();
+      }
+
+      expect(printed).toHaveLength(1);
+      expect(printed[0]).toContain(join(dir, stuck));
+      if (lang === 'zh') expect(printed[0]).toContain('删除旧的迁移前备份');
+      else expect(printed[0]).not.toMatch(CJK);
+      const files = readdirSync(dir);
+      expect(files).toContain(stuck);
+      const backups = files.filter((f) => BACKUP.test(f) && f !== stuck);
+      expect(backups).toHaveLength(KEEP_BACKUPS);
+      expect(backups).toEqual(expect.arrayContaining(earlier.slice(-(KEEP_BACKUPS - 1))));
+      // The database opens as usual.
+      const store = new Store(file);
+      expect(store.listRepos()).toEqual([]);
+      store.close();
+    }
   });
 });
 
