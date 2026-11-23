@@ -286,6 +286,8 @@ describe('the accept step', () => {
 });
 
 describe('the Run stages', () => {
+  afterEach(() => setLang('zh'));
+
   it('shows who does each stage, with the approval before merging', () => {
     expect(runStages(input(manualRepo))).toEqual([
       {
@@ -355,6 +357,37 @@ describe('the Run stages', () => {
       'claude-reviewer 只读评估需求：合理就开工；有疑问时不等人回复就自己决定（写明假设后开工，或者不做）',
     );
     expect(noteWith(0.5)).toContain('30 分钟内没人回复就自己决定');
+  });
+
+  it('shows a command stage run by the Master, and where a failure goes back to', () => {
+    const e2eWith = (e2e: Record<string, unknown>, repoCommands: string[] = ['npm test']) => {
+      const withCommand = TemplateSchema.parse({
+        ...template,
+        stages: template.stages.map((s) =>
+          s.id === 'e2e' ? { id: 'e2e', name: 'E2E', kind: 'command', ...e2e } : s,
+        ),
+      });
+      const cfg = { ...config, templates: [withCommand] } as typeof config;
+      const i = { ...input(manualRepo), flow: issueFlow(cfg, manualRepo, repoCommands) };
+      return runStages(i)?.find((s) => s.id === 'e2e');
+    };
+    expect(e2eWith({ verify: { commands: ['npx playwright test'] } })).toEqual({
+      id: 'e2e',
+      name: 'E2E',
+      actors: ['master'],
+      note: 'Master 运行命令（不调用 Agent），有命令失败就带着输出回到「编码」',
+    });
+    expect(e2eWith({ gate: true })).toEqual({
+      id: 'e2e',
+      name: 'E2E',
+      actors: ['master', 'human'],
+      note: 'Master 运行命令（不调用 Agent），有命令失败就带着输出回到「编码」，通过后等你审批',
+    });
+    expect(e2eWith({}, [])?.note).toBe('没有要运行的命令，直接通过');
+    setLang('en');
+    expect(e2eWith({ gate: true })?.note).toBe(
+      'The Master runs commands (no agent); when one fails, it goes back to "编码" with the output; then waits for your approval',
+    );
   });
 
   it('merges without approval with auto_merge, as the Master creates those Runs', () => {

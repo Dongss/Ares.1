@@ -502,6 +502,34 @@ export function runStages(
           }
         : { id, name, actors: ['ai'], note: work };
     }
+    if (s.kind === 'command') {
+      const work =
+        s.commands?.length === 0
+          ? t({
+              zh: '没有要运行的命令，直接通过',
+              en: 'Nothing to run, so it passes right away',
+            })
+          : s.onFail
+            ? t({
+                zh: `Master 运行命令（不调用 Agent），有命令失败就带着输出回到「${s.onFail.name}」`,
+                en: `The Master runs commands (no agent); when one fails, it goes back to "${s.onFail.name}" with the output`,
+              })
+            : t({
+                zh: 'Master 运行命令（不调用 Agent）',
+                en: 'The Master runs commands (no agent)',
+              });
+      return s.gate
+        ? {
+            id,
+            name,
+            actors: ['master', 'human'],
+            note: t({
+              zh: `${work}，通过后等你审批`,
+              en: `${work}; then waits for your approval`,
+            }),
+          }
+        : { id, name, actors: ['master'], note: work };
+    }
     if (s.kind === 'merge') {
       if (s.gate) {
         return {

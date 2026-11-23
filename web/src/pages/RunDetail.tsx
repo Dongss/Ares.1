@@ -865,6 +865,14 @@ function StageBlock(props: {
           })}
         </p>
       )}
+      {kind === 'command' && (
+        <p className="hint">
+          {t({
+            zh: 'Master 在工作目录运行这一阶段的命令，不调用 Agent；有命令失败时带着输出回退。',
+            en: 'The Master runs the commands of this stage in the worktree, without an agent; when one fails, the stage goes back with its output.',
+          })}
+        </p>
+      )}
       {kind === 'assess' && (
         <p className="hint">
           {t({

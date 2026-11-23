@@ -1292,9 +1292,9 @@ export class Engine {
       case 'pending':
         return this.beginStage(run, sr, eff);
       case 'executing':
-        return eff.def.kind === 'merge'
-          ? this.executeMerge(run, sr, eff, signal)
-          : this.executeTasks(run, sr, eff, signal);
+        if (eff.def.kind === 'merge') return this.executeMerge(run, sr, eff, signal);
+        if (eff.def.kind === 'command') return this.executeCommandStage(run, sr, eff, signal);
+        return this.executeTasks(run, sr, eff, signal);
       case 'waiting_approval':
         return this.afterApproval(run, sr, eff);
       case 'passed':
@@ -1385,6 +1385,11 @@ export class Engine {
       // The merge gate is the approval *before* merging.
       if (eff.gate) this.requestApproval(run, sr);
       else this.store.updateStageRun(sr.id, { status: 'executing' });
+      return;
+    }
+    if (eff.def.kind === 'command') {
+      // Its gate is the approval after the commands pass (`executeCommandStage`).
+      this.store.updateStageRun(sr.id, { status: 'executing' });
       return;
     }
     const agentId = eff.def.agent;
@@ -2504,9 +2509,9 @@ export class Engine {
   private rollback(run: Run, sr: StageRun): void {
     const def = run.template.stages.find((s) => s.id === sr.stageId);
     const reason = sr.failReason === 'rejected' ? 'reject' : 'fail';
-    // Only review / merge stages fail their checks or a merge (failTarget); agent stages rework
-    // instead and reach here only after a rejected approval. The fallback keeps rollbackTarget's
-    // rule.
+    // Only review / merge / command stages fail their checks or a merge (failTarget); agent stages
+    // rework instead and reach here only after a rejected approval. The fallback keeps
+    // rollbackTarget's rule.
     const target =
       (reason === 'fail' ? failTarget(run.template, sr.stageId) : null) ??
       rollbackTarget(run.template, sr.stageId, reason);
@@ -2543,6 +2548,73 @@ export class Engine {
     });
     this.store.event(run.id, 'stage.rollback', { from: sr.stageId, to: target });
     this.startStage(run, target, feedback);
+  }
+
+  /**
+   * Command stage: the Master runs the stage's commands (`stageVerifyCommands`: its
+   * `verify.commands`, otherwise the repo's verify commands) in the Run's worktree, without an
+   * agent and without committing anything. When all pass, the stage passes, or with a gate waits
+   * for its approval. When one fails, the stage fails with the command and the end of its output,
+   * and `rollback` goes to `failTarget` (`on_fail` or the nearest earlier agent stage) with that as
+   * feedback, counted toward max_loops like a review sending the work back. Whatever the commands
+   * left in the worktree is discarded, so that an agent going on from here does not commit it
+   * with its work. Interrupted (a pause, a restart), the stage runs its commands again.
+   */
+  private async executeCommandStage(
+    run: Run,
+    sr: StageRun,
+    eff: EffectiveStage,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const repo = this.store.getRepo(run.repoId);
+    const workdir = this.workdir(run);
+    const commands = stageVerifyCommands(eff.def, repo.verifyCommands);
+    if (commands.length === 0) {
+      // Nothing to run (the stage names no commands and the repo has none): it passes, like an
+      // agent stage without verify commands.
+      this.store.event(run.id, 'stage.no_commands', { stageId: sr.stageId });
+      if (eff.gate) this.requestApproval(run, sr);
+      else this.passStage(run, sr);
+      return;
+    }
+    const results = await runCommands(commands, workdir, {
+      timeoutMs: this.commandTimeoutMs(),
+      logPath: join(this.runLogDir(run.id), `command-${sr.id}.log`),
+      env: this.agentEnv(),
+      signal,
+    });
+    this.checkAbort(signal);
+    if (await hasChanges(workdir)) {
+      await resetHard(workdir, 'HEAD');
+      this.checkAbort(signal);
+      this.store.event(run.id, 'command.discarded_changes', { stageId: sr.stageId });
+    }
+    const failed = results.find((r) => !r.passed);
+    this.store.tx(() => {
+      for (const r of results) {
+        this.store.addCheck({
+          runId: run.id,
+          stageRunId: sr.id,
+          attemptId: null,
+          kind: 'command',
+          name: r.command,
+          passed: r.passed,
+          detail: r.outputTail,
+        });
+      }
+      if (failed) {
+        this.store.updateStageRun(sr.id, {
+          status: 'failed',
+          failReason: 'check',
+          failFeedback: formatCommandFailure(failed),
+          endedAt: nowIso(),
+        });
+        this.store.event(run.id, 'stage.failed', { stageId: sr.stageId, reason: 'check' });
+      }
+    });
+    if (failed) return;
+    if (eff.gate) this.requestApproval(run, sr);
+    else this.passStage(run, sr);
   }
 
   /**

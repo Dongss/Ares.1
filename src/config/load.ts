@@ -4,7 +4,7 @@ import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
 import { join as joinList, type Lang, setLang, t } from '../i18n.js';
 import { defaultAgentsYaml, defaultConfigYaml, defaultSelfDevYaml } from './defaults.js';
-import { conflictTarget, failTarget } from './flow.js';
+import { conflictTarget, failTarget, runsAgent } from './flow.js';
 import {
   type AgentConfig,
   type AgentEntry,
@@ -413,6 +413,32 @@ export function validateTemplate(
         );
       }
     }
+    if (s.kind === 'command') {
+      // The Master runs the commands itself: nothing an agent would use applies.
+      const agentOnly = [
+        s.agent !== undefined && 'agent',
+        s.agent_candidates !== undefined && 'agent_candidates',
+        s.planning === 'llm' && 'planning: llm',
+        s.verify?.llm_check && 'verify.llm_check',
+      ].filter((field): field is string => typeof field === 'string');
+      if (agentOnly.length > 0) {
+        errors.push(
+          where({
+            zh: `command（命令）阶段只运行命令、不调用 Agent，不能指定 ${joinList(agentOnly)}`,
+            en: `a command stage only runs commands and calls no agent, it cannot have ${joinList(agentOnly)}`,
+          }),
+        );
+      }
+      if (s.verify?.commands?.length === 0) {
+        errors.push(
+          where({
+            zh: 'command（命令）阶段的 verify.commands 是空列表，没有要运行的命令；不写 verify.commands 时运行仓库登记的检查命令',
+            en: "a command stage's verify.commands is an empty list, so there is nothing to run; without verify.commands it runs the repo's verify commands",
+          }),
+        );
+      }
+      return;
+    }
     if (s.agent_candidates) {
       errors.push(
         where({
@@ -591,6 +617,30 @@ export function validateTemplate(
     );
   }
 
+  // A failed command is only fixed by an agent that reads its output and changes the code.
+  // Going back anywhere else runs the same code again, which passes only if the failure was
+  // flaky, until max_loops ends the Run: valid, but most likely not what the author meant.
+  for (const s of tpl.stages) {
+    if (s.kind !== 'command') continue;
+    const back = failTarget(tpl, s.id);
+    // An on_fail naming no stage is already an error.
+    if (back === null || !ids.has(back)) continue;
+    if (tpl.stages.find((p) => p.id === back)?.kind === 'agent') continue;
+    const where =
+      back === s.id
+        ? t({ zh: '失败时没有可回退的 Agent 阶段', en: 'has no agent stage to go back to' })
+        : t({
+            zh: `失败时回退到的 ${back} 不是 Agent 阶段`,
+            en: `goes back to ${back} when it fails, which is not an agent stage`,
+          });
+    warnings.push(
+      t({
+        zh: `阶段 ${s.id}：命令阶段${where}。命令失败后没有 Agent 按失败输出修改代码，只会重新运行同样的代码，直到超过 max_loops。想让 Agent 修复，就把 on_fail 指向一个 Agent 阶段（kind: agent）`,
+        en: `Stage ${s.id}: the command stage ${where}. After a command fails, no agent changes the code by its output, so the same code runs again until max_loops is reached. To have an agent fix it, point on_fail at an agent stage (kind: agent)`,
+      }),
+    );
+  }
+
   // "human" (or "pause" over budget) is a valid choice, but a Run waiting for a human stops the
   // system while nobody is around. Only a warning: templates already installed (self-dev used to
   // say human) stay usable.
@@ -600,7 +650,7 @@ export function validateTemplate(
   for (const s of tpl.stages) {
     // No agent runs there, so nothing errors, is reworked or checks the budget; their rollbacks
     // follow the defaults.
-    if (s.kind === 'merge' || s.kind === 'placeholder') continue;
+    if (!runsAgent(s.kind)) continue;
     for (const option of waitsForHuman(s.escalate)) {
       warnings.push(
         t({
@@ -617,8 +667,8 @@ export function validateTemplate(
 /**
  * Artifact names the stages of a template produce, in stage order: what `inputs` may name
  * besides `diff`. Mirrors the engine: an agent stage saves its last reply under each of its
- * `outputs`, a review stage saves `review`, an assess stage saves `assessment`; merge and
- * placeholder stages save nothing (nor do other stages save their `outputs`).
+ * `outputs`, a review stage saves `review`, an assess stage saves `assessment`; merge,
+ * placeholder and command stages save nothing (nor do other stages save their `outputs`).
  */
 function producedArtifacts(t: WorkflowTemplate): string[] {
   const names = new Set<string>();

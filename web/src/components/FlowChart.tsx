@@ -89,6 +89,17 @@ function FlowStageBody({ stage, progress }: { stage: FlowStage; progress?: FlowP
           {t({ zh: '合并到目标分支', en: 'Merge into the target branch' })}
         </Line>
       )}
+      {stage.kind === 'command' && (
+        <Line label={kindLabel()}>
+          {t({ zh: '命令', en: 'Command' })}
+          <span className="flow-sub">
+            {t({
+              zh: 'Master 运行下面的命令，不调用 Agent',
+              en: 'The Master runs the commands below, without an agent',
+            })}
+          </span>
+        </Line>
+      )}
       {stage.kind === 'placeholder' && (
         <Line label={kindLabel()}>
           {t({ zh: '占位', en: 'Placeholder' })}
@@ -139,6 +150,11 @@ function FlowStageBody({ stage, progress }: { stage: FlowStage; progress?: FlowP
               })}
             </span>
           )}
+          {stage.kind === 'command' && stage.commands?.length === 0 && (
+            <span className="flow-sub">
+              {t({ zh: '没有要运行的命令，直接通过', en: 'Nothing to run, so it passes' })}
+            </span>
+          )}
         </Line>
       )}
       {stage.kind === 'agent' && (
@@ -167,7 +183,9 @@ function FlowStageBody({ stage, progress }: { stage: FlowStage; progress?: FlowP
         <Line label={t({ zh: '审批', en: 'Approval' })} tone="attention">
           {stage.kind === 'merge'
             ? t({ zh: '合并前人工审批', en: 'A human approves before merging' })
-            : t({ zh: '完成后人工审批', en: 'A human approves when done' })}
+            : stage.kind === 'command'
+              ? t({ zh: '命令通过后人工审批', en: 'A human approves once the commands pass' })
+              : t({ zh: '完成后人工审批', en: 'A human approves when done' })}
         </Line>
       )}
       {stage.onReject && (

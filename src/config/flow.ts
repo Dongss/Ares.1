@@ -212,10 +212,17 @@ export function effectiveBudget(
 export function budgetPauses(template: WorkflowTemplate, overrides: RunOverrides): boolean {
   return template.stages.some(
     (s) =>
-      s.kind !== 'merge' &&
-      s.kind !== 'placeholder' &&
+      runsAgent(s.kind) &&
       effectiveStage(template, s.id, overrides).escalate.on_budget_exceeded === 'pause',
   );
+}
+
+/**
+ * Stage kinds an agent runs in. In merge, placeholder and command stages the Master does the work
+ * itself, so nothing there errors, is reworked or checks the budget.
+ */
+export function runsAgent(kind: StageDef['kind']): boolean {
+  return kind === 'agent' || kind === 'review' || kind === 'assess';
 }
 
 /**
@@ -412,7 +419,7 @@ export function runsNoCommands(kind: StageDef['kind']): boolean {
  * Verify commands a stage runs: its own `verify.commands`, otherwise the repo default.
  * Review, assess and placeholder stages run none (they change no code; the reviewer's verdict is
  * the review's check); merge stages run them only after bringing in new commits from the target
- * branch.
+ * branch; command stages run them and nothing else.
  */
 export function stageVerifyCommands(def: StageDef, repoDefault: string[]): string[] {
   if (runsNoCommands(def.kind)) return [];
@@ -421,7 +428,8 @@ export function stageVerifyCommands(def: StageDef, repoDefault: string[]): strin
 
 /**
  * Where a failed / rejected stage rolls back to when the template does not say.
- * agent stage → itself; review / merge stage → the nearest earlier agent stage.
+ * agent stage → itself; any other stage (review, merge, command, placeholder, assess) → the
+ * nearest earlier agent stage, or itself when there is none.
  */
 export function defaultRollbackTarget(template: WorkflowTemplate, stageId: string): string {
   const idx = template.stages.findIndex((s) => s.id === stageId);
@@ -458,10 +466,11 @@ export function rollbackTarget(
  * - agent stage → null: a task that fails its checks is reworked within the stage
  *   (`rework`, up to `max_retries`, then the Run fails or waits for a human by `on_exhausted`);
  *   the stage itself never fails.
- * - review / merge stage → the stage is marked failed and `rollback` goes to
+ * - review / merge / command stage → the stage is marked failed and `rollback` goes to
  *   `rollbackTarget(…, 'fail')`, i.e. `on_fail` or the nearest earlier agent stage.
  *   (A merge stage fails when its verify commands fail after syncing the target branch, or when
- *   syncing it conflicts and `conflictTarget` has an agent stage to resolve that.)
+ *   syncing it conflicts and `conflictTarget` has an agent stage to resolve that; a command stage
+ *   fails when one of its commands fails.)
  */
 export function failTarget(template: WorkflowTemplate, stageId: string): string | null {
   const def = template.stages.find((s) => s.id === stageId);

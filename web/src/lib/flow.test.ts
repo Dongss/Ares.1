@@ -260,6 +260,58 @@ describe('placeholder stages', () => {
   });
 });
 
+describe('command stages', () => {
+  const withCommand = (e2e: Record<string, unknown>) =>
+    TemplateSchema.parse({
+      id: 'c',
+      stages: [
+        { id: 'code', name: '编码', agent: 'coder' },
+        { id: 'review', name: '评审', kind: 'review', agent: 'reviewer' },
+        { id: 'e2e', name: 'E2E', kind: 'command', ...e2e },
+        { id: 'merge', name: '合并', kind: 'merge', gate: true },
+      ],
+    });
+
+  it('show their commands and no agent, and go back to the nearest agent stage', () => {
+    const template = withCommand({ verify: { commands: ['npx playwright test'] } });
+    const [, , e2e] = buildFlow({ template, repoVerifyCommands: ['npm test'], agents });
+    expect(e2e).toMatchObject({
+      kind: 'command',
+      agent: null,
+      commands: ['npx playwright test'],
+      commandsFromRepo: false,
+      onFail: { id: 'code', name: '编码' },
+      onConflict: null,
+      gate: false,
+      onReject: null,
+    });
+  });
+
+  it('go back to on_fail, and on_reject when their approval is rejected', () => {
+    const template = withCommand({ on_fail: 'review', gate: true, on_reject: 'review' });
+    const [, , e2e] = buildFlow({ template, repoVerifyCommands: ['npm test'], agents });
+    expect(e2e).toMatchObject({
+      commands: ['npm test'],
+      commandsFromRepo: true,
+      onFail: { id: 'review', name: '评审' },
+      gate: true,
+      onReject: { id: 'review', name: '评审' },
+    });
+  });
+
+  it('cannot fail without commands; without a repo the default may have some', () => {
+    const template = withCommand({});
+    const [, , none] = buildFlow({ template, repoVerifyCommands: [], agents });
+    expect(none).toMatchObject({ commands: [], commandsFromRepo: true, onFail: null });
+    const [, , unknown] = buildFlow({ template, repoVerifyCommands: null, agents });
+    expect(unknown).toMatchObject({
+      commands: null,
+      commandsFromRepo: true,
+      onFail: { id: 'code', name: '编码' },
+    });
+  });
+});
+
 describe('assess stages', () => {
   it('show their agent, run no checks and never go back on failure', () => {
     const withAssess = TemplateSchema.parse({

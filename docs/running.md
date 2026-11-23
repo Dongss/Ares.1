@@ -120,7 +120,7 @@ github:
 
 ### Agent 拿不到 GitHub 凭据
 
-只把陌生人写的内容挡在提示词外面还不够：Agent 能执行命令，要是继承了本机 gh 的登录，它自己跑一下 `gh issue view 12 --comments`，陌生人的评论就又进来了；它还能以本机登录的所有 GitHub 账号读写这些账号能访问的所有仓库。Master 读 issue、发评论、推送都是自己做的，Agent 用不着 GitHub 凭据，所以 Agent（编码、评审、需求评估、侦察）和准备命令、检查命令都在去掉了 GitHub 凭据的环境里运行：
+只把陌生人写的内容挡在提示词外面还不够：Agent 能执行命令，要是继承了本机 gh 的登录，它自己跑一下 `gh issue view 12 --comments`，陌生人的评论就又进来了；它还能以本机登录的所有 GitHub 账号读写这些账号能访问的所有仓库。Master 读 issue、发评论、推送都是自己做的，Agent 用不着 GitHub 凭据，所以 Agent（编码、评审、需求评估、侦察）和准备命令、检查命令（包括命令阶段的命令）都在去掉了 GitHub 凭据的环境里运行：
 
 - 去掉 `GH_TOKEN`、`GITHUB_TOKEN`、`GH_ENTERPRISE_TOKEN`、`GITHUB_ENTERPRISE_TOKEN`，再把 `GH_TOKEN` 设成一个无效的值 `ares1-agent-no-github-access`。gh 优先用 `GH_TOKEN`，GitHub 会拒绝它，gh 也就不会退回去用存在配置文件或 macOS 钥匙串里的登录。
 - `GH_CONFIG_DIR` 指向数据目录下的空目录 `data/agent-gh-config/`，gh 在里面是未登录状态。每次启动 Agent、运行命令之前都会把它清空，Agent 往里面写的东西留不到下一次。
@@ -167,9 +167,35 @@ defaults:
 
 数据目录里已经装好的 `workflows/self-dev.yaml` 不会自动更新。旧版本写的是 `on_agent_error: human`：出错时会先自动重试，重试用完后才卡住等人，加载时也会提示。想让它出错时也不等人，就手动改成 `switch_agent`。
 
+## 命令阶段
+
+模板里的阶段除了由 Agent 执行的 `agent`（编码）、`review`（评审）、`assess`（需求评估），由 Master 执行的 `merge`（合并）和直接通过的 `placeholder`（占位），还可以是 `kind: command`：Master 在 Run 的工作目录里依次运行这一阶段的命令，不调用 Agent。项目自己的端到端测试、冒烟测试或部署前检查（比如 playwright，或者 `docker compose up` 之后探活）都可以这样放成独立的阶段，不用为每种项目写代码：
+
+```yaml
+  - id: e2e
+    name: E2E
+    kind: command
+    verify:
+      commands: ["npx playwright test"]
+    # on_fail: implement   # 命令失败时回到哪个阶段，不写就是前面最近的 Agent 阶段
+    # gate: true           # 命令通过后等人审批
+```
+
+- 命令写在 `verify.commands` 里，和其他阶段一样；不写就运行仓库登记的检查命令。写成空列表是配置错误。命令阶段不能指定 `agent`、`agent_candidates`、`planning: llm` 和 `verify.llm_check`。
+- 命令按顺序运行，有一条失败就不再往下跑。和检查命令一样不带 GitHub 凭据（见上面的「Agent 拿不到 GitHub 凭据」），每条命令的超时是 `config.yaml` 里的 `defaults.command_timeout_minutes`。输出写进数据目录的 `logs/<Run id>/command-<阶段轮次 id>.log`，Run 详情页在这一阶段下列出每条命令是否通过和输出的末尾。
+- 全部通过：阶段通过，进入下一阶段。设了 `gate: true` 时先等人审批，审批在命令通过之后；驳回时回到 `on_reject` 指向的阶段，不写就是前面最近的 Agent 阶段。
+- 有命令失败：阶段标为没通过（原因是「检查没有通过」），回退到 `on_fail` 指向的阶段，不写就是它前面最近的 Agent 阶段（通常是编码）。失败的命令、退出码和输出的末尾作为反馈交给那个阶段的 Agent。和评审打回一样计入 `max_loops`，用完后按 `on_exhausted` 处理（见下面的「返工或回退用完时」）。
+- `on_fail` 指向的不是 Agent 阶段、或者前面根本没有 Agent 阶段时，没有 Agent 按失败输出改代码，同样的代码只会重跑到回退用完，加载模板时会给出警告。
+- 命令阶段不提交，也不改 Run 的代码：命令跑完后，它们留在工作目录里的改动（生成的报告、截图等没被 git 忽略的文件）会丢掉，不会被之后的 Agent 一起提交。被 git 忽略的文件（比如 `node_modules`、构建产物）不动。
+- 阶段没写命令、仓库也没登记检查命令时，没有要运行的命令，阶段直接通过（记一个 `stage.no_commands` 事件），和没有检查命令的编码阶段一样。
+- 运行到一半被暂停或 Master 重启时，恢复后这一阶段的命令全部重新运行。
+- 这里不调用 Agent，所以 `escalate` 里出错重试、换 Agent、预算的设置对它不起作用，`timeout_minutes` 也不用于命令。
+
+默认的 `self-dev.yaml` 里 E2E 阶段仍是 `kind: placeholder`，注释写了怎样改成命令阶段。数据目录里已经装好的模板不会自动更新，需要时手动改。
+
 ## 返工或回退用完时
 
-Task 没通过检查（检查命令失败、结构化输出不合格等）时，带着问题返工；评审打回、审批被驳回、合并前同步目标分支后检查没过、合并时和目标分支冲突（见下面的「合并冲突」）时，回退到 `on_fail` / `on_reject` 指向的阶段重做。两者都有上限，用完后怎么处理由 `escalate.on_exhausted` 决定：
+Task 没通过检查（检查命令失败、结构化输出不合格等）时，带着问题返工；评审打回、审批被驳回、命令阶段的命令失败（见上面的「命令阶段」）、合并前同步目标分支后检查没过、合并时和目标分支冲突（见下面的「合并冲突」）时，回退到 `on_fail` / `on_reject` 指向的阶段重做。两者都有上限，用完后怎么处理由 `escalate.on_exhausted` 决定：
 
 ```yaml
 defaults:

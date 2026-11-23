@@ -174,8 +174,11 @@ export const StageSchema = z.strictObject({
   /**
    * placeholder: a step not implemented yet; shown in the flow and passed without doing anything.
    * assess: a read-only agent judges the requirement before any work (go / ask / drop).
+   * command: the Master runs `verify.commands` (the repo's verify commands when not given) in the
+   * Run's worktree, without an agent; when one fails, the stage goes back to `on_fail` (the
+   * nearest earlier agent stage by default) with the command and the end of its output.
    */
-  kind: z.enum(['agent', 'review', 'merge', 'placeholder', 'assess']).default('agent'),
+  kind: z.enum(['agent', 'review', 'merge', 'placeholder', 'assess', 'command']).default('agent'),
   agent: z.string().optional(),
   agent_candidates: z.array(z.string()).optional(),
   planning: z.enum(['single', 'llm']).default('single'),

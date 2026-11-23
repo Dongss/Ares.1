@@ -356,6 +356,115 @@ stages:
     expect(rollbackTarget(t, 'merge', 'reject')).toBe('implement');
   });
 
+  describe('command stages', () => {
+    const tpl = (id: string, extra: string) => `id: ${id}
+stages:
+  - { id: implement, kind: agent, agent: claude-coder }
+  - { id: docs, kind: agent, agent: claude-coder }
+  - { id: e2e, kind: command${extra} }
+  - { id: merge, kind: merge }
+`;
+    const load = (files: Record<string, string>) => {
+      const paths = home();
+      for (const [file, yaml] of Object.entries(files)) {
+        writeFile(join(paths.workflowsDir, file), yaml);
+      }
+      return loadConfig(paths, ['claude-code']);
+    };
+    const e2eOf = (t: WorkflowTemplate) => t.stages[2] as WorkflowTemplate['stages'][number];
+
+    it('load with their own commands or the repo default, and fail back like a review', () => {
+      const cfg = load({
+        'own.yaml': tpl(
+          'own',
+          ', name: E2E, gate: true, verify: { commands: [npx playwright test] }',
+        ),
+        'repo.yaml': tpl('repo', ''),
+        'back.yaml': tpl('back', ', on_fail: implement'),
+      });
+      for (const file of ['own.yaml', 'repo.yaml', 'back.yaml']) {
+        expect(cfg.errors[`workflows/${file}`]).toBeUndefined();
+        expect(cfg.warnings[`workflows/${file}`]).toBeUndefined();
+      }
+      const own = cfg.templates.get('own') as WorkflowTemplate;
+      expect(stageVerifyCommands(e2eOf(own), ['npm test'])).toEqual(['npx playwright test']);
+      const repo = cfg.templates.get('repo') as WorkflowTemplate;
+      expect(stageVerifyCommands(e2eOf(repo), ['npm test'])).toEqual(['npm test']);
+      // The nearest earlier agent stage, unless on_fail says otherwise.
+      expect(defaultRollbackTarget(own, 'e2e')).toBe('docs');
+      expect(failTarget(own, 'e2e')).toBe('docs');
+      expect(failTarget(cfg.templates.get('back') as WorkflowTemplate, 'e2e')).toBe('implement');
+      expect(rollbackTarget(own, 'e2e', 'reject')).toBe('docs');
+    });
+
+    it('cannot have what only an agent uses, nor an empty list of commands', () => {
+      const cfg = load({
+        'agent.yaml': tpl('a1', ', agent: claude-coder'),
+        'candidates.yaml': tpl('a2', ', agent_candidates: [claude-coder]'),
+        'planning.yaml': tpl('a3', ', planning: llm'),
+        'all.yaml': tpl('a4', ', agent: claude-coder, planning: llm, verify: { llm_check: true }'),
+        'empty.yaml': tpl('a5', ', verify: { commands: [] }'),
+      });
+      const errors = (file: string) => cfg.errors[`workflows/${file}`];
+      expect(errors('agent.yaml')).toEqual([
+        '阶段 e2e：command（命令）阶段只运行命令、不调用 Agent，不能指定 agent',
+      ]);
+      expect(errors('candidates.yaml')).toEqual([
+        '阶段 e2e：command（命令）阶段只运行命令、不调用 Agent，不能指定 agent_candidates',
+      ]);
+      expect(errors('planning.yaml')).toEqual([
+        '阶段 e2e：command（命令）阶段只运行命令、不调用 Agent，不能指定 planning: llm',
+      ]);
+      expect(errors('all.yaml')).toEqual([
+        '阶段 e2e：command（命令）阶段只运行命令、不调用 Agent，不能指定 agent、planning: llm、verify.llm_check',
+      ]);
+      expect(errors('empty.yaml')).toEqual([
+        '阶段 e2e：command（命令）阶段的 verify.commands 是空列表，没有要运行的命令；不写 verify.commands 时运行仓库登记的检查命令',
+      ]);
+      for (const id of ['a1', 'a2', 'a3', 'a4', 'a5']) expect(cfg.templates.has(id)).toBe(false);
+
+      setLang('en');
+      const en = load({ 'all.yaml': tpl('a4', ', agent: claude-coder, verify: { commands: [] }') });
+      expect(en.errors['workflows/all.yaml']).toEqual([
+        'Stage e2e: a command stage only runs commands and calls no agent, it cannot have agent',
+        "Stage e2e: a command stage's verify.commands is an empty list, so there is nothing to run; without verify.commands it runs the repo's verify commands",
+      ]);
+    });
+
+    it('warn when a failure goes back to no agent stage, and never about waiting or the budget', () => {
+      const cfg = load({
+        'alone.yaml': `id: alone
+stages:
+  - { id: e2e, kind: command }
+  - { id: merge, kind: merge }
+`,
+        'review.yaml': `id: to-review
+stages:
+  - { id: implement, agent: claude-coder }
+  - { id: review, kind: review, agent: claude-reviewer }
+  - { id: e2e, kind: command, on_fail: review }
+  - { id: merge, kind: merge }
+`,
+        // No agent runs there: nothing errors, is reworked or checks the budget.
+        'escalate.yaml': tpl(
+          'escalate',
+          ', escalate: { on_exhausted: human, on_agent_error: human, on_budget_exceeded: pause }',
+        ),
+      });
+      expect(cfg.templates.has('alone')).toBe(true);
+      // Without an agent stage, the merge stage cannot have conflicts resolved either.
+      expect(cfg.warnings['workflows/alone.yaml']).toEqual([
+        expect.stringMatching(/^阶段 merge：合并阶段失败时没有可回退的 Agent 阶段。/),
+        '阶段 e2e：命令阶段失败时没有可回退的 Agent 阶段。命令失败后没有 Agent 按失败输出修改代码，只会重新运行同样的代码，直到超过 max_loops。想让 Agent 修复，就把 on_fail 指向一个 Agent 阶段（kind: agent）',
+      ]);
+      expect(cfg.warnings['workflows/review.yaml']).toEqual([
+        expect.stringMatching(/^阶段 e2e：命令阶段失败时回退到的 review 不是 Agent 阶段。/),
+      ]);
+      expect(cfg.warnings['workflows/escalate.yaml']).toBeUndefined();
+      expect(budgetPauses(cfg.templates.get('escalate') as WorkflowTemplate, {})).toBe(false);
+    });
+  });
+
   it('accepts assess stages run by an agent that can run read-only, without checks', () => {
     const paths = home();
     writeFile(

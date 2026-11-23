@@ -187,6 +187,13 @@ stages:
     kind: placeholder          # 占位：暂未实现，执行到这一步直接通过
     instructions: |
       端到端测试（暂未实现）
+    # 想在这里运行项目自己的端到端测试、冒烟测试或部署前检查，就改成 kind: command 并写上命令
+    # （去掉上面的 instructions）。Master 在工作目录依次运行，不调 Agent；有命令失败时带着输出
+    # 回到 on_fail（不写就是前面最近的 Agent 阶段，即编码），计入 max_loops。不写 verify 就运行
+    # 仓库登记的检查命令。
+    # kind: command
+    # verify:
+    #   commands: ["npx playwright test"]
 
   - id: merge
     name: 合并
@@ -236,6 +243,14 @@ stages:
     kind: placeholder          # placeholder: not implemented yet, this step passes right away
     instructions: |
       End-to-end tests (not implemented yet)
+    # To run the project's own end-to-end tests, smoke tests or pre-deployment checks here, change
+    # it to kind: command and write the commands (and drop the instructions above). The Master runs
+    # them in order in the worktree, without an agent; when one fails, the stage goes back to
+    # on_fail (by default the nearest earlier agent stage, i.e. coding) with the output, counted
+    # toward max_loops. Without verify it runs the repo's verify commands.
+    # kind: command
+    # verify:
+    #   commands: ["npx playwright test"]
 
   - id: merge
     name: Merge

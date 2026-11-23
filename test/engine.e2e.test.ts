@@ -664,6 +664,297 @@ agents:
   });
 });
 
+/** TEST_WORKFLOW_YAML with an E2E command stage (`e2e`, lines of YAML) between review and merge. */
+const withCommandStage = (e2e: string) =>
+  TEST_WORKFLOW_YAML.replace(
+    '  - id: merge\n',
+    `  - id: e2e\n    name: E2E\n    kind: command\n${e2e}  - id: merge\n`,
+  );
+
+/**
+ * Coding → docs (another agent stage) → E2E commands going back to coding → merge without
+ * approval, with one rollback allowed.
+ */
+const commandOnFail = (e2eCommand: string, defaults = '') => `
+id: dev
+name: 测试流程
+defaults:
+  escalate:
+    max_retries: 2
+    on_agent_error: switch_agent
+${defaults}  max_loops: 1
+stages:
+  - id: implement
+    name: 编码
+    kind: agent
+    agent: coder
+  - id: docs
+    name: 文档
+    kind: agent
+    agent: coder2
+  - id: e2e
+    name: E2E
+    kind: command
+    on_fail: implement
+    verify:
+      commands: [${JSON.stringify(e2eCommand)}]
+  - id: merge
+    name: 合并
+    kind: merge
+`;
+
+describe('engine: command stages', () => {
+  const store = () => (h as Harness).master.store;
+  const stagesOf = (runId: string) =>
+    store()
+      .listStageRuns(runId)
+      .map((sr) => [sr.stageId, sr.status]);
+  const stageRun = (runId: string, stageId: string, round = 1) =>
+    store()
+      .listStageRuns(runId)
+      .find((sr) => sr.stageId === stageId && sr.round === round);
+  const checksOf = (runId: string, stageId: string, round = 1) => {
+    const id = stageRun(runId, stageId, round)?.id;
+    return store()
+      .listChecks(runId)
+      .filter((c) => c.stageRunId === id);
+  };
+  const eventTypes = (runId: string) =>
+    store()
+      .listEvents(runId)
+      .map((e) => e.type);
+
+  it('runs its commands without an agent and without GitHub credentials, then goes on', async () => {
+    vi.stubEnv('GITHUB_TOKEN', 'ghp_master');
+    const out = tmpDir('ares1-command-');
+    h = await harness({
+      workflow: withCommandStage(
+        `    verify:\n      commands: [${JSON.stringify(`env > ${out}/e2e.env`)}, "grep -q ok feature.txt && echo e2e-ok && echo report > e2e-report.txt"]\n`,
+      ),
+    });
+    const run = h.run();
+    const waiting = await h.waitStatus(run.id, 'waiting_approval');
+    expect(stagesOf(run.id)).toEqual([
+      ['implement', 'passed'],
+      ['review', 'passed'],
+      ['e2e', 'passed'],
+      ['merge', 'waiting_approval'],
+    ]);
+    // Only the coder and the reviewer ran; the command stage has no task.
+    expect(h.fake.calls.map((c) => c.model)).toEqual(['coder', 'reviewer']);
+    const e2e = stageRun(run.id, 'e2e');
+    expect(store().listTasks(e2e?.id as string)).toEqual([]);
+    const checks = checksOf(run.id, 'e2e');
+    expect(checks.map((c) => [c.kind, c.name, c.passed, c.attemptId])).toEqual([
+      ['command', `env > ${out}/e2e.env`, true, null],
+      [
+        'command',
+        'grep -q ok feature.txt && echo e2e-ok && echo report > e2e-report.txt',
+        true,
+        null,
+      ],
+    ]);
+    expect(checks[1]?.detail).toContain('e2e-ok');
+    const log = join(h.master.paths.logsDir, run.id, `command-${e2e?.id}.log`);
+    expect(readFileSync(log, 'utf8')).toContain('e2e-ok');
+    // No GitHub credentials, like the verify commands.
+    const env = readEnvFile(join(out, 'e2e.env'));
+    expect(env.GITHUB_TOKEN).toBeUndefined();
+    expect(env.GH_TOKEN).toBe(AGENT_GH_TOKEN);
+    expect(env.GH_CONFIG_DIR).toBe(h.master.paths.agentGhConfigDir);
+    // Nothing is committed, and what the commands left behind is not part of the work.
+    const worktree = waiting.worktreePath as string;
+    expect(git(worktree, 'rev-parse', 'HEAD')).toBe(waiting.headCommit);
+    expect(existsSync(join(worktree, 'e2e-report.txt'))).toBe(false);
+    expect(git(worktree, 'status', '--porcelain')).toBe('');
+    expect(eventTypes(run.id)).toContain('command.discarded_changes');
+
+    h.master.engine.approve(run.id);
+    await h.waitStatus(run.id, 'completed');
+    expect(git(h.repoDir, 'show', 'main:feature.txt')).toBe('ok');
+    expect(git(h.repoDir, 'ls-tree', '--name-only', 'main')).not.toContain('e2e-report.txt');
+  });
+
+  it("runs the repo's verify commands when it names none, and passes when there are none", async () => {
+    h = await harness({
+      workflow: withCommandStage(''),
+      verifyCommands: ['grep -q ok feature.txt'],
+    });
+    const run = h.run();
+    await h.waitStatus(run.id, 'waiting_approval');
+    expect(checksOf(run.id, 'e2e').map((c) => [c.name, c.passed])).toEqual([
+      ['grep -q ok feature.txt', true],
+    ]);
+    expect(eventTypes(run.id)).not.toContain('stage.no_commands');
+
+    store().updateRepo(h.repo.id, { verifyCommands: [] });
+    const bare = h.run('下一个');
+    await h.waitStatus(bare.id, 'waiting_approval');
+    expect(stageRun(bare.id, 'e2e')?.status).toBe('passed');
+    expect(checksOf(bare.id, 'e2e')).toEqual([]);
+    expect(eventTypes(bare.id)).toContain('stage.no_commands');
+  });
+
+  it('goes back to the nearest agent stage with the failed command and its output', async () => {
+    h = await harness({
+      workflow: withCommandStage(
+        '    verify:\n      commands: ["echo E2E 挂了：找不到按钮 && grep -q fixed feature.txt"]\n',
+      ),
+    });
+    let round = 0;
+    h.scripts.coder = (ctx) => {
+      round++;
+      writeFile(join(ctx.input.workdir, 'feature.txt'), round === 1 ? 'ok\n' : 'ok fixed\n');
+      return done();
+    };
+    const run = h.run();
+    await h.waitStatus(run.id, 'waiting_approval');
+    expect(stagesOf(run.id)).toEqual([
+      ['implement', 'passed'],
+      ['review', 'passed'],
+      ['e2e', 'failed'],
+      ['implement', 'passed'],
+      ['review', 'passed'],
+      ['e2e', 'passed'],
+      ['merge', 'waiting_approval'],
+    ]);
+    const failed = stageRun(run.id, 'e2e', 1);
+    expect(failed?.failReason).toBe('check');
+    expect(failed?.failFeedback).toBe(
+      '检查命令 `echo E2E 挂了：找不到按钮 && grep -q fixed feature.txt` 未通过（退出码 1）。输出末尾：\n```\nE2E 挂了：找不到按钮\n\n```',
+    );
+    expect(checksOf(run.id, 'e2e', 1).map((c) => c.passed)).toEqual([false]);
+    const rollback = store()
+      .listEvents(run.id)
+      .find((e) => e.type === 'stage.rollback');
+    expect(rollback?.data).toEqual({ from: 'e2e', to: 'implement' });
+    // No agent ran for the command stage; the coder got the failure as feedback.
+    expect(h.fake.calls.map((c) => c.model)).toEqual(['coder', 'reviewer', 'coder', 'reviewer']);
+    const prompt = h.fake.calls[2]?.prompt ?? '';
+    expect(prompt).toContain('「E2E」没有通过');
+    expect(prompt).toContain(
+      '检查命令 `echo E2E 挂了：找不到按钮 && grep -q fixed feature.txt` 未通过',
+    );
+    expect(prompt).toContain('E2E 挂了：找不到按钮');
+  });
+
+  it('goes back to on_fail, and ends the Run once past max_loops (on_exhausted: fail)', async () => {
+    h = await harness({ workflow: commandOnFail('echo 页面打不开 && false') });
+    const run = h.run();
+    const failed = await h.waitStatus(run.id, 'failed');
+    // on_fail skips the nearer agent stage (docs): back to implement.
+    const rollbacks = store()
+      .listEvents(run.id)
+      .filter((e) => e.type === 'stage.rollback')
+      .map((e) => e.data);
+    expect(rollbacks).toEqual([{ from: 'e2e', to: 'implement' }]);
+    expect(stagesOf(run.id)).toEqual([
+      ['implement', 'passed'],
+      ['docs', 'passed'],
+      ['e2e', 'failed'],
+      ['implement', 'passed'],
+      ['docs', 'passed'],
+      ['e2e', 'failed'],
+    ]);
+    const coder = h.fake.calls.filter((c) => c.model === 'coder');
+    expect(coder).toHaveLength(2);
+    expect(coder[1]?.prompt).toContain('「E2E」没有通过');
+    expect(coder[1]?.prompt).toContain('页面打不开');
+    expect(failed.blocked).toBeNull();
+    expect(failed.error).toContain(
+      '阶段「编码」已执行 2 轮，超过回退上限 1，Run 结束（on_exhausted: fail），工作目录和分支已保留。最后一次「E2E」没有通过：\n检查命令 `echo 页面打不开 && false` 未通过（退出码 1）',
+    );
+    expect(failed.error).toContain('页面打不开');
+    expect(eventTypes(run.id)).not.toContain('run.blocked');
+  });
+
+  it('with on_exhausted: human, waits at max_loops; a retry grants one more round', async () => {
+    const marker = join(tmpDir('ares1-e2e-'), 'fixed');
+    h = await harness({
+      workflow: commandOnFail(`test -f ${marker}`, '    on_exhausted: human\n'),
+    });
+    const run = h.run();
+    const blocked = await h.waitStatus(run.id, 'blocked');
+    expect(blocked.blocked?.kind).toBe('max_loops');
+    expect(blocked.blocked?.message).toContain('阶段 implement 已执行 2 轮，超过回退上限 1');
+    expect(blocked.blocked?.message).toContain(`检查命令 \`test -f ${marker}\` 未通过`);
+
+    writeFile(marker, '1\n');
+    await h.master.engine.retry(run.id);
+    await h.waitStatus(run.id, 'completed');
+    expect(store().countStageRounds(run.id, 'implement')).toBe(3);
+    expect(stageRun(run.id, 'e2e', 3)?.status).toBe('passed');
+  });
+
+  it('with a gate, waits for an approval once the commands pass; a rejection goes back', async () => {
+    h = await harness({
+      workflow: withCommandStage(
+        '    gate: true\n    verify:\n      commands: ["grep -q ok feature.txt"]\n',
+      ),
+    });
+    const run = h.run();
+    await h.waitStatus(run.id, 'waiting_approval');
+    const current = () => store().getStageRun(store().getRun(run.id).currentStageRunId as string);
+    expect(current().stageId).toBe('e2e');
+    expect(current().status).toBe('waiting_approval');
+    // The commands ran before the approval.
+    expect(checksOf(run.id, 'e2e').map((c) => c.passed)).toEqual([true]);
+    expect(store().latestApproval(current().id)?.status).toBe('pending');
+
+    // A rejection goes back to the nearest agent stage with the comment.
+    h.master.engine.reject(run.id, 'E2E 截图里按钮颜色不对');
+    await waitFor(
+      () =>
+        current().stageId === 'e2e' &&
+        current().round === 2 &&
+        current().status === 'waiting_approval',
+      'second e2e approval',
+    );
+    expect(store().countStageRounds(run.id, 'implement')).toBe(2);
+    const coder = h.fake.calls.filter((c) => c.model === 'coder');
+    expect(coder[1]?.prompt).toContain('E2E 截图里按钮颜色不对');
+
+    h.master.engine.approve(run.id);
+    await waitFor(
+      () => current().stageId === 'merge' && current().status === 'waiting_approval',
+      'merge approval',
+    );
+    expect(stageRun(run.id, 'e2e', 2)?.status).toBe('passed');
+  });
+
+  it('runs its commands again after a restart', async () => {
+    const marker = join(tmpDir('ares1-e2e-'), 'may-finish');
+    const first = await harness({
+      workflow: withCommandStage(
+        `    verify:\n      commands: [${JSON.stringify(`test -f ${marker} || sleep 30; echo half > partial.txt; grep -q ok feature.txt`)}]\n`,
+      ),
+    });
+    const run = first.run();
+    const e2eExecuting = () => {
+      const s = first.master.store;
+      const id = s.getRun(run.id).currentStageRunId;
+      const sr = id ? s.getStageRun(id) : undefined;
+      return sr?.stageId === 'e2e' && sr.status === 'executing';
+    };
+    await waitFor(e2eExecuting, 'the command stage to start');
+    // Stopped in the middle of the commands (a crash goes through the same recovery).
+    await first.close();
+
+    writeFile(marker, '1\n');
+    h = await harness({ home: first.home, repoDir: first.repoDir });
+    const waiting = await h.waitStatus(run.id, 'waiting_approval');
+    expect(stagesOf(run.id)).toEqual([
+      ['implement', 'passed'],
+      ['review', 'passed'],
+      ['e2e', 'passed'],
+      ['merge', 'waiting_approval'],
+    ]);
+    expect(checksOf(run.id, 'e2e').map((c) => c.passed)).toEqual([true]);
+    expect(existsSync(join(waiting.worktreePath as string, 'partial.txt'))).toBe(false);
+    expect(h.fake.calls).toEqual([]);
+  });
+});
+
 /** The discussion of a Run in short: 「assessor:ask」, 「human:dashboard」, 「timeout:24」. */
 const discussionKinds = (run: Run) =>
   run.discussion.map(

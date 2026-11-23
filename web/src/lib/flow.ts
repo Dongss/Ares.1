@@ -5,6 +5,7 @@ import {
   failTarget,
   replyTimeoutHours,
   rollbackTarget,
+  runsAgent,
   runsNoCommands,
   stageVerifyCommands,
 } from '../../../src/config/flow.js';
@@ -30,7 +31,7 @@ export interface FlowStageRef {
 
 export interface FlowStage extends FlowStageRef {
   kind: StageDef['kind'];
-  /** Who runs the stage; null for merge stages (the Master merges). */
+  /** Who runs the stage; null where no agent runs (merge, placeholder and command stages). */
   agent: {
     id: string;
     model: string | null;
@@ -61,7 +62,7 @@ export interface FlowStage extends FlowStageRef {
   gate: boolean;
   /**
    * Where the stage goes back to when its checks or review fail (`failTarget`). null for agent
-   * stages, which rework their task instead, and for merge stages without verify commands,
+   * stages, which rework their task instead, and for merge and command stages without commands,
    * which cannot fail.
    */
   onFail: FlowStageRef | null;
@@ -108,16 +109,19 @@ export function buildFlow({
       usesRepoDefault && repoVerifyCommands === null
         ? null
         : stageVerifyCommands(def, repoVerifyCommands ?? []);
-    // Without a repo, a merge stage on the repo default may have commands, so it may fail.
+    // Without a repo, a merge or command stage on the repo default may have commands, so it may
+    // fail.
     const failsTo =
-      def.kind === 'merge' && commands?.length === 0 ? null : failTarget(template, def.id);
+      (def.kind === 'merge' || def.kind === 'command') && commands?.length === 0
+        ? null
+        : failTarget(template, def.id);
     const conflictTo = conflictTarget(template, def.id);
     return {
       id: def.id,
       name: def.name ?? def.id,
       kind: def.kind,
       agent:
-        def.kind === 'merge' || def.kind === 'placeholder' || !def.agent
+        !runsAgent(def.kind) || !def.agent
           ? null
           : {
               id: def.agent,
