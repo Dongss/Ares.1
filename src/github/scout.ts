@@ -720,7 +720,9 @@ function codeBlock(text: string): string {
 /**
  * The section on the Master's failed upgrade, followed by a blank line; empty without one. The
  * proposals go to GitHub, so paths under the home directory are left out of what the script
- * recorded, as they are from everything the Master publishes.
+ * recorded, as they are from everything the Master publishes. A failure of the environment (no
+ * node or npm) says nothing about the code and is retried by the Master, so the scout is told not
+ * to spend a proposal on it rather than to put fixing it first.
  */
 function upgradeSection(failure: UpgradeFailure | null | undefined): string {
   if (!failure) return '';
@@ -733,27 +735,46 @@ function upgradeSection(failure: UpgradeFailure | null | undefined): string {
   const output = failure.detail
     ? `${t({ zh: '- 输出末尾：', en: '- End of the output:' })}\n${codeBlock(redactForGitHub(failure.detail))}`
     : t({ zh: '- 输出末尾：没有记下。', en: '- End of the output: not recorded.' });
-  const section = t({
-    zh: `## Master 自动升级失败
-${brandName()}的 Master 就是从这个仓库构建的：它运行在这个仓库的一份克隆（稳定副本）里，目标分支有新提交时自动升级（\`npm ci\`、\`npm run build\`，再启动新版本，检查它能否响应，并观察几分钟，看它会不会出错退出）。${date} 它尝试升级到目标分支上的提交 ${to}，失败了，已回退到 ${from} 继续运行。
+  const title = failure.env
+    ? t({
+        zh: '## Master 自动升级因运行环境失败',
+        en: "## The Master's automatic upgrade failed because of the environment",
+      })
+    : t({ zh: '## Master 自动升级失败', en: "## The Master's automatic upgrade failed" });
+  const facts = t({
+    zh: `${brandName()}的 Master 就是从这个仓库构建的：它运行在这个仓库的一份克隆（稳定副本）里，目标分支有新提交时自动升级（\`npm ci\`、\`npm run build\`，再启动新版本，检查它能否响应，并观察几分钟，看它会不会出错退出）。${date} 它尝试升级到目标分支上的提交 ${to}，失败了，已回退到 ${from} 继续运行。
 - 失败消息：${message}
-${output}
+${output}`,
+    en: `The Master of ${brandName()} is built from this repo: it runs in a clone of it (the stable copy) and upgrades itself when the target branch gets new commits (\`npm ci\`, \`npm run build\`, then it starts the new version, checks that it responds and watches it for a few minutes in case it exits with an error). On ${date} it tried to upgrade to commit ${to} on the target branch and failed; it rolled back to ${from} and keeps running that.
+- Failure message: ${message}
+${output}`,
+  });
+  const advice = failure.env ? envFailureAdvice() : codeFailureAdvice(toShort);
+  return `${title}\n${facts}\n\n${advice}\n\n`;
+}
 
-这很可能说明目标分支上的代码在稳定副本里无法构建、启动，或者启动后不久就出错退出。修好之前，每次升级都会失败，Master 一直停在旧版本上，系统的自我进化也就停了，所以修复它是最高优先级，排在上面所有线索之前：根据上面的输出和代码找出原因，把修复作为第一条提案，在证据里写上失败的提交和输出中的关键行。
+/** What the scout does about an upgrade that failed for the environment, not for the code. */
+function envFailureAdvice(): string {
+  return t({
+    zh: `这次失败出在运行环境（比如稳定副本所在的机器上找不到能用的 node 或 npm），和这个提交的代码无关。Master 不会把这个提交记成失败过，会等一段时间后自己再试，环境好了升级就会成功。所以不要为此提代码修复，也不要把它排在上面的线索前面。
+- 只有输出表明仓库里的脚本（比如 \`scripts/find-node.sh\`、\`scripts/self-upgrade.sh\`）本身有缺陷时，比如机器上明明装着合适的 node 却没有找到，才提修复：先核对问题在现在的代码里是否还在，已有的 issue 已经覆盖时不要重复提。`,
+    en: `This failure is the environment's (for example, no usable node or npm on the machine of the stable copy), not the code's in that commit. The Master does not count the commit as failed: it waits a while and tries again by itself, and the upgrade succeeds once the environment is fixed. So do not propose a code fix for it, and do not put it before the leads above.
+- Propose a fix only if the output shows a defect in a script of the repo itself (such as \`scripts/find-node.sh\` or \`scripts/self-upgrade.sh\`), for example that it missed a suitable node installed on the machine: check first whether the problem is still in the code as it is now, and do not propose it again if an existing issue covers it.`,
+  });
+}
+
+/** What the scout does about an upgrade that failed for any other reason: fix it first. */
+function codeFailureAdvice(toShort: string): string {
+  return t({
+    zh: `这很可能说明目标分支上的代码在稳定副本里无法构建、启动，或者启动后不久就出错退出。修好之前，每次升级都会失败，Master 一直停在旧版本上，系统的自我进化也就停了，所以修复它是最高优先级，排在上面所有线索之前：根据上面的输出和代码找出原因，把修复作为第一条提案，在证据里写上失败的提交和输出中的关键行。
 - 如果输出表明是网络、npm 源、磁盘空间这类环境问题，而不是代码的问题，就不要硬提代码修复。
 - 你读到的目标分支可能已经比 ${toShort} 新：先核对问题在现在的代码里是否还在，已经修好的不要再提。
 - 已有的 issue 里已经有针对这个失败的修复时，不要重复提。`,
-    en: `## The Master's automatic upgrade failed
-The Master of ${brandName()} is built from this repo: it runs in a clone of it (the stable copy) and upgrades itself when the target branch gets new commits (\`npm ci\`, \`npm run build\`, then it starts the new version, checks that it responds and watches it for a few minutes in case it exits with an error). On ${date} it tried to upgrade to commit ${to} on the target branch and failed; it rolled back to ${from} and keeps running that.
-- Failure message: ${message}
-${output}
-
-Most likely the code on the target branch cannot be built or started in the stable copy, or exits with an error soon after it starts. Until that is fixed, every upgrade fails, the Master stays on the old version, and the system stops evolving, so fixing it comes first, before all the leads above: find the cause from the output and the code, make the fix your first proposal, and cite the failed commit and the key lines of the output in its evidence.
+    en: `Most likely the code on the target branch cannot be built or started in the stable copy, or exits with an error soon after it starts. Until that is fixed, every upgrade fails, the Master stays on the old version, and the system stops evolving, so fixing it comes first, before all the leads above: find the cause from the output and the code, make the fix your first proposal, and cite the failed commit and the key lines of the output in its evidence.
 - If the output shows a problem of the environment, such as the network, the npm registry or disk space, rather than of the code, do not force a code fix.
 - The target branch you read may be newer than ${toShort}: check first whether the problem is still in the code as it is now, and do not propose a fix for one already fixed.
 - Do not propose a fix again if one for this failure is among the existing issues.`,
   });
-  return `${section}\n\n`;
 }
 
 /** A part of a Run's time, named as the dashboard and the Run summaries name it. */

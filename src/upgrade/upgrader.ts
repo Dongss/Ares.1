@@ -110,6 +110,11 @@ const UpgradeFailureSchema = z.object({
   message: z.string(),
   detail: z.string().nullable(),
   at: z.string(),
+  /**
+   * The failure is the environment's (no usable node or npm), not the commit's: the scout is not
+   * asked to fix the code for it. Missing in records written before the field existed.
+   */
+  env: z.boolean().optional(),
 });
 export type UpgradeFailure = z.infer<typeof UpgradeFailureSchema>;
 
@@ -119,7 +124,7 @@ export function lastUpgradeFailure(store: Store): UpgradeFailure | null {
   if (!value) return null;
   try {
     const parsed = UpgradeFailureSchema.safeParse(JSON.parse(value));
-    return parsed.success ? parsed.data : null;
+    return parsed.success ? { ...parsed.data, env: parsed.data.env ?? false } : null;
   } catch {
     return null;
   }
@@ -279,6 +284,7 @@ export class Upgrader {
           message,
           detail,
           at: nowIso(),
+          ...(result.env ? { env: true } : {}),
         };
         store.setSetting(LAST_FAILURE_KEY, JSON.stringify(failure));
         store.event(null, 'upgrade.failed', {

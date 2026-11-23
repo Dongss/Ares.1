@@ -951,6 +951,80 @@ describe('scoutPrompt: failed upgrade of the Master', () => {
     expect(text).toContain('fixing it comes first');
     expect(text.indexOf('automatic upgrade failed')).toBeLessThan(text.indexOf('## Recent Runs'));
   });
+
+  it('asks to fix a failure that is not the environment’s first, as before', () => {
+    const detail = 'src/a.ts(3,1): error TS1005';
+    const text = prompt({ ...failure(detail), env: false });
+    expect(text).toBe(prompt(failure(detail)));
+    expect(text).toContain('## Master 自动升级失败\n');
+    expect(text).toContain('所以修复它是最高优先级，排在上面所有线索之前');
+    expect(text).toContain('把修复作为第一条提案');
+    expect(text).not.toContain('因运行环境失败');
+  });
+
+  it('tells the scout not to spend a proposal on a failure of the environment', () => {
+    const message = '构建 bbbbbbb 时找不到能用的 node 或 npm（是运行环境的问题），已回退到 aaaaaaa';
+    const text = prompt({ ...failure('node: command not found'), message, env: true });
+    const start = text.indexOf('## Master 自动升级因运行环境失败\n');
+    expect(start).toBeGreaterThan(-1);
+    const section = text.slice(start, text.indexOf('## 最近的 Run'));
+    // The facts stay.
+    expect(section).toContain(`2026-11-20 它尝试升级到目标分支上的提交 ${'b'.repeat(40)}，失败了`);
+    expect(section).toContain('已回退到 aaaaaaa 继续运行');
+    expect(section).toContain(`- 失败消息：${message}`);
+    expect(section).toContain('- 输出末尾：\n```\nnode: command not found\n```');
+    // The advice is the environment's.
+    expect(text).not.toContain('## Master 自动升级失败');
+    expect(text).not.toContain('修复它是最高优先级');
+    expect(text).not.toContain('排在上面所有线索之前');
+    expect(text).not.toContain('把修复作为第一条提案');
+    expect(section).toContain('这次失败出在运行环境');
+    expect(section).toContain('和这个提交的代码无关');
+    expect(section).toContain('会等一段时间后自己再试');
+    expect(section).toContain('所以不要为此提代码修复，也不要把它排在上面的线索前面');
+    expect(section).toContain('只有输出表明仓库里的脚本（比如 `scripts/find-node.sh`');
+    expect(section).toContain('已有的 issue 已经覆盖时不要重复提');
+  });
+
+  it('tells it in English too, with no Chinese left', () => {
+    setLang('en');
+    const english = (env?: boolean) =>
+      scoutPrompt({
+        repoName: 'demo',
+        max: 3,
+        runs: '(no Runs yet)',
+        issues: '',
+        upgrade: {
+          ...failure('node: command not found'),
+          message: 'Building bbbbbbb found no usable node or npm; rolled back to aaaaaaa',
+          ...(env === undefined ? {} : { env }),
+        },
+      });
+    const text = english(true);
+    expect(text).not.toMatch(/[一-鿿]/);
+    expect(text).toContain("## The Master's automatic upgrade failed because of the environment\n");
+    expect(text).toContain(`On 2026-11-20 it tried to upgrade to commit ${'b'.repeat(40)}`);
+    expect(text).toContain('- Failure message: Building bbbbbbb found no usable node or npm');
+    expect(text).toContain('- End of the output:\n```\nnode: command not found\n```');
+    expect(text).not.toContain('fixing it comes first');
+    expect(text).not.toContain('make the fix your first proposal');
+    expect(text).toContain("This failure is the environment's");
+    expect(text).toContain('it waits a while and tries again by itself');
+    expect(text).toContain(
+      'So do not propose a code fix for it, and do not put it before the leads above.',
+    );
+    expect(text).toContain(
+      'a defect in a script of the repo itself (such as `scripts/find-node.sh`',
+    );
+    expect(text.indexOf('because of the environment')).toBeLessThan(text.indexOf('## Recent Runs'));
+
+    const code = english(false);
+    expect(code).toBe(english());
+    expect(code).not.toMatch(/[一-鿿]/);
+    expect(code).toContain("## The Master's automatic upgrade failed\n");
+    expect(code).toContain('fixing it comes first, before all the leads above');
+    expect(code).not.toContain("This failure is the environment's");
+  });
 });
 
 describe('scout in English', () => {

@@ -244,7 +244,13 @@ describe('upgrader', () => {
     const failed = eventsOf(h, 'upgrade.failed');
     expect(failed).toHaveLength(1);
     expect(JSON.parse(failed[0]?.data ?? '{}')).toEqual({ from, to, message, detail });
-    expect(lastUpgradeFailure(h.master.store)).toMatchObject({ from, to, message, detail });
+    expect(lastUpgradeFailure(h.master.store)).toMatchObject({
+      from,
+      to,
+      message,
+      detail,
+      env: false,
+    });
     expect(h.master.store.getSetting('upgrade.failed_to')).toBe(to);
 
     // And it does not try that commit again.
@@ -289,7 +295,12 @@ describe('upgrader', () => {
       message: '拉取或构建 bbb 失败',
       detail,
       at: expect.any(String),
+      env: false,
     });
+    // Only a failure of the environment records the flag.
+    expect(
+      JSON.parse(h.master.store.getSetting('upgrade.last_failure') ?? '{}'),
+    ).not.toHaveProperty('env');
     await h.close();
 
     // Still there after another start without a result; gone once an upgrade succeeds.
@@ -302,6 +313,19 @@ describe('upgrader', () => {
     );
     h = await harness({ home });
     expect(lastUpgradeFailure(h.master.store)).toBeNull();
+  });
+
+  it('reads a failure recorded before it said whether the environment caused it', async () => {
+    h = await harness();
+    const old = {
+      from: 'aaa',
+      to: 'bbb',
+      message: '拉取或构建 bbb 失败',
+      detail: null,
+      at: '2026-11-20T08:00:00.000Z',
+    };
+    h.master.store.setSetting('upgrade.last_failure', JSON.stringify(old));
+    expect(lastUpgradeFailure(h.master.store)).toEqual({ ...old, env: false });
   });
 
   it('counts a result file of the wrong shape as a failure it cannot read', async () => {
@@ -464,7 +488,8 @@ describe('upgrader', () => {
     expect(failedEvents(t)).toEqual([{ from, to, message, env: true }]);
     // Not given up like a commit that failed: nothing records it as failed.
     expect(t.master.store.getSetting('upgrade.failed_to')).toBeNull();
-    expect(lastUpgradeFailure(t.master.store)).toMatchObject({ to, message });
+    // Recorded as the environment's, so the scout is not asked to fix the code for it.
+    expect(lastUpgradeFailure(t.master.store)).toMatchObject({ to, message, env: true });
 
     // Within a check interval, it waits.
     await t.master.upgrader.check();
