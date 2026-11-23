@@ -112,6 +112,10 @@ web/                  dashboard (React + Vite)
                       each page (with *.test.ts next to them)
   src/styles.css      all styles
 docs/                 documents for people besides the README (in Chinese)
+  examples/           configuration examples laid out like a data directory: config.yaml,
+                      agents.yaml, workflows/ (light, strict, with-e2e, cross-review) and a
+                      README on copying them and on the repo registration per language;
+                      loaded by test/examples.test.ts
 test/
   helpers.ts          temp dirs and repos, a Master with fake agents (harness), FakeGitHub
   *.test.ts           tests run by npm test
@@ -172,6 +176,7 @@ test/
 - `README.md` (Chinese) holds the requirements and goals. Do not change the goals.
 - This file is for agents: layout, commands and conventions. Keep it in English, and update it when the layout, commands or conventions change.
 - Other documents go in `docs/`, written in Chinese only; no English copies. `docs/running.md` covers running, configuring and upgrading; update it when behavior, configuration or the API changes.
+- `docs/examples/` holds configuration examples people copy into their data directory, commented in Chinese only. Keep them in sync with the schema (`src/config/schema.ts`) and the loading rules (`src/config/load.ts`): `test/examples.test.ts` loads the directory as a Master home and fails on any error or warning, so a schema change that breaks an example also updates the example. When a new setting is worth showing, add it there too.
 
 ## Notes
 

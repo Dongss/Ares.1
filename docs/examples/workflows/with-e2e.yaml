@@ -1,0 +1,57 @@
+# 带 E2E 的流程：编码 → 评审 → E2E → 合并。
+#
+# 适合有端到端测试、冒烟测试的项目（前端、带数据库的服务等）：单元测试之外，合并前再把整个应用跑起来测一遍。
+# E2E 是 kind: command 的阶段：Master 在 Run 的工作目录里依次运行命令，不调用 Agent；
+# 有命令失败时，带着失败的命令和输出的末尾回到编码阶段（on_fail），由编码 Agent 按输出修改。
+#
+# 命令要用到的浏览器、依赖，在看板的仓库登记里用准备命令装好（见 README.md）。
+
+id: with-e2e
+name: 带 E2E
+description: 编码 → 评审 → E2E（命令阶段）→ 合并；E2E 失败时回到编码
+
+defaults:
+  escalate:
+    max_retries: 2               # 检查没过时最多返工 2 次；Agent 出错时同一个 Agent 也最多重试 2 次（分开计数）
+    on_agent_error: switch_agent # 重试用完后换一个 Agent 再试，都不行就结束 Run、标为失败
+    on_budget_exceeded: abort    # 花费达到 budget_usd 后结束 Run、标为失败
+    on_exhausted: fail           # 返工或回退用完后结束 Run、标为失败，从 issue 来的会带着原因自动重做
+  max_loops: 3                 # E2E 失败、评审打回、审批驳回都会回退，同一阶段最多回退重做 3 轮
+  budget_usd: 30               # 单个 Run 的预算（美元）；不写 = 不限
+
+stages:
+  - id: implement
+    name: 编码
+    kind: agent
+    agent: claude-coder
+    instructions: |
+      实现目标中描述的需求，并补充必要的测试；涉及界面或接口行为的改动，补上或更新对应的端到端测试。
+
+  - id: review
+    name: 评审
+    kind: review
+    agent: claude-reviewer
+    inputs: [diff]
+    on_fail: implement
+
+  - id: e2e
+    name: E2E
+    kind: command              # 由 Master 运行命令，不能指定 agent；命令的超时是 config.yaml 的 defaults.command_timeout_minutes
+    verify:
+      commands:                # 依次运行，有一条失败就停下、回到 on_fail；不写 verify 就运行仓库登记的检查命令
+        - npx playwright test
+      # 不是网页项目时，换成把服务跑起来再探活，例如（写成一条命令，失败时也会把服务停掉）：
+      #   - |
+      #     set -e
+      #     trap 'docker compose down -v' EXIT
+      #     docker compose up -d --build --wait
+      #     curl -fsS --retry 30 --retry-delay 2 --retry-all-errors http://127.0.0.1:8080/healthz
+    on_fail: implement         # 命令失败时回到编码阶段，失败的命令、退出码和输出末尾作为反馈交给编码 Agent。
+                               # 指向不是 Agent 阶段（比如评审）时没人改代码，只会重跑同样的代码（加载时会警告）
+    # 命令跑完后留在工作目录里、没被 git 忽略的文件（报告、截图等）会被丢掉，不会被提交
+
+  - id: merge
+    name: 合并
+    kind: merge
+    gate: true                 # 合并前等人审批；仓库设了 auto_merge: true 时从 issue 来的 Run 不等审批
+    on_reject: implement

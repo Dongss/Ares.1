@@ -1,0 +1,70 @@
+# Agent 定义示例：复制到数据目录（默认 ~/.ares1）下的 agents.yaml，保存后自动生效。
+#
+# Agent = CLI + 模型 + 运行参数。同一个 CLI 换了模型、effort 或权限就是另一个 Agent，
+# 模板里按这里的名字（agents 下面的键）引用 Agent。
+#
+# 某个 Agent 写错了（字段拼错、cli 不支持等）只会停用它自己，看板的「配置」页会写明原因；
+# 引用了它的模板也会被停用。
+#
+# 模板设了 on_agent_error: switch_agent（默认就是）时，Agent 出错且重试用完后，Master 从这里
+# 挑一个这个 Task 还没用过、已启用的 Agent 接着做：先挑档次（tier）不低于当前 Agent 的，
+# 同档次里挑成本（cost）低的，再一样就按这个文件里的顺序；需求评估阶段只挑 claude-code 的。
+# 所以 tier、cost 和顺序决定了出错时换给谁。
+
+agents:
+  # 主力编码：最强的模型配高 effort，贵，但返工少
+  claude-coder:
+    cli: claude-code          # 用哪个 CLI 运行：claude-code（Claude Code）或 cursor-agent
+    model: opus               # 传给 claude --model：opus / sonnet / haiku 这类别名，或完整的模型名
+    effort: xhigh             # 推理强度，传给 claude --effort：low / medium / high / xhigh / max；不写则用 CLI 的默认值
+    tier: high                # 能力档次：low / mid / high，默认 mid；出错换 Agent 时先找不低于这个档次的
+    cost: high                # 成本档次：low / mid / high，默认 mid；同档次里先换成本低的
+    tags: [coding]            # 标签：只在看板的「配置」页显示，方便自己归类
+    timeout_minutes: 90       # 这个 Agent 单次执行的超时（分钟）；模板阶段的 timeout_minutes 优先，
+                              # 都不写时用 config.yaml 的 defaults.timeout_minutes
+    args: ["--fallback-model", "sonnet"]  # 原样追加到命令行末尾的参数：这里是 opus 繁忙或不可用时临时改用 sonnet；
+                                          # 不要在这里写 --effort（和 effort 字段冲突，会报错），也不要写 --model
+
+  # 评审、需求评估、侦察：便宜一档的模型，评审只读代码、给意见，用不着最强的模型
+  claude-reviewer:
+    cli: claude-code
+    model: sonnet
+    effort: high
+    tier: mid
+    cost: mid
+    tags: [review, assess, scout]
+    # 需求评估和侦察都以只读方式运行，只有 claude-code 支持，所以它们要用 claude-code 的 Agent
+
+  # 只改文件、不执行命令的 Agent：适合改文档这类不用跑命令的小活（见 workflows/light.yaml）
+  claude-docs:
+    cli: claude-code
+    model: haiku              # 最便宜的模型；不写 effort，用 CLI 的默认值
+    tier: low
+    cost: low
+    tags: [docs]
+    permission: safe          # full（默认）= 可以执行命令；safe = 只能改文件，不能执行任何命令（包括测试、构建和 git）。
+                              # 检查命令仍由 Master 在它改完后运行，没通过就带着输出返工。
+                              # 评审要运行 git diff，不要让 safe 的 Agent 做评审
+
+  # 另一家的模型（通过 cursor-agent 运行），用来交叉评审（见 workflows/cross-review.yaml）
+  cursor-grok:
+    cli: cursor-agent
+    model: grok-4.7-high      # cursor-agent 的推理强度写在模型名里（-low / -medium / -high / -xhigh），
+                              # 不能配置 effort 字段（会报错）。账号能用哪些模型：cursor-agent --list-models
+    tier: high
+    cost: mid
+    tags: [coding, review]
+    price:                    # 每百万 token 的价格（美元）。cursor-agent 只报 token 数、不报花费，
+      input: 3                # 配了价格 Master 才能估算花费、执行预算（budget_usd、daily_budget_usd）；
+      output: 15              # 这里的数字只是示例，按你账号的实际价格填写。Claude Code 自己报花费，不用配
+    timeout_minutes: 60
+
+  # 停用的 Agent：最强的配置，留着给难啃的需求，需要时把 enabled 改成 true（或删掉这一行）
+  claude-max:
+    cli: claude-code
+    model: opus
+    effort: max
+    tier: high
+    cost: high
+    tags: [coding]
+    enabled: false            # false = 停用：模板不能引用它，出错换 Agent 时也不会换到它；默认 true

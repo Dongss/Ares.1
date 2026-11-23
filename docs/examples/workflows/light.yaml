@@ -1,0 +1,47 @@
+# 轻量流程：编码 → 评审 → 合并，不做需求评估。
+#
+# 适合文档仓库、改配置、修错别字这类小改动：需求写得清楚、改错了代价小，省掉需求评估那一轮的时间和花费。
+# 没有需求评估，编码 Agent 只能按自己对 issue 的理解去做，不会先提问；需求可能有歧义时改用 strict.yaml。
+#
+# 编码用只改文件、不执行命令的 claude-docs（见 agents.yaml），检查交给 Master 运行仓库登记的检查命令。
+# 要改代码的小需求，把编码阶段的 agent 换成 claude-coder 这类能执行命令的 Agent。
+
+id: light                      # 模板 id：config.yaml 的 github.repos.<仓库名>.template 按它引用；小写字母、数字、- 和 _
+name: 轻量                      # 看板上显示的名字
+description: 编码 → 评审 → 合并，不做需求评估；适合文档和小改动
+
+defaults:                      # 整个模板的默认设置，阶段里的 escalate 可以按阶段覆盖
+  escalate:
+    max_retries: 1               # 检查没过时最多返工 1 次；Agent 出错时也只重试 1 次（两者分开计数）。默认 2
+    on_agent_error: switch_agent # Agent 出错且重试用完后：换一个 Agent 再试，都不行就结束 Run、标为失败（默认）。
+                                 # retry = 不换 Agent，重试用完就失败；human = 卡住等人（没人在场时就停在那里，加载时会警告）
+    on_budget_exceeded: abort    # 花费达到 budget_usd 后：结束 Run、标为失败（默认）；pause = 卡住等人调高预算（加载时会警告）
+    on_exhausted: fail           # 返工 max_retries 次仍没通过，或回退超过 max_loops：结束 Run、标为失败，
+                                 # 从 issue 来的会带着失败原因自动重做（默认）；human = 卡住等人（加载时会警告）
+  max_loops: 2                 # 评审打回、审批驳回后，同一阶段最多回退重做几轮。默认 3
+  budget_usd: 5                # 单个 Run 的预算（美元）：每次启动 Agent 前检查，达到后按 on_budget_exceeded 处理；
+                               # 不写 = 不限。按看板「统计」页里实际的花费调整
+
+stages:
+  - id: implement
+    name: 编码
+    kind: agent                # 由 Agent 改代码；改完后 Master 运行检查命令，没通过就带着输出返工
+    agent: claude-docs
+    instructions: |
+      按目标修改文档或做小的改动，改动范围只限于需求本身。
+    # 检查命令默认用看板上仓库登记的检查命令，也可以在这里覆盖：
+    # verify:
+    #   commands: ["npx markdownlint-cli2 '**/*.md'"]
+
+  - id: review
+    name: 评审
+    kind: review               # 由 Agent 评审改动，打回时带着意见回到 on_fail
+    agent: claude-reviewer     # 评审 Agent 要和编码 Agent 不同，否则就是自己评自己（加载时会警告）
+    inputs: [diff]             # 放进提示词的资料：diff = 本 Run 的改动
+    on_fail: implement         # 评审打回时回到哪个阶段；不写就是前面最近的 Agent 阶段
+
+  - id: merge
+    name: 合并
+    kind: merge                # 由 Master 合并进目标分支，必须是最后一个阶段
+    gate: true                 # 合并前等人审批。仓库在 config.yaml 里设了 auto_merge: true 时，从 issue 来的 Run 不等审批
+    on_reject: implement       # 审批被驳回时回到哪个阶段，驳回意见交给那个阶段的 Agent

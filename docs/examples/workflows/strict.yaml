@@ -1,0 +1,56 @@
+# 严格流程：需求评估 → 编码 → 评审 → 人工审批 → 合并。
+#
+# 适合生产仓库：每个需求先由只读的 Agent 评估，有疑问就在 issue 上提问、等人回复；
+# 合并前一定由人看过。配合 config.yaml 里这个仓库的 auto_merge: false 使用：
+# auto_merge: true 会让从 issue 来的 Run 跳过合并阶段的审批。
+#
+# 人工把关只用 gate（审批）表达，escalate 仍然选「不等人」的写法：Agent 出错、返工用完、超出预算时
+# Run 结束、标为失败，从 issue 来的会自动重做。escalate 里写 human / pause 会让 Run 在没人时一直卡住，
+# 加载模板时会给出警告。
+
+id: strict
+name: 严格
+description: 需求评估 → 编码 → 评审 → 人工审批 → 合并；适合生产仓库
+
+defaults:
+  escalate:
+    max_retries: 2               # 检查没过时最多返工 2 次；Agent 出错时同一个 Agent 也最多重试 2 次（分开计数）
+    on_agent_error: switch_agent # 重试用完后换一个 Agent 再试，都不行就结束 Run、标为失败
+    on_budget_exceeded: abort    # 花费达到 budget_usd 后结束 Run、标为失败
+    on_exhausted: fail           # 返工或回退用完后结束 Run、标为失败，从 issue 来的会带着原因自动重做
+  max_loops: 3                 # 评审打回、审批驳回后，同一阶段最多回退重做 3 轮；人多次驳回用完后也按 on_exhausted 处理
+  budget_usd: 40               # 单个 Run 的预算（美元）；不写 = 不限
+
+stages:
+  - id: assess
+    name: 需求评估
+    kind: assess               # 只读地评估需求：go = 开工；ask = 在 issue 上提问等人回复；drop = 人同意后不做
+    agent: claude-reviewer     # 以只读方式运行，只能用 claude-code 的 Agent
+    reply_timeout_hours: 48    # 提问后等人回复几小时，超时由评估自己决定（写明假设后开工，或者不做）。
+                               # 0 = 不等人；null = 一直等到有人回复（Run 只等人，不会自己往下走）；不写 = 24
+
+  - id: implement
+    name: 编码
+    kind: agent
+    agent: claude-coder
+    inputs: [assessment]       # 有需求评估阶段时，后面的编码、评审阶段都要带上 assessment：
+                               # 讨论后修改的需求只通过它交给 Agent（漏了加载时会警告）
+    instructions: |
+      实现目标中描述的需求，并补充必要的测试。不要改动和需求无关的代码。
+    escalate:                  # 按阶段覆盖 defaults.escalate：编码比评审更容易返工，这里多给一次
+      max_retries: 3
+
+  - id: review
+    name: 评审
+    kind: review
+    agent: claude-reviewer     # 和需求评估用同一个 Agent 没关系，只要和编码 Agent 不同
+    inputs: [diff, assessment]
+    on_fail: implement
+    timeout_minutes: 30        # 这个阶段单次执行的超时（分钟），优先于 agents.yaml 和 config.yaml 里的超时
+
+  - id: merge
+    name: 合并
+    kind: merge
+    gate: true                 # 人工审批：在看板上批准后才合并，驳回时带着意见回到 on_reject
+    on_reject: implement
+    # on_fail 不写：合并时和目标分支冲突，回到前面最近的 Agent 阶段（编码）由 Agent 解决冲突

@@ -1,0 +1,50 @@
+# 交叉评审流程：编码 → 另一家模型评审 → 合并。
+#
+# 适合想减少同一个模型「看不出自己的错」的项目：编码用 Claude（claude-coder，通过 Claude Code），
+# 评审用 Grok（cursor-grok，通过 cursor-agent），两家的盲点不一样，评审更容易挑出问题。
+# 某一家的服务宕机或额度用完时，出错换 Agent 也能换到另一家接着做（见下面的 on_agent_error）。
+#
+# 关于 agent_candidates：模板格式里有这个字段（给一个阶段列出几个候选 Agent），但还没有实现，
+# 写了它的模板会被停用，看板「配置」页会报错。现在出错时换 Agent 靠 on_agent_error: switch_agent，
+# 换给谁由 agents.yaml 里各 Agent 的 tier、cost 和顺序决定。
+
+id: cross-review
+name: 交叉评审
+description: 编码和评审用不同厂商的 Agent，出错时换 Agent 再试
+
+defaults:
+  escalate:
+    max_retries: 1               # Agent 出错时同一个 Agent 只重试 1 次就换 Agent，比默认的 2 次更快换到另一家；
+                                 # 检查没过时也最多返工 1 次（两者分开计数）
+    on_agent_error: switch_agent # 重试用完后换一个这个 Task 还没用过的 Agent：先挑档次（tier）不低于当前 Agent 的，
+                                 # 同档次挑成本（cost）低的。按示例的 agents.yaml：
+                                 #   编码的 claude-coder 出错 → 换成 cursor-grok（同为 high，成本更低）
+                                 #   评审的 cursor-grok 出错 → 换成 claude-coder（这时评审和编码是同一个 Agent，
+                                 #   交叉评审就失效了；介意的话在 agents.yaml 里再加一个 high 档次的评审 Agent）
+                                 # 换过的 Agent 都出错，Run 结束、标为失败，从 issue 来的过一会儿自动重做
+    on_budget_exceeded: abort    # 花费达到 budget_usd 后结束 Run、标为失败。cursor-agent 不报花费，
+                                 # 要在 agents.yaml 里给 cursor-grok 配 price，它的花费才算得进预算
+    on_exhausted: fail           # 返工或回退用完后结束 Run、标为失败
+  max_loops: 3                 # 评审打回、审批驳回后，同一阶段最多回退重做 3 轮
+  budget_usd: 30               # 单个 Run 的预算（美元）；不写 = 不限
+
+stages:
+  - id: implement
+    name: 编码
+    kind: agent
+    agent: claude-coder
+    instructions: |
+      实现目标中描述的需求，并补充必要的测试。
+
+  - id: review
+    name: 交叉评审
+    kind: review
+    agent: cursor-grok         # 和编码不同厂商的模型
+    inputs: [diff]
+    on_fail: implement
+
+  - id: merge
+    name: 合并
+    kind: merge
+    gate: true                 # 合并前等人审批；仓库设了 auto_merge: true 时从 issue 来的 Run 不等审批
+    on_reject: implement

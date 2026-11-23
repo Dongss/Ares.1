@@ -30,12 +30,14 @@ node dist/cli.js      # 数据目录 ~/.ares1（或 $ARES1_HOME），端口 4870
 
 配置文件改动后会自动重新加载。改端口或 CLI 路径（`bins`）需要重启 Master。
 
+默认配置只有给 Ares.1 开发自己用的 `self-dev` 模板。给别的项目配置时，可以参考 [`docs/examples/`](examples/README.md)：一组完整的 `config.yaml`、`agents.yaml` 和几种场景的流程模板（轻量、严格、带 E2E、交叉评审），每一项都有注释，目录结构和数据目录一样，可以直接复制过来改；那里还写了 npm、pnpm、Python、Go、Rust 项目登记仓库时检查命令和准备命令怎么填。
+
 ## 接入 GitHub
 
 Run 只从 GitHub issue 来。
 
 1. 安装并登录 [gh](https://cli.github.com/)。登录了多个账号时，在 `config.yaml` 的 `github.account` 里指定用哪个。
-2. 在看板的「仓库」页登记本地仓库：填仓库名、绝对路径、目标分支和检查命令。
+2. 在看板的「仓库」页登记本地仓库：填仓库名、绝对路径、目标分支和检查命令。常见语言的项目怎么填检查命令和准备命令，见 [`docs/examples/`](examples/README.md#在看板上登记仓库)。
 3. 在 `config.yaml` 里打开 `github`，把登记的仓库名写进 `repos`：
 
    ```yaml
@@ -59,7 +61,7 @@ Master 第一次访问仓库时会自动创建这些标签：
 | `ares1:failed` | 被终止，或失败次数达到上限后不再自动重做。重新加 `ares1:ready` 会再做一次 |
 | `ares1:auto` | 按 `auto_accept` 的设置自动采纳的 |
 
-AI 侦察、自动采纳、自动合并、推送和每日预算的设置写在 `config.yaml` 的注释里。
+AI 侦察、自动采纳、自动合并、推送和每日预算的设置写在 `config.yaml` 的注释里；[`docs/examples/config.yaml`](examples/config.yaml) 有登记了多个仓库、各用不同设置的完整示例。
 
 流程里有需求评估阶段（`kind: assess`）时，评估有疑问会在 issue 上提问，等你在 issue 下（或 Run 详情页）回复，回复后带着讨论重新评估。为了没人在场时系统也不停转，等待有上限，由评估阶段的 `reply_timeout_hours` 决定：
 
@@ -193,7 +195,7 @@ defaults:
 - 运行到一半被暂停或 Master 重启时，恢复后这一阶段的命令全部重新运行。
 - 这里不调用 Agent，所以 `escalate` 里出错重试、换 Agent、预算的设置对它不起作用，`timeout_minutes` 也不用于命令。
 
-默认的 `self-dev.yaml` 里 E2E 阶段仍是 `kind: placeholder`，注释写了怎样改成命令阶段。数据目录里已经装好的模板不会自动更新，需要时手动改。
+默认的 `self-dev.yaml` 里 E2E 阶段仍是 `kind: placeholder`，注释写了怎样改成命令阶段。数据目录里已经装好的模板不会自动更新，需要时手动改。带命令阶段的完整模板见 [`docs/examples/workflows/with-e2e.yaml`](examples/workflows/with-e2e.yaml)。
 
 ## 返工或回退用完时
 
