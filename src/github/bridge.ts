@@ -752,29 +752,47 @@ export class IssueBridge {
         issue: prev.number,
         newRun: next.id,
       });
-      store.setIssueSynced(next.id, 'queued');
     });
+    // The label and the comment are each tried even when the other fails: a lost comment must not
+    // leave the old Run's label on the issue (ares1:needs-you on an issue whose Run only waits in
+    // the queue), and a lost label must not cost the comment. The first error is reported.
+    const errors: unknown[] = [];
+    const attempt = async (step: () => Promise<void>) => {
+      try {
+        await step();
+      } catch (err) {
+        errors.push(err);
+      }
+    };
     try {
-      await this.comment(
-        prev.repo,
-        prev.number,
-        goalChangedComment({
-          oldRunId: run.id,
-          runId: next.id,
-          templateName: this.templateName(cfg),
-          dashboardUrl: this.dashboardUrl(),
-        }),
-      );
-      // The Run may have moved on already; the next sync reports where it is.
-      await this.gh().setLabels(
-        prev.repo,
-        prev.number,
-        withStatusLabel(latest.labels, LABELS.running),
+      await attempt(async () => {
+        // The Run may have moved on already; the next sync reports where it is.
+        await this.gh().setLabels(
+          prev.repo,
+          prev.number,
+          withStatusLabel(latest.labels, LABELS.running),
+        );
+        // Marked caught up only once the label is set: until then the next sync sets the label
+        // the new Run's status wants. A crash in between only sets the same label again.
+        store.setIssueSynced(next.id, 'queued');
+      });
+      await attempt(() =>
+        this.comment(
+          prev.repo,
+          prev.number,
+          goalChangedComment({
+            oldRunId: run.id,
+            runId: next.id,
+            templateName: this.templateName(cfg),
+            dashboardUrl: this.dashboardUrl(),
+          }),
+        ),
       );
     } finally {
       // A removal that fails is recorded on the old Run by the engine.
       await this.deps.engine.removeGoalChangedWorkspace(run.id, next.id);
     }
+    if (errors.length > 0) throw errors[0];
   }
 
   /** The Run merges, or waits for the approval to merge: too late to start it over. */

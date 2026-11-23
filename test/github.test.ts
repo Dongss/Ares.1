@@ -2142,6 +2142,73 @@ describe('issues: changed by a human', () => {
     await t.waitStatus(next.id, 'waiting_approval');
   });
 
+  /**
+   * Issue #1's Run paused, so the issue says ares1:needs-you; from now on every coder call keeps
+   * working, so the new Run stays running.
+   */
+  async function paused() {
+    const { t, run } = await coding();
+    t.scripts.coder = () => new Promise(() => {});
+    await t.master.engine.pause(run.id);
+    await t.master.issues.sync();
+    expect(gh.get(1).labels).toEqual([LABELS.needsYou]);
+    const { worktreePath } = t.master.store.getRun(run.id);
+    if (!worktreePath) throw new Error('no worktree');
+    return { t, run, worktreePath };
+  }
+
+  it('still sets ares1:running when the comment on the new Run fails', async () => {
+    const { t, run: old, worktreePath } = await paused();
+    const commentsBefore = gh.get(1).comments.length;
+    gh.failing.set('comment #1', '评论发不出去');
+
+    gh.get(1).body = '不保留旧写法';
+    await t.master.issues.poll();
+
+    expect(t.master.store.getRun(old.id).status).toBe('cancelled');
+    expect(runsOf(t)).toHaveLength(2);
+    expect(gh.get(1).labels).toEqual([LABELS.running]);
+    expect(gh.get(1).comments).toHaveLength(commentsBefore);
+    expect(existsSync(worktreePath)).toBe(false);
+    expect(t.master.issues.status().lastError?.message).toContain('评论发不出去');
+
+    // Nothing more to do on the issue, nor another Run.
+    gh.failing.clear();
+    await t.master.issues.poll();
+    expect(gh.get(1).labels).toEqual([LABELS.running]);
+    expect(gh.get(1).comments).toHaveLength(commentsBefore);
+    expect(runsOf(t)).toHaveLength(2);
+    expect(t.master.issues.status().lastError).toBeNull();
+  });
+
+  it('still comments when setting the label fails; a later poll sets it', async () => {
+    const { t, run: old, worktreePath } = await paused();
+    const commentsBefore = gh.get(1).comments.length;
+    gh.failing.set(`setLabels #1 ${LABELS.running}`, '标签改不了');
+
+    gh.get(1).body = '不保留旧写法';
+    await t.master.issues.poll();
+
+    expect(t.master.store.getRun(old.id).status).toBe('cancelled');
+    const next = runsOf(t)[1];
+    if (!next) throw new Error('no new run');
+    const comments = gh.get(1).comments.slice(commentsBefore);
+    expect(comments).toHaveLength(1);
+    expect(stripMarker(comments[0] ?? '')).toContain(`按新内容开始了 Run \`${next.id}\``);
+    expect(gh.get(1).labels).toEqual([LABELS.needsYou]);
+    expect(t.master.store.getRun(next.id).issueSynced).toBeNull();
+    expect(existsSync(worktreePath)).toBe(false);
+    expect(t.master.issues.status().lastError?.message).toContain('标签改不了');
+
+    gh.failing.clear();
+    await t.waitStatus(next.id, 'running');
+    await t.master.issues.poll();
+    expect(t.master.store.getRun(next.id).issueSynced).toBe('running');
+    expect(gh.get(1).labels).toEqual([LABELS.running]);
+    expect(gh.get(1).comments).toHaveLength(commentsBefore + 1);
+    expect(t.master.issues.status().lastError).toBeNull();
+  });
+
   it('leaves the Run alone while the text stays the same', async () => {
     const { t, run, signals } = await coding();
     // Whitespace around the body, other labels and comments do not change the goal.
