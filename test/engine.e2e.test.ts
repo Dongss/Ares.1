@@ -242,6 +242,24 @@ agents:
     expect(reviewerCall?.prompt).toContain('不需要重复运行');
   });
 
+  it('tells a second review in a row the same verify commands passed', async () => {
+    h = await harness({
+      workflow: TEST_WORKFLOW_YAML.replace(
+        '  - id: merge\n',
+        '  - id: review2\n    name: 复审\n    kind: review\n    agent: reviewer\n    on_fail: implement\n  - id: merge\n',
+      ),
+    });
+    const run = h.run();
+    await h.waitStatus(run.id, 'waiting_approval');
+    // The first review's task passed on the same commit, without commands of its own.
+    const prompts = h.fake.calls.filter((c) => c.model === 'reviewer').map((c) => c.prompt);
+    expect(prompts).toHaveLength(2);
+    for (const prompt of prompts) {
+      expect(prompt).toContain('## 已通过的检查');
+      expect(prompt).toContain('`grep -q ok feature.txt`');
+    }
+  });
+
   it("words the coding prompt after the running agent's permission", async () => {
     h = await harness({
       agents: `
@@ -1173,6 +1191,181 @@ describe('engine: a reviewer does not change the work', () => {
     expect(discarded[0]?.discardedCommits).toEqual([discarded[0]?.toHead]);
     expect(calls).toBe(2);
     await approveAndMerge(run.id);
+  });
+
+  describe('stopped in the middle of the review', () => {
+    /** What the first reviewer committed on the Run's branch. */
+    let committed = '';
+    /**
+     * The first reviewer commits on the Run's branch, then works on until it is stopped (or for
+     * good, when its Master "crashes"); a later one passes, recording the commit it reviewed.
+     */
+    const reviewers = (h1: Harness) => {
+      committed = '';
+      const reviewed: string[] = [];
+      h1.scripts.reviewer = async (ctx) => {
+        const wd = ctx.input.workdir;
+        writeFile(join(wd, 'feature.txt'), 'changed by the reviewer\n');
+        writeFile(join(wd, 'reviewer.txt'), 'unreviewed\n');
+        git(wd, 'add', '-A');
+        git(wd, 'commit', '-q', '-m', 'reviewer');
+        committed = git(wd, 'rev-parse', 'HEAD');
+        await new Promise((resolve) => ctx.signal.addEventListener('abort', resolve));
+        return review();
+      };
+      return {
+        reviewed,
+        /** Installs the later reviewer on the Master that goes on with the Run. */
+        next: (h2: Harness) => {
+          h2.scripts.reviewer = (ctx) => {
+            reviewed.push(git(ctx.input.workdir, 'rev-parse', 'HEAD'));
+            return review();
+          };
+        },
+      };
+    };
+    /** Starts a Run and waits until its reviewer has committed; returns the coder's commit. */
+    const startReview = async (h1: Harness) => {
+      const run = h1.run();
+      await waitFor(() => committed !== '', 'the reviewer to commit');
+      return { run, coded: h1.master.store.getRun(run.id).headCommit as string };
+    };
+    /** The review went back to the coder's commit, dropping the reviewer's. */
+    const expectDropped = (runId: string, coded: string, extra: object = {}) => {
+      expect(discardedOf(runId)).toEqual([
+        {
+          attemptId: reviewAttempt(runId),
+          fromHead: coded,
+          toHead: committed,
+          discardedCommits: [committed],
+          uncommitted: false,
+          ...extra,
+        },
+      ]);
+    };
+
+    it('drops the commit the reviewer made when the Master restarts', async () => {
+      const first = await harness();
+      const { reviewed, next } = reviewers(first);
+      const { run, coded } = await startReview(first);
+      // An upgrade restarts the Master like this.
+      await first.close();
+
+      h = await harness({ home: first.home, repoDir: first.repoDir });
+      next(h);
+      expectDropped(run.id, coded);
+      const waiting = await h.waitStatus(run.id, 'waiting_approval');
+      expect(waiting.headCommit).toBe(coded);
+      expectCoderWork(waiting);
+      // The review done again saw the coder's work only.
+      expect(reviewed).toEqual([coded]);
+      expect(await approveAndMerge(run.id)).not.toContain(committed);
+    });
+
+    it('drops it after a crash, also when the reviewer checked out another branch', async () => {
+      const first = await harness();
+      const { reviewed, next } = reviewers(first);
+      const reviewer = first.scripts.reviewer as Script;
+      let onOtherBranch = '';
+      first.scripts.reviewer = (ctx) => {
+        const working = reviewer(ctx);
+        const wd = ctx.input.workdir;
+        git(wd, 'checkout', '-q', '-b', 'reviewer-branch');
+        writeFile(join(wd, 'other.txt'), 'elsewhere\n');
+        git(wd, 'add', '-A');
+        git(wd, 'commit', '-q', '-m', 'reviewer on another branch');
+        onOtherBranch = git(wd, 'rev-parse', 'HEAD');
+        writeFile(join(wd, 'left.txt'), 'uncommitted\n');
+        return working;
+      };
+      const { run, coded } = await startReview(first);
+      await waitFor(() => onOtherBranch !== '', 'the reviewer to switch branches');
+      // A crash: the database still says "running" when the next Master opens it.
+      expect(first.master.store.getRun(run.id).status).toBe('running');
+
+      h = await harness({ home: first.home, repoDir: first.repoDir });
+      next(h);
+      expectDropped(run.id, coded, { uncommitted: true, checkedOut: 'reviewer-branch' });
+      const waiting = await h.waitStatus(run.id, 'waiting_approval');
+      expectCoderWork(waiting);
+      expect(reviewed).toEqual([coded]);
+      expect(git(h.repoDir, 'rev-parse', 'reviewer-branch')).toBe(onOtherBranch);
+      const merged = await approveAndMerge(run.id);
+      expect(merged).not.toContain(committed);
+      expect(merged).not.toContain(onOtherBranch);
+      // The "crashed" first Master is left as is; its hanging fake reviewer never resolves.
+    });
+
+    it('drops it when the Run is paused, and the review starts again on resume', async () => {
+      h = await harness();
+      const { reviewed, next } = reviewers(h);
+      const { run, coded } = await startReview(h);
+      next(h);
+      const paused = await h.master.engine.pause(run.id);
+      expect(paused.status).toBe('paused');
+      // Already while paused, the branch holds the coder's work only.
+      const worktree = paused.worktreePath as string;
+      expect(git(worktree, 'symbolic-ref', '--short', 'HEAD')).toBe(paused.branch);
+      expect(git(worktree, 'rev-parse', 'HEAD')).toBe(coded);
+      expect(git(worktree, 'status', '--porcelain')).toBe('');
+      expectDropped(run.id, coded);
+
+      h.master.engine.resume(run.id);
+      const waiting = await h.waitStatus(run.id, 'waiting_approval');
+      expectCoderWork(waiting);
+      expect(reviewed).toEqual([coded]);
+      expect(await approveAndMerge(run.id)).not.toContain(committed);
+    });
+
+    it('drops it before the review runs again when the worktree was gone meanwhile', async () => {
+      const first = await harness();
+      const { reviewed, next } = reviewers(first);
+      const { run, coded } = await startReview(first);
+      // A crash, and the worktree deleted before the next Master starts: nothing could be put back
+      // then, and the worktree comes back from the branch with the reviewer's commit.
+      const worktree = first.master.store.getRun(run.id).worktreePath as string;
+      rmSync(worktree, { recursive: true, force: true });
+
+      h = await harness({ home: first.home, repoDir: first.repoDir });
+      next(h);
+      const waiting = await h.waitStatus(run.id, 'waiting_approval');
+      const types = store()
+        .listEvents(run.id)
+        .map((e) => e.type);
+      expect(types.filter((type) => type === 'run.workspace_restored')).toHaveLength(1);
+      expectDropped(run.id, coded);
+      expectCoderWork(waiting);
+      expect(reviewed).toEqual([coded]);
+      expect(await approveAndMerge(run.id)).not.toContain(committed);
+    });
+  });
+
+  it('keeps the accepted work when a review that committed fails for good', async () => {
+    h = await harness({ workflow: WAIT_WHEN_EXHAUSTED });
+    const commits: string[] = [];
+    h.scripts.reviewer = (ctx) => {
+      const wd = ctx.input.workdir;
+      writeFile(join(wd, 'reviewer.txt'), `unreviewed ${commits.length}\n`);
+      git(wd, 'add', '-A');
+      git(wd, 'commit', '-q', '-m', 'reviewer');
+      commits.push(git(wd, 'rev-parse', 'HEAD'));
+      return { finalMessage: '看起来没问题' };
+    };
+    const run = h.run();
+    const blocked = await h.waitStatus(run.id, 'blocked');
+    expect(blocked.blocked?.kind).toBe('task_failed');
+    // The first try and both reworks, each dropped; the Run stays on the coder's commit.
+    expect(commits).toHaveLength(3);
+    expect(discardedOf(run.id).flatMap((d) => d.discardedCommits as string[])).toEqual(commits);
+    expectCoderWork(blocked);
+
+    h.scripts.reviewer = () => review();
+    await h.master.engine.retry(run.id);
+    const waiting = await h.waitStatus(run.id, 'waiting_approval');
+    expect(waiting.headCommit).toBe(blocked.headCommit);
+    expectCoderWork(waiting);
+    const merged = await approveAndMerge(run.id);
+    for (const commit of commits) expect(merged).not.toContain(commit);
   });
 });
 

@@ -36,6 +36,7 @@ import {
   RunOverridesSchema,
   replyTimeoutHours,
   rollbackTarget,
+  type StageDef,
   stageVerifyCommands,
 } from '../config/schema.js';
 import { redactForGitHub } from '../github/redact.js';
@@ -2156,13 +2157,27 @@ export class Engine {
     run: Run,
     sr: StageRun,
     eff: EffectiveStage,
-    task: Task,
+    initial: Task,
     agent: AgentConfig,
     adapter: AgentAdapter,
     signal: AbortSignal,
   ): Promise<void> {
     const workdir = this.workdir(run);
-    const head = await revParse(workdir, 'HEAD');
+    let task = initial;
+    // The commit the review started on, which the work goes back to after it.
+    let head = task.baseCommit;
+    if (head) {
+      // Started before: a stop in the middle of the review normally put the work back there
+      // (`discardInFlight`); when it could not (the worktree was gone, say), what that reviewer
+      // left goes now, before this one looks.
+      await this.discardReviewWork(run, task, head);
+    } else {
+      // Recorded before the reviewer runs, so that what it leaves behind can be dropped also when
+      // the Master stops in the middle (a pause, an upgrade, a crash).
+      head = await revParse(workdir, 'HEAD');
+      task = this.store.updateTask(task.id, { baseCommit: head });
+    }
+    this.checkAbort(signal);
     const base = await this.reviewBase(run, head);
     const stat = await diffStat(workdir, base);
     this.checkAbort(signal);
@@ -2171,7 +2186,7 @@ export class Engine {
       ctx,
       base,
       stat,
-      this.passedCommandsAt(run.id, head),
+      this.passedCommandsAt(run, head),
       this.previousReview(run, sr),
     );
     // Not the previous round's review: what went wrong with this round's last attempt (e.g. the
@@ -2192,15 +2207,7 @@ export class Engine {
 
     // A reviewer must not change code; drop anything it left behind, its commits too, which
     // would otherwise be merged unreviewed.
-    const discarded = await this.discardStageWork(run, head);
-    if (discarded) {
-      this.store.tx(() => {
-        this.store.event(run.id, 'review.changes_discarded', {
-          attemptId: attempt.id,
-          ...discarded,
-        });
-      });
-    }
+    await this.discardReviewWork(run, task, head);
     this.checkAbort(signal);
 
     if (result.status !== 'completed')
@@ -3214,19 +3221,32 @@ export class Engine {
   // Helpers
   // =========================================================================
 
-  /** Undo whatever was in progress (pause / shutdown / crash recovery). */
+  /**
+   * Undo whatever was in progress (pause / shutdown / crash recovery). A review stopped halfway
+   * goes back on the Run's branch to the commit it started on, as when a review ends
+   * (`discardReviewWork`): a commit its reviewer made would otherwise stay on the branch, be
+   * taken for the work under review by the next review and be merged with it.
+   */
   private async discardInFlight(run: Run): Promise<void> {
     for (const task of this.store.listRunTasks(run.id)) {
       if (!IN_FLIGHT_TASK.has(task.status)) continue;
-      if (run.worktreePath && task.baseCommit) await resetHard(run.worktreePath, task.baseCommit);
-      this.store.updateTask(task.id, {
-        status: 'pending',
-        retries: 0,
-        sessionId: null,
-        sessionAgentId: null,
-        pendingFeedback: null,
+      const path = run.worktreePath;
+      if (path && task.baseCommit) {
+        if (this.stageKindOf(run, task) !== 'review') await resetHard(path, task.baseCommit);
+        // When this cannot be done (the worktree is gone, say), the review does it before it runs
+        // again (`runReviewTask`), where a failure stops only this Run and not the Master's start.
+        else await this.discardReviewWork(run, task, task.baseCommit).catch(() => {});
+      }
+      this.store.tx(() => {
+        this.store.updateTask(task.id, {
+          status: 'pending',
+          retries: 0,
+          sessionId: null,
+          sessionAgentId: null,
+          pendingFeedback: null,
+        });
+        this.store.event(run.id, 'task.discarded', { taskId: task.id });
       });
-      this.store.event(run.id, 'task.discarded', { taskId: task.id });
     }
     // Also gives up a merge started for an agent (`conflictMerge`) before the agent ran, which
     // may leave nothing else to see; it starts again with the task.
@@ -3282,6 +3302,29 @@ export class Engine {
       uncommitted,
       ...(checkedOut === branch ? {} : { checkedOut }),
     };
+  }
+
+  /**
+   * After a review, or a review stopped halfway: back to `from`, the commit it started on
+   * (`discardStageWork`), recording what its reviewer left behind as `review.changes_discarded`
+   * with the task's last attempt.
+   */
+  private async discardReviewWork(run: Run, task: Task, from: string): Promise<void> {
+    const discarded = await this.discardStageWork(run, from);
+    if (!discarded) return;
+    const attemptId = this.store.listAttempts(task.id).at(-1)?.id;
+    this.store.tx(() => {
+      this.store.event(run.id, 'review.changes_discarded', {
+        ...(attemptId ? { attemptId } : {}),
+        ...discarded,
+      });
+    });
+  }
+
+  /** The kind of the stage the task belongs to in the Run's workflow. */
+  private stageKindOf(run: Run, task: Task): StageDef['kind'] | undefined {
+    const { stageId } = this.store.getStageRun(task.stageRunId);
+    return run.template.stages.find((s) => s.id === stageId)?.kind;
   }
 
   private setStatus(runId: string, status: RunStatus, patch: Partial<Run> = {}): Run {
@@ -3478,18 +3521,20 @@ export class Engine {
 
   /**
    * Verify commands that passed on `head`: those of the last agent task whose accepted
-   * result is exactly this commit (a task without changes leaves HEAD at its base).
+   * result is exactly this commit (a task without changes leaves HEAD at its base). Only tasks of
+   * agent stages count: a review's task also starts on `head` and passes there, without commands.
    */
-  private passedCommandsAt(runId: string, head: string): string[] {
-    const tasks = this.store.listRunTasks(runId);
+  private passedCommandsAt(run: Run, head: string): string[] {
+    const tasks = this.store.listRunTasks(run.id);
     for (let i = tasks.length - 1; i >= 0; i--) {
       const task = tasks[i] as Task;
       if (task.status !== 'passed' || !task.baseCommit) continue;
+      if (this.stageKindOf(run, task) !== 'agent') continue;
       if ((task.commitSha ?? task.baseCommit) !== head) continue;
       const attempt = this.store.listAttempts(task.id).findLast((a) => a.outcome === 'passed');
       if (!attempt) return [];
       return this.store
-        .listChecks(runId)
+        .listChecks(run.id)
         .filter((c) => c.attemptId === attempt.id && c.kind === 'command' && c.passed)
         .map((c) => c.name);
     }
