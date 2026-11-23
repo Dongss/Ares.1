@@ -75,10 +75,15 @@ describe('format helpers', () => {
     expect(formatMinutes(360)).toBe('6 小时');
     expect(formatMinutes(90)).toBe('1 小时 30 分钟');
     expect(formatMinutes(121)).toBe('2 小时 1 分钟');
-    // Fractions round to whole minutes; below a minute the value is kept.
+    // Fractions round to whole minutes; below a minute they read in seconds, at least one.
     expect(formatMinutes(15.4)).toBe('15 分钟');
     expect(formatMinutes(59.6)).toBe('1 小时');
-    expect(formatMinutes(0.5)).toBe('0.5 分钟');
+    expect(formatMinutes(0.5)).toBe('30 秒');
+    expect(formatMinutes(0.333)).toBe('20 秒');
+    expect(formatMinutes(1 / 3)).toBe('20 秒');
+    expect(formatMinutes(0.001)).toBe('1 秒');
+    // What rounds up to 60 seconds reads as a minute, not "60 秒".
+    expect(formatMinutes(0.999)).toBe('1 分钟');
   });
 
   describe('run time', () => {
@@ -349,11 +354,15 @@ describe('format helpers in English', () => {
       90: '1 hour 30 minutes',
       121: '2 hours 1 minute',
       150: '2 hours 30 minutes',
-      0.5: '0.5 minutes',
+      0.5: '30 seconds',
+      0.001: '1 second',
+      0.999: '1 minute',
     };
     for (const [minutes, text] of Object.entries(intervals)) {
       expect(formatMinutes(Number(minutes))).toBe(text);
     }
+    expect(formatMinutes(1 / 3)).toBe('20 seconds');
+    expect([1 / 3, 0.5, 0.001].map(formatMinutes).join(' ')).not.toMatch(/[一-鿿]/);
     expect(formatRunCost(0, true)).toBe('cost unknown');
     expect(formatRunCost(1.5, true)).toBe('$1.50 + unknown');
     expect(formatAttemptCost({ costUsd: null, status: 'completed' })).toBe('cost unknown');

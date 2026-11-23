@@ -140,12 +140,18 @@ export function formatDuration(ms: number): string {
 
 /**
  * A configured interval in minutes, in words: "15 分钟" / "15 minutes", "6 小时" / "6 hours",
- * "1 小时 30 分钟" / "1 hour 30 minutes". Fractions are rounded to whole minutes, except below
- * one minute where the value is shown as is.
+ * "1 小时 30 分钟" / "1 hour 30 minutes". Fractions are rounded to whole minutes; below one
+ * minute the value is shown in seconds, "30 秒" / "30 seconds", rounded to at least one second
+ * (what rounds up to 60 seconds reads as one minute).
  */
 export function formatMinutes(minutes: number): string {
   const minuteText = (n: number) =>
     t({ zh: `${n} 分钟`, en: `${n} ${n === 1 ? 'minute' : 'minutes'}` });
+  if (minutes > 0 && minutes < 1) {
+    const s = Math.max(1, Math.round(minutes * 60));
+    if (s < 60) return t({ zh: `${s} 秒`, en: `${s} ${s === 1 ? 'second' : 'seconds'}` });
+    return minuteText(1);
+  }
   if (minutes < 1) return minuteText(minutes);
   const total = Math.round(minutes);
   if (total < 60) return minuteText(total);
