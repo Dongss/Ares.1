@@ -76,8 +76,11 @@ src/
   notify/
     notice.ts         which events notify people (shared by system notifications and dashboard)
     system.ts         system notifications sent by the Master (macOS)
-  upgrade/upgrader.ts the Master upgrades itself: finds a new version, waits for the work in hand,
-                      hands over to scripts/self-upgrade.sh
+  upgrade/
+    upgrader.ts       the Master upgrades itself: finds a new version, waits for the work in hand,
+                      hands over to scripts/self-upgrade.sh, keeps the last failed upgrade
+    source.ts         which registered repo is the Master's own source (from the install
+                      directory's origin), whose scout is shown failed upgrades
   workspace/git.ts    git: worktrees, commits, rollback, merge, fast-forward
   verify/commands.ts  run check commands and setup commands
   api/

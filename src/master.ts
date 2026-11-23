@@ -25,7 +25,7 @@ import { type Lang, lang, setLang } from './i18n.js';
 import { type SendNotice, SystemNotifier } from './notify/system.js';
 import { Store } from './store/store.js';
 import { type UpgradePlan, Upgrader } from './upgrade/upgrader.js';
-import { revParse } from './workspace/git.js';
+import { git, revParse } from './workspace/git.js';
 
 /** CLIs with a built-in adapter. */
 export const BUILTIN_CLIS = ['claude-code', 'cursor-agent'];
@@ -164,9 +164,22 @@ export class Master {
       rateLimitWait: opts.rateLimitWait,
       dirtyTargetCheckMs: opts.dirtyTargetCheckMs,
     });
-    const issues = new IssueBridge({ store, engine, paths, config, adapters, github: opts.github });
-    const notifier = new SystemNotifier(store, config, opts.notice);
     const installDir = opts.installDir ?? null;
+    // Where the install directory pulls from tells which registered repo is the Master's source.
+    const originUrl = installDir
+      ? await git(installDir, ['remote', 'get-url', 'origin']).catch(() => null)
+      : null;
+    const masterOrigin = installDir && originUrl ? { installDir, url: originUrl } : null;
+    const issues = new IssueBridge({
+      store,
+      engine,
+      paths,
+      config,
+      adapters,
+      github: opts.github,
+      masterOrigin,
+    });
+    const notifier = new SystemNotifier(store, config, opts.notice);
     let master: Master | undefined;
     const upgrader = new Upgrader({
       store,

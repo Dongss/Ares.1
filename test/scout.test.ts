@@ -1,10 +1,12 @@
 import { rmSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { GhIssue } from '../src/github/client.js';
 import { issueDigest, runDigest, scoutPrompt } from '../src/github/scout.js';
 import { setLang } from '../src/i18n.js';
 import type { Run, RunStatus } from '../src/store/types.js';
+import type { UpgradeFailure } from '../src/upgrade/upgrader.js';
 import {
   ASSESS_AGENTS_YAML,
   ASSESS_WORKFLOW_YAML,
@@ -599,6 +601,74 @@ describe('scoutPrompt', () => {
     expect(prompt).toContain('最多 3 条');
     expect(prompt).toContain('## 最近的 Run\n（还没有 Run）');
     expect(prompt).toContain('## 已有的 issue\n（无）');
+  });
+});
+
+describe('scoutPrompt: failed upgrade of the Master', () => {
+  afterEach(() => setLang('zh'));
+
+  const failure = (detail: string | null = null): UpgradeFailure => ({
+    from: 'a'.repeat(40),
+    to: 'b'.repeat(40),
+    message: '拉取或构建 bbbbbbb 失败，已回退到 aaaaaaa',
+    detail,
+    at: '2026-11-20T08:00:00.000Z',
+  });
+  const prompt = (upgrade?: UpgradeFailure | null) =>
+    scoutPrompt({ repoName: 'demo', max: 3, runs: '（还没有 Run）', issues: '（无）', upgrade });
+
+  it('leaves the prompt as it was without a failed upgrade', () => {
+    expect(prompt(null)).toBe(prompt());
+    expect(prompt()).not.toContain('自动升级失败');
+  });
+
+  it('lists the failed commit, the message and the end of the output before the Runs', () => {
+    const detail = `npm ERR! in ${join(homedir(), 'ares1-stable')}\nsrc/a.ts(3,1): error TS1005`;
+    const text = prompt(failure(detail));
+    const section = text.slice(
+      text.indexOf('## Master 自动升级失败'),
+      text.indexOf('## 最近的 Run'),
+    );
+    expect(section).toContain(`2026-11-20 它尝试升级到目标分支上的提交 ${'b'.repeat(40)}，失败了`);
+    expect(section).toContain('已回退到 aaaaaaa 继续运行');
+    expect(section).toContain('- 失败消息：拉取或构建 bbbbbbb 失败，已回退到 aaaaaaa');
+    expect(section).toContain(
+      '- 输出末尾：\n```\nnpm ERR! in ~/ares1-stable\nsrc/a.ts(3,1): error TS1005\n```',
+    );
+    expect(section).toContain('修复它是最高优先级');
+    expect(section).toContain('网络、npm 源、磁盘空间这类环境问题');
+    // Proposals go to GitHub: no home directory.
+    expect(text).not.toContain(homedir());
+  });
+
+  it('keeps a fence inside the output from ending the code block', () => {
+    const text = prompt(failure('before\n```\nafter'));
+    expect(text).toContain('````\nbefore\n```\nafter\n````');
+  });
+
+  it('says when the output was not recorded', () => {
+    expect(prompt(failure())).toContain('- 输出末尾：没有记下。');
+  });
+
+  it('has the section in English, with no Chinese left but the output itself', () => {
+    setLang('en');
+    const text = scoutPrompt({
+      repoName: 'demo',
+      max: 3,
+      runs: '(no Runs yet)',
+      issues: '',
+      upgrade: {
+        ...failure('npm ERR! code ELIFECYCLE'),
+        message: 'Pulling or building bbbbbbb failed; rolled back to aaaaaaa',
+      },
+    });
+    expect(text).not.toMatch(/[一-鿿]/);
+    expect(text).toContain("## The Master's automatic upgrade failed\n");
+    expect(text).toContain(`On 2026-11-20 it tried to upgrade to commit ${'b'.repeat(40)}`);
+    expect(text).toContain('- Failure message: Pulling or building bbbbbbb failed');
+    expect(text).toContain('- End of the output:\n```\nnpm ERR! code ELIFECYCLE\n```');
+    expect(text).toContain('fixing it comes first');
+    expect(text.indexOf('automatic upgrade failed')).toBeLessThan(text.indexOf('## Recent Runs'));
   });
 });
 

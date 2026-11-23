@@ -28,6 +28,8 @@ import {
   type ScoutProposal,
   type UntrustedAuthor,
 } from '../store/types.js';
+import { isMasterSource, type MasterOrigin } from '../upgrade/source.js';
+import { lastUpgradeFailure, type UpgradeFailure } from '../upgrade/upgrader.js';
 import { errorMessage, nowIso } from '../util.js';
 import {
   addDetachedWorktree,
@@ -116,6 +118,11 @@ export interface BridgeDeps {
   adapters: Map<string, AgentAdapter>;
   /** Tests pass a fake; otherwise gh, as the configured account. */
   github?: GitHub;
+  /**
+   * The install directory the Master runs from and its origin, to tell which repo is the
+   * Master's own source; null when it does not run from one (then no repo is).
+   */
+  masterOrigin?: MasterOrigin | null;
 }
 
 /** Start of the current day in the Master's local time, as ISO. */
@@ -1068,6 +1075,17 @@ export class IssueBridge {
     }
   }
 
+  /**
+   * The Master's last failed upgrade if `repo` is the Master's own source, so that its scout
+   * proposes fixing what the stable copy cannot build or start; null for every other repo.
+   */
+  private upgradeFailureFor(repo: Repo, github: string): UpgradeFailure | null {
+    const failure = lastUpgradeFailure(this.deps.store);
+    if (!failure) return null;
+    const origin = this.deps.masterOrigin ?? null;
+    return isMasterSource(origin, { path: repo.path, github }) ? failure : null;
+  }
+
   private async runScout(
     scout: Scout,
     repo: Repo,
@@ -1099,6 +1117,7 @@ export class IssueBridge {
         max: scoutCfg.max_proposals,
         runs: runDigest(store, repo.id),
         issues: issueDigest(open, closed, await this.masterLogin()),
+        upgrade: this.upgradeFailureFor(repo, scout.issuesRepo),
       });
       // Read the target branch as committed, like a Run does, not whatever the main worktree has
       // checked out or left uncommitted. A detached worktree creates no branch.

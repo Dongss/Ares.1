@@ -42,10 +42,12 @@ import {
   git,
   type Harness,
   harness,
+  initRepo,
   OWNER,
   review,
   type Script,
   STRANGER,
+  tmpDir,
   waitFor,
   writeFile,
 } from './helpers.js';
@@ -506,6 +508,70 @@ describe('issues: scout', () => {
     expect(prompt).toContain('#6（issue 的作者不是仓库成员，也没有人确认过，内容不列出）');
     expect(prompt).not.toContain('陌生人');
     expect(prompt).not.toContain('删掉 README');
+  });
+
+  /**
+   * A Master running from a clone of `source` (its stable copy), started after an upgrade failed
+   * with output that has the home directory in it, and the prompt of a scout of demo.
+   */
+  async function afterFailedUpgrade(opts: { demoIsSource: boolean }) {
+    const repoDir = initRepo();
+    const source = opts.demoIsSource ? repoDir : initRepo();
+    const installDir = join(tmpDir('ares1-install-'), 'stable');
+    git(source, 'clone', '-q', source, installDir);
+    const home = tmpDir('ares1-home-');
+    const failed = 'c'.repeat(40);
+    writeFile(
+      join(home, 'data', 'upgrade-result.json'),
+      JSON.stringify({
+        ok: false,
+        from: git(installDir, 'rev-parse', 'HEAD'),
+        to: failed,
+        message: `拉取或构建 ${failed.slice(0, 7)} 失败`,
+        detail: `> tsc\n${join(homedir(), 'ares1-stable', 'src', 'a.ts')}(3,1): error TS1005: "," expected.`,
+      }),
+    );
+    gh = new FakeGitHub();
+    h = await harness({
+      home,
+      repoDir,
+      agents: AGENTS,
+      config: config(),
+      github: gh,
+      master: { installDir, launchUpgrade: () => {}, exit: () => {} },
+    });
+    const t = h;
+    t.scripts.scout = () => ({ structured: { proposals: [] } });
+    const scoutPromptNow = async () => {
+      const scout = await t.master.issues.startScout('demo', 'manual');
+      await scoutDone(t, scout.id);
+      return t.fake.calls.at(-1)?.prompt ?? '';
+    };
+    return { t, home, failed, scoutPromptNow };
+  }
+
+  it("shows the Master's failed upgrade to the scout of its own repo, until one succeeds", async () => {
+    const { t, home, failed, scoutPromptNow } = await afterFailedUpgrade({ demoIsSource: true });
+    const prompt = await scoutPromptNow();
+    expect(prompt).toContain('## Master 自动升级失败');
+    expect(prompt).toContain(`目标分支上的提交 ${failed}`);
+    expect(prompt).toContain(`- 失败消息：拉取或构建 ${failed.slice(0, 7)} 失败`);
+    expect(prompt).toContain('~/ares1-stable/src/a.ts(3,1): error TS1005: "," expected.');
+    expect(prompt).not.toContain(homedir());
+    expect(prompt.indexOf('## Master 自动升级失败')).toBeLessThan(prompt.indexOf('## 最近的 Run'));
+
+    // The next upgrade succeeds: the section is gone.
+    writeFile(
+      join(home, 'data', 'upgrade-result.json'),
+      JSON.stringify({ ok: true, from: 'aaa', to: 'bbb', message: '' }),
+    );
+    await t.master.upgrader.check();
+    expect(await scoutPromptNow()).not.toContain('自动升级失败');
+  });
+
+  it("does not show the Master's failed upgrade to the scouts of other repos", async () => {
+    const { scoutPromptNow } = await afterFailedUpgrade({ demoIsSource: false });
+    expect(await scoutPromptNow()).not.toContain('自动升级失败');
   });
 
   it('stops auto-accepting once the daily budget is spent', async () => {

@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { z } from 'zod';
 import type { UpgradeStatus } from '../api/types.js';
 import type { HomePaths, LoadedConfig } from '../config/load.js';
 import type { Engine } from '../engine/engine.js';
@@ -44,11 +45,59 @@ const FAILED_KEY = 'upgrade.failed_to';
 const TARGET_KEY = 'upgrade.target';
 
 /** How a finished upgrade went, written by the script. */
-interface UpgradeResult {
-  ok: boolean;
-  from: string;
-  to: string;
-  message?: string;
+const UpgradeResultSchema = z.object({
+  ok: z.boolean(),
+  from: z.string(),
+  to: z.string(),
+  message: z.string().optional(),
+  /** On failure, the end of the output that says why (the build's, or the new Master's). */
+  detail: z.string().optional(),
+});
+type UpgradeResult = z.infer<typeof UpgradeResultSchema>;
+
+/**
+ * The last upgrade the script tried that failed, kept until an upgrade succeeds: the scout of the
+ * Master's own repo is shown it, so that the system fixes the version it cannot build or start.
+ */
+const LAST_FAILURE_KEY = 'upgrade.last_failure';
+
+const UpgradeFailureSchema = z.object({
+  from: z.string(),
+  /** The commit that failed; empty when the script could not tell. */
+  to: z.string(),
+  message: z.string(),
+  detail: z.string().nullable(),
+  at: z.string(),
+});
+export type UpgradeFailure = z.infer<typeof UpgradeFailureSchema>;
+
+/** The last upgrade that failed, if no upgrade has succeeded since. */
+export function lastUpgradeFailure(store: Store): UpgradeFailure | null {
+  const value = store.getSetting(LAST_FAILURE_KEY);
+  if (!value) return null;
+  try {
+    const parsed = UpgradeFailureSchema.safeParse(JSON.parse(value));
+    return parsed.success ? parsed.data : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The script's result file; one that cannot be read counts as a failed upgrade. */
+function readResult(file: string): UpgradeResult {
+  try {
+    const parsed = UpgradeResultSchema.safeParse(JSON.parse(readFileSync(file, 'utf8')));
+    if (parsed.success) return parsed.data;
+  } catch {}
+  return {
+    ok: false,
+    from: '',
+    to: '',
+    message: t({
+      zh: '升级结果文件无法解析',
+      en: 'The upgrade result file could not be parsed',
+    }),
+  };
 }
 
 /**
@@ -106,20 +155,7 @@ export class Upgrader {
   /** Report what the last upgrade script did, once. */
   private reportResult(): void {
     if (!existsSync(this.resultFile)) return;
-    let result: UpgradeResult;
-    try {
-      result = JSON.parse(readFileSync(this.resultFile, 'utf8')) as UpgradeResult;
-    } catch {
-      result = {
-        ok: false,
-        from: '',
-        to: '',
-        message: t({
-          zh: '升级结果文件无法解析',
-          en: 'The upgrade result file could not be parsed',
-        }),
-      };
-    }
+    const result = readResult(this.resultFile);
     rmSync(this.resultFile, { force: true });
     const store = this.deps.store;
     store.tx(() => {
@@ -127,15 +163,27 @@ export class Upgrader {
       store.setSetting(TARGET_KEY, null);
       if (result.ok) {
         store.setSetting(FAILED_KEY, null);
+        store.setSetting(LAST_FAILURE_KEY, null);
         store.event(null, 'upgrade.done', { from: result.from, to: result.to });
       } else {
         // Without a planned target, trust the script's `to` only if it moved past `from`.
         const failed = target ?? (result.to && result.to !== result.from ? result.to : '');
         if (failed) store.setSetting(FAILED_KEY, failed);
+        const message = result.message || t({ zh: '升级失败', en: 'The upgrade failed' });
+        const detail = result.detail?.trim() ? result.detail : null;
+        const failure: UpgradeFailure = {
+          from: result.from,
+          to: failed,
+          message,
+          detail,
+          at: nowIso(),
+        };
+        store.setSetting(LAST_FAILURE_KEY, JSON.stringify(failure));
         store.event(null, 'upgrade.failed', {
           from: result.from,
           to: failed,
-          message: result.message ?? t({ zh: '升级失败', en: 'The upgrade failed' }),
+          message,
+          ...(detail ? { detail } : {}),
         });
       }
     });
