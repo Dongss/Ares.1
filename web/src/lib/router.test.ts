@@ -15,6 +15,9 @@ describe('parseRoute', () => {
     expect(parseRoute('#/workspaces/x')).toEqual({ name: 'notFound', path: '/workspaces/x' });
     expect(parseRoute('#/agents')).toEqual({ name: 'agents' });
     expect(parseRoute('#/agents/')).toEqual({ name: 'agents' });
+    expect(parseRoute('#/events')).toEqual({ name: 'events' });
+    expect(parseRoute('#/events/')).toEqual({ name: 'events' });
+    expect(parseRoute('#/events/x')).toEqual({ name: 'notFound', path: '/events/x' });
     expect(parseRoute('#/guide')).toEqual({ name: 'guide' });
     expect(parseRoute('#/guide/')).toEqual({ name: 'guide' });
     expect(parseRoute('#/guide/labels')).toEqual({ name: 'guide', section: 'labels' });
@@ -28,6 +31,7 @@ describe('parseRoute', () => {
     expect(parseRoute(href.run('run-1'))).toEqual({ name: 'run', id: 'run-1' });
     expect(parseRoute(href.workspaces)).toEqual({ name: 'workspaces' });
     expect(parseRoute(href.agents)).toEqual({ name: 'agents' });
+    expect(parseRoute(href.events)).toEqual({ name: 'events' });
     expect(parseRoute(href.guide)).toEqual({ name: 'guide' });
     expect(parseRoute(href.guideSection('faq'))).toEqual({ name: 'guide', section: 'faq' });
     expect(parseRoute(href.configTemplate('self-dev'))).toEqual({

@@ -5,6 +5,7 @@ import {
   attemptAgentLabel,
   FAIL_REASON,
   formatAttemptCost,
+  formatBytes,
   formatCost,
   formatDuration,
   formatMinutes,
@@ -136,6 +137,14 @@ describe('format helpers', () => {
     expect(formatTokens(950)).toBe('950');
     expect(formatTokens(12_345)).toBe('12.3k');
     expect(formatTokens(2_500_000)).toBe('2.50M');
+  });
+
+  it('formats sizes', () => {
+    expect(formatBytes(0)).toBe('0 B');
+    expect(formatBytes(1023)).toBe('1023 B');
+    expect(formatBytes(3_500)).toBe('3.4 KB');
+    expect(formatBytes(12.5 * 1024 * 1024)).toBe('12.5 MB');
+    expect(formatBytes(1.2 * 1024 ** 3)).toBe('1.20 GB');
   });
 
   it('uses the first line of a goal as its title', () => {

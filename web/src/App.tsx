@@ -16,6 +16,7 @@ import { attentionCount, pageTitle } from './lib/runs.js';
 import { useConnected } from './lib/stream.js';
 import { AgentsPage } from './pages/Agents.js';
 import { ConfigPage } from './pages/Config.js';
+import { EventsPage } from './pages/Events.js';
 import { GuidePage } from './pages/Guide.js';
 import { HomePage } from './pages/Home.js';
 import { IssuesPage } from './pages/Issues.js';
@@ -93,6 +94,9 @@ export function App() {
           </NavLink>
           <NavLink to={href.agents} active={route.name === 'agents'}>
             Agent
+          </NavLink>
+          <NavLink to={href.events} active={route.name === 'events'}>
+            {t({ zh: '事件', en: 'Events' })}
           </NavLink>
           <NavLink to={href.workspaces} active={route.name === 'workspaces'}>
             {t({ zh: '工作区', en: 'Workspaces' })}
@@ -217,6 +221,7 @@ function Page(props: {
   if (route.name === 'issues') return <IssuesPage />;
   if (route.name === 'workspaces') return <WorkspacesPage />;
   if (route.name === 'agents') return <AgentsPage />;
+  if (route.name === 'events') return <EventsPage />;
   if (route.name === 'config')
     return <ConfigPage config={props.config} error={props.configError} target={route.template} />;
   if (route.name === 'guide')

@@ -904,6 +904,36 @@ textarea:focus {
   margin-bottom: 2px;
 }
 
+/* events page: events of no Run */
+.global-events th {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-2);
+  font-weight: 500;
+  text-align: left;
+  white-space: nowrap;
+}
+.global-events td:nth-child(2) {
+  white-space: nowrap;
+}
+.global-events tr.event-danger .event-text {
+  color: var(--danger);
+}
+.global-events tr.event-attention .event-text {
+  color: var(--attention);
+}
+.global-events .event-text a {
+  white-space: nowrap;
+}
+.events-more {
+  display: flex;
+  justify-content: center;
+  margin-bottom: 16px;
+}
+.events-end {
+  text-align: center;
+}
+
 /* repos */
 .repo-head {
   display: flex;

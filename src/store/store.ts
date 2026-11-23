@@ -472,6 +472,32 @@ export class Store {
     }));
   }
 
+  /**
+   * Events that belong to no Run (restarts, pruned logs, upgrades, GitHub errors, scouts...),
+   * newest first; `beforeId` pages back to older ones.
+   */
+  listGlobalEvents(opts: { beforeId?: number; limit?: number } = {}): EventRow[] {
+    const limit = opts.limit ?? 200;
+    const rows = (
+      opts.beforeId === undefined
+        ? this.db
+            .prepare('SELECT * FROM events WHERE run_id IS NULL ORDER BY id DESC LIMIT ?')
+            .all(limit)
+        : this.db
+            .prepare(
+              'SELECT * FROM events WHERE run_id IS NULL AND id < ? ORDER BY id DESC LIMIT ?',
+            )
+            .all(opts.beforeId, limit)
+    ) as { id: number; ts: string; type: string; data: string }[];
+    return rows.map((r) => ({
+      id: r.id,
+      runId: null,
+      ts: r.ts,
+      type: r.type,
+      data: JSON.parse(r.data) as Record<string, unknown>,
+    }));
+  }
+
   // ---- repos ---------------------------------------------------------------
 
   createRepo(input: Omit<Repo, 'id' | 'createdAt'>): Repo {

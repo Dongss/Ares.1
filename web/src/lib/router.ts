@@ -14,6 +14,8 @@ export type Route =
   | { name: 'workspaces' }
   /** Every agent with its executions, outcomes, cost and latest error. */
   | { name: 'agents' }
+  /** Events of no Run: restarts, pruned logs, upgrades, GitHub errors, scouts... */
+  | { name: 'events' }
   /** How the self-hosting loop works; `section`: scroll to that section. */
   | { name: 'guide'; section?: string }
   /** `template`: scroll to that template's card. */
@@ -28,6 +30,7 @@ export const href = {
   stats: '#/stats',
   workspaces: '#/workspaces',
   agents: '#/agents',
+  events: '#/events',
   config: '#/config',
   configTemplate: (id: string) => `#/config/templates/${encodeURIComponent(id)}`,
   guide: '#/guide',
@@ -43,6 +46,7 @@ export function parseRoute(hash: string): Route {
   if (path === '/stats') return { name: 'stats' };
   if (path === '/workspaces') return { name: 'workspaces' };
   if (path === '/agents') return { name: 'agents' };
+  if (path === '/events') return { name: 'events' };
   if (path === '/config') return { name: 'config' };
   if (path === '/guide') return { name: 'guide' };
   const section = /^\/guide\/([^/]+)$/.exec(path);

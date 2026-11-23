@@ -103,7 +103,9 @@ src/
                       environment (exit code 127, its first program not in PATH), and whether a
                       command can find its first program without running it
   api/
-    server.ts         HTTP API (Hono) and SSE
+    server.ts         HTTP API (Hono) and SSE; GET /api/events lists the global events (those of
+                      no Run: restarts, pruned logs, upgrades, GitHub errors, scouts...) newest
+                      first, paged with ?before=<id>
     types.ts          API data types, shared by Master and dashboard
     agents.ts, stats.ts, workspaces.ts, diff.ts   data of the Agents, Stats and Workspaces pages
                       and diffs
@@ -124,7 +126,8 @@ scripts/
 web/                  dashboard (React + Vite)
   src/App.tsx         top bar (navigation, work switch, notification switch, language switch)
                       and routing
-  src/pages/          Home, RunDetail, Issues, Stats, Agents, Workspaces, Repos, Config, Guide
+  src/pages/          Home, RunDetail, Issues, Stats, Agents, Events, Workspaces, Repos, Config,
+                      Guide
   src/components/     ui.tsx (common components), AgentOutput, DiffPanel, FlowChart,
                       Notifications, WorkSwitch
   src/lib/            API calls, SSE, routing, language choice, formatting and the pure logic of

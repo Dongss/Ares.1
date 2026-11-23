@@ -88,6 +88,12 @@ const StatsQuery = z.strictObject({
   range: z.enum(STATS_RANGES).default('7d'),
   repo: z.string().min(1).optional(),
 });
+/** Most global events one request returns. */
+const GLOBAL_EVENTS_MAX = 500;
+const GlobalEventsQuery = z.strictObject({
+  before: z.coerce.number().int().positive().optional(),
+  limit: z.coerce.number().int().min(1).max(GLOBAL_EVENTS_MAX).default(200),
+});
 const RetryInput = z.strictObject({
   agentId: z.string().optional(),
   note: z.string().optional(),
@@ -109,6 +115,19 @@ async function body<T>(
     throw new BadRequestError(
       parsed.error.issues
         .map((i) => `${i.path.join('.') || '(body)'}: ${i.message}`)
+        .join(t({ zh: '；', en: '; ' })),
+    );
+  }
+  return parsed.data;
+}
+
+/** A request's query string, validated; 400 when invalid. */
+function query<T>(c: { req: { query: () => Record<string, string> } }, schema: z.ZodType<T>): T {
+  const parsed = schema.safeParse(c.req.query());
+  if (!parsed.success) {
+    throw new BadRequestError(
+      parsed.error.issues
+        .map((i) => `${i.path.join('.') || '(query)'}: ${i.message}`)
         .join(t({ zh: '；', en: '; ' })),
     );
   }
@@ -267,6 +286,13 @@ export function createApi(deps: ApiDeps): Hono {
     return c.json(store.listEvents(c.req.param('id'), after));
   });
 
+  // Events of no Run (restarts, pruned logs, upgrades, GitHub errors...), newest first;
+  // ?before=<id> pages back.
+  app.get('/api/events', (c) => {
+    const { before, limit } = query(c, GlobalEventsQuery);
+    return c.json(store.listGlobalEvents({ beforeId: before, limit }) satisfies EventRow[]);
+  });
+
   // What the Run changes on its target branch, or one task commit with ?commit=<sha>.
   app.get('/api/runs/:id/diff', async (c) => {
     const run = store.getRun(c.req.param('id'));
@@ -328,13 +354,7 @@ export function createApi(deps: ApiDeps): Hono {
 
   // ---- statistics ------------------------------------------------------
   app.get('/api/stats', (c) => {
-    const parsed = StatsQuery.safeParse(c.req.query());
-    if (!parsed.success) {
-      throw new BadRequestError(
-        parsed.error.issues.map((i) => `${i.path.join('.') || '(query)'}: ${i.message}`).join('；'),
-      );
-    }
-    const { range, repo } = parsed.data;
+    const { range, repo } = query(c, StatsQuery);
     const repoId = repo ? store.getRepo(repo).id : null;
     return c.json(collectStats(store, { range, repoId }) satisfies StatsView);
   });

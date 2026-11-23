@@ -207,6 +207,14 @@ export function formatTokens(n: number): string {
   return `${(n / 1_000_000).toFixed(2)}M`;
 }
 
+/** A size in bytes: "512 B", "3.4 KB", "12.5 MB", "1.20 GB" (powers of 1024). */
+export function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 ** 2) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(1)} MB`;
+  return `${(n / 1024 ** 3).toFixed(2)} GB`;
+}
+
 export function shortSha(sha: string | null | undefined): string {
   return sha ? sha.slice(0, 8) : '';
 }

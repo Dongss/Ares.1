@@ -830,6 +830,66 @@ agents:
   });
 });
 
+describe('GET /api/events', () => {
+  it('lists the events of no Run, newest first, paged with before and limit', async () => {
+    h = await harness();
+    const store = h.master.store;
+    // Whatever the Master recorded on its own at start, then ours interleaved with a Run's.
+    const before = store.listGlobalEvents({ limit: 500 }).map((e) => e.id);
+    const a = store.event(null, 'logs.pruned', { runs: 1, scouts: 0, files: 2, bytes: 10 });
+    store.event('run-x', 'run.status', { status: 'running' });
+    const b = store.event(null, 'github.error', { message: 'boom' });
+    store.event('run-x', 'run.status', { status: 'completed' });
+    const c = store.event(null, 'master.restarted', { pid: 1, startedAt: a.ts });
+
+    const all = await call('GET', '/api/events');
+    expect(all.status).toBe(200);
+    const rows = all.json as EventRow[];
+    expect(rows.every((e) => e.runId === null)).toBe(true);
+    expect(rows.map((e) => e.id)).toEqual([c.id, b.id, a.id, ...before]);
+    expect(rows[0]).toEqual({
+      id: c.id,
+      runId: null,
+      ts: c.ts,
+      type: 'master.restarted',
+      data: { pid: 1, startedAt: a.ts },
+    });
+
+    const first = (await call('GET', '/api/events?limit=2')).json as EventRow[];
+    expect(first.map((e) => e.id)).toEqual([c.id, b.id]);
+    const next = (await call('GET', `/api/events?before=${b.id}&limit=2`)).json as EventRow[];
+    expect(next[0]?.id).toBe(a.id);
+    expect(next.every((e) => e.id < b.id && e.runId === null)).toBe(true);
+    expect((await call('GET', `/api/events?before=${a.id}&limit=500`)).json).toEqual(
+      rows.filter((e) => e.id < a.id),
+    );
+
+    // 200 by default.
+    for (let i = 0; i < 200; i++) store.event(null, 'master.working', { on: i % 2 === 0 });
+    expect(((await call('GET', '/api/events')).json as EventRow[]).length).toBe(200);
+  });
+
+  it('rejects invalid paging parameters', async () => {
+    h = await harness();
+    for (const q of [
+      'limit=0',
+      'limit=501',
+      'limit=abc',
+      'limit=1.5',
+      'before=0',
+      'before=-3',
+      'before=x',
+      'other=1',
+    ]) {
+      const res = await call('GET', `/api/events?${q}`);
+      expect(res.status, q).toBe(400);
+      expect(typeof res.json.error).toBe('string');
+    }
+    expect((await call('GET', '/api/events?limit=500')).status).toBe(200);
+    expect((await call('GET', '/api/events?limit=1&before=1')).json).toEqual([]);
+  });
+});
+
 describe('GET /api/stats', () => {
   const AGENTS = `${TEST_AGENTS_YAML}
   scout:

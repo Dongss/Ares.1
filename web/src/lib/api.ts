@@ -84,6 +84,14 @@ export const api = {
   runs: () => request<RunSummary[]>('GET', '/api/runs'),
   run: (runId: string) => request<RunDetail>('GET', `/api/runs/${id(runId)}`),
   runEvents: (runId: string) => request<EventRow[]>('GET', `/api/runs/${id(runId)}/events`),
+  /** Events of no Run, newest first; `before`: only those older than that event id. */
+  globalEvents: (opts: { before?: number; limit?: number } = {}) => {
+    const q = new URLSearchParams();
+    if (opts.before !== undefined) q.set('before', String(opts.before));
+    if (opts.limit !== undefined) q.set('limit', String(opts.limit));
+    const qs = q.toString();
+    return request<EventRow[]>('GET', `/api/events${qs ? `?${qs}` : ''}`);
+  },
   diff: (runId: string, commit?: string) =>
     request<DiffView | null>(
       'GET',
