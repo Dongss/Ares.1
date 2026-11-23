@@ -289,7 +289,32 @@ export function missingProgram(program: string, env: NodeJS.ProcessEnv): string 
  */
 export function environmentProblem(result: CommandResult, env: NodeJS.ProcessEnv): string | null {
   if (result.passed || result.timedOut || result.exitCode !== COMMAND_NOT_FOUND) return null;
-  const program = firstProgram(result.command);
+  return commandMissing(result.command, env);
+}
+
+/**
+ * What of the program a command line starts first (`firstProgram`) cannot be found with `env`
+ * (`missingProgram`), without running the command; null when it is found, or when it cannot be
+ * told without running the shell. A relative path names a file of the worktree, which is the
+ * code's, so it is never the environment's fault.
+ */
+export function commandMissing(command: string, env: NodeJS.ProcessEnv): string | null {
+  const program = firstProgram(command);
   if (!program || (program.includes('/') && !isAbsolute(program))) return null;
   return missingProgram(program, env);
+}
+
+/**
+ * The first of `commands` that could not run with `env` for want of a program (`commandMissing`),
+ * with that program; null when every one finds what it starts.
+ */
+export function firstMissingCommand(
+  commands: readonly string[],
+  env: NodeJS.ProcessEnv,
+): { command: string; missing: string } | null {
+  for (const command of commands) {
+    const missing = commandMissing(command, env);
+    if (missing) return { command, missing };
+  }
+  return null;
 }

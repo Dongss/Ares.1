@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import { AGENT_GH_TOKEN, agentEnv } from '../src/adapters/process.js';
 import {
   environmentProblem,
+  firstMissingCommand,
   firstProgram,
   formatCommandFailure,
   missingProgram,
@@ -166,5 +167,22 @@ describe('environmentProblem', () => {
     // Other failures are the code's too.
     const failed = await run('false', system);
     expect(environmentProblem(failed.result, failed.env)).toBeNull();
+  });
+
+  it('tells the first command that cannot find its program without running any', () => {
+    const dir = bin({ 'fake-npm': '#!/usr/bin/env ares1-no-such-node\nconsole.log(1)\n' });
+    const env = { ...process.env, PATH: `${dir}:${system}` };
+    expect(
+      firstMissingCommand(
+        ['cd web && ares1-no-such-tool', './scripts/check.sh', 'grep -q ok f', 'fake-npm test'],
+        env,
+      ),
+    ).toEqual({ command: 'fake-npm test', missing: 'ares1-no-such-node' });
+    expect(
+      firstMissingCommand(['FOO=1 ares1-no-such-tool --check', '/nowhere/bin/npm test'], env),
+    ).toEqual({ command: 'FOO=1 ares1-no-such-tool --check', missing: 'ares1-no-such-tool' });
+    // Shell words and relative paths cannot be told, or are the code's.
+    expect(firstMissingCommand(['cd web && npm test', 'node_modules/.bin/vitest'], env)).toBeNull();
+    expect(firstMissingCommand([], env)).toBeNull();
   });
 });

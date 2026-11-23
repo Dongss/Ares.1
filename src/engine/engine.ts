@@ -55,6 +55,7 @@ import { errorMessage, newId, nowIso } from '../util.js';
 import {
   type CommandResult,
   environmentProblem,
+  firstMissingCommand,
   formatCommandFailure,
   missingProgram,
   runCommands,
@@ -1384,7 +1385,7 @@ export class Engine {
       }
       const failed = results.find((r) => !r.passed);
       const missing = failed && environmentProblem(failed, env);
-      if (failed && missing) return this.blockOnEnvironment(run, failed, missing, 'setup');
+      if (failed && missing) return this.blockOnEnvironment(run, failed.command, missing, 'setup');
       if (failed) {
         // Mostly passing or due to the environment (a registry down, a flaky install): end the
         // Run instead of waiting for a human, so that a Run from an issue is redone in a fresh
@@ -1721,6 +1722,12 @@ export class Engine {
       detail: problem?.message ?? (report.ok ? report.value.summary : ''),
     });
     if (problem !== null || !report.ok) {
+      if (
+        problem?.kind === 'incomplete' &&
+        (await this.blockIncompleteOnEnvironment(run, sr, task, verify, signal))
+      ) {
+        return;
+      }
       return this.rework(run, eff, task, attempt, problem?.message ?? '');
     }
 
@@ -1756,6 +1763,47 @@ export class Engine {
       agent,
       signal,
     });
+  }
+
+  /**
+   * The agent reported its task incomplete: before sending it back, whether its verify commands
+   * could run at all. When the node the Master runs on is gone, or the program a verify command
+   * starts first is not found in the commands' environment (`firstMissingCommand`), the agent most
+   * likely gave up for the same reason, which no rework can fix: the Run blocks on the environment
+   * instead, and no rework is used up. The attempt's changes are undone and the task goes back to
+   * `pending`, so that once the Run goes on its agent starts over from the task's base commit; left
+   * `verifying`, only the checks would run again (`resumeVerify`) and could pass unfinished work.
+   * What the agent wrote is not read: it can say anything, in any language. Returns whether the Run
+   * was blocked.
+   */
+  private async blockIncompleteOnEnvironment(
+    run: Run,
+    sr: StageRun,
+    task: Task,
+    verify: string[],
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    if (verify.length === 0) return false;
+    const nodeGone = this.deps.nodeMissing?.() === true;
+    const missing = nodeGone ? null : firstMissingCommand(verify, this.agentEnv());
+    if (!nodeGone && !missing) return false;
+    if (task.baseCommit) await resetHard(this.workdir(run), task.baseCommit);
+    this.checkAbort(signal);
+    this.store.tx(() => {
+      this.store.updateTask(task.id, {
+        status: 'pending',
+        sessionId: null,
+        sessionAgentId: null,
+        pendingFeedback: null,
+      });
+      this.store.event(run.id, 'task.discarded', { taskId: task.id });
+      if (missing) {
+        this.blockOnEnvironment(run, missing.command, missing.missing, 'incomplete', sr.id);
+      } else {
+        this.blockOnMissingNode(run, sr.id, 'incomplete');
+      }
+    });
+    return true;
   }
 
   /**
@@ -1805,7 +1853,7 @@ export class Engine {
     const failed = results.find((r) => !r.passed);
     if (failed) {
       const missing = environmentProblem(failed, env);
-      if (missing) return this.blockOnEnvironment(run, failed, missing, 'verify', sr.id);
+      if (missing) return this.blockOnEnvironment(run, failed.command, missing, 'verify', sr.id);
       return this.rework(run, eff, task, attempt, formatCommandFailure(failed));
     }
 
@@ -2746,7 +2794,7 @@ export class Engine {
     const missing = failed && environmentProblem(failed, env);
     if (failed && missing) {
       this.recordStageChecks(run, sr, results);
-      return this.blockOnEnvironment(run, failed, missing, 'verify', sr.id);
+      return this.blockOnEnvironment(run, failed.command, missing, 'verify', sr.id);
     }
     this.store.tx(() => {
       this.recordStageChecks(run, sr, results);
@@ -2833,7 +2881,7 @@ export class Engine {
         await giveUpSync();
         this.checkAbort(signal);
         this.recordStageChecks(run, sr, results);
-        return this.blockOnEnvironment(run, failed, missing, 'verify', sr.id);
+        return this.blockOnEnvironment(run, failed.command, missing, 'verify', sr.id);
       }
       this.store.tx(() => {
         this.recordStageChecks(run, sr, results);
@@ -3106,16 +3154,28 @@ export class Engine {
    * manager deleted it), they would only fail for want of node or npm. Blocks the Run on the
    * environment instead, with that node as `missing`, and returns true; the upgrader restarts the
    * Master on a node it finds (`Upgrader`), and the restarted Master's `start` lets the Run go on.
+   * `incomplete`: the agent reported its task incomplete and the commands were not run for it
+   * (`blockIncompleteOnEnvironment`); the task starts over.
    */
-  private blockOnMissingNode(run: Run, stageRunId?: string): boolean {
+  private blockOnMissingNode(
+    run: Run,
+    stageRunId?: string,
+    what: 'commands' | 'incomplete' = 'commands',
+  ): boolean {
     if (!this.deps.nodeMissing?.()) return false;
     const node = process.execPath;
     this.block(run.id, {
       kind: 'environment',
-      message: t({
-        zh: `Master 正在用的 node（${node}）已经不存在了（比如换 Node 版本时被删掉），所以没有运行准备命令或检查命令，免得它们找不到 node、npm 而白白失败。这不是代码的问题：不返工，也不消耗返工和重做次数。Master 会自己找到能用的 node 并重启，重启后 Run 自动接着做。`,
-        en: `The node this Master runs on (${node}) is gone (deleted when switching Node versions, say), so no setup or verify commands were run: they would only fail for want of node and npm. That is no fault of the code, so there is no rework and no rework or redo is used up. The Master finds a usable node and restarts by itself, and the Run goes on after the restart.`,
-      }),
+      message:
+        what === 'incomplete'
+          ? t({
+              zh: `Agent 报告没有完成，而 Master 正在用的 node（${node}）已经不存在了（比如换 Node 版本时被删掉），检查命令会找不到 node、npm，Agent 多半也是因此没做完。这不是代码的问题：这次执行不算返工，也不消耗返工和重做次数；它的改动已撤销。Master 会自己找到能用的 node 并重启，重启后这个 Task 从开始前的提交重新执行。`,
+              en: `The agent reported its task incomplete, and the node this Master runs on (${node}) is gone (deleted when switching Node versions, say): the verify commands would not find node and npm, which is most likely why. That is no fault of the code, so this execution does not count as rework and no rework or redo is used up; its changes were undone. The Master finds a usable node and restarts by itself, and the task starts over from the commit before it after the restart.`,
+            })
+          : t({
+              zh: `Master 正在用的 node（${node}）已经不存在了（比如换 Node 版本时被删掉），所以没有运行准备命令或检查命令，免得它们找不到 node、npm 而白白失败。这不是代码的问题：不返工，也不消耗返工和重做次数。Master 会自己找到能用的 node 并重启，重启后 Run 自动接着做。`,
+              en: `The node this Master runs on (${node}) is gone (deleted when switching Node versions, say), so no setup or verify commands were run: they would only fail for want of node and npm. That is no fault of the code, so there is no rework and no rework or redo is used up. The Master finds a usable node and restarts by itself, and the Run goes on after the restart.`,
+            }),
       missing: node,
       ...(stageRunId ? { stageRunId } : {}),
     });
@@ -3123,32 +3183,45 @@ export class Engine {
   }
 
   /**
-   * A command failed for the environment (`environmentProblem`): the program it starts first, or
-   * that program's interpreter, is not in PATH. Blocks the Run on it rather than sending the work
-   * back or failing the Run: the agents cannot change the Master's environment, and a redo would
-   * fail the same way. Whatever stage or task it was in stays where it is, to run the commands
-   * again once the Run goes on (`checkEnvironment`, `start`, or a retry by hand).
+   * A command could not run for the environment: the program it starts first, or that program's
+   * interpreter, is not in PATH. Either it failed with 127 (`environmentProblem`; `setup`,
+   * `verify`), or the agent reported its task incomplete and the verify command was not run
+   * (`incomplete`, see `blockIncompleteOnEnvironment`). Blocks the Run on it rather than sending
+   * the work back or failing the Run: the agents cannot change the Master's environment, and a
+   * redo would fail the same way. Whatever stage or task it was in stays where it is, to run the
+   * commands (or the task's agent) again once the Run goes on (`checkEnvironment`, `start`, or a
+   * retry by hand).
    */
   private blockOnEnvironment(
     run: Run,
-    failed: CommandResult,
+    command: string,
     missing: string,
-    what: 'setup' | 'verify',
+    what: 'setup' | 'verify' | 'incomplete',
     stageRunId?: string,
   ): void {
-    const command =
-      what === 'setup'
-        ? t({ zh: `准备命令 \`${failed.command}\``, en: `the setup command \`${failed.command}\`` })
-        : t({
-            zh: `检查命令 \`${failed.command}\``,
-            en: `the verify command \`${failed.command}\``,
-          });
+    const goOn = t({
+      zh: `装好 ${missing}，或者让 Master 的 PATH 里能找到它（比如换 Node 版本后重启 Master）之后，Run 会自己接着做：Master 大约每分钟查一次，重启后也会接着做；也可以在看板上重试。`,
+      en: `Once ${missing} is installed or the Master's PATH finds it (restart the Master after switching Node versions, say), the Run goes on by itself: the Master looks about every minute, and after a restart; you can also retry it on the dashboard.`,
+    });
+    let message: string;
+    if (what === 'incomplete') {
+      message = t({
+        zh: `运行环境里找不到 \`${missing}\`：Agent 报告没有完成，而检查命令 \`${command}\` 要用到的 \`${missing}\` 在 PATH 里找不到，Agent 多半也是因此没做完。这是 Master 运行环境的问题，不是代码的问题：这次执行不算返工，也不消耗返工和重做次数；它的改动已撤销，接着做时这个 Task 从开始前的提交重新执行。${goOn}`,
+        en: `\`${missing}\` is not found in the environment: the agent reported its task incomplete, and \`${missing}\`, which the verify command \`${command}\` needs, is not in PATH, which is most likely why. That is a problem of the Master's environment, not of the code, so this execution does not count as rework and no rework or redo is used up; its changes were undone, and the task starts over from the commit before it when the Run goes on. ${goOn}`,
+      });
+    } else {
+      const which =
+        what === 'setup'
+          ? t({ zh: `准备命令 \`${command}\``, en: `the setup command \`${command}\`` })
+          : t({ zh: `检查命令 \`${command}\``, en: `the verify command \`${command}\`` });
+      message = t({
+        zh: `运行环境里找不到 \`${missing}\`：${which}的退出码是 127（找不到命令）。这是 Master 运行环境的问题，不是代码的问题：不返工，也不消耗返工和重做次数。${goOn}`,
+        en: `\`${missing}\` is not found in the environment: ${which} exited with 127 (command not found). That is a problem of the Master's environment, not of the code, so there is no rework and no rework or redo is used up. ${goOn}`,
+      });
+    }
     this.block(run.id, {
       kind: 'environment',
-      message: t({
-        zh: `运行环境里找不到 \`${missing}\`：${command}的退出码是 127（找不到命令）。这是 Master 运行环境的问题，不是代码的问题：不返工，也不消耗返工和重做次数。装好 ${missing}，或者让 Master 的 PATH 里能找到它（比如换 Node 版本后重启 Master）之后，Run 会自己接着做：Master 大约每分钟查一次，重启后也会接着做；也可以在看板上重试。`,
-        en: `\`${missing}\` is not found in the environment: ${command} exited with 127 (command not found). That is a problem of the Master's environment, not of the code, so there is no rework and no rework or redo is used up. Once ${missing} is installed or the Master's PATH finds it (restart the Master after switching Node versions, say), the Run goes on by itself: the Master looks about every minute, and after a restart; you can also retry it on the dashboard.`,
-      }),
+      message,
       missing,
       ...(stageRunId ? { stageRunId } : {}),
     });

@@ -72,9 +72,11 @@ export type BlockKind =
   | 'untrusted_issue'
   /**
    * A setup or verify command could not run because the Master's environment lacks the program
-   * it starts (exit code 127, the program not in PATH), or the node the Master runs on is gone: no
-   * fault of the code, so no rework, retry or redo is used up. Goes on by itself once the program
-   * is found again or the Master restarts; `missing` names the program.
+   * it starts (exit code 127, the program not in PATH), or the node the Master runs on is gone;
+   * also when an agent reported its task incomplete while a verify command's program was not in
+   * PATH (the task then starts over). No fault of the code, so no rework, retry or redo is used
+   * up. Goes on by itself once the program is found again or the Master restarts; `missing` names
+   * the program.
    */
   | 'environment'
   | 'error';

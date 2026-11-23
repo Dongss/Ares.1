@@ -529,8 +529,8 @@ function retryHint(kind: BlockKind): string {
       en: 'Once you have read the goal and confirmed it can go to the agents, the Run starts from the beginning.',
     },
     environment: {
-      zh: '装好缺的程序，或者让 Master 的 PATH 能找到它（换了 Node 版本就重启 Master）之后，Run 会在约一分钟内自动接着做，Master 重启后也会，不用重试；也可以手动重试，立刻再跑一次被卡住的命令（Agent 已经做完的改动保留，只重跑检查）。这不消耗返工和重做次数。',
-      en: 'Once the missing program is installed or the Master’s PATH finds it (restart the Master after switching Node versions), the Run goes on by itself within about a minute, and after a restart; no retry needed. You can also retry by hand to run the blocked commands again at once (work the agent already did is kept, and only the checks run again). No rework or redo is used up.',
+      zh: '装好缺的程序，或者让 Master 的 PATH 能找到它（换了 Node 版本就重启 Master）之后，Run 会在约一分钟内自动接着做，Master 重启后也会，不用重试；也可以手动重试，立刻再跑一次被卡住的命令（Agent 已经做完的改动保留，只重跑检查；Agent 报告没做完的，这个 Task 从开始前的提交重新执行）。这不消耗返工和重做次数。',
+      en: 'Once the missing program is installed or the Master’s PATH finds it (restart the Master after switching Node versions), the Run goes on by itself within about a minute, and after a restart; no retry needed. You can also retry by hand to run the blocked commands again at once (work the agent already did is kept, and only the checks run again; if the agent reported its task incomplete, the task starts over from the commit before it). No rework or redo is used up.',
     },
     error: {
       zh: '重试会从出错的 Task 开始前的提交重做。',

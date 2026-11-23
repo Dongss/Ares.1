@@ -90,7 +90,8 @@ src/
                       directory's origin), whose scout is shown failed upgrades
   workspace/git.ts    git: worktrees, commits, rollback, merge, fast-forward
   verify/commands.ts  run check commands and setup commands; whether a failed one failed for the
-                      environment (exit code 127, its first program not in PATH)
+                      environment (exit code 127, its first program not in PATH), and whether a
+                      command can find its first program without running it
   api/
     server.ts         HTTP API (Hono) and SSE
     types.ts          API data types, shared by Master and dashboard

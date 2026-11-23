@@ -1100,6 +1100,160 @@ describe('engine: a program missing from the environment', () => {
     expect(calls).toBe(2);
     expect(h.master.store.listRunTasks(run.id)[0]?.retries).toBe(1);
   });
+
+  describe('when the agent reports its task incomplete', () => {
+    const incomplete = (summary = '检查命令找不到程序，做不完'): FakeOutcome => ({
+      finalMessage: `\`\`\`json\n${JSON.stringify({ status: 'incomplete', summary })}\n\`\`\``,
+    });
+    /** A coder that gives up half done the first time and finishes afterwards. */
+    const givesUpOnce = (first: () => void = () => {}): Script => {
+      let calls = 0;
+      return (ctx) => {
+        if (++calls === 1) {
+          first();
+          writeFile(join(ctx.input.workdir, 'half.txt'), 'half\n');
+          return incomplete();
+        }
+        writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+        return done();
+      };
+    };
+    const types = (runId: string) =>
+      (h as Harness).master.store.listEvents(runId).map((e) => e.type);
+
+    it('blocks on the environment instead of reworking when a check cannot find its program, and the agent starts over once it is found', async () => {
+      const sent: string[] = [];
+      h = await harness({
+        verifyCommands: ['grep -q ok feature.txt', `${MISSING} --check`],
+        config: 'notify:\n  system: true\n',
+        master: { notice: (title) => sent.push(title) },
+      });
+      h.scripts.coder = givesUpOnce();
+      const { store, engine } = h.master;
+      const run = h.run();
+      const blocked = await h.waitStatus(run.id, 'blocked');
+      expect(blocked.error).toBeNull();
+      expect(blocked.blocked).toMatchObject({ kind: 'environment', missing: MISSING });
+      expect(blocked.blocked?.stageRunId).toBe(blocked.currentStageRunId);
+      expect(blocked.blocked?.message).toContain(
+        `运行环境里找不到 \`${MISSING}\`：Agent 报告没有完成，而检查命令 \`${MISSING} --check\` 要用到的 \`${MISSING}\` 在 PATH 里找不到`,
+      );
+      expect(sent.at(-1)).toBe(`Run 卡住了：运行环境里找不到 ${MISSING}`);
+      // Not a rework: the count is unchanged, and the task goes back to run its agent again.
+      const [task] = store.listRunTasks(run.id) as [Task];
+      expect(task).toMatchObject({ status: 'pending', retries: 0, pendingFeedback: null });
+      expect(task.sessionId).toBeNull();
+      expect(store.listAttempts(task.id).map((a) => a.outcome)).toEqual([null]);
+      expect(types(run.id)).not.toContain('task.rework');
+      expect(types(run.id)).toContain('task.discarded');
+      // The half-done work is undone, and no check ran.
+      const worktree = blocked.worktreePath as string;
+      expect(existsSync(join(worktree, 'half.txt'))).toBe(false);
+      expect(git(worktree, 'rev-parse', 'HEAD')).toBe(task.baseCommit);
+      expect(store.listChecks(run.id).filter((c) => c.kind === 'command')).toEqual([]);
+
+      // Still missing: nothing changes.
+      expect(engine.checkEnvironment()).toEqual([]);
+      expect(store.getRun(run.id).status).toBe('blocked');
+
+      install(MISSING);
+      expect(engine.checkEnvironment()).toEqual([run.id]);
+      await h.waitStatus(run.id, 'waiting_approval');
+      // The agent ran again from the start, with the task's prompt rather than a rework's.
+      const coder = h.fake.calls.filter((c) => c.model === 'coder');
+      expect(coder).toHaveLength(2);
+      expect(coder[1]?.resumeSessionId).toBeUndefined();
+      expect(coder[1]?.prompt).not.toContain('你报告任务没有完成');
+      expect(store.getTask(task.id)).toMatchObject({ status: 'passed', retries: 0 });
+      expect(store.listAttempts(task.id).map((a) => a.outcome)).toEqual([null, 'passed']);
+      expect(git(worktree, 'show', '--stat', '--format=', 'HEAD')).not.toContain('half.txt');
+      const after = types(run.id);
+      expect(after).toContain('environment.resumed');
+      expect(after).not.toContain('task.verify_resumed');
+      expect(after).not.toContain('task.rework');
+      expect(after).not.toContain('run.retry');
+    });
+
+    it('starts the agent over on a retry by hand too', async () => {
+      h = await harness({ verifyCommands: [`${MISSING} --check`] });
+      h.scripts.coder = givesUpOnce();
+      const run = h.run();
+      await h.waitStatus(run.id, 'blocked');
+      install(MISSING);
+      await h.master.engine.retry(run.id);
+      await h.waitStatus(run.id, 'waiting_approval');
+      expect(h.fake.calls.map((c) => c.model)).toEqual(['coder', 'coder', 'reviewer']);
+      expect(h.master.store.listRunTasks(run.id)[0]?.retries).toBe(0);
+      expect(types(run.id)).not.toContain('task.verify_resumed');
+    });
+
+    it("blocks with the Master's node as missing when that node is gone", async () => {
+      let gone = false;
+      const sentinel = join(tmpDir('ares1-marker-'), 'verified');
+      h = await harness({
+        verifyCommands: [`touch ${sentinel}`, 'grep -q ok feature.txt'],
+        master: { nodeMissing: () => gone },
+      });
+      // nvm uninstalls the version the Master runs on while the agent works.
+      h.scripts.coder = givesUpOnce(() => {
+        gone = true;
+      });
+      const { store, engine } = h.master;
+      const run = h.run();
+      const blocked = await h.waitStatus(run.id, 'blocked');
+      expect(blocked.blocked).toMatchObject({ kind: 'environment', missing: process.execPath });
+      expect(blocked.blocked?.message).toContain(
+        `Agent 报告没有完成，而 Master 正在用的 node（${process.execPath}）已经不存在了`,
+      );
+      const [task] = store.listRunTasks(run.id) as [Task];
+      expect(task).toMatchObject({ status: 'pending', retries: 0 });
+      expect(types(run.id)).not.toContain('task.rework');
+      expect(existsSync(sentinel)).toBe(false);
+      expect(existsSync(join(blocked.worktreePath as string, 'half.txt'))).toBe(false);
+
+      // The restarted Master's node finds everything.
+      gone = false;
+      expect(engine.checkEnvironment()).toEqual([run.id]);
+      await h.waitStatus(run.id, 'waiting_approval');
+      expect(h.fake.calls.filter((c) => c.model === 'coder')).toHaveLength(2);
+      expect(existsSync(sentinel)).toBe(true);
+      expect(store.getTask(task.id)).toMatchObject({ status: 'passed', retries: 0 });
+      expect(types(run.id)).not.toContain('task.verify_resumed');
+    });
+
+    it('still reworks with what the agent said when every check finds its program', async () => {
+      h = await harness({ verifyCommands: ['cd . && true', 'grep -q ok feature.txt'] });
+      h.scripts.coder = givesUpOnce();
+      const run = h.run();
+      await h.waitStatus(run.id, 'waiting_approval');
+      const { store } = h.master;
+      const [task] = store.listRunTasks(run.id) as [Task];
+      expect(task.retries).toBe(1);
+      expect(store.listAttempts(task.id).map((a) => a.outcome)).toEqual(['rework', 'passed']);
+      const rework = store.listEvents(run.id).find((e) => e.type === 'task.rework');
+      expect(String(rework?.data.feedback)).toContain('检查命令找不到程序，做不完');
+      expect(types(run.id)).not.toContain('run.blocked');
+      // A rework goes on with the agent's session and its work.
+      const coder = h.fake.calls.filter((c) => c.model === 'coder');
+      expect(coder[1]?.resumeSessionId).toBeTruthy();
+    });
+
+    it('says so in English', async () => {
+      setLang('en');
+      try {
+        h = await harness({ verifyCommands: [`${MISSING} --check`] });
+        h.scripts.coder = givesUpOnce();
+        const run = h.run();
+        const blocked = await h.waitStatus(run.id, 'blocked');
+        expect(blocked.blocked?.message).toContain(
+          `\`${MISSING}\` is not found in the environment: the agent reported its task incomplete, and \`${MISSING}\`, which the verify command \`${MISSING} --check\` needs, is not in PATH`,
+        );
+        expect(blocked.blocked?.message).not.toMatch(/[一-鿿]/);
+      } finally {
+        setLang('zh');
+      }
+    });
+  });
 });
 
 /** The discussion of a Run in short: 「assessor:ask」, 「human:dashboard」, 「timeout:24」. */
