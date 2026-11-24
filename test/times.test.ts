@@ -9,6 +9,7 @@ import {
   runTimeParts,
   runTimes,
   timeParts,
+  workSwitchesOf,
 } from '../src/engine/times.js';
 import { setLang } from '../src/i18n.js';
 
@@ -261,6 +262,28 @@ describe('runTimes', () => {
       });
       expect(times).toMatchObject({ queuedMs: (30 - 14) * MIN + 10 * MIN, stoppedMs: 14 * MIN });
     });
+  });
+});
+
+describe('workSwitchesOf', () => {
+  it('reads the switches from the master.working events, leaving out those without on/off', () => {
+    const types: string[] = [];
+    const switches = workSwitchesOf({
+      listGlobalEventsOfType: (type) => {
+        types.push(type);
+        return [
+          { ts: at(1), data: { on: false } },
+          { ts: at(2), data: {} },
+          { ts: at(3), data: { on: 'true' } },
+          { ts: at(4), data: { on: true } },
+        ];
+      },
+    });
+    expect(types).toEqual(['master.working']);
+    expect(switches).toEqual([
+      { ts: at(1), on: false },
+      { ts: at(4), on: true },
+    ]);
   });
 });
 

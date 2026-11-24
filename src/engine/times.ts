@@ -147,16 +147,31 @@ export interface RunRecordReader {
   listGlobalEventsOfType(type: string): readonly Pick<EventRow, 'ts' | 'data'>[];
 }
 
-/** `runTimes` of a Run, from its records in the store. */
-export function storedRunTimes(store: RunRecordReader, run: Run): RunTimes {
+/** Every time the work switch was turned on or off, from the store's global events. */
+export function workSwitchesOf(
+  store: Pick<RunRecordReader, 'listGlobalEventsOfType'>,
+): WorkSwitch[] {
+  // Recorded by the store's setWorking with whether work is now on.
+  return store
+    .listGlobalEventsOfType('master.working')
+    .flatMap((e) => (typeof e.data.on === 'boolean' ? [{ ts: e.ts, on: e.data.on }] : []));
+}
+
+/**
+ * `runTimes` of a Run, from its records in the store. A caller working out the times of several
+ * Runs passes the work switches (`workSwitchesOf`) read once for all of them; otherwise they are
+ * read here.
+ */
+export function storedRunTimes(
+  store: RunRecordReader,
+  run: Run,
+  switches?: readonly WorkSwitch[],
+): RunTimes {
   return runTimes(run, {
     attempts: store.listRunAttempts(run.id),
     approvals: store.listApprovals(run.id),
     events: store.listEvents(run.id),
-    // Recorded by the store's setWorking with whether work is now on.
-    workSwitches: store
-      .listGlobalEventsOfType('master.working')
-      .flatMap((e) => (typeof e.data.on === 'boolean' ? [{ ts: e.ts, on: e.data.on }] : [])),
+    workSwitches: switches ?? workSwitchesOf(store),
   });
 }
 

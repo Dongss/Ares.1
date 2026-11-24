@@ -1,7 +1,8 @@
 import { rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { storedRunTimes } from '../src/engine/times.js';
 import type { GhIssue } from '../src/github/client.js';
 import { markComment, RETRIES_EXHAUSTED_MARKER } from '../src/github/issues.js';
 import { issueDigest, runDigest, scoutPrompt } from '../src/github/scout.js';
@@ -191,6 +192,59 @@ describe('runDigest', () => {
     } finally {
       setLang('zh');
     }
+  });
+
+  it('reads the work switch once for all the finished Runs', async () => {
+    h = await harness({ workflow: IMPLEMENT_ONLY });
+    const store = h.master.store;
+    const first = h.run();
+    await h.waitStatus(first.id, 'completed');
+    const created = h.run();
+    await h.waitStatus(created.id, 'completed');
+    // Created an hour after the first, so that each is queued with work switched off apart.
+    const second = store.updateRun(created.id, { createdAt: later(first, 60) });
+    // Each started 30 minutes after it was created, done 5 minutes later.
+    for (const run of [first, second]) {
+      retimeStatuses(h, run, [
+        ['running', 30],
+        ['completed', 35],
+      ]);
+      store.updateRun(run.id, { finishedAt: later(run, 35) });
+      for (const a of store.listRunAttempts(run.id)) {
+        store.updateAttempt(a.id, { startedAt: later(run, 30), endedAt: later(run, 35) });
+      }
+    }
+    // Work was switched off from before the first Run was created until 25 minutes after, and
+    // again from 10 to 20 minutes after the second was created.
+    for (const on of [false, true, false, true]) store.setWorking(on);
+    const switches = store.listGlobalEventsOfType('master.working');
+    for (const [e, min] of [
+      [switches[0], -10],
+      [switches[1], 25],
+      [switches[2], 70],
+      [switches[3], 80],
+    ] as const) {
+      store.db.prepare('UPDATE events SET ts = ? WHERE id = ?').run(later(first, min), e?.id ?? 0);
+    }
+    const reads = vi.spyOn(store, 'listGlobalEventsOfType');
+    let text: string;
+    try {
+      text = digest(h);
+      expect(reads.mock.calls.filter(([type]) => type === 'master.working')).toHaveLength(1);
+    } finally {
+      reads.mockRestore();
+    }
+    expect(text).toContain('，用时 35 分钟（Agent 执行 5 分钟，排队 5 分钟，停工 25 分钟）');
+    expect(text).toContain('，用时 35 分钟（Agent 执行 5 分钟，排队 20 分钟，停工 10 分钟）');
+    // The same times as each Run's read on its own.
+    expect(storedRunTimes(store, store.getRun(first.id))).toMatchObject({
+      queuedMs: 5 * 60_000,
+      stoppedMs: 25 * 60_000,
+    });
+    expect(storedRunTimes(store, store.getRun(second.id))).toMatchObject({
+      queuedMs: 20 * 60_000,
+      stoppedMs: 10 * 60_000,
+    });
   });
 
   it('tells the time a Run was paused, and queued again once resumed', async () => {

@@ -26,6 +26,8 @@ import {
   runTimeParts,
   storedRunTimes,
   timeParts,
+  type WorkSwitch,
+  workSwitchesOf,
 } from '../engine/times.js';
 import { join, t } from '../i18n.js';
 import type { Store } from '../store/store.js';
@@ -517,6 +519,13 @@ function terminationReason(events: EventRow[]): string {
 export function runDigest(store: Store, repoId: string, limit = 15): string {
   const runs = store.listRuns({ repoId }).slice(0, limit);
   if (runs.length === 0) return t({ zh: '（还没有 Run）', en: '(no Runs yet)' });
+  // Every finished Run's times need the whole record of the work switch: read it once, at the
+  // first finished Run, rather than once per Run.
+  let switches: WorkSwitch[] | undefined;
+  const workSwitches = () => {
+    switches ??= workSwitchesOf(store);
+    return switches;
+  };
   return runs
     .map((run) => {
       const stageRuns = store.listStageRuns(run.id);
@@ -530,7 +539,7 @@ export function runDigest(store: Store, repoId: string, limit = 15): string {
       const trusted = trustedGoal(run);
       const rounds = new Map<string, number>();
       for (const sr of stageRuns) rounds.set(sr.stageId, (rounds.get(sr.stageId) ?? 0) + 1);
-      const took = run.finishedAt ? tookText(storedRunTimes(store, run)) : '';
+      const took = run.finishedAt ? tookText(storedRunTimes(store, run, workSwitches())) : '';
       const status = statusText(run.status);
       const date = run.createdAt.slice(0, 10);
       const goal = trusted
