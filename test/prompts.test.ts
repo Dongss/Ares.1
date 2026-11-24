@@ -273,6 +273,7 @@ describe('planning prompts', () => {
   it("tells a step's agent what the step is, what is done and what is left to later steps", () => {
     const step = {
       index: 2,
+      total: 3,
       titles: ['加接口', '接上存储', '补文档'],
       instructions: '把接口接到 store 上',
     };
@@ -497,6 +498,7 @@ describe('prompts in English', () => {
       planBare: planPrompt({ ...enCtx(), verifyCommands: [] }, null),
       step: taskPrompt(enCtx(stage), null, 'full', undefined, {
         index: 2,
+        total: 3,
         titles: ['Add the API', 'Wire up the store', 'Document it'],
         instructions: 'Connect the API to the store',
       }),

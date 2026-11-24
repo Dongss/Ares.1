@@ -360,18 +360,17 @@ const roundName = (stageName: string, round: number) =>
   t({ zh: `${stageName}第 ${round} 轮`, en: `${stageName} round ${round}` });
 
 /**
- * Why a step of a plan has not passed, or null when it passed or may still pass: it failed, the
- * Run was terminated or failed on it, or the Run ended before the step was reached or finished.
+ * Why a step of a plan has not passed, or null when it passed or may still pass: it failed, or
+ * the Run ended (terminated, or failed elsewhere) before the step was reached or done. Ending a
+ * Run cancels its unfinished tasks, so a step's status alone does not tell the two apart; whether
+ * it was executed does.
  */
 function stepStatusText(task: Task, executions: number, runEnded: boolean): string | null {
   if (task.status === 'passed') return null;
   if (task.status === 'failed') return t({ zh: '失败', en: 'failed' });
-  if (task.status !== 'cancelled' && !runEnded) return null;
-  if (executions === 0) {
-    return t({ zh: 'Run 结束时还没执行到', en: 'not reached before the Run ended' });
-  }
-  return task.status === 'cancelled'
-    ? t({ zh: '没做完就被终止', en: 'terminated before it was done' })
+  if (!runEnded) return null;
+  return executions === 0
+    ? t({ zh: 'Run 结束时还没执行到', en: 'not reached before the Run ended' })
     : t({ zh: 'Run 结束时还没做完', en: 'not done when the Run ended' });
 }
 

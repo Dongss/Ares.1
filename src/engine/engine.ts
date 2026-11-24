@@ -1911,11 +1911,13 @@ export class Engine {
    */
   private plannedStep(sr: StageRun, task: Task): PlannedStep | undefined {
     const tasks = this.store.listTasks(sr.id);
-    const step = planSteps(tasks).get(task.id);
+    const steps = planSteps(tasks);
+    const step = steps.get(task.id);
     if (!step) return undefined;
     return {
       index: step.index,
-      titles: tasks.filter((t) => t.kind === 'work').map((t) => t.title),
+      total: step.total,
+      titles: tasks.filter((t) => steps.has(t.id)).map((t) => t.title),
       instructions: task.instructions,
     };
   }
@@ -2126,9 +2128,7 @@ export class Engine {
         runId: run.id,
         agent: done.agent,
         attempt: this.store.getAttempt(attempt.id),
-        ...(step
-          ? { step: { index: step.index, total: step.titles.length, title: task.title } }
-          : {}),
+        ...(step ? { step: { index: step.index, total: step.total, title: task.title } } : {}),
       }),
     );
     this.checkAbort(signal);

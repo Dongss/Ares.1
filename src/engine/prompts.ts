@@ -180,6 +180,8 @@ This requirement's branch conflicted when it was to be merged into ${merge.targe
 export interface PlannedStep {
   /** Position among the plan's tasks, from 1. */
   index: number;
+  /** How many steps the plan has. */
+  total: number;
   /** Titles of all the plan's tasks, in order. */
   titles: string[];
   /** What the plan says this step does. */
@@ -188,7 +190,7 @@ export interface PlannedStep {
 
 function stepSection(step: PlannedStep | undefined): string {
   if (!step) return '';
-  const total = step.titles.length;
+  const { total } = step;
   const title = step.titles[step.index - 1] ?? '';
   const plan = step.titles
     .map((s, i) => {

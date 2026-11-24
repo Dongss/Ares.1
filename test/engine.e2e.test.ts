@@ -4967,6 +4967,16 @@ stages:
       ['plan', '拆分任务', 'passed'],
       ['work', 'a', 'passed'],
     ]);
+
+    // A plan of a single step is the whole stage: prompted and committed as without a plan.
+    const [stepCall] = h.fake.calls.filter((c) => c.model === 'coder' && !c.readOnly);
+    expect(stepCall?.prompt).toContain('## 当前阶段：编码\n\n实现 添加 feature.txt');
+    expect(stepCall?.prompt).not.toContain('## 这一步');
+    expect(stepCall?.prompt).not.toContain('整个计划');
+    const [, step] = store.listTasks(implement.id) as [Task, Task];
+    const message = git(h.repoDir, 'log', '-1', '--format=%B', step.commitSha as string);
+    expect(message.startsWith('编码: 添加 feature.txt\n\n写了 ')).toBe(true);
+    expect(message).not.toContain('第 1/1 步');
   });
 
   it('creates no task from a plan that does not match the format', async () => {
@@ -5141,6 +5151,43 @@ stages:
     expect(lines.slice(at + 1)).toEqual([
       '    第 2/3 步「b」：执行 3 次，返工原因：`grep -q ok feature.txt` 未通过 ×3',
       '    第 2/3 步「b」：失败',
+      '    第 3/3 步「c」：Run 结束时还没执行到',
+    ]);
+  });
+
+  it('tells the scout which step a cancel stopped in the middle of', async () => {
+    const steps = planner(['a', 'b', 'c']);
+    let executions = 0;
+    h = await harness({
+      workflow: PLANNED_WORKFLOW,
+      scripts: {
+        // The second step runs until the Run is cancelled.
+        coder: async (ctx) => {
+          if (!ctx.input.readOnly && ++executions === 2) {
+            await new Promise((resolve) => ctx.signal.addEventListener('abort', resolve));
+            return done();
+          }
+          return steps(ctx);
+        },
+        reviewer: () => review(),
+      },
+    });
+    const run = h.run();
+    await waitFor(() => executions === 2, 'second step to start');
+    await h.master.engine.cancel(run.id);
+
+    const [implement] = implementRounds(run.id) as [StageRun];
+    expect(tasksOf(implement.id)).toEqual([
+      ['plan', '拆分任务', 'passed'],
+      ['work', 'a', 'passed'],
+      ['work', 'b', 'cancelled'],
+      ['work', 'c', 'cancelled'],
+    ]);
+    const lines = runDigest(h.master.store, h.repo.id).split('\n');
+    const at = lines.indexOf('  编码第 1 轮：拆成 3 步');
+    expect(at).toBeGreaterThan(0);
+    expect(lines.slice(at + 1, at + 3)).toEqual([
+      '    第 2/3 步「b」：Run 结束时还没做完',
       '    第 3/3 步「c」：Run 结束时还没执行到',
     ]);
   });
