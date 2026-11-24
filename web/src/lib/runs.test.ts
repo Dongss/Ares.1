@@ -382,20 +382,28 @@ describe('requirement assessment', () => {
 
   it('shows the size beside the conclusion, with what it means', () => {
     expect(sizeText(undefined)).toBeNull();
-    expect(sizeText('S')).toEqual({ label: '规模 S', meaning: '一处小改动' });
-    expect(sizeText('M')).toEqual({ label: '规模 M', meaning: '一个 Run 能做完的普通需求' });
+    expect(sizeText('S')).toEqual({
+      label: '规模 S',
+      meaning: '一处小改动，比如改一个函数、一段文字或一项配置',
+    });
+    expect(sizeText('M')).toEqual({ label: '规模 M', meaning: '不用拆分、一次就能做完的普通需求' });
     expect(sizeText('L')).toEqual({
       label: '规模 L',
-      meaning: '要改多个模块，一次做完容易超时或返工',
+      meaning: '要改多个模块、一次做完容易超时或返工的需求，可能先拆成几步，再一步一步做',
     });
     setLang('en');
     const english = (['S', 'M', 'L'] as const).map((size) => sizeText(size));
+    // The meanings the assessment sized by, starting with a capital as they stand alone.
     expect(english).toEqual([
-      { label: 'Size S', meaning: 'One small change' },
-      { label: 'Size M', meaning: 'An ordinary requirement one Run can finish' },
+      {
+        label: 'Size S',
+        meaning: 'One small change, such as a function, a passage of text or a setting',
+      },
+      { label: 'Size M', meaning: 'An ordinary requirement done in one go, without splitting it' },
       {
         label: 'Size L',
-        meaning: 'Changes across several modules, likely to time out or need rework in one go',
+        meaning:
+          'Changes across several modules, likely to time out or need rework when done in one go, so it may be split into steps done one after another',
       },
     ]);
     expect(JSON.stringify(english)).not.toMatch(/[一-鿿]/);

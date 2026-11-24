@@ -1,4 +1,5 @@
 import { brandName } from '../brand.js';
+import { PROPOSAL_SIZES, sizeMeanings } from '../config/flow.js';
 import type { AgentConfig, StageDef } from '../config/schema.js';
 import { join, t } from '../i18n.js';
 import type {
@@ -707,20 +708,22 @@ export function formatDiscussion(discussion: readonly DiscussionEntry[], level =
 }
 
 /**
- * How an assessment that goes ahead sizes the requirement (`size`, `REQUIREMENT_SIZES`). A stage
- * with `planning: auto` splits only an L into steps.
+ * How an assessment that goes ahead sizes the requirement (`size`, `REQUIREMENT_SIZES`), with the
+ * meanings the scout's proposals use too (`sizeMeanings`). A stage with `planning: auto` splits
+ * only an L into steps.
  */
 function sizeRule(): string {
-  return t({
-    zh: `verdict 为 go 时还要给出 size，估计需求的规模，只能是 S、M、L 三个字母之一：
-- S：一处小改动，比如改一个函数、一段文字或一项配置；
-- M：一个 Run 能做完的普通需求；
-- L：要改多个模块，一次做完容易超时或返工的需求；这样的需求可能先拆成几步，再一步一步做。`,
-    en: `With verdict go, also give size, how big you judge the requirement, as one of the letters S, M and L:
-- S: one small change, such as a function, a passage of text or a setting;
-- M: an ordinary requirement one Run can finish;
-- L: changes across several modules, likely to time out or need rework when done in one go; such a requirement may be split into steps done one after another.`,
+  const meanings = sizeMeanings();
+  const last = PROPOSAL_SIZES.length - 1;
+  const items = PROPOSAL_SIZES.map((size, i) => {
+    const end = i === last ? t({ zh: '。', en: '.' }) : t({ zh: '；', en: ';' });
+    return `- ${size}${t({ zh: '：', en: ': ' })}${meanings[size]}${end}`;
   });
+  const head = t({
+    zh: 'verdict 为 go 时还要给出 size，估计需求的规模，只能是 S、M、L 三个字母之一：',
+    en: 'With verdict go, also give size, how big you judge the requirement, as one of the letters S, M and L:',
+  });
+  return [head, ...items].join('\n');
 }
 
 /**

@@ -2,7 +2,13 @@
 
 import { z } from 'zod';
 import { brandName } from '../brand.js';
-import { isAutoAcceptable, PROPOSAL_SIZES, RISKS, type Risk } from '../config/flow.js';
+import {
+  isAutoAcceptable,
+  PROPOSAL_SIZES,
+  RISKS,
+  type Risk,
+  sizeMeanings,
+} from '../config/flow.js';
 import {
   deniedOperations,
   parseReport,
@@ -82,6 +88,17 @@ export const ScoutReportSchema = z.object({
   proposals: z.array(ProposalSchema),
 });
 
+/**
+ * 「S：…；M：…；L：…」: what a proposal's size means, the same meanings a requirement assessment
+ * sizes by (`sizeMeanings`), so the two judge a requirement alike.
+ */
+function sizeDescription(): string {
+  const meanings = sizeMeanings();
+  return PROPOSAL_SIZES.map((size) => `${size}${t({ zh: '：', en: ': ' })}${meanings[size]}`).join(
+    t({ zh: '；', en: '; ' }),
+  );
+}
+
 /** JSON schema of the scout's answer, its descriptions in the language in use. */
 export function scoutReportJsonSchema() {
   return {
@@ -142,10 +159,7 @@ export function scoutReportJsonSchema() {
             category: { enum: ['bug', 'feature', 'improvement', 'docs', 'test', 'refactor'] },
             size: {
               enum: [...PROPOSAL_SIZES],
-              description: t({
-                zh: 'S：一小时内；M：半天内；L：更大',
-                en: 'S: within an hour; M: within half a day; L: larger',
-              }),
+              description: sizeDescription(),
             },
             risk: { enum: [...RISKS] },
             why: {

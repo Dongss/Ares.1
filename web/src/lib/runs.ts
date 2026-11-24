@@ -4,6 +4,7 @@ import {
   discussionReplyWait,
   RAW_LOG_KEEP_DAYS,
   runRawLogsExpired,
+  sizeMeanings,
 } from '../../../src/config/flow.js';
 import {
   assessedSize,
@@ -248,26 +249,19 @@ export function assessmentSize(run: Pick<Run, 'discussion'>): RequirementSize | 
 }
 
 /**
- * 「规模 L」 and what the size means, shown beside the assessment's conclusion; null without a
- * size (`assessmentSize`).
+ * 「规模 L」 and what the size means (`sizeMeanings`, the meanings the assessment sized by),
+ * shown beside the assessment's conclusion; null without a size (`assessmentSize`).
  */
 export function sizeText(
   size: RequirementSize | undefined,
 ): { label: string; meaning: string } | null {
   if (!size) return null;
-  const meanings: Record<RequirementSize, string> = t({
-    zh: {
-      S: '一处小改动',
-      M: '一个 Run 能做完的普通需求',
-      L: '要改多个模块，一次做完容易超时或返工',
-    },
-    en: {
-      S: 'One small change',
-      M: 'An ordinary requirement one Run can finish',
-      L: 'Changes across several modules, likely to time out or need rework in one go',
-    },
-  });
-  return { label: t({ zh: `规模 ${size}`, en: `Size ${size}` }), meaning: meanings[size] };
+  const meaning = sizeMeanings()[size];
+  // Shown on its own, so it starts with a capital in English.
+  return {
+    label: t({ zh: `规模 ${size}`, en: `Size ${size}` }),
+    meaning: meaning.charAt(0).toUpperCase() + meaning.slice(1),
+  };
 }
 
 /**

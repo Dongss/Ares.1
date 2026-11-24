@@ -14,6 +14,7 @@ import {
   type Attempt,
   type EventRow,
   FINISHED_RUN_STATUSES,
+  REQUIREMENT_SIZES,
   type RequirementSize,
   type Run,
   type Scout,
@@ -24,9 +25,33 @@ import type { Escalate, RunOverrides, StageDef, WorkflowTemplate } from './schem
 export const RISKS = ['low', 'mid', 'high'] as const;
 export type Risk = (typeof RISKS)[number];
 
-/** Size of a proposal: S within an hour, M within half a day, L larger. */
-export const PROPOSAL_SIZES = ['S', 'M', 'L'] as const;
-export type ProposalSize = (typeof PROPOSAL_SIZES)[number];
+/**
+ * Size of a proposal, ordered and judged by scope (`sizeMeanings`): the same letters, with the
+ * same meanings, as the size a requirement assessment gives.
+ */
+export const PROPOSAL_SIZES = REQUIREMENT_SIZES;
+export type ProposalSize = RequirementSize;
+
+/**
+ * What each size means, by scope. The one definition the scout's output format, the requirement
+ * assessment's prompt and the Run detail page all show, so the scout and the assessment judge a
+ * requirement the same way. Lower case and without end punctuation, for callers to put in a list
+ * or a sentence.
+ */
+export function sizeMeanings(): Record<ProposalSize, string> {
+  return t({
+    zh: {
+      S: '一处小改动，比如改一个函数、一段文字或一项配置',
+      M: '不用拆分、一次就能做完的普通需求',
+      L: '要改多个模块、一次做完容易超时或返工的需求，可能先拆成几步，再一步一步做',
+    },
+    en: {
+      S: 'one small change, such as a function, a passage of text or a setting',
+      M: 'an ordinary requirement done in one go, without splitting it',
+      L: 'changes across several modules, likely to time out or need rework when done in one go, so it may be split into steps done one after another',
+    },
+  });
+}
 
 /** What auto-accept looks at in a proposal. */
 export interface ProposalKind {

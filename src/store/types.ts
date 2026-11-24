@@ -194,9 +194,9 @@ export interface FailedAttempt {
 export type AssessVerdict = 'go' | 'ask' | 'drop';
 
 /**
- * How big an assessment judged the requirement: S one small change, M an ordinary requirement one
- * Run finishes, L changes across several modules, likely to time out or run out of reworks in one
- * go. The same letters in every language.
+ * How big an assessment judged the requirement, ordered from small to large; proposals use the
+ * same letters (`PROPOSAL_SIZES`). What each means is `sizeMeanings` in `src/config/flow.ts`. The
+ * same letters in every language.
  */
 export const REQUIREMENT_SIZES = ['S', 'M', 'L'] as const;
 export type RequirementSize = (typeof REQUIREMENT_SIZES)[number];

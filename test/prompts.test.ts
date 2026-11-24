@@ -1,6 +1,7 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { PROPOSAL_SIZES, sizeMeanings } from '../src/config/flow.js';
 import type { StageDef } from '../src/config/schema.js';
 import { formatFeedback, formatReviewIssues, resultProblem } from '../src/engine/contracts.js';
 import { commitMessage } from '../src/engine/engine.js';
@@ -13,6 +14,7 @@ import {
   reworkPrompt,
   taskPrompt,
 } from '../src/engine/prompts.js';
+import { scoutReportJsonSchema } from '../src/github/scout.js';
 import { setLang } from '../src/i18n.js';
 import type { AssessmentEntry, FailedAttempt, ReplyTimeoutEntry } from '../src/store/types.js';
 
@@ -194,8 +196,10 @@ describe('prompts', () => {
       expect(prompt).toContain(
         'verdict 为 go 时还要给出 size，估计需求的规模，只能是 S、M、L 三个字母之一：\n- S：一处小改动',
       );
-      expect(prompt).toContain('- M：一个 Run 能做完的普通需求；');
-      expect(prompt).toContain('- L：要改多个模块，一次做完容易超时或返工的需求；');
+      expect(prompt).toContain('- M：不用拆分、一次就能做完的普通需求；');
+      expect(prompt).toContain(
+        '- L：要改多个模块、一次做完容易超时或返工的需求，可能先拆成几步，再一步一步做。',
+      );
       expect(prompt).toContain('{"verdict": "go", "size": "M", "summary": ');
     }
   });
@@ -240,6 +244,44 @@ describe('prompts', () => {
     expect(assessPrompt(ctx({ id: 'assess', kind: 'assess' }), [], null)).not.toContain(
       '之前的尝试',
     );
+  });
+});
+
+describe('size meanings', () => {
+  afterEach(() => setLang('zh'));
+
+  // The assessment's prompt and the scout's output format, both in the language in use.
+  const texts = (goal: string) => {
+    const properties = scoutReportJsonSchema().properties.proposals.items.properties;
+    return {
+      assess: assessPrompt({ ...ctx({ id: 'assess', kind: 'assess' }), goal }, [], null),
+      scout: properties.size.description,
+    };
+  };
+
+  it('gives the assessment and the scout the same meaning of S, M and L, from one place', () => {
+    const meanings = sizeMeanings();
+    const { assess, scout } = texts('添加 feature.txt');
+    for (const size of PROPOSAL_SIZES) {
+      expect(assess).toContain(`- ${size}：${meanings[size]}`);
+      expect(scout).toContain(`${size}：${meanings[size]}`);
+    }
+    expect(scout).toBe(`S：${meanings.S}；M：${meanings.M}；L：${meanings.L}`);
+    // Sizes are judged by scope, not by hours.
+    expect(scout).not.toMatch(/小时|半天/);
+  });
+
+  it('does the same in English', () => {
+    setLang('en');
+    const meanings = sizeMeanings();
+    const { assess, scout } = texts('Add feature.txt');
+    for (const size of PROPOSAL_SIZES) {
+      expect(assess).toContain(`- ${size}: ${meanings[size]}`);
+      expect(scout).toContain(`${size}: ${meanings[size]}`);
+    }
+    expect(scout).toBe(`S: ${meanings.S}; M: ${meanings.M}; L: ${meanings.L}`);
+    expect(scout).not.toMatch(/hour/);
+    expect(`${JSON.stringify(meanings)}${scout}${assess}`).not.toMatch(/[一-鿿]/);
   });
 });
 
