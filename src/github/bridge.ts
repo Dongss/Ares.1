@@ -48,7 +48,7 @@ import {
 } from '../store/types.js';
 import { isMasterSource, type MasterOrigin } from '../upgrade/source.js';
 import { lastUpgradeFailure, type UpgradeFailure } from '../upgrade/upgrader.js';
-import { errorMessage, nowIso } from '../util.js';
+import { errorMessage, nowIso, tail } from '../util.js';
 import {
   type CommandResult,
   environmentProblem,
@@ -202,6 +202,109 @@ export function mergeRemoteMessage(branch: string): string {
   );
 }
 
+/** A check that failed on the Master's merge of GitHub's commits, as github.diverged gives it. */
+export interface FailedCheck {
+  command: string;
+  kind: 'setup' | 'verify';
+  exitCode: number | null;
+  timedOut: boolean;
+  /** The program it could not find, when that is why it failed. */
+  missing?: string;
+  /** End of its output. */
+  output: string;
+}
+
+/**
+ * Why the Master's merge of GitHub's commits into the target branch needs an agent
+ * (`mergeRemote`): it conflicted in `files`, or a check failed on it (`failed`, its output in
+ * `log`). The data of the github.diverged event, as it is.
+ */
+export type RemoteMergeFailure =
+  | { conflict: true; files: string[] }
+  | { failed: FailedCheck; log: string };
+
+/** How much of a failed check's output the goal of a Run that merges GitHub's commit quotes. */
+const GOAL_OUTPUT_CHARS = 2000;
+
+/** What the Master's merge ran into, as a list for the goal of the Run that takes it over. */
+function mergeFailureLines(why: RemoteMergeFailure): string {
+  if (!('failed' in why)) {
+    return `- ${t({ zh: '冲突的文件：', en: 'Conflicted files: ' })}${joinList(why.files)}`;
+  }
+  const { failed } = why;
+  const command =
+    failed.kind === 'setup'
+      ? t({ zh: '没通过的准备命令', en: 'Failed setup command' })
+      : t({ zh: '没通过的检查命令', en: 'Failed verify command' });
+  const how = failed.timedOut
+    ? t({ zh: '（超时）', en: ' (timed out)' })
+    : failed.exitCode !== null
+      ? t({ zh: `（退出码 ${failed.exitCode}）`, en: ` (exit code ${failed.exitCode})` })
+      : '';
+  const lines = [
+    `- ${command}${t({ zh: '：', en: ': ' })}\`${failed.command}\`${how}`,
+    `- ${t({ zh: '日志：', en: 'Log: ' })}${why.log}`,
+  ];
+  const output = failed.output.trim();
+  if (output) {
+    const end = tail(output, GOAL_OUTPUT_CHARS);
+    lines.push(
+      `- ${t({ zh: '输出的最后部分：', en: 'End of its output:' })}\n\n\`\`\`\n${end}\n\`\`\``,
+    );
+  }
+  return lines.join('\n');
+}
+
+/**
+ * The goal of the Run the Master creates for an agent to merge commit `remote` of the target
+ * branch `branch` on GitHub into the local one, at `local`, when its own merge of the two did not
+ * go through (`why`). Written in the Master's language and complete, so that the requirement
+ * assessment goes ahead without asking: what to merge, what to keep, that the checks must pass
+ * afterwards, and what the Master's merge ran into.
+ */
+export function mergeRemoteGoal(input: {
+  branch: string;
+  local: string;
+  remote: string;
+  why: RemoteMergeFailure;
+}): string {
+  const { branch, local, remote, why } = input;
+  const r = remote.slice(0, 7);
+  const l = local.slice(0, 7);
+  const title = t({
+    zh: `合并 GitHub 上 ${branch} 的提交 ${r}`,
+    en: `Merge commit ${r} from ${branch} on GitHub`,
+  });
+  const trouble =
+    'failed' in why
+      ? t({ zh: '合并后检查没通过', en: 'failed the checks' })
+      : t({ zh: '有冲突', en: 'conflicted' });
+  const intro = t({
+    zh: `这是 Master 自动建的合并任务，不来自 issue。本地目标分支 ${branch} 和 GitHub 上的 ${branch} 已经分叉，各有对方没有的提交；Master 自己合并两边时${trouble}，所以交给这个 Run 处理。合并进来之前，Master 不会把 ${branch} 推送到 GitHub。`,
+    en: `The Master created this merge task by itself; it comes from no issue. The local target branch ${branch} and ${branch} on GitHub have diverged, each with commits the other lacks, and the Master's own merge of the two ${trouble}, so this Run takes it over. Until it is merged in, the Master pushes nothing of ${branch} to GitHub.`,
+  });
+  const task = t({
+    zh: `要做的：把 GitHub 上 ${branch} 的提交 ${r}（完整的是 ${remote}）合并进本地目标分支 ${branch}（Master 合并时在 ${l}，完整的是 ${local}）。编码阶段开始时，Master 会在工作目录里执行 git merge --no-ff --no-commit ${remote}，把冲突留在文件里交给编码 Agent；合并提交由 Master 完成。`,
+    en: `What to do: merge commit ${r} (in full, ${remote}) from ${branch} on GitHub into the local target branch ${branch} (at ${l} when the Master merged, in full ${local}). When the coding stage starts, the Master runs git merge --no-ff --no-commit ${remote} in the working directory and leaves the conflicts in the files for the coding agent; the Master makes the merge commit.`,
+  });
+  const rules = t({
+    zh: `要求：
+- 冲突时两边的改动都要保留：本地 ${branch} 上的和 GitHub 上的都不能丢，把两边的意图合在一起，删掉所有冲突标记。
+- 合并后仓库的检查命令要能通过。
+- 只做这次合并需要的改动，不做别的需求。`,
+    en: `Requirements:
+- Where the two conflict, keep the changes of both sides: nothing of the local ${branch} or of GitHub's may be lost; bring together what each side meant, and remove every conflict marker.
+- After the merge, the repo's check commands must pass.
+- Make only the changes this merge needs, nothing else.`,
+  });
+  const found = mergeFailureLines(why);
+  const seen = t({
+    zh: `Master 自己合并时的情况：\n${found}`,
+    en: `What the Master's merge ran into:\n${found}`,
+  });
+  return [title, intro, task, rules, seen].join('\n\n');
+}
+
 /**
  * The target branch and GitHub's, each with commits the other lacks, as last seen, and what came
  * of merging the two.
@@ -210,10 +313,13 @@ interface Divergence {
   local: string;
   remote: string;
   /**
-   * What github.diverged has told since the two began to diverge, by `outcome`: 'failed' once a
-   * hand merge was asked for. Later records of what was told already do not notify again.
+   * What github.diverged has told since the two began to diverge: 'failed' once a hand merge was
+   * asked for, 'run' once the merge was handed to the Run `reportedRun`, 'environment' once a
+   * missing program was. Later records of what was told already do not notify again.
    */
-  reported?: 'failed' | 'environment';
+  reported?: 'failed' | 'environment' | 'run';
+  /** The Run told about when `reported` is 'run'. */
+  reportedRun?: string;
   /**
    * What came of merging this pair:
    * - failed: the merge conflicted or a check failed on it, recorded; not tried again;
@@ -222,6 +328,11 @@ interface Divergence {
    * Undefined: not tried yet, or put off.
    */
   outcome?: 'failed' | 'environment';
+  /**
+   * Why the merge of this pair failed, while a Run that merges `remote` goes on with it: once
+   * the Run ends without merging, a human is asked to merge, for this reason.
+   */
+  handed?: RemoteMergeFailure;
   /**
    * The merge commit, checked, when fast-forwarding the target branch to it had to wait: the
    * next round tries the fast-forward again without merging and checking once more.
@@ -233,14 +344,18 @@ interface Divergence {
 type RemoteMerge =
   | { kind: 'merged'; merge: string }
   /** Conflicts or failed checks; `data` goes into the github.diverged event. */
-  | { kind: 'failed'; data: Record<string, unknown> }
+  | { kind: 'failed'; data: RemoteMergeFailure }
   /** A program the checks start is missing; `data` as for failed. */
   | { kind: 'environment'; data: Record<string, unknown> }
   /** Not tried, or cut short, for no fault of the commits (node gone, the Master stopping). */
   | { kind: 'later' };
 
 /** A check that failed on the merge, as the github.diverged event gives it. */
-function failedCheck(result: CommandResult, kind: 'setup' | 'verify', missing?: string) {
+function failedCheck(
+  result: CommandResult,
+  kind: 'setup' | 'verify',
+  missing?: string,
+): FailedCheck {
   return {
     command: result.command,
     kind,
@@ -854,7 +969,8 @@ export class IssueBridge {
    *   out with uncommitted changes (`github.pull_blocked`, each reason once per streak);
    * - diverged: GitHub's commits are merged in by the Master when they merge without conflicts
    *   and the repo's checks pass on the result (`mergeDiverged`); the push later in the round
-   *   takes the merge to GitHub. Otherwise nothing is pushed until a human merges (pushTarget).
+   *   takes the merge to GitHub. Otherwise a Run's agent merges them, or a human does when no
+   *   Run can, and nothing is pushed until then (pushTarget).
    * A fetch that fails is thrown, to be reported like every GitHub error.
    */
   private async syncTarget(name: string): Promise<void> {
@@ -924,10 +1040,16 @@ export class IssueBridge {
    * push later in the round takes it to GitHub. Not while a Run of the repo merges, looked at
    * again after the checks; a fast-forward that has to wait is tried again next round with the
    * same merge commit. When the merge conflicts or a check fails on it, the branch stays as it
-   * is: recorded (`github.diverged`, with the conflicted files or the failed command) and not
-   * tried again for the same pair of commits; a human merges. A check that cannot start for a
-   * missing program is recorded too, but tried again each round, to go on once it is installed.
-   * Each kind of record notifies once while the divergence lasts (`repeated` on the others).
+   * is and the merge is not tried again for the same pair of commits. It is handed to a Run that
+   * merges `remote` (`handToRun`), created for it (`github.diverged_run`) unless the repo had one
+   * already: the Run's coding agent finishes the merge, and once the Run is merged the target
+   * branch has `remote`, so the next round finds it ahead and pushes. Without such a Run going
+   * on (none could be created, or the one for `remote` was terminated or failed, at the time or
+   * later) a human merges. Either way it is recorded (`github.diverged`, with the conflicted files
+   * or the failed command, and `runId` while a Run has it). A check that cannot start for a
+   * missing program is recorded too, with no Run, but tried again each round, to go on once it is
+   * installed. Each kind of record notifies once while the divergence lasts (`repeated` on the
+   * others): handing it to a Run (once per Run), asking for a hand merge, a missing program.
    */
   private async mergeDiverged(
     repo: Repo,
@@ -937,8 +1059,21 @@ export class IssueBridge {
   ): Promise<void> {
     const seen = this.diverged.get(repo.id);
     const same = seen?.local === local && seen.remote === remote ? seen : undefined;
-    if (same?.outcome === 'failed') return;
-    const divergence: Divergence = same ?? { local, remote, reported: seen?.reported };
+    if (same?.outcome === 'failed') {
+      // The Run it was handed to ended without merging it: a human merges now.
+      if (same.handed && !this.mergeRunGoesOn(repo, remote)) {
+        const why = same.handed;
+        same.handed = undefined;
+        this.recordDiverged(repo, name, same, 'failed', why);
+      }
+      return;
+    }
+    const divergence: Divergence = same ?? {
+      local,
+      remote,
+      reported: seen?.reported,
+      reportedRun: seen?.reportedRun,
+    };
     this.diverged.set(repo.id, divergence);
     let merge = divergence.merge;
     // A merge commit kept for long may have been garbage-collected meanwhile.
@@ -950,20 +1085,16 @@ export class IssueBridge {
         this.pullBlocked.delete(repo.id);
         const before = divergence.outcome;
         divergence.outcome = result.kind;
-        // The same pair still missing the same program: recorded already.
-        if (before === 'environment' && result.kind === 'environment') return;
-        const reported = divergence.reported;
-        // Already told: a hand merge was asked for, or the same kind of trouble was reported.
-        const repeated = reported === 'failed' || reported === result.kind;
-        divergence.reported = reported === 'failed' ? 'failed' : result.kind;
-        this.deps.store.event(null, 'github.diverged', {
-          repo: name,
-          branch: repo.targetBranch,
-          local,
-          remote,
-          ...result.data,
-          ...(repeated ? { repeated: true } : {}),
-        });
+        if (result.kind === 'environment') {
+          // The same pair still missing the same program: recorded already.
+          if (before !== 'environment') {
+            this.recordDiverged(repo, name, divergence, 'environment', result.data);
+          }
+          return;
+        }
+        const run = this.handToRun(repo, name, local, remote, result.data);
+        if (run) divergence.handed = result.data;
+        this.recordDiverged(repo, name, divergence, 'failed', result.data, run ?? undefined);
         return;
       }
       merge = result.merge;
@@ -979,6 +1110,107 @@ export class IssueBridge {
       local,
       remote,
       merge,
+    });
+  }
+
+  /**
+   * The Run that merges GitHub's commit `remote` into the repo's target branch, at `local`, after
+   * the Master's own merge failed (`why`): the one the repo has for `remote` while it goes on;
+   * else a new one, with `mergeRemoteGoal` and the repo's template, without approval before
+   * merging when `auto_merge` is on, like the Runs of its issues. One Run per commit, found again
+   * after a restart (`runMergingRemote`). Null when a human merges instead: the repo's Run for
+   * `remote` was terminated or failed, the repo no longer pushes, its template is missing or has
+   * no agent stage to merge in, or the Run could not be created.
+   */
+  private handToRun(
+    repo: Repo,
+    name: string,
+    local: string,
+    remote: string,
+    why: RemoteMergeFailure,
+  ): { id: string; created: boolean } | null {
+    const existing = this.deps.store.runMergingRemote(repo.id, remote);
+    if (existing) {
+      if (FINISHED_RUN_STATUSES.includes(existing.status)) return null;
+      return { id: existing.id, created: false };
+    }
+    // Looked at again: the config may have changed while the merge was checked.
+    const cfg = this.cfg.master.github?.repos[name];
+    if (!cfg?.push) return null;
+    const template = this.template(name, cfg);
+    if (!template?.stages.some((s) => s.kind === 'agent')) return null;
+    try {
+      const run = this.deps.engine.createRun({
+        repo: repo.name,
+        template: cfg.template,
+        goal: mergeRemoteGoal({ branch: repo.targetBranch, local, remote, why }),
+        overrides: issueRunOverrides(template, cfg.auto_merge),
+        mergeRemote: remote,
+      });
+      return { id: run.id, created: true };
+    } catch {
+      // The template turned out unusable: a human merges, as the github.diverged event asks.
+      return null;
+    }
+  }
+
+  /** Whether the Run the repo has to merge GitHub's commit `remote` goes on. */
+  private mergeRunGoesOn(repo: Repo, remote: string): boolean {
+    const run = this.deps.store.runMergingRemote(repo.id, remote);
+    return run !== undefined && !FINISHED_RUN_STATUSES.includes(run.status);
+  }
+
+  /**
+   * Record that the pair of `divergence` does not merge by itself (`github.diverged`, with
+   * `data`): handed to the Run `run`, also recorded as created for it (`github.diverged_run`)
+   * when it is new; else for a human to merge (`failed`), or until a missing program is installed
+   * (`environment`). `repeated`, not notified, when the same was told while the divergence lasts:
+   * the same Run, a hand merge, or a missing program after any of them.
+   */
+  private recordDiverged(
+    repo: Repo,
+    name: string,
+    divergence: Divergence,
+    kind: 'failed' | 'environment',
+    data: RemoteMergeFailure | Record<string, unknown>,
+    run?: { id: string; created: boolean },
+  ): void {
+    const reported = divergence.reported;
+    let repeated: boolean;
+    if (run) {
+      repeated = reported === 'run' && divergence.reportedRun === run.id;
+      divergence.reported = 'run';
+      divergence.reportedRun = run.id;
+    } else if (kind === 'failed') {
+      repeated = reported === 'failed';
+      divergence.reported = 'failed';
+      divergence.reportedRun = undefined;
+    } else {
+      // Nothing to add while a hand merge was asked for, or a Run has the merge.
+      repeated = reported !== undefined;
+      divergence.reported ??= 'environment';
+    }
+    const { local, remote } = divergence;
+    const branch = repo.targetBranch;
+    this.deps.store.tx(() => {
+      this.deps.store.event(null, 'github.diverged', {
+        repo: name,
+        branch,
+        local,
+        remote,
+        ...data,
+        ...(run ? { runId: run.id } : {}),
+        ...(repeated ? { repeated: true } : {}),
+      });
+      if (run?.created) {
+        this.deps.store.event(null, 'github.diverged_run', {
+          repo: name,
+          branch,
+          local,
+          remote,
+          runId: run.id,
+        });
+      }
     });
   }
 

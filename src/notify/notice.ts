@@ -140,11 +140,11 @@ export const NOTICE_KINDS: Record<NoticeKind, { label: string; when: string }> =
   pull: {
     zh: {
       label: '没能拉取 GitHub 上的新提交',
-      when: 'GitHub 上的目标分支有本地没有的提交，但 Master 没能把本地目标分支更新过去，标题后面写着仓库名：两边已经分叉（各有对方没有的提交），Master 自动合并时有冲突或者合并后检查没通过，要你手动合并，合并前不再推送；或者检查要用的程序找不到；或者目标分支检出的工作目录里有未提交的改动。同一次分叉、同一种原因只通知一次',
+      when: 'GitHub 上的目标分支有本地没有的提交，但 Master 没能把本地目标分支更新过去，标题后面写着仓库名：两边已经分叉（各有对方没有的提交），Master 自动合并时有冲突或者合并后检查没通过，于是交给一个 Run，由编码 Agent 合并，评审并合并后自动推送，点开就是这个 Run；建不了 Run，或者这个 Run 被终止、失败了，就要你手动合并；合并前都不推送。或者检查要用的程序找不到；或者目标分支检出的工作目录里有未提交的改动。同一次分叉里，交给同一个 Run、要你手动合并、同一种原因都只通知一次',
     },
     en: {
       label: 'Could not pull new commits from GitHub',
-      when: "The target branch on GitHub has commits the local one lacks, but the Master could not bring the local branch up to them, with the repo after the title: the two have diverged (each has commits the other lacks) and the Master's merge of the two conflicts or fails the checks, so you need to merge them, with nothing pushed until then; or a program the checks start is missing; or the target branch is checked out with uncommitted changes. Each divergence and each reason is notified once",
+      when: "The target branch on GitHub has commits the local one lacks, but the Master could not bring the local branch up to them, with the repo after the title: the two have diverged (each has commits the other lacks) and the Master's merge of the two conflicts or fails the checks, so a Run takes it over, whose coding agent merges them, pushed once the Run is reviewed and merged (a click opens the Run); when no Run can be created, or the Run is terminated or fails, you need to merge them; nothing is pushed until they are merged. Or a program the checks start is missing; or the target branch is checked out with uncommitted changes. Within a divergence, handing it to a Run, asking you to merge, and each reason are each notified once",
     },
   },
   upgrade: {
@@ -338,6 +338,22 @@ export function noticeFor(event: EventRow, goal: string | undefined): Notice | n
         en: 'until then the Master pushes nothing and the issues of completed Runs stay open',
       });
       const cause = divergedCause(event.data);
+      const handedTo = text(event.data.runId);
+      if (handedTo) {
+        // Handed to a Run the Master created to merge it: a click opens that Run.
+        const why = cause ? t({ zh: `，${cause.text}`, en: `, and ${cause.text}` }) : '';
+        return {
+          ...pullNotice(
+            event,
+            t({
+              zh: `${branch} 和 GitHub 上的已经分叉${at}${why}；已交给 Run ${handedTo} 处理：编码 Agent 合并两边，评审并合并后自动推送。${until}`,
+              en: `${branch} has diverged from GitHub's${at}${why}. Run ${handedTo} takes it over: its coding agent merges the two, and once reviewed and merged it is pushed by itself; ${until}`,
+            }),
+          ),
+          runId: handedTo,
+          about: 'run',
+        };
+      }
       if (cause?.kind === 'environment') {
         return pullNotice(
           event,
@@ -368,6 +384,9 @@ export function noticeFor(event: EventRow, goal: string | undefined): Notice | n
     case 'github.merged_remote':
       // GitHub's new commits were taken in by themselves (the merge passed the repo's checks):
       // nothing for a human to do.
+      return null;
+    case 'github.diverged_run':
+      // Told by the github.diverged recorded with it, which names the Run.
       return null;
     case 'github.pull_blocked': {
       const branch = text(event.data.branch) ?? t({ zh: '目标分支', en: 'The target branch' });

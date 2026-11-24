@@ -651,6 +651,20 @@ export class Store {
     );
   }
 
+  /**
+   * The newest Run of the repo that the Master created to merge GitHub's commit `remote` into
+   * the target branch (`mergeRemote`), finished or not.
+   */
+  runMergingRemote(repoId: string, remote: string): Run | undefined {
+    return this.one<Run>(
+      'runs',
+      `SELECT * FROM runs WHERE repo_id = ? AND merge_remote = ?
+         ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+      repoId,
+      remote,
+    );
+  }
+
   /** The newest Run created from this issue, finished or not. */
   latestRunForIssue(issuesRepo: string, number: number): Run | undefined {
     return this.one<Run>(

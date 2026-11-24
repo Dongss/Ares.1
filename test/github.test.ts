@@ -17,7 +17,7 @@ import {
   scoutFailureStreak,
 } from '../src/config/flow.js';
 import { findTemplate, githubConfigKey } from '../src/config/load.js';
-import { mergeRemoteMessage } from '../src/github/bridge.js';
+import { mergeRemoteGoal, mergeRemoteMessage } from '../src/github/bridge.js';
 import type { GhComment, GhIssue } from '../src/github/client.js';
 import {
   COMMENT_MARKER,
@@ -2042,8 +2042,10 @@ describe('issues: pulling the target branch from GitHub', () => {
     expect(gh.pushes).toEqual([local]);
   });
 
-  it('records a conflicting divergence once, notifies once and pushes nothing until a human merges', async () => {
+  it('hands a conflicting divergence to one Run, notifies once and pushes nothing until it is merged', async () => {
     const t = await start(config({ push: true }));
+    // The Run stays in the queue: what it does is the engine's business.
+    t.master.engine.setWorking(false);
     const out = tmpDir('ares1-checks-');
     // Never run: a merge that conflicts is not checked.
     t.master.store.updateRepo(t.repo.id, { setupCommands: [`echo x >> ${out}/runs`] });
@@ -2055,30 +2057,68 @@ describe('issues: pulling the target branch from GitHub', () => {
     expect(git(t.repoDir, 'status', '--porcelain')).toBe('');
     expect(existsSync(join(out, 'runs'))).toBe(false);
     expect(extraWorktrees(t)).toEqual([]);
+
+    // Exactly one Run, of no issue, to merge GitHub's commit, with the repo's template.
+    const runs = t.master.store.listRuns();
+    expect(runs).toHaveLength(1);
+    const run = runs[0] as Run;
+    expect(run).toMatchObject({
+      mergeRemote: remote,
+      issue: null,
+      status: 'queued',
+      templateId: 'dev',
+      overrides: {},
+    });
+    expect(run.goal.split('\n')[0]).toBe(`合并 GitHub 上 main 的提交 ${remote.slice(0, 7)}`);
+    expect(run.goal).toContain(`git merge --no-ff --no-commit ${remote}`);
+    expect(run.goal).toContain('冲突的文件：README.md');
+
     const diverged = events(t, 'github.diverged');
     expect(diverged.map((e) => e.data)).toEqual([
-      { repo: 'demo', branch: 'main', local, remote, conflict: true, files: ['README.md'] },
+      {
+        repo: 'demo',
+        branch: 'main',
+        local,
+        remote,
+        conflict: true,
+        files: ['README.md'],
+        runId: run.id,
+      },
     ]);
+    const created = events(t, 'github.diverged_run');
+    expect(created.map((e) => [e.runId, e.data])).toEqual([
+      [null, { repo: 'demo', branch: 'main', local, remote, runId: run.id }],
+    ]);
+    expect(created[0] && noticeFor(created[0], undefined)).toBeNull();
     const notice = diverged[0] && noticeFor(diverged[0], undefined);
-    expect(notice).toMatchObject({ kind: 'pull', about: 'issues', runId: null });
+    expect(notice).toMatchObject({ kind: 'pull', about: 'run', runId: run.id });
     expect(notice?.title).toBe('没能拉取 GitHub 上的新提交：demo');
     expect(notice?.body).toContain('自动合并有冲突（README.md）');
-    expect(notice?.body).toContain('手动合并');
+    expect(notice?.body).toContain(`已交给 Run ${run.id} 处理`);
+    expect(notice?.body).not.toContain('手动合并');
     expect(gh.calls).not.toContain('push main');
     expect(events(t, 'github.merged_remote')).toHaveLength(0);
     // No GitHub failure: nothing was refused.
     expect(t.master.issues.status().lastError).toBeNull();
     expect(events(t, 'github.error')).toHaveLength(0);
 
-    // The local branch moves on meanwhile (a Run merged): tried again, recorded, not notified
-    // again.
+    // The local branch moves on meanwhile (another Run merged): tried again, still the same
+    // Run's, not notified again.
     const local2 = commitLocally(t, 'ours2.txt');
     await t.master.issues.poll();
     await t.master.issues.poll();
     const later = events(t, 'github.diverged');
     expect(later).toHaveLength(2);
-    expect(later[1]?.data).toMatchObject({ local: local2, remote, conflict: true, repeated: true });
+    expect(later[1]?.data).toMatchObject({
+      local: local2,
+      remote,
+      conflict: true,
+      runId: run.id,
+      repeated: true,
+    });
     expect(later[1] && noticeFor(later[1], undefined)).toBeNull();
+    expect(t.master.store.listRuns()).toHaveLength(1);
+    expect(events(t, 'github.diverged_run')).toHaveLength(1);
     expect(gh.calls).not.toContain('push main');
     expect(head(t)).toBe(local2);
 
@@ -2089,10 +2129,13 @@ describe('issues: pulling the target branch from GitHub', () => {
     expect(gh.pushes).toEqual([merged]);
     expect(events(t, 'github.diverged')).toHaveLength(2);
 
-    // Diverging again is recorded and notified again.
+    // Diverging again, on another commit of GitHub's: a Run of its own, notified again.
     const again = conflicting(t, merged, ' again');
     gh.remoteHead = again.remote;
     await t.master.issues.poll();
+    const next = t.master.store.listRuns().find((r) => r.mergeRemote === again.remote);
+    if (!next) throw new Error('no Run for the new commit');
+    expect(t.master.store.listRuns()).toHaveLength(2);
     const third = events(t, 'github.diverged');
     expect(third).toHaveLength(3);
     expect(third[2]?.data).toEqual({
@@ -2102,10 +2145,132 @@ describe('issues: pulling the target branch from GitHub', () => {
       remote: again.remote,
       conflict: true,
       files: ['README.md'],
+      runId: next.id,
     });
-    expect(third[2] && noticeFor(third[2], undefined)?.kind).toBe('pull');
+    expect(third[2] && noticeFor(third[2], undefined)).toMatchObject({
+      kind: 'pull',
+      runId: next.id,
+    });
     expect(existsSync(join(out, 'runs'))).toBe(false);
     expect(extraWorktrees(t)).toEqual([]);
+  });
+
+  it('creates no second Run for the same commit of GitHub, across polls and restarts', async () => {
+    const t = await start(config({ push: true }));
+    t.master.engine.setWorking(false);
+    const { remote } = conflicting(t, head(t));
+    gh.remoteHead = remote;
+    for (let i = 0; i < 3; i++) await t.master.issues.poll();
+    const [run] = t.master.store.listRuns();
+    if (!run) throw new Error('no run');
+    expect(run.mergeRemote).toBe(remote);
+
+    // A new Master knows nothing of the divergence: it merges once more and finds the Run.
+    await t.close();
+    const again = await restart(t, config({ push: true }));
+    for (let i = 0; i < 3; i++) await again.master.issues.poll();
+    expect(again.master.store.listRuns().map((r) => r.id)).toEqual([run.id]);
+    expect(events(again, 'github.diverged_run')).toHaveLength(1);
+    // Told once more by the new Master, of the same Run.
+    const diverged = events(again, 'github.diverged');
+    expect(diverged.map((e) => [e.data.runId, e.data.repeated])).toEqual([
+      [run.id, undefined],
+      [run.id, undefined],
+    ]);
+
+    // Once more after the local branch moved on: same commit of GitHub's, same Run.
+    commitLocally(again, 'ours2.txt');
+    await again.master.issues.poll();
+    expect(again.master.store.listRuns()).toHaveLength(1);
+    expect(events(again, 'github.diverged').at(-1)?.data).toMatchObject({
+      runId: run.id,
+      repeated: true,
+    });
+    expect(gh.calls).not.toContain('push main');
+  });
+
+  it.each([
+    ['terminated', 'cancelled'],
+    ['failed', 'failed'],
+  ] as const)(
+    'asks a human to merge once the Run for the commit is %s, and creates no other',
+    async (_, end) => {
+      const t = await start(config({ push: true }));
+      t.master.engine.setWorking(false);
+      const { local, remote } = conflicting(t, head(t));
+      gh.remoteHead = remote;
+      await t.master.issues.poll();
+      const [run] = t.master.store.listRuns();
+      if (!run) throw new Error('no run');
+      if (end === 'cancelled') await t.master.engine.cancel(run.id);
+      else
+        t.master.store.updateRun(run.id, {
+          status: 'failed',
+          finishedAt: new Date().toISOString(),
+        });
+
+      // The next round sees it ended without merging: a human merges now, told once.
+      await t.master.issues.poll();
+      await t.master.issues.poll();
+      const manual = {
+        repo: 'demo',
+        branch: 'main',
+        local,
+        remote,
+        conflict: true,
+        files: ['README.md'],
+      };
+      const diverged = events(t, 'github.diverged');
+      expect(diverged.map((e) => e.data)).toEqual([{ ...manual, runId: run.id }, manual]);
+      const notice = diverged[1] && noticeFor(diverged[1], undefined);
+      expect(notice).toMatchObject({ kind: 'pull', about: 'issues', runId: null });
+      expect(notice?.body).toContain('手动合并');
+
+      // The local branch moves on: still for a human, not told again.
+      const local2 = commitLocally(t, 'ours2.txt');
+      await t.master.issues.poll();
+      expect(events(t, 'github.diverged').at(-1)?.data).toEqual({
+        ...manual,
+        local: local2,
+        repeated: true,
+      });
+
+      // Nor after a restart: no Run, a hand merge asked for once more.
+      await t.close();
+      const again = await restart(t, config({ push: true }));
+      await again.master.issues.poll();
+      await again.master.issues.poll();
+      expect(again.master.store.listRuns().map((r) => r.id)).toEqual([run.id]);
+      expect(events(again, 'github.diverged_run')).toHaveLength(1);
+      const last = events(again, 'github.diverged');
+      expect(last).toHaveLength(4);
+      expect(last[3]?.data).toEqual({ ...manual, local: local2 });
+      expect(last[3] && noticeFor(last[3], undefined)?.body).toContain('手动合并');
+      expect(gh.calls).not.toContain('push main');
+    },
+  );
+
+  it('asks a human to merge when the template has no agent stage to merge in', async () => {
+    const workflow = `
+id: dev
+name: 只合并
+stages:
+  - id: merge
+    name: 合并
+    kind: merge
+`;
+    const t = await start(config({ push: true }), workflow);
+    t.master.engine.setWorking(false);
+    const { local, remote } = conflicting(t, head(t));
+    gh.remoteHead = remote;
+    await t.master.issues.poll();
+    expect(t.master.store.listRuns()).toHaveLength(0);
+    expect(events(t, 'github.diverged_run')).toHaveLength(0);
+    const diverged = events(t, 'github.diverged');
+    expect(diverged.map((e) => e.data)).toEqual([
+      { repo: 'demo', branch: 'main', local, remote, conflict: true, files: ['README.md'] },
+    ]);
+    expect(diverged[0] && noticeFor(diverged[0], undefined)?.body).toContain('手动合并');
   });
 
   it('merges new commits on GitHub that do not conflict, checks the merge and pushes it', async () => {
@@ -2181,14 +2346,90 @@ describe('issues: pulling the target branch from GitHub', () => {
     expect(events(t, 'github.merged_remote')).toHaveLength(1);
   });
 
+  it('writes the goal of a Run that merges a commit of GitHub, in either language', () => {
+    const local = 'a'.repeat(40);
+    const remote = 'b'.repeat(40);
+    const conflict = mergeRemoteGoal({
+      branch: 'main',
+      local,
+      remote,
+      why: { conflict: true, files: ['README.md', 'src/a.ts'] },
+    });
+    expect(conflict.split('\n')[0]).toBe('合并 GitHub 上 main 的提交 bbbbbbb');
+    for (const part of [
+      'Master 自动建的合并任务',
+      'Master 自己合并两边时有冲突',
+      `提交 bbbbbbb（完整的是 ${remote}）合并进本地目标分支 main（Master 合并时在 aaaaaaa`,
+      `git merge --no-ff --no-commit ${remote}`,
+      '两边的改动都要保留',
+      '合并后仓库的检查命令要能通过',
+      '- 冲突的文件：README.md、src/a.ts',
+    ]) {
+      expect(conflict).toContain(part);
+    }
+    const check = {
+      command: 'npm test',
+      kind: 'verify' as const,
+      exitCode: null,
+      timedOut: true,
+      output: 'x'.repeat(3000),
+    };
+    const failed = mergeRemoteGoal({
+      branch: 'main',
+      local,
+      remote,
+      why: { failed: check, log: '/h/logs/github-merge-demo.log' },
+    });
+    expect(failed).toContain('Master 自己合并两边时合并后检查没通过');
+    expect(failed).toContain('- 没通过的检查命令：`npm test`（超时）');
+    expect(failed).toContain('- 日志：/h/logs/github-merge-demo.log');
+    // Only the end of a long output.
+    expect(failed).toContain('…（前面省略 1000 个字符）');
+    expect(failed).not.toContain('冲突的文件');
+    const setup = mergeRemoteGoal({
+      branch: 'main',
+      local,
+      remote,
+      why: {
+        failed: { ...check, kind: 'setup', timedOut: false, exitCode: 2, output: '' },
+        log: 'l',
+      },
+    });
+    expect(setup).toContain('- 没通过的准备命令：`npm test`（退出码 2）');
+    expect(setup).not.toContain('输出的最后部分');
+
+    setLang('en');
+    const texts = [
+      mergeRemoteGoal({
+        branch: 'main',
+        local,
+        remote,
+        why: { conflict: true, files: ['README.md', 'src/a.ts'] },
+      }),
+      mergeRemoteGoal({
+        branch: 'main',
+        local,
+        remote,
+        why: { failed: { ...check, exitCode: 1, timedOut: false }, log: 'l' },
+      }),
+    ];
+    expect(texts[0]?.split('\n')[0]).toBe('Merge commit bbbbbbb from main on GitHub');
+    expect(texts[0]).toContain('- Conflicted files: README.md, src/a.ts');
+    expect(texts[1]).toContain('- Failed verify command: `npm test` (exit code 1)');
+    expect(texts[1]).toContain("the Master's own merge of the two failed the checks");
+    for (const text of texts) expect(text).not.toMatch(/[一-鿿]/);
+  });
+
   it('leaves the user home directory out of the merge commit message', () => {
     expect(mergeRemoteMessage(`${homedir()}/x`)).toBe('合并 GitHub 上 ~/x 的新提交');
     setLang('en');
     expect(mergeRemoteMessage(`${homedir()}/x`)).toBe('Merge new commits from ~/x on GitHub');
   });
 
-  it('keeps the target branch when the checks fail on the merge, and does not try that again', async () => {
+  it('keeps the target branch when the checks fail on the merge, hands it to a Run and does not try that again', async () => {
     const t = await start(config({ push: true }));
+    // The Run stays in the queue, its setup commands not run.
+    t.master.engine.setWorking(false);
     const out = tmpDir('ares1-checks-');
     // Neither side has feature.txt.
     t.master.store.updateRepo(t.repo.id, {
@@ -2216,10 +2457,23 @@ describe('issues: pulling the target branch from GitHub', () => {
     });
     expect(diverged[0]?.data.conflict).toBeUndefined();
     expect(readFileSync(log, 'utf8')).toContain('$ test -f feature.txt');
+    // A Run's agent makes the checks pass on the merge: its goal says which one failed.
+    const runs = t.master.store.listRuns();
+    expect(runs).toHaveLength(1);
+    const run = runs[0] as Run;
+    expect(run).toMatchObject({ mergeRemote: remote, issue: null, status: 'queued' });
+    expect(run.goal).toContain('合并后检查没通过');
+    expect(run.goal).toContain('没通过的检查命令：`test -f feature.txt`（退出码 1）');
+    expect(run.goal).toContain(`日志：${log}`);
+    expect(run.goal).not.toContain('冲突的文件');
+    expect(diverged[0]?.data.runId).toBe(run.id);
+    expect(events(t, 'github.diverged_run').map((e) => e.data)).toEqual([
+      { repo: 'demo', branch: 'main', local, remote, runId: run.id },
+    ]);
     const notice = diverged[0] && noticeFor(diverged[0], undefined);
-    expect(notice?.kind).toBe('pull');
+    expect(notice).toMatchObject({ kind: 'pull', runId: run.id, about: 'run' });
     expect(notice?.body).toContain('自动合并后检查命令 `test -f feature.txt` 没通过（退出码 1）');
-    expect(notice?.body).toContain('手动合并');
+    expect(notice?.body).toContain(`已交给 Run ${run.id} 处理`);
     // Checked once for the pair, its worktree deleted.
     const dirs = () => readFileSync(join(out, 'dirs'), 'utf8').trim().split('\n');
     expect(dirs()).toHaveLength(1);
@@ -2237,9 +2491,11 @@ describe('issues: pulling the target branch from GitHub', () => {
     expect(later[1]?.data).toMatchObject({
       local: local2,
       failed: { kind: 'setup', exitCode: 3 },
+      runId: run.id,
       repeated: true,
     });
     expect(later[1] && noticeFor(later[1], undefined)).toBeNull();
+    expect(t.master.store.listRuns()).toHaveLength(1);
     expect(dirs()).toHaveLength(2);
     expect(head(t)).toBe(local2);
     expect(extraWorktrees(t)).toEqual([]);
@@ -2271,6 +2527,9 @@ describe('issues: pulling the target branch from GitHub', () => {
     const notice = diverged[0] && noticeFor(diverged[0], undefined);
     expect(notice?.body).toContain('找不到 ares1-no-such-program');
     expect(notice?.body).toContain('自动再合并');
+    // Nothing for an agent to do: the next check merges by itself.
+    expect(t.master.store.listRuns()).toHaveLength(0);
+    expect(events(t, 'github.diverged_run')).toHaveLength(0);
     expect(head(t)).toBe(local);
     expect(gh.calls).not.toContain('push main');
     expect(extraWorktrees(t)).toEqual([]);
@@ -2388,11 +2647,18 @@ describe('issues: pulling the target branch from GitHub', () => {
 
   it('keeps the issue of a completed Run open while diverged, and closes it once merged', async () => {
     const t = await start(config({ autoMerge: true, push: true }));
+    t.master.engine.setWorking(false);
     const { remote } = conflicting(t, head(t));
     gh.remoteHead = remote;
+    await t.master.issues.poll();
+    // Nobody merges GitHub's commit: the Run created for it is terminated, a human merges.
+    const [merging] = t.master.store.listRuns();
+    if (!merging?.mergeRemote) throw new Error('no Run to merge the commit');
+    await t.master.engine.cancel(merging.id);
+    t.master.engine.setWorking(true);
     gh.add({ title: '加 feature', labels: [LABELS.ready] });
     await t.master.issues.poll();
-    const [run] = t.master.store.listRuns();
+    const run = t.master.store.listRuns().find((r) => r.issue);
     if (!run) throw new Error('no run');
     await t.waitStatus(run.id, 'completed');
     await t.master.issues.sync();
@@ -2531,6 +2797,39 @@ describe('issues: pulling the target branch from GitHub', () => {
     await t.master.issues.poll();
     expect(gh.calls).not.toContain('fetch main');
     expect(head(t)).toBe(before);
+
+    // Nor does a divergence get a Run.
+    t.master.engine.setWorking(false);
+    gh.remoteHead = conflicting(t, before).remote;
+    await t.master.issues.poll();
+    expect(t.master.store.listRuns()).toHaveLength(0);
+    expect(events(t, 'github.diverged')).toHaveLength(0);
+  });
+
+  it('creates no Run when push is turned off while the merge is checked', async () => {
+    const t = await start(config({ push: true }));
+    t.master.engine.setWorking(false);
+    const out = tmpDir('ares1-checks-');
+    t.master.store.updateRepo(t.repo.id, {
+      verifyCommands: [
+        `touch ${out}/started; while [ ! -f ${out}/go ]; do sleep 0.05; done; exit 1`,
+      ],
+    });
+    const remote = pushedByOthers(t, head(t));
+    gh.remoteHead = remote;
+    commitLocally(t);
+    const polled = t.master.issues.poll();
+    await waitFor(() => existsSync(join(out, 'started')), 'the checks to start');
+    writeFile(join(t.home, 'config.yaml'), config({ push: false }));
+    t.master.configWatcher.reload();
+    writeFile(join(out, 'go'), '');
+    await polled;
+    expect(t.master.store.listRuns()).toHaveLength(0);
+    expect(events(t, 'github.diverged_run')).toHaveLength(0);
+    const diverged = events(t, 'github.diverged');
+    expect(diverged).toHaveLength(1);
+    expect(diverged[0]?.data.runId).toBeUndefined();
+    expect(diverged[0] && noticeFor(diverged[0], undefined)?.body).toContain('手动合并');
   });
 });
 

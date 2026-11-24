@@ -645,6 +645,35 @@ describe('the target branch cannot take the commits on GitHub', () => {
     ]);
     for (const text of texts) expect(text).not.toMatch(/[一-鿿]/);
   });
+
+  it('says a divergence was handed to a Run, and opens that Run', () => {
+    const handed = (e: typeof diverged) => ({ ...e, data: { ...e.data, runId: 'run-m1' } });
+    const notice = noticeFor(handed(conflict), undefined);
+    expect(notice).toEqual({
+      kind: 'pull',
+      title: '没能拉取 GitHub 上的新提交：demo',
+      body: 'main 和 GitHub 上的已经分叉（本地 aaaaaaa，GitHub bbbbbbb），自动合并有冲突（a.ts、b.ts）；已交给 Run run-m1 处理：编码 Agent 合并两边，评审并合并后自动推送。在此之前 Master 不推送，已完成 Run 的 issue 保持打开',
+      runId: 'run-m1',
+      about: 'run',
+    });
+    expect(noticeFor(handed(failed), undefined)?.body).toContain(
+      '自动合并后检查命令 `npm test` 没通过（退出码 1）；已交给 Run run-m1 处理',
+    );
+    // Told once per Run.
+    const again = handed(conflict);
+    expect(noticeFor({ ...again, data: { ...again.data, repeated: true } }, undefined)).toBeNull();
+    // The Run's creation is told by the divergence recorded with it.
+    const created = ev('github.diverged_run', { ...pair, runId: 'run-m1' });
+    expect(noticeFor(created, undefined)).toBeNull();
+
+    setLang('en');
+    const texts = [handed(conflict), handed(failed)].map((e) => noticeFor(e, undefined)?.body);
+    expect(texts).toEqual([
+      "main has diverged from GitHub's (local aaaaaaa, GitHub bbbbbbb), and the Master's merge conflicts in a.ts, b.ts. Run run-m1 takes it over: its coding agent merges the two, and once reviewed and merged it is pushed by itself; until then the Master pushes nothing and the issues of completed Runs stay open",
+      "main has diverged from GitHub's (local aaaaaaa, GitHub bbbbbbb), and the verify command `npm test` failed on the Master's merge (exit code 1). Run run-m1 takes it over: its coding agent merges the two, and once reviewed and merged it is pushed by itself; until then the Master pushes nothing and the issues of completed Runs stay open",
+    ]);
+    for (const text of [...texts, NOTICE_KINDS.pull.when]) expect(text).not.toMatch(/[一-鿿]/);
+  });
 });
 
 describe('notifications in English', () => {
