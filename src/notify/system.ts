@@ -26,12 +26,18 @@ export type SendNotice = (
 export type ExecFile = (
   file: string,
   args: string[],
-  options: { timeout: number },
+  options: { timeout: number; killSignal: NodeJS.Signals },
   callback: (error: Error | null, stdout?: string, stderr?: string) => void,
 ) => void;
 
 /** A notification command that hangs (e.g. waiting for a D-Bus that never answers) is killed. */
 export const NOTICE_TIMEOUT_MS = 10_000;
+
+/**
+ * The signal execFile kills a command with when it outlives NOTICE_TIMEOUT_MS. A command killed
+ * by it is told as timed out; one killed by any other signal is told by that signal.
+ */
+export const NOTICE_KILL_SIGNAL: NodeJS.Signals = 'SIGTERM';
 
 /** Whether the Master can send system notifications on this platform: macOS and Linux. */
 export function systemNoticeSupported(platform: NodeJS.Platform = process.platform): boolean {
@@ -96,8 +102,9 @@ function failureReason(file: string, err: CommandError, stderr = ''): string {
   const printed = stderr || (ran && newline >= 0 ? err.message.slice(newline + 1) : '');
   const said = firstLine(printed, REASON_MAX);
   const saying = (what: string) => (said ? `${what}${t({ zh: '：', en: ': ' })}${said}` : what);
-  // The Master kills it only when it outlived the timeout.
-  if (err.killed === true) {
+  // When a command outlives the timeout, execFile kills it with NOTICE_KILL_SIGNAL and sets
+  // killed. Killed in any other way, it is told by its signal below, not as timed out.
+  if (err.killed === true && err.signal === NOTICE_KILL_SIGNAL) {
     const seconds = NOTICE_TIMEOUT_MS / 1000;
     return t({
       zh: `${seconds} 秒内无响应被终止`,
@@ -153,7 +160,8 @@ function runNoticeCommand(
       reason: failureReason(file, err instanceof Error ? err : new Error(String(err)), stderr),
     });
   try {
-    execFile(file, command.args, { timeout: NOTICE_TIMEOUT_MS }, (err, _stdout, stderr) => {
+    const options = { timeout: NOTICE_TIMEOUT_MS, killSignal: NOTICE_KILL_SIGNAL };
+    execFile(file, command.args, options, (err, _stdout, stderr) => {
       if (err) failed(err, stderr);
       else report({ ok: true, file, reason: null });
     });

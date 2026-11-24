@@ -13,6 +13,7 @@ import { BLOCK_KIND, NOTICE_KINDS, noticeFor } from '../src/notify/notice.js';
 import {
   type ExecFile,
   makeSystemNotice,
+  NOTICE_KILL_SIGNAL,
   NOTICE_TIMEOUT_MS,
   type NoticeFailure,
   noticeScript,
@@ -46,9 +47,9 @@ import {
  * `stderr()` as what the command wrote to its standard error.
  */
 function fakeExecFile(fail: () => Error | null = () => null, stderr: () => string = () => '') {
-  const calls: { file: string; args: string[]; timeout: number }[] = [];
+  const calls: { file: string; args: string[]; timeout: number; killSignal: string }[] = [];
   const execFile: ExecFile = (file, args, options, callback) => {
-    calls.push({ file, args, timeout: options.timeout });
+    calls.push({ file, args, timeout: options.timeout, killSignal: options.killSignal });
     callback(fail(), '', stderr());
   };
   return { calls, execFile };
@@ -220,9 +221,12 @@ describe('system notifications', () => {
         file: 'notify-send',
         args: ['--app-name', '战神一号', 'Run 卡住了', body],
         timeout: 10_000,
+        killSignal: 'SIGTERM',
       },
     ]);
     expect(NOTICE_TIMEOUT_MS).toBe(10_000);
+    // Node's own default for a timeout, passed on explicitly: the reason tells a timeout by it.
+    expect(NOTICE_KILL_SIGNAL).toBe('SIGTERM');
     expect(results).toEqual([null]);
     // Nobody listening for the result is fine too.
     expect(() => send('Run 卡住了', body)).not.toThrow();
@@ -326,6 +330,14 @@ describe('system notifications', () => {
     });
     expect(reasonOf(signalled)).toBe('被信号 SIGKILL 终止');
     expect(reasonOf(signalled, 'oops')).toBe('被信号 SIGKILL 终止：oops');
+    // Killed by execFile, but not with the timeout's signal: told by its signal, not as timed out.
+    const killedOtherwise = Object.assign(new Error(`Command failed: osascript -e ${script}`), {
+      code: null,
+      killed: true,
+      signal: 'SIGKILL',
+    });
+    expect(reasonOf(killedOtherwise)).toBe('被信号 SIGKILL 终止');
+    expect(reasonOf(killedOtherwise, 'oops')).toBe('被信号 SIGKILL 终止：oops');
     expect(reasonOf(enoent('osascript'))).toBe('找不到 osascript');
   });
 
@@ -336,7 +348,12 @@ describe('system notifications', () => {
         const send = makeSystemNotice({
           platform: 'linux',
           execFile: (_file, _args, options, callback) =>
-            execFile(file, args, { timeout: timeout ?? options.timeout }, callback),
+            execFile(
+              file,
+              args,
+              { timeout: timeout ?? options.timeout, killSignal: options.killSignal },
+              callback,
+            ),
         });
         send('标题', '正文', resolve);
       });
@@ -612,6 +629,9 @@ describe('notifications in English', () => {
     expect(reasonOf(Object.assign(new Error('x'), { killed: false, signal: 'SIGKILL' }))).toBe(
       'terminated by signal SIGKILL',
     );
+    expect(reasonOf(Object.assign(new Error('x'), { killed: true, signal: 'SIGKILL' }))).toBe(
+      'terminated by signal SIGKILL',
+    );
     expect(reasonOf(enoent('osascript'))).toBe('osascript was not found');
   });
 
@@ -623,13 +643,43 @@ describe('notifications in English', () => {
     expect(await reason(commandFailed('osascript', 'execution error', { code: 1 }))).toBe(
       'exit code 1: execution error',
     );
-    expect(await reason(commandFailed('osascript', '', { killed: true }))).toBe(
+    expect(await reason(commandFailed('osascript', '', { killed: true, signal: 'SIGTERM' }))).toBe(
       'killed after no answer within 10 seconds',
     );
     expect(await reason(commandFailed('osascript', '', { signal: 'SIGKILL' }))).toBe(
       'terminated by signal SIGKILL',
     );
     expect(await reason(commandFailed('osascript', 'oops', {}))).toBe('failed: oops');
+  });
+
+  it('tells a timeout only by the signal the timeout kills with, in both languages', async () => {
+    const reason = async (err: Error) =>
+      (await sendSystemNotice('Test', 'A thing', { platform: 'darwin', execFile: fail(err) }))
+        ?.reason;
+    const timedOut = () => commandFailed('osascript', '', { killed: true, signal: 'SIGTERM' });
+    const killed = (printed: string) =>
+      commandFailed('osascript', printed, { killed: true, signal: 'SIGKILL' });
+
+    expect(await reason(timedOut())).toBe('10 秒内无响应被终止');
+    expect(await reason(killed(''))).toBe('被信号 SIGKILL 终止');
+    expect(await reason(killed('oops\nmore'))).toBe('被信号 SIGKILL 终止：oops');
+    // Killed without a signal: not a timeout either, but a command that ran and failed.
+    expect(await reason(commandFailed('osascript', '', { killed: true }))).toBe('运行失败');
+
+    setLang('en');
+    const english = [
+      await reason(timedOut()),
+      await reason(killed('')),
+      await reason(killed('oops\nmore')),
+      await reason(commandFailed('osascript', '', { killed: true })),
+    ];
+    expect(english).toEqual([
+      'killed after no answer within 10 seconds',
+      'terminated by signal SIGKILL',
+      'terminated by signal SIGKILL: oops',
+      'failed',
+    ]);
+    for (const text of english) expect(text).not.toMatch(/[一-鿿]/);
   });
 });
 
@@ -644,7 +694,12 @@ describe('a system notification whose outcome is wanted (the test notification)'
       reason: null,
     });
     expect(calls).toEqual([
-      { file: 'osascript', args: ['-e', noticeScript('标题', '正文')], timeout: 10_000 },
+      {
+        file: 'osascript',
+        args: ['-e', noticeScript('标题', '正文')],
+        timeout: 10_000,
+        killSignal: NOTICE_KILL_SIGNAL,
+      },
     ]);
   });
 
@@ -661,8 +716,21 @@ describe('a system notification whose outcome is wanted (the test notification)'
       reason: '退出码 1：0:5: execution error: 出错了 (-1728)',
     });
     expect(
-      (await outcome(commandFailed('notify-send', '', { killed: true }), 'linux'))?.reason,
+      (
+        await outcome(
+          commandFailed('notify-send', '', { killed: true, signal: NOTICE_KILL_SIGNAL }),
+          'linux',
+        )
+      )?.reason,
     ).toBe('10 秒内无响应被终止');
+    expect(
+      (
+        await outcome(
+          commandFailed('notify-send', 'oops', { killed: true, signal: 'SIGKILL' }),
+          'linux',
+        )
+      )?.reason,
+    ).toBe('被信号 SIGKILL 终止：oops');
     // A command that ran and failed with neither an exit code nor a signal: still no command line.
     expect((await outcome(commandFailed('osascript', '', {})))?.reason).toBe('运行失败');
     expect((await outcome(enoent('notify-send'), 'linux'))?.reason).toContain('libnotify');
