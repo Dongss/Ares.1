@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import type { GitHubRepoStatus } from '../../../src/api/types.js';
+import type { GitHubRepoStatus, NotifyTestResult } from '../../../src/api/types.js';
 import { TemplateSchema } from '../../../src/config/schema.js';
 import { setLang } from '../../../src/i18n.js';
 import { NOTICE_KINDS, type NoticeKind, noticeFor } from '../../../src/notify/notice.js';
@@ -21,6 +21,8 @@ import {
   mergeNeedsApproval,
   noticeRows,
   notifyChannel,
+  notifyTestLines,
+  notifyTestUnavailable,
   runStages,
   scoutGuide,
   shellQuote,
@@ -612,6 +614,99 @@ describe('notifications', () => {
       expect(text).toContain(webhook ? 'A webhook is set' : 'set notify.webhook');
       expect(text).not.toMatch(/[一-鿿]/);
     }
+  });
+});
+
+describe('the test notification', () => {
+  afterEach(() => setLang('zh'));
+  const CJK = /[一-鿿]/;
+
+  const off = { enabled: false, ok: false, reason: null };
+  const result = (
+    system: Partial<NotifyTestResult['system']>,
+    webhook: Partial<NotifyTestResult['webhook']>,
+  ): NotifyTestResult => ({
+    system: { ...off, supported: true, ...system },
+    webhook: { ...off, status: null, ...webhook },
+  });
+  const lines = (r: NotifyTestResult) =>
+    notifyTestLines(r).map((l) => [l.channel, l.label, l.tone, l.text]);
+
+  it('can be sent only through a channel of the Master', () => {
+    expect(notifyTestUnavailable(true, false)).toBeNull();
+    expect(notifyTestUnavailable(false, true)).toBeNull();
+    expect(notifyTestUnavailable(true, true)).toBeNull();
+    const why = notifyTestUnavailable(false, false);
+    expect(why).toContain('notify.system');
+    expect(why).toContain('notify.webhook');
+    setLang('en');
+    expect(notifyTestUnavailable(false, false)).toContain('nothing to test');
+    expect(notifyTestUnavailable(false, false)).not.toMatch(CJK);
+  });
+
+  it('tells how each channel went', () => {
+    expect(
+      lines(result({ enabled: true, ok: true }, { enabled: true, ok: true, status: 200 })),
+    ).toEqual([
+      [
+        'system',
+        '系统通知',
+        'success',
+        '已交给系统显示；没看到的话，检查系统的通知设置（勿扰、专注模式、是否允许通知）',
+      ],
+      ['webhook', 'webhook', 'success', '对方已接收（HTTP 200）'],
+    ]);
+    expect(
+      lines(
+        result(
+          {
+            enabled: true,
+            reason: '找不到 notify-send，Linux 上需要安装 libnotify（提供 notify-send）',
+          },
+          { enabled: true, status: 500, reason: 'HTTP 500 Internal Server Error' },
+        ),
+      ),
+    ).toEqual([
+      [
+        'system',
+        '系统通知',
+        'danger',
+        '发送失败：找不到 notify-send，Linux 上需要安装 libnotify（提供 notify-send）',
+      ],
+      ['webhook', 'webhook', 'danger', '发送失败：HTTP 500 Internal Server Error'],
+    ]);
+    expect(lines(result({}, {}))).toEqual([
+      ['system', '系统通知', 'muted', '没有打开（config.yaml 的 notify.system）'],
+      ['webhook', 'webhook', 'muted', '没有配置（config.yaml 的 notify.webhook）'],
+    ]);
+    expect(lines(result({ supported: false }, {}))[0]?.[3]).toBe(
+      'Master 所在的平台不支持（只支持 macOS、Linux）',
+    );
+  });
+
+  it('tells it in English without Chinese', () => {
+    setLang('en');
+    const all = [
+      result({ enabled: true, ok: true }, { enabled: true, ok: true, status: 204 }),
+      result(
+        { enabled: true, reason: 'exit code 1: execution error' },
+        { enabled: true, reason: 'fetch failed (ECONNREFUSED)' },
+      ),
+      result({}, {}),
+      result({ supported: false }, {}),
+    ].flatMap(lines);
+    for (const line of all) expect(line.join(' ')).not.toMatch(CJK);
+    expect(all.map((l) => l[3])).toEqual([
+      "Handed to the system to show; if you did not see it, check the system's notification settings (Do Not Disturb, Focus, permissions)",
+      'Accepted (HTTP 204)',
+      'Failed: exit code 1: execution error',
+      'Failed: fetch failed (ECONNREFUSED)',
+      'Off (notify.system in config.yaml)',
+      'Not set (notify.webhook in config.yaml)',
+      "Not supported on the Master's platform (only macOS and Linux)",
+      'Not set (notify.webhook in config.yaml)',
+    ]);
+    expect(all.slice(0, 2).map((l) => l[1])).toEqual(['System notification', 'Webhook']);
   });
 });
 

@@ -1542,6 +1542,23 @@ button.flow-stage-body:hover:not(:disabled) {
 .guide-nowrap {
   white-space: nowrap;
 }
+.guide-notify-test {
+  margin: 12px 0;
+}
+.guide-notify-results {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.guide-notify-results li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+}
 .guide-legend {
   display: flex;
   flex-wrap: wrap;

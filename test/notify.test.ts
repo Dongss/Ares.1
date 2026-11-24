@@ -17,6 +17,7 @@ import {
   type NoticeFailure,
   noticeScript,
   SystemNotifier,
+  sendSystemNotice,
   systemNoticeSupported,
 } from '../src/notify/system.js';
 import {
@@ -67,6 +68,24 @@ function exited(code: number, commandLine: string): Error {
 }
 
 const NO_NOTIFY_SEND = '找不到 notify-send，Linux 上需要安装 libnotify（提供 notify-send）';
+
+/** An execFile that fails every command with `err`, passing no stderr on. */
+const fail =
+  (err: Error): ExecFile =>
+  (_file, _args, _options, callback) =>
+    callback(err);
+
+/** An error as execFile gives for a command that ran and failed: the command line comes first. */
+function commandFailed(
+  file: string,
+  printed: string,
+  how: { code?: number; killed?: boolean; signal?: string },
+): Error {
+  return Object.assign(
+    new Error(`Command failed: ${file} -e display notification "正文"\n${printed}`),
+    { code: how.code ?? null, killed: how.killed ?? false, signal: how.signal ?? null },
+  );
+}
 
 let h: Harness | undefined;
 
@@ -595,6 +614,113 @@ describe('notifications in English', () => {
     );
     expect(reasonOf(enoent('osascript'))).toBe('osascript was not found');
   });
+
+  it('tells how a system notification failed in English', async () => {
+    setLang('en');
+    const reason = async (err: Error) =>
+      (await sendSystemNotice('Test', 'A thing', { platform: 'darwin', execFile: fail(err) }))
+        ?.reason;
+    expect(await reason(commandFailed('osascript', 'execution error', { code: 1 }))).toBe(
+      'exit code 1: execution error',
+    );
+    expect(await reason(commandFailed('osascript', '', { killed: true }))).toBe(
+      'killed after no answer within 10 seconds',
+    );
+    expect(await reason(commandFailed('osascript', '', { signal: 'SIGKILL' }))).toBe(
+      'terminated by signal SIGKILL',
+    );
+    expect(await reason(commandFailed('osascript', 'oops', {}))).toBe('failed: oops');
+  });
+});
+
+describe('a system notification whose outcome is wanted (the test notification)', () => {
+  it('resolves with how it went, running nothing where the platform has no command', async () => {
+    const { calls, execFile } = fakeExecFile();
+    expect(sendSystemNotice('标题', '正文', { platform: 'win32', execFile })).toBeNull();
+    expect(calls).toEqual([]);
+    expect(await sendSystemNotice('标题', '正文', { platform: 'darwin', execFile })).toEqual({
+      ok: true,
+      file: 'osascript',
+      reason: null,
+    });
+    expect(calls).toEqual([
+      { file: 'osascript', args: ['-e', noticeScript('标题', '正文')], timeout: 10_000 },
+    ]);
+  });
+
+  it('says why it failed, without the command line and the texts it carried', async () => {
+    const outcome = (err: Error, platform: NodeJS.Platform = 'darwin') =>
+      sendSystemNotice('标题', '正文', { platform, execFile: fail(err) });
+    expect(
+      await outcome(
+        commandFailed('osascript', '0:5: execution error: 出错了 (-1728)\n', { code: 1 }),
+      ),
+    ).toEqual({
+      ok: false,
+      file: 'osascript',
+      reason: '退出码 1：0:5: execution error: 出错了 (-1728)',
+    });
+    expect(
+      (await outcome(commandFailed('notify-send', '', { killed: true }), 'linux'))?.reason,
+    ).toBe('10 秒内无响应被终止');
+    // A command that ran and failed with neither an exit code nor a signal: still no command line.
+    expect((await outcome(commandFailed('osascript', '', {})))?.reason).toBe('运行失败');
+    expect((await outcome(enoent('notify-send'), 'linux'))?.reason).toContain('libnotify');
+    // Not execFile's own wording: as it is.
+    expect((await outcome(new Error('参数里有 NUL')))?.reason).toBe('参数里有 NUL');
+    // execFile throwing right away fails it the same.
+    const throwing = await sendSystemNotice('标题', '正文\0', {
+      platform: 'linux',
+      execFile: () => {
+        throw new Error('参数里有 NUL');
+      },
+    });
+    expect(throwing).toEqual({ ok: false, file: 'notify-send', reason: '参数里有 NUL' });
+  });
+
+  it('reads a command that really failed', async () => {
+    const outcome = await sendSystemNotice('标题', '正文', {
+      platform: 'linux',
+      // The real execFile, running a command that prints why and exits 3.
+      execFile: (_file, _args, options, callback) =>
+        execFile('sh', ['-c', 'echo 没有桌面会话 >&2; exit 3'], options, (err) => callback(err)),
+    });
+    expect(outcome).toEqual({ ok: false, file: 'notify-send', reason: '退出码 3：没有桌面会话' });
+  });
+
+  it('logs nothing, records nothing and leaves the streak of real notifications alone', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const logged = () =>
+      warn.mock.calls.map((c) => String(c[0])).filter((m) => m.startsWith('[通知] 系统通知'));
+    try {
+      let error: Error | null = enoent('notify-send');
+      const { execFile } = fakeExecFile(() => error);
+      h = await harness({
+        config: 'notify:\n  system: true\n',
+        master: { notice: makeSystemNotice({ platform: 'linux', execFile }) },
+      });
+      const store = h.master.store;
+      const failures = () => store.listEventsOfType('notify.system_failed', '');
+      const test = () => sendSystemNotice('标题', '正文', { platform: 'linux', execFile });
+      const real = () => store.event(null, 'scout.failed', scoutFailed(SCOUT_FAILURE_NOTIFY_AFTER));
+
+      // A failed test: no log, no event; the first real failure is still told.
+      expect((await test())?.ok).toBe(false);
+      expect(failures()).toEqual([]);
+      expect(logged()).toEqual([]);
+      real();
+      expect(failures()).toHaveLength(1);
+      // A test getting through does not end the streak: the next real failure is not told.
+      error = null;
+      expect((await test())?.ok).toBe(true);
+      error = enoent('notify-send');
+      real();
+      expect(failures()).toHaveLength(1);
+      expect(logged()).toHaveLength(1);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
 });
 
 describe('webhook notifications', () => {
@@ -1079,7 +1205,7 @@ describe('webhook settings for the scripts (webhook.curl)', () => {
       headers: webhookRequest(
         webhook,
         { kind: 'scout', title: 't', body: 'b', runId: null, about: 'issues' },
-        { id: 1, runId: null, ts: '', type: 'scout.failed', data: {} },
+        { ts: '', type: 'scout.failed' },
       ).headers,
     });
     expect(hook.received).toHaveLength(1);

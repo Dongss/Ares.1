@@ -246,6 +246,8 @@ export async function harness(opts: HarnessOptions = {}): Promise<Harness> {
     pollIssues: false,
     upgradeTimer: false,
     notice: () => {},
+    // The test notification never runs osascript or notify-send: it "succeeds".
+    execFile: (_file, _args, _options, callback) => callback(null),
     // Retry an agent that errored right away.
     agentRetryBackoff: { firstMs: 0, maxMs: 0 },
     ...opts.master,

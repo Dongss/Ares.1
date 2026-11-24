@@ -1,5 +1,10 @@
 import { Fragment, type ReactNode, useEffect, useState } from 'react';
-import type { ConfigView, GitHubRepoStatus, RunSummary } from '../../../src/api/types.js';
+import type {
+  ConfigView,
+  GitHubRepoStatus,
+  NotifyTestResult,
+  RunSummary,
+} from '../../../src/api/types.js';
 import { brandName, brandSlogan } from '../../../src/brand.js';
 import { join, t } from '../../../src/i18n.js';
 import type { Repo } from '../../../src/store/types.js';
@@ -25,12 +30,14 @@ import {
   labelHelp,
   noticeRows,
   notifyChannel,
+  notifyTestLines,
+  notifyTestUnavailable,
   runStages,
   scoutGuide,
   startCommand,
   stopCommand,
 } from '../lib/guide.js';
-import { useReloadOn, useResource } from '../lib/hooks.js';
+import { useAction, useReloadOn, useResource } from '../lib/hooks.js';
 import { acceptRanges, issuesUrl, newIssueUrl } from '../lib/issues.js';
 import { href } from '../lib/router.js';
 import { attentionCount } from '../lib/runs.js';
@@ -618,6 +625,7 @@ function NotifySection({
         })}
       </p>
       <p className="guide-now">{notifyChannel(systemNotify, webhookNotify)}</p>
+      <NotifyTest systemNotify={systemNotify} webhookNotify={webhookNotify} />
       <div className="table-wrap">
         <table className="table">
           <thead>
@@ -639,6 +647,50 @@ function NotifySection({
         </table>
       </div>
     </>
+  );
+}
+
+/** Sends a test notification through the Master's channels and shows how each went. */
+function NotifyTest({
+  systemNotify,
+  webhookNotify,
+}: {
+  systemNotify: boolean;
+  webhookNotify: boolean;
+}) {
+  const action = useAction();
+  const [result, setResult] = useState<NotifyTestResult>();
+  const unavailable = notifyTestUnavailable(systemNotify, webhookNotify);
+  return (
+    <div className="guide-notify-test">
+      <div className="issues-poll">
+        <button
+          type="button"
+          disabled={action.busy || unavailable !== null}
+          onClick={async () => {
+            setResult(undefined);
+            const sent = await action.run(() => api.notifyTest());
+            if (sent) setResult(sent);
+          }}
+        >
+          {action.busy
+            ? t({ zh: '发送中…', en: 'Sending…' })
+            : t({ zh: '发一条测试通知', en: 'Send a test notification' })}
+        </button>
+        {unavailable && <span className="muted">{unavailable}</span>}
+      </div>
+      {result && (
+        <ul className="guide-notify-results">
+          {notifyTestLines(result).map((line) => (
+            <li key={line.channel}>
+              <Badge tone={line.tone}>{line.label}</Badge>
+              <span>{line.text}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+      <ErrorBox>{action.error}</ErrorBox>
+    </div>
   );
 }
 

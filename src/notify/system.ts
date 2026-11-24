@@ -66,13 +66,22 @@ export function noticeCommand(
 /** How long a reason may be: one line, enough for an error from the command. */
 const REASON_MAX = 200;
 
+/** What execFile's error carries besides the message. */
+interface CommandError extends Error {
+  code?: unknown;
+  killed?: unknown;
+  signal?: unknown;
+}
+
+/** How execFile's message starts for a command that ran and failed. */
+const COMMAND_FAILED = 'Command failed:';
+
 /**
- * Why `file` failed, short. Not the error's message when the command exited with an error: Node
- * puts the whole command line there, the notification's texts (a Run's goal) included.
+ * Why `file` failed, short. Never the first line of execFile's message for a command that ran:
+ * Node puts the whole command line there, the notification's texts (a Run's goal) included.
  */
-function failureReason(file: string, err: Error, stderr = ''): string {
-  const e = err as Error & { code?: unknown; killed?: unknown; signal?: unknown };
-  if (e.code === 'ENOENT') {
+function failureReason(file: string, err: CommandError, stderr = ''): string {
+  if (err.code === 'ENOENT') {
     return file === 'notify-send'
       ? t({
           zh: '找不到 notify-send，Linux 上需要安装 libnotify（提供 notify-send）',
@@ -80,24 +89,100 @@ function failureReason(file: string, err: Error, stderr = ''): string {
         })
       : t({ zh: `找不到 ${file}`, en: `${file} was not found` });
   }
+  // What the command said: its standard error, which execFile also puts after the command line
+  // in its message (all there is when the caller passed no stderr on).
+  const ran = err.message.startsWith(COMMAND_FAILED);
+  const newline = err.message.indexOf('\n');
+  const printed = stderr || (ran && newline >= 0 ? err.message.slice(newline + 1) : '');
+  const said = firstLine(printed, REASON_MAX);
+  const saying = (what: string) => (said ? `${what}${t({ zh: '：', en: ': ' })}${said}` : what);
   // The Master kills it only when it outlived the timeout.
-  if (e.killed === true) {
+  if (err.killed === true) {
     const seconds = NOTICE_TIMEOUT_MS / 1000;
     return t({
       zh: `${seconds} 秒内无响应被终止`,
       en: `killed after no answer within ${seconds} seconds`,
     });
   }
-  const said = firstLine(stderr, REASON_MAX);
-  if (typeof e.signal === 'string') {
-    const by = t({ zh: `被信号 ${e.signal} 终止`, en: `terminated by signal ${e.signal}` });
-    return said ? `${by}${t({ zh: '：', en: ': ' })}${said}` : by;
+  if (typeof err.signal === 'string') {
+    return saying(t({ zh: `被信号 ${err.signal} 终止`, en: `terminated by signal ${err.signal}` }));
   }
-  if (typeof e.code === 'number') {
-    const exit = t({ zh: `退出码 ${e.code}`, en: `exit code ${e.code}` });
-    return said ? `${exit}${t({ zh: '：', en: ': ' })}${said}` : exit;
+  if (typeof err.code === 'number') {
+    return saying(t({ zh: `退出码 ${err.code}`, en: `exit code ${err.code}` }));
   }
+  if (ran) return saying(t({ zh: '运行失败', en: 'failed' }));
   return firstLine(err.message, REASON_MAX);
+}
+
+/** How sending one system notification went. */
+export interface SystemNoticeOutcome {
+  /** The command was run and ended well. */
+  ok: boolean;
+  /** The command run, e.g. notify-send. */
+  file: string;
+  /** Why it failed; null when it did not. */
+  reason: string | null;
+}
+
+/**
+ * Runs the command that shows a notification on `platform` and hands `done` how it went, once
+ * (at once when execFile answers at once). Never throws, whatever `done` does. Returns false,
+ * running nothing and calling nothing, where the platform has no command.
+ */
+function runNoticeCommand(
+  platform: NodeJS.Platform,
+  execFile: ExecFile,
+  title: string,
+  body: string,
+  done: (outcome: SystemNoticeOutcome) => void,
+): boolean {
+  const command = noticeCommand(platform, title, body);
+  if (!command) return false;
+  const { file } = command;
+  const report = (outcome: SystemNoticeOutcome) => {
+    try {
+      done(outcome);
+    } catch {
+      // Hearing the result must not fail the Master, nor count as a failure to send.
+    }
+  };
+  const failed = (err: unknown, stderr?: string) =>
+    report({
+      ok: false,
+      file,
+      reason: failureReason(file, err instanceof Error ? err : new Error(String(err)), stderr),
+    });
+  try {
+    execFile(file, command.args, { timeout: NOTICE_TIMEOUT_MS }, (err, _stdout, stderr) => {
+      if (err) failed(err, stderr);
+      else report({ ok: true, file, reason: null });
+    });
+  } catch (err) {
+    // execFile throws right away on arguments it cannot pass (e.g. a NUL character).
+    failed(err);
+  }
+  return true;
+}
+
+/**
+ * Sends one system notification and resolves with how it went, for the dashboard's test
+ * notification; null where the platform has no command. Never rejects and logs nothing: the
+ * outcome goes back to whoever asked.
+ */
+export function sendSystemNotice(
+  title: string,
+  body: string,
+  opts: { platform?: NodeJS.Platform; execFile?: ExecFile } = {},
+): Promise<SystemNoticeOutcome> | null {
+  const { promise, resolve } = Promise.withResolvers<SystemNoticeOutcome>();
+  const ran = runNoticeCommand(
+    opts.platform ?? process.platform,
+    opts.execFile ?? nodeExecFile,
+    title,
+    body,
+    resolve,
+  );
+  return ran ? promise : null;
 }
 
 /**
@@ -111,33 +196,9 @@ export function makeSystemNotice(
   const platform = opts.platform ?? process.platform;
   const execFile: ExecFile = opts.execFile ?? nodeExecFile;
   return (title, body, done) => {
-    const command = noticeCommand(platform, title, body);
-    if (!command) return;
-    const report = (failure: NoticeFailure | null) => {
-      try {
-        done?.(failure);
-      } catch {
-        // Hearing the result must not fail the Master, nor count as a failure to send.
-      }
-    };
-    const failed = (err: unknown, stderr?: string) =>
-      report({
-        command: command.file,
-        reason: failureReason(
-          command.file,
-          err instanceof Error ? err : new Error(String(err)),
-          stderr,
-        ),
-      });
-    try {
-      execFile(command.file, command.args, { timeout: NOTICE_TIMEOUT_MS }, (err, _out, stderr) => {
-        if (err) failed(err, stderr);
-        else report(null);
-      });
-    } catch (err) {
-      // execFile throws right away on arguments it cannot pass (e.g. a NUL character).
-      failed(err);
-    }
+    runNoticeCommand(platform, execFile, title, body, ({ ok, file, reason }) =>
+      done?.(ok ? null : { command: file, reason: reason ?? '' }),
+    );
   };
 }
 
@@ -150,7 +211,8 @@ export const systemNotice: SendNotice = makeSystemNotice();
  *
  * The first failure of a streak is logged and recorded as the global event notify.system_failed
  * (on the Events page, where a human coming back sees that no notification reached them); later
- * failures are not, until a notification is shown again.
+ * failures are not, until a notification is shown again. The dashboard's test notification
+ * (sendSystemNotice) does not go through it: it neither starts nor ends a streak.
  */
 export class SystemNotifier {
   /** A failure was told and no notification has been shown since. */

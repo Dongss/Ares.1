@@ -379,7 +379,7 @@ notify:
   }
   ```
 
-  `kind` 是通知的种类（`approval`、`discussion`、`blocked`、`failed`、`proposals`、`scout`、`github`、`upgrade`，以及只由脚本在 Master 停了、起不来时发的 `master_down`，见下面），`title`、`body` 是通知的标题和正文（按 `language` 的语言），`text` 是「标题\n正文」，`runId` 是相关的 Run（没有时为 `null`），`about` 说明点开该去哪里（`run` 是 Run 详情页，`issues` 是「需求」页，`master` 没有特定页面），`eventType` 是引起通知的事件类型，`at` 是事件发生的时间。Slack 的入站 webhook 会显示 `text`、忽略其他字段，可以直接接。
+  `kind` 是通知的种类（`approval`、`discussion`、`blocked`、`failed`、`proposals`、`scout`、`github`、`upgrade`；只由脚本在 Master 停了、起不来时发的 `master_down`，见下面；以及人在看板上点「发一条测试通知」时发的 `test`，见下面的「测试通知」），`title`、`body` 是通知的标题和正文（按 `language` 的语言），`text` 是「标题\n正文」，`runId` 是相关的 Run（没有时为 `null`），`about` 说明点开该去哪里（`run` 是 Run 详情页，`issues` 是「需求」页，`master` 没有特定页面），`eventType` 是引起通知的事件类型，`at` 是事件发生的时间。Slack 的入站 webhook 会显示 `text`、忽略其他字段，可以直接接。
 - `format: text`：`Content-Type: text/plain; charset=utf-8`，正文就是「标题\n正文」，适合 ntfy 这类直接显示正文的服务。
 - 飞书、钉钉的机器人 webhook 要求固定的消息格式，不能直接接：要经过一层转发（自己的小服务把正文改成它们要的格式），或者先发到 ntfy 这类服务。
 - 发出去的标题、正文和 `text` 都先把用户目录下的路径换成 `~`（和发到 GitHub 的文字一样，见「发到 GitHub 的文字不带用户目录」），不把系统用户名发给外部服务。
@@ -391,6 +391,28 @@ notify:
   - 每条通知 POST 一次，用 `curl`（`-q -K webhook.curl`，最多等 10 秒），不需要 node 和 jq（这时可能正是 node 找不到）；没有这个文件或者没有 `curl` 就不发，其他照旧。`-q` 让 curl 不读你自己的 curl 配置（`~/.curlrc`，或者 `$CURL_HOME`、`$XDG_CONFIG_HOME` 下的），只用 Master 写下的设置：那里的代理、`--trace`、额外请求头之类的设置不会改变这次发送，也不会把地址和请求头写进跟踪文件。保活脚本和系统通知一样，同一次停转只发一次。
   - `format: json` 时字段和上面一样：`kind` 是 `master_down`，`title` 是通知标题（展示名），`body` 是系统通知里的那句话，`text` 是「标题\n正文」，`runId` 为 `null`，`about` 是 `master`，`eventType` 保活脚本是 `keepalive.alert`、升级脚本是 `upgrade.master_down`，`at` 是发送的时间（精确到秒，比如 `2026-11-23T08:00:00Z`）。`format: text` 时正文是「标题\n正文」。正文里以用户目录开头的路径同样换成 `~`。
   - 失败时（不是 2xx、连不上或 10 秒内没有响应）不重试，不影响脚本的退出码，只在各自的日志里记一行（保活脚本在 `keepalive.log`，升级脚本在 `upgrade.log`），只写 curl 的退出码（比如 7 是连不上，22 是返回了错误状态码，28 是超时），不写地址和请求头。
+
+### 测试通知
+
+配好 `notify.system` 或 `notify.webhook` 后，不用等到真有 Run 卡住才知道通道通不通：在看板「说明」页的「会在什么时候通知你」一节点「发一条测试通知」，Master 立即按当前的配置（改了 `config.yaml` 保存后不用重启）向打开的每条通道各发一条，等结果都回来（webhook 最多等 10 秒）再在按钮旁逐条显示：
+
+- 系统通知：在 macOS、Linux 上打开了 `notify.system` 时发，标题是「测试通知」，正文是「这是一条测试通知，收到说明通知通道可用。」（按 `language` 的语言）。命令正常结束显示「已交给系统显示」：这不保证一定弹出来了，勿扰、专注模式或者没允许通知都可能拦下，没看到要去检查系统的通知设置。命令失败时显示原因，写法和 `notify.system_failed` 的原因一样，比如 Linux 上没装 `notify-send`、命令的退出码加上它错误输出的第一行、10 秒内无响应被终止；不显示完整的命令行。没打开时显示「没有打开」，Master 所在的平台不支持（比如 Windows）时显示「不支持」，都不执行任何命令。
+- webhook：配了 `notify.webhook` 时 POST 一条，格式和真实的通知一样（`format: json` 时 `kind` 是 `test`，`eventType` 是 `notify.test`，`runId` 为 `null`，`about` 是 `master`，`at` 是发送的时间；`format: text` 时正文是「标题\n正文」），文字同样把用户目录换成 `~`。返回 2xx 时显示「对方已接收」和状态码；失败时显示 HTTP 状态码或错误原因（连不上、10 秒内没有响应等），不显示地址和请求头。没配时显示「没有配置」。
+
+两条通道都没有（没打开 `notify.system` 或平台不支持，也没配 `notify.webhook`）时按钮不能点，旁边写明要先配哪个。浏览器通知不经过 Master，不在测试之列。
+
+测试通知不是由事件引起的，不记任何事件。测试发送失败不记 `notify.webhook_failed` 或 `notify.system_failed`，也不在 Master 的输出里记一行，结果只返回给按钮；它也不影响真实通知的失败记录：测试失败后真实通知第一次失败照样记，测试成功也不结束真实通知连续失败的那一串。
+
+对应的 API 是 `POST /api/notify/test`（不需要请求体），返回
+
+```json
+{
+  "system": { "enabled": true, "supported": true, "ok": true, "reason": null },
+  "webhook": { "enabled": true, "ok": false, "status": 500, "reason": "HTTP 500 Internal Server Error" }
+}
+```
+
+`enabled` 说明这条通道这次有没有发（`system` 要打开了 `notify.system` 且平台支持，`webhook` 要配了 `notify.webhook`），`ok` 说明发成功了没有，`reason` 是失败的原因（按 Master 的 `language`，不含 webhook 的地址和请求头；成功或没发时为 `null`）；`system.supported` 说明 Master 所在的平台支不支持系统通知，`webhook.status` 是 webhook 返回的 HTTP 状态码（没有响应或没发时为 `null`）。
 
 ## 稳定副本和自动升级
 

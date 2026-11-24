@@ -218,6 +218,31 @@ export interface HealthView {
   version: string | null;
 }
 
+/** How one channel of a test notification went (POST /api/notify/test). */
+export interface NotifyTestChannel {
+  /** The channel is set up, so the test was sent through it; false = nothing was sent. */
+  enabled: boolean;
+  /** It was sent: the command ended well, or the webhook answered with a 2xx status. */
+  ok: boolean;
+  /** Why it failed, in the Master's language; null when it did not or was not sent. */
+  reason: string | null;
+}
+
+/**
+ * The outcome of a test notification, sent through each channel the Master notifies by under
+ * the configuration in use. Never the webhook's address or headers: they may carry tokens.
+ */
+export interface NotifyTestResult {
+  system: NotifyTestChannel & {
+    /** The Master can send system notifications on its platform (macOS, Linux). */
+    supported: boolean;
+  };
+  webhook: NotifyTestChannel & {
+    /** The HTTP status the webhook answered with; null when it gave no answer or was not sent. */
+    status: number | null;
+  };
+}
+
 /** One repo whose issues the Master works on. */
 export interface GitHubRepoStatus {
   /** Repo name as registered on the dashboard. */

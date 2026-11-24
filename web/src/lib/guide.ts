@@ -1,4 +1,9 @@
-import type { ConfigView, GitHubRepoStatus, UpgradeStatus } from '../../../src/api/types.js';
+import type {
+  ConfigView,
+  GitHubRepoStatus,
+  NotifyTestResult,
+  UpgradeStatus,
+} from '../../../src/api/types.js';
 import {
   type AutoAcceptRule,
   backoffMs,
@@ -840,6 +845,86 @@ export function notifyChannel(systemNotify: boolean, webhookNotify = false): str
         en: 'To be reached away from this machine (say, with the Master on a server without a desktop), set notify.webhook in config.yaml to POST notifications to a service such as ntfy or an address of your own.',
       });
   return `${channel}${t({ zh: '', en: ' ' })}${webhook}`;
+}
+
+/**
+ * Why the test notification cannot be sent: the Master notifies through no channel of its own
+ * (system notifications on a platform that has them, or a webhook); null when it can.
+ */
+export function notifyTestUnavailable(
+  systemNotify: boolean,
+  webhookNotify: boolean,
+): string | null {
+  if (systemNotify || webhookNotify) return null;
+  return t({
+    zh: 'Master 现在没有自己发通知的通道，没有可测的：在 config.yaml 里打开 notify.system（macOS、Linux）或配 notify.webhook，保存后再试。浏览器通知不经过 Master，不在测试之列。',
+    en: 'The Master has no channel of its own to notify by, so there is nothing to test: turn on notify.system (macOS, Linux) or set notify.webhook in config.yaml, save, and try again. Browser notifications do not go through the Master and are not tested.',
+  });
+}
+
+/** How the test notification went through one channel, as shown next to the button. */
+export interface NotifyTestLine {
+  channel: 'system' | 'webhook';
+  label: string;
+  tone: Tone;
+  text: string;
+}
+
+/** One line per channel: sent, why it failed, or not set up. */
+export function notifyTestLines(result: NotifyTestResult): NotifyTestLine[] {
+  const failed = (reason: string | null) =>
+    reason
+      ? t({ zh: `发送失败：${reason}`, en: `Failed: ${reason}` })
+      : t({ zh: '发送失败', en: 'Failed' });
+  const { system, webhook } = result;
+  const systemLine: Omit<NotifyTestLine, 'channel' | 'label'> = system.enabled
+    ? system.ok
+      ? {
+          tone: 'success',
+          // The command ending well does not mean it showed: Do Not Disturb, Focus or the
+          // notification permission may have held it back.
+          text: t({
+            zh: '已交给系统显示；没看到的话，检查系统的通知设置（勿扰、专注模式、是否允许通知）',
+            en: "Handed to the system to show; if you did not see it, check the system's notification settings (Do Not Disturb, Focus, permissions)",
+          }),
+        }
+      : { tone: 'danger', text: failed(system.reason) }
+    : {
+        tone: 'muted',
+        text: system.supported
+          ? t({
+              zh: '没有打开（config.yaml 的 notify.system）',
+              en: 'Off (notify.system in config.yaml)',
+            })
+          : t({
+              zh: 'Master 所在的平台不支持（只支持 macOS、Linux）',
+              en: "Not supported on the Master's platform (only macOS and Linux)",
+            }),
+      };
+  const webhookLine: Omit<NotifyTestLine, 'channel' | 'label'> = webhook.enabled
+    ? webhook.ok
+      ? {
+          tone: 'success',
+          text:
+            webhook.status === null
+              ? t({ zh: '对方已接收', en: 'Accepted' })
+              : t({
+                  zh: `对方已接收（HTTP ${webhook.status}）`,
+                  en: `Accepted (HTTP ${webhook.status})`,
+                }),
+        }
+      : { tone: 'danger', text: failed(webhook.reason) }
+    : {
+        tone: 'muted',
+        text: t({
+          zh: '没有配置（config.yaml 的 notify.webhook）',
+          en: 'Not set (notify.webhook in config.yaml)',
+        }),
+      };
+  return [
+    { channel: 'system', label: t({ zh: '系统通知', en: 'System notification' }), ...systemLine },
+    { channel: 'webhook', label: t({ zh: 'webhook', en: 'Webhook' }), ...webhookLine },
+  ];
 }
 
 /** The labels the Master puts on issues; ares1:auto as auto_accept is set now. */
