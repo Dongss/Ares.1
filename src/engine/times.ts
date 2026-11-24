@@ -1,8 +1,8 @@
 // How long a Run took, and how much of that the agents worked, the Run waited in the queue, or it
 // waited for a human. Used for the scout's digest, the issue's closing comment and the Run's page
-// on the dashboard, so that time spent queued behind other Runs, paused, or waiting for an
-// approval or a reply is not read as slow agents. Pure (type imports and src/i18n.ts only): the
-// dashboard imports it.
+// on the dashboard, so that time spent queued behind other Runs, with work switched off, paused,
+// or waiting for an approval or a reply is not read as slow agents. Pure (type imports and
+// src/i18n.ts only): the dashboard imports it.
 
 import { t } from '../i18n.js';
 import type { Approval, Attempt, EventRow, Run, RunStatus } from '../store/types.js';
@@ -14,10 +14,15 @@ export interface RunTimes {
   agentMs: number;
   /**
    * Queued, from creation or each requeue until the Run's next status change: behind other Runs,
-   * while work is switched off, waiting for an upgrade or while the Master was not running.
-   * A stretch not over yet does not count.
+   * waiting for an upgrade or while the Master was not running. A stretch not over yet does not
+   * count.
    */
   queuedMs: number;
+  /**
+   * The part of those stretches in the queue while work was switched off: the Run waited for a
+   * human to switch it on, not for the queue.
+   */
+  stoppedMs: number;
   /** Approvals that were decided, each from asked to decided. */
   approvalMs: number;
   /**
@@ -35,9 +40,43 @@ export interface RunRecords {
   approvals: readonly Pick<Approval, 'createdAt' | 'decidedAt'>[];
   /** `run.status` events carry the new status in `data.status`. */
   events: readonly Pick<EventRow, 'id' | 'ts' | 'type' | 'data'>[];
+  /**
+   * Every time the work switch was turned on or off (the global `master.working` events), in the
+   * order they were recorded. None means it was always on.
+   */
+  workSwitches?: readonly WorkSwitch[];
+}
+
+/** The work switch turned on or off at `ts`. */
+export interface WorkSwitch {
+  ts: string;
+  on: boolean;
 }
 
 const span = (from: string, to: string) => Math.max(0, Date.parse(to) - Date.parse(from));
+
+/**
+ * How much of the time from `from` to `to` work was switched off. Before the first switch it was
+ * on; within the time, it is as the last switch before it left it.
+ */
+function switchedOffMs(from: string, to: string, switches: readonly WorkSwitch[]): number {
+  const end = Date.parse(to);
+  let mark = Date.parse(from);
+  let on = true;
+  let off = 0;
+  for (const s of switches) {
+    const at = Date.parse(s.ts);
+    if (at >= end) break;
+    // A switch at or before the start (or out of order) only sets what it is from then on.
+    if (at > mark) {
+      if (!on) off += at - mark;
+      mark = at;
+    }
+    on = s.on;
+  }
+  if (!on && end > mark) off += end - mark;
+  return off;
+}
 
 /**
  * Splits a Run's time. Executions, approvals and blocks go by the same rules as the waits on the
@@ -58,8 +97,11 @@ export function runTimes(
   // A Run is created queued without a status event; from then on every status change records a
   // `run.status` event, which ends the status before it. A block is recorded right after the
   // status change into it, so the next status change (a retry, a reply to the discussion,
-  // termination) ends it.
+  // termination) ends it. Of each stretch in the queue, what passed with work switched off is told
+  // apart: a paused or running Run is not held up by the switch, so only queueing is.
+  const switches = records.workSwitches ?? [];
   let queuedMs = 0;
+  let stoppedMs = 0;
   let pausedMs = 0;
   let blockedMs = 0;
   let status: RunStatus | null = 'queued';
@@ -71,8 +113,12 @@ export function runTimes(
     } else if (e.type === 'run.status') {
       for (const s of blockedSince) blockedMs += span(s, e.ts);
       blockedSince = [];
-      if (status === 'queued') queuedMs += span(since, e.ts);
-      else if (status === 'paused') pausedMs += span(since, e.ts);
+      if (status === 'queued') {
+        const queued = span(since, e.ts);
+        const stopped = Math.min(queued, switchedOffMs(since, e.ts, switches));
+        stoppedMs += stopped;
+        queuedMs += queued - stopped;
+      } else if (status === 'paused') pausedMs += span(since, e.ts);
       const next = e.data.status;
       status = typeof next === 'string' ? (next as RunStatus) : null;
       since = e.ts;
@@ -82,6 +128,7 @@ export function runTimes(
     totalMs: run.finishedAt ? span(run.createdAt, run.finishedAt) : null,
     agentMs,
     queuedMs,
+    stoppedMs,
     approvalMs,
     blockedMs,
     pausedMs,
@@ -96,6 +143,8 @@ export interface RunRecordReader {
   listRunAttempts(runId: string): RunRecords['attempts'];
   listApprovals(runId: string): RunRecords['approvals'];
   listEvents(runId: string): RunRecords['events'];
+  /** Global events of the type, in the order they were recorded. */
+  listGlobalEventsOfType(type: string): readonly Pick<EventRow, 'ts' | 'data'>[];
 }
 
 /** `runTimes` of a Run, from its records in the store. */
@@ -104,6 +153,10 @@ export function storedRunTimes(store: RunRecordReader, run: Run): RunTimes {
     attempts: store.listRunAttempts(run.id),
     approvals: store.listApprovals(run.id),
     events: store.listEvents(run.id),
+    // Recorded by the store's setWorking with whether work is now on.
+    workSwitches: store
+      .listGlobalEventsOfType('master.working')
+      .flatMap((e) => (typeof e.data.on === 'boolean' ? [{ ts: e.ts, on: e.data.on }] : [])),
   });
 }
 
@@ -120,6 +173,7 @@ export function runTimePartLabels(): Record<RunTimePart, string> {
     zh: {
       agentMs: 'Agent 执行',
       queuedMs: '排队',
+      stoppedMs: '停工',
       approvalMs: '等审批',
       blockedMs: '卡住等人',
       pausedMs: '暂停',
@@ -127,6 +181,7 @@ export function runTimePartLabels(): Record<RunTimePart, string> {
     en: {
       agentMs: 'Agent work',
       queuedMs: 'Queued',
+      stoppedMs: 'Work switched off',
       approvalMs: 'Awaiting approval',
       blockedMs: 'Stuck, waiting for a human',
       pausedMs: 'Paused',
@@ -153,6 +208,8 @@ export type RunTimeGroup = 'agent' | 'queue' | 'human';
 export const RUN_TIME_PART_GROUP: Record<RunTimePart, RunTimeGroup> = {
   agentMs: 'agent',
   queuedMs: 'queue',
+  // Waiting for a human to switch work on again.
+  stoppedMs: 'human',
   approvalMs: 'human',
   blockedMs: 'human',
   pausedMs: 'human',

@@ -50,6 +50,25 @@ const BOOL_COLUMNS: Partial<Record<Table, readonly string[]>> = {
 const toSnake = (key: string) => key.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
 const toCamel = (key: string) => key.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
 
+/**
+ * A row of the events table that belongs to no Run. A type literal rather than an interface, so
+ * that the rows node:sqlite returns can be cast to it.
+ */
+type GlobalEventRow = {
+  id: number;
+  ts: string;
+  type: string;
+  data: string;
+};
+
+const globalEvent = (r: GlobalEventRow): EventRow => ({
+  id: r.id,
+  runId: null,
+  ts: r.ts,
+  type: r.type,
+  data: JSON.parse(r.data) as Record<string, unknown>,
+});
+
 export interface StoreEvents {
   event: [EventRow];
 }
@@ -488,14 +507,19 @@ export class Store {
               'SELECT * FROM events WHERE run_id IS NULL AND id < ? ORDER BY id DESC LIMIT ?',
             )
             .all(opts.beforeId, limit)
-    ) as { id: number; ts: string; type: string; data: string }[];
-    return rows.map((r) => ({
-      id: r.id,
-      runId: null,
-      ts: r.ts,
-      type: r.type,
-      data: JSON.parse(r.data) as Record<string, unknown>,
-    }));
+    ) as GlobalEventRow[];
+    return rows.map(globalEvent);
+  }
+
+  /**
+   * Every event of the type that belongs to no Run, in the order they were recorded (such as the
+   * work switch's `master.working`, to tell how long work was switched off).
+   */
+  listGlobalEventsOfType(type: string): EventRow[] {
+    const rows = this.db
+      .prepare('SELECT * FROM events WHERE run_id IS NULL AND type = ? ORDER BY id')
+      .all(type) as GlobalEventRow[];
+    return rows.map(globalEvent);
   }
 
   // ---- repos ---------------------------------------------------------------

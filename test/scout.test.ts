@@ -156,6 +156,43 @@ describe('runDigest', () => {
     expect(digest(h)).toContain('，用时 35 分钟（Agent 执行 5 分钟，排队 30 分钟）');
   });
 
+  it('tells the time a Run was queued with work switched off apart from the queue', async () => {
+    h = await harness({ workflow: IMPLEMENT_ONLY });
+    const run = h.run();
+    await h.waitStatus(run.id, 'completed');
+    const store = h.master.store;
+    // Started 30 minutes after it was created, done 5 minutes later.
+    retimeStatuses(h, run, [
+      ['running', 30],
+      ['completed', 35],
+    ]);
+    store.updateRun(run.id, { finishedAt: later(run, 35) });
+    for (const a of store.listRunAttempts(run.id)) {
+      store.updateAttempt(a.id, { startedAt: later(run, 30), endedAt: later(run, 35) });
+    }
+    // Work was switched off since before the Run was created, until 25 minutes after.
+    store.setWorking(false);
+    store.setWorking(true);
+    const switches = store.listGlobalEventsOfType('master.working');
+    expect(switches.map((e) => e.data.on)).toEqual([false, true]);
+    for (const [e, min] of [
+      [switches[0], -10],
+      [switches[1], 25],
+    ] as const) {
+      store.db.prepare('UPDATE events SET ts = ? WHERE id = ?').run(later(run, min), e?.id ?? 0);
+    }
+
+    expect(digest(h)).toContain('，用时 35 分钟（Agent 执行 5 分钟，排队 5 分钟，停工 25 分钟）');
+    setLang('en');
+    try {
+      expect(digest(h)).toContain(
+        ', took 35 min (Agent work 5 min, Queued 5 min, Work switched off 25 min)',
+      );
+    } finally {
+      setLang('zh');
+    }
+  });
+
   it('tells the time a Run was paused, and queued again once resumed', async () => {
     h = await harness({ workflow: IMPLEMENT_ONLY });
     let calls = 0;
@@ -965,6 +1002,13 @@ describe('scoutPrompt', () => {
       '可以作为提案的来源，但要先到代码里核对它是否仍然存在、是否已经有 issue 覆盖',
     );
   });
+
+  it('counts the time with work switched off as waiting for a human, not the queue', () => {
+    const clue = prompt.split('\n').find((l) => l.startsWith('1. '));
+    expect(clue).toContain(
+      '用时里「停工」「等审批」「卡住等人」「暂停」的部分是在等人处理，「排队」的部分是在等别的 Run 做完（也包括等升级、Master 没运行的时候）',
+    );
+  });
 });
 
 describe('scoutPrompt: failed upgrade of the Master', () => {
@@ -1127,6 +1171,9 @@ describe('scout in English', () => {
     );
     expect(clue).toContain(
       'first check in the code that each one is still there and that no existing issue covers it',
+    );
+    expect(clue).toContain(
+      '"Work switched off", "Awaiting approval", "Stuck, waiting for a human" and "Paused" are time spent waiting for a human, and "Queued" is time spent waiting for other Runs to finish (including while an upgrade is pending or the Master is not running)',
     );
   });
 

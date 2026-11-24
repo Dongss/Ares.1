@@ -3319,7 +3319,14 @@ describe('issues: texts', () => {
     expect(blocked.comment).toContain('> 测试没过');
     const completed = run({ status: 'completed', finishedAt: '2026-11-19T00:12:00.000Z' });
     const min = 60_000;
-    const none = { agentMs: 0, queuedMs: 0, approvalMs: 0, blockedMs: 0, pausedMs: 0 };
+    const none = {
+      agentMs: 0,
+      queuedMs: 0,
+      stoppedMs: 0,
+      approvalMs: 0,
+      blockedMs: 0,
+      pausedMs: 0,
+    };
     const done = issueUpdate(completed, {
       ...ctx,
       times: {
@@ -3366,6 +3373,22 @@ describe('issues: texts', () => {
     expect(both.comment).toContain(
       '用时 60 分钟（其中 Agent 执行 10 分钟、排队 20 分钟、等人 30 分钟）',
     );
+    // Queued with work switched off: waiting for a human to switch it on, not for the queue.
+    const stopped = issueUpdate(completed, {
+      ...ctx,
+      times: {
+        ...none,
+        totalMs: 916 * min,
+        agentMs: 10 * min,
+        queuedMs: 6 * min,
+        stoppedMs: 899 * min,
+        approvalMs: min,
+      },
+    });
+    expect(stopped.comment).toContain(
+      '用时 916 分钟（其中 Agent 执行 10 分钟、排队 6 分钟、等人 900 分钟）',
+    );
+    expect(stopped.comment).not.toContain('停工');
     expect(issueUpdate(run({ status: 'failed', error: '炸了' }), ctx).label).toBe(LABELS.failed);
   });
 
@@ -3430,12 +3453,28 @@ describe('issues: texts', () => {
     it('says on the issue what happened to the Run', () => {
       setLang('en');
       const completed = run({ status: 'completed', finishedAt: '2026-11-19T00:12:00.000Z' });
-      const none = { agentMs: 0, queuedMs: 0, approvalMs: 0, blockedMs: 0, pausedMs: 0 };
+      const none = {
+        agentMs: 0,
+        queuedMs: 0,
+        stoppedMs: 0,
+        approvalMs: 0,
+        blockedMs: 0,
+        pausedMs: 0,
+      };
       const done = issueUpdate(completed, { ...ctx, times: { ...none, totalMs: 12 * 60_000 } });
       expect(done.comment).toBe(
         'Merged into the local `main` (`abcdef1`); the code shows on GitHub once it is pushed.' +
           '\n\ncost $1.23 · took 12 min\n\nDashboard: http://127.0.0.1:4870/#/runs/run_1',
       );
+      // Work switched off counts as waiting for a human.
+      const stopped = issueUpdate(completed, {
+        ...ctx,
+        times: { ...none, totalMs: 60 * 60_000, agentMs: 10 * 60_000, stoppedMs: 50 * 60_000 },
+      });
+      expect(stopped.comment).toContain(
+        'cost $1.23 · took 60 min (of which Agent work 10 min, Waiting for a human 50 min)',
+      );
+      expect(stopped.comment).not.toMatch(cjk);
       const failed = issueUpdate(run({ status: 'failed', error: 'boom' }), ctx);
       expect(failed.comment).toBe(
         'The Run failed:\n\n> boom\n\nTo redo it, add the `ares1:ready` label again.' +

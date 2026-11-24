@@ -88,7 +88,14 @@ describe('format helpers', () => {
 
   describe('run time', () => {
     const MIN = 60_000;
-    const none = { agentMs: 0, queuedMs: 0, approvalMs: 0, blockedMs: 0, pausedMs: 0 };
+    const none = {
+      agentMs: 0,
+      queuedMs: 0,
+      stoppedMs: 0,
+      approvalMs: 0,
+      blockedMs: 0,
+      pausedMs: 0,
+    };
     const createdAt = '2026-11-20T00:00:00.000Z';
     const at = (min: number) => new Date(Date.parse(createdAt) + min * MIN).toISOString();
 
@@ -105,11 +112,14 @@ describe('format helpers', () => {
         pausedMs: 3 * MIN,
         blockedMs: 40_000,
         approvalMs: 2 * MIN,
+        stoppedMs: 5 * MIN,
         queuedMs: 12,
         agentMs: 90 * MIN + 400,
       };
+      // The Run's page lists the time work was switched off on its own, after the queue.
       expect(runTimePartTexts(times)).toEqual([
         'Agent 执行 1 小时 30 分',
+        '停工 5 分 0 秒',
         '等审批 2 分 0 秒',
         '卡住等人 40 秒',
         '暂停 3 分 0 秒',

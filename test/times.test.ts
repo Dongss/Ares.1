@@ -80,6 +80,7 @@ describe('runTimes', () => {
       totalMs: null,
       agentMs: 10 * MIN + 5 * MIN + 30_500 + 4 * MIN,
       queuedMs: (5 + 3 + 1 + 2) * MIN,
+      stoppedMs: 0,
       approvalMs: 60 * MIN,
       blockedMs: 20 * MIN + 3 * MIN,
       pausedMs: 10 * MIN,
@@ -150,9 +151,115 @@ describe('runTimes', () => {
       totalMs: MIN,
       agentMs: 0,
       queuedMs: 0,
+      stoppedMs: 0,
       approvalMs: 0,
       blockedMs: 0,
       pausedMs: 0,
+    });
+  });
+
+  describe('with work switched off', () => {
+    const turned = (on: boolean, min: number) => ({ ts: at(min), on });
+    const none = { attempts: [], approvals: [] };
+    // Queued from 0 to 30, running to 40, paused to 60, queued again to 70, running to 80.
+    const events = [
+      status('running', 30),
+      status('paused', 40),
+      status('queued', 60),
+      status('running', 70),
+      status('completed', 80),
+    ];
+    const finished = { createdAt: at(0), finishedAt: at(80) };
+
+    it('tells the time queued with work switched off apart from the queue', () => {
+      // Off from 10 to 25, while queued.
+      const times = runTimes(finished, {
+        ...none,
+        events,
+        workSwitches: [turned(false, 10), turned(true, 25)],
+      });
+      expect(times).toMatchObject({
+        queuedMs: (10 + 5 + 10) * MIN,
+        stoppedMs: 15 * MIN,
+        pausedMs: 20 * MIN,
+      });
+    });
+
+    it('counts work switched off before the Run was created', () => {
+      // Off since before the Run, on again at 20; off again from 65 to after the Run finished.
+      const times = runTimes(finished, {
+        ...none,
+        events,
+        workSwitches: [turned(true, -100), turned(false, -50), turned(true, 20), turned(false, 65)],
+      });
+      expect(times).toMatchObject({
+        queuedMs: (10 + 5) * MIN,
+        stoppedMs: (20 + 5) * MIN,
+      });
+      // Off all along: the Run's whole time in the queue was waiting for work to be switched on.
+      expect(
+        runTimes(finished, { ...none, events, workSwitches: [turned(false, -1)] }),
+      ).toMatchObject({ queuedMs: 0, stoppedMs: 40 * MIN });
+    });
+
+    it('does not take the switch while the Run is running or paused', () => {
+      // Off from 32 to 38 (running) and from 45 to 55 (paused): the queue keeps all its time.
+      const times = runTimes(finished, {
+        ...none,
+        events,
+        workSwitches: [turned(false, 32), turned(true, 38), turned(false, 45), turned(true, 55)],
+      });
+      expect(times).toEqual(runTimes(finished, { ...none, events }));
+      expect(times).toMatchObject({ queuedMs: 40 * MIN, stoppedMs: 0, pausedMs: 20 * MIN });
+      // Switched off while running and on while paused: the queue before and after is all queue.
+      expect(
+        runTimes(finished, {
+          ...none,
+          events,
+          workSwitches: [turned(false, 35), turned(true, 50)],
+        }),
+      ).toMatchObject({ queuedMs: 40 * MIN, stoppedMs: 0 });
+      // Switched off while paused: the Run is resumed into the queue with work off.
+      expect(
+        runTimes(finished, {
+          ...none,
+          events,
+          workSwitches: [turned(false, 50), turned(true, 64)],
+        }),
+      ).toMatchObject({ queuedMs: (30 + 6) * MIN, stoppedMs: 4 * MIN, pausedMs: 20 * MIN });
+    });
+
+    it('is as without switches when work stayed on', () => {
+      const without = runTimes(created, records);
+      expect(runTimes(created, { ...records, workSwitches: [] })).toEqual(without);
+      expect(
+        runTimes(created, { ...records, workSwitches: [turned(true, -10), turned(true, 3)] }),
+      ).toEqual(without);
+    });
+
+    it('does not count a stretch in the queue that is not over yet', () => {
+      expect(
+        runTimes(created, { ...none, events: [], workSwitches: [turned(false, 1)] }),
+      ).toMatchObject({ queuedMs: 0, stoppedMs: 0 });
+    });
+
+    it('counts switches on and off within one stretch in the queue', () => {
+      const times = runTimes(finished, {
+        ...none,
+        events,
+        workSwitches: [
+          turned(false, 2),
+          turned(true, 4),
+          // Switched off twice in a row: off from the first.
+          turned(false, 10),
+          turned(false, 12),
+          turned(true, 20),
+          // Switched on again just as the Run started running.
+          turned(false, 28),
+          turned(true, 30),
+        ],
+      });
+      expect(times).toMatchObject({ queuedMs: (30 - 14) * MIN + 10 * MIN, stoppedMs: 14 * MIN });
     });
   });
 });
@@ -182,6 +289,7 @@ describe('time texts', () => {
       pausedMs: 5,
       blockedMs: 4,
       approvalMs: 3,
+      stoppedMs: 6,
       queuedMs: 2,
       agentMs: 1,
       totalMs: 100,
@@ -189,6 +297,7 @@ describe('time texts', () => {
     expect(runTimeParts(times)).toEqual([
       ['Agent 执行', 1],
       ['排队', 2],
+      ['停工', 6],
       ['等审批', 3],
       ['卡住等人', 4],
       ['暂停', 5],
@@ -201,6 +310,7 @@ describe('grouped time parts', () => {
     totalMs: 1000,
     agentMs: 1,
     queuedMs: 20,
+    stoppedMs: 600000,
     approvalMs: 300,
     blockedMs: 4000,
     pausedMs: 50000,
@@ -218,7 +328,7 @@ describe('grouped time parts', () => {
     expect(groupedTimeParts(times)).toEqual([
       ['Agent 执行', 1],
       ['排队', 20],
-      ['等人', 300 + 4000 + 50000],
+      ['等人', 600000 + 300 + 4000 + 50000],
     ]);
   });
 
@@ -230,9 +340,10 @@ describe('grouped time parts', () => {
   it('adds up to the parts of the time', () => {
     const sum = (list: [string, number][]) => list.reduce((s, [, ms]) => s + ms, 0);
     expect(sum(groupedTimeParts(times))).toBe(sum(runTimeParts(times)));
-    // A human group is waiting for approvals, replies to a block and resumes.
+    // A human group is waiting for work to be switched on, approvals, replies to a block and
+    // resumes.
     const human = groupedTimeParts(times).find(([label]) => label === '等人')?.[1];
-    expect(human).toBe(times.approvalMs + times.blockedMs + times.pausedMs);
+    expect(human).toBe(times.stoppedMs + times.approvalMs + times.blockedMs + times.pausedMs);
   });
 });
 
@@ -244,19 +355,34 @@ describe('time texts in English', () => {
     const times = {
       totalMs: 100 * MIN,
       agentMs: 40 * MIN,
-      queuedMs: 0,
+      queuedMs: 3 * MIN,
+      stoppedMs: 50 * MIN,
       approvalMs: 2 * MIN,
       blockedMs: 0,
       pausedMs: 0,
     };
     expect(timeParts(runTimeParts(times))).toEqual([
       'Agent work 40 min',
+      'Queued 3 min',
+      'Work switched off 50 min',
       'Awaiting approval 2 min',
+    ]);
+    expect(timeParts(groupedTimeParts(times))).toEqual([
+      'Agent work 40 min',
+      'Queued 3 min',
+      'Waiting for a human 52 min',
     ]);
     expect(groupedTimeParts(times).map(([label]) => label)).toEqual([
       'Agent work',
       'Queued',
       'Waiting for a human',
     ]);
+  });
+
+  it('names every part of the time in English, without Chinese left', () => {
+    setLang('en');
+    const labels = Object.values(runTimePartLabels());
+    expect(labels).toContain('Work switched off');
+    for (const label of labels) expect(label).not.toMatch(/[一-鿿]/);
   });
 });

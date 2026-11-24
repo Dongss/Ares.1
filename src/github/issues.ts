@@ -418,7 +418,8 @@ const quote = (text: string, max = 800) => {
 
 /**
  * 「用时 957 分钟（其中 …）」, the total followed by the groups of `groupedTimeParts`: queueing and
- * waiting for approvals, replies to a block or a resume are told apart from the agents' work.
+ * waiting for work to be switched on, approvals, replies to a block or a resume are told apart
+ * from the agents' work.
  * null when the time is not known.
  */
 const tookText = (times: RunTimes | undefined): string | null => {

@@ -134,6 +134,24 @@ describe('store', () => {
     expect(store.listEvents(run.id)[0]?.data).toEqual({ a: 1 });
   });
 
+  it('lists the global events of one type, oldest first', () => {
+    const store = new Store(':memory:');
+    const { mk } = seed(store);
+    const run = mk('g');
+    store.setWorking(false);
+    store.event(null, 'master.restarted', {});
+    // An event of a Run is not global, even of the same type.
+    store.event(run.id, 'master.working', { on: true });
+    store.setWorking(true);
+    const switches = store.listGlobalEventsOfType('master.working');
+    expect(switches.map((e) => [e.runId, e.data])).toEqual([
+      [null, { on: false }],
+      [null, { on: true }],
+    ]);
+    expect(switches[0]?.id).toBeLessThan(switches[1]?.id ?? 0);
+    expect(store.listGlobalEventsOfType('nothing')).toEqual([]);
+  });
+
   it('counts stage rounds and refuses to delete a repo with runs', () => {
     const store = new Store(':memory:');
     const { repo, mk } = seed(store);
