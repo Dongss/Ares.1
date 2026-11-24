@@ -1,7 +1,8 @@
 // How a workflow template flows: which template a repo's Runs get by id (the home directory's or
-// the repo's own), effective stage settings, budgets, verify commands, rollback
-// targets, which stage rounds are split into tasks and whether a template can split an L
-// requirement at all; also the overrides of Runs from issues, which proposals are accepted
+// the repo's own), effective stage settings, budgets, verify commands, rollback targets, which
+// agents a stage may run with and which of them does its work by the requirement's difficulty,
+// which stage rounds are split into tasks and whether a template can split an L requirement at
+// all; also the overrides of Runs from issues, which proposals are accepted
 // automatically, how long the automatic scout backs off and which Runs it waits for, after how
 // many failed scouts in a row a human is notified, how long a failed Run of an issue waits before
 // it is redone, how long a Run or a scout waits for an agent that is out of quota or rate-limited,
@@ -14,6 +15,7 @@ import { replyDeadline } from '../engine/discussion.js';
 import { t } from '../i18n.js';
 import {
   type Attempt,
+  type Difficulty,
   type EventRow,
   FINISHED_RUN_STATUSES,
   REQUIREMENT_SIZES,
@@ -21,7 +23,7 @@ import {
   type Run,
   type Scout,
 } from '../store/types.js';
-import type { Escalate, RunOverrides, StageDef, WorkflowTemplate } from './schema.js';
+import type { AgentConfig, Escalate, RunOverrides, StageDef, WorkflowTemplate } from './schema.js';
 
 /** Risk of a proposal, ordered; auto-accept takes everything up to a chosen level. */
 export const RISKS = ['low', 'mid', 'high'] as const;
@@ -299,6 +301,67 @@ export function plansStage(
  */
 export function templateSplits(template: Pick<WorkflowTemplate, 'stages'>): boolean {
   return template.stages.some((s) => plansStage(s, 'L'));
+}
+
+const LEVEL_RANKS = { low: 0, mid: 1, high: 2 } as const;
+
+/**
+ * Rank of a level, low < mid < high: the levels of an agent's tier and cost (agents.yaml) and of
+ * a requirement's difficulty (`DIFFICULTIES`), so they compare with each other.
+ */
+export function levelRank(level: Difficulty | AgentConfig['tier'] | AgentConfig['cost']): number {
+  return LEVEL_RANKS[level];
+}
+
+/**
+ * The agents a stage may run with, in the template's order: its `agent_candidates` when it has
+ * them, otherwise its one `agent`; empty when it has neither (merge, placeholder and command
+ * stages).
+ */
+export function stageAgentIds(def: Pick<StageDef, 'agent' | 'agent_candidates'>): string[] {
+  if (def.agent_candidates) return [...def.agent_candidates];
+  return def.agent ? [def.agent] : [];
+}
+
+/**
+ * Why `chooseStageAgent` chose its agent: `first` = the Run has no difficulty, so the first
+ * usable candidate; `fit` = the cheapest whose tier is at least the difficulty; `highest` = no
+ * candidate's tier is that high, so the highest tier.
+ */
+export type StageAgentReason = 'first' | 'fit' | 'highest';
+
+/**
+ * Who does a stage's work, from its candidates (`stageAgentIds`) by the requirement's assessed
+ * difficulty (`assessedDifficulty`). Only candidates that are enabled (in `agents`, which holds
+ * enabled agents only) and that `usable` says can run the stage count; undefined when none does.
+ * Without a difficulty (no assess stage, an assessment that gave none or was recorded before
+ * assessments gave one) it is the first of them in the list. With one, it is the cheapest of
+ * those whose tier is at least the difficulty, equal costs going by the list's order; when no
+ * tier is that high, the highest tier, then the cheapest, then the list's order. Only `tier` and
+ * `cost` of the agents are read.
+ */
+export function chooseStageAgent(
+  candidates: readonly string[],
+  agents: ReadonlyMap<string, Pick<AgentConfig, 'id' | 'tier' | 'cost'>>,
+  difficulty: Difficulty | undefined,
+  usable: (id: string) => boolean,
+): { id: string; reason: StageAgentReason } | undefined {
+  const available = candidates.flatMap((id) => {
+    const agent = agents.get(id);
+    return agent && usable(id) ? [agent] : [];
+  });
+  const [first] = available;
+  if (!first) return undefined;
+  if (difficulty === undefined) return { id: first.id, reason: 'first' };
+  type Candidate = (typeof available)[number];
+  const byCost = (a: Candidate, b: Candidate) => levelRank(a.cost) - levelRank(b.cost);
+  // Array.prototype.sort is stable: equal ranks keep the list's order.
+  const fit = available.filter((a) => levelRank(a.tier) >= levelRank(difficulty)).sort(byCost)[0];
+  if (fit) return { id: fit.id, reason: 'fit' };
+  const highest =
+    [...available].sort((a, b) => levelRank(b.tier) - levelRank(a.tier) || byCost(a, b))[0] ??
+    first;
+  return { id: highest.id, reason: 'highest' };
 }
 
 /**

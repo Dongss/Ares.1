@@ -11,6 +11,7 @@ import {
   REPO_WORKFLOWS_DIR,
   resolveTemplate,
   runsAgent,
+  stageAgentIds,
   type TemplateSource,
   templateSplits,
 } from './flow.js';
@@ -644,8 +645,9 @@ function waitForHumanWarning(option: WaitingOption): string {
 }
 
 /**
- * Checks that need more than the schema: references between stages and agents,
- * and features that are not implemented yet in this milestone.
+ * Checks that need more than the schema: references between stages and agents, which stages
+ * may name agents and which settings go together, and features that are not implemented yet
+ * (verify.llm_check).
  */
 export function validateTemplate(
   tpl: WorkflowTemplate,
@@ -698,14 +700,11 @@ export function validateTemplate(
       }
       return;
     }
-    if (s.agent_candidates) {
-      errors.push(
-        where({
-          zh: 'agent_candidates（按难度选 Agent）尚未实现，请改用 agent',
-          en: 'agent_candidates (choosing agents by difficulty) is not implemented yet, use agent',
-        }),
-      );
-    }
+    // What a stage the Master runs by itself wrongly names; `agent: ""` counts as none.
+    const agentFields = [
+      s.agent && 'agent',
+      s.agent_candidates !== undefined && 'agent_candidates',
+    ].filter((field): field is string => typeof field === 'string');
     if (s.planning !== 'single' && s.kind !== 'agent') {
       // Only work that is checked and committed is worth splitting into steps.
       errors.push(
@@ -724,11 +723,11 @@ export function validateTemplate(
       );
     }
     if (s.kind === 'placeholder') {
-      if (s.agent) {
+      if (agentFields.length > 0) {
         errors.push(
           where({
-            zh: 'placeholder（占位）阶段不执行任何操作，不能指定 agent',
-            en: 'a placeholder stage does nothing and cannot have an agent',
+            zh: `placeholder（占位）阶段不执行任何操作，不能指定 ${joinList(agentFields)}`,
+            en: `a placeholder stage does nothing and cannot have ${joinList(agentFields)}`,
           }),
         );
       }
@@ -743,11 +742,11 @@ export function validateTemplate(
       return;
     }
     if (s.kind === 'merge') {
-      if (s.agent) {
+      if (agentFields.length > 0) {
         errors.push(
           where({
-            zh: 'merge 阶段由 Master 执行，不能指定 agent',
-            en: 'the Master runs the merge stage, it cannot have an agent',
+            zh: `merge 阶段由 Master 执行，不能指定 ${joinList(agentFields)}`,
+            en: `the Master runs the merge stage, it cannot have ${joinList(agentFields)}`,
           }),
         );
       }
@@ -769,51 +768,96 @@ export function validateTemplate(
         }),
       );
     }
-    if (!s.agent) {
-      errors.push(where({ zh: '需要指定 agent', en: 'an agent is required' }));
-      return;
-    }
-    const agent = agents.get(s.agent);
-    if (!agent) {
+    if (s.agent !== undefined && s.agent_candidates !== undefined) {
       errors.push(
         where({
-          zh: `Agent ${s.agent} 不存在或未启用`,
-          en: `agent ${s.agent} does not exist or is disabled`,
+          zh: 'agent 和 agent_candidates 只能写一个：agent 总用同一个 Agent，agent_candidates 按需求的难度从候选里挑',
+          en: "agent and agent_candidates cannot both be set: agent always uses the same agent, agent_candidates picks one of the candidates by the requirement's difficulty",
         }),
       );
       return;
     }
-    if (s.kind === 'assess' && !readOnlyClis.includes(agent.cli)) {
+    if (s.agent_candidates?.length === 0) {
       errors.push(
         where({
-          zh: `assess（需求评估）阶段要以只读方式运行，Agent ${s.agent} 的 CLI ${agent.cli} 不支持，请换用 ${readOnlyClis.join('、') || '支持只读的 CLI'} 的 Agent`,
-          en: `an assess stage runs read-only, which the CLI ${agent.cli} of agent ${s.agent} does not support; use an agent of ${readOnlyClis.join(', ') || 'a CLI that supports read-only'}`,
+          zh: 'agent_candidates 是空列表，没有可选的 Agent',
+          en: 'agent_candidates is an empty list, so there is no agent to pick',
+        }),
+      );
+      return;
+    }
+    const candidates = stageAgentIds(s);
+    if (candidates.length === 0) {
+      errors.push(
+        where({
+          zh: '需要指定 agent，或者用 agent_candidates 列出按难度挑选的候选 Agent',
+          en: 'an agent is required, or agent_candidates listing the agents to pick from by difficulty',
+        }),
+      );
+      return;
+    }
+    const repeated = [...new Set(candidates.filter((id, i) => candidates.indexOf(id) !== i))];
+    if (repeated.length > 0) {
+      errors.push(
+        where({
+          zh: `agent_candidates 里 ${joinList(repeated)} 写了不止一次`,
+          en: `agent_candidates lists ${joinList(repeated)} more than once`,
         }),
       );
     }
-    // auto splits only some Runs, but any of them may need the read-only run.
-    if (s.kind === 'agent' && s.planning !== 'single' && !readOnlyClis.includes(agent.cli)) {
-      errors.push(
-        where({
-          zh: `planning: ${s.planning} 先以只读方式运行阶段的 Agent 来拆分任务，Agent ${s.agent} 的 CLI ${agent.cli} 不支持，请换用 ${readOnlyClis.join('、') || '支持只读的 CLI'} 的 Agent`,
-          en: `planning: ${s.planning} first runs the stage's agent read-only to split the stage into tasks, which the CLI ${agent.cli} of agent ${s.agent} does not support; use an agent of ${readOnlyClis.join(', ') || 'a CLI that supports read-only'}`,
-        }),
-      );
+    for (const id of new Set(candidates)) {
+      const agent = agents.get(id);
+      if (!agent) {
+        errors.push(
+          where({
+            zh: `Agent ${id} 不存在或未启用`,
+            en: `agent ${id} does not exist or is disabled`,
+          }),
+        );
+        continue;
+      }
+      // Any candidate may be the one chosen, so each must be able to run read-only where the
+      // stage needs it.
+      if (s.kind === 'assess' && !readOnlyClis.includes(agent.cli)) {
+        errors.push(
+          where({
+            zh: `assess（需求评估）阶段要以只读方式运行，Agent ${id} 的 CLI ${agent.cli} 不支持，请换用 ${readOnlyClis.join('、') || '支持只读的 CLI'} 的 Agent`,
+            en: `an assess stage runs read-only, which the CLI ${agent.cli} of agent ${id} does not support; use an agent of ${readOnlyClis.join(', ') || 'a CLI that supports read-only'}`,
+          }),
+        );
+      }
+      // auto splits only some Runs, but any of them may need the read-only run.
+      if (s.kind === 'agent' && s.planning !== 'single' && !readOnlyClis.includes(agent.cli)) {
+        errors.push(
+          where({
+            zh: `planning: ${s.planning} 先以只读方式运行阶段的 Agent 来拆分任务，Agent ${id} 的 CLI ${agent.cli} 不支持，请换用 ${readOnlyClis.join('、') || '支持只读的 CLI'} 的 Agent`,
+            en: `planning: ${s.planning} first runs the stage's agent read-only to split the stage into tasks, which the CLI ${agent.cli} of agent ${id} does not support; use an agent of ${readOnlyClis.join(', ') || 'a CLI that supports read-only'}`,
+          }),
+        );
+      }
     }
   });
 
-  // The reviewer should differ from the agents it reviews, or it reviews its own work.
+  // The reviewer should differ from the agents it reviews, or it reviews its own work. With
+  // candidates, any of a review's may meet any of the coding stages' before it.
   tpl.stages.forEach((s, idx) => {
-    if (s.kind !== 'review' || !s.agent) return;
-    const reviewed = tpl.stages
-      .slice(0, idx)
-      .filter((p) => p.kind === 'agent' && p.agent)
-      .map((p) => p.agent);
-    if (reviewed.includes(s.agent)) {
+    if (s.kind !== 'review') return;
+    const coders = new Set(
+      tpl.stages
+        .slice(0, idx)
+        .filter((p) => p.kind === 'agent')
+        .flatMap(stageAgentIds),
+    );
+    const both = [...new Set(stageAgentIds(s).filter((id) => coders.has(id)))];
+    if (both.length > 0) {
+      const list = joinList(both);
       warnings.push(
         t({
-          zh: `阶段 ${s.id}：评审 Agent ${s.agent} 与编码 Agent 相同，建议换一个`,
-          en: `Stage ${s.id}: reviewer ${s.agent} is also the coding agent; better use another one`,
+          zh: `阶段 ${s.id}：评审 Agent ${list} 与编码 Agent 相同，建议换一个`,
+          en:
+            both.length === 1
+              ? `Stage ${s.id}: reviewer ${list} is also a coding agent; better use another one`
+              : `Stage ${s.id}: reviewers ${list} are also coding agents; better use others`,
         }),
       );
     }

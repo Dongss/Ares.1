@@ -24,6 +24,7 @@ import {
   LEFTOVER_WORKSPACE_EVENTS,
   type LeftoverWorkspaceReason,
   leftoverWorkspaces,
+  levelRank,
   plansStage,
   RATE_LIMIT_WAIT,
   type RateLimitWait,
@@ -31,6 +32,7 @@ import {
   type RunLimitWait,
   rateLimitDelayMs,
   recordedLimitWait,
+  stageAgentIds,
 } from '../config/flow.js';
 import {
   findTemplate,
@@ -174,8 +176,6 @@ export interface EngineDeps {
  */
 export const AGENT_RETRY_BACKOFF: Backoff = { firstMs: 30_000, maxMs: 600_000 };
 
-const LEVEL_RANK = { low: 0, mid: 1, high: 2 } as const;
-
 /**
  * The agent to switch a task to after its agent kept erroring or could not run at all
  * (`on_agent_error: switch_agent`): one the task has not tried yet that can run the stage, those
@@ -189,11 +189,11 @@ export function switchCandidate(
   tried: ReadonlySet<string>,
   usable: (agent: AgentConfig) => boolean,
 ): AgentConfig | undefined {
-  const floor = current ? LEVEL_RANK[current.tier] : 0;
-  const lower = (a: AgentConfig) => (LEVEL_RANK[a.tier] >= floor ? 0 : 1);
+  const floor = current ? levelRank(current.tier) : 0;
+  const lower = (a: AgentConfig) => (levelRank(a.tier) >= floor ? 0 : 1);
   const candidates = [...agents].filter((a) => !tried.has(a.id) && usable(a));
   // Array.prototype.sort is stable: equal ranks keep the file order.
-  candidates.sort((a, b) => lower(a) - lower(b) || LEVEL_RANK[a.cost] - LEVEL_RANK[b.cost]);
+  candidates.sort((a, b) => lower(a) - lower(b) || levelRank(a.cost) - levelRank(b.cost));
   return candidates[0];
 }
 
@@ -1753,7 +1753,7 @@ export class Engine {
       this.store.updateStageRun(sr.id, { status: 'executing' });
       return;
     }
-    const agentId = eff.def.agent;
+    const agentId = stageAgentIds(eff.def)[0];
     if (!agentId) {
       throw new Error(
         t({

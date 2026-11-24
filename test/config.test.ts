@@ -3,9 +3,11 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   budgetPauses,
+  chooseStageAgent,
   discussionReplyWait,
   issueRunOverrides,
   leftoverWorkspaces,
+  levelRank,
   limitedScout,
   loopsExhausted,
   plansStage,
@@ -20,6 +22,7 @@ import {
   scoutFailureStreak,
   scoutLimitWait,
   splitUnfinishedRuns,
+  stageAgentIds,
   templateSplits,
 } from '../src/config/flow.js';
 import {
@@ -46,15 +49,17 @@ import {
 } from '../src/config/schema.js';
 import { setLang } from '../src/i18n.js';
 import { BUILTIN_CLIS, BUILTIN_READ_ONLY_CLIS } from '../src/master.js';
-import type {
-  AssessmentEntry,
-  BlockKind,
-  DiscussionEntry,
-  RedoState,
-  Run,
-  RunStatus,
-  Scout,
-  ScoutProposal,
+import {
+  type AssessmentEntry,
+  type BlockKind,
+  DIFFICULTIES,
+  type Difficulty,
+  type DiscussionEntry,
+  type RedoState,
+  type Run,
+  type RunStatus,
+  type Scout,
+  type ScoutProposal,
 } from '../src/store/types.js';
 import { tmpDir, writeFile } from './helpers.js';
 
@@ -731,7 +736,8 @@ stages:
     expect(cfg.errors['agents.yaml#unknown']?.[0]).toMatch(/不支持的 cli/);
     const bad = cfg.errors['workflows/bad.yaml'] ?? [];
     expect(bad.join('\n')).toMatch(/Agent off 不存在或未启用/);
-    expect(bad.join('\n')).toMatch(/agent_candidates/);
+    // Candidates are fine on an agent stage.
+    expect(bad.join('\n')).not.toMatch(/阶段 b：/);
     expect(bad.join('\n')).toMatch(/planning: llm（拆分任务）只能用在 agent（编码）阶段/);
     expect(bad.join('\n')).toMatch(/merge 阶段必须是最后一个/);
     expect(bad.join('\n')).toMatch(/回退目标 nowhere 不存在/);
@@ -914,6 +920,211 @@ stages:
     // A rejected placeholder approval goes back to the nearest agent stage.
     expect(rollbackTarget(t, 'e2e', 'reject')).toBe('implement');
     expect(rollbackTarget(t, 'merge', 'reject')).toBe('implement');
+  });
+
+  describe('agent_candidates', () => {
+    const AGENTS = `agents:
+  cheap: { cli: claude-code, model: haiku, tier: low, cost: low }
+  strong: { cli: claude-code, model: opus, tier: high, cost: high }
+  grok: { cli: cursor-agent, model: grok-4.7-high, tier: mid, cost: low }
+  reviewer: { cli: claude-code, model: sonnet }
+  off: { cli: claude-code, model: sonnet, enabled: false }
+`;
+    const load = (files: Record<string, string>) => {
+      const paths = home();
+      writeFile(paths.agentsFile, AGENTS);
+      for (const [file, yaml] of Object.entries(files)) {
+        writeFile(join(paths.workflowsDir, file), yaml);
+      }
+      return loadConfig(paths, ['claude-code', 'cursor-agent'], ['claude-code']);
+    };
+
+    it('load on assess, agent and review stages, whichever CLI a review candidate has', () => {
+      const cfg = load({
+        'ok.yaml': `id: ok
+stages:
+  - { id: assess, kind: assess, agent_candidates: [cheap, strong] }
+  - { id: implement, agent_candidates: [cheap, strong], planning: auto, inputs: [assessment] }
+  - { id: review, kind: review, agent_candidates: [grok, reviewer], inputs: [diff, assessment] }
+  - { id: merge, kind: merge }
+`,
+      });
+      expect(cfg.errors['workflows/ok.yaml']).toBeUndefined();
+      expect(cfg.warnings['workflows/ok.yaml']).toBeUndefined();
+      const tpl = cfg.templates.get('ok') as WorkflowTemplate;
+      expect(tpl.stages.map(stageAgentIds)).toEqual([
+        ['cheap', 'strong'],
+        ['cheap', 'strong'],
+        ['grok', 'reviewer'],
+        [],
+      ]);
+    });
+
+    it('cannot go with agent, be empty or repeat a candidate, and some stage needs one or the other', () => {
+      const cfg = load({
+        'both.yaml': `id: both
+stages:
+  - { id: implement, agent: cheap, agent_candidates: [cheap, strong] }
+`,
+        'empty.yaml': `id: empty
+stages:
+  - { id: implement, agent_candidates: [] }
+`,
+        'repeated.yaml': `id: repeated
+stages:
+  - { id: implement, agent_candidates: [cheap, strong, cheap, strong, cheap] }
+`,
+        'none.yaml': `id: none
+stages:
+  - { id: implement, agent: cheap }
+  - { id: review, kind: review }
+`,
+      });
+      const errors = (file: string) => cfg.errors[`workflows/${file}`];
+      expect(errors('both.yaml')).toEqual([
+        '阶段 implement：agent 和 agent_candidates 只能写一个：agent 总用同一个 Agent，agent_candidates 按需求的难度从候选里挑',
+      ]);
+      expect(errors('empty.yaml')).toEqual([
+        '阶段 implement：agent_candidates 是空列表，没有可选的 Agent',
+      ]);
+      expect(errors('repeated.yaml')).toEqual([
+        '阶段 implement：agent_candidates 里 cheap、strong 写了不止一次',
+      ]);
+      expect(errors('none.yaml')).toEqual([
+        '阶段 review：需要指定 agent，或者用 agent_candidates 列出按难度挑选的候选 Agent',
+      ]);
+      for (const id of ['both', 'empty', 'repeated', 'none']) {
+        expect(cfg.templates.has(id)).toBe(false);
+      }
+    });
+
+    it('cannot be on stages the Master runs by itself', () => {
+      const tpl = (id: string, stage: string) => `id: ${id}
+stages:
+  - { id: implement, agent: cheap }
+  - ${stage}
+  - { id: merge, kind: merge }
+`;
+      const cfg = load({
+        'command.yaml': tpl('c1', '{ id: e2e, kind: command, agent_candidates: [cheap] }'),
+        'placeholder.yaml': tpl('c2', '{ id: e2e, kind: placeholder, agent_candidates: [cheap] }'),
+        'both.yaml': tpl(
+          'c3',
+          '{ id: e2e, kind: placeholder, agent: cheap, agent_candidates: [] }',
+        ),
+        'merge.yaml': `id: c4
+stages:
+  - { id: implement, agent: cheap }
+  - { id: merge, kind: merge, agent_candidates: [cheap, strong] }
+`,
+      });
+      const errors = (file: string) => cfg.errors[`workflows/${file}`];
+      expect(errors('command.yaml')).toEqual([
+        '阶段 e2e：command（命令）阶段只运行命令、不调用 Agent，不能指定 agent_candidates',
+      ]);
+      expect(errors('placeholder.yaml')).toEqual([
+        '阶段 e2e：placeholder（占位）阶段不执行任何操作，不能指定 agent_candidates',
+      ]);
+      expect(errors('both.yaml')).toEqual([
+        '阶段 e2e：placeholder（占位）阶段不执行任何操作，不能指定 agent、agent_candidates',
+      ]);
+      expect(errors('merge.yaml')).toEqual([
+        '阶段 merge：merge 阶段由 Master 执行，不能指定 agent_candidates',
+      ]);
+      for (const id of ['c1', 'c2', 'c3', 'c4']) expect(cfg.templates.has(id)).toBe(false);
+    });
+
+    it('needs every candidate enabled, and read-only where the stage runs read-only', () => {
+      const cfg = load({
+        'missing.yaml': `id: missing
+stages:
+  - { id: implement, agent_candidates: [cheap, off, nobody] }
+`,
+        'assess.yaml': `id: assess
+stages:
+  - { id: assess, kind: assess, agent_candidates: [cheap, grok] }
+  - { id: implement, agent: cheap, inputs: [assessment] }
+`,
+        'plan.yaml': `id: plan
+stages:
+  - { id: implement, agent_candidates: [grok, strong], planning: llm }
+`,
+        // A single task runs with edits, so any CLI does.
+        'single.yaml': `id: single
+stages:
+  - { id: implement, agent_candidates: [grok, strong] }
+`,
+      });
+      const errors = (file: string) => cfg.errors[`workflows/${file}`];
+      expect(errors('missing.yaml')).toEqual([
+        '阶段 implement：Agent off 不存在或未启用',
+        '阶段 implement：Agent nobody 不存在或未启用',
+      ]);
+      expect(errors('assess.yaml')).toEqual([
+        '阶段 assess：assess（需求评估）阶段要以只读方式运行，Agent grok 的 CLI cursor-agent 不支持，请换用 claude-code 的 Agent',
+      ]);
+      expect(errors('plan.yaml')).toEqual([
+        '阶段 implement：planning: llm 先以只读方式运行阶段的 Agent 来拆分任务，Agent grok 的 CLI cursor-agent 不支持，请换用 claude-code 的 Agent',
+      ]);
+      expect(errors('single.yaml')).toBeUndefined();
+      expect([...cfg.templates.keys()].sort()).toEqual(['single']);
+    });
+
+    it('warn when a review candidate is also a coding candidate', () => {
+      const tpl = (id: string, implement: string, review: string) => `id: ${id}
+stages:
+  - { id: implement, ${implement} }
+  - { id: docs, kind: placeholder }
+  - { id: review, kind: review, ${review} }
+  - { id: merge, kind: merge }
+`;
+      const files = {
+        'many.yaml': tpl(
+          'many',
+          'agent_candidates: [cheap, grok]',
+          'agent_candidates: [grok, strong, cheap]',
+        ),
+        'one.yaml': tpl('one', 'agent_candidates: [cheap, strong]', 'agent: strong'),
+        'apart.yaml': tpl('apart', 'agent_candidates: [cheap, grok]', 'agent_candidates: [strong]'),
+      };
+      const cfg = load(files);
+      for (const file of Object.keys(files))
+        expect(cfg.errors[`workflows/${file}`]).toBeUndefined();
+      expect(cfg.warnings['workflows/many.yaml']).toEqual([
+        '阶段 review：评审 Agent grok、cheap 与编码 Agent 相同，建议换一个',
+      ]);
+      expect(cfg.warnings['workflows/one.yaml']).toEqual([
+        '阶段 review：评审 Agent strong 与编码 Agent 相同，建议换一个',
+      ]);
+      expect(cfg.warnings['workflows/apart.yaml']).toBeUndefined();
+
+      setLang('en');
+      const en = load({
+        ...files,
+        'both.yaml': `id: both
+stages:
+  - { id: implement, agent: cheap, agent_candidates: [cheap] }
+`,
+        'repeated.yaml': `id: repeated
+stages:
+  - { id: implement, agent_candidates: [cheap, cheap] }
+`,
+      });
+      expect(en.warnings['workflows/many.yaml']).toEqual([
+        'Stage review: reviewers grok, cheap are also coding agents; better use others',
+      ]);
+      expect(en.warnings['workflows/one.yaml']).toEqual([
+        'Stage review: reviewer strong is also a coding agent; better use another one',
+      ]);
+      expect(en.errors['workflows/both.yaml']).toEqual([
+        "Stage implement: agent and agent_candidates cannot both be set: agent always uses the same agent, agent_candidates picks one of the candidates by the requirement's difficulty",
+      ]);
+      expect(en.errors['workflows/repeated.yaml']).toEqual([
+        'Stage implement: agent_candidates lists cheap more than once',
+      ]);
+      const texts = [...Object.values(en.errors), ...Object.values(en.warnings)].flat();
+      expect(texts.join('\n')).not.toMatch(/[一-鿿]/);
+    });
   });
 
   describe('command stages', () => {
@@ -1828,6 +2039,107 @@ describe('plansStage', () => {
     expect(plansStage(effectiveStage(t, 'a', {}).def, 'L')).toBe(false);
     expect(plansStage(effectiveStage(t, 'b', {}).def, 'L')).toBe(true);
     expect(plansStage(effectiveStage(t, 'b', {}).def, 'M')).toBe(false);
+  });
+});
+
+describe('stageAgentIds', () => {
+  it("lists a stage's candidates, else its agent, else nothing", () => {
+    expect(stageAgentIds({ agent_candidates: ['a', 'b'] })).toEqual(['a', 'b']);
+    expect(stageAgentIds({ agent: 'a' })).toEqual(['a']);
+    expect(stageAgentIds({})).toEqual([]);
+    expect(stageAgentIds({ agent: '' })).toEqual([]);
+  });
+
+  it('ranks levels low < mid < high', () => {
+    expect(DIFFICULTIES.map(levelRank)).toEqual([0, 1, 2]);
+  });
+});
+
+describe('chooseStageAgent', () => {
+  const agents = (...list: [id: string, tier: Difficulty, cost: Difficulty][]) =>
+    new Map(list.map(([id, tier, cost]) => [id, { id, tier, cost }]));
+  const all = () => true;
+  const AGENTS = agents(
+    ['strong', 'high', 'high'],
+    ['middle', 'mid', 'mid'],
+    ['cheap', 'low', 'low'],
+  );
+  const LIST = ['strong', 'middle', 'cheap'];
+
+  it('takes the cheapest candidate whose tier is at least the difficulty', () => {
+    expect(chooseStageAgent(LIST, AGENTS, 'low', all)).toEqual({ id: 'cheap', reason: 'fit' });
+    expect(chooseStageAgent(LIST, AGENTS, 'mid', all)).toEqual({ id: 'middle', reason: 'fit' });
+    expect(chooseStageAgent(LIST, AGENTS, 'high', all)).toEqual({ id: 'strong', reason: 'fit' });
+    // A tier above the difficulty is fine when it costs less.
+    const bargain = agents(['pricey', 'mid', 'high'], ['bargain', 'high', 'low']);
+    expect(chooseStageAgent(['pricey', 'bargain'], bargain, 'mid', all)).toEqual({
+      id: 'bargain',
+      reason: 'fit',
+    });
+  });
+
+  it('takes the first usable candidate without a difficulty', () => {
+    expect(chooseStageAgent(LIST, AGENTS, undefined, all)).toEqual({
+      id: 'strong',
+      reason: 'first',
+    });
+    expect(chooseStageAgent(['gone', ...LIST], AGENTS, undefined, (id) => id !== 'strong')).toEqual(
+      { id: 'middle', reason: 'first' },
+    );
+  });
+
+  it('takes the highest tier when none is high enough, then the cheapest, then the order', () => {
+    const weak = agents(['a', 'low', 'low'], ['b', 'mid', 'high'], ['c', 'mid', 'mid']);
+    expect(chooseStageAgent(['a', 'b', 'c'], weak, 'high', all)).toEqual({
+      id: 'c',
+      reason: 'highest',
+    });
+    const same = agents(['a', 'low', 'low'], ['b', 'mid', 'mid'], ['c', 'mid', 'mid']);
+    expect(chooseStageAgent(['a', 'b', 'c'], same, 'high', all)).toEqual({
+      id: 'b',
+      reason: 'highest',
+    });
+    expect(chooseStageAgent(['a', 'c', 'b'], same, 'high', all)).toEqual({
+      id: 'c',
+      reason: 'highest',
+    });
+    // Only the usable ones count.
+    expect(chooseStageAgent(LIST, AGENTS, 'high', (id) => id !== 'strong')).toEqual({
+      id: 'middle',
+      reason: 'highest',
+    });
+  });
+
+  it('goes by the list order between equal costs', () => {
+    const twins = agents(['x', 'high', 'mid'], ['y', 'high', 'mid'], ['z', 'low', 'low']);
+    for (const difficulty of ['mid', 'high'] as const) {
+      expect(chooseStageAgent(['x', 'y', 'z'], twins, difficulty, all)?.id).toBe('x');
+      expect(chooseStageAgent(['y', 'x', 'z'], twins, difficulty, all)?.id).toBe('y');
+    }
+  });
+
+  it('skips candidates that are disabled or cannot run the stage', () => {
+    // `off` is not among the enabled agents.
+    expect(chooseStageAgent(['off', ...LIST], AGENTS, 'low', all)).toEqual({
+      id: 'cheap',
+      reason: 'fit',
+    });
+    expect(chooseStageAgent(LIST, AGENTS, 'low', (id) => id !== 'cheap')).toEqual({
+      id: 'middle',
+      reason: 'fit',
+    });
+    expect(chooseStageAgent(LIST, AGENTS, 'low', (id) => id === 'strong')).toEqual({
+      id: 'strong',
+      reason: 'fit',
+    });
+  });
+
+  it('chooses nobody when no candidate is usable', () => {
+    for (const difficulty of [undefined, ...DIFFICULTIES]) {
+      expect(chooseStageAgent(LIST, AGENTS, difficulty, () => false)).toBeUndefined();
+      expect(chooseStageAgent(['off', 'gone'], AGENTS, difficulty, all)).toBeUndefined();
+      expect(chooseStageAgent([], AGENTS, difficulty, all)).toBeUndefined();
+    }
   });
 });
 
