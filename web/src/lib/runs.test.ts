@@ -3,10 +3,12 @@ import type { RunSummary } from '../../../src/api/types.js';
 import { setLang } from '../../../src/i18n.js';
 import type { AssessmentEntry, DiscussionEntry } from '../../../src/store/types.js';
 import {
+  assessmentDifficulty,
   assessmentHeadline,
   assessmentSize,
   attentionCount,
   canCleanUpWorkspace,
+  difficultyText,
   discussionItems,
   eventText,
   groupRuns,
@@ -409,6 +411,71 @@ describe('requirement assessment', () => {
     expect(JSON.stringify(english)).not.toMatch(/[一-鿿]/);
   });
 
+  it('shows the difficulty beside the size, with what it means', () => {
+    expect(difficultyText(undefined)).toBeNull();
+    expect(difficultyText('low')).toEqual({
+      label: '难度 low',
+      meaning: '局部的小改动，比如改一处文案、补测试',
+    });
+    expect(difficultyText('mid')).toEqual({ label: '难度 mid', meaning: '跨模块的行为改动' });
+    expect(difficultyText('high')).toEqual({
+      label: '难度 high',
+      meaning: '涉及核心的状态机、git 操作、数据库迁移，或者对正确性要求很高的改动',
+    });
+    setLang('en');
+    const english = (['low', 'mid', 'high'] as const).map((d) => difficultyText(d));
+    // The meanings the assessment judged by, starting with a capital as they stand alone.
+    expect(english).toEqual([
+      {
+        label: 'Difficulty low',
+        meaning: 'A small, local change, such as rewording some text or adding tests',
+      },
+      { label: 'Difficulty mid', meaning: 'A change of behavior across modules' },
+      {
+        label: 'Difficulty high',
+        meaning:
+          'Changes to a core state machine, git operations or database migrations, or work that has to be exactly right',
+      },
+    ]);
+    expect(JSON.stringify(english)).not.toMatch(/[一-鿿]/);
+  });
+
+  it('shows the difficulty candidates are picked by, none for a dropped requirement', () => {
+    const difficulty = (...discussion: DiscussionEntry[]) => assessmentDifficulty({ discussion });
+    expect(difficulty(assessed({ verdict: 'go', questions: [], difficulty: 'high' }))).toBe('high');
+    // A drop gave a difficulty, but nothing runs for a dropped requirement.
+    expect(difficulty(assessed({ verdict: 'drop', questions: [], difficulty: 'low' }))).toBe(
+      undefined,
+    );
+    expect(
+      difficulty(
+        assessed({ verdict: 'go', questions: [], difficulty: 'mid' }),
+        reply,
+        assessed({ verdict: 'drop', questions: [], difficulty: 'mid' }),
+      ),
+    ).toBeUndefined();
+    // Asking again after a go: the candidates are still picked by that go's difficulty.
+    expect(
+      difficulty(
+        assessed({ verdict: 'go', questions: [], difficulty: 'low' }),
+        reply,
+        assessed({}),
+      ),
+    ).toBe('low');
+    // A later go decides anew.
+    expect(
+      difficulty(
+        assessed({ verdict: 'go', questions: [], difficulty: 'low' }),
+        reply,
+        assessed({ verdict: 'go', questions: [], difficulty: 'high' }),
+      ),
+    ).toBe('high');
+    // An ask on its own decides nothing; no difficulty given, or no assessment at all.
+    expect(difficulty(assessed({ difficulty: 'high' }))).toBeUndefined();
+    expect(difficulty(assessed({ verdict: 'go', questions: [], size: 'M' }))).toBeUndefined();
+    expect(difficulty()).toBeUndefined();
+  });
+
   it('shows the size stages planning by size go by, none for a dropped requirement', () => {
     const size = (...discussion: DiscussionEntry[]) => assessmentSize({ discussion });
     expect(size(assessed({ verdict: 'go', questions: [], size: 'L' }))).toBe('L');
@@ -618,6 +685,59 @@ describe('a Run started over because its issue changed', () => {
       "The issue's title or body changed, so this Run, which worked from the old text, was terminated automatically; Run run_new started on the new one",
       "Run run_new redoes the changed issue from the start, so this Run's working directory and branch were removed automatically",
       "Run run_new redoes the changed issue from the start, but this Run's working directory and branch could not be removed automatically; clean them up by hand on the Workspaces page",
+    ]);
+    for (const text of texts) expect(text).not.toMatch(/[一-鿿]/);
+  });
+});
+
+describe('the agent a stage with agent_candidates picked', () => {
+  afterEach(() => setLang('zh'));
+  const selected = (data: Record<string, unknown>) => ({
+    type: 'agent.selected',
+    data: {
+      stageId: 'implement',
+      round: 1,
+      taskId: 'task_1',
+      agentId: 'coder',
+      difficulty: 'mid',
+      reason: 'fit',
+      candidates: ['cheap', 'coder', 'strong'],
+      ...data,
+    },
+  });
+  const all = [
+    selected({}),
+    selected({ agentId: 'strong', difficulty: 'high', reason: 'highest', round: 2 }),
+    selected({ agentId: 'cheap', difficulty: null, reason: 'first' }),
+    selected({ agentId: 'cheap', difficulty: null, reason: 'unavailable' }),
+  ];
+
+  it('says who it picked and why', () => {
+    expect(all.map((e) => eventText(e))).toEqual([
+      '阶段 implement 第 1 轮：按难度 mid，从候选（cheap、coder、strong）里选了 coder：档次够用、成本最低',
+      '阶段 implement 第 2 轮：按难度 high，候选（cheap、coder、strong）里没有档次够的，选了档次最高的 strong',
+      '阶段 implement 第 1 轮：需求评估没有给出难度，用候选（cheap、coder、strong）里第一个能用的 cheap',
+      '阶段 implement 第 1 轮：候选（cheap、coder、strong）都不能跑这个阶段，先交给第一个 cheap，之后按 on_agent_error 处理',
+    ]);
+  });
+
+  it('shows only the data when it is not of that shape', () => {
+    expect(eventText(selected({ reason: 'other' }))).toBeNull();
+    expect(eventText(selected({ candidates: 'coder' }))).toBeNull();
+    expect(eventText(selected({ agentId: undefined }))).toBeNull();
+    // Picked by difficulty, yet none recorded.
+    expect(eventText(selected({ difficulty: null }))).toBeNull();
+    expect(eventText(selected({ difficulty: 'huge', reason: 'highest' }))).toBeNull();
+  });
+
+  it('in English', () => {
+    setLang('en');
+    const texts = all.map((e) => eventText(e));
+    expect(texts).toEqual([
+      'Stage implement, round 1: by difficulty mid, coder was picked from the candidates (cheap, coder, strong) as the cheapest whose tier is enough',
+      'Stage implement, round 2: by difficulty high, none of the candidates (cheap, coder, strong) has a tier that high, so strong, the highest tier, was picked',
+      'Stage implement, round 1: the assessment gave no difficulty, so cheap, the first usable of the candidates (cheap, coder, strong), was picked',
+      'Stage implement, round 1: none of the candidates (cheap, coder, strong) can run this stage, so it goes to the first, cheap, and on_agent_error decides what follows',
     ]);
     for (const text of texts) expect(text).not.toMatch(/[一-鿿]/);
   });

@@ -4,11 +4,14 @@ import { t } from '../../../src/i18n.js';
 import {
   type AgentConfigState,
   assessInDoubt,
+  candidatesRuleText,
   FLOW_STATUS,
   type FlowProgress,
   type FlowStage,
+  type FlowStageAgent,
   planningText,
   reworkText,
+  tierCostText,
 } from '../lib/flow.js';
 import { Badge } from './ui.js';
 
@@ -113,17 +116,15 @@ function FlowStageBody({ stage, progress }: { stage: FlowStage; progress?: FlowP
           </span>
         </Line>
       )}
-      {stage.agent && (
-        <Line label="Agent">
-          {stage.agent.id}
-          <span className="flow-sub">
-            {stage.agent.config === 'ok'
-              ? `${stage.agent.model ?? t({ zh: '默认模型', en: 'default model' })} · ${
-                  stage.agent.effort ?? t({ zh: '默认 effort', en: 'default effort' })
-                }`
-              : agentConfigText(stage.agent.config)}
-          </span>
-        </Line>
+      {stage.byDifficulty ? (
+        <Candidates agents={stage.agents} />
+      ) : (
+        stage.agents.map((agent) => (
+          <Line key={agent.id} label="Agent">
+            {agent.id}
+            <span className="flow-sub">{agentModelText(agent)}</span>
+          </Line>
+        ))
       )}
       {!runsNoCommands(stage.kind) && (
         <Line label={t({ zh: '检查', en: 'Checks' })}>
@@ -208,6 +209,40 @@ function failLabel(): string {
 
 function backTo(stage: string): string {
   return t({ zh: `回到「${stage}」`, en: `Back to "${stage}"` });
+}
+
+/**
+ * The candidates of a stage with `agent_candidates`, in the template's order, each with its model,
+ * effort, tier and cost, and how a round picks one of them. Spans only: the stage body may be a
+ * button, which holds no lists.
+ */
+function Candidates({ agents }: { agents: FlowStageAgent[] }) {
+  return (
+    <span className="flow-line flow-line-block">
+      <span className="flow-label">{t({ zh: '候选 Agent', en: 'Agent candidates' })}</span>
+      <span className="flow-candidates">
+        {agents.map((agent) => {
+          const levels = tierCostText(agent);
+          return (
+            <span key={agent.id} className="flow-candidate">
+              <span>{agent.id}</span>
+              <span className="flow-sub">{agentModelText(agent)}</span>
+              {levels && <span className="flow-sub">{levels}</span>}
+            </span>
+          );
+        })}
+      </span>
+      <span className="flow-sub">{candidatesRuleText()}</span>
+    </span>
+  );
+}
+
+/** 「opus · xhigh」, or why the agent's configuration is not known. */
+function agentModelText(agent: FlowStageAgent): string {
+  if (agent.config !== 'ok') return agentConfigText(agent.config);
+  return `${agent.model ?? t({ zh: '默认模型', en: 'default model' })} · ${
+    agent.effort ?? t({ zh: '默认 effort', en: 'default effort' })
+  }`;
 }
 
 function agentConfigText(state: Exclude<AgentConfigState, 'ok'>): string {

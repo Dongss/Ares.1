@@ -57,6 +57,26 @@ export function sizeMeanings(): Record<ProposalSize, string> {
   });
 }
 
+/**
+ * What each difficulty means (`DIFFICULTIES`). The one definition the requirement assessment's
+ * prompt and the Run detail page both show. Lower case and without end punctuation, for callers
+ * to put in a list or a sentence.
+ */
+export function difficultyMeanings(): Record<Difficulty, string> {
+  return t({
+    zh: {
+      low: '局部的小改动，比如改一处文案、补测试',
+      mid: '跨模块的行为改动',
+      high: '涉及核心的状态机、git 操作、数据库迁移，或者对正确性要求很高的改动',
+    },
+    en: {
+      low: 'a small, local change, such as rewording some text or adding tests',
+      mid: 'a change of behavior across modules',
+      high: 'changes to a core state machine, git operations or database migrations, or work that has to be exactly right',
+    },
+  });
+}
+
 /** What auto-accept looks at in a proposal. */
 export interface ProposalKind {
   risk: Risk;

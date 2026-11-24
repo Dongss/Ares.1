@@ -1059,6 +1059,26 @@ button.flow-stage-body:hover:not(:disabled) {
 .flow-line-attention .flow-value {
   color: var(--attention);
 }
+/* A line whose label is too long for the label column: the label above, the value below. */
+.flow-line-block {
+  flex-direction: column;
+  gap: 2px;
+}
+.flow-line-block .flow-label {
+  width: auto;
+}
+.flow-candidates {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.flow-candidate {
+  display: flex;
+  flex-direction: column;
+  padding: 2px 0 2px 8px;
+  border-left: 2px solid var(--border);
+  overflow-wrap: anywhere;
+}
 .flow-command {
   padding: 0 4px;
   border-radius: 4px;

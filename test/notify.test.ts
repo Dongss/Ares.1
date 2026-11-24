@@ -927,8 +927,12 @@ describe('webhook notifications', () => {
     await h.waitStatus(ok.id, 'waiting_approval');
     engine.approve(ok.id);
     await h.waitStatus(ok.id, 'completed');
+    // Every notice is POSTed on its own, so two sent together may arrive in either order: each
+    // one is waited for before the next event, to check the order they were sent in.
+    await webhook.idle();
     // A failed Run, and a scout that failed the third time in a row (not the second).
     store.event(ok.id, 'run.status', { status: 'failed' });
+    await webhook.idle();
     store.event(null, 'scout.failed', scoutFailed(SCOUT_FAILURE_NOTIFY_AFTER - 1));
     store.event(null, 'scout.failed', scoutFailed(SCOUT_FAILURE_NOTIFY_AFTER));
     await webhook.idle();
@@ -953,6 +957,8 @@ describe('webhook notifications', () => {
     h.scripts.coder = () => ({ status: 'failed', error: '炸了' });
     const run = h.run(`修好 ${join(home, 'proj', 'a.ts')} 里的问题`, blockOnAgentError());
     await h.waitStatus(run.id, 'blocked');
+    // Sent on its own, so it arrives before the next one only once it is through.
+    await h.master.webhook.idle();
     // The Master's own node, under the home directory with a version manager, went missing.
     const node = join(home, '.nvm', 'versions', 'node', 'v24.0.0', 'bin', 'node');
     h.master.store.event(run.id, 'run.blocked', { kind: 'environment', missing: node });

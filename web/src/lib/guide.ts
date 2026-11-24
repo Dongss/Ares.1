@@ -487,6 +487,23 @@ export function cycleSteps(input: GuideInput, rule?: AutoAcceptRule): CycleStep[
   return [scoutStep, propose, accept, run, push, upgradeStep, rescout];
 }
 
+/**
+ * Who runs a stage, to start a sentence with: its one agent, or, for a stage with several
+ * `agent_candidates`, the one picked from them by difficulty; `none` when it names no agent.
+ */
+export function stageAgentText(
+  stage: Pick<FlowStage, 'agents' | 'byDifficulty'>,
+  none: string,
+): string {
+  const ids = stage.agents.map((a) => a.id);
+  if (ids.length === 0) return none;
+  if (!stage.byDifficulty || ids.length === 1) return join(ids);
+  return t({
+    zh: `按难度从 ${join(ids)} 中选出的 Agent`,
+    en: `The agent picked by difficulty from ${join(ids)}`,
+  });
+}
+
 /** The stages of a Run from an issue, as the Run step shows them; null without a flow. */
 export function runStages(
   input: Pick<GuideInput, 'flow' | 'github' | 'targetBranch'>,
@@ -505,7 +522,7 @@ export function runStages(
       };
     }
     if (s.kind === 'assess') {
-      const agent = s.agent?.id ?? noAgent;
+      const agent = stageAgentText(s, noAgent);
       const hours = s.replyTimeoutHours;
       const alone =
         hours === null
@@ -591,7 +608,7 @@ export function runStages(
             }),
       };
     }
-    const agent = s.agent?.id ?? noAgent;
+    const agent = stageAgentText(s, noAgent);
     const work =
       s.kind === 'review'
         ? t({
@@ -1081,7 +1098,7 @@ export function guardrails(input: GuideInput, working: boolean | undefined): Gua
             on: true,
             text: reviews
               .map((s) => {
-                const agent = s.agent?.id ?? t({ zh: '评审 Agent', en: 'The review agent' });
+                const agent = stageAgentText(s, t({ zh: '评审 Agent', en: 'The review agent' }));
                 return t({
                   zh: `${agent} 看每轮改动，有「必须修改」的问题就打回${
                     s.onFail ? `「${s.onFail.name}」` : ''

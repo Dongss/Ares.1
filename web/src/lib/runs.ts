@@ -1,12 +1,15 @@
 import type { RateLimitedWait, RunDetail, RunSummary } from '../../../src/api/types.js';
 import { brandTitle } from '../../../src/brand.js';
 import {
+  type AgentSelection,
+  difficultyMeanings,
   discussionReplyWait,
   RAW_LOG_KEEP_DAYS,
   runRawLogsExpired,
   sizeMeanings,
 } from '../../../src/config/flow.js';
 import {
+  assessedDifficulty,
   assessedSize,
   conclusionLabel,
   conclusionOf,
@@ -15,9 +18,11 @@ import {
   pendingTimeout,
   verdictLabel,
 } from '../../../src/engine/discussion.js';
-import { t } from '../../../src/i18n.js';
+import { join, t } from '../../../src/i18n.js';
 import {
   type AssessmentEntry,
+  DIFFICULTIES,
+  type Difficulty,
   type DiscussionEntry,
   type EventRow,
   FINISHED_RUN_STATUSES,
@@ -249,6 +254,33 @@ export function assessmentSize(run: Pick<Run, 'discussion'>): RequirementSize | 
 }
 
 /**
+ * The requirement's difficulty the Run detail shows beside the size: the one stages with
+ * `agent_candidates` pick their agent by (`assessedDifficulty`, the latest go round's), so the page
+ * tells why a round went to the agent it did. Undefined when the assessment concluded drop, even
+ * if that round gave a difficulty: nothing runs for a dropped requirement.
+ */
+export function assessmentDifficulty(run: Pick<Run, 'discussion'>): Difficulty | undefined {
+  if (conclusionOf(run.discussion)?.verdict === 'drop') return undefined;
+  return assessedDifficulty(run.discussion);
+}
+
+/**
+ * 「难度 mid」 and what the difficulty means (`difficultyMeanings`, the meanings the assessment
+ * judged by), shown beside the size; null without a difficulty (`assessmentDifficulty`).
+ */
+export function difficultyText(
+  difficulty: Difficulty | undefined,
+): { label: string; meaning: string } | null {
+  if (!difficulty) return null;
+  const meaning = difficultyMeanings()[difficulty];
+  // Shown on its own, so it starts with a capital in English.
+  return {
+    label: t({ zh: `难度 ${difficulty}`, en: `Difficulty ${difficulty}` }),
+    meaning: meaning.charAt(0).toUpperCase() + meaning.slice(1),
+  };
+}
+
+/**
  * 「规模 L」 and what the size means (`sizeMeanings`, the meanings the assessment sized by),
  * shown beside the assessment's conclusion; null without a size (`assessmentSize`).
  */
@@ -319,11 +351,69 @@ export function rawLogPrunedText(
   });
 }
 
+const SELECTION_REASONS: readonly AgentSelection['reason'][] = [
+  'first',
+  'fit',
+  'highest',
+  'unavailable',
+];
+
+/**
+ * 「阶段 implement 第 1 轮：按难度 mid，从候选（a、b、c）里选了 b……」: who a round of a stage with
+ * `agent_candidates` went to and why (`agent.selected`, `AgentSelection`); null when the data is
+ * not of that shape.
+ */
+function agentSelectedText(data: EventRow['data']): string | null {
+  const { stageId, round, agentId, difficulty, reason, candidates } = data;
+  const why = SELECTION_REASONS.find((r) => r === reason);
+  if (
+    typeof stageId !== 'string' ||
+    typeof round !== 'number' ||
+    typeof agentId !== 'string' ||
+    !why ||
+    !Array.isArray(candidates) ||
+    !candidates.every((c) => typeof c === 'string')
+  ) {
+    return null;
+  }
+  const level = DIFFICULTIES.find((d) => d === difficulty);
+  const list = join(candidates);
+  const where = t({
+    zh: `阶段 ${stageId} 第 ${round} 轮：`,
+    en: `Stage ${stageId}, round ${round}: `,
+  });
+  switch (why) {
+    case 'fit':
+      if (!level) return null;
+      return `${where}${t({
+        zh: `按难度 ${level}，从候选（${list}）里选了 ${agentId}：档次够用、成本最低`,
+        en: `by difficulty ${level}, ${agentId} was picked from the candidates (${list}) as the cheapest whose tier is enough`,
+      })}`;
+    case 'highest':
+      if (!level) return null;
+      return `${where}${t({
+        zh: `按难度 ${level}，候选（${list}）里没有档次够的，选了档次最高的 ${agentId}`,
+        en: `by difficulty ${level}, none of the candidates (${list}) has a tier that high, so ${agentId}, the highest tier, was picked`,
+      })}`;
+    case 'first':
+      return `${where}${t({
+        zh: `需求评估没有给出难度，用候选（${list}）里第一个能用的 ${agentId}`,
+        en: `the assessment gave no difficulty, so ${agentId}, the first usable of the candidates (${list}), was picked`,
+      })}`;
+    case 'unavailable':
+      return `${where}${t({
+        zh: `候选（${list}）都不能跑这个阶段，先交给第一个 ${agentId}，之后按 on_agent_error 处理`,
+        en: `none of the candidates (${list}) can run this stage, so it goes to the first, ${agentId}, and on_agent_error decides what follows`,
+      })}`;
+  }
+}
+
 /**
  * The event in words, for the events list, from its structured data; null for events that only
  * show their data.
  */
 export function eventText(event: Pick<EventRow, 'type' | 'data'>, now = new Date()): string | null {
+  if (event.type === 'agent.selected') return agentSelectedText(event.data);
   if (event.type === 'task.rate_limited') {
     const { agentId, retryAt } = event.data;
     if (typeof agentId === 'string' && typeof retryAt === 'string') {

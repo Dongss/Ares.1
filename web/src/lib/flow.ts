@@ -7,6 +7,7 @@ import {
   rollbackTarget,
   runsAgent,
   runsNoCommands,
+  stageAgentIds,
   stageVerifyCommands,
 } from '../../../src/config/flow.js';
 import type {
@@ -29,19 +30,33 @@ export interface FlowStageRef {
   name: string;
 }
 
+/** One agent a stage may run with, as its configuration has it. */
+export interface FlowStageAgent {
+  id: string;
+  /** null when the agent's configuration is not known (`config` other than `ok`). */
+  model: string | null;
+  effort: string | null;
+  tier: AgentConfig['tier'] | null;
+  cost: AgentConfig['cost'] | null;
+  /**
+   * Whether the agent configuration is known: `ok` found and enabled, `missing` not configured
+   * or disabled; `loading` / `error` while the configuration is not (yet) available.
+   */
+  config: AgentConfigState;
+}
+
 export interface FlowStage extends FlowStageRef {
   kind: StageDef['kind'];
-  /** Who runs the stage; null where no agent runs (merge, placeholder and command stages). */
-  agent: {
-    id: string;
-    model: string | null;
-    effort: string | null;
-    /**
-     * Whether the agent configuration is known: `ok` found and enabled, `missing` not configured
-     * or disabled; `loading` / `error` while the configuration is not (yet) available.
-     */
-    config: AgentConfigState;
-  } | null;
+  /**
+   * Who may run the stage, in the template's order (`stageAgentIds`): its `agent_candidates`, or
+   * its one `agent`. Empty where no agent runs (merge, placeholder and command stages).
+   */
+  agents: FlowStageAgent[];
+  /**
+   * The stage has `agent_candidates`: each round goes to the one `chooseStageAgent` picks by the
+   * requirement's assessed difficulty (`candidatesRuleText`).
+   */
+  byDifficulty: boolean;
   /**
    * Verify commands the stage runs (none for review, assess and placeholder stages); null when
    * they are the repo default but no repo is given (`repoVerifyCommands: null`).
@@ -88,7 +103,26 @@ export interface FlowInput {
   agents: FlowAgent[] | 'loading' | 'error';
 }
 
-type FlowAgent = Pick<AgentConfig, 'id' | 'model' | 'effort' | 'args'> & { enabled?: boolean };
+type FlowAgent = Pick<AgentConfig, 'id' | 'model' | 'effort' | 'args' | 'tier' | 'cost'> & {
+  enabled?: boolean;
+};
+
+/** One candidate of a stage, as the configuration (`agents`) has it. */
+function flowStageAgent(id: string, agents: FlowInput['agents']): FlowStageAgent {
+  if (!Array.isArray(agents)) {
+    return { id, model: null, effort: null, tier: null, cost: null, config: agents };
+  }
+  const agent = agents.find((a) => a.id === id && a.enabled !== false);
+  if (!agent) return { id, model: null, effort: null, tier: null, cost: null, config: 'missing' };
+  return {
+    id,
+    model: agent.model ?? null,
+    effort: agentEffort(agent) ?? null,
+    tier: agent.tier,
+    cost: agent.cost,
+    config: 'ok',
+  };
+}
 
 export function buildFlow({
   template,
@@ -102,10 +136,7 @@ export function buildFlow({
   });
   return template.stages.map((def) => {
     const eff = effectiveStage(template, def.id, overrides);
-    const known = Array.isArray(agents);
-    const agentConfig = known
-      ? agents.find((a) => a.id === def.agent && a.enabled !== false)
-      : undefined;
+    const runs = runsAgent(def.kind);
     const usesRepoDefault = !runsNoCommands(def.kind) && def.verify?.commands === undefined;
     const commands =
       usesRepoDefault && repoVerifyCommands === null
@@ -122,15 +153,8 @@ export function buildFlow({
       id: def.id,
       name: def.name ?? def.id,
       kind: def.kind,
-      agent:
-        !runsAgent(def.kind) || !def.agent
-          ? null
-          : {
-              id: def.agent,
-              model: agentConfig?.model ?? null,
-              effort: agentConfig ? (agentEffort(agentConfig) ?? null) : null,
-              config: !known ? agents : agentConfig ? 'ok' : 'missing',
-            },
+      agents: runs ? stageAgentIds(def).map((id) => flowStageAgent(id, agents)) : [],
+      byDifficulty: runs && def.agent_candidates !== undefined,
       commands,
       commandsFromRepo: usesRepoDefault,
       planning: def.kind === 'agent' ? def.planning : null,
@@ -192,6 +216,26 @@ export function planningText(planning: StageDef['planning'] | null): string | nu
     });
   }
   return null;
+}
+
+/**
+ * How a stage with `agent_candidates` picks the agent of a round, as `chooseStageAgent` does in
+ * the engine.
+ */
+export function candidatesRuleText(): string {
+  return t({
+    zh: '按需求评估给出的难度，挑档次够用、成本最低的；没有够档次的就挑档次最高的；没有难度时用第一个',
+    en: 'By the difficulty the assessment gave: the cheapest whose tier is enough, else the highest tier; the first one when there is no difficulty',
+  });
+}
+
+/** 「档次 high · 成本 mid」: an agent's tier and cost as agents.yaml gives them. */
+export function tierCostText(agent: Pick<FlowStageAgent, 'tier' | 'cost'>): string | null {
+  if (agent.tier === null || agent.cost === null) return null;
+  return t({
+    zh: `档次 ${agent.tier} · 成本 ${agent.cost}`,
+    en: `tier ${agent.tier} · cost ${agent.cost}`,
+  });
 }
 
 /**

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { Fragment, useEffect, useState } from 'react';
 import { isCostUnknown } from '../../../src/api/cost.js';
 import type { ConfigView, RunDetail } from '../../../src/api/types.js';
 import { effectiveBudget, REDO_BACKOFF_MAX_HOURS } from '../../../src/config/flow.js';
@@ -44,9 +44,11 @@ import {
 import { useAction, useReloadOn, useResource, useTick } from '../lib/hooks.js';
 import { autoPlanText, roundTasks, stepLabel, stepsDoneText, taskTitle } from '../lib/plan.js';
 import {
+  assessmentDifficulty,
   assessmentHeadline,
   assessmentSize,
   canCleanUpWorkspace,
+  difficultyText,
   discussionItems,
   eventText,
   ignoredCommentsText,
@@ -656,18 +658,21 @@ function AssessmentCard({ detail }: { detail: RunDetail }) {
   const headline = assessmentHeadline(run);
   if (!headline) return null;
   const { conclusion } = headline;
-  const size = sizeText(assessmentSize(run));
+  const levels = [sizeText(assessmentSize(run)), difficultyText(assessmentDifficulty(run))];
   const items = discussionItems(run.discussion);
   return (
     <section className="card assessment">
       <div className="stage-head">
         <h2>{t({ zh: '需求评估', en: 'Requirement assessment' })}</h2>
         <Badge tone={headline.tone}>{headline.label}</Badge>
-        {size && (
-          <>
-            <Badge tone="muted">{size.label}</Badge>
-            <span className="muted">{size.meaning}</span>
-          </>
+        {levels.map(
+          (level) =>
+            level && (
+              <Fragment key={level.label}>
+                <Badge tone="muted">{level.label}</Badge>
+                <span className="muted">{level.meaning}</span>
+              </Fragment>
+            ),
         )}
       </div>
       {conclusion && <div className="assessment-summary">{conclusion.summary}</div>}

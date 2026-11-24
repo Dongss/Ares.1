@@ -424,6 +424,44 @@ describe('the Run stages', () => {
     );
   });
 
+  it('says an agent is picked by difficulty from the candidates of a stage', () => {
+    const withCandidates = TemplateSchema.parse({
+      ...template,
+      stages: [
+        { id: 'assess', name: '需求评估', kind: 'assess', agent_candidates: ['claude-reviewer'] },
+        ...template.stages.map((s) =>
+          s.id === 'implement'
+            ? { ...s, agent: undefined, agent_candidates: ['cheap-coder', 'claude-coder'] }
+            : s.id === 'review'
+              ? { ...s, agent: undefined, agent_candidates: ['claude-reviewer', 'cheap-coder'] }
+              : s,
+        ),
+      ],
+    });
+    const cfg = { ...config, templates: [withCandidates] } as typeof config;
+    const i = { ...input(manualRepo), flow: issueFlow(cfg, manualRepo, ['npm test']) };
+    const notes = runStages(i)?.map((s) => s.note);
+    // One candidate: it is the one, with nothing to pick from.
+    expect(notes?.[0]).toMatch(/^claude-reviewer 只读评估需求/);
+    expect(notes?.[1]).toBe(
+      '按难度从 cheap-coder、claude-coder 中选出的 Agent 执行，检查命令通过才算完成',
+    );
+    expect(notes?.[2]).toBe(
+      '按难度从 claude-reviewer、cheap-coder 中选出的 Agent 评审，有必须修改的问题就打回「编码」',
+    );
+    expect(guardrails(i, true).find((g) => g.title === 'AI 评审')?.text).toBe(
+      '按难度从 claude-reviewer、cheap-coder 中选出的 Agent 看每轮改动，有「必须修改」的问题就打回「编码」',
+    );
+    setLang('en');
+    const english = runStages(i)?.map((s) => s.note);
+    expect(english?.[1]).toBe(
+      'The agent picked by difficulty from cheap-coder, claude-coder does the work; it is done only when the checks pass',
+    );
+    expect(guardrails(i, true).find((g) => g.title === 'AI review')?.text).toBe(
+      'The agent picked by difficulty from claude-reviewer, cheap-coder looks at every round of changes and sends back anything that must change to "编码"',
+    );
+  });
+
   it('merges without approval with auto_merge, as the Master creates those Runs', () => {
     const merge = runStages(input(autoRepo))?.find((s) => s.id === 'merge');
     expect(merge).toEqual({

@@ -1,12 +1,13 @@
 import { brandName } from '../brand.js';
-import { PROPOSAL_SIZES, sizeMeanings } from '../config/flow.js';
+import { difficultyMeanings, PROPOSAL_SIZES, sizeMeanings } from '../config/flow.js';
 import type { AgentConfig, StageDef } from '../config/schema.js';
 import { join, t } from '../i18n.js';
-import type {
-  AssessmentEntry,
-  DiscussionEntry,
-  FailedAttempt,
-  ReplyTimeoutEntry,
+import {
+  type AssessmentEntry,
+  DIFFICULTIES,
+  type DiscussionEntry,
+  type FailedAttempt,
+  type ReplyTimeoutEntry,
 } from '../store/types.js';
 import { MAX_PLAN_TASKS } from './contracts.js';
 import {
@@ -728,20 +729,21 @@ function sizeRule(): string {
 
 /**
  * How an assessment that goes ahead judges the requirement's difficulty (`difficulty`,
- * `DIFFICULTIES`): the stages with `agent_candidates` pick the cheapest candidate whose tier is
- * at least that.
+ * `DIFFICULTIES`), with the meanings the Run detail page shows too (`difficultyMeanings`): the
+ * stages with `agent_candidates` pick the cheapest candidate whose tier is at least that.
  */
 function difficultyRule(): string {
-  return t({
-    zh: `verdict 为 go 时还要给出 difficulty，估计需求的难度，只能是 low、mid、high 三者之一。后面的阶段按难度从候选 Agent 里挑档次够用、费用最低的一个：估低了可能做不好，估高了会多花钱。
-- low：局部的小改动，比如改一处文案、补测试；
-- mid：跨模块的行为改动；
-- high：涉及核心的状态机、git 操作、数据库迁移，或者对正确性要求很高的改动。`,
-    en: `With verdict go, also give difficulty, how hard you judge the requirement, as one of low, mid and high. Later stages go by it to pick, among their candidate agents, the cheapest one capable enough: too low and the work may not be done well, too high and it costs more than it needs to.
-- low: a small, local change, such as rewording some text or adding tests;
-- mid: a change of behavior across modules;
-- high: changes to a core state machine, git operations or database migrations, or work that has to be exactly right.`,
+  const meanings = difficultyMeanings();
+  const last = DIFFICULTIES.length - 1;
+  const items = DIFFICULTIES.map((level, i) => {
+    const end = i === last ? t({ zh: '。', en: '.' }) : t({ zh: '；', en: ';' });
+    return `- ${level}${t({ zh: '：', en: ': ' })}${meanings[level]}${end}`;
   });
+  const head = t({
+    zh: 'verdict 为 go 时还要给出 difficulty，估计需求的难度，只能是 low、mid、high 三者之一。后面的阶段按难度从候选 Agent 里挑档次够用、费用最低的一个：估低了可能做不好，估高了会多花钱。',
+    en: 'With verdict go, also give difficulty, how hard you judge the requirement, as one of low, mid and high. Later stages go by it to pick, among their candidate agents, the cheapest one capable enough: too low and the work may not be done well, too high and it costs more than it needs to.',
+  });
+  return [head, ...items].join('\n');
 }
 
 /**

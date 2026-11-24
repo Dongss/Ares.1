@@ -3,12 +3,15 @@ import { TemplateSchema } from '../../../src/config/schema.js';
 import { setLang } from '../../../src/i18n.js';
 import type { StageRun } from '../../../src/store/types.js';
 import {
+  type AgentConfigState,
   assessInDoubt,
   buildFlow,
+  candidatesRuleText,
   FLOW_STATUS,
   planningText,
   reworkText,
   stageProgress,
+  tierCostText,
 } from './flow.js';
 
 const template = TemplateSchema.parse({
@@ -22,52 +25,64 @@ const template = TemplateSchema.parse({
   ],
 });
 
+type Level = 'low' | 'mid' | 'high';
+
+/** A configured agent, tier and cost mid unless given. */
+const agent = (
+  id: string,
+  model: string,
+  extra: { effort?: 'high'; args?: string[]; tier?: Level; cost?: Level; enabled?: boolean } = {},
+) => ({ id, model, args: [] as string[], tier: 'mid' as Level, cost: 'mid' as Level, ...extra });
+
 const agents = [
-  { id: 'planner', model: 'opus', effort: 'high' as const, args: [] },
-  { id: 'coder', model: 'sonnet', args: ['--effort', 'xhigh'] },
-  { id: 'reviewer', model: 'opus', args: [] },
+  agent('planner', 'opus', { effort: 'high', tier: 'high', cost: 'high' }),
+  agent('coder', 'sonnet', { args: ['--effort', 'xhigh'] }),
+  agent('reviewer', 'opus'),
 ];
+
+/** What the flow shows of an agent whose configuration is not known. */
+const unknown = (id: string, config: AgentConfigState) => ({
+  id,
+  model: null,
+  effort: null,
+  tier: null,
+  cost: null,
+  config,
+});
 
 describe('buildFlow', () => {
   const flow = buildFlow({ template, repoVerifyCommands: ['npm run lint'], agents });
   const stage = (id: string) => flow.find((s) => s.id === id);
 
-  it('lists the stages in template order with their agent, model and effort', () => {
+  it('lists the stages in template order with their agent, model, effort, tier and cost', () => {
     expect(flow.map((s) => s.name)).toEqual(['设计', '编码', '评审', '合并']);
-    expect(stage('design')?.agent).toEqual({
-      id: 'planner',
-      model: 'opus',
-      effort: 'high',
-      config: 'ok',
-    });
-    expect(stage('code')?.agent).toEqual({
-      id: 'coder',
-      model: 'sonnet',
-      effort: 'xhigh',
-      config: 'ok',
-    });
-    expect(stage('review')?.agent).toEqual({
-      id: 'reviewer',
-      model: 'opus',
-      effort: null,
-      config: 'ok',
-    });
-    expect(stage('merge')?.agent).toBeNull();
+    expect(stage('design')?.agents).toEqual([
+      { id: 'planner', model: 'opus', effort: 'high', tier: 'high', cost: 'high', config: 'ok' },
+    ]);
+    expect(stage('code')?.agents).toEqual([
+      { id: 'coder', model: 'sonnet', effort: 'xhigh', tier: 'mid', cost: 'mid', config: 'ok' },
+    ]);
+    expect(stage('review')?.agents).toEqual([
+      { id: 'reviewer', model: 'opus', effort: null, tier: 'mid', cost: 'mid', config: 'ok' },
+    ]);
+    expect(stage('merge')?.agents).toEqual([]);
+    // One agent each: none of them picks by difficulty.
+    expect(flow.map((s) => s.byDifficulty)).toEqual([false, false, false, false]);
   });
 
   it('shows an agent missing from the configuration or disabled without model', () => {
     const [first] = buildFlow({ template, repoVerifyCommands: [], agents: [] });
-    expect(first?.agent).toEqual({ id: 'planner', model: null, effort: null, config: 'missing' });
-    const disabled = [{ ...agents[0], id: 'planner', model: 'opus', args: [], enabled: false }];
+    expect(first?.agents).toEqual([unknown('planner', 'missing')]);
+    const disabled = [agent('planner', 'opus', { enabled: false })];
     const [off] = buildFlow({ template, repoVerifyCommands: [], agents: disabled });
-    expect(off?.agent?.config).toBe('missing');
+    expect(off?.agents).toEqual([unknown('planner', 'missing')]);
   });
 
   it('tells a configuration still loading or failed to load apart from a missing agent', () => {
     for (const state of ['loading', 'error'] as const) {
       const [first, , , merge] = buildFlow({ template, repoVerifyCommands: [], agents: state });
-      expect(first?.agent).toEqual({ id: 'planner', model: null, effort: null, config: state });
-      expect(merge?.agent).toBeNull();
+      expect(first?.agents).toEqual([unknown('planner', state)]);
+      expect(merge?.agents).toEqual([]);
     }
   });
 
@@ -217,6 +232,79 @@ describe('buildFlow', () => {
   });
 });
 
+describe('stages with agent_candidates', () => {
+  afterEach(() => setLang('zh'));
+
+  const withCandidates = TemplateSchema.parse({
+    id: 'by-difficulty',
+    stages: [
+      { id: 'assess', kind: 'assess', agent_candidates: ['reviewer', 'planner'] },
+      { id: 'code', agent_candidates: ['cheap', 'coder', 'planner'] },
+      { id: 'review', kind: 'review', agent_candidates: ['reviewer'] },
+      { id: 'merge', kind: 'merge' },
+    ],
+  });
+  const all = [...agents, agent('cheap', 'haiku', { tier: 'low', cost: 'low' })];
+
+  it('lists the candidates in the template order, with model, effort, tier and cost', () => {
+    const flow = buildFlow({ template: withCandidates, repoVerifyCommands: [], agents: all });
+    expect(flow.map((s) => s.agents.map((a) => a.id))).toEqual([
+      ['reviewer', 'planner'],
+      ['cheap', 'coder', 'planner'],
+      ['reviewer'],
+      [],
+    ]);
+    // Even one candidate picks by difficulty: there is nothing else to pick.
+    expect(flow.map((s) => s.byDifficulty)).toEqual([true, true, true, false]);
+    expect(flow[1]?.agents).toEqual([
+      { id: 'cheap', model: 'haiku', effort: null, tier: 'low', cost: 'low', config: 'ok' },
+      { id: 'coder', model: 'sonnet', effort: 'xhigh', tier: 'mid', cost: 'mid', config: 'ok' },
+      { id: 'planner', model: 'opus', effort: 'high', tier: 'high', cost: 'high', config: 'ok' },
+    ]);
+  });
+
+  it('marks each candidate missing or disabled on its own', () => {
+    const some = [
+      agent('coder', 'sonnet'),
+      agent('planner', 'opus', { tier: 'high', enabled: false }),
+    ];
+    const [, code] = buildFlow({ template: withCandidates, repoVerifyCommands: [], agents: some });
+    expect(code?.agents.map((a) => [a.id, a.config])).toEqual([
+      ['cheap', 'missing'],
+      ['coder', 'ok'],
+      ['planner', 'missing'],
+    ]);
+    expect(code?.agents[2]).toEqual(unknown('planner', 'missing'));
+  });
+
+  it('shows every candidate loading or failed to load with the configuration', () => {
+    for (const state of ['loading', 'error'] as const) {
+      const [, code] = buildFlow({
+        template: withCandidates,
+        repoVerifyCommands: [],
+        agents: state,
+      });
+      expect(code?.agents).toEqual(['cheap', 'coder', 'planner'].map((id) => unknown(id, state)));
+    }
+  });
+
+  it('says how a round picks among them, and each tier and cost', () => {
+    expect(candidatesRuleText()).toBe(
+      '按需求评估给出的难度，挑档次够用、成本最低的；没有够档次的就挑档次最高的；没有难度时用第一个',
+    );
+    expect(tierCostText({ tier: 'high', cost: 'low' })).toBe('档次 high · 成本 low');
+    expect(tierCostText(unknown('x', 'missing'))).toBeNull();
+    setLang('en');
+    expect(candidatesRuleText()).toBe(
+      'By the difficulty the assessment gave: the cheapest whose tier is enough, else the highest tier; the first one when there is no difficulty',
+    );
+    expect(tierCostText({ tier: 'mid', cost: 'high' })).toBe('tier mid · cost high');
+    expect(`${candidatesRuleText()}${tierCostText({ tier: 'mid', cost: 'mid' })}`).not.toMatch(
+      /[一-鿿]/,
+    );
+  });
+});
+
 describe('stageProgress', () => {
   const sr = (id: string, stageId: string, round: number, status: StageRun['status']) =>
     ({ id, stageId, round, status }) as StageRun;
@@ -281,7 +369,8 @@ describe('placeholder stages', () => {
     });
     expect(flow[1]).toMatchObject({
       kind: 'placeholder',
-      agent: null,
+      agents: [],
+      byDifficulty: false,
       commands: [],
       commandsFromRepo: false,
       onFail: null,
@@ -315,7 +404,8 @@ describe('command stages', () => {
     const [, , e2e] = buildFlow({ template, repoVerifyCommands: ['npm test'], agents });
     expect(e2e).toMatchObject({
       kind: 'command',
-      agent: null,
+      agents: [],
+      byDifficulty: false,
       commands: ['npx playwright test'],
       commandsFromRepo: false,
       onFail: { id: 'code', name: '编码' },
@@ -363,7 +453,7 @@ describe('assess stages', () => {
     const flow = buildFlow({ template: withAssess, repoVerifyCommands: ['npm test'], agents });
     expect(flow[0]).toMatchObject({
       kind: 'assess',
-      agent: { id: 'reviewer', model: 'opus', config: 'ok' },
+      agents: [{ id: 'reviewer', model: 'opus', config: 'ok' }],
       commands: [],
       commandsFromRepo: false,
       onFail: null,
