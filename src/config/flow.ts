@@ -1,10 +1,11 @@
 // How a workflow template flows: effective stage settings, budgets, verify commands, rollback
-// targets and which stage rounds are split into tasks; also the overrides of Runs from issues,
-// which proposals are accepted automatically, how long the automatic scout backs off and which
-// Runs it waits for, after how many failed scouts in a row a human is notified, how long a failed
-// Run of an issue waits before it is redone, how long a Run or a scout waits for an agent that is
-// out of quota or rate-limited, how long the raw output of agents is kept, and which worktrees of
-// failed or cancelled Runs of issues are left over for the Master to remove.
+// targets, which stage rounds are split into tasks and whether a template can split an L
+// requirement at all; also the overrides of Runs from issues, which proposals are accepted
+// automatically, how long the automatic scout backs off and which Runs it waits for, after how
+// many failed scouts in a row a human is notified, how long a failed Run of an issue waits before
+// it is redone, how long a Run or a scout waits for an agent that is out of quota or rate-limited,
+// how long the raw output of agents is kept, and which worktrees of failed or cancelled Runs of
+// issues are left over for the Master to remove.
 // Pure logic (type imports, src/i18n.ts, src/store/types.ts and src/engine/discussion.ts only),
 // so the dashboard shows the same rules the engine applies.
 
@@ -278,6 +279,16 @@ export function plansStage(
 ): boolean {
   if (def.kind !== 'agent') return false;
   return def.planning === 'llm' || (def.planning === 'auto' && size === 'L');
+}
+
+/**
+ * Whether the template can split an L requirement into steps done one after another in one Run:
+ * some agent stage plans (`planning: auto` or `llm`, so `plansStage` splits it for an L). Without
+ * one, an L requirement goes to one Run as a whole. The config warning about auto-accepting L and
+ * the scout's prompt both go by it.
+ */
+export function templateSplits(template: Pick<WorkflowTemplate, 'stages'>): boolean {
+  return template.stages.some((s) => plansStage(s, 'L'));
 }
 
 /**

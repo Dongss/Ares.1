@@ -91,7 +91,7 @@ Master 第一次访问仓库时会自动创建这些标签：
 
 AI 侦察、自动采纳、自动合并、推送和每日预算的设置写在 `config.yaml` 的注释里；[`docs/examples/config.yaml`](examples/config.yaml) 有登记了多个仓库、各用不同设置的完整示例。
 
-自动采纳（`auto_accept`）按侦察给提案标的风险和大小决定采纳哪些：风险不超过 `max_risk`（`none` / `low` / `mid` / `high`，默认 `none`）、大小也不超过 `max_size`（`S` / `M` / `L`，默认 `L`）的提案，Master 不等人，直接加上 `ares1:ready` 和 `ares1:auto`。`max_risk` 为 `none` 时不自动采纳任何提案，不管 `max_size` 是什么。`max_size` 默认是 `L`，因为编码阶段设了 `planning: auto` 或 `llm` 的模板（默认的 self-dev 就是）会先把 L 的需求拆成几步，在一个 Run 里一步一步做完；想让大需求先经过人，就设成 `M`。`max_per_day` 限制每天最多自动采纳几条，不写就不限。每轮检查时，还在等人的提案落在采纳范围内的（比如刚放宽了设置），也会被自动采纳。
+自动采纳（`auto_accept`）按侦察给提案标的风险和大小决定采纳哪些：风险不超过 `max_risk`（`none` / `low` / `mid` / `high`，默认 `none`）、大小也不超过 `max_size`（`S` / `M` / `L`，默认 `L`）的提案，Master 不等人，直接加上 `ares1:ready` 和 `ares1:auto`。`max_risk` 为 `none` 时不自动采纳任何提案，不管 `max_size` 是什么。`max_size` 默认是 `L`，因为编码阶段设了 `planning: auto` 或 `llm` 的模板（默认的 self-dev 就是）会先把 L 的需求拆成几步，在一个 Run 里一步一步做完；想让大需求先经过人，就设成 `M`。开了自动采纳、`max_size` 是 `L`（包括不写），而仓库用的模板里没有一个 Agent 阶段是 `planning: auto` 或 `llm` 时，L 的需求会整个交给一个 Run 一次做完，容易超时或返工，看板「配置」页会在 `config.yaml` 的警告里写明是哪个仓库、哪个模板，建议给编码阶段设 `planning: auto`，或把 `max_size` 调成 `M`。这只是提醒，仓库照常工作；模板不存在时那里已经报错，不再另外提醒。`max_per_day` 限制每天最多自动采纳几条，不写就不限。每轮检查时，还在等人的提案落在采纳范围内的（比如刚放宽了设置），也会被自动采纳。
 
 流程里有需求评估阶段（`kind: assess`）时，评估有疑问会在 issue 上提问，等你在 issue 下（或 Run 详情页）回复，回复后带着讨论重新评估。为了没人在场时系统也不停转，等待有上限，由评估阶段的 `reply_timeout_hours` 决定：
 

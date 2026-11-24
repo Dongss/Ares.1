@@ -42,7 +42,10 @@ export function templateCards(view: ConfigView): {
   return { valid, invalid };
 }
 
-/** Warnings about config.yaml itself, e.g. unknown keys that were ignored. */
+/**
+ * Warnings about config.yaml itself, e.g. unknown keys that were ignored, or a repo that
+ * auto-accepts size L with a template that cannot split it.
+ */
 export function configFileWarnings(view: ConfigView): string[] {
   return view.warnings['config.yaml'] ?? [];
 }

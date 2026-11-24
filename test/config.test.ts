@@ -19,8 +19,15 @@ import {
   scoutFailureStreak,
   scoutLimitWait,
   splitUnfinishedRuns,
+  templateSplits,
 } from '../src/config/flow.js';
-import { ConfigError, homePaths, initHome, loadConfig } from '../src/config/load.js';
+import {
+  ConfigError,
+  githubConfigKey,
+  homePaths,
+  initHome,
+  loadConfig,
+} from '../src/config/load.js';
 import {
   agentEffort,
   defaultRollbackTarget,
@@ -298,6 +305,85 @@ upgrade: { auto: true }
     expect(scout({}).data?.scout?.interval_minutes).toBe(0);
     expect(scout({ interval_minutes: 7.5 }).data?.scout?.interval_minutes).toBe(7.5);
     expect(scout({ interval_minutes: -1 }).success).toBe(false);
+  });
+
+  describe('auto-accepting size L with a template that cannot split it', () => {
+    /** A template doing the coding in one go, whatever the size. */
+    const WHOLE = `id: whole
+stages:
+  - { id: implement, agent: claude-coder }
+  - { id: review, kind: review, agent: claude-reviewer }
+  - { id: merge, kind: merge }
+`;
+    const LLM = WHOLE.replace('id: whole', 'id: llm').replace(
+      'agent: claude-coder }',
+      'agent: claude-coder, planning: llm }',
+    );
+    function load(repo: string, extra = '') {
+      const paths = home();
+      writeFile(join(paths.workflowsDir, 'whole.yaml'), WHOLE);
+      writeFile(join(paths.workflowsDir, 'llm.yaml'), LLM);
+      writeFile(paths.configFile, `${extra}github:\n  repos:\n    app: ${repo}\n`);
+      return loadConfig(paths, ['claude-code'], ['claude-code']);
+    }
+    const WARNING =
+      '仓库 app 会自动采纳大小为 L 的提案（auto_accept.max_size: L），但它用的模板 whole 没有 planning: auto 或 llm 的 Agent 阶段：L 的需求会整个交给一个 Run 一次做完，容易超时或返工。建议编码阶段用 planning: auto，或者把 max_size 调成 M，让 L 的提案留给人';
+
+    it('warns when auto-accept takes L, max_size by default or written', () => {
+      for (const accept of ['{ max_risk: low }', '{ max_risk: high, max_size: L }']) {
+        const cfg = load(`{ template: whole, auto_accept: ${accept} }`);
+        expect(cfg.warnings, accept).toEqual({ 'config.yaml': [WARNING] });
+        // Only a warning: the repo and its template keep working.
+        expect(cfg.errors, accept).toEqual({});
+        expect(cfg.templates.has('whole')).toBe(true);
+        expect(cfg.master.github?.repos.app?.auto_accept.max_size).toBe('L');
+      }
+    });
+
+    it('joins the warnings about unknown keys instead of replacing them', () => {
+      const cfg = load('{ template: whole, auto_accept: { max_risk: mid } }', 'upgarde: {}\n');
+      expect(cfg.warnings['config.yaml']).toEqual([
+        expect.stringMatching(/^未知的配置项 upgarde，已忽略/),
+        WARNING,
+      ]);
+    });
+
+    it('does not warn with a template that splits, or when auto-accept leaves L to a human', () => {
+      for (const repo of [
+        // The default self-dev template plans its coding stage (planning: auto).
+        '{ template: self-dev, auto_accept: { max_risk: high } }',
+        '{ template: llm, auto_accept: { max_risk: high } }',
+        '{ template: whole, auto_accept: { max_risk: high, max_size: M } }',
+        '{ template: whole, auto_accept: { max_risk: low, max_size: S } }',
+        '{ template: whole, auto_accept: { max_risk: none } }',
+        '{ template: whole }',
+      ]) {
+        const cfg = load(repo);
+        expect(cfg.warnings, repo).toEqual({});
+        expect(cfg.errors, repo).toEqual({});
+      }
+    });
+
+    it('a missing template gets only its error', () => {
+      const cfg = load('{ template: nope, auto_accept: { max_risk: high } }');
+      expect(cfg.warnings).toEqual({});
+      expect(cfg.errors).toEqual({ [githubConfigKey('app')]: ['模板 nope 不存在或无效'] });
+    });
+
+    it('warns in English when config.yaml says so', () => {
+      try {
+        const cfg = load('{ template: whole, auto_accept: { max_risk: low } }', 'language: en\n');
+        expect(cfg.warnings).toEqual({
+          'config.yaml': [
+            'Repo app auto-accepts size L proposals (auto_accept.max_size: L), but its template whole has no agent stage with planning: auto or llm: an L requirement goes to one Run as a whole, done in one go and likely to time out or need rework. Better set planning: auto on the coding stage, or lower max_size to M to leave L proposals to a human',
+          ],
+        });
+        expect(cfg.warnings['config.yaml']?.[0]).not.toMatch(/[一-鿿]/);
+      } finally {
+        // Back to the default language, zod's messages included, for the other tests.
+        load('{ template: whole }');
+      }
+    });
   });
 
   it('gives an issue 3 Runs by default, and at least 1', () => {
@@ -1355,6 +1441,28 @@ describe('plansStage', () => {
         expect(plansStage({ kind, planning }, 'L')).toBe(false);
       }
     }
+  });
+
+  it('a template splits an L when some agent stage plans, auto or llm', () => {
+    const tpl = (...plannings: ('single' | 'llm' | 'auto')[]) =>
+      TemplateSchema.parse({
+        id: 't',
+        stages: [
+          ...plannings.map((planning, i) => ({ id: `code${i}`, agent: 'x', planning })),
+          { id: 'review', kind: 'review', agent: 'y' },
+          { id: 'merge', kind: 'merge' },
+        ],
+      });
+    expect(templateSplits(tpl('single'))).toBe(false);
+    expect(templateSplits(tpl('auto'))).toBe(true);
+    expect(templateSplits(tpl('llm'))).toBe(true);
+    expect(templateSplits(tpl('single', 'auto'))).toBe(true);
+    expect(templateSplits(tpl('single', 'single'))).toBe(false);
+    const parsed = (stages: object[]) => templateSplits(TemplateSchema.parse({ id: 't', stages }));
+    // Planning unset is single.
+    expect(parsed([{ id: 'a', agent: 'x' }])).toBe(false);
+    // Only agent stages split, whatever another kind of stage says.
+    expect(parsed([{ id: 'r', kind: 'review', agent: 'y', planning: 'auto' }])).toBe(false);
   });
 
   it('takes a stage as the template parses it: single unless it says', () => {

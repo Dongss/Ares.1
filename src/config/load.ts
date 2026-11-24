@@ -4,13 +4,14 @@ import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
 import { join as joinList, type Lang, setLang, t } from '../i18n.js';
 import { defaultAgentsYaml, defaultConfigYaml, defaultSelfDevYaml } from './defaults.js';
-import { conflictTarget, failTarget, runsAgent } from './flow.js';
+import { conflictTarget, failTarget, runsAgent, templateSplits } from './flow.js';
 import {
   type AgentConfig,
   type AgentEntry,
   AgentSchema,
   AgentsFileSchema,
   type Escalate,
+  type GitHubRepoConfig,
   type MasterConfig,
   MasterConfigSchema,
   type SourceFile,
@@ -220,13 +221,23 @@ export function loadConfig(
   }
 
   // GitHub repos refer to templates and agents; a broken reference disables that repo only.
+  // Settings that work but likely not as meant only add to config.yaml's warnings.
+  const repoWarnings: string[] = [];
   for (const [name, repo] of Object.entries(master.github?.repos ?? {})) {
     const problems: string[] = [];
-    if (!templates.has(repo.template)) {
+    const template = templates.get(repo.template);
+    if (!template) {
       problems.push(
         t({
           zh: `模板 ${repo.template} 不存在或无效`,
           en: `Template ${repo.template} does not exist or is invalid`,
+        }),
+      );
+    } else if (wholeLAutoAccepted(repo.auto_accept, template)) {
+      repoWarnings.push(
+        t({
+          zh: `仓库 ${name} 会自动采纳大小为 L 的提案（auto_accept.max_size: L），但它用的模板 ${repo.template} 没有 planning: auto 或 llm 的 Agent 阶段：L 的需求会整个交给一个 Run 一次做完，容易超时或返工。建议编码阶段用 planning: auto，或者把 max_size 调成 M，让 L 的提案留给人`,
+          en: `Repo ${name} auto-accepts size L proposals (auto_accept.max_size: L), but its template ${repo.template} has no agent stage with planning: auto or llm: an L requirement goes to one Run as a whole, done in one go and likely to time out or need rework. Better set planning: auto on the coding stage, or lower max_size to M to leave L proposals to a human`,
         }),
       );
     }
@@ -239,6 +250,9 @@ export function loadConfig(
       );
     }
     if (problems.length > 0) errors[githubConfigKey(name)] = problems;
+  }
+  if (repoWarnings.length > 0) {
+    warnings['config.yaml'] = [...(warnings['config.yaml'] ?? []), ...repoWarnings];
   }
 
   return {
@@ -256,6 +270,17 @@ export function loadConfig(
 }
 
 /** Key of a GitHub repo's problems in `errors`. */
+/**
+ * Whether a repo auto-accepts size L proposals with a template that cannot split them into steps
+ * (`templateSplits`), so a whole L requirement would go to one Run unseen by a human.
+ */
+function wholeLAutoAccepted(
+  limits: GitHubRepoConfig['auto_accept'],
+  template: WorkflowTemplate,
+): boolean {
+  return limits.max_risk !== 'none' && limits.max_size === 'L' && !templateSplits(template);
+}
+
 export function githubConfigKey(repoName: string): string {
   return `config.yaml#github.repos.${repoName}`;
 }
