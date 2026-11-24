@@ -237,6 +237,8 @@ export class Master {
           store.event(null, 'config.reloaded', {
             errors: Object.keys(change.config.errors).length,
           });
+          // A higher concurrency.per_repo starts queued Runs at once.
+          engine.kick();
         } else {
           store.event(null, 'config.reload_failed', { message: change.message });
         }

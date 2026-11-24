@@ -65,8 +65,8 @@ export function WorkOffBanner({ work }: { work: WorkSwitch }) {
               en: `Switching work on or off failed: ${work.error}`,
             })
           : t({
-              zh: '已停工：排队的 Run 不会开始，也不会从 GitHub 接活或自动侦察。正在执行的 Run 会做完，想立刻停下就暂停它。',
-              en: 'Stopped: queued Runs do not start, and no issues are taken from GitHub or scouted automatically. The running Run finishes; pause it to stop it right away.',
+              zh: '已停工：排队的 Run 不会开始，也不会从 GitHub 接活或自动侦察。正在执行的 Run 都会做完，想立刻停下哪个就暂停哪个。',
+              en: 'Stopped: queued Runs do not start, and no issues are taken from GitHub or scouted automatically. Running Runs finish; pause one to stop it right away.',
             })}
       </span>
       {work.working === false && (

@@ -89,9 +89,8 @@ export interface RunDetail {
   branchExists: boolean;
   /**
    * The Run is queued because its agent was out of quota or rate-limited, and goes on at
-   * `retryAt` (ISO; also waiting for its repo's execution slot then if another Run of the repo
-   * has it). null when it is not waiting for a quota. The wait is not kept across a Master restart: the Run then just
-   * tries again.
+   * `retryAt` (ISO; then also waiting for room if `concurrency.per_repo` other Runs of the repo
+   * execute). null when it is not waiting for a quota. The wait holds across a Master restart.
    */
   rateLimited: RateLimitedWait | null;
   /**
@@ -155,6 +154,11 @@ export interface DiffView {
 export interface ConfigView {
   /** config.yaml's `language`: what the Master writes in, and the dashboard's default. */
   language: Lang;
+  /**
+   * config.yaml's `concurrency.per_repo`: how many Runs of a repo execute at the same time (their
+   * merges go one at a time).
+   */
+  perRepo: number;
   /** Valid and enabled agents. */
   agents: AgentConfig[];
   /** Valid templates. */
@@ -206,7 +210,9 @@ export interface HealthView {
   ok: boolean;
   /** The first of `activeRuns`, null when none executes; kept for older clients. */
   activeRun: string | null;
-  /** The Runs executing now, at most one per repo, in the order they started. */
+  /**
+   * The Runs executing now, at most `concurrency.per_repo` per repo, in the order they started.
+   */
   activeRuns: string[];
   /** The work switch: off = nothing new starts. */
   working: boolean;

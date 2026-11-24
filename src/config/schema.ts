@@ -133,6 +133,16 @@ export const MasterConfigSchema = z.object({
       command_timeout_minutes: z.number().positive().default(20),
     })
     .prefault({}),
+  /** How many Runs execute at the same time. */
+  concurrency: z
+    .strictObject({
+      /**
+       * Runs of one repo (one execution slot: repos registered on the same path share it) that
+       * execute at the same time, each in its own worktree. Their merges still go one at a time.
+       */
+      per_repo: z.number().int().min(1).default(1),
+    })
+    .prefault({}),
   /** Omitted = no GitHub integration. */
   github: GitHubSchema.optional(),
   /** Notifications sent by the Master itself, when a human is needed. */

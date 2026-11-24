@@ -363,8 +363,8 @@ function RunActions(props: {
           <h2>{rateLimitText(props.detail.rateLimited)}</h2>
           <p>
             {t({
-              zh: '这不算出错，不消耗重试次数，也不用人处理：执行槽先让给其他 Run，到时间后从同一个 Task 接着做。想马上再试，可以暂停后再恢复。',
-              en: 'This is not an error: it uses up no retries and needs no human. The execution slot goes to other Runs meanwhile, and the same Task carries on at that time. To try again right away, pause and resume the Run.',
+              zh: '这不算出错，不消耗重试次数，也不用人处理：等待期间它不算在正在执行的 Run 里，排队的其他 Run 照常执行，到时间后从同一个 Task 接着做。想马上再试，可以暂停后再恢复。',
+              en: 'This is not an error: it uses up no retries and needs no human. Meanwhile it does not count among the executing Runs, so other queued Runs go ahead, and the same Task carries on at that time. To try again right away, pause and resume the Run.',
             })}
           </p>
         </div>

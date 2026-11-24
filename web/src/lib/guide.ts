@@ -112,6 +112,8 @@ export interface GuideInput {
   github: GitHubRepoStatus | null;
   /** `github.poll_minutes`. */
   pollMinutes: number;
+  /** `concurrency.per_repo`: how many Runs of a repo execute at the same time. */
+  perRepo: number;
   /** The Runs created from its issues (`issueFlow`); null without GitHub or a valid template. */
   flow: IssueFlow | null;
   /** The registered repo's target branch; null when not known. */
@@ -256,6 +258,19 @@ function capitalize(s: string): string {
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
+/** How many Runs execute at the same time under `concurrency.per_repo`, lowercase. */
+export function concurrencyText(perRepo: number): string {
+  return perRepo === 1
+    ? t({
+        zh: '每个仓库同一时间只执行一个 Run（concurrency.per_repo: 1），不同仓库的 Run 可以同时执行',
+        en: 'each repo executes one Run at a time (concurrency.per_repo: 1), while Runs of different repos can execute side by side',
+      })
+    : t({
+        zh: `每个仓库同一时间最多执行 ${perRepo} 个 Run（concurrency.per_repo），各在自己的工作目录里做，合并时一个一个来；不同仓库的 Run 也可以同时执行`,
+        en: `each repo executes up to ${perRepo} Runs at a time (concurrency.per_repo), each in its own working directory, and they merge one at a time; Runs of different repos can execute side by side too`,
+      });
+}
+
 /**
  * The steps of the loop: scout → file issues → accept → Run → push → upgrade → scout again,
  * each with who does it under the current configuration. Steps the configuration leaves to a
@@ -360,8 +375,8 @@ export function cycleSteps(input: GuideInput, rule?: AutoAcceptRule): CycleStep[
         runActors,
         input.flow
           ? t({
-              zh: `Master 每 ${pollMinutes} 分钟查一次带 ares1:ready 的 issue，按模板「${input.flow.templateName}」建 Run，进展回写到 issue；每个仓库同一时间只执行一个 Run，不同仓库的 Run 可以同时执行`,
-              en: `Every ${pollMinutes} minutes the Master looks for issues labeled ares1:ready, creates Runs from them with the template "${input.flow.templateName}" and reports progress on the issue; each repo executes one Run at a time, while Runs of different repos can execute side by side`,
+              zh: `Master 每 ${pollMinutes} 分钟查一次带 ares1:ready 的 issue，按模板「${input.flow.templateName}」建 Run，进展回写到 issue；${concurrencyText(input.perRepo)}`,
+              en: `Every ${pollMinutes} minutes the Master looks for issues labeled ares1:ready, creates Runs from them with the template "${input.flow.templateName}" and reports progress on the issue; ${concurrencyText(input.perRepo)}`,
             })
           : t({
               zh: `模板「${github.template}」不存在或无效，issue 建不了 Run：先修好配置`,
@@ -1275,8 +1290,8 @@ export function idleReasons(input: IdleInput, now = new Date()): string[] {
     const n = input.attention;
     reasons.push(
       t({
-        zh: `有 ${n} 个 Run 在等你审批或卡住了：它们让出了执行位；只等人的 Run 不挡自动侦察，但和等你处理的提案一起计入上限（max_proposals），攒满后不再侦察。到首页「待我处理」处理。`,
-        en: `${n} ${n === 1 ? 'Run is' : 'Runs are'} waiting for your approval or blocked: ${n === 1 ? 'it frees' : 'they free'} the execution slot. Runs waiting only for you do not hold the automatic scout back, but count toward its limit (max_proposals) together with the proposals waiting for you, and it stops scouting once that is reached. Handle ${n === 1 ? 'it' : 'them'} under "Needs me" on the home page.`,
+        zh: `有 ${n} 个 Run 在等你审批或卡住了：它们不算在正在执行的 Run 里（每个仓库最多同时执行 concurrency.per_repo 个），排队的 Run 照常开始；只等人的 Run 不挡自动侦察，但和等你处理的提案一起计入上限（max_proposals），攒满后不再侦察。到首页「待我处理」处理。`,
+        en: `${n} ${n === 1 ? 'Run is' : 'Runs are'} waiting for your approval or blocked: ${n === 1 ? 'it does' : 'they do'} not count among the executing Runs (up to concurrency.per_repo per repo), so queued Runs still start. Runs waiting only for you do not hold the automatic scout back, but count toward its limit (max_proposals) together with the proposals waiting for you, and it stops scouting once that is reached. Handle ${n === 1 ? 'it' : 'them'} under "Needs me" on the home page.`,
       }),
     );
   }

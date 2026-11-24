@@ -4039,6 +4039,278 @@ describe('engine: Runs of different repos', () => {
   });
 });
 
+describe('engine: Runs of one repo side by side (concurrency.per_repo)', () => {
+  const PER_REPO_2 = 'concurrency: { per_repo: 2 }\n';
+
+  /**
+   * Coding → review → merge without approval, so that a Run completes on its own. `mergeCheck`
+   * is the merge stage's own check command when given (the repo's otherwise).
+   */
+  const flow = (mergeCheck?: string) => `
+id: dev
+name: 测试流程
+defaults:
+  escalate:
+    max_retries: 2
+    on_agent_error: switch_agent
+  max_loops: 3
+stages:
+  - id: implement
+    name: 编码
+    kind: agent
+    agent: coder
+  - id: review
+    name: 评审
+    kind: review
+    agent: reviewer
+    inputs: [diff]
+    on_fail: implement
+  - id: merge
+    name: 合并
+    kind: merge
+    on_reject: implement
+${mergeCheck ? `    verify:\n      commands:\n        - ${JSON.stringify(mergeCheck)}\n` : ''}`;
+
+  /** A merge check that logs when it starts and ends, by Run id (its worktree's name). */
+  const loggedCheck = (log: string) =>
+    `echo "start $(basename "$PWD")" >> '${log}'; sleep 0.3; echo "end $(basename "$PWD")" >> '${log}'; grep -q ok feature.txt`;
+
+  /** Writes feature.txt and a file of its own Run, so that two Runs merge without a conflict. */
+  const coder: Script = (ctx) => {
+    writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+    writeFile(join(ctx.input.workdir, `${basename(ctx.input.workdir)}.txt`), 'ok\n');
+    return done();
+  };
+
+  /**
+   * A coder that waits until `release` is called (or it is stopped), then does `work`; `started`
+   * counts its executions. Released once, it no longer waits.
+   */
+  const heldCoder = (work: Script) => {
+    let open = () => {};
+    const released = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    const held = {
+      started: 0,
+      release: () => open(),
+      script: (async (ctx) => {
+        held.started++;
+        const stopped = new Promise((resolve) => ctx.signal.addEventListener('abort', resolve));
+        await Promise.race([released, stopped]);
+        return ctx.signal.aborted ? done() : work(ctx);
+      }) as Script,
+    };
+    return held;
+  };
+
+  /** Another Run's work lands on main. */
+  const commitOnMain = (repoDir: string, file: string, content: string) => {
+    writeFile(join(repoDir, file), content);
+    git(repoDir, 'add', '-A');
+    git(repoDir, 'commit', '-q', '-m', `main changes ${file}`);
+  };
+
+  const eventsOf = (t: Harness, run: Run, type: string) =>
+    t.master.store.listEvents(run.id).filter((e) => e.type === type);
+  const status = (t: Harness, run: Run) => t.master.store.getRun(run.id).status;
+  /** When the Run's first coding attempt started and ended, in epoch ms. */
+  const codingSpan = (t: Harness, run: Run) => {
+    const attempt = t.master.store.listRunAttempts(run.id).find((a) => a.agentId === 'coder');
+    return { start: Date.parse(attempt?.startedAt ?? ''), end: Date.parse(attempt?.endedAt ?? '') };
+  };
+  const mergedHead = (t: Harness, run: Run) => eventsOf(t, run, 'merge.done')[0]?.data.head;
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  it('codes two Runs of a repo at the same time, and merges them one at a time', async () => {
+    const log = join(tmpDir(), 'merge-checks.log');
+    h = await harness({ config: PER_REPO_2, workflow: flow(loggedCheck(log)) });
+    const t = h;
+    const held = heldCoder(coder);
+    t.scripts.coder = held.script;
+    const a = t.run('第一个');
+    const b = t.run('第二个');
+    await waitFor(() => held.started === 2, 'both coders to start');
+    expect([status(t, a), status(t, b)]).toEqual(['running', 'running']);
+    expect(t.master.engine.activeRunIds).toEqual([a.id, b.id]);
+    // main moves on meanwhile, so that both merges sync it and run their check.
+    commitOnMain(t.repoDir, 'other.txt', 'other\n');
+    held.release();
+    await t.waitStatus(a.id, 'completed');
+    await t.waitStatus(b.id, 'completed');
+
+    // The coding agents executed at the same time.
+    const [spanA, spanB] = [codingSpan(t, a), codingSpan(t, b)];
+    expect(spanA.start).toBeLessThan(spanB.end);
+    expect(spanB.start).toBeLessThan(spanA.end);
+
+    // The merges did not: one's check ended before the other's started.
+    const lines = readFileSync(log, 'utf8').trim().split('\n');
+    const [first, second] = [lines[0]?.split(' ')[1], lines[2]?.split(' ')[1]];
+    expect(lines).toEqual([`start ${first}`, `end ${first}`, `start ${second}`, `end ${second}`]);
+    expect([first, second].sort()).toEqual([a.id, b.id].sort());
+    const [earlier, later] = first === a.id ? [a, b] : [b, a];
+
+    // The later one merged in what the earlier one merged, without a conflict.
+    expect(eventsOf(t, later, 'merge.synced').at(-1)?.data.targetHead).toBe(mergedHead(t, earlier));
+    expect(git(t.repoDir, 'rev-parse', 'main')).toBe(mergedHead(t, later));
+    git(t.repoDir, 'merge-base', '--is-ancestor', String(mergedHead(t, earlier)), 'main');
+    for (const run of [a, b]) {
+      expect(git(t.repoDir, 'show', `main:${run.id}.txt`)).toBe('ok');
+      expect(t.master.store.listStageRuns(run.id).map((s) => s.failReason)).toEqual([
+        null,
+        null,
+        null,
+      ]);
+    }
+    expect(git(t.repoDir, 'show', 'main:other.txt')).toBe('other');
+    await waitFor(() => t.master.engine.activeRunIds.length === 0, 'both Runs to be done');
+  });
+
+  it('sends the Run that merges second back to resolve a conflict with the first', async () => {
+    h = await harness({ config: PER_REPO_2, workflow: flow() });
+    const t = h;
+    const held = heldCoder((ctx) => {
+      const file = join(ctx.input.workdir, 'feature.txt');
+      if (existsSync(file) && /^<<<<<<< /m.test(readFileSync(file, 'utf8'))) {
+        writeFile(file, 'ok\nresolved\n');
+        return done('解决了冲突');
+      }
+      // Both Runs add feature.txt, each with lines of its own.
+      writeFile(file, `ok\n${basename(ctx.input.workdir)}\n`);
+      return done();
+    });
+    t.scripts.coder = held.script;
+    const a = t.run('第一个');
+    const b = t.run('第二个');
+    await waitFor(() => held.started === 2, 'both coders to start');
+    held.release();
+    await t.waitStatus(a.id, 'completed');
+    await t.waitStatus(b.id, 'completed');
+
+    const conflicted = (run: Run) =>
+      t.master.store.listStageRuns(run.id).some((s) => s.failReason === 'conflict');
+    expect([a, b].filter(conflicted)).toHaveLength(1);
+    const [earlier, later] = conflicted(b) ? [a, b] : [b, a];
+    expect(
+      t.master.store.listStageRuns(later.id).map((s) => [s.stageId, s.status, s.failReason]),
+    ).toEqual([
+      ['implement', 'passed', null],
+      ['review', 'passed', null],
+      ['merge', 'failed', 'conflict'],
+      ['implement', 'passed', null],
+      ['review', 'passed', null],
+      ['merge', 'passed', null],
+    ]);
+    // The coding agent resolved the merge with what the earlier Run had merged.
+    expect(eventsOf(t, later, 'merge.started').map((e) => e.data.targetHead)).toEqual([
+      mergedHead(t, earlier),
+    ]);
+    // main lost nothing: the earlier Run's commit is in it, with the resolution on top.
+    git(t.repoDir, 'merge-base', '--is-ancestor', String(mergedHead(t, earlier)), 'main');
+    expect(git(t.repoDir, 'rev-parse', 'main')).toBe(mergedHead(t, later));
+    expect(git(t.repoDir, 'show', 'main:feature.txt')).toBe('ok\nresolved');
+  });
+
+  it('creates a worktree only after the merge in progress; a pause ends the wait', async () => {
+    const gate = join(tmpDir(), 'go');
+    const check = `while [ ! -f '${gate}' ]; do sleep 0.05; done; grep -q ok feature.txt`;
+    h = await harness({ config: PER_REPO_2, workflow: flow(check) });
+    const t = h;
+    const held = heldCoder(coder);
+    t.scripts.coder = held.script;
+    const a = t.run('第一个');
+    await waitFor(() => held.started === 1, 'the first coder to start');
+    // main moves on, so that the merge syncs it and runs its check, which waits for the gate.
+    commitOnMain(t.repoDir, 'other.txt', 'other\n');
+    held.release();
+    await waitFor(() => eventsOf(t, a, 'merge.synced').length === 1, 'the first to merge');
+
+    // The second starts executing at once, but its worktree waits for the merge.
+    const b = t.run('第二个');
+    expect(status(t, b)).toBe('running');
+    await sleep(200);
+    expect(eventsOf(t, b, 'workspace.created')).toEqual([]);
+    expect(held.started).toBe(1);
+
+    // Paused while waiting, it stops at once; the merge goes on.
+    await t.master.engine.pause(b.id);
+    expect(status(t, b)).toBe('paused');
+    expect(status(t, a)).toBe('running');
+    expect(eventsOf(t, a, 'merge.done')).toEqual([]);
+    // Resumed, it waits for the same merge again.
+    t.master.engine.resume(b.id);
+    expect(status(t, b)).toBe('running');
+    await sleep(100);
+    expect(eventsOf(t, b, 'workspace.created')).toEqual([]);
+
+    writeFile(gate, '');
+    await t.waitStatus(a.id, 'completed');
+    await t.waitStatus(b.id, 'completed');
+    const [merged] = eventsOf(t, a, 'merge.done');
+    const [created] = eventsOf(t, b, 'workspace.created');
+    expect(created?.id).toBeGreaterThan(merged?.id ?? Number.POSITIVE_INFINITY);
+    // So it started on main with the first Run's work in it.
+    expect(created?.data.base).toBe(merged?.data.head);
+    expect(git(t.repoDir, 'show', `main:${a.id}.txt`)).toBe('ok');
+    expect(git(t.repoDir, 'show', `main:${b.id}.txt`)).toBe('ok');
+  });
+
+  it('starts the Runs it recovers after a crash side by side again', async () => {
+    const first = await harness({ config: PER_REPO_2, workflow: flow() });
+    first.scripts.coder = async (ctx) => {
+      await new Promise((resolve) => ctx.signal.addEventListener('abort', resolve));
+      return done();
+    };
+    const a = first.run('第一个');
+    const b = first.run('第二个');
+    await waitFor(() => first.fake.calls.length === 2, 'both coders to start');
+    // A crash: the database still says both are running when the next Master opens it.
+    expect([status(first, a), status(first, b)]).toEqual(['running', 'running']);
+
+    const held = heldCoder(coder);
+    h = await harness({
+      home: first.home,
+      repoDir: first.repoDir,
+      workflow: flow(),
+      scripts: { coder: held.script, reviewer: () => review() },
+    });
+    const t = h;
+    await waitFor(() => held.started === 2, 'both recovered coders to start');
+    expect([status(t, a), status(t, b)]).toEqual(['running', 'running']);
+    expect([...t.master.engine.activeRunIds].sort()).toEqual([a.id, b.id].sort());
+    for (const run of [a, b]) {
+      expect(eventsOf(t, run, 'run.recovered')).toHaveLength(1);
+      expect(t.master.store.listRunAttempts(run.id)[0]?.status).toBe('interrupted');
+    }
+    held.release();
+    await t.waitStatus(a.id, 'completed');
+    await t.waitStatus(b.id, 'completed');
+    expect(git(t.repoDir, 'show', `main:${a.id}.txt`)).toBe('ok');
+    expect(git(t.repoDir, 'show', `main:${b.id}.txt`)).toBe('ok');
+    // The "crashed" first Master is left as is; its hanging fake agents never resolve.
+  });
+
+  it('starts more Runs at once when concurrency.per_repo is raised', async () => {
+    h = await harness({ workflow: flow() });
+    const t = h;
+    const held = heldCoder(coder);
+    t.scripts.coder = held.script;
+    const a = t.run('第一个');
+    const b = t.run('第二个');
+    await waitFor(() => held.started === 1, 'the first coder to start');
+    t.master.engine.kick();
+    expect(status(t, b)).toBe('queued');
+
+    writeFile(join(t.home, 'config.yaml'), PER_REPO_2);
+    await waitFor(() => held.started === 2, 'the second coder to start once the config reloads');
+    expect(t.master.engine.activeRunIds).toEqual([a.id, b.id]);
+    held.release();
+    await t.waitStatus(a.id, 'completed');
+    await t.waitStatus(b.id, 'completed');
+  });
+});
+
 describe('engine: workspace consistency', () => {
   const eventsOf = (runId: string, type: string) =>
     (h as Harness).master.store.listEvents(runId).filter((e) => e.type === type);

@@ -98,8 +98,8 @@ async function main(): Promise<void> {
     const stop = async () => {
       console.log(
         t({
-          zh: `收到 ${signal}，正在停止（正在执行的 Run 会回到队首）…`,
-          en: `Got ${signal}, stopping (the executing Run goes back to the head of the queue)…`,
+          zh: `收到 ${signal}，正在停止（正在执行的 Run 都会回到队首）…`,
+          en: `Got ${signal}, stopping (executing Runs go back to the head of the queue)…`,
         }),
       );
       await master.close();

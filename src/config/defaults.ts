@@ -24,6 +24,10 @@ defaults:
   timeout_minutes: 60          # 单次 Agent 执行的超时
   command_timeout_minutes: 20  # 单条检查 / 准备命令的超时
 
+# 同一仓库最多同时执行几个 Run，各在自己的工作目录里做，合并时一个一个来；大于 1 时更容易出现合并冲突
+# concurrency:
+#   per_repo: 1
+
 # 用 GitHub Issues 管理需求，让 AI 侦察提需求（说明见${brandName()}仓库的 docs/running.md）：需要安装并登录 gh
 # github:
 #   account: my-account          # 可选：用 gh 的哪个账号，不写则用当前账号
@@ -69,6 +73,10 @@ port: 4870
 defaults:
   timeout_minutes: 60          # timeout of a single agent execution
   command_timeout_minutes: 20  # timeout of a single verify / setup command
+
+# How many Runs of one repo execute at the same time, each in its own worktree; they merge one at a time. Above 1, merge conflicts get more likely
+# concurrency:
+#   per_repo: 1
 
 # Requirements as GitHub Issues, with an AI scout proposing them (see docs/running.md in the ${brandName()} repo); needs gh installed and logged in
 # github:

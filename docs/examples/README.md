@@ -4,7 +4,7 @@
 
 | 文件 | 内容 |
 |---|---|
-| [`config.yaml`](config.yaml) | 全局配置：语言、端口、CLI 路径、超时、通知、自动升级；GitHub 里登记了 4 个仓库，分别用下面 4 个模板，侦察、自动采纳、自动合并、推送、每日预算的设置各不相同 |
+| [`config.yaml`](config.yaml) | 全局配置：语言、端口、CLI 路径、超时、同时执行几个 Run、通知、自动升级；GitHub 里登记了 4 个仓库，分别用下面 4 个模板，侦察、自动采纳、自动合并、推送、每日预算的设置各不相同 |
 | [`agents.yaml`](agents.yaml) | 5 个 Agent：编码用的强模型配高 effort（`claude-coder`），评审、需求评估、侦察用的便宜一档的模型（`claude-reviewer`），只改文件不执行命令的 `permission: safe`（`claude-docs`），cursor-agent 的另一家模型（`cursor-grok`，带 `price`），停用的 `enabled: false`（`claude-max`）；也演示了 `timeout_minutes`、`args` 的写法 |
 | [`workflows/light.yaml`](workflows/light.yaml) | 轻量：编码 → 评审 → 合并，不做需求评估。适合文档、小改动 |
 | [`workflows/strict.yaml`](workflows/strict.yaml) | 严格：需求评估 → 编码 → 评审 → 人工审批 → 合并。适合生产仓库；编码阶段用 `planning: auto`：需求评估给出的规模是 L 时先把需求拆成几步，再一步一步做、一步一步检查和提交 |
@@ -32,7 +32,7 @@ cp docs/examples/workflows/*.yaml ~/.ares1/workflows/
 
 | 设置 | 在哪里 |
 |---|---|
-| 语言、端口、CLI 路径（`bins`）、Agent 执行和命令的超时、系统通知、自动升级 | `config.yaml` |
+| 语言、端口、CLI 路径（`bins`）、Agent 执行和命令的超时、同一仓库同时执行几个 Run、系统通知、自动升级 | `config.yaml` |
 | 仓库接不接 GitHub、用哪个模板、侦察、自动采纳、自动合并、推送、每日预算、一个 issue 最多跑几次 | `config.yaml` 的 `github.repos.<仓库名>` |
 | 有哪些 Agent：CLI、模型、effort、权限、档次、价格、超时、额外参数 | `agents.yaml` |
 | 流程：有哪些阶段、谁来做、返工和回退的次数、出错时怎么办、单个 Run 的预算、哪里要人审批、命令阶段运行什么 | `workflows/*.yaml` |

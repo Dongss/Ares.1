@@ -124,8 +124,8 @@ defaults:
     expect(cfg.master.notify.system).toBe(false);
     expect(cfg.master.defaults).toEqual({ timeout_minutes: 60, command_timeout_minutes: 10 });
     expect(cfg.warnings['config.yaml']).toEqual([
-      '未知的配置项 upgarde，已忽略（是不是写错了？可用：language、port、bins、defaults、github、notify、upgrade）',
-      '未知的配置项 notfy，已忽略（是不是写错了？可用：language、port、bins、defaults、github、notify、upgrade）',
+      '未知的配置项 upgarde，已忽略（是不是写错了？可用：language、port、bins、defaults、concurrency、github、notify、upgrade）',
+      '未知的配置项 notfy，已忽略（是不是写错了？可用：language、port、bins、defaults、concurrency、github、notify、upgrade）',
       '未知的配置项 defaults.timeout_minute，已忽略（是不是写错了？可用：timeout_minutes、command_timeout_minutes）',
     ]);
     expect(cfg.errors).toEqual({});
@@ -168,6 +168,7 @@ defaults:
       `port: 4870
 bins: { claude-code: /opt/bin/claude }
 defaults: { timeout_minutes: 30, command_timeout_minutes: 10 }
+concurrency: { per_repo: 2 }
 github:
   account: me
   poll_minutes: 5
@@ -186,6 +187,25 @@ upgrade: { auto: true }
     // Strict sections still reject typos: unlike the top level, they never ignored them.
     writeFile(paths.configFile, 'upgrade: { autto: true }\n');
     expect(() => loadConfig(paths, ['claude-code'])).toThrow(/autto/);
+  });
+
+  it('executes one Run of a repo at a time by default, more with concurrency.per_repo', () => {
+    const paths = home();
+    // The default config.yaml leaves it out.
+    expect(loadConfig(paths, ['claude-code']).master.concurrency).toEqual({ per_repo: 1 });
+    writeFile(paths.configFile, 'concurrency: {}\n');
+    expect(loadConfig(paths, ['claude-code']).master.concurrency).toEqual({ per_repo: 1 });
+    writeFile(paths.configFile, 'concurrency: { per_repo: 3 }\n');
+    const cfg = loadConfig(paths, ['claude-code'], ['claude-code']);
+    expect(cfg.master.concurrency.per_repo).toBe(3);
+    expect(cfg.warnings).toEqual({});
+    // At least one, a whole number; a typo in the section is an error, as in the other sections.
+    for (const bad of ['0', '-1', '1.5', '"2"', 'null']) {
+      writeFile(paths.configFile, `concurrency: { per_repo: ${bad} }\n`);
+      expect(() => loadConfig(paths, ['claude-code']), bad).toThrow(/concurrency\.per_repo/);
+    }
+    writeFile(paths.configFile, 'concurrency: { per_rep: 2 }\n');
+    expect(() => loadConfig(paths, ['claude-code'])).toThrow(/per_rep/);
   });
 
   it('takes a webhook with an http or https address, JSON by default', () => {

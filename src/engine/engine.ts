@@ -257,6 +257,8 @@ export interface RetryInput {
 /** An executing Run. */
 interface Active {
   runId: string;
+  /** Its repo's execution slot (`slotOf`) when it started. */
+  slot: string;
   controller: AbortController;
   done: Promise<void>;
 }
@@ -313,18 +315,26 @@ type KeptWorkspaceRemoval = { manual: true } | LeftoverWorkspaceReason;
 const IN_FLIGHT_TASK = new Set<Task['status']>(['running', 'verifying']);
 
 /**
- * The workflow engine: a deterministic state machine that executes one Run at a time per repo,
- * each in the Run's own worktree, one task and one commit at a time. Runs of different repos
- * execute side by side.
+ * The workflow engine: a deterministic state machine that executes up to `concurrency.per_repo`
+ * Runs at a time per repo, each in the Run's own worktree, one task and one commit at a time.
+ * Runs of different repos execute side by side. A repo's Runs share its git repository (the
+ * target branch, worktrees, branches), so what they do there besides their own worktree goes one
+ * Run at a time, under the repo's merge lock (`withMergeLock`): merging, creating and removing
+ * worktrees.
  */
 export class Engine {
   /** Live agent output for the dashboard; not persisted (raw logs are on disk). */
   readonly live = new EventEmitter<{ agent: [LiveAgentEvent] }>();
   /**
-   * The executing Runs by execution slot (`slotOf`), in the order they started: one per repo,
-   * since a repo's Runs share its git repository (worktrees, the target branch, merges).
+   * The executing Runs by Run id, in the order they started; each records its execution slot
+   * (`slotOf`), of which `kick` lets `concurrency.per_repo` Runs execute at a time.
    */
   private readonly active = new Map<string, Active>();
+  /**
+   * The merge lock of each execution slot (`withMergeLock`): the end of the chain of the Runs
+   * holding it or waiting for it, removed once the last one released it.
+   */
+  private readonly mergeLocks = new Map<string, Promise<void>>();
   private stopping = false;
   private holding = false;
   /** Workspace cleanups in progress, by Run id; a second request joins the first. */
@@ -452,13 +462,19 @@ export class Engine {
 
   /** The Runs currently executing, in the order they started. */
   get activeRunIds(): string[] {
-    return [...this.active.values()].map((active) => active.runId);
+    return [...this.active.keys()];
   }
 
   /** The executing Run `runId`, if it is executing. */
   private activeOf(runId: string): Active | undefined {
-    for (const active of this.active.values()) if (active.runId === runId) return active;
-    return undefined;
+    return this.active.get(runId);
+  }
+
+  /** How many Runs execute in the execution slot `slot`. */
+  private executingIn(slot: string): number {
+    let count = 0;
+    for (const active of this.active.values()) if (active.slot === slot) count++;
+    return count;
   }
 
   private async killOrphan(attempt: Attempt): Promise<void> {
@@ -488,15 +504,17 @@ export class Engine {
 
   /**
    * While the work switch is on, start queued Runs in queue order: each one whose execution slot
-   * (`slotOf`) is free, so one per repo at a time. Runs waiting for their agent's quota are
-   * passed by until their wait ends; `kick` is woken up when the first wait ends.
+   * (`slotOf`) has fewer than `concurrency.per_repo` Runs executing, the ones started in this
+   * round included. Runs waiting for their agent's quota are passed by until their wait ends;
+   * `kick` is woken up when the first wait ends.
    */
   kick(): void {
     clearTimeout(this.limitTimer);
     this.limitTimer = undefined;
     // Whatever ends the early returns (a Run finishing, the switch turned on, the hold lifted)
-    // kicks again; so does a Run finishing for the slot it frees.
+    // kicks again; so does a Run finishing for the place it frees in its slot.
     if (this.stopping || this.holding || !this.store.working) return;
+    const perRepo = this.cfg.master.concurrency.per_repo;
     const queued = this.store.queuedRuns();
     // A Run that left the queue meanwhile (paused, cancelled) waits no more.
     const ids = new Set(queued.map((r) => r.id));
@@ -505,6 +523,8 @@ export class Engine {
     let wake: number | undefined;
     const slots = new Map<string, string>();
     for (const run of queued) {
+      // Started meanwhile by a kick from a listener of an earlier launch's status event.
+      if (this.active.has(run.id)) continue;
       const until = this.limitWaits.get(run.id)?.until;
       if (until !== undefined && until > now) {
         wake = Math.min(wake ?? until, until);
@@ -515,7 +535,7 @@ export class Engine {
         slot = this.slotOf(run);
         slots.set(run.repoId, slot);
       }
-      if (!this.active.has(slot)) this.launch(run.id, slot);
+      if (this.executingIn(slot) < perRepo) this.launch(run.id, slot);
     }
     if (wake !== undefined) {
       const timer = setTimeout(() => this.kick(), Math.min(wake - now, MAX_TIMER_MS));
@@ -524,24 +544,72 @@ export class Engine {
     }
   }
 
-  /** Execute the queued Run `runId` in the free execution slot `slot`. */
+  /** Execute the queued Run `runId` in the execution slot `slot`, which has room for it. */
   private launch(runId: string, slot: string): void {
     this.limitWaits.delete(runId);
-    this.setStatus(runId, 'running', { queuePos: null });
     const controller = new AbortController();
-    const active: Active = { runId, controller, done: Promise.resolve() };
-    this.active.set(slot, active);
+    const active: Active = { runId, slot, controller, done: Promise.resolve() };
+    // Registered before its status changes: a listener of the status event may kick again, and
+    // must count it and not start it a second time.
+    this.active.set(runId, active);
+    try {
+      this.setStatus(runId, 'running', { queuePos: null });
+    } catch (err) {
+      this.active.delete(runId);
+      throw err;
+    }
     active.done = this.drive(runId, controller.signal).finally(() => {
-      if (this.active.get(slot) === active) this.active.delete(slot);
+      if (this.active.get(runId) === active) this.active.delete(runId);
       setImmediate(() => this.kick());
     });
   }
 
   /**
+   * Run `fn` holding the merge lock of the Run's execution slot, after the Runs that hold it or
+   * wait for it already. The Runs of a repo execute side by side in their own worktrees, but
+   * share its git repository: what they do there besides their own worktree goes one at a time,
+   * so that two merges never race for the target branch (each merges in what the one before it
+   * merged) and git commands that change the shared worktree list and branches do not race
+   * either (creating, restoring and removing worktrees). A pause, cancel or shutdown (`signal`)
+   * ends the wait at once and throws `Aborted`; without a signal it waits until the lock is
+   * free. Released however `fn` ends.
+   */
+  private async withMergeLock<T>(
+    run: Run,
+    signal: AbortSignal | undefined,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const slot = this.activeOf(run.id)?.slot ?? this.slotOf(run);
+    const before = this.mergeLocks.get(slot) ?? Promise.resolve();
+    let release = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // The next one waits for this one, and through it for those before, even when this one
+    // stops waiting early: the lock is free only once the whole chain has settled.
+    const chain = before.then(() => held);
+    this.mergeLocks.set(slot, chain);
+    void chain.then(() => {
+      if (this.mergeLocks.get(slot) === chain) this.mergeLocks.delete(slot);
+    });
+    try {
+      if (signal) {
+        await untilAborted(before, signal);
+        this.checkAbort(signal);
+      } else {
+        await before;
+      }
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  /**
    * The execution slot of a Run: its repo's path with symlinks resolved, so that two repos
-   * registered on the same git repository (e.g. with different target branches) share one and
-   * their git commands do not race. The registered path when it cannot be resolved (it is gone:
-   * the Run then fails on it as before).
+   * registered on the same git repository (e.g. with different target branches) share one, and
+   * with it its merge lock, so that their git commands do not race. The registered path when it
+   * cannot be resolved (it is gone: the Run then fails on it as before).
    */
   private slotOf(run: Run): string {
     const { path } = this.store.getRepo(run.repoId);
@@ -554,8 +622,8 @@ export class Engine {
 
   /**
    * A queued Run waiting for its agent's quota to come back: the agent and when the Run goes on
-   * (then also waiting for its repo's execution slot if another Run of the repo has it). null
-   * when it does not wait (any more).
+   * (then also waiting for room in its repo's execution slot if `concurrency.per_repo` other Runs
+   * of the repo execute). null when it does not wait (any more).
    */
   rateLimited(run: Run): RateLimitedWait | null {
     const wait = this.limitWaits.get(run.id);
@@ -1107,14 +1175,16 @@ export class Engine {
   }
 
   /**
-   * Every time a Run gets the execution slot (also after a Master restart), make sure its
-   * worktree is still what the Master left there; returns whether the Run goes on. A worktree
-   * that was only deleted (cleaning up the disk, say) comes back from the Run's branch, as a
-   * human's retry would bring it back. Otherwise the worktree can no longer be trusted (history
-   * rewritten, another branch checked out, the branch gone too): the Run ends as failed instead
-   * of waiting for a human, and a Run from an issue is redone in a fresh worktree. A Run in a
-   * review first has its worktree put back where the review started (`redoStoppedReviewDiscard`),
-   * as the review would before it runs again; when that fails, the reason goes with the error.
+   * Every time a Run starts executing (also after a Master restart), make sure its worktree is
+   * still what the Master left there; returns whether the Run goes on. A worktree that was only
+   * deleted (cleaning up the disk, say) comes back from the Run's branch, as a human's retry
+   * would bring it back. Otherwise the worktree can no longer be trusted (history rewritten,
+   * another branch checked out, the branch gone too): the Run ends as failed instead of waiting
+   * for a human, and a Run from an issue is redone in a fresh worktree. A Run in a review first
+   * has its worktree put back where the review started (`redoStoppedReviewDiscard`), as the
+   * review would before it runs again; when that fails, the reason goes with the error. Putting
+   * the work back and restoring the worktree hold the repo's merge lock (`withMergeLock`); only
+   * looking needs none.
    */
   private async checkWorkspace(runId: string, signal: AbortSignal): Promise<boolean> {
     const run = this.store.getRun(runId);
@@ -1124,7 +1194,9 @@ export class Engine {
     if (!problem) return true;
     const why =
       problem.reason === 'missing'
-        ? await this.restoreMissingWorkspace(run, problem, signal)
+        ? await this.withMergeLock(run, signal, () =>
+            this.restoreMissingWorkspace(run, problem, signal),
+          )
         : undiscarded === null
           ? problem.message
           : t({
@@ -1289,11 +1361,12 @@ export class Engine {
    * fails is recorded on that Run and passed by. Nothing left to remove is fine, so calling it
    * again does no harm.
    *
-   * Unlike the removal of superseded attempts this does not hold the execution slot: it is called
-   * from the GitHub bridge while other Runs may execute, and is as safe as a removal by hand
-   * (`cleanupWorkspace`). It only touches each failed Run's own worktree and branch, never an
-   * executing Run's, and git's own locks keep concurrent commands from corrupting the repo; a
-   * removal that loses a race for a lock only ends up recorded as `workspace.cleanup_failed`.
+   * Unlike the removal of superseded attempts this does not hold the repo's merge lock
+   * (`withMergeLock`): it is called from the GitHub bridge while other Runs may execute and
+   * merge, and is as safe as a removal by hand (`cleanupWorkspace`). It only touches each failed
+   * Run's own worktree and branch, never an executing Run's, and git's own locks keep concurrent
+   * commands from corrupting the repo; a removal that loses a race for a lock only ends up
+   * recorded as `workspace.cleanup_failed`.
    */
   async removeExhaustedAttempts(keptRunId: string, earlierRunIds: string[]): Promise<void> {
     const issue = this.store.getRun(keptRunId).issue;
@@ -1329,7 +1402,7 @@ export class Engine {
    * `workspace.cleanup_failed` is tried again; a removal that fails again is recorded again and
    * passed by. Nothing left is fine, so calling it again records nothing more.
    *
-   * Like `removeExhaustedAttempts` it does not hold the execution slot: it only touches failed
+   * Like `removeExhaustedAttempts` it does not hold the merge lock: it only touches failed
    * and cancelled Runs' own worktrees and branches, never an executing Run's. Ends after the
    * removal in progress when the engine stops. A call while one is in progress joins it.
    */
@@ -1570,15 +1643,19 @@ export class Engine {
   /**
    * Create the Run's worktree + branch from the target branch and run setup commands. A setup
    * command that fails for the environment blocks the Run (`environment`) without recording the
-   * worktree, so that going on starts over here.
+   * worktree, so that going on starts over here. Creating the worktree holds the repo's merge
+   * lock (`withMergeLock`); the setup commands run in the Run's own worktree without it.
    */
   private async prepareWorkspace(run: Run, signal: AbortSignal): Promise<void> {
     const repo = this.store.getRepo(run.repoId);
     if (repo.setupCommands.length > 0 && this.blockOnMissingNode(run)) return;
     const { path, branch } = this.newWorkspace(run.id);
-    await removeWorktree(repo.path, path, branch); // leftovers of an interrupted attempt
-    const base = await revParse(repo.path, repo.targetBranch);
-    await addWorktree(repo.path, path, branch, base);
+    const base = await this.withMergeLock(run, signal, async () => {
+      await removeWorktree(repo.path, path, branch); // leftovers of an interrupted attempt
+      const head = await revParse(repo.path, repo.targetBranch);
+      await addWorktree(repo.path, path, branch, head);
+      return head;
+    });
     this.checkAbort(signal);
     this.store.event(run.id, 'workspace.created', { path, branch, base });
 
@@ -2351,7 +2428,7 @@ export class Engine {
     let head = task.baseCommit;
     if (head) {
       // Started before: a stop in the middle of the review normally put the work back there
-      // (`discardInFlight`), or getting the execution slot again did (`checkWorkspace`); when
+      // (`discardInFlight`), or starting to execute again did (`checkWorkspace`); when
       // neither could (the worktree was gone, say), what that reviewer left goes now, before this
       // one looks.
       await this.discardReviewWork(run, task, head);
@@ -2549,8 +2626,11 @@ export class Engine {
     });
     // Wake up at the new discussion's deadline.
     if (entry.verdict === 'ask' && waitHours) this.checkReplyTimeouts();
-    // Nothing was done in the workspace.
-    if (entry.verdict === 'drop') await this.removeMergedWorkspace(run);
+    // Nothing was done in the workspace. The Run has ended, so nothing stops the wait for the
+    // repo's merge lock; a shutdown stops the Run holding it.
+    if (entry.verdict === 'drop') {
+      await this.withMergeLock(run, undefined, () => this.removeMergedWorkspace(run));
+    }
   }
 
   /**
@@ -2897,7 +2977,8 @@ export class Engine {
           delayMs,
         });
       });
-      // Holds the execution slot meanwhile; a pause, cancel or shutdown ends the wait at once.
+      // Still counts as executing meanwhile, one of its repo's `concurrency.per_repo` Runs; a
+      // pause, cancel or shutdown ends the wait at once.
       if (delayMs > 0) await delay(delayMs, undefined, { signal }).catch(() => {});
       this.checkAbort(signal);
       return;
@@ -2971,9 +3052,10 @@ export class Engine {
    * other agent takes over, nobody is asked. The task goes back to pending with the same agent
    * and feedback (a rework resumes the session of the attempt that hit the limit, which knows
    * what it did so far; the worktree keeps its changes, as after an agent error), and the Run
-   * goes back to the head of the queue, giving up the execution slot until the quota is expected
-   * back (`rateLimitDelayMs`); other Runs go on meanwhile. The wait is in `limitWaits`, and its
-   * `task.rate_limited` event keeps it across a Master restart (`restoreLimitWaits`).
+   * goes back to the head of the queue, no longer counting as executing until the quota is
+   * expected back (`rateLimitDelayMs`); other Runs go on meanwhile. The wait is in
+   * `limitWaits`, and its `task.rate_limited` event keeps it across a Master restart
+   * (`restoreLimitWaits`).
    */
   private waitForQuota(run: Run, task: Task, attempt: Attempt, result: AgentResult): void {
     this.store.updateAttempt(attempt.id, { outcome: 'rate_limited' });
@@ -3086,7 +3168,7 @@ export class Engine {
         approvalId: approval.id,
         stageId: sr.stageId,
       });
-      // Waiting for a human releases the execution slot.
+      // Waiting for a human no longer counts as executing: the next queued Run takes its place.
       this.setStatus(run.id, 'waiting_approval');
     });
   }
@@ -3252,9 +3334,21 @@ export class Engine {
   /**
    * Merge stage: bring in the latest target branch, re-run checks if it moved,
    * then fast-forward the target branch. A conflict goes back to an agent stage to resolve, or
-   * ends the Run when no agent stage can (`mergeConflict`).
+   * ends the Run when no agent stage can (`mergeConflict`). Holds the repo's merge lock
+   * throughout (`withMergeLock`), the checks included: the Runs of a repo executing side by side
+   * merge one at a time, and each brings in what the ones before it merged.
    */
-  private async executeMerge(
+  private executeMerge(
+    run: Run,
+    sr: StageRun,
+    eff: EffectiveStage,
+    signal: AbortSignal,
+  ): Promise<void> {
+    return this.withMergeLock(run, signal, () => this.mergeHoldingLock(run, sr, eff, signal));
+  }
+
+  /** `executeMerge` once it holds the merge lock. */
+  private async mergeHoldingLock(
     run: Run,
     sr: StageRun,
     eff: EffectiveStage,
@@ -3457,10 +3551,19 @@ export class Engine {
     });
   }
 
-  private async complete(run: Run, signal: AbortSignal): Promise<void> {
-    await this.removeMergedWorkspace(run);
-    this.setStatus(run.id, 'completed', { finishedAt: nowIso() });
-    await this.removeSupersededWorkspaces(run, signal);
+  /**
+   * After the last stage: remove the Run's merged worktree and branch, complete the Run, then
+   * remove what its issue's failed attempts kept. Holds the repo's merge lock (`withMergeLock`)
+   * meanwhile, so that these removals do not race with the git commands of the repo's other
+   * Runs (a merge, a new worktree). Stopped while waiting for the lock, the Run is still running
+   * and completes when it goes on.
+   */
+  private complete(run: Run, signal: AbortSignal): Promise<void> {
+    return this.withMergeLock(run, signal, async () => {
+      await this.removeMergedWorkspace(run);
+      this.setStatus(run.id, 'completed', { finishedAt: nowIso() });
+      await this.removeSupersededWorkspaces(run, signal);
+    });
   }
 
   /**
@@ -3469,8 +3572,8 @@ export class Engine {
    * completed Run's. Without this every failed attempt would keep its worktree (dependencies
    * included) for good while nobody is around. Cancelled Runs stay: a human ended them and may
    * still want to look. A removal that fails is recorded on that Run and passed by; the completed
-   * Run stays completed. Holds its repo's execution slot meanwhile, so the repo's next Run's git
-   * commands do not race with the removals.
+   * Run stays completed. Called holding the repo's merge lock (`complete`), so the git commands
+   * of the repo's other Runs do not race with the removals.
    */
   private async removeSupersededWorkspaces(run: Run, signal: AbortSignal): Promise<void> {
     if (!run.issue) return;
@@ -3510,7 +3613,7 @@ export class Engine {
    * taken for the work under review by the next review and be merged with it. When that fails
    * (the worktree is gone, the Run's branch is checked out elsewhere, a git lock...), the failure
    * is recorded with the task (`review.discard_deferred`) instead of stopping the Master's start
-   * or shutdown, and the Run does it when it next gets the execution slot: before its worktree is
+   * or shutdown, and the Run does it when it next starts executing: before its worktree is
    * checked (`checkWorkspace`), so that a reviewer's checkout of another branch does not fail the
    * Run, or, for a deleted worktree, once it is back and before the review runs again
    * (`runReviewTask`).
@@ -3638,13 +3741,14 @@ export class Engine {
   }
 
   /**
-   * When a Run in a review gets the execution slot: put its worktree back on the Run's branch at
-   * the commit the review started on, before the worktree is checked against the records
+   * When a Run in a review starts executing: put its worktree back on the Run's branch at the
+   * commit the review started on, before the worktree is checked against the records
    * (`checkWorkspace`). Putting back the work of a review stopped halfway may have failed then
    * (`review.discard_deferred`); a reviewer that checked out another branch would otherwise fail
    * the Run as not on its branch, before the review could put it back itself (`runReviewTask`).
    * Nothing left over changes nothing, so it needs no record of that failure. A deleted worktree
-   * is left for `restoreMissingWorkspace`. Returns why it failed, or null.
+   * is left for `restoreMissingWorkspace`. Holds the repo's merge lock (`withMergeLock`) while
+   * it puts the work back. Returns why it failed, or null.
    */
   private async redoStoppedReviewDiscard(run: Run, signal: AbortSignal): Promise<string | null> {
     const path = run.worktreePath;
@@ -3652,8 +3756,11 @@ export class Engine {
     const task = this.store
       .listTasks(run.currentStageRunId)
       .find((candidate) => candidate.status === 'pending' && candidate.baseCommit);
-    if (!task?.baseCommit || this.stageKindOf(run, task) !== 'review') return null;
-    const failed = await this.discardStoppedReview(run, task, path, task.baseCommit);
+    const from = task?.baseCommit;
+    if (!task || !from || this.stageKindOf(run, task) !== 'review') return null;
+    const failed = await this.withMergeLock(run, signal, () =>
+      this.discardStoppedReview(run, task, path, from),
+    );
     this.checkAbort(signal);
     return failed;
   }
@@ -3670,7 +3777,7 @@ export class Engine {
     return run;
   }
 
-  /** Put the Run first in the queue, to go on as soon as its repo's execution slot is free. */
+  /** Put the Run first in the queue, to go on as soon as its repo's execution slot has room. */
   private requeueHead(runId: string, eventType: string): void {
     this.store.tx(() => {
       this.setStatus(runId, 'queued', { queuePos: this.store.queueHead(), blocked: null });
@@ -3904,6 +4011,21 @@ export class Engine {
   /** Environment of agents and of the commands run on their work: no GitHub credentials. */
   private agentEnv(): NodeJS.ProcessEnv {
     return prepareAgentEnv(this.deps.paths.agentGhConfigDir);
+  }
+}
+
+/** Wait until `promise` settles or `signal` is aborted, whichever comes first. */
+async function untilAborted(promise: Promise<unknown>, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return;
+  let onAbort = () => {};
+  const aborted = new Promise<void>((resolve) => {
+    onAbort = resolve;
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+  try {
+    await Promise.race([promise, aborted]);
+  } finally {
+    signal.removeEventListener('abort', onAbort);
   }
 }
 

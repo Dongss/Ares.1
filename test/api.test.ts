@@ -168,6 +168,19 @@ describe('HTTP API', () => {
     expect(paused).toMatchObject({ activeRun: second.id, activeRuns: [second.id, third.id] });
   });
 
+  it('reports up to concurrency.per_repo executing Runs of a repo', async () => {
+    h = await harness({ config: 'concurrency: { per_repo: 2 }\n' });
+    const t = h;
+    t.scripts.coder = (ctx) =>
+      new Promise((resolve) => ctx.signal.addEventListener('abort', () => resolve(done())));
+    const runs = [t.run('一'), t.run('二'), t.run('三')];
+    await waitFor(() => t.fake.calls.length === 2, 'two coders to start');
+    const busy: HealthView = (await call('GET', '/api/health')).json;
+    expect(busy).toMatchObject({ activeRun: runs[0]?.id, activeRuns: [runs[0]?.id, runs[1]?.id] });
+    const config: ConfigView = (await call('GET', '/api/config')).json;
+    expect(config.perRepo).toBe(2);
+  });
+
   it('tells a raw log deleted past retention from a missing one, and keeps the events', async () => {
     h = await harness();
     const { store, logPruner } = h.master;
@@ -840,6 +853,8 @@ agents:
     writeFile(join(home, 'workflows', 'broken.yaml'), 'id: dev2\nstages: []\n');
     h = await harness({ home, agents });
     const { json } = (await call('GET', '/api/config')) as { json: ConfigView };
+    // config.yaml leaves concurrency out: one Run of a repo at a time.
+    expect(json.perRepo).toBe(1);
     // Existing fields are unchanged: only enabled agents and valid templates.
     expect(json.agents.map((a) => a.id)).toEqual(['coder', 'coder2', 'reviewer']);
     expect(json.templates.map((t) => t.id)).toEqual(['dev']);

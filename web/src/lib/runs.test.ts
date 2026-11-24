@@ -605,7 +605,7 @@ describe('a review stopped halfway whose work could not be put back', () => {
 
   it('says the Run puts it back before its worktree is checked', () => {
     expect(eventText(deferred)).toBe(
-      '评审中途停下时，没能丢掉评审者留下的改动、把工作目录放回评审开始时的提交；Run 再拿到执行位时先补做，再检查工作目录、重新评审',
+      '评审中途停下时，没能丢掉评审者留下的改动、把工作目录放回评审开始时的提交；Run 再开始执行时先补做，再检查工作目录、重新评审',
     );
     expect(eventText({ type: 'review.changes_discarded', data: {} })).toBeNull();
   });
@@ -614,7 +614,7 @@ describe('a review stopped halfway whose work could not be put back', () => {
     setLang('en');
     const text = eventText(deferred);
     expect(text).toBe(
-      'When the review stopped halfway, what the reviewer left could not be dropped to put the working directory back where the review started; the Run does it first when it next gets the execution slot, before its working directory is checked and the review runs again',
+      'When the review stopped halfway, what the reviewer left could not be dropped to put the working directory back where the review started; the Run does it first when it next starts executing, before its working directory is checked and the review runs again',
     );
     expect(text).not.toMatch(/[一-鿿]/);
   });

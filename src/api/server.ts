@@ -207,6 +207,7 @@ export function createApi(deps: ApiDeps): Hono {
     const cfg = config();
     return c.json({
       language: cfg.master.language,
+      perRepo: cfg.master.concurrency.per_repo,
       agents: [...cfg.agents.values()],
       templates: [...cfg.templates.values()],
       errors: cfg.errors,

@@ -103,6 +103,7 @@ function input(github: GitHubRepoStatus | null, upgrade = off): GuideInput {
   return {
     github,
     pollMinutes: 5,
+    perRepo: 1,
     flow: github ? issueFlow(config, github, ['npm test']) : null,
     targetBranch: 'main',
     upgrade,
@@ -141,7 +142,11 @@ describe('the cycle', () => {
     expect(steps.run?.text).toContain('Master 每 5 分钟查一次带 ares1:ready 的 issue');
     expect(steps.run?.text).toContain('「自举开发」');
     expect(steps.run?.text).toContain(
-      '每个仓库同一时间只执行一个 Run，不同仓库的 Run 可以同时执行',
+      '每个仓库同一时间只执行一个 Run（concurrency.per_repo: 1），不同仓库的 Run 可以同时执行',
+    );
+    // More Runs of a repo at a time with concurrency.per_repo; they still merge one by one.
+    expect(byId({ ...input(manualRepo), perRepo: 2 }).run?.text).toContain(
+      '每个仓库同一时间最多执行 2 个 Run（concurrency.per_repo），各在自己的工作目录里做，合并时一个一个来',
     );
   });
 
@@ -858,7 +863,7 @@ describe('idleReasons', () => {
       scout: { ...scout, waiting: { reason: '等 1 个未结束的 Run 做完' } },
     };
     const stuck =
-      '有 1 个 Run 在等你审批或卡住了：它们让出了执行位；只等人的 Run 不挡自动侦察，但和等你处理的提案一起计入上限（max_proposals），攒满后不再侦察。到首页「待我处理」处理。';
+      '有 1 个 Run 在等你审批或卡住了：它们不算在正在执行的 Run 里（每个仓库最多同时执行 concurrency.per_repo 个），排队的 Run 照常开始；只等人的 Run 不挡自动侦察，但和等你处理的提案一起计入上限（max_proposals），攒满后不再侦察。到首页「待我处理」处理。';
     expect(idleReasons({ ...base, attention: 1 }, now)).toEqual([stuck]);
     // Runs waiting for you no longer hold the scout: what it waits for is said on its own.
     expect(idleReasons({ ...base, attention: 1, github: busy }, now)).toEqual([
@@ -1005,8 +1010,13 @@ describe('in English', () => {
     );
     expect(steps.push?.text).toContain('pushes the target branch (main) to GitHub');
     expect(steps.run?.text).toContain(
-      'each repo executes one Run at a time, while Runs of different repos can execute side by side',
+      'each repo executes one Run at a time (concurrency.per_repo: 1), while Runs of different repos can execute side by side',
     );
+    const parallel = byId({ ...inputEn(partialRepo), perRepo: 3 }).run?.text;
+    expect(parallel).toContain(
+      'each repo executes up to 3 Runs at a time (concurrency.per_repo), each in its own working directory, and they merge one at a time',
+    );
+    expect(parallel).not.toMatch(CJK);
     expect(runStages(inputEn(manualRepo))?.find((s) => s.id === 'e2e')?.name).toBe(
       'E2E (placeholder)',
     );
@@ -1118,7 +1128,7 @@ describe('in English', () => {
     }
     const stuck = idleReasons({ ...base, attention: 2 }, now);
     expect(stuck).toEqual([
-      '2 Runs are waiting for your approval or blocked: they free the execution slot. Runs waiting only for you do not hold the automatic scout back, but count toward its limit (max_proposals) together with the proposals waiting for you, and it stops scouting once that is reached. Handle them under "Needs me" on the home page.',
+      '2 Runs are waiting for your approval or blocked: they do not count among the executing Runs (up to concurrency.per_repo per repo), so queued Runs still start. Runs waiting only for you do not hold the automatic scout back, but count toward its limit (max_proposals) together with the proposals waiting for you, and it stops scouting once that is reached. Handle them under "Needs me" on the home page.',
     ]);
     expect(stuck.join('\n')).not.toMatch(/[一-鿿]/);
     expect(idleReasons({ ...base, github: waitingFor('5 proposals await you') }, now)).toEqual([
