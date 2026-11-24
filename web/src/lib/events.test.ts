@@ -70,6 +70,22 @@ const SAMPLES: [string, Record<string, unknown>][] = [
     },
   ],
   [
+    'github.diverged',
+    {
+      repo: 'demo',
+      branch: 'main',
+      local: 'a1',
+      remote: 'c3',
+      conflict: true,
+      files: ['a.ts'],
+      runId: 'run-1',
+    },
+  ],
+  [
+    'github.diverged_run',
+    { repo: 'demo', branch: 'main', local: 'aaaa1111', remote: 'cccc3333', runId: 'run-1' },
+  ],
+  [
     'github.merged_remote',
     { repo: 'demo', branch: 'main', local: 'aaaa1111', remote: 'cccc3333', merge: 'dddd4444' },
   ],
@@ -343,6 +359,55 @@ describe('globalEventText', () => {
     expect(text('github.merged_remote', merged)).not.toMatch(/[一-鿿]/);
   });
 
+  it('says when a divergence is handed to a Run the Master created to merge it', () => {
+    const pair = { repo: 'demo', branch: 'main', local: 'aaaaaaaa1111', remote: 'cccc33334444' };
+    const conflict = { ...pair, conflict: true, files: ['a.ts', 'b.ts'], runId: 'run-7' };
+    const failed = {
+      ...pair,
+      failed: { command: 'npm test', kind: 'verify', exitCode: 1, timedOut: false },
+      runId: 'run-7',
+    };
+    const created = { ...pair, runId: 'run-7' };
+    expect(text('github.diverged', conflict)).toBe(
+      'demo 的 main 和 GitHub 上的已经分叉（本地 aaaaaaaa，GitHub cccc3333），自动合并有冲突（a.ts、b.ts）；已交给 Run run-7 处理，不用你手动合并：编码 Agent 合并两边，评审并合并后推送；在此之前不推送，已完成 Run 的 issue 保持打开',
+    );
+    expect(text('github.diverged', failed)).toBe(
+      'demo 的 main 和 GitHub 上的已经分叉（本地 aaaaaaaa，GitHub cccc3333），自动合并后检查命令 `npm test` 没通过（退出码 1）；已交给 Run run-7 处理，不用你手动合并：编码 Agent 合并两边，评审并合并后推送；在此之前不推送，已完成 Run 的 issue 保持打开',
+    );
+    expect(text('github.diverged', { ...pair, runId: 'run-7' })).toBe(
+      'demo 的 main 和 GitHub 上的已经分叉（本地 aaaaaaaa，GitHub cccc3333），两边各有对方没有的提交；已交给 Run run-7 处理，不用你手动合并：编码 Agent 合并两边，评审并合并后推送；在此之前不推送，已完成 Run 的 issue 保持打开',
+    );
+    expect(text('github.diverged_run', created)).toBe(
+      'demo 的 main 和 GitHub 上的分叉了（本地 aaaaaaaa，GitHub cccc3333），Master 自己没能合并，建了 Run run-7：由编码 Agent 合并 GitHub 上的提交 cccc3333，评审并合并后推送到 GitHub',
+    );
+    expect(text('github.diverged_run', { repo: 'demo', branch: 'main' })).toBe(
+      'demo 的 main 和 GitHub 上的分叉了，Master 自己没能合并，建了一个 Run：由编码 Agent 合并 GitHub 上的新提交，评审并合并后推送到 GitHub',
+    );
+    // Still worth a look while nothing is pushed; the Run it created is told by the same.
+    expect(globalEventTone(ev('github.diverged', conflict))).toBe('attention');
+    expect(globalEventTone(ev('github.diverged_run', created))).toBe('neutral');
+
+    setLang('en');
+    expect(text('github.diverged', conflict)).toBe(
+      "Diverged from GitHub: main of demo (local aaaaaaaa, GitHub cccc3333) and the one on GitHub each have commits the other lacks, and the Master's merge conflicts in a.ts, b.ts. Run run-7 takes it over, with nothing to merge by hand: its coding agent merges the two, pushed once the Run is reviewed and merged; until then nothing is pushed and the issues of completed Runs stay open",
+    );
+    expect(text('github.diverged', failed)).toBe(
+      "Diverged from GitHub: main of demo (local aaaaaaaa, GitHub cccc3333) and the one on GitHub each have commits the other lacks, and the verify command `npm test` failed on the Master's merge (exit code 1). Run run-7 takes it over, with nothing to merge by hand: its coding agent merges the two, pushed once the Run is reviewed and merged; until then nothing is pushed and the issues of completed Runs stay open",
+    );
+    expect(text('github.diverged_run', created)).toBe(
+      'Diverged from GitHub: the Master could not merge main of demo (local aaaaaaaa, GitHub cccc3333) by itself, so it created Run run-7, whose coding agent merges commit cccc3333 from GitHub; pushed to GitHub once the Run is reviewed and merged',
+    );
+    expect(text('github.diverged_run', {})).toBe(
+      'Diverged from GitHub: the Master could not merge the target branch of a repo by itself, so it created a Run, whose coding agent merges the new commits from GitHub; pushed to GitHub once the Run is reviewed and merged',
+    );
+    for (const data of [conflict, failed, { ...pair, runId: 'run-7' }]) {
+      expect(text('github.diverged', data)).not.toMatch(/[一-鿿]/);
+    }
+    for (const data of [created, {}]) {
+      expect(text('github.diverged_run', data)).not.toMatch(/[一-鿿]/);
+    }
+  });
+
   it('counts what a scout proposed, with English plurals', () => {
     const data = { repo: 'demo', created: 3, auto: 1, pending: 2 };
     expect(text('scout.completed', data)).toBe(
@@ -425,11 +490,32 @@ describe('globalEventTone', () => {
 
 describe('globalEventLink', () => {
   it('links scouts and auto-accepted proposals to the Issues page', () => {
-    expect(globalEventLink({ type: 'scout.completed' })).toBe('#/issues');
-    expect(globalEventLink({ type: 'scout.failed' })).toBe('#/issues');
-    expect(globalEventLink({ type: 'issue.auto_accepted' })).toBe('#/issues');
-    expect(globalEventLink({ type: 'logs.pruned' })).toBeNull();
-    expect(globalEventLink({ type: 'master.restarted' })).toBeNull();
+    const issues = { href: '#/issues', label: '查看需求' };
+    expect(globalEventLink(ev('scout.completed'))).toEqual(issues);
+    expect(globalEventLink(ev('scout.failed'))).toEqual(issues);
+    expect(globalEventLink(ev('issue.auto_accepted'))).toEqual(issues);
+    expect(globalEventLink(ev('logs.pruned'))).toBeNull();
+    expect(globalEventLink(ev('master.restarted'))).toBeNull();
+    setLang('en');
+    expect(globalEventLink(ev('scout.completed'))).toEqual({
+      href: '#/issues',
+      label: 'See issues',
+    });
+  });
+
+  it('links a divergence handed to a Run, and the Run created for it, to that Run', () => {
+    const run = { href: '#/runs/run-7', label: '查看 Run' };
+    expect(globalEventLink(ev('github.diverged', { conflict: true, runId: 'run-7' }))).toEqual(run);
+    expect(globalEventLink(ev('github.diverged_run', { runId: 'run-7' }))).toEqual(run);
+    // For a human to merge: no Run to see.
+    expect(globalEventLink(ev('github.diverged', { conflict: true }))).toBeNull();
+    expect(globalEventLink(ev('github.diverged_run'))).toBeNull();
+    expect(globalEventLink(ev('github.pushed', { runId: 'run-7' }))).toBeNull();
+    setLang('en');
+    expect(globalEventLink(ev('github.diverged_run', { runId: 'run-7' }))).toEqual({
+      href: '#/runs/run-7',
+      label: 'See the Run',
+    });
   });
 });
 

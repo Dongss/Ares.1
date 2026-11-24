@@ -113,7 +113,7 @@ function EventLine({ event }: { event: EventRow }) {
             {link && (
               <>
                 {' '}
-                <a href={link}>{t({ zh: '查看需求', en: 'See issues' })}</a>
+                <a href={link.href}>{link.label}</a>
               </>
             )}
           </div>

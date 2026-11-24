@@ -240,6 +240,14 @@ export function globalEventText(event: GlobalEvent, now = new Date()): string | 
             })
           : '';
       const cause = divergedCause(d);
+      const runId = str(d.runId);
+      if (runId) {
+        // Handed to a Run the Master created to merge GitHub's commit: nothing for a human yet.
+        return t({
+          zh: `${branchOf(event)} 和 GitHub 上的已经分叉${at}，${cause?.text ?? '两边各有对方没有的提交'}；已交给 Run ${runId} 处理，不用你手动合并：编码 Agent 合并两边，评审并合并后推送；在此之前不推送，已完成 Run 的 issue 保持打开`,
+          en: `Diverged from GitHub: ${branchOf(event)}${at} and the one on GitHub each have commits the other lacks${cause ? `, and ${cause.text}` : ''}. Run ${runId} takes it over, with nothing to merge by hand: its coding agent merges the two, pushed once the Run is reviewed and merged; until then nothing is pushed and the issues of completed Runs stay open`,
+        });
+      }
       if (cause?.kind === 'environment') {
         return t({
           zh: `${branchOf(event)} 和 GitHub 上的已经分叉${at}，${cause.text}；装好后下一轮检查会自动再合并，在此之前不推送，已完成 Run 的 issue 保持打开`,
@@ -255,6 +263,31 @@ export function globalEventText(event: GlobalEvent, now = new Date()): string | 
       return t({
         zh: `${branchOf(event)} 和 GitHub 上的已经分叉${at}，两边各有对方没有的提交，不会自动合并，要你手动合并；在此之前不推送，已完成 Run 的 issue 保持打开`,
         en: `Diverged from GitHub: ${branchOf(event)}${at} and the one on GitHub each have commits the other lacks, and they are not merged by themselves. Merge them by hand; until then nothing is pushed and the issues of completed Runs stay open`,
+      });
+    }
+    case 'github.diverged_run': {
+      const runId = str(d.runId);
+      const local = str(d.local);
+      const remote = str(d.remote);
+      const at =
+        local && remote
+          ? t({
+              zh: `（本地 ${shortSha(local)}，GitHub ${shortSha(remote)}）`,
+              en: ` (local ${shortSha(local)}, GitHub ${shortSha(remote)})`,
+            })
+          : '';
+      const run = runId
+        ? t({ zh: ` Run ${runId}`, en: `Run ${runId}` })
+        : t({ zh: '一个 Run', en: 'a Run' });
+      const commit = remote
+        ? t({
+            zh: `GitHub 上的提交 ${shortSha(remote)}`,
+            en: `commit ${shortSha(remote)} from GitHub`,
+          })
+        : t({ zh: 'GitHub 上的新提交', en: 'the new commits from GitHub' });
+      return t({
+        zh: `${branchOf(event)} 和 GitHub 上的分叉了${at}，Master 自己没能合并，建了${run}：由编码 Agent 合并 ${commit}，评审并合并后推送到 GitHub`,
+        en: `Diverged from GitHub: the Master could not merge ${branchOf(event)}${at} by itself, so it created ${run}, whose coding agent merges ${commit}; pushed to GitHub once the Run is reviewed and merged`,
       });
     }
     case 'github.merged_remote': {
@@ -413,14 +446,32 @@ export function globalEventTone(event: GlobalEvent): Tone {
       return 'attention';
     case 'config.reloaded':
       return (num(event.data.errors) ?? 0) > 0 ? 'attention' : 'neutral';
+    case 'github.diverged_run':
+      // A Run took the merge over; the github.diverged recorded with it is the one to look at.
+      return 'neutral';
     default:
       return 'neutral';
   }
 }
 
-/** Where to see more about the event: scouts and the issues they propose live on the Issues page. */
-export function globalEventLink(event: Pick<EventRow, 'type'>): string | null {
-  if (event.type.startsWith('scout.') || event.type === 'issue.auto_accepted') return href.issues;
+/** A link from an event to where to see more about it. */
+export interface EventLink {
+  href: string;
+  label: string;
+}
+
+/**
+ * Where to see more about the event: scouts and the issues they propose live on the Issues page;
+ * a divergence handed to a Run, on that Run's page.
+ */
+export function globalEventLink(event: GlobalEvent): EventLink | null {
+  if (event.type.startsWith('scout.') || event.type === 'issue.auto_accepted') {
+    return { href: href.issues, label: t({ zh: '查看需求', en: 'See issues' }) };
+  }
+  const runId = str(event.data.runId);
+  if ((event.type === 'github.diverged' || event.type === 'github.diverged_run') && runId) {
+    return { href: href.run(runId), label: t({ zh: '查看 Run', en: 'See the Run' }) };
+  }
   return null;
 }
 

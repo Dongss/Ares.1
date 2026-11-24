@@ -46,13 +46,13 @@ Agent CLI 的原始输出（stream-json）带着工具调用的完整结果：�
 
 ### 全局事件
 
-Master 把不属于任何 Run 的事记成全局事件（事件的 Run 为空）：上一个 Master 异常退出（`master.restarted`）、清理原始日志（`logs.pruned`）、恢复数据库备份（`store.backup_restored`）、node 不见了（`master.node_missing`）、打开或关闭工作开关（`master.working`）、配置重新加载（`config.reloaded`、`config.reload_failed`）、访问 GitHub 出错（`github.error`，同一串连续失败里同一个错误只记一次，见「通知」）、webhook 通知发送失败（`notify.webhook_failed`）、系统通知发送失败（`notify.system_failed`）、推送目标分支（`github.pushed`）、从 GitHub 拉取目标分支（`github.pulled`、`github.merged_remote`、`github.diverged`、`github.pull_blocked`，见「拉取 GitHub 上的新提交」）、自动采纳提案（`issue.auto_accepted`）、侦察（`scout.started`、`scout.completed`、`scout.failed`、`scout.rate_limited`）和升级（`upgrade.started`、`upgrade.done`、`upgrade.failed`）。这篇文档里说「事件列表里记一条」这些事件的地方，都指这里。
+Master 把不属于任何 Run 的事记成全局事件（事件的 Run 为空）：上一个 Master 异常退出（`master.restarted`）、清理原始日志（`logs.pruned`）、恢复数据库备份（`store.backup_restored`）、node 不见了（`master.node_missing`）、打开或关闭工作开关（`master.working`）、配置重新加载（`config.reloaded`、`config.reload_failed`）、访问 GitHub 出错（`github.error`，同一串连续失败里同一个错误只记一次，见「通知」）、webhook 通知发送失败（`notify.webhook_failed`）、系统通知发送失败（`notify.system_failed`）、推送目标分支（`github.pushed`）、从 GitHub 拉取目标分支（`github.pulled`、`github.merged_remote`、`github.diverged`、`github.diverged_run`、`github.pull_blocked`，见「拉取 GitHub 上的新提交」）、自动采纳提案（`issue.auto_accepted`）、侦察（`scout.started`、`scout.completed`、`scout.failed`、`scout.rate_limited`）和升级（`upgrade.started`、`upgrade.done`、`upgrade.failed`）。这篇文档里说「事件列表里记一条」这些事件的地方，都指这里。
 
 Master 大部分时间没人看着，人回来时在看板的「事件」页查这段时间发生过什么：
 
 - 最新的在前，每页 200 条，底部「加载更早的」往前翻；有新的全局事件时自动刷新。
-- 每条有时间、类型和一句说明：比如删了几个原始日志、多大，上一个 Master 的 pid 和启动时间，恢复了哪个备份、较新的库移到了哪里。出错的（`github.error`、`notify.webhook_failed`、`notify.system_failed`、`config.reload_failed`、`upgrade.failed`、`scout.failed`）标成红色，值得留意的（`master.restarted`、`master.node_missing`、`store.backup_restored`、`github.diverged`、`github.pull_blocked`，有无效配置项的 `config.reloaded`）标成橙色。升级失败带着脚本输出末尾时可以展开看。鼠标悬停在说明上能看到原始数据。
-- 侦察和自动采纳的事件带着去「需求」页的链接。
+- 每条有时间、类型和一句说明：比如删了几个原始日志、多大，上一个 Master 的 pid 和启动时间，恢复了哪个备份、较新的库移到了哪里。出错的（`github.error`、`notify.webhook_failed`、`notify.system_failed`、`config.reload_failed`、`upgrade.failed`、`scout.failed`）标成红色，值得留意的（`master.restarted`、`master.node_missing`、`store.backup_restored`、`github.diverged`、`github.pull_blocked`，有无效配置项的 `config.reloaded`）标成橙色，其余的（包括建了合并 Run 的 `github.diverged_run`：要留意的分叉由同时记的 `github.diverged` 标出）不标颜色。分叉交给 Run 处理时，`github.diverged` 的说明写「已交给 Run <id> 处理」，不再要你手动合并。升级失败带着脚本输出末尾时可以展开看。鼠标悬停在说明上能看到原始数据。
+- 侦察和自动采纳的事件带着去「需求」页的链接；交给 Run 的 `github.diverged` 和 `github.diverged_run` 带着去这个 Run 的链接。
 - 看板还不认识的事件类型（以后新加的）照样列出，显示类型名和原始数据。
 - 每个 Run 自己的事件不在这里，在 Run 详情页。
 
@@ -87,7 +87,7 @@ Master 只在数据目录里还没有 `workflows/` 目录时（第一次启动�
 
 ## 接入 GitHub
 
-Run 只从 GitHub issue 来。
+Run 从 GitHub issue 来。例外只有一种：目标分支和 GitHub 上的分叉、Master 自己合并不了时，它自动建一个不关联 issue 的 Run 来合并（见「交给 Run 合并」）。
 
 1. 安装并登录 [gh](https://cli.github.com/)。登录了多个账号时，在 `config.yaml` 的 `github.account` 里指定用哪个。
 2. 在看板的「仓库」页登记本地仓库：填仓库名、绝对路径、目标分支和检查命令。常见语言的项目怎么填检查命令和准备命令，见 [`docs/examples/`](examples/README.md#在看板上登记仓库)。
@@ -176,7 +176,7 @@ stages:
 - GitHub 上还没有这个分支（新建的空仓库，或者分支被人删了）：按本地领先处理，不记 `github.error`、不通知，同一轮随后的推送在 GitHub 上建出这个分支（记 `github.pushed`）。拉取失败后 Master 再用 `git ls-remote --heads` 问一次 GitHub 有没有这个分支，问得到、回答没有才算这种情况；不看 git 的报错文字，它可能随系统语言变化。
 - 本地落后（本地目标分支是 GitHub 上那个提交的祖先）：把本地目标分支快进过去，事件列表里记一条 `github.pulled`（数据里有 `repo`、`branch`，快进前的提交 `from` 和快进后的 `to`），不通知。目标分支没在任何工作目录里检出时直接移动分支（比较并交换：分支在这期间被移动过就不动它，按一次普通的出错记录，下一轮再试）；检出在干净的工作目录里时在那里 `git merge --ff-only`，工作目录里的文件跟着更新。GitHub 上已经有这些提交，不会再推送一次。已经在执行的 Run 不受影响，它们合并时照常先合并目标分支的最新代码，有冲突走「合并冲突」的流程。
 - 本地落后，但目标分支检出在有未提交改动（只看已跟踪的文件）的工作目录里：不快进，事件列表里记一条 `github.pull_blocked`（数据里有 `repo`、`branch`、原因 `reason`（目前只有 `dirty`）、检出它的工作目录 `worktree`，以及 `git status --porcelain` 列出的改动 `status`），并通知「没能拉取 GitHub 上的新提交」。同一种原因在连续受阻的几轮里只记一次、只通知一次；快进成功、或者有一轮不再受阻后重新开始。提交或丢弃这些改动后，下一轮检查自动拉取。这期间也不推送：GitHub 上已经有本地的提交，推送只会因为不能快进被拒绝。
-- 两边分叉（各有对方没有的提交，比如有人在 GitHub 上直接提交，同时 Master 合并了 Run）：Master 自己把 GitHub 上的提交合并进来，不建 Run，详见下面的「分叉时自动合并」。合并成功时本地目标分支快进到合并提交，同一轮随后推送到 GitHub；合并有冲突或者合并后检查没通过时，本地目标分支不变、不推送，等你手动合并。
+- 两边分叉（各有对方没有的提交，比如有人在 GitHub 上直接提交，同时 Master 合并了 Run）：Master 先自己把 GitHub 上的提交合并进来，详见下面的「分叉时自动合并」。合并成功时本地目标分支快进到合并提交，同一轮随后推送到 GitHub。合并有冲突或者合并后检查没通过时，本地目标分支不变、不推送，Master 建一个合并 GitHub 上那个提交的 Run，由编码 Agent 解决，评审并合并后下一轮推送，见下面的「交给 Run 合并」；建不了 Run，或者这个 Run 被终止、失败了，才等你手动合并。
 
 #### 分叉时自动合并
 
@@ -185,19 +185,31 @@ stages:
 3. 检查全部通过后，再看一次有没有 Run 开始合并这个仓库：有就这一轮不动，下一轮直接用这个已经检查过的合并提交，不再跑一遍检查。没有就像「本地落后」一样把本地目标分支快进到合并提交（比较并交换；检出在有未提交改动的工作目录里时记 `github.pull_blocked`，改动清掉后下一轮接着快进，同样不重跑检查），事件列表里记一条 `github.merged_remote`（数据里有 `repo`、`branch`，两边的提交 `local`、`remote` 和合并提交 `merge`），不通知。同一轮随后照常推送，记 `github.pushed`；之后已完成 Run 的 issue 照常关闭。
 4. 不管结果如何，临时工作目录都会删掉；合并提交本身留在仓库里，供快进用。Master 在检查途中被强行结束、没来得及删的，下次启动时删掉（登记的仓库里、系统临时目录下名字以 `ares1-merge-` 开头的工作目录）。
 
-没能自动合并时，本地目标分支不变，事件列表里记一条 `github.diverged`（数据里有 `repo`、`branch`，两边的提交 `local`、`remote`），并通知一次「没能拉取 GitHub 上的新提交」，正文写明原因：
+没能自动合并时，本地目标分支不变，事件列表里记一条 `github.diverged`（数据里有 `repo`、`branch`，两边的提交 `local`、`remote`；交给 Run 处理时还有这个 Run 的 `runId`），并通知一次「没能拉取 GitHub 上的新提交」，正文写明原因：
 
-- 合并有冲突：中止合并，不运行任何命令，数据里有 `conflict: true` 和有冲突的文件 `files`。通知要你手动合并。
-- 合并后有命令没通过：数据里有 `failed`（命令 `command`、种类 `kind`（`setup` 准备命令或 `verify` 检查命令）、退出码 `exitCode`、是否超时 `timedOut`、输出末尾 `output`）和日志路径 `log`。通知要你手动处理后合并。
-- 有条命令要启动的程序在运行环境里找不到（比如没有 `npm`，和 Run 的「运行环境缺少命令」一样判断，能事先看出来的在合并前就判断，不建临时工作目录）：数据里的 `failed` 有命令、种类和找不到的程序 `missing`。这不怪代码，所以这一对提交之后每轮都再试；同一对只记一次。通知说装好后下一轮会自动再合并。
+- 合并有冲突：中止合并，不运行任何命令，数据里有 `conflict: true` 和有冲突的文件 `files`。交给一个 Run 合并（见下面的「交给 Run 合并」），通知说已交给这个 Run 处理；建不了 Run 时通知要你手动合并。
+- 合并后有命令没通过：数据里有 `failed`（命令 `command`、种类 `kind`（`setup` 准备命令或 `verify` 检查命令）、退出码 `exitCode`、是否超时 `timedOut`、输出末尾 `output`）和日志路径 `log`。和冲突一样交给 Run；建不了 Run 时通知要你手动处理后合并。
+- 有条命令要启动的程序在运行环境里找不到（比如没有 `npm`，和 Run 的「运行环境缺少命令」一样判断，能事先看出来的在合并前就判断，不建临时工作目录）：数据里的 `failed` 有命令、种类和找不到的程序 `missing`。这不怪代码，所以不建 Run，这一对提交之后每轮都再试；同一对只记一次。通知说装好后下一轮会自动再合并。
 - Master 运行的 node 不见了（见「换 Node 版本时」）：这一轮不合并，也不记录，等 node 回来后下一轮再试。Master 停止时正在运行的命令会被中止，下次启动后再试。
 
-冲突和命令失败的那一对提交（本地和 GitHub 上各自的提交）不再重试，免得每轮都跑一遍检查命令。分叉期间不推送（推送每轮都会被拒绝），所以也不会每轮报推送失败。分叉期间本地或 GitHub 上又有了新提交（比如又有 Run 合并了），就是新的一对，重新尝试合并；还是失败就再记一条带 `repeated: true` 的 `github.diverged`，不再通知（之前只是找不到程序、这次是冲突或命令失败时除外，那是新情况，会通知）。分叉消失后（自动合并成功，或你手动合并了），下一轮照常推送；之后再分叉会重新记录、重新通知。
+冲突和命令失败的那一对提交（本地和 GitHub 上各自的提交）不再重试，免得每轮都跑一遍检查命令。分叉期间不推送（推送每轮都会被拒绝），所以也不会每轮报推送失败。分叉期间本地或 GitHub 上又有了新提交（比如又有 Run 合并了），就是新的一对，重新尝试合并；还是失败就再记一条 `github.diverged`。同一次分叉里，下面每种情况只通知一次，之后同样的记录带 `repeated: true`，不再通知：交给同一个 Run（交给另一个 Run 时再通知一次）；要你手动合并；找不到程序（之前已经交给 Run 或要你手动合并时，找不到程序不再通知）。分叉消失后（自动合并成功、合并 Run 合并了，或你手动合并了），下一轮照常推送；之后再分叉会重新记录、重新通知。
 
 - 分叉期间完成的 Run，代码合并进了本地目标分支，但还没推到 GitHub 上，所以它的 issue 保持打开，标签不变。分叉消失后，下一轮检查推送上去，issue 随之关闭，评论里写明已推送到 GitHub。
 - 手动合并的做法：在登记的仓库里 `git fetch`，再 `git merge origin/<目标分支>`，解决冲突后提交。推送可以自己做，也可以留给 Master 下一轮做。
 
-有 Run 正在执行合并阶段时，这个仓库这一轮不拉取，也不自动合并，免得和合并抢目标分支；等审批合并的 Run 不算。拉取失败（网络不通、gh 没登录、没有权限等；GitHub 上没有这个分支不算，见上面）和其他访问 GitHub 的失败一样记 `github.error`，按「一串连续失败」去重（见「通知」），这一轮的其他步骤照常进行；git 连合并都开始不了（不是冲突）时也这样记，下一轮再试。自动合并要跑检查命令时，这一轮后面的步骤（领取 issue、同步 issue 等）等它跑完再做，每对提交最多跑一次。分叉和受阻的状态只记在 Master 的内存里：Master 重启后第一轮重新判断，还在分叉时会再尝试一次自动合并，失败会再记一条、再通知一次。
+有 Run 正在执行合并阶段时，这个仓库这一轮不拉取，也不自动合并，免得和合并抢目标分支；等审批合并的 Run 不算。拉取失败（网络不通、gh 没登录、没有权限等；GitHub 上没有这个分支不算，见上面）和其他访问 GitHub 的失败一样记 `github.error`，按「一串连续失败」去重（见「通知」），这一轮的其他步骤照常进行；git 连合并都开始不了（不是冲突）时也这样记，下一轮再试。自动合并要跑检查命令时，这一轮后面的步骤（领取 issue、同步 issue 等）等它跑完再做，每对提交最多跑一次。分叉和受阻的状态只记在 Master 的内存里：Master 重启后第一轮重新判断，还在分叉时会再尝试一次自动合并，失败会再记一条、再通知一次。交给哪个 Run 不靠内存，而是按 Run 上记的提交查（见下面），所以重启后不会为同一个提交另建 Run。
+
+#### 交给 Run 合并
+
+Master 自己合并有冲突或者合并后检查没通过时，建一个 Run，让编码 Agent 把 GitHub 上的那个提交合并进来：
+
+- **建什么样的 Run**：模板用这个仓库在 `github.repos.<name>.template` 里配的（和它的 issue 的 Run 一样，数据目录的优先，没有就用仓库自带的），遵守 `auto_merge`（打开时合并不等审批），不关联 issue。Run 上记着要合并的提交 `mergeRemote`（`GET /api/runs/:id` 返回的 `run` 和 Run 的 `run.created` 事件里都有；只有 Master 自己会设它）。目标按 Master 的语言写，写得完整，需求评估不用再问：合并 GitHub 上 <目标分支> 的提交 <短 hash>，两边的完整提交，冲突时两边的改动都要保留、删掉所有冲突标记，合并后仓库的检查命令要能通过，只做这次合并需要的改动；最后附上 Master 自己合并时遇到的情况：冲突的文件，或者没通过的命令、退出码或超时、日志路径和输出的最后部分（最多 2000 字）。
+- **编码阶段怎么合并**：第一个会改代码的 Agent 阶段（通常是编码；需求评估、评审和拆分计划不算）的 Task 启动 Agent 之前，Master 在 Run 的工作目录里执行 `git merge --no-ff --no-commit <这个提交>`，把冲突标记留在文件里，Run 的事件里记 `merge.started`（`source` 为 `remote`，`targetHead` 是这个提交）。之后和「合并冲突」一样：提示词说明有一个未完成的合并、列出冲突的文件，要求两边的改动都保留；Agent 完成后先检查冲突文件里还有没有冲突标记，有就带着文件名返工；再运行检查命令，通过后由 Master 提交，这个 Task 的提交就是以这个 GitHub 提交为父提交之一的合并提交。没有冲突、只是合并后检查没通过时也这样合并，Agent 修好检查就行。阶段拆成几步时只有第一步合并；之后的步骤、返工、后面的阶段和轮次看到这个提交已经在 HEAD 里，就不再合并。合并进来的 GitHub 提交算这个 Run 的改动，评审时一起看。中途暂停、Master 重启或 Task 最终失败时，工作目录回到合并之前，下次执行重新合并。这个提交在仓库里找不到（比如被垃圾回收了）时，Run 直接结束、标为失败，`error` 写明原因。
+- **合并之后**：Run 照常评审，经合并阶段合并进本地目标分支，本地目标分支就包含了 GitHub 上的那个提交。下一轮检查看到本地领先，不再记 `github.diverged`，照常推送（`github.pushed`），分叉期间完成的 Run 的 issue 随之关闭。
+- **一个提交只建一个 Run**：按（仓库，GitHub 上的提交）去重，查的是 Run 上记的 `mergeRemote`，存在数据库里，Master 重启后照样有效。这个 Run 还没结束（排队、执行中、等审批、卡住、暂停）时，之后再记的 `github.diverged` 都带着它的 `runId`，不另建；分叉期间本地又有了新提交（比如别的 Run 合并了）也是这样。GitHub 上又有了新提交时是新的一对，先重新尝试自动合并，还是失败就为新的提交另建一个 Run。
+- **Run 结束而没合并时**：这个 Run 被终止（比如你在看板上终止）或失败后，下一轮记一条不带 `runId` 的 `github.diverged`，通知一次要你手动合并，回到没有这个 Run 时的做法。同一个 GitHub 提交之后不再自动建 Run，Master 重启后也一样；它不来自 issue，失败后也不会自动重做。
+- **不建 Run 的情况**：缺程序（见上面，装好后 Master 自己再合并）；仓库关了 `push`（这时根本不拉取、不检查分叉）；模板找不到、没有 Agent 阶段，或者建 Run 出错。后两种要你手动合并。
+- **事件**：建 Run 时，在同一个事务里记 `github.diverged`（带 `runId`）和 `github.diverged_run`（数据里有 `repo`、`branch`、两边的提交 `local`、`remote` 和 `runId`）。`github.diverged_run` 本身不通知，通知由同时记的 `github.diverged` 发：正文说已交给 Run <id> 处理、编码 Agent 合并两边、评审并合并后自动推送，点开是这个 Run。
 
 ### Run 期间改了 issue
 
@@ -501,12 +513,13 @@ Run 等审批或卡住等人时不算在正在执行的 Run 里，同一仓库�
 - 冲突反复出现时，和别的回退一样受 `max_loops` 限制，用完后按 `on_exhausted` 处理（默认 Run 结束、标为失败）。
 - 合并阶段的 `on_fail` 指向的不是 Agent 阶段（比如评审阶段，它不能改文件）时，没有 Agent 能解决冲突，Run 不等人，直接结束、标为失败，`error` 里列出冲突的文件；从 issue 来的按 `max_run_attempts` 自动重做（见下面的「Run 什么时候停下来等人」）。重做在目标分支的最新代码上新建工作目录，编码 Agent 从一开始就基于最新代码改，原来的冲突也就没了。加载模板时会对这种设置给出警告；想让 Agent 解决冲突，就把 `on_fail` 指向一个 Agent 阶段。
 - git 合并因为冲突以外的原因失败时（git 锁、磁盘满、索引损坏等，git 没报出冲突的文件），没有冲突可解决，Run 结束、标为失败，从 issue 来的按 `max_run_attempts` 自动重做（见下面的「Run 什么时候停下来等人」）。
+- 分叉时 Master 建的合并 Run 也用这套做法让 Agent 解决冲突，只是合并的是 GitHub 上的那个提交，而且从第一个会改代码的 Agent 阶段一开始就合并，不用等合并阶段冲突回退，见上面的「交给 Run 合并」。
 
 ## Run 什么时候停下来等人
 
 Run 卡住（`blocked`）、已暂停或等审批时不算在正在执行的 Run 里（见「同时执行几个 Run」），排队的 Run 照常执行。这些只等人的 Run 也不会让仓库停止自动侦察：它们和等你处理的提案一起计入 `scout.max_proposals`，合计没到上限时照常侦察，到了上限才等你处理（见上面的「接入 GitHub」）。只有排队、执行中的 Run，等评估回复且设了超时的 Run，以及等目标分支上的改动清掉的 Run（见下面），会让侦察等它们做完。默认配置下，只有这些情况会停下来等人：
 
-- 审批：模板里设了 `gate` 的阶段（从 issue 来的 Run 打开 `auto_merge` 时，合并不等审批）。
+- 审批：模板里设了 `gate` 的阶段（从 issue 来的 Run 和分叉时交给 Run 合并的 Run，在仓库打开 `auto_merge` 时，合并不等审批）。
 - 需求评估有疑问，等你回复，最多等 `reply_timeout_hours`（到时间评估自己决定，所以这种 Run 算作会自己往下走；设为 `null` 时一直等，算作只等人）；issue 作者不是仓库成员，等你确认需求。
 - 配置为等人时：`on_agent_error: human`（包括 Agent 不可用时）、`on_exhausted: human`、`on_budget_exceeded: pause`（超出预算）。
 
@@ -541,7 +554,7 @@ Agent 出错且重试、换 Agent 都用完，Agent 不可用且没有可换的 
 
 访问 GitHub 失败（读写 issue、推送目标分支、侦察时搜索 issue 等）时，事件列表里记一条 `github.error`（数据是 `{ message }`，错误信息），并通知「GitHub 访问失败」，正文是错误信息的第一行，点开是「需求」页。一轮轮询要对每个登记的仓库做好几步，每一步都可能失败，所以按「一串连续失败」去重：从第一次失败起，到有一轮轮询对 GitHub 的访问全部成功为止，同一个错误只记一条、只通知一次，哪怕几种错误轮流出现（比如两个仓库一个返回 404、一个返回 502）也是每种各一条，不会每轮都通知。有一轮访问全部成功后重新开始，之后同样的错误再出现会再记、再通知。错误信息里可能带每次都变的内容（比如请求 id），所以一串失败最多记 20 种不同的错误，超过后这串失败不再记新的 `github.error`。看板「需求」页上的「GitHub 调用失败」不去重，始终显示最近一次失败的时间和信息，有一轮访问全部成功后消失。
 
-目标分支和 GitHub 上的分叉了、Master 没能自动合并（`github.diverged`），或者因为检出的工作目录有未提交的改动没能快进（`github.pull_blocked`）时，通知「没能拉取 GitHub 上的新提交：<仓库名>」，正文说明原因和要你做什么：自动合并有冲突（列出冲突的文件）或者合并后哪条命令没通过，要你手动合并；检查要用的程序找不到，装好后会自动再合并；或者要处理那些改动。点开是「需求」页。同一次分叉、同一种原因只通知一次，细节见「拉取 GitHub 上的新提交」。快进成功（`github.pulled`）和分叉后自动合并成功（`github.merged_remote`）不通知。
+目标分支和 GitHub 上的分叉了、Master 没能自动合并（`github.diverged`），或者因为检出的工作目录有未提交的改动没能快进（`github.pull_blocked`）时，通知「没能拉取 GitHub 上的新提交：<仓库名>」，正文说明原因和要你做什么：自动合并有冲突（列出冲突的文件）或者合并后哪条命令没通过，已交给 Run <id> 处理（编码 Agent 合并两边，评审并合并后自动推送），点开是这个 Run；建不了 Run，或者这个 Run 被终止、失败了，要你手动合并；检查要用的程序找不到，装好后会自动再合并；或者要处理那些改动。除了交给 Run 的，点开都是「需求」页。同一次分叉里，交给同一个 Run、要你手动合并、同一种原因都只通知一次，细节见「拉取 GitHub 上的新提交」和「交给 Run 合并」。快进成功（`github.pulled`）、分叉后自动合并成功（`github.merged_remote`）和建了合并 Run（`github.diverged_run`，由同时记的 `github.diverged` 通知）不通知。
 
 通知有三条通道，用同一套规则（`src/notify/notice.ts`）：
 
