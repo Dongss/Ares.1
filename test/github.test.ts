@@ -2373,6 +2373,55 @@ describe('issues: pulling the target branch from GitHub', () => {
     expect(t.master.issues.status().lastError).toBeNull();
   });
 
+  it('creates the target branch on a new, empty GitHub repo without reporting an error', async () => {
+    const sent: string[] = [];
+    gh = new FakeGitHub();
+    gh.remoteMissing = true;
+    const t = await harness({
+      agents: AGENTS,
+      config: `${config({ push: true })}notify:\n  system: true\n`,
+      github: gh,
+      master: { notice: (title) => sent.push(title) },
+    });
+    h = t;
+    const local = head(t);
+    await t.master.issues.poll();
+    expect(gh.calls).toContain('fetch main');
+    expect(events(t, 'github.error')).toHaveLength(0);
+    expect(t.master.issues.status().lastError).toBeNull();
+    expect(events(t, 'github.pushed').map((e) => e.data)).toEqual([
+      { repo: 'demo', branch: 'main', head: local },
+    ]);
+    expect(gh.pushes).toEqual([local]);
+    expect(gh.remoteMissing).toBe(false);
+    expect(gh.remoteHead).toBe(local);
+    expect(head(t)).toBe(local);
+    expect(events(t, 'github.pulled')).toHaveLength(0);
+    expect(events(t, 'github.diverged')).toHaveLength(0);
+
+    // GitHub has it now: the next round finds nothing to do.
+    await t.master.issues.poll();
+    expect(gh.pushes).toEqual([local]);
+    expect(events(t, 'github.error')).toHaveLength(0);
+    expect(sent).toEqual([]);
+  });
+
+  it('pushes the target branch again when it was deleted on GitHub', async () => {
+    const t = await start(config({ push: true }));
+    gh.remoteHead = head(t);
+    const local = commitLocally(t);
+    await t.master.issues.poll();
+    expect(gh.pushes).toEqual([local]);
+
+    // Somebody deletes the branch on GitHub; the local one has not moved since the push.
+    gh.remoteMissing = true;
+    await t.master.issues.poll();
+    expect(gh.pushes).toEqual([local, local]);
+    expect(gh.remoteMissing).toBe(false);
+    expect(events(t, 'github.error')).toHaveLength(0);
+    expect(t.master.issues.status().lastError).toBeNull();
+  });
+
   it('does not fetch for repos that do not push', async () => {
     const t = await start(config({ push: false }));
     gh.remoteHead = pushedByOthers(t, head(t));

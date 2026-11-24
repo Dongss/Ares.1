@@ -817,6 +817,8 @@ export class IssueBridge {
    * as not to race the engine for the branch (a merge that starts meanwhile is guarded by
    * fastForwardBranch's compare-and-swap). Runs going on merge the new commits as usual when
    * they merge. By GitHub's commit (remote) and the local one (local):
+   * - GitHub has no such branch yet (a new, empty repo, or the branch was deleted): as local
+   *   ahead, the push later in the round creates it;
    * - the same, or local ahead (not pushed yet): nothing to do, the push follows;
    * - local behind: fast-forwarded (`github.pulled`). GitHub has it, so it is not pushed back,
    *   nor is the old commit while the fast-forward is refused because the branch is checked
@@ -833,6 +835,13 @@ export class IssueBridge {
     const branch = repo.targetBranch;
     const full = await this.issuesRepo(repo, cfg);
     const remote = await this.gh().fetch(repo.path, full, branch);
+    if (remote === null) {
+      this.diverged.delete(repo.id);
+      this.pullBlocked.delete(repo.id);
+      // What was pushed is gone (or never was): the push later in the round creates it again.
+      this.pushed.delete(repo.path);
+      return;
+    }
     await this.trackOrigin(repo, full, remote);
     const local = await revParse(repo.path, branch);
     if (remote === local || (await isAncestor(repo.path, remote, local))) {

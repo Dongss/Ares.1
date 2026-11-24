@@ -456,7 +456,11 @@ export class FakeGitHub implements GitHub {
   async push(path: string, _repo: string, branch: string): Promise<void> {
     this.call(`push ${branch}`);
     const head = execFileSync('git', ['rev-parse', branch], { cwd: path, encoding: 'utf8' }).trim();
-    if (this.remoteHead !== null) {
+    if (this.remoteMissing) {
+      // The push creates the branch on GitHub.
+      this.remoteMissing = false;
+      this.remoteHead = head;
+    } else if (this.remoteHead !== null) {
       // GitHub refuses what is not a fast-forward of what it has.
       const ff = spawnSync('git', ['merge-base', '--is-ancestor', this.remoteHead, head], {
         cwd: path,
@@ -473,8 +477,12 @@ export class FakeGitHub implements GitHub {
    */
   remoteHead: string | null = null;
 
-  async fetch(path: string, _repo: string, branch: string): Promise<string> {
+  /** GitHub has no such branch yet (a new, empty repo): fetch finds none, a push creates it. */
+  remoteMissing = false;
+
+  async fetch(path: string, _repo: string, branch: string): Promise<string | null> {
     this.call(`fetch ${branch}`);
+    if (this.remoteMissing) return null;
     if (this.remoteHead !== null) return this.remoteHead;
     return execFileSync('git', ['rev-parse', branch], { cwd: path, encoding: 'utf8' }).trim();
   }

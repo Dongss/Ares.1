@@ -73,8 +73,9 @@ export interface GitHub {
   /**
    * Fetch `branch` of the GitHub repo into the local clone at `path`, as the same account, and
    * return the commit it points at. No ref of the clone moves; the commit's objects are in it.
+   * null: the GitHub repo has no such branch yet (e.g. a new, empty repo).
    */
-  fetch(path: string, repo: string, branch: string): Promise<string>;
+  fetch(path: string, repo: string, branch: string): Promise<string | null>;
 }
 
 export class GhError extends Error {}
@@ -431,18 +432,30 @@ export class GhCli implements GitHub {
     );
   }
 
-  async fetch(path: string, repo: string, branch: string): Promise<string> {
+  async fetch(path: string, repo: string, branch: string): Promise<string | null> {
     const failed = (detail: string) =>
       t({
         zh: `从 ${repo} 拉取 ${branch} 失败：${detail}`,
         en: `Fetching ${branch} from ${repo} failed: ${detail}`,
       });
-    // Into FETCH_HEAD only: no ref of the clone changes, the caller decides what to move.
-    await this.gitWithGh(
-      path,
-      ['fetch', '-q', '--no-tags', `https://github.com/${repo}.git`, `refs/heads/${branch}`],
-      failed,
-    );
+    const url = `https://github.com/${repo}.git`;
+    const ref = `refs/heads/${branch}`;
+    try {
+      // Into FETCH_HEAD only: no ref of the clone changes, the caller decides what to move.
+      await this.gitWithGh(path, ['fetch', '-q', '--no-tags', url, ref], failed);
+    } catch (err) {
+      // Whether GitHub lacks the branch is asked of ls-remote rather than read from fetch's
+      // message, which git may write in the system's language; only after a failure, so a
+      // round still costs one request.
+      let heads: string;
+      try {
+        heads = await this.gitWithGh(path, ['ls-remote', '--heads', url, ref], failed);
+      } catch {
+        throw err;
+      }
+      if (heads === '') return null;
+      throw err;
+    }
     return this.gitWithGh(path, ['rev-parse', '--verify', 'FETCH_HEAD^{commit}'], failed);
   }
 }

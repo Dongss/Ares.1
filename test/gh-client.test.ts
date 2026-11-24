@@ -50,7 +50,7 @@ const FAKE_GIT = `#!/usr/bin/env node
 const fs = require('node:fs');
 const path = require('node:path');
 const call = { args: process.argv.slice(2), token: process.env.GH_TOKEN ?? null, cwd: process.cwd() };
-fs.writeFileSync(path.join(__dirname, 'git-call.json'), JSON.stringify(call));
+fs.appendFileSync(path.join(__dirname, 'git-calls.jsonl'), JSON.stringify(call) + '\\n');
 process.stderr.write('fatal: Authentication failed for https://github.com/acme/widgets.git/\\n');
 process.exitCode = 128;
 `;
@@ -693,13 +693,26 @@ describe('GhCli with an account', () => {
   });
 });
 
-/** A fake `git` first on PATH; returns where it records its call. */
-function fakeGit(): string {
+interface GitCall {
+  args: string[];
+  token: string | null;
+  cwd: string;
+}
+
+/** A fake `git` first on PATH that always fails; returns the calls it got so far, in order. */
+function fakeGit(): () => GitCall[] {
   const dir = tmpDir('ares1-git-');
   writeFile(join(dir, 'git'), FAKE_GIT);
   chmodSync(join(dir, 'git'), 0o755);
   setEnv('PATH', `${dir}${delimiter}${process.env.PATH ?? ''}`);
-  return join(dir, 'git-call.json');
+  const record = join(dir, 'git-calls.jsonl');
+  return () =>
+    existsSync(record)
+      ? readFileSync(record, 'utf8')
+          .split('\n')
+          .filter(Boolean)
+          .map((line) => JSON.parse(line) as GitCall)
+      : [];
 }
 
 /** Point https://github.com/acme/ at a local directory, so no push reaches the network. */
@@ -724,7 +737,7 @@ describe('GhCli push', () => {
       "ares1-gh-it's-",
     );
     expect(gh.bin).toContain("'");
-    const record = fakeGit();
+    const calls = fakeGit();
     const clone = tmpDir('ares1-clone-');
 
     const err = await ghError(
@@ -734,11 +747,9 @@ describe('GhCli push', () => {
       '推送 ares1/run-1 到 acme/widgets 失败：fatal: Authentication failed for https://github.com/acme/widgets.git/',
     );
 
-    const call = JSON.parse(readFileSync(record, 'utf8')) as {
-      args: string[];
-      token: string | null;
-      cwd: string;
-    };
+    expect(calls()).toHaveLength(1);
+    const [call] = calls();
+    if (!call) throw new Error('git was not called');
     const quoted = `'${gh.bin.split("'").join("'\\''")}'`;
     expect(call.args).toEqual([
       '-c',
@@ -794,27 +805,36 @@ describe('GhCli push', () => {
 describe('GhCli fetch', () => {
   it('uses gh as the credential helper and keeps the token out of the arguments', async () => {
     const gh = fakeGh([{ when: ['auth', 'token', '--user', 'ares1-bot'], stdout: 'tok-2\n' }]);
-    const record = fakeGit();
+    const calls = fakeGit();
     const clone = tmpDir('ares1-clone-');
 
     const err = await ghError(new GhCli(gh.bin, 'ares1-bot').fetch(clone, 'acme/widgets', 'main'));
     expect(err.message).toBe(
       '从 acme/widgets 拉取 main 失败：fatal: Authentication failed for https://github.com/acme/widgets.git/',
     );
-    const call = JSON.parse(readFileSync(record, 'utf8')) as { args: string[]; token: string };
-    expect(call.args).toEqual([
+    const helper = [
       '-c',
       'credential.helper=',
       '-c',
       `credential.helper=!'${gh.bin}' auth git-credential`,
-      'fetch',
-      '-q',
-      '--no-tags',
-      'https://github.com/acme/widgets.git',
-      'refs/heads/main',
+    ];
+    // After the failed fetch it asks whether GitHub has the branch; that fails too, so the
+    // fetch's error stands.
+    expect(calls().map((c) => c.args)).toEqual([
+      [
+        ...helper,
+        'fetch',
+        '-q',
+        '--no-tags',
+        'https://github.com/acme/widgets.git',
+        'refs/heads/main',
+      ],
+      [...helper, 'ls-remote', '--heads', 'https://github.com/acme/widgets.git', 'refs/heads/main'],
     ]);
-    expect(call.token).toBe('tok-2');
-    expect(call.args.join(' ')).not.toContain('tok-2');
+    for (const call of calls()) {
+      expect(call.token).toBe('tok-2');
+      expect(call.args.join(' ')).not.toContain('tok-2');
+    }
     expect(err.message).not.toContain('tok-2');
   });
 
@@ -840,14 +860,31 @@ describe('GhCli fetch', () => {
     expect(git(clone, 'for-each-ref')).toBe(refs);
   });
 
-  it('reports what git wrote to stderr when the branch is not on GitHub', async () => {
-    const clone = initRepo();
+  it('returns null when GitHub has no such branch, as in a new, empty repo', async () => {
     const remotes = localGitHub();
-    git(remotes, 'init', '-q', '--bare', 'widgets.git');
+    const bare = join(remotes, 'widgets.git');
+    mkdirSync(bare);
+    git(bare, 'init', '-q', '--bare');
+    const clone = initRepo();
+    const refs = git(clone, 'for-each-ref');
+    const cli = new GhCli(fakeGh([]).bin);
 
-    const err = await ghError(new GhCli(fakeGh([]).bin).fetch(clone, 'acme/widgets', 'no-such'));
-    expect(err.message).toMatch(/^从 acme\/widgets 拉取 no-such 失败：/);
-    expect(err.message).toContain('no-such');
+    expect(await cli.fetch(clone, 'acme/widgets', 'main')).toBeNull();
+    // Other branches on GitHub do not count.
+    const theirs = initRepo();
+    git(theirs, 'push', '-q', bare, 'main:other');
+    expect(await cli.fetch(clone, 'acme/widgets', 'main')).toBeNull();
+    expect(git(clone, 'for-each-ref')).toBe(refs);
+  });
+
+  it('reports what git wrote to stderr when GitHub cannot be reached', async () => {
+    const clone = initRepo();
+    // No repo there: neither the fetch nor the question whether the branch exists gets through.
+    localGitHub();
+
+    const err = await ghError(new GhCli(fakeGh([]).bin).fetch(clone, 'acme/widgets', 'main'));
+    expect(err.message).toMatch(/^从 acme\/widgets 拉取 main 失败：/);
+    expect(err.message).toContain('widgets.git');
   });
 });
 
