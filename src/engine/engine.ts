@@ -140,6 +140,7 @@ import {
   assessmentArtifact,
   assessPrompt,
   type MergeInProgress,
+  mergeSubject,
   type PlannedStep,
   type PreviousPlan,
   type PreviousReview,
@@ -253,6 +254,11 @@ export interface CreateRunInput {
    * (`untrusted_issue`) with this message, and starts once a human confirms it with a retry.
    */
   confirmGoal?: string;
+  /**
+   * Only for the Master itself: a commit of the target branch on GitHub the Run merges in. Its
+   * first agent task starts the merge in the worktree and leaves conflicts to the agent.
+   */
+  mergeRemote?: string;
 }
 
 export interface RetryInput {
@@ -276,13 +282,26 @@ interface Active {
   done: Promise<void>;
 }
 
-/** A merge of the target branch in the worktree that a task's agent resolves (`conflictMerge`). */
+/**
+ * A merge in the worktree that a task's agent resolves (`conflictMerge`): of the target branch, or
+ * of the commit from GitHub the Run merges.
+ */
 interface ConflictMerge extends MergeInProgress {
-  /** The target branch's commit being merged in (MERGE_HEAD). */
-  targetHead: string;
   /** Started for this attempt: no earlier session saw the worktree as it is now. */
   started: boolean;
 }
+
+/** The merge a task of a round has to resolve (`mergeToResolve`). */
+interface MergeToResolve {
+  source: MergeInProgress['source'];
+  /** The commit to merge in; MERGE_HEAD when `merging`. */
+  targetHead: string;
+  /** Already in progress in the worktree. */
+  merging: boolean;
+}
+
+/** The commit from GitHub a Run merges (`mergeRemote`) is not in the repo. */
+class MergeCommitMissing extends Error {}
 
 /** Why a Run's worktree no longer matches the records (`workspaceProblem`). */
 interface WorkspaceProblem {
@@ -723,11 +742,13 @@ export class Engine {
         goal,
         overrides,
         issue: input.issue ?? null,
+        mergeRemote: input.mergeRemote ?? null,
       });
       this.store.event(r.id, 'run.created', {
         repo: repo.name,
         template: template.id,
         ...(input.issue ? { issue: input.issue.number } : {}),
+        ...(input.mergeRemote ? { mergeRemote: input.mergeRemote } : {}),
       });
       if (input.confirmGoal !== undefined) {
         // Blocked before it ever runs: no agent reads the goal until a human confirmed it.
@@ -1584,6 +1605,8 @@ export class Engine {
       if (signal.aborted || err instanceof Aborted) return;
       const current = this.store.getRun(runId);
       if (current.status !== 'running') return;
+      // Found before any agent started: nothing to stop, and no retry would find it either.
+      if (err instanceof MergeCommitMissing) return this.failRun(runId, err.message);
       await this.internalError(runId, err, signal);
     }
   }
@@ -2203,7 +2226,7 @@ export class Engine {
         stageRunId: sr.id,
         attemptId: attempt.id,
         kind: 'merge',
-        name: t({ zh: `合并 ${merge.target}`, en: `Merge ${merge.target}` }),
+        name: t({ zh: `合并 ${mergeSubject(merge)}`, en: `Merge ${mergeSubject(merge)}` }),
         passed: unresolved === null,
         detail: unresolved ?? resolved,
       });
@@ -2337,8 +2360,9 @@ export class Engine {
       for (const name of eff.def.outputs) {
         this.saveArtifact(run, sr, name, 'output', done.finalMessage);
       }
-      if (merge) {
+      if (merge?.source === 'target') {
         // Like a merge stage's sync: the Run's changes are counted from this target commit on.
+        // Not for a commit from GitHub: that is part of the Run's changes, not where they start.
         this.store.event(run.id, 'merge.synced', {
           target: merge.target,
           targetHead: merge.targetHead,
@@ -2371,11 +2395,13 @@ export class Engine {
       : null;
     let merge: ConflictMerge | null = null;
     let usable = report?.ok === true;
-    if (usable && this.resolvesConflict(run, sr)) {
-      if (await isMerging(workdir))
-        merge = await this.conflictMerge(run, sr, task, workdir, signal);
-      else usable = false;
+    if (usable) {
+      // A merge the agent resolved has to be in progress still. When a reset gave it up, only an
+      // agent can resolve it again: the task starts over.
+      const wanted = await this.mergeToResolve(run, sr, workdir);
       this.checkAbort(signal);
+      if (wanted?.merging) merge = await this.conflictMerge(run, sr, task, workdir, signal);
+      else if (wanted) usable = false;
     }
     if (!attempt || !report?.ok || !usable) {
       if (task.baseCommit) await resetHard(workdir, task.baseCommit);
@@ -2405,13 +2431,11 @@ export class Engine {
   }
 
   /**
-   * The merge of the target branch a round of an agent stage resolves, when a merge conflict
-   * rolled back to it (`conflictTarget`); null otherwise, or once the target branch is merged in.
-   * Every attempt needs the merge in progress in the worktree. A rework goes on with the one
+   * The merge a task of an agent stage's round resolves (`mergeToResolve`); null when there is
+   * none. Every attempt needs the merge in progress in the worktree. A rework goes on with the one
    * there. Otherwise (the first attempt, or after a pause, a restart or a failed task reset the
-   * worktree, which gives the merge up) the Master starts merging the target branch's latest
-   * commit without committing, leaving the conflicts in the files for the agent; the task's commit
-   * is then the merge commit.
+   * worktree, which gives the merge up) the Master starts merging the commit without committing,
+   * leaving the conflicts in the files for the agent; the task's commit is then the merge commit.
    */
   private async conflictMerge(
     run: Run,
@@ -2420,11 +2444,12 @@ export class Engine {
     workdir: string,
     signal: AbortSignal,
   ): Promise<ConflictMerge | null> {
-    if (!this.resolvesConflict(run, sr)) return null;
-    const repo = this.store.getRepo(run.repoId);
-    const target = repo.targetBranch;
-    if (await isMerging(workdir)) {
-      const targetHead = await revParse(workdir, 'MERGE_HEAD');
+    const wanted = await this.mergeToResolve(run, sr, workdir);
+    this.checkAbort(signal);
+    if (!wanted) return null;
+    const { source, targetHead } = wanted;
+    const target = this.store.getRepo(run.repoId).targetBranch;
+    if (wanted.merging) {
       // The files that conflicted when it started; the agent may have staged some since.
       const recorded = this.store
         .listEvents(run.id)
@@ -2438,18 +2463,62 @@ export class Engine {
         ? recorded.filter((f): f is string => typeof f === 'string')
         : await conflictedFiles(workdir);
       this.checkAbort(signal);
-      return { target, targetHead, files, started: false };
+      return { source, target, targetHead, files, started: false };
     }
-    const targetHead = await revParse(repo.path, target);
-    const merged = await isAncestor(workdir, targetHead, 'HEAD');
-    this.checkAbort(signal);
-    if (merged) return null;
     // Only an agent that gave up the merge itself leaves changes without one: start over.
     if (await hasChanges(workdir)) await resetHard(workdir, 'HEAD');
     const files = await startMerge(workdir, targetHead);
     this.checkAbort(signal);
-    this.store.event(run.id, 'merge.started', { taskId: task.id, target, targetHead, files });
-    return { target, targetHead, files, started: true };
+    this.store.event(run.id, 'merge.started', {
+      taskId: task.id,
+      source,
+      target,
+      targetHead,
+      files,
+    });
+    return { source, target, targetHead, files, started: true };
+  }
+
+  /**
+   * Whether a task of an agent stage's round has a merge to resolve, and of which commit. A round
+   * a merge conflict rolled back to (`resolvesConflict`) merges the target branch's latest commit.
+   * Otherwise a Run the Master created to merge a commit from GitHub (`mergeRemote`) merges that
+   * commit, from its first agent task on: once a task committed the merge, that commit is in HEAD
+   * and later tasks, reworks, rounds and stages have nothing to merge. Null when there is nothing,
+   * or once the commit is in HEAD. A merge in progress in the worktree is the one to go on with.
+   * Throws `MergeCommitMissing` when the commit from GitHub is not in the repo.
+   */
+  private async mergeToResolve(
+    run: Run,
+    sr: StageRun,
+    workdir: string,
+  ): Promise<MergeToResolve | null> {
+    const source = this.resolvesConflict(run, sr) ? 'target' : run.mergeRemote ? 'remote' : null;
+    if (!source) return null;
+    if (await isMerging(workdir)) {
+      return { source, targetHead: await revParse(workdir, 'MERGE_HEAD'), merging: true };
+    }
+    const repo = this.store.getRepo(run.repoId);
+    const targetHead =
+      source === 'target'
+        ? await revParse(repo.path, repo.targetBranch)
+        : await this.remoteCommit(run, workdir);
+    if (await isAncestor(workdir, targetHead, 'HEAD')) return null;
+    return { source, targetHead, merging: false };
+  }
+
+  /** The commit from GitHub the Run merges, as a full hash; throws `MergeCommitMissing`. */
+  private async remoteCommit(run: Run, workdir: string): Promise<string> {
+    const commit = run.mergeRemote ?? '';
+    const sha = await revParse(workdir, commit).catch(() => null);
+    if (sha) return sha;
+    const target = this.store.getRepo(run.repoId).targetBranch;
+    throw new MergeCommitMissing(
+      t({
+        zh: `要合并的 GitHub 上 ${target} 的提交 ${commit} 在仓库里找不到（可能被垃圾回收了），没法开始合并。Run 结束，工作目录和分支已保留；需要的话请手动合并 GitHub 上的 ${target}。`,
+        en: `Commit ${commit} from ${target} on GitHub, which this Run merges, is not in the repo (it may have been garbage-collected), so the merge cannot start. The Run ended; the working directory and branch are kept. Merge ${target} from GitHub by hand if it is still needed.`,
+      }),
+    );
   }
 
   /** Whether a stage round exists because merging the target branch conflicted. */
@@ -2465,16 +2534,27 @@ export class Engine {
     if (!(await isMerging(workdir))) {
       // Committed by the agent itself: against the rules, but merged all the same.
       if (await isAncestor(workdir, merge.targetHead, 'HEAD')) return null;
+      const subject = mergeSubject(merge);
       return t({
-        zh: `工作目录里合并 ${merge.target} 的操作被中止了。不要执行 git merge --abort、git reset 或 git commit；下一次尝试前 Master 会重新开始合并。`,
-        en: `The merge of ${merge.target} in the working directory was given up. Do not run git merge --abort, git reset or git commit; the Master starts the merge again before the next attempt.`,
+        zh: `工作目录里合并 ${subject} 的操作被中止了。不要执行 git merge --abort、git reset 或 git commit；下一次尝试前 Master 会重新开始合并。`,
+        en: `The merge of ${subject} in the working directory was given up. Do not run git merge --abort, git reset or git commit; the Master starts the merge again before the next attempt.`,
       });
     }
     const left = await filesWithConflictMarkers(workdir, merge.files);
     if (left.length === 0) return null;
+    const markers = t({
+      zh: `这些文件里还有冲突标记（<<<<<<<、=======、>>>>>>>）：${joinList(left)}。`,
+      en: `These files still have conflict markers (<<<<<<<, =======, >>>>>>>): ${joinList(left)}.`,
+    });
+    if (merge.source === 'remote') {
+      return t({
+        zh: `${markers}请解决这些冲突，删掉所有冲突标记，同时保留本地 ${merge.target} 的改动和 ${mergeSubject(merge)} 带来的改动。`,
+        en: `${markers} Resolve those conflicts and remove every conflict marker, keeping both the changes of the local ${merge.target} and those ${mergeSubject(merge)} brings.`,
+      });
+    }
     return t({
-      zh: `这些文件里还有冲突标记（<<<<<<<、=======、>>>>>>>）：${joinList(left)}。请解决这些冲突，删掉所有冲突标记，同时保留 ${merge.target} 的改动和本需求的改动。`,
-      en: `These files still have conflict markers (<<<<<<<, =======, >>>>>>>): ${joinList(left)}. Resolve those conflicts and remove every conflict marker, keeping both the changes of ${merge.target} and those of this requirement.`,
+      zh: `${markers}请解决这些冲突，删掉所有冲突标记，同时保留 ${merge.target} 的改动和本需求的改动。`,
+      en: `${markers} Resolve those conflicts and remove every conflict marker, keeping both the changes of ${merge.target} and those of this requirement.`,
     });
   }
 

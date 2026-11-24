@@ -579,12 +579,14 @@ export class Store {
   createRun(
     input: Pick<Run, 'repoId' | 'templateId' | 'template' | 'goal' | 'overrides'> & {
       issue?: RunIssue | null;
+      mergeRemote?: string | null;
     },
   ): Run {
     const now = nowIso();
     const run: Run = {
       ...input,
       issue: input.issue ?? null,
+      mergeRemote: input.mergeRemote ?? null,
       issueSynced: null,
       discussion: [],
       issueDiscussionSynced: 0,

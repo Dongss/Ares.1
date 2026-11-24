@@ -4018,6 +4018,407 @@ describe('engine: merge conflicts', () => {
   });
 });
 
+describe('engine: a Run that merges a commit from GitHub', () => {
+  /** MERGE_HEAD of the worktree; null when no merge is in progress. */
+  const mergeHead = (worktree: string): string | null => {
+    try {
+      return git(worktree, 'rev-parse', '-q', '--verify', 'MERGE_HEAD');
+    } catch {
+      return null;
+    }
+  };
+  const commit = (repoDir: string, file: string, content: string, message: string): string => {
+    writeFile(join(repoDir, file), content);
+    git(repoDir, 'add', '-A');
+    git(repoDir, 'commit', '-q', '-m', message);
+    return git(repoDir, 'rev-parse', 'HEAD');
+  };
+  /**
+   * A repo whose main and GitHub's main diverged from one commit: `remote`, as fetched from
+   * GitHub (kept on a branch of its own), and `local` on main. With `conflict` both change the one
+   * line of shared.txt; otherwise each adds a file of its own.
+   */
+  const diverged = (conflict = true) => {
+    const repoDir = initRepo();
+    commit(repoDir, 'shared.txt', 'base\n', 'base');
+    git(repoDir, 'checkout', '-q', '-b', 'github');
+    const remote = conflict
+      ? commit(repoDir, 'shared.txt', 'from github\n', 'on GitHub')
+      : commit(repoDir, 'remote.txt', 'from github\n', 'on GitHub');
+    git(repoDir, 'checkout', '-q', 'main');
+    const local = conflict
+      ? commit(repoDir, 'shared.txt', 'local\n', 'local')
+      : commit(repoDir, 'local.txt', 'local\n', 'local');
+    return { repoDir, remote, local };
+  };
+  /** Checks that pass once shared.txt keeps both sides; conflict markers do not fail them. */
+  const BOTH_SIDES = ['grep -q local shared.txt', 'grep -q github shared.txt'];
+  const resolve = (workdir: string) =>
+    writeFile(join(workdir, 'shared.txt'), 'local\nfrom github\n');
+  const noGate = { stages: { merge: { gate: false } } };
+  const mergeRun = (remote: string, goal = '合并 GitHub 上的提交') =>
+    (h as Harness).master.engine.createRun({
+      repo: 'demo',
+      template: 'dev',
+      goal,
+      overrides: noGate,
+      mergeRemote: remote,
+    });
+  const coderCalls = () => (h as Harness).fake.calls.filter((c) => c.model === 'coder');
+  const eventsOf = (runId: string, type: string) =>
+    (h as Harness).master.store.listEvents(runId).filter((e) => e.type === type);
+  /** The merge checks of agents' attempts, without the merge stage's own. */
+  const agentMergeChecks = (runId: string) =>
+    (h as Harness).master.store
+      .listChecks(runId)
+      .filter((c) => c.kind === 'merge' && c.attemptId !== null);
+  const parents = (repoDir: string, sha: string) =>
+    git(repoDir, 'rev-list', '--parents', '-n', '1', sha).split(' ').slice(1);
+  const contains = (repoDir: string, ancestor: string, ref: string) => {
+    try {
+      git(repoDir, 'merge-base', '--is-ancestor', ancestor, ref);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  it('starts merging it in the first coding task, whose commit is the merge, and merges it into main', async () => {
+    const { repoDir, remote, local } = diverged();
+    const seen: { head: string | null; content: string }[] = [];
+    h = await harness({
+      repoDir,
+      verifyCommands: BOTH_SIDES,
+      scripts: {
+        coder: (ctx) => {
+          const content = readFileSync(join(ctx.input.workdir, 'shared.txt'), 'utf8');
+          seen.push({ head: mergeHead(ctx.input.workdir), content });
+          resolve(ctx.input.workdir);
+          return done('合并了 GitHub 上的提交');
+        },
+        reviewer: () => review(),
+      },
+    });
+    const store = h.master.store;
+    const run = mergeRun(remote);
+    expect(run.mergeRemote).toBe(remote);
+    expect(run.issue).toBeNull();
+    await h.waitStatus(run.id, 'completed');
+    expect(eventsOf(run.id, 'run.created')[0]?.data.mergeRemote).toBe(remote);
+
+    // The coding agent found the merge in progress, with the conflict in the file.
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.head).toBe(remote);
+    expect(seen[0]?.content).toMatch(/^<<<<<<< /m);
+    expect(seen[0]?.content).toMatch(/^>>>>>>> /m);
+    const short = remote.slice(0, 7);
+    const prompt = coderCalls()[0]?.prompt;
+    expect(prompt).toContain('## 未完成的合并');
+    expect(prompt).toContain(`这个 Run 要把 GitHub 上 main 的提交 ${short} 合并进本地的 main`);
+    expect(prompt).toContain('- `shared.txt`');
+    expect(prompt).toContain('不要执行 git commit、git merge --abort、git reset');
+
+    // The task's commit is the merge, and main has GitHub's commit now.
+    const task = store.listRunTasks(run.id).find((t) => t.title === '编码') as Task;
+    expect(parents(repoDir, task.commitSha as string)).toEqual([local, remote]);
+    expect(contains(repoDir, remote, 'main')).toBe(true);
+    expect(git(repoDir, 'show', 'main:shared.txt')).toBe('local\nfrom github');
+    expect(agentMergeChecks(run.id).map((c) => [c.name, c.passed, c.detail])).toEqual([
+      [`合并 GitHub 上 main 的提交 ${short}`, true, '冲突已解决：shared.txt'],
+    ]);
+
+    // Started once, on GitHub's commit; no sync recorded on it, so it is part of the Run's changes.
+    expect(eventsOf(run.id, 'merge.started').map((e) => e.data)).toEqual([
+      {
+        taskId: task.id,
+        source: 'remote',
+        target: 'main',
+        targetHead: remote,
+        files: ['shared.txt'],
+      },
+    ]);
+    expect(eventsOf(run.id, 'merge.synced').map((e) => e.data.targetHead)).not.toContain(remote);
+    expect(h.fake.calls.find((c) => c.model === 'reviewer')?.prompt).toContain(
+      `git diff ${local}...HEAD`,
+    );
+  });
+
+  it('reworks while conflict markers are left, going on with the same merge', async () => {
+    const { repoDir, remote } = diverged();
+    const heads: (string | null)[] = [];
+    let calls = 0;
+    h = await harness({
+      repoDir,
+      verifyCommands: BOTH_SIDES,
+      scripts: {
+        coder: (ctx) => {
+          calls++;
+          heads.push(mergeHead(ctx.input.workdir));
+          // The first call leaves the conflict as it is: its markers still pass the checks.
+          if (calls === 2) resolve(ctx.input.workdir);
+          return done();
+        },
+        reviewer: () => review(),
+      },
+    });
+    const run = mergeRun(remote);
+    await h.waitStatus(run.id, 'completed');
+    expect(git(repoDir, 'show', 'main:shared.txt')).toBe('local\nfrom github');
+
+    expect(heads).toEqual([remote, remote]);
+    const [, fixed] = coderCalls();
+    expect(fixed?.resumeSessionId).toBeTruthy();
+    expect(fixed?.prompt).toContain('这些文件里还有冲突标记');
+    expect(fixed?.prompt).toContain(
+      `同时保留本地 main 的改动和 GitHub 上 main 的提交 ${remote.slice(0, 7)} 带来的改动`,
+    );
+    const store = h.master.store;
+    const attempts = store.listRunAttempts(run.id).filter((a) => a.agentId === 'coder');
+    expect(attempts.map((a) => a.outcome)).toEqual(['rework', 'passed']);
+    const leftCheck = store
+      .listChecks(run.id)
+      .find((c) => c.attemptId === attempts[0]?.id && c.kind === 'merge');
+    expect(leftCheck?.passed).toBe(false);
+    expect(eventsOf(run.id, 'merge.started')).toHaveLength(1);
+    expect(contains(repoDir, remote, 'main')).toBe(true);
+  });
+
+  it('merges a commit without conflicts too, for the agent to make the checks pass', async () => {
+    const { repoDir, remote, local } = diverged(false);
+    const heads: (string | null)[] = [];
+    h = await harness({
+      repoDir,
+      scripts: {
+        coder: (ctx) => {
+          heads.push(mergeHead(ctx.input.workdir));
+          // The check looks for feature.txt, which neither side has.
+          writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+          return done('修好了检查');
+        },
+        reviewer: () => review(),
+      },
+    });
+    const run = mergeRun(remote);
+    await h.waitStatus(run.id, 'completed');
+    expect(heads).toEqual([remote]);
+    const prompt = coderCalls()[0]?.prompt;
+    expect(prompt).toContain('## 未完成的合并');
+    expect(prompt).toContain('这次合并没有冲突，但合并后的代码通不过检查');
+    expect(prompt).not.toContain('冲突的地方');
+    const store = h.master.store;
+    expect(eventsOf(run.id, 'merge.started').map((e) => e.data.files)).toEqual([[]]);
+    expect(agentMergeChecks(run.id).map((c) => c.detail)).toEqual(['合并没有冲突']);
+    const task = store.listRunTasks(run.id).find((t) => t.title === '编码') as Task;
+    expect(parents(repoDir, task.commitSha as string)).toEqual([local, remote]);
+    expect(git(repoDir, 'show', 'main:remote.txt')).toBe('from github');
+    expect(git(repoDir, 'show', 'main:feature.txt')).toBe('ok');
+  });
+
+  it('does not merge it again in the rounds after it is in', async () => {
+    const { repoDir, remote } = diverged();
+    const heads: (string | null)[] = [];
+    let reviews = 0;
+    h = await harness({
+      repoDir,
+      verifyCommands: BOTH_SIDES,
+      scripts: {
+        coder: (ctx) => {
+          heads.push(mergeHead(ctx.input.workdir));
+          if (heads.length === 1) resolve(ctx.input.workdir);
+          else writeFile(join(ctx.input.workdir, 'notes.txt'), 'reviewed\n');
+          return done();
+        },
+        reviewer: () => {
+          reviews++;
+          return reviews === 1
+            ? review([{ severity: 'must', description: '补上 notes.txt' }])
+            : review();
+        },
+      },
+    });
+    const run = mergeRun(remote);
+    await h.waitStatus(run.id, 'completed');
+    const store = h.master.store;
+    expect(store.listStageRuns(run.id).map((s) => [s.stageId, s.round, s.status])).toEqual([
+      ['implement', 1, 'passed'],
+      ['review', 1, 'failed'],
+      ['implement', 2, 'passed'],
+      ['review', 2, 'passed'],
+      ['merge', 1, 'passed'],
+    ]);
+    // The second round's agent found no merge, was told of none, and made an ordinary commit.
+    expect(heads).toEqual([remote, null]);
+    expect(coderCalls()[1]?.prompt).not.toContain('未完成的合并');
+    expect(eventsOf(run.id, 'merge.started')).toHaveLength(1);
+    const [first, second] = store.listRunTasks(run.id).filter((t) => t.title === '编码') as [
+      Task,
+      Task,
+    ];
+    expect(parents(repoDir, first.commitSha as string)).toHaveLength(2);
+    expect(parents(repoDir, second.commitSha as string)).toEqual([first.commitSha]);
+    expect(agentMergeChecks(run.id)).toHaveLength(1);
+    expect(git(repoDir, 'show', 'main:notes.txt')).toBe('reviewed');
+    expect(contains(repoDir, remote, 'main')).toBe(true);
+  });
+
+  it('merges it only in the first step of a planned stage, not while planning', async () => {
+    const { repoDir, remote } = diverged();
+    const workflow = TEST_WORKFLOW_YAML.replace(
+      '    agent: coder\n',
+      '    agent: coder\n    planning: llm\n',
+    );
+    const heads: [boolean, string | null][] = [];
+    h = await harness({
+      repoDir,
+      workflow,
+      verifyCommands: BOTH_SIDES,
+      scripts: {
+        coder: (ctx) => {
+          heads.push([ctx.input.readOnly === true, mergeHead(ctx.input.workdir)]);
+          if (ctx.input.readOnly) {
+            return {
+              finalMessage: `\`\`\`json\n${JSON.stringify({
+                tasks: [
+                  { title: 'a', instructions: '解决冲突' },
+                  { title: 'b', instructions: '写 b.txt' },
+                ],
+              })}\n\`\`\``,
+            };
+          }
+          if (ctx.input.prompt.includes('这次只做这一步：\n\n解决冲突')) resolve(ctx.input.workdir);
+          else writeFile(join(ctx.input.workdir, 'b.txt'), 'b\n');
+          return done();
+        },
+        reviewer: () => review(),
+      },
+    });
+    const run = mergeRun(remote);
+    await h.waitStatus(run.id, 'completed');
+    expect(heads).toEqual([
+      [true, null],
+      [false, remote],
+      [false, null],
+    ]);
+    const store = h.master.store;
+    const [plan, a, b] = store.listRunTasks(run.id) as [Task, Task, Task];
+    expect([plan.kind, a.title, b.title]).toEqual(['plan', 'a', 'b']);
+    expect(eventsOf(run.id, 'merge.started').map((e) => e.data.taskId)).toEqual([a.id]);
+    expect(coderCalls()[0]?.prompt).not.toContain('未完成的合并');
+    expect(coderCalls()[1]?.prompt).toContain('## 未完成的合并');
+    expect(coderCalls()[2]?.prompt).not.toContain('未完成的合并');
+    expect(parents(repoDir, b.commitSha as string)).toEqual([a.commitSha]);
+    expect(git(repoDir, 'show', 'main:b.txt')).toBe('b');
+    expect(contains(repoDir, remote, 'main')).toBe(true);
+  });
+
+  it('a pause gives the merge up; the resumed task merges the commit again', async () => {
+    const { repoDir, remote } = diverged();
+    let calls = 0;
+    h = await harness({
+      repoDir,
+      verifyCommands: BOTH_SIDES,
+      scripts: {
+        coder: async (ctx) => {
+          calls++;
+          if (calls === 1) {
+            writeFile(join(ctx.input.workdir, 'shared.txt'), 'half resolved\n');
+            await new Promise((r) => ctx.signal.addEventListener('abort', r));
+            return done();
+          }
+          expect(mergeHead(ctx.input.workdir)).toBe(remote);
+          expect(readFileSync(join(ctx.input.workdir, 'shared.txt'), 'utf8')).toMatch(/^<<<<<<< /m);
+          resolve(ctx.input.workdir);
+          return done();
+        },
+        reviewer: () => review(),
+      },
+    });
+    const run = mergeRun(remote);
+    await waitFor(() => calls === 1, 'the coding agent to start');
+    const worktree = h.master.store.getRun(run.id).worktreePath as string;
+    expect(mergeHead(worktree)).toBe(remote);
+    const task = h.master.store.listRunTasks(run.id).find((t) => t.title === '编码') as Task;
+
+    await h.master.engine.pause(run.id);
+    // Back to before the merge: no MERGE_HEAD, nothing uncommitted.
+    expect(mergeHead(worktree)).toBeNull();
+    expect(git(worktree, 'status', '--porcelain')).toBe('');
+    expect(git(worktree, 'rev-parse', 'HEAD')).toBe(task.baseCommit);
+
+    h.master.engine.resume(run.id);
+    await h.waitStatus(run.id, 'completed');
+    expect(calls).toBe(2);
+    const started = eventsOf(run.id, 'merge.started');
+    expect(started.map((e) => e.data.targetHead)).toEqual([remote, remote]);
+    expect(contains(repoDir, remote, 'main')).toBe(true);
+  });
+
+  it('ends the Run with an error saying so when the commit is not in the repo', async () => {
+    h = await harness();
+    const missing = '0123456789abcdef0123456789abcdef01234567';
+    const run = mergeRun(missing);
+    const failed = await h.waitStatus(run.id, 'failed');
+    expect(failed.error).toContain(`要合并的 GitHub 上 main 的提交 ${missing} 在仓库里找不到`);
+    expect(failed.error).not.toContain('Master 内部错误');
+    expect(coderCalls()).toHaveLength(0);
+    expect(h.master.store.listRunTasks(run.id).map((t) => t.status)).toEqual(['cancelled']);
+    expect(eventsOf(run.id, 'merge.started')).toEqual([]);
+  });
+
+  describe('in English', () => {
+    afterEach(() => setLang('zh'));
+    const englishWorkflow = () =>
+      TEST_WORKFLOW_YAML.replace('name: 测试流程', 'name: Test flow')
+        .replace('name: 编码', 'name: Coding')
+        .replace('name: 评审', 'name: Review')
+        .replace('name: 合并', 'name: Merge');
+
+    it('tells the agent about the merge and checks it without Chinese', async () => {
+      const { repoDir, remote } = diverged();
+      let calls = 0;
+      h = await harness({
+        config: 'language: en\n',
+        workflow: englishWorkflow(),
+        repoDir,
+        verifyCommands: BOTH_SIDES,
+        scripts: {
+          coder: (ctx) => {
+            calls++;
+            if (calls === 2) resolve(ctx.input.workdir);
+            return done('merged');
+          },
+          reviewer: () => review(),
+        },
+      });
+      const run = mergeRun(remote, 'Merge the commit from GitHub');
+      await h.waitStatus(run.id, 'completed');
+      const short = remote.slice(0, 7);
+      const [first, second] = coderCalls();
+      expect(first?.prompt).toContain(
+        `This Run merges commit ${short} from main on GitHub into the local main`,
+      );
+      expect(second?.prompt).toContain('These files still have conflict markers');
+      const checks = agentMergeChecks(run.id).map((c) => `${c.name}: ${c.detail}`);
+      expect(checks[0]).toContain(`Merge commit ${short} from main on GitHub: These files still`);
+      expect(checks[1]).toBe(
+        `Merge commit ${short} from main on GitHub: Conflicts resolved: shared.txt`,
+      );
+      for (const text of [first?.prompt, second?.prompt, ...checks]) {
+        expect(text).toBeTruthy();
+        expect(text).not.toMatch(/[一-鿿]/);
+      }
+    });
+
+    it('says the commit is not in the repo without Chinese', async () => {
+      h = await harness({ config: 'language: en\n', workflow: englishWorkflow() });
+      const missing = '0123456789abcdef0123456789abcdef01234567';
+      const failed = await h.waitStatus(mergeRun(missing, 'Merge it').id, 'failed');
+      expect(failed.error).toContain(`Commit ${missing} from main on GitHub`);
+      expect(failed.error).not.toMatch(/[一-鿿]/);
+    });
+  });
+});
+
 describe('engine: restart', () => {
   it('a graceful stop requeues the active run and a new Master finishes it', async () => {
     const first = await harness();

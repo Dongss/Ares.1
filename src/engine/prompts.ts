@@ -139,16 +139,34 @@ function noGitHubRule(): string {
   });
 }
 
-/** A merge of the target branch the Master started in the worktree for the agent to finish. */
+/**
+ * A merge the Master started in the worktree for the agent to finish: of the target branch's
+ * latest commit, after merging the Run into it conflicted (`target`), or of a commit of the target
+ * branch on GitHub that a Run the Master created for it merges in (`remote`).
+ */
 export interface MergeInProgress {
+  source: 'target' | 'remote';
   /** The target branch's name. */
   target: string;
+  /** The commit being merged in (MERGE_HEAD). */
+  targetHead: string;
   /** Files that conflicted; empty when everything merged cleanly. */
   files: string[];
 }
 
+/** What a merge brings in, as prompts and checks name it. */
+export function mergeSubject(merge: Pick<MergeInProgress, 'source' | 'target' | 'targetHead'>) {
+  if (merge.source === 'target') return merge.target;
+  const short = merge.targetHead.slice(0, 7);
+  return t({
+    zh: `GitHub 上 ${merge.target} 的提交 ${short}`,
+    en: `commit ${short} from ${merge.target} on GitHub`,
+  });
+}
+
 function mergeSection(merge: MergeInProgress | undefined): string {
   if (!merge) return '';
+  if (merge.source === 'remote') return remoteMergeSection(merge);
   const files = merge.files.map((f) => `- \`${f}\``).join('\n');
   const conflicts =
     merge.files.length > 0
@@ -171,6 +189,42 @@ function mergeSection(merge: MergeInProgress | undefined): string {
     en: `## A merge in progress
 
 This requirement's branch conflicted when it was to be merged into ${merge.target}. The Master has started merging the latest code of ${merge.target} in the working directory (git merge --no-commit), without committing it. ${conflicts}
+
+- Do not run git commit, git merge --abort or git reset, and do not throw away either side's changes with git checkout; just fix the files, and the Master makes the merge commit.
+
+`,
+  });
+}
+
+/** `mergeSection` for a Run that merges a commit of the target branch on GitHub. */
+function remoteMergeSection(merge: MergeInProgress): string {
+  const subject = mergeSubject(merge);
+  const files = merge.files.map((f) => `- \`${f}\``).join('\n');
+  const conflicts =
+    merge.files.length > 0
+      ? t({
+          zh: `下面这些文件有冲突，冲突的地方用 \`<<<<<<<\`、\`=======\`、\`>>>>>>>\` 标出来了：\n\n${files}\n\n解决每一处冲突：两边的改动都要保留，本地 ${merge.target} 上的和 GitHub 上的都不能丢，把两边的意图合在一起，并删掉所有冲突标记。冲突标记没清干净的话，这次结果不算通过，要返工。`,
+          en: `These files have conflicts, marked with \`<<<<<<<\`, \`=======\` and \`>>>>>>>\`:\n\n${files}\n\nResolve every conflict: keep the changes of both sides, those of the local ${merge.target} and those from GitHub, bringing together what each side meant, and remove every conflict marker. If any conflict marker is left, this result does not pass and has to be reworked.`,
+        })
+      : t({
+          zh: '这次合并没有冲突，但合并后的代码通不过检查：两边的改动可能配合不上。修改代码，让两边的改动都保留下来，并且能一起工作。',
+          en: 'This merge has no conflicts, but the merged code fails the checks: the changes of the two sides may not fit together. Change the code so that the changes of both sides stay and work together.',
+        });
+  return t({
+    zh: `## 未完成的合并
+
+这个 Run 要把 ${subject} 合并进本地的 ${merge.target}：两边已经分叉，Master 自己合并没有成功。Master 已经在工作目录里开始合并这个提交（git merge --no-ff --no-commit），还没有提交。${conflicts}
+
+合并后，检查命令要能通过。
+
+- 不要执行 git commit、git merge --abort、git reset，也不要用 git checkout 丢掉哪一边的改动；改好文件就行，合并提交由 Master 完成。
+
+`,
+    en: `## A merge in progress
+
+This Run merges ${subject} into the local ${merge.target}: the two have diverged, and the Master could not merge them by itself. The Master has started merging that commit in the working directory (git merge --no-ff --no-commit), without committing it. ${conflicts}
+
+After the merge, the check commands must pass.
 
 - Do not run git commit, git merge --abort or git reset, and do not throw away either side's changes with git checkout; just fix the files, and the Master makes the merge commit.
 

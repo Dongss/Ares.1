@@ -114,10 +114,17 @@ export interface Run {
   headCommit: string | null;
   blocked: BlockInfo | null;
   /**
-   * The GitHub issue this Run was created from. Null only for Runs created on the dashboard
-   * before Runs came only from issues (and for Runs tests create directly).
+   * The GitHub issue this Run was created from. Null for the Runs the Master creates itself to
+   * merge a commit from GitHub (`mergeRemote`), for Runs created on the dashboard before Runs
+   * came only from issues, and for Runs tests create directly.
    */
   issue: RunIssue | null;
+  /**
+   * For a Run the Master creates on its own to merge a commit of the target branch on GitHub
+   * that could not be merged without an agent (conflicts, or checks failing after the merge):
+   * that commit. The first agent task starts merging it in the worktree. Null for every other Run.
+   */
+  mergeRemote: string | null;
   /** The last Run status reported on the issue; the issue is caught up when it differs. */
   issueSynced: RunStatus | null;
   /** Extra stage rollbacks granted by a human after hitting max_loops. */

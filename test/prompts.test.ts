@@ -8,6 +8,8 @@ import { commitMessage } from '../src/engine/engine.js';
 import {
   assessmentArtifact,
   assessPrompt,
+  type MergeInProgress,
+  mergeSubject,
   type PromptContext,
   planPrompt,
   reviewPrompt,
@@ -22,6 +24,19 @@ import type {
   FailedAttempt,
   ReplyTimeoutEntry,
 } from '../src/store/types.js';
+
+const targetMerge = (files: string[]): MergeInProgress => ({
+  source: 'target',
+  target: 'main',
+  targetHead: '1234567890abcdef',
+  files,
+});
+const remoteMerge = (files: string[]): MergeInProgress => ({
+  source: 'remote',
+  target: 'main',
+  targetHead: 'abcdef1234567890',
+  files,
+});
 
 const ctx = (stage: Partial<StageDef> = {}): PromptContext => ({
   goal: '添加 feature.txt',
@@ -87,16 +102,42 @@ describe('prompts', () => {
 
   it('tells the agent about a merge in progress and its conflicts, only when there is one', () => {
     expect(taskPrompt(ctx(), null, 'full')).not.toContain('未完成的合并');
-    const prompt = taskPrompt(ctx(), null, 'full', { target: 'main', files: ['a.ts', 'b.md'] });
+    const prompt = taskPrompt(ctx(), null, 'full', targetMerge(['a.ts', 'b.md']));
     expect(prompt).toContain('## 未完成的合并');
     expect(prompt).toContain('开始合并 main 的最新代码（git merge --no-commit）');
     expect(prompt).toContain('- `a.ts`\n- `b.md`');
     expect(prompt).toContain('同时保留 main 的改动和本需求的改动');
     expect(prompt).toContain('删掉所有冲突标记');
     expect(prompt).toContain('不要执行 git commit、git merge --abort、git reset');
-    const clean = taskPrompt(ctx(), null, 'full', { target: 'main', files: [] });
+    const clean = taskPrompt(ctx(), null, 'full', targetMerge([]));
     expect(clean).toContain('这次合并没有冲突');
     expect(clean).not.toContain('冲突的地方');
+  });
+
+  it('tells the agent of a Run merging a commit from GitHub what to merge and to keep both sides', () => {
+    const prompt = taskPrompt(ctx(), null, 'full', remoteMerge(['a.ts']));
+    expect(prompt).toContain('## 未完成的合并');
+    expect(prompt).toContain('这个 Run 要把 GitHub 上 main 的提交 abcdef1 合并进本地的 main');
+    expect(prompt).toContain('git merge --no-ff --no-commit');
+    expect(prompt).toContain('- `a.ts`');
+    expect(prompt).toContain('两边的改动都要保留');
+    expect(prompt).toContain('合并后，检查命令要能通过');
+    expect(prompt).toContain('不要执行 git commit、git merge --abort、git reset');
+    expect(prompt).not.toContain('本需求的分支在合并进');
+    const clean = taskPrompt(ctx(), null, 'full', remoteMerge([]));
+    expect(clean).toContain('这次合并没有冲突，但合并后的代码通不过检查');
+    expect(clean).not.toContain('冲突的地方');
+  });
+
+  it('names what a merge brings in', () => {
+    expect(mergeSubject(targetMerge([]))).toBe('main');
+    expect(mergeSubject(remoteMerge([]))).toBe('GitHub 上 main 的提交 abcdef1');
+    setLang('en');
+    try {
+      expect(mergeSubject(remoteMerge([]))).toBe('commit abcdef1 from main on GitHub');
+    } finally {
+      setLang('zh');
+    }
   });
 
   it('leaves out the verify commands when there are none, under either permission', () => {
@@ -550,8 +591,10 @@ describe('prompts in English', () => {
         [],
         null,
       ),
-      mergeTask: taskPrompt(enCtx(), null, 'full', { target: 'main', files: ['a.ts'] }),
-      cleanMergeTask: taskPrompt(enCtx(), null, 'safe', { target: 'main', files: [] }),
+      mergeTask: taskPrompt(enCtx(), null, 'full', targetMerge(['a.ts'])),
+      cleanMergeTask: taskPrompt(enCtx(), null, 'safe', targetMerge([])),
+      remoteMergeTask: taskPrompt(enCtx(), null, 'full', remoteMerge(['a.ts'])),
+      cleanRemoteMergeTask: taskPrompt(enCtx(), null, 'safe', remoteMerge([])),
     };
     for (const [name, prompt] of Object.entries(prompts)) {
       expect(prompt, name).not.toMatch(CJK);

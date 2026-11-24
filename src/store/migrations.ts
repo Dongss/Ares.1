@@ -194,4 +194,8 @@ export const MIGRATIONS: readonly string[] = [
   `
   ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'work';
   `,
+  // v9: the commit from GitHub a Run merges into its target branch; null for every other Run.
+  `
+  ALTER TABLE runs ADD COLUMN merge_remote TEXT;
+  `,
 ];

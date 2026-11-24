@@ -43,6 +43,7 @@ function run(id: string, status: RunSummary['status'], extra: Partial<RunSummary
     baseCommit: null,
     headCommit: null,
     issue: null,
+    mergeRemote: null,
     issueSynced: null,
     discussion: [],
     issueDiscussionSynced: 0,
