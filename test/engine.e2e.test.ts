@@ -6098,3 +6098,280 @@ describe('engine: planning: auto', () => {
     expect(implementTasks(h, run.id)).toEqual([[['work', '编码']]]);
   });
 });
+
+describe('engine: agent_candidates', () => {
+  const eventData = (runId: string, type: string) =>
+    (h as Harness).master.store
+      .listEvents(runId)
+      .filter((e) => e.type === type)
+      .map((e) => e.data);
+  /**
+   * Candidates of each tier, the higher the costlier, and `outsider`: high tier and low cost, so
+   * the first an agent of any tier would be switched to among all agents, but no candidate.
+   */
+  const AGENTS = `
+agents:
+  assessor: { cli: fake, model: assessor, tier: high }
+  big: { cli: fake, model: big, tier: high, cost: high }
+  middle: { cli: fake, model: middle, tier: mid, cost: mid }
+  small: { cli: fake, model: small, tier: low, cost: low }
+  outsider: { cli: fake, model: outsider, tier: high, cost: low }
+  reviewer: { cli: fake, model: reviewer }
+`;
+  const CANDIDATES = ['big', 'middle', 'small'];
+  /** Assessment, then coding by one of `candidates`, review and merge (no approval). */
+  const withCandidates = (yaml: string, candidates: string[], more = '') => {
+    const changed = yaml.replace(
+      '    agent: coder\n',
+      `    agent_candidates: [${candidates.join(', ')}]\n${more}`,
+    );
+    expect(changed).not.toBe(yaml);
+    return changed;
+  };
+  const WORKFLOW = withCandidates(ASSESS_WORKFLOW_YAML, CANDIDATES);
+  /** A coder that plans `titles` read-only, otherwise writes feature.txt (and its step's file). */
+  const coding =
+    (titles: string[] = []): Script =>
+    (ctx) => {
+      if (ctx.input.readOnly) {
+        const tasks = titles.map((title) => ({ title, instructions: `写 ${title}.txt` }));
+        return { finalMessage: `\`\`\`json\n${JSON.stringify({ tasks })}\n\`\`\`` };
+      }
+      const file = /写 (\S+\.txt)/.exec(ctx.input.prompt)?.[1];
+      if (file) writeFile(join(ctx.input.workdir, file), `${ctx.input.model}\n`);
+      writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+      return done(`${ctx.input.model} 写了 feature.txt`);
+    };
+  const failing =
+    (error: string): Script =>
+    () => ({ status: 'failed', error });
+  /** The assessor going ahead with `difficulty` (none: leaves it out), every agent coding. */
+  const scripts = (difficulty?: 'low' | 'mid' | 'high'): Record<string, Script> => ({
+    assessor: () => assessment('go', difficulty ? { difficulty } : {}),
+    ...Object.fromEntries([...CANDIDATES, 'outsider'].map((id) => [id, coding()])),
+    reviewer: () => review(),
+  });
+  /** The tasks of the Run's coding rounds, in order. */
+  const implementTasks = (runId: string) => {
+    const store = (h as Harness).master.store;
+    return store
+      .listStageRuns(runId)
+      .filter((sr) => sr.stageId === 'implement')
+      .flatMap((sr) => store.listTasks(sr.id));
+  };
+
+  it.each([
+    ['low', 'small', 'fit'],
+    ['mid', 'middle', 'fit'],
+    ['high', 'big', 'fit'],
+    ['no', 'big', 'first'],
+  ] as const)(
+    'codes a requirement of %s difficulty with %s (%s)',
+    async (level, agentId, reason) => {
+      const difficulty = level === 'no' ? undefined : level;
+      h = await harness({ agents: AGENTS, workflow: WORKFLOW, scripts: scripts(difficulty) });
+      const run = h.run();
+      await h.waitStatus(run.id, 'completed');
+      expect(h.fake.calls.map((c) => c.model)).toEqual(['assessor', agentId, 'reviewer']);
+      const [task] = implementTasks(run.id) as [Task];
+      expect(task.agentId).toBe(agentId);
+      // Only the stage with candidates records its choice.
+      expect(eventData(run.id, 'agent.selected')).toEqual([
+        {
+          stageId: 'implement',
+          round: 1,
+          taskId: task.id,
+          agentId,
+          difficulty: difficulty ?? null,
+          reason,
+          candidates: CANDIDATES,
+        },
+      ]);
+    },
+  );
+
+  it('codes with the first candidate in a template without an assessment', async () => {
+    h = await harness({
+      agents: AGENTS,
+      workflow: withCandidates(TEST_WORKFLOW_YAML, ['middle', 'small']),
+      scripts: scripts(),
+    });
+    const run = h.run();
+    await h.waitStatus(run.id, 'waiting_approval');
+    expect(h.fake.calls.map((c) => c.model)).toEqual(['middle', 'reviewer']);
+    const [task] = implementTasks(run.id) as [Task];
+    expect(eventData(run.id, 'agent.selected')).toEqual([
+      {
+        stageId: 'implement',
+        round: 1,
+        taskId: task.id,
+        agentId: 'middle',
+        difficulty: null,
+        reason: 'first',
+        candidates: ['middle', 'small'],
+      },
+    ]);
+  });
+
+  it('reworks with the chosen agent, and chooses again in every round', async () => {
+    let calls = 0;
+    let reviews = 0;
+    h = await harness({
+      agents: AGENTS,
+      workflow: WORKFLOW,
+      scripts: {
+        ...scripts('mid'),
+        // The verify command sends its first execution back.
+        middle: (ctx) => {
+          writeFile(join(ctx.input.workdir, 'feature.txt'), ++calls === 1 ? 'wrong\n' : 'ok\n');
+          return done();
+        },
+        reviewer: () =>
+          ++reviews === 1 ? review([{ severity: 'must', description: '再改改' }]) : review(),
+      },
+    });
+    const run = h.run();
+    await h.waitStatus(run.id, 'completed');
+    expect(h.fake.calls.map((c) => c.model)).toEqual([
+      'assessor',
+      'middle',
+      'middle',
+      'reviewer',
+      'middle',
+      'reviewer',
+    ]);
+    const [first, second] = implementTasks(run.id) as [Task, Task];
+    expect(h.master.store.listAttempts(first.id).map((a) => [a.agentId, a.outcome])).toEqual([
+      ['middle', 'rework'],
+      ['middle', 'passed'],
+    ]);
+    expect(eventData(run.id, 'agent.selected').map((d) => [d.round, d.taskId, d.agentId])).toEqual([
+      [1, first.id, 'middle'],
+      [2, second.id, 'middle'],
+    ]);
+  });
+
+  it('plans and does the steps with the chosen agent (planning: llm)', async () => {
+    h = await harness({
+      agents: AGENTS,
+      workflow: withCandidates(ASSESS_WORKFLOW_YAML, CANDIDATES, '    planning: llm\n'),
+      scripts: { ...scripts('low'), small: coding(['a', 'b']) },
+    });
+    const run = h.run();
+    await h.waitStatus(run.id, 'completed');
+    expect(h.fake.calls.map((c) => [c.model, c.readOnly === true])).toEqual([
+      ['assessor', true],
+      ['small', true],
+      ['small', false],
+      ['small', false],
+      ['reviewer', false],
+    ]);
+    const tasks = implementTasks(run.id);
+    expect(tasks.map((task) => [task.kind, task.title, task.agentId])).toEqual([
+      ['plan', '拆分任务', 'small'],
+      ['work', 'a', 'small'],
+      ['work', 'b', 'small'],
+    ]);
+    expect(eventData(run.id, 'agent.selected')).toEqual([
+      {
+        stageId: 'implement',
+        round: 1,
+        taskId: tasks[0]?.id,
+        agentId: 'small',
+        difficulty: 'low',
+        reason: 'fit',
+        candidates: CANDIDATES,
+      },
+    ]);
+  });
+
+  it('gives the steps to the chosen agent also when another candidate took over the plan', async () => {
+    h = await harness({
+      agents: AGENTS,
+      workflow: withCandidates(ASSESS_WORKFLOW_YAML, CANDIDATES, '    planning: llm\n'),
+      scripts: {
+        ...scripts('low'),
+        small: (ctx) => (ctx.input.readOnly ? failing('拆不动')(ctx) : coding()(ctx)),
+        middle: coding(['a', 'b']),
+      },
+    });
+    const run = h.run(undefined, { stages: { implement: { escalate: { max_retries: 0 } } } });
+    await h.waitStatus(run.id, 'completed');
+    expect(h.fake.calls.map((c) => [c.model, c.readOnly === true])).toEqual([
+      ['assessor', true],
+      ['small', true],
+      ['middle', true],
+      ['small', false],
+      ['small', false],
+      ['reviewer', false],
+    ]);
+    expect(eventData(run.id, 'task.agent_switched').map((d) => [d.from, d.to])).toEqual([
+      ['small', 'middle'],
+    ]);
+    expect(implementTasks(run.id).map((task) => [task.kind, task.agentId])).toEqual([
+      ['plan', 'middle'],
+      ['work', 'small'],
+      ['work', 'small'],
+    ]);
+  });
+
+  it('switches only among the candidates (switch_agent), then ends the Run as failed', async () => {
+    h = await harness({
+      agents: AGENTS,
+      workflow: WORKFLOW,
+      scripts: {
+        ...scripts('high'),
+        ...Object.fromEntries(CANDIDATES.map((id) => [id, failing(`${id} 出错`)])),
+      },
+    });
+    const run = h.run(undefined, { stages: { implement: { escalate: { max_retries: 0 } } } });
+    const failed = await h.waitStatus(run.id, 'failed');
+    // From big, the same tier or higher first, then the cheaper; outsider, though high and cheap,
+    // is no candidate.
+    expect(h.fake.calls.map((c) => c.model)).toEqual(['assessor', 'big', 'small', 'middle']);
+    expect(eventData(run.id, 'task.agent_switched').map((d) => [d.from, d.to])).toEqual([
+      ['big', 'small'],
+      ['small', 'middle'],
+    ]);
+    expect(failed.error).toContain('试过的 Agent（big、small、middle）都出错了');
+    expect(failed.error).toContain('on_agent_error: switch_agent');
+    expect(eventData(run.id, 'agent.selected').map((d) => [d.agentId, d.reason])).toEqual([
+      ['big', 'fit'],
+    ]);
+  });
+
+  it('gives the round to the first candidate when none can run, and ends the Run', async () => {
+    const t = await harness({
+      agents: AGENTS,
+      workflow: WORKFLOW,
+      scripts: {
+        ...scripts('low'),
+        // The candidates are gone from agents.yaml by the time the coding starts.
+        assessor: () => {
+          for (const id of CANDIDATES) t.master.config.agents.delete(id);
+          return assessment('go', { difficulty: 'low' });
+        },
+      },
+    });
+    h = t;
+    const run = t.run();
+    const failed = await t.waitStatus(run.id, 'failed');
+    expect(t.fake.calls.map((c) => c.model)).toEqual(['assessor']);
+    const [task] = implementTasks(run.id) as [Task];
+    expect(eventData(run.id, 'agent.selected')).toEqual([
+      {
+        stageId: 'implement',
+        round: 1,
+        taskId: task.id,
+        agentId: 'big',
+        difficulty: 'low',
+        reason: 'unavailable',
+        candidates: CANDIDATES,
+      },
+    ]);
+    // outsider could run, but is no candidate.
+    expect(eventData(run.id, 'task.agent_switched')).toEqual([]);
+    expect(failed.error).toContain('Agent big 不存在、未启用或没有对应的 Adapter');
+    expect(failed.error).toContain('没有别的可用 Agent 能接手');
+  });
+});

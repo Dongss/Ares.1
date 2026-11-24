@@ -331,6 +331,23 @@ export function stageAgentIds(def: Pick<StageDef, 'agent' | 'agent_candidates'>)
 export type StageAgentReason = 'first' | 'fit' | 'highest';
 
 /**
+ * What the engine records when a round of a stage with `agent_candidates` starts (event
+ * `agent.selected`): who it gave the round to and why. `unavailable` = no candidate could run the
+ * stage, so it went to the first one, whose task then goes the way of an agent that cannot run
+ * (by `on_agent_error`). A type alias rather than an interface, so that it passes as event data
+ * (`Record<string, unknown>`).
+ */
+export type AgentSelection = {
+  stageId: string;
+  round: number;
+  taskId: string;
+  agentId: string;
+  difficulty: Difficulty | null;
+  reason: StageAgentReason | 'unavailable';
+  candidates: string[];
+};
+
+/**
  * Who does a stage's work, from its candidates (`stageAgentIds`) by the requirement's assessed
  * difficulty (`assessedDifficulty`). Only candidates that are enabled (in `agents`, which holds
  * enabled agents only) and that `usable` says can run the stage count; undefined when none does.

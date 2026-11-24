@@ -18,8 +18,10 @@ import type {
   RunWorkspaceState,
 } from '../api/types.js';
 import {
+  type AgentSelection,
   type Backoff,
   backoffMs,
+  chooseStageAgent,
   discussionReplyWait,
   LEFTOVER_WORKSPACE_EVENTS,
   type LeftoverWorkspaceReason,
@@ -126,6 +128,7 @@ import {
   TaskReportSchema,
 } from './contracts.js';
 import {
+  assessedDifficulty,
   assessedSize,
   assessmentProblem,
   formatAssessment,
@@ -1753,8 +1756,65 @@ export class Engine {
       this.store.updateStageRun(sr.id, { status: 'executing' });
       return;
     }
-    const agentId = stageAgentIds(eff.def)[0];
-    if (!agentId) {
+    // planning: auto goes by the size the Run's assessment gave, decided anew every round.
+    const planned = plansStage(eff.def, assessedSize(run.discussion));
+    const { agentId, selection } = this.stageAgent(run, eff, planned);
+    this.store.tx(() => {
+      const task = planned
+        ? // planning: llm (or auto for a requirement sized L) — the stage's agent first splits
+          // it into tasks (`runPlanTask`). Every round plans anew, with the reason the previous
+          // one was sent back and that round's plan and results (`previousPlan`), listing only
+          // the steps that change something.
+          this.store.createTask({
+            runId: run.id,
+            stageRunId: sr.id,
+            kind: 'plan',
+            title: t({ zh: '拆分任务', en: 'Plan the tasks' }),
+            instructions: eff.def.instructions ?? '',
+            agentId,
+          })
+        : // planning: single (or auto for any other size) — the whole stage is one task.
+          this.store.createTask({
+            runId: run.id,
+            stageRunId: sr.id,
+            title: eff.def.name ?? eff.def.id,
+            instructions: eff.def.instructions ?? '',
+            agentId,
+          });
+      if (selection) {
+        const data: AgentSelection = {
+          stageId: sr.stageId,
+          round: sr.round,
+          taskId: task.id,
+          agentId,
+          ...selection,
+        };
+        this.store.event(run.id, 'agent.selected', data);
+      }
+      this.store.updateStageRun(sr.id, { status: 'executing' });
+    });
+  }
+
+  /**
+   * Who starts a round of an agent stage. A stage with one `agent` always gets it. A stage with
+   * `agent_candidates` gets the one `chooseStageAgent` picks by the Run's assessed difficulty,
+   * among the candidates that have an adapter and, when the round runs read-only (an assessment,
+   * or a round that is planned first), can run so; `selection` is then what `agent.selected`
+   * records. When no candidate can run it, the first one, so that its task goes the way of any
+   * agent that cannot run (`agentUnavailable`, by `on_agent_error`). The choice holds for the
+   * round: reworks keep the task's agent, and a planned round's steps go to it too.
+   */
+  private stageAgent(
+    run: Run,
+    eff: EffectiveStage,
+    planned: boolean,
+  ): {
+    agentId: string;
+    selection?: Pick<AgentSelection, 'difficulty' | 'reason' | 'candidates'>;
+  } {
+    const candidates = stageAgentIds(eff.def);
+    const [first] = candidates;
+    if (!first) {
       throw new Error(
         t({
           zh: `阶段 ${eff.def.id} 没有指定 agent`,
@@ -1762,33 +1822,22 @@ export class Engine {
         }),
       );
     }
-    this.store.tx(() => {
-      // planning: auto goes by the size the Run's assessment gave, decided anew every round.
-      if (plansStage(eff.def, assessedSize(run.discussion))) {
-        // planning: llm (or auto for a requirement sized L) — the stage's agent first splits it
-        // into tasks (`runPlanTask`). Every round plans anew, with the reason the previous one
-        // was sent back and that round's plan and results (`previousPlan`), listing only the
-        // steps that change something.
-        this.store.createTask({
-          runId: run.id,
-          stageRunId: sr.id,
-          kind: 'plan',
-          title: t({ zh: '拆分任务', en: 'Plan the tasks' }),
-          instructions: eff.def.instructions ?? '',
-          agentId,
-        });
-      } else {
-        // planning: single (or auto for any other size) — the whole stage is one task.
-        this.store.createTask({
-          runId: run.id,
-          stageRunId: sr.id,
-          title: eff.def.name ?? eff.def.id,
-          instructions: eff.def.instructions ?? '',
-          agentId,
-        });
-      }
-      this.store.updateStageRun(sr.id, { status: 'executing' });
+    if (!eff.def.agent_candidates) return { agentId: first };
+    const difficulty = assessedDifficulty(run.discussion);
+    const readOnly = eff.def.kind === 'assess' || planned;
+    const chosen = chooseStageAgent(candidates, this.cfg.agents, difficulty, (id) => {
+      const cli = this.cfg.agents.get(id)?.cli;
+      const adapter = cli === undefined ? undefined : this.deps.adapters.get(cli);
+      return adapter !== undefined && (!readOnly || adapter.supportsReadOnly === true);
     });
+    return {
+      agentId: chosen?.id ?? first,
+      selection: {
+        difficulty: difficulty ?? null,
+        reason: chosen?.reason ?? 'unavailable',
+        candidates,
+      },
+    };
   }
 
   private async executeTasks(
@@ -2715,8 +2764,9 @@ export class Engine {
       );
     }
     const planned = report.value.tasks;
-    // The stage's agent does the work, also when another one made the plan.
-    const agentId = eff.def.agent ?? task.agentId;
+    // The stage's agent does the work, also when another one made the plan: its one `agent`, or
+    // the candidate chosen when the round started (`agent.selected`), whom the plan ran with first.
+    const agentId = eff.def.agent ?? this.triedAgents(task)[0] ?? task.agentId;
     this.store.tx(() => {
       this.store.addCheck({
         runId: run.id,
@@ -3144,6 +3194,8 @@ export class Engine {
 
   /**
    * Who takes over a task whose agent kept erroring or cannot run; undefined when nobody is left.
+   * A stage with `agent_candidates` switches only among them (the enabled ones, in the list's
+   * order); one with a single `agent`, among all enabled agents (agents.yaml's order).
    */
   private switchTarget(
     eff: EffectiveStage,
@@ -3151,15 +3203,13 @@ export class Engine {
     tried: readonly string[],
   ): AgentConfig | undefined {
     const readOnly = eff.def.kind === 'assess' || task.kind === 'plan';
-    return switchCandidate(
-      this.cfg.agents.values(),
-      this.cfg.agents.get(task.agentId),
-      new Set(tried),
-      (agent) => {
-        const adapter = this.deps.adapters.get(agent.cli);
-        return adapter !== undefined && (!readOnly || adapter.supportsReadOnly === true);
-      },
-    );
+    const agents = eff.def.agent_candidates
+      ? eff.def.agent_candidates.flatMap((id) => this.cfg.agents.get(id) ?? [])
+      : this.cfg.agents.values();
+    return switchCandidate(agents, this.cfg.agents.get(task.agentId), new Set(tried), (agent) => {
+      const adapter = this.deps.adapters.get(agent.cli);
+      return adapter !== undefined && (!readOnly || adapter.supportsReadOnly === true);
+    });
   }
 
   /** Final failure: roll the worktree back to before the task. */
