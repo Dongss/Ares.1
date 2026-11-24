@@ -14,11 +14,14 @@ import {
   RATE_LIMIT_WAIT,
   RAW_LOG_KEEP_DAYS,
   REDO_BACKOFF_MAX_HOURS,
+  REPO_WORKFLOWS_DIR,
   redoDelayMs,
+  type TemplateSource,
 } from '../../../src/config/flow.js';
 import { waitText } from '../../../src/engine/discussion.js';
 import { join, t } from '../../../src/i18n.js';
 import { NOTICE_KINDS, type NoticeKind } from '../../../src/notify/notice.js';
+import { findRepoTemplate } from './config.js';
 import { buildFlow, type FlowStage } from './flow.js';
 import { formatCost, formatMinutes, type Tone } from './format.js';
 import { acceptRanges, afterChinese, beforeChinese, scoutWaitText } from './issues.js';
@@ -124,6 +127,8 @@ export interface GuideInput {
 /** How a Run created from an issue goes: the template with the `auto_merge` override applied. */
 export interface IssueFlow {
   templateName: string;
+  /** Where the template comes from: the home directory, or the repo's own .ares1/workflows/. */
+  templateSource: TemplateSource;
   stages: FlowStage[];
   /** The Run's budget in USD; undefined = no limit. */
   budgetUsd: number | undefined;
@@ -132,19 +137,22 @@ export interface IssueFlow {
 }
 
 /**
- * The flow of the Runs a repo's issues become, as the Master creates them (same overrides,
- * `issueRunOverrides`). null when the template is missing or invalid.
+ * The flow of the Runs a repo's issues become, as the Master creates them: the same template (the
+ * home directory's, else the repo's own, `findRepoTemplate`) and the same overrides
+ * (`issueRunOverrides`). null when the template is missing or invalid.
  */
 export function issueFlow(
-  config: Pick<ConfigView, 'templates' | 'agents'>,
-  github: Pick<GitHubRepoStatus, 'template' | 'autoMerge'>,
+  config: Pick<ConfigView, 'templates' | 'repoTemplates' | 'agents'>,
+  github: Pick<GitHubRepoStatus, 'name' | 'template' | 'autoMerge'>,
   repoVerifyCommands: string[] | null,
 ): IssueFlow | null {
-  const template = config.templates.find((t) => t.id === github.template);
-  if (!template) return null;
+  const found = findRepoTemplate(config, github.name, github.template);
+  if (!found) return null;
+  const { template } = found;
   const overrides = issueRunOverrides(template, github.autoMerge) ?? {};
   return {
     templateName: template.name ?? template.id,
+    templateSource: found.source,
     stages: buildFlow({ template, overrides, repoVerifyCommands, agents: config.agents }),
     budgetUsd: effectiveBudget(template, overrides),
     budgetPauses: budgetPauses(template, overrides),
@@ -375,8 +383,8 @@ export function cycleSteps(input: GuideInput, rule?: AutoAcceptRule): CycleStep[
         runActors,
         input.flow
           ? t({
-              zh: `Master 每 ${pollMinutes} 分钟查一次带 ares1:ready 的 issue，按模板「${input.flow.templateName}」建 Run，进展回写到 issue；${concurrencyText(input.perRepo)}`,
-              en: `Every ${pollMinutes} minutes the Master looks for issues labeled ares1:ready, creates Runs from them with the template "${input.flow.templateName}" and reports progress on the issue; ${concurrencyText(input.perRepo)}`,
+              zh: `Master 每 ${pollMinutes} 分钟查一次带 ares1:ready 的 issue，按模板「${input.flow.templateName}」${input.flow.templateSource === 'repo' ? `（仓库自带的，在目标分支的 ${REPO_WORKFLOWS_DIR}/ 里）` : ''}建 Run，进展回写到 issue；${concurrencyText(input.perRepo)}`,
+              en: `Every ${pollMinutes} minutes the Master looks for issues labeled ares1:ready, creates Runs from them with the template "${input.flow.templateName}"${input.flow.templateSource === 'repo' ? ` (the repo's own, in ${REPO_WORKFLOWS_DIR}/ on the target branch)` : ''} and reports progress on the issue; ${concurrencyText(input.perRepo)}`,
             })
           : t({
               zh: `模板「${github.template}」不存在或无效，issue 建不了 Run：先修好配置`,

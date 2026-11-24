@@ -1136,6 +1136,48 @@ button.flow-stage-body:hover:not(:disabled) {
 .config-template .flow {
   margin: 10px 0;
 }
+.config-repo-templates {
+  margin-top: 16px;
+}
+.config-repo-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px;
+  margin: 0 0 8px;
+  font-size: 15px;
+}
+.config-repo-head .muted {
+  font-size: 13px;
+  font-weight: normal;
+}
+/* A repo's template the home directory overrides: shown, but has no effect. */
+.config-template-shadowed {
+  border-style: dashed;
+  background: var(--surface-2);
+}
+.config-template-invalid {
+  border-color: var(--danger);
+}
+/* Where a repo's template comes from and what is wrong with the repo's own (repos, issues). */
+.template-problems {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.template-problems li {
+  margin: 4px 0;
+  word-break: break-word;
+}
+.template-problems li.danger {
+  color: var(--danger);
+}
+.template-problems li.attention {
+  color: var(--attention);
+}
+.template-problems code {
+  margin-right: 6px;
+}
 .table-wrap {
   overflow-x: auto;
 }

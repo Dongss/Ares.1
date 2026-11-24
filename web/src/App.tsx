@@ -178,7 +178,11 @@ export function App() {
           repos={repos}
           config={config.data}
           configError={config.data ? undefined : config.error}
-          onReposChanged={repos.reload}
+          onReposChanged={() => {
+            repos.reload();
+            // The templates a repo keeps follow its target branch, read again by then.
+            config.reload();
+          }}
         />
       </main>
     </div>
@@ -218,7 +222,7 @@ function Page(props: {
   onReposChanged: () => void;
 }) {
   const { route, runs, repos } = props;
-  if (route.name === 'issues') return <IssuesPage />;
+  if (route.name === 'issues') return <IssuesPage config={props.config} />;
   if (route.name === 'workspaces') return <WorkspacesPage />;
   if (route.name === 'agents') return <AgentsPage />;
   if (route.name === 'events') return <EventsPage />;
@@ -257,7 +261,9 @@ function Page(props: {
     case 'stats':
       return <StatsPage repos={repos.data} />;
     case 'repos':
-      return <ReposPage repos={repos.data} onChanged={props.onReposChanged} />;
+      return (
+        <ReposPage repos={repos.data} config={props.config} onChanged={props.onReposChanged} />
+      );
     case 'notFound':
       return (
         <Empty>

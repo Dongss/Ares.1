@@ -222,6 +222,15 @@ export function createApi(deps: ApiDeps): Hono {
       agentsFile: cfg.agentsFile,
       agentEntries: cfg.agentEntries,
       templateFiles: cfg.templateFiles,
+      repoTemplates: [...cfg.repoTemplates.values()]
+        .sort((a, b) => (a.repo < b.repo ? -1 : a.repo > b.repo ? 1 : 0))
+        .map((r) => ({
+          repo: r.repo,
+          branch: r.branch,
+          sha: r.sha,
+          templates: [...r.templates.values()],
+          files: r.files,
+        })),
       ...status(),
     } satisfies ConfigView);
   });

@@ -1,5 +1,6 @@
 import { type ReactNode, useState } from 'react';
 import { t } from '../../../src/i18n.js';
+import type { TemplateProblem } from '../lib/config.js';
 import type { Tone } from '../lib/format.js';
 
 export function Badge({ tone, children }: { tone: Tone; children: ReactNode }) {
@@ -82,4 +83,19 @@ export function Collapsible(props: {
 /** Preformatted text that can get long: scrolls instead of growing forever. */
 export function Pre({ children, className }: { children: ReactNode; className?: string }) {
   return <pre className={`pre ${className ?? ''}`}>{children}</pre>;
+}
+
+/** The problems of the templates a repo keeps (`repoTemplateProblems`), each after its file. */
+export function TemplateProblems({ problems }: { problems: TemplateProblem[] }) {
+  if (problems.length === 0) return null;
+  return (
+    <ul className="template-problems">
+      {problems.map((p) => (
+        <li key={`${p.file}\n${p.text}`} className={p.tone}>
+          <code>{p.file}</code>
+          {p.text}
+        </li>
+      ))}
+    </ul>
+  );
 }

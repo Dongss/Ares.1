@@ -496,7 +496,8 @@ stages:
       });
       const [file] = cfg.repoTemplates.get('app')?.files ?? [];
       expect(file).toMatchObject({ key, templateId: 'self-dev', shadowed: true });
-      expect(file?.warnings).toEqual(cfg.warnings[key]);
+      // The file keeps its template's own warnings only; `shadowed` says the rest.
+      expect(file?.warnings).toEqual([]);
     });
 
     it('keeps the version that last loaded when a file breaks, and warns', () => {
@@ -516,6 +517,7 @@ stages:
         source: BROKEN_YAML,
         templateId: 'x',
         errors: [],
+        warnings: [],
         lastGood: { sha: SHA1, source: X },
       });
       expect(file?.lastGood?.errors).toEqual([
@@ -544,6 +546,33 @@ stages:
       expect(again.warnings).toEqual({});
       expect(again.repoTemplates.get('app')?.files[0]?.lastGood).toBeUndefined();
       expect(findTemplate(again, 'app', 'x')?.template.stages.map((s) => s.id)).toContain('land');
+    });
+
+    it("keeps on the file only its template's own warnings, and tells the rest in order", () => {
+      const paths = home();
+      const repos = '    app: { template: self-dev }\n';
+      const key = 'app:.ares1/workflows/self-dev.yaml';
+      // Reviewed by its own coder: a warning of the template itself.
+      const own = X.replace('id: x', 'id: self-dev').replace(
+        'agent: claude-reviewer',
+        'agent: claude-coder',
+      );
+      const first = load(paths, repos, { app: source(SHA1, { 'self-dev.yaml': own }) });
+      const ownWarning = '阶段 review：评审 Agent claude-coder 与编码 Agent 相同，建议换一个';
+      const broken = load(
+        paths,
+        repos,
+        { app: source(SHA2, { 'self-dev.yaml': BROKEN_YAML }) },
+        first,
+      );
+      const [file] = broken.repoTemplates.get('app')?.files ?? [];
+      expect(file).toMatchObject({ shadowed: true, lastGood: { sha: SHA1 } });
+      expect(file?.warnings).toEqual([ownWarning]);
+      expect(broken.warnings[key]).toEqual([
+        expect.stringMatching(/^这次加载失败，继续使用上次加载成功的版本（提交 1111111）/),
+        ownWarning,
+        expect.stringMatching(/^数据目录里也有 id 为 self-dev 的模板/),
+      ]);
     });
 
     it('treats a file that never loaded as missing', () => {

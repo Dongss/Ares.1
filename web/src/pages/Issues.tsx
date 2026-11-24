@@ -1,8 +1,14 @@
-import type { GitHubRepoStatus, GitHubStatus, UpgradeStatus } from '../../../src/api/types.js';
+import type {
+  ConfigView,
+  GitHubRepoStatus,
+  GitHubStatus,
+  UpgradeStatus,
+} from '../../../src/api/types.js';
 import { t } from '../../../src/i18n.js';
 import type { Scout, ScoutGap } from '../../../src/store/types.js';
-import { Badge, Empty, ErrorBox } from '../components/ui.js';
+import { Badge, Empty, ErrorBox, TemplateProblems } from '../components/ui.js';
 import { api } from '../lib/api.js';
+import { repoTemplateChoice, repoTemplateProblems, templateSourceText } from '../lib/config.js';
 import { formatCost, formatTime } from '../lib/format.js';
 import { useAction, useReloadOn, useResource } from '../lib/hooks.js';
 import {
@@ -20,8 +26,11 @@ import {
 } from '../lib/issues.js';
 import { href } from '../lib/router.js';
 
-/** GitHub issues as the backlog and the AI scouts that propose them. */
-export function IssuesPage() {
+/**
+ * GitHub issues as the backlog and the AI scouts that propose them. `config`: the configuration
+ * in use (reloaded by the app), for where each repo's template comes from.
+ */
+export function IssuesPage({ config }: { config: ConfigView | undefined }) {
   const github = useResource(() => api.github(), 'github');
   const upgrade = useResource(() => api.upgrade(), 'upgrade');
   useReloadOn(upgrade.reload, (e) => e.type.startsWith('upgrade.') || e.type === 'run.status');
@@ -51,7 +60,7 @@ export function IssuesPage() {
       )}
       {upgrade.data && <UpgradeCard status={upgrade.data} onChecked={upgrade.reload} />}
       {github.data.repos.map((r) => (
-        <RepoIssues key={r.name} repo={r} onStarted={scouts.reload} />
+        <RepoIssues key={r.name} repo={r} config={config} onStarted={scouts.reload} />
       ))}
       <h2>{t({ zh: '侦察记录', en: 'Scouts' })}</h2>
       {scouts.error && <ErrorBox>{scouts.error}</ErrorBox>}
@@ -244,9 +253,16 @@ function NotConfigured() {
   );
 }
 
-function RepoIssues({ repo, onStarted }: { repo: GitHubRepoStatus; onStarted: () => void }) {
+function RepoIssues(props: {
+  repo: GitHubRepoStatus;
+  config: ConfigView | undefined;
+  onStarted: () => void;
+}) {
+  const { repo, config, onStarted } = props;
   const action = useAction();
   const scout = repo.scout;
+  const template = config ? repoTemplateChoice(config, repo.name, repo.template) : null;
+  const templateProblems = config ? repoTemplateProblems(config, repo.name) : [];
   return (
     <section className="card repo">
       <div className="repo-head">
@@ -270,9 +286,20 @@ function RepoIssues({ repo, onStarted }: { repo: GitHubRepoStatus; onStarted: ()
         </ErrorBox>
       )}
       <dl className="meta">
-        <div>
+        <div className="wide">
           <dt>{t({ zh: 'Run 模板', en: 'Run template' })}</dt>
-          <dd>{repo.template}</dd>
+          <dd>
+            {repo.template}
+            {template && (
+              <span className="muted">
+                {t({
+                  zh: `（${templateSourceText(template)}）`,
+                  en: ` (${templateSourceText(template)})`,
+                })}
+              </span>
+            )}
+            <TemplateProblems problems={templateProblems} />
+          </dd>
         </div>
         <div className="wide">
           <dt>{t({ zh: '侦察', en: 'Scout' })}</dt>

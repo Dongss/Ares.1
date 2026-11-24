@@ -151,6 +151,23 @@ export interface DiffView {
   truncated: boolean;
 }
 
+/** The templates a registered repo keeps in .ares1/workflows/, as committed on its target branch. */
+export interface RepoTemplatesView {
+  /** The repo's name as registered. */
+  repo: string;
+  /** The target branch the files were read from, and the commit it was at. */
+  branch: string;
+  sha: string;
+  /**
+   * The repo's valid templates, including earlier versions standing in for files that now fail
+   * (`lastGood`), and those whose id the home directory also has (`shadowed`), although Runs get
+   * the home directory's.
+   */
+  templates: WorkflowTemplate[];
+  /** Every file with its source, including invalid ones, by file name. */
+  files: TemplateFile[];
+}
+
 /** GET /api/config (read-only; reloaded when the files change). */
 export interface ConfigView {
   /** config.yaml's `language`: what the Master writes in, and the dashboard's default. */
@@ -162,11 +179,14 @@ export interface ConfigView {
   perRepo: number;
   /** Valid and enabled agents. */
   agents: AgentConfig[];
-  /** Valid templates. */
+  /** Valid templates of the home directory. */
   templates: WorkflowTemplate[];
-  /** Problems keyed by "agents.yaml#<id>" or "workflows/<file>"; those items are not used. */
+  /**
+   * Problems keyed by "agents.yaml#<id>", "workflows/<file>" or a repo's
+   * "<repo>:.ares1/workflows/<file>"; those items are not used.
+   */
   errors: Record<string, string[]>;
-  /** Problems that disable nothing, keyed by "config.yaml" or "workflows/<file>". */
+  /** Problems that disable nothing, keyed by "config.yaml" or a template file's key. */
   warnings: Record<string, string[]>;
   /** The configuration directory (Master home). */
   dir: string;
@@ -176,6 +196,12 @@ export interface ConfigView {
   agentEntries: AgentEntry[];
   /** Every file in workflows/ with its source, including invalid ones. */
   templateFiles: TemplateFile[];
+  /**
+   * The templates registered repos keep in their own .ares1/workflows/, in repo name order; repos
+   * without such files are left out. Each repo's are seen by that repo only, after the home
+   * directory's (`resolveTemplate`).
+   */
+  repoTemplates: RepoTemplatesView[];
   /** When the configuration in use was loaded (it reloads when the files change). */
   loadedAt: string;
   /** The last reload failed; the previous configuration is still in use. */

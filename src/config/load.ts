@@ -252,13 +252,13 @@ export function loadConfig(
   for (const [name, source] of options.repoSources ?? []) {
     const previous = options.previous?.repoTemplates.get(name);
     const loaded = loadRepoTemplates(name, source.files, agents, readOnlyClis, previous);
-    // The home directory's template wins: this machine's override of the repo's.
     for (const entry of loaded.files) {
-      if (entry.templateId === null || !templates.has(entry.templateId)) continue;
-      entry.shadowed = true;
-      entry.warnings.push(shadowedWarning(entry.templateId, templateFiles));
+      // The home directory's template wins: this machine's override of the repo's.
+      if (entry.templateId !== null && templates.has(entry.templateId)) entry.shadowed = true;
+      if (entry.errors.length > 0) errors[entry.key] = entry.errors;
+      const told = repoFileWarnings(entry, templateFiles);
+      if (told.length > 0) warnings[entry.key] = told;
     }
-    recordProblems(loaded.files, errors, warnings);
     repoTemplates.set(name, {
       repo: name,
       branch: source.branch,
@@ -339,9 +339,10 @@ export function repoTemplateKey(repoName: string, file: string): string {
  * Load a repo's own template files (`files`, as committed) like those of the home directory,
  * except that a file failing to load keeps its template as last loaded (`previous`: this repo's
  * last load) when that version still loads with the agents of now: a broken change on the target
- * branch must not stop the repo's work. The file is then marked with `lastGood` and warned about.
- * A file that never loaded is invalid, as in the home directory. Ids are only checked against the
- * repo's other files, not against the home directory's.
+ * branch must not stop the repo's work. The file is then marked with `lastGood`, and its
+ * `warnings` are those of that version (`repoFileWarnings` adds what `lastGood` says). A file that
+ * never loaded is invalid, as in the home directory. Ids are only checked against the repo's other
+ * files, not against the home directory's.
  */
 export function loadRepoTemplates(
   repoName: string,
@@ -371,7 +372,7 @@ export function loadRepoTemplates(
     if (good && earlier?.template) {
       entry.templateId = earlier.template.id;
       entry.lastGood = { ...good, errors: loaded.errors };
-      entry.warnings = [lastGoodWarning(good.sha, loaded.errors), ...earlier.warnings];
+      entry.warnings = earlier.warnings;
       templates.set(earlier.template.id, earlier.template);
       continue;
     }
@@ -394,6 +395,20 @@ function lastGood(
   if (!previous || !entry || entry.templateId === null) return undefined;
   if (entry.lastGood) return { sha: entry.lastGood.sha, source: entry.lastGood.source };
   return { sha: previous.sha, source: entry.source };
+}
+
+/**
+ * A repo's file's warnings as the configuration tells them: what `lastGood` says first, then
+ * those of the template in use, then what `shadowed` says. The file itself keeps only the middle
+ * ones, so that the dashboard can word the other two in its own language.
+ */
+function repoFileWarnings(entry: TemplateFile, homeFiles: readonly TemplateFile[]): string[] {
+  const told = [...entry.warnings];
+  if (entry.lastGood) told.unshift(lastGoodWarning(entry.lastGood.sha, entry.lastGood.errors));
+  if (entry.shadowed && entry.templateId !== null) {
+    told.push(shadowedWarning(entry.templateId, homeFiles));
+  }
+  return told;
 }
 
 function lastGoodWarning(sha: string, errors: readonly string[]): string {

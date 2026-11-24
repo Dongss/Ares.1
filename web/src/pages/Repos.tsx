@@ -1,26 +1,39 @@
 import { type FormEvent, useState } from 'react';
+import type { ConfigView } from '../../../src/api/types.js';
+import { REPO_WORKFLOWS_DIR } from '../../../src/config/flow.js';
 import { t } from '../../../src/i18n.js';
 import type { Repo } from '../../../src/store/types.js';
-import { ConfirmButton, Empty, ErrorBox } from '../components/ui.js';
+import { Badge, ConfirmButton, Empty, ErrorBox, TemplateProblems } from '../components/ui.js';
 import { api } from '../lib/api.js';
-import { parseLines } from '../lib/format.js';
+import { repoTemplateBadges, repoTemplateGroups, repoTemplateProblems } from '../lib/config.js';
+import { parseLines, shortSha } from '../lib/format.js';
 import { useAction } from '../lib/hooks.js';
+import { href } from '../lib/router.js';
 
-export function ReposPage({ repos, onChanged }: { repos: Repo[]; onChanged: () => void }) {
+/** `config`: the configuration in use (reloaded by the app), for the templates repos keep. */
+export function ReposPage(props: {
+  repos: Repo[];
+  config: ConfigView | undefined;
+  onChanged: () => void;
+}) {
+  const { repos, config, onChanged } = props;
   return (
     <div className="repos">
       <h1>{t({ zh: '仓库', en: 'Repos' })}</h1>
       {repos.length === 0 ? (
         <Empty>{t({ zh: '还没有登记仓库。', en: 'No repos registered yet.' })}</Empty>
       ) : (
-        repos.map((repo) => <RepoCard key={repo.id} repo={repo} onChanged={onChanged} />)
+        repos.map((repo) => (
+          <RepoCard key={repo.id} repo={repo} config={config} onChanged={onChanged} />
+        ))
       )}
       <AddRepo onAdded={onChanged} />
     </div>
   );
 }
 
-function RepoCard({ repo, onChanged }: { repo: Repo; onChanged: () => void }) {
+function RepoCard(props: { repo: Repo; config: ConfigView | undefined; onChanged: () => void }) {
+  const { repo, config, onChanged } = props;
   const [editing, setEditing] = useState(false);
   const action = useAction();
 
@@ -57,6 +70,14 @@ function RepoCard({ repo, onChanged }: { repo: Repo; onChanged: () => void }) {
           <dt>{t({ zh: '准备命令', en: 'Setup commands' })}</dt>
           <dd>{commandList(repo.setupCommands)}</dd>
         </div>
+        {config && (
+          <div className="wide">
+            <dt>{t({ zh: '自带的流程模板', en: 'Its own workflow templates' })}</dt>
+            <dd>
+              <OwnTemplates repo={repo.name} config={config} />
+            </dd>
+          </div>
+        )}
       </dl>
       <div className="form-actions">
         <button type="button" onClick={() => setEditing(true)}>
@@ -73,6 +94,45 @@ function RepoCard({ repo, onChanged }: { repo: Repo; onChanged: () => void }) {
       </div>
       <ErrorBox>{action.error}</ErrorBox>
     </section>
+  );
+}
+
+/** The templates the repo keeps on its target branch, what became of them, and their problems. */
+function OwnTemplates({ repo, config }: { repo: string; config: ConfigView }) {
+  const group = repoTemplateGroups(config).find((g) => g.repo === repo);
+  if (!group) {
+    return (
+      <span className="muted">
+        {t({
+          zh: `无（可以在目标分支的 ${REPO_WORKFLOWS_DIR}/ 里放模板）`,
+          en: `None (templates can be kept in ${REPO_WORKFLOWS_DIR}/ on the target branch)`,
+        })}
+      </span>
+    );
+  }
+  return (
+    <>
+      <span className="commands">
+        {group.cards.map((card) => (
+          <span key={card.key}>
+            <code>{card.template?.id ?? card.file}</code>{' '}
+            {repoTemplateBadges(card).map((b) => (
+              <Badge key={b.label} tone={b.tone}>
+                {b.label}
+              </Badge>
+            ))}
+          </span>
+        ))}
+      </span>
+      <TemplateProblems problems={repoTemplateProblems(config, repo)} />
+      <div className="hint">
+        {t({
+          zh: `读自目标分支 ${group.branch} 上的 ${REPO_WORKFLOWS_DIR}/（提交 ${shortSha(group.sha)}），`,
+          en: `Read from ${REPO_WORKFLOWS_DIR}/ on the target branch ${group.branch} (commit ${shortSha(group.sha)}); `,
+        })}
+        <a href={href.config}>{t({ zh: '在配置页查看', en: 'see them on the Config page' })}</a>
+      </div>
+    </>
   );
 }
 

@@ -1,5 +1,6 @@
 import { useEffect } from 'react';
 import type { ConfigView } from '../../../src/api/types.js';
+import { REPO_WORKFLOWS_DIR } from '../../../src/config/flow.js';
 import type { SourceFile } from '../../../src/config/schema.js';
 import { join, LANG_NAMES, t } from '../../../src/i18n.js';
 import { FlowChart } from '../components/FlowChart.js';
@@ -9,12 +10,17 @@ import {
   type AgentRow,
   agentRows,
   configFileWarnings,
+  type RepoTemplateCard,
+  type RepoTemplateGroup,
+  repoTemplateBadges,
+  repoTemplateGroups,
+  repoTemplateNotes,
   type TemplateCard,
   templateAnchor,
   templateCards,
 } from '../lib/config.js';
 import { buildFlow } from '../lib/flow.js';
-import { formatTime } from '../lib/format.js';
+import { formatTime, shortSha } from '../lib/format.js';
 
 /** Read-only view of the Master's configuration files. */
 export function ConfigPage(props: {
@@ -40,6 +46,7 @@ export function ConfigPage(props: {
     );
   }
   const { valid, invalid } = templateCards(config);
+  const repoGroups = repoTemplateGroups(config);
   const agents = agentRows(config);
   const fileErrors = config.errors['agents.yaml'];
   const configWarnings = configFileWarnings(config);
@@ -98,6 +105,50 @@ export function ConfigPage(props: {
             ))}
           </>
         )}
+      </section>
+
+      <section className="section">
+        <h2>
+          {t({ zh: '仓库自带的模板', en: 'Templates kept in repos' })}
+          <span className="count">{repoGroups.reduce((n, g) => n + g.cards.length, 0)}</span>
+        </h2>
+        <p className="hint">
+          {t({
+            zh: (
+              <>
+                登记的仓库可以在目标分支的 <code>{REPO_WORKFLOWS_DIR}/*.yaml</code>{' '}
+                里放模板，格式和数据目录的一样，跟着代码一起演进。
+                {`只读目标分支上已提交的内容，分支前进后自动重新加载；只有这个仓库的 Run 能用。`}
+                仓库用的模板（<code>github.repos</code> 的 <code>template</code>
+                ）先在数据目录里找，找不到才用仓库自带的，所以两边有同一个 id
+                时用数据目录的。文件加载失败时继续用上次加载成功的版本。
+              </>
+            ),
+            en: (
+              <>
+                A registered repo can keep templates in <code>{REPO_WORKFLOWS_DIR}/*.yaml</code> on
+                its target branch, written as in the home directory, so that they evolve with the
+                code. Only what is committed on the target branch is read, again whenever the branch
+                moves; only that repo's Runs can use them. The template a repo uses (
+                <code>template</code> under <code>github.repos</code>) is looked up in the home
+                directory first, and in the repo's own only when it is not there, so the home
+                directory's wins when both have the same id. A file that fails to load keeps the
+                version that last loaded.
+              </>
+            ),
+          })}
+        </p>
+        {repoGroups.length === 0 && (
+          <Empty>
+            {t({
+              zh: '登记的仓库都没有自带模板。',
+              en: 'No registered repo keeps templates of its own.',
+            })}
+          </Empty>
+        )}
+        {repoGroups.map((group) => (
+          <RepoTemplatesView key={group.repo} group={group} config={config} />
+        ))}
       </section>
 
       <section className="section">
@@ -176,6 +227,90 @@ function TemplateCardView(props: { card: TemplateCard; config: ConfigView; targe
       )}
       <FlowChart stages={flow} />
       <Collapsible title={t({ zh: 'YAML 原文', en: 'YAML source' })}>
+        <Pre>{card.source}</Pre>
+      </Collapsible>
+    </section>
+  );
+}
+
+/** The templates one repo keeps, each card marked with what became of its file. */
+function RepoTemplatesView({ group, config }: { group: RepoTemplateGroup; config: ConfigView }) {
+  return (
+    <div className="config-repo-templates">
+      <h3 className="config-repo-head">
+        {group.repo}
+        <span className="muted">
+          {t({ zh: '目标分支 ', en: 'target branch ' })}
+          <code>{group.branch}</code>
+          {t({ zh: '，提交 ', en: ', commit ' })}
+          <code>{shortSha(group.sha)}</code>
+        </span>
+      </h3>
+      {group.cards.map((card) => (
+        <RepoTemplateCardView key={card.key} card={card} config={config} />
+      ))}
+    </div>
+  );
+}
+
+function RepoTemplateCardView({ card, config }: { card: RepoTemplateCard; config: ConfigView }) {
+  const template = card.template;
+  const notes = repoTemplateNotes(card);
+  // Why nothing loaded from the file, or why the file as on the branch is not the version in use.
+  const errors = card.lastGood?.errors ?? card.errors;
+  const flow = template && buildFlow({ template, repoVerifyCommands: null, agents: config.agents });
+  return (
+    <section className={`card config-template config-template-${card.state}`}>
+      <div className="config-template-head">
+        <h3>{template ? (template.name ?? template.id) : card.file}</h3>
+        {template && <code className="muted">{template.id}</code>}
+        {repoTemplateBadges(card).map((b) => (
+          <Badge key={b.label} tone={b.tone}>
+            {b.label}
+          </Badge>
+        ))}
+      </div>
+      {template?.description && <p className="config-template-desc">{template.description}</p>}
+      <SourceLine path={card.path} />
+      {notes.length > 0 && (
+        <div className="warn-box">
+          {notes.map((n) => (
+            <div key={n}>{n}</div>
+          ))}
+        </div>
+      )}
+      {errors.length > 0 && (
+        <ErrorBox>
+          {errors.map((e) => (
+            <div key={e}>{e}</div>
+          ))}
+        </ErrorBox>
+      )}
+      {card.warnings.length > 0 && (
+        <div className="warn-box">
+          {card.warnings.map((w) => (
+            <div key={w}>{w}</div>
+          ))}
+        </div>
+      )}
+      {flow && <FlowChart stages={flow} />}
+      {card.lastGood && (
+        <Collapsible
+          title={t({
+            zh: `在用的版本（提交 ${shortSha(card.lastGood.sha)}）`,
+            en: `The version in use (commit ${shortSha(card.lastGood.sha)})`,
+          })}
+        >
+          <Pre>{card.lastGood.source}</Pre>
+        </Collapsible>
+      )}
+      <Collapsible
+        title={
+          card.lastGood
+            ? t({ zh: '目标分支上的 YAML（加载失败）', en: 'YAML on the target branch (fails)' })
+            : t({ zh: 'YAML 原文', en: 'YAML source' })
+        }
+      >
         <Pre>{card.source}</Pre>
       </Collapsible>
     </section>

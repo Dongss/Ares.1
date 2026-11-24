@@ -48,6 +48,7 @@ const template = TemplateSchema.parse({
 
 const config = {
   templates: [template],
+  repoTemplates: [],
   agents: [
     { id: 'claude-coder', model: 'opus', effort: 'xhigh' as const, args: [] },
     { id: 'claude-reviewer', model: 'opus', args: [] },
@@ -781,6 +782,41 @@ describe('guardrails', () => {
         'the redo waits 1 minute first, twice as long after each further failure, up to 2 hours',
       );
       expect(text?.text).not.toMatch(/[一-鿿]/);
+    } finally {
+      setLang('zh');
+    }
+  });
+
+  it("finds the repo's template as the Master does: the home directory's, else the repo's own", () => {
+    const own = TemplateSchema.parse({ ...template, id: 'own', name: '仓库自带的流程' });
+    // The templates the repo "ares1" keeps.
+    const keeps = (templates: (typeof template)[]): typeof config => ({
+      ...config,
+      repoTemplates: [{ repo: 'ares1', branch: 'main', sha: 'abc', templates, files: [] }],
+    });
+    const cfg = keeps([own]);
+    const ownRepo = { ...manualRepo, template: 'own' };
+
+    const flow = issueFlow(cfg, ownRepo, null);
+    expect(flow).toMatchObject({ templateName: '仓库自带的流程', templateSource: 'repo' });
+    expect(byId({ ...input(ownRepo), flow }).run?.text).toContain(
+      '按模板「仓库自带的流程」（仓库自带的，在目标分支的 .ares1/workflows/ 里）建 Run',
+    );
+    // Another repo does not see it.
+    expect(issueFlow(cfg, { ...ownRepo, name: 'other' }, null)).toBeNull();
+    // The home directory's of the same id wins.
+    expect(issueFlow(keeps([{ ...own, id: 'self-dev' }]), manualRepo, null)).toMatchObject({
+      templateName: '自举开发',
+      templateSource: 'home',
+    });
+    expect(byId(input(manualRepo)).run?.text).not.toContain('仓库自带');
+
+    setLang('en');
+    try {
+      const text = byId({ ...input(ownRepo), flow: issueFlow(cfg, ownRepo, null) }).run?.text;
+      expect(text).toContain(
+        `with the template "仓库自带的流程" (the repo's own, in .ares1/workflows/ on the target branch)`,
+      );
     } finally {
       setLang('zh');
     }

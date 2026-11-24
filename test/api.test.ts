@@ -913,6 +913,70 @@ agents:
     });
   });
 
+  it('exposes the templates each repo keeps, with what became of their files', async () => {
+    h = await harness();
+    const { repoDir, master } = h;
+    const workflows = join(repoDir, '.ares1', 'workflows');
+    const X = TEST_WORKFLOW_YAML.replace('id: dev', 'id: x');
+    const commit = (files: Record<string, string>) => {
+      for (const [file, source] of Object.entries(files)) writeFile(join(workflows, file), source);
+      git(repoDir, 'add', '-A');
+      git(repoDir, 'commit', '-q', '-m', 'workflows');
+      return git(repoDir, 'rev-parse', 'HEAD');
+    };
+    const get = async () => ((await call('GET', '/api/config')) as { json: ConfigView }).json;
+    expect((await get()).repoTemplates).toEqual([]);
+
+    // One valid, one the home directory overrides (same id), one invalid.
+    const first = commit({ 'x.yaml': X, 'dev.yaml': TEST_WORKFLOW_YAML, 'bad.yaml': 'id: bad\n' });
+    // Uncommitted changes play no part.
+    writeFile(join(workflows, 'y.yaml'), X.replace('id: x', 'id: y'));
+    await master.repoWorkflows.refresh();
+    const json = await get();
+    // The home directory's own templates are as before.
+    expect(json.templates.map((t) => t.id)).toEqual(['dev']);
+    expect(json.repoTemplates).toHaveLength(1);
+    const [demo] = json.repoTemplates;
+    expect(demo).toMatchObject({ repo: 'demo', branch: 'main', sha: first });
+    expect(demo?.templates.map((t) => t.id).sort()).toEqual(['dev', 'x']);
+    expect(demo?.files.map((f) => [f.file, f.templateId, f.shadowed ?? false])).toEqual([
+      ['bad.yaml', null, false],
+      ['dev.yaml', 'dev', true],
+      ['x.yaml', 'x', false],
+    ]);
+    expect(demo?.files[0]?.errors).toEqual(json.errors['demo:.ares1/workflows/bad.yaml']);
+    expect(demo?.files[2]).toMatchObject({
+      key: 'demo:.ares1/workflows/x.yaml',
+      path: '.ares1/workflows/x.yaml',
+      source: X,
+      errors: [],
+    });
+    // The structured flag says it; the configuration's warnings word it.
+    expect(demo?.files[1]?.warnings).toEqual([]);
+    expect(json.warnings['demo:.ares1/workflows/dev.yaml']).toEqual([
+      expect.stringMatching(/^数据目录里也有 id 为 dev 的模板（workflows\/dev\.yaml）/),
+    ]);
+
+    // Broken on the target branch: the version that last loaded stays, marked with its commit.
+    const second = commit({ 'x.yaml': 'id: [\n' });
+    await master.repoWorkflows.refresh();
+    const broken = (await get()).repoTemplates[0];
+    expect(broken?.sha).toBe(second);
+    const x = broken?.files.find((f) => f.file === 'x.yaml');
+    expect(x).toMatchObject({ templateId: 'x', source: 'id: [\n', errors: [], warnings: [] });
+    expect(x?.lastGood).toMatchObject({ sha: first, source: X });
+    expect(x?.lastGood?.errors).toEqual([expect.stringMatching(/不是合法的 YAML/)]);
+    expect(broken?.templates.find((t) => t.id === 'x')?.name).toBe('测试流程');
+
+    // Repos in name order.
+    const other = initRepo();
+    writeFile(join(other, '.ares1', 'workflows', 'z.yaml'), X.replace('id: x', 'id: z'));
+    git(other, 'add', '-A');
+    git(other, 'commit', '-q', '-m', 'workflows');
+    expect((await call('POST', '/api/repos', { name: 'alpha', path: other })).status).toBe(201);
+    expect((await get()).repoTemplates.map((r) => r.repo)).toEqual(['alpha', 'demo']);
+  });
+
   it('streams events over SSE', async () => {
     h = await harness();
     const res = await h.master.app.request('/api/stream');

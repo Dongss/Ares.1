@@ -338,11 +338,15 @@ export interface TemplateFile {
    */
   templateId: string | null;
   errors: string[];
+  /**
+   * Those of the template loaded from this file. What `lastGood` and `shadowed` say is told in the
+   * configuration's `warnings` under `key`, not here.
+   */
   warnings: string[];
   /**
    * Only a repo's file that failed to load this time while an earlier version of it had loaded:
    * that version is the template in use. `sha`: the commit it was read from; `errors`: why the
-   * file as written failed (also told in `warnings`).
+   * file as written failed.
    */
   lastGood?: { sha: string; source: string; errors: string[] };
   /**
