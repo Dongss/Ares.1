@@ -1,0 +1,56 @@
+# 自举用的流程：需求评估 → 编码 → 检查 → 评审 → E2E（占位）→ 合并前人工审批 → 合并
+id: self-dev
+name: 自举开发
+
+defaults:
+  escalate:
+    max_retries: 2               # 返工次数上限；Agent 出错时也按这个次数重试（带退避），两者分开计数
+    on_agent_error: switch_agent # Agent 出错：重试用完后换另一个 Agent 再试，都不行就结束 Run、标为失败；human = 重试用完后卡住等人
+    on_exhausted: fail           # 返工 max_retries 次仍未通过，或回退超过 max_loops：结束 Run、标为失败，从 issue 来的会带着原因自动重做；human = 卡住等人
+  max_loops: 3                 # 同一阶段最多回退重做几轮（评审打回、审批驳回都算）
+
+stages:
+  - id: assess
+    name: 需求评估
+    kind: assess               # 只读地评估需求：go 开工；ask 在 issue / 看板上讨论；人同意后 drop 不做
+    agent: claude-reviewer     # 以只读方式运行，要用支持只读的 CLI（claude-code）
+    reply_timeout_hours: 24    # 提出疑问后等人回复几小时，超时由评估自己决定（写明假设后开工，或者不做）；0 = 不等人；null = 一直等
+
+  - id: implement
+    name: 编码
+    kind: agent
+    agent: claude-coder        # planning: auto 要以只读方式拆分，要用支持只读的 CLI（claude-code）
+    planning: auto             # 按需求评估给出的规模：L（要改多个模块）先由这个 Agent 只读地拆成几步，再一步一步做、
+                               # 一步一步检查和提交；S、M 或没给规模时整个阶段一次做完。single = 从不拆分，llm = 总是拆分
+    inputs: [assessment]       # 评估结论（讨论后修改的需求）放进提示词
+    instructions: |
+      实现目标中描述的需求，并补充必要的测试。
+    # 检查命令默认使用仓库登记时配置的命令，也可以在这里覆盖：
+    # verify:
+    #   commands: ["npm run build", "npm test", "npm run lint"]
+
+  - id: review
+    name: 评审
+    kind: review
+    agent: claude-reviewer
+    inputs: [diff, assessment]
+    on_fail: implement
+
+  - id: e2e
+    name: E2E
+    kind: placeholder          # 占位：暂未实现，执行到这一步直接通过
+    instructions: |
+      端到端测试（暂未实现）
+    # 想在这里运行项目自己的端到端测试、冒烟测试或部署前检查，就改成 kind: command 并写上命令
+    # （去掉上面的 instructions）。Master 在工作目录依次运行，不调 Agent；有命令失败时带着输出
+    # 回到 on_fail（不写就是前面最近的 Agent 阶段，即编码），计入 max_loops。不写 verify 就运行
+    # 仓库登记的检查命令。
+    # kind: command
+    # verify:
+    #   commands: ["npx playwright test"]
+
+  - id: merge
+    name: 合并
+    kind: merge
+    gate: true
+    on_reject: implement

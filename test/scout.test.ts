@@ -1041,7 +1041,13 @@ describe('scoutPrompt', () => {
 
   it('introduces the project by its display name, not the technical one', () => {
     expect(prompt.startsWith('你是战神一号的「侦察」：')).toBe(true);
-    expect(prompt).not.toContain('ares1');
+    // The technical id shows up only as the repo's .ares1/ directory, never naming the project.
+    expect(prompt.replaceAll('.ares1/', '')).not.toContain('ares1');
+  });
+
+  it("rates changes to .ares1/, the repo's own workflow, as high risk", () => {
+    const high = prompt.split('\n').find((l) => l.startsWith('  - high：'));
+    expect(high).toContain('改动 .ares1/ 下的文件（仓库自己的开发流程）');
   });
 
   it("sends the scout to README.md's goals, the basis for every decision, and AGENTS.md", () => {
@@ -1447,6 +1453,9 @@ describe('scout in English', () => {
     expect(prompt).toContain('Write in English.');
     expect(prompt).toContain('At most 3,');
     expect(prompt).toContain('## Recent Runs\n(no Runs yet)');
+    expect(prompt.split('\n').find((l) => l.startsWith('  - high: '))).toContain(
+      "changes to files under .ares1/ (the repo's own development workflow)",
+    );
     const clue = prompt.split('\n').find((l) => l.startsWith('1. '));
     expect(clue).toContain(
       '"Work switched off", "Awaiting approval", "Stuck, waiting for a human" and "Paused" are time spent waiting for a human, and "Queued" is time spent waiting for other Runs to finish (including while an upgrade is pending or the Master is not running)',

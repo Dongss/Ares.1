@@ -154,7 +154,10 @@ agents:
   });
 }
 
-/** workflows/self-dev.yaml written on first start. */
+/**
+ * workflows/self-dev.yaml written on first start. Its Chinese text is also this repo's own
+ * .ares1/workflows/self-dev.yaml, the workflow it is developed with: change both together.
+ */
 export function defaultSelfDevYaml(): string {
   return t({
     zh: `# 自举用的流程：需求评估 → 编码 → 检查 → 评审 → E2E（占位）→ 合并前人工审批 → 合并

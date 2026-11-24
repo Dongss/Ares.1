@@ -25,6 +25,7 @@ cp docs/examples/workflows/*.yaml ~/.ares1/workflows/
 - Master 发现配置文件变了会自动重新加载，不用重启（改 `port`、`bins` 除外）。加载的结果在看板的「配置」页：哪个 Agent、模板或仓库有问题，就只停用它自己，并写明原因。
 - `config.yaml` 里的 `my-web`、`my-api`、`my-docs`、`my-tool` 是占位名：改成你在看板「仓库」页登记的仓库名，用不到的整段删掉。`issues_repo` 也要改成你自己的 GitHub 仓库，或者删掉，让 gh 按本地仓库的 remote 推断。
 - 只想要其中一部分也行：模板可以只挑需要的复制，但 `config.yaml` 里仓库用的模板（`template`）、模板和侦察用的 Agent 都得存在，否则对应的仓库或模板会被停用。
+- 模板也可以不复制到数据目录，而是提交到仓库目标分支的 `.ares1/workflows/` 里，格式一样，跟着代码一起评审、一起演进，只给这个仓库用；数据目录里有同 id 的模板时用数据目录那份。详见 [`docs/running.md`](../running.md#仓库自带的流程模板) 的「仓库自带的流程模板」。
 - 数据目录里原来的 `workflows/self-dev.yaml` 用的是 `claude-coder` 和 `claude-reviewer`，示例的 `agents.yaml` 保留了这两个名字，换上示例后它照样能用。
 - 示例的 `language` 是 `zh`；想让 issue 评论和给 Agent 的提示词用英文，就改成 `en`。
 

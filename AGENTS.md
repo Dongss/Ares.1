@@ -31,6 +31,9 @@ npm run test:real    # tests that call the real Claude Code and cursor-agent: co
 ## Layout
 
 ```
+.ares1/workflows/     this repo's own workflow templates, read from the target branch by the Master
+                      developing it; self-dev.yaml is defaultSelfDevYaml() in Chinese, word for
+                      word (a test keeps them the same: change both together)
 src/
   cli.ts              start command: parses --home / --port and starts the Master
   master.ts           wires config, store, engine, GitHub bridge, notifications, upgrade and API

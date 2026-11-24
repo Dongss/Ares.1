@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from 'node:fs';
+import { readdirSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
@@ -107,6 +107,19 @@ describe('config', () => {
     writeFile(paths.configFile, 'port: 5000\n');
     initHome(paths);
     expect(readFileSync(paths.configFile, 'utf8')).toBe('port: 5000\n');
+  });
+
+  it("leaves workflows/ empty once its templates were deleted, to use the repos' own", () => {
+    const paths = home();
+    rmSync(join(paths.workflowsDir, 'self-dev.yaml'));
+    // Every start runs it: a template written again would override the repo's of the same id.
+    initHome(paths);
+    expect(readdirSync(paths.workflowsDir)).toEqual([]);
+    expect(loadConfig(paths, ['claude-code'], ['claude-code']).templates.size).toBe(0);
+    // A home without workflows/ is new, and gets the default again.
+    rmSync(paths.workflowsDir, { recursive: true });
+    initHome(paths);
+    expect(readdirSync(paths.workflowsDir)).toEqual(['self-dev.yaml']);
   });
 
   it('an invalid config.yaml stops the Master', () => {

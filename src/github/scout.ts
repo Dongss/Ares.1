@@ -1138,7 +1138,7 @@ ${splitIntro(input)}
 - risk 的含义：
   - low：只涉及文档、测试、看板展示，或不改变行为的重构；
   - mid：改变行为，但影响范围清楚；
-  - high：涉及数据库迁移、合并或回滚等 git 操作、Agent 权限、配置格式、对外发布。
+  - high：涉及数据库迁移、合并或回滚等 git 操作、Agent 权限、配置格式、对外发布，或者改动 .ares1/ 下的文件（仓库自己的开发流程）。
 - 用中文写。不要写本机的绝对路径，也不要写任何个人信息。
 
 ${upgradeSection(input.upgrade)}## 最近的 Run
@@ -1187,7 +1187,7 @@ ${splitIntro(input)}
 - What risk means:
   - low: only documentation, tests, how the dashboard shows things, or refactoring without behavior change;
   - mid: changes behavior, with a clear scope;
-  - high: database migrations, git operations such as merging or rollback, agent permissions, the configuration format, publishing anything outside.
+  - high: database migrations, git operations such as merging or rollback, agent permissions, the configuration format, publishing anything outside, or changes to files under .ares1/ (the repo's own development workflow).
 - Write in English. Do not write absolute paths of this machine or any personal information.
 
 ${upgradeSection(input.upgrade)}## Recent Runs

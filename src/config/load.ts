@@ -63,9 +63,12 @@ export function homePaths(home: string): HomePaths {
 
 /**
  * Create the home layout and write default config files that do not exist yet, in the
- * language in use.
+ * language in use. The default template is written only into a new workflows/: one left empty
+ * had its templates deleted on purpose, e.g. to use those the repos keep in .ares1/workflows/,
+ * and a template written there again at the next start would override the repo's.
  */
 export function initHome(paths: HomePaths): void {
+  const newWorkflows = !existsSync(paths.workflowsDir);
   for (const dir of [
     paths.home,
     paths.workflowsDir,
@@ -78,7 +81,7 @@ export function initHome(paths: HomePaths): void {
   }
   writeIfMissing(paths.configFile, defaultConfigYaml());
   writeIfMissing(paths.agentsFile, defaultAgentsYaml());
-  if (readdirSync(paths.workflowsDir).length === 0) {
+  if (newWorkflows) {
     writeFileSync(join(paths.workflowsDir, 'self-dev.yaml'), defaultSelfDevYaml());
   }
 }

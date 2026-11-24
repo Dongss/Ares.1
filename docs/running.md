@@ -20,7 +20,7 @@ node dist/cli.js      # 数据目录 ~/.ares1（或 $ARES1_HOME），端口 4870
 |---|---|
 | `config.yaml` | 全局配置：语言、端口、同时执行几个 Run、GitHub、通知、自动升级 |
 | `agents.yaml` | Agent 定义（CLI + 模型 + 运行参数） |
-| `workflows/` | 流程模板 |
+| `workflows/` | 流程模板（仓库也可以自带，见「仓库自带的流程模板」） |
 | `data/ares1.db` | 运行状态（SQLite），升级迁移前自动备份成 `ares1.db.bak-v<版本>-<时间>`，只保留最近 5 份，更早的在迁移成功后自动删掉；旧版本遇到比自己新的库时恢复备份，较新的库改名成 `ares1.db.newer-v<版本>-<时间>` 留着（见「稳定副本和自动升级」） |
 | `data/logs/` | 执行日志：`<Run id>/` 下每次 Agent 执行的原始输出（`<执行 id>.jsonl` 和 `.jsonl.stderr`）、看板展示用的精简事件（`.events.jsonl`）、检查命令的输出（`.verify.log`），以及 `setup.log`、`command-*.log`、`merge-*.log`；`scouts/` 下是侦察的原始输出。原始输出在 Run 或侦察结束 30 天后自动删掉，其余一直保留（见下面「原始日志的保留期」） |
 | `data/artifacts/` | 评审意见等产物 |
@@ -31,7 +31,7 @@ node dist/cli.js      # 数据目录 ~/.ares1（或 $ARES1_HOME），端口 4870
 | `master.out`、`upgrade.log`、`keepalive.log` | 后台运行时的输出、自动升级的日志、保活脚本的日志 |
 | `webhook.curl` | 配置了 `notify.webhook` 时，Master 留给保活脚本和升级脚本的 webhook 设置，权限 0600（见「通知」的「webhook」） |
 
-配置文件改动后会自动重新加载。改端口或 CLI 路径（`bins`）需要重启 Master。
+配置文件改动后会自动重新加载，仓库自带的模板跟着目标分支重新加载。改端口或 CLI 路径（`bins`）需要重启 Master。
 
 ### 原始日志的保留期
 
@@ -58,7 +58,32 @@ Master 大部分时间没人看着，人回来时在看板的「事件」页查�
 
 API 是 `GET /api/events`，按 id 从新到旧返回 Run 为空的事件，格式和 `GET /api/runs/:id/events` 的一样（`id`、`runId`、`ts`、`type`、`data`）。参数 `limit` 是 1–500 的整数，默认 200；`before=<id>` 只返回比这个 id 更早的，用上一页最后一条的 id 往前翻。参数不合法时返回 400。
 
-默认配置只有给 Ares.1 开发自己用的 `self-dev` 模板。给别的项目配置时，可以参考 [`docs/examples/`](examples/README.md)：一组完整的 `config.yaml`、`agents.yaml` 和几种场景的流程模板（轻量、严格、带 E2E、交叉评审），每一项都有注释，目录结构和数据目录一样，可以直接复制过来改；那里还写了 npm、pnpm、Python、Go、Rust 项目登记仓库时检查命令和准备命令怎么填。
+默认配置只有给 Ares.1 开发自己用的 `self-dev` 模板。给别的项目配置时，可以参考 [`docs/examples/`](examples/README.md)：一组完整的 `config.yaml`、`agents.yaml` 和几种场景的流程模板（轻量、严格、带 E2E、交叉评审），每一项都有注释，目录结构和数据目录一样，可以直接复制过来改；那里还写了 npm、pnpm、Python、Go、Rust 项目登记仓库时检查命令和准备命令怎么填。流程模板也可以放在仓库自己的 `.ares1/workflows/` 里，跟着代码一起演进，见下面的「仓库自带的流程模板」。
+
+## 仓库自带的流程模板
+
+流程模板除了放在数据目录的 `workflows/` 里，也可以放在登记的仓库里，和代码一起提交、一起评审、跟着代码演进，就像 CI 配置放在仓库里一样：检查命令、E2E 阶段、评审要求改了，流程跟着改，不用再到每台机器的数据目录里手动同步。
+
+Ares.1 自己的仓库就带着 [`.ares1/workflows/self-dev.yaml`](../.ares1/workflows/self-dev.yaml)。它和第一次启动时写进数据目录的默认 `self-dev.yaml`（中文版）一字不差，有测试守着；改默认模板时两边一起改。这样改进自举流程的需求合并之后，正在运行的 Master 就用上了改进后的流程。
+
+- **放在哪**：仓库目标分支上的 `.ares1/workflows/*.yaml`（`.yml` 也行），格式和数据目录里的模板完全一样，id 是文件里写的 `id`。只看这个目录里的文件，不看子目录和符号链接。
+- **只读已提交的**：Master 读目标分支所在的那个提交里的文件（`git ls-tree`、`git cat-file`），不碰工作目录。目标分支检出的目录里没提交的改动、别的分支上的改动都不算。目标分支指 Master 在本地合并 Run 用的那个分支（看板「仓库」页登记的）。
+- **什么时候重新读**：Master 启动时（在恢复 Run 和检查 GitHub 之前）；Run 合并进目标分支之后；从 GitHub 拉取到新提交（`github.pulled`、`github.merged_remote`）之后；每轮检查 GitHub（每 `poll_minutes` 分钟）开始时，人直接提交到本地目标分支的改动在这时读到；在看板「仓库」页增加、修改或删除仓库之后。目标分支还在同一个提交时不重新读。文件内容变了时，配置重新加载，事件列表里记一条 `config.reloaded`；只是提交变了、文件没变时只更新记下的提交，不记事件。目标分支读不出来（目录或分支没了、git 出错）时，沿用之前从同一路径、同一分支读到的文件，在 Master 的输出（`master.out`）里记一行原因，同样的错误连着出现只记一次。
+- **怎么找**：`config.yaml` 里 `github.repos.<仓库>.template` 写的 id，先在数据目录的 `workflows/` 里找，找不到再在这个仓库自带的模板里找。数据目录里的算这台机器的覆盖，由在这台机器上的人说了算。两边有同一个 id 时用数据目录那份，看板「配置」页在仓库那个文件（键是 `<仓库名>:.ares1/workflows/<文件>`）的警告里写明仓库里这份没有生效、数据目录里是哪个文件，以及想改用仓库里的就删掉数据目录里那个文件。两边都没有时，和以前一样在 `config.yaml` 下报「模板不存在或无效」，不建 Run。
+- **只对本仓库可见**：仓库自带的模板只给这个仓库的 Run 用，别的仓库写同一个 id 也找不到它。它们的 id 只和同一个仓库里的其他文件比，不和数据目录、别的仓库比。
+- **坏了会怎样**：目标分支上的模板改坏了（YAML 不合法、不符合格式、引用了不存在或没启用的 Agent 等），仓库也不会停转：继续用这个文件上次加载成功的版本，「配置」页在这个文件的警告里写明这次为什么失败、在用的是哪个提交上的版本。上次成功的版本只记在内存里，所以 Master 重启时目标分支上的文件还是坏的，就没有能用的版本：这个文件记为错误，按模板不存在处理，用它的仓库不建新的 Run。改好并提交到目标分支，下次重新读时就恢复。已经建好的 Run 用的是建 Run 时存下的模板，都不受影响。
+- **合并前先试加载**：Run 的分支改了 `.ares1/workflows/`（和合入后的目标分支不一样）时，合并阶段在合入目标分支的最新代码之后、重跑检查命令之前，用当前配置里的 Agent，把 Run 分支上已提交的这些文件试加载一遍；这里没有「上次成功的版本」兜底。有文件加载失败就不合并，和检查命令没通过一样：合并阶段标为没通过，合并阶段的检查里记一条「流程模板（.ares1/workflows/）」，回退到合并阶段 `on_fail` 指向的阶段（默认是它前面最近的 Agent 阶段，通常是编码）返工，反馈里逐个列出文件和加载错误，要求改好或撤回这些改动；和别的回退一样受 `max_loops` 限制，用完后按 `on_exhausted` 处理（默认 Run 结束、标为失败）。所以坏模板进不了目标分支。Run 没动这个目录时不试加载。
+- **看板**：「配置」页按仓库列出各仓库自带的模板文件，标明有效、无效、被数据目录覆盖、正在用旧版本，并写明原因；「仓库」页每个仓库有一行「自带的流程模板」；「需求」页写明仓库的 Run 用的模板来自数据目录还是仓库。API `GET /api/config` 的 `repoTemplates` 按仓库名列出有这些文件的仓库：读的分支（`branch`）和提交（`sha`）、在用的模板（`templates`），以及每个文件（`files`；`lastGood` 是正在代替坏文件的旧版本和它的提交，`shadowed` 表示数据目录里有同 id 的模板）。
+- **改 `.ares1/` 就是改这个仓库自己的开发流程**，所以侦察给这类提案标 `high` 风险（见「侦察提什么」），开了自动采纳也要 `max_risk` 是 `high` 才会自动采纳。
+
+### 从数据目录的模板切换到仓库自带的
+
+已经装好的 Master，数据目录里有第一次启动时写的 `workflows/self-dev.yaml`，它会一直盖住仓库里同 id 的模板，「配置」页在 `<仓库名>:.ares1/workflows/self-dev.yaml` 下警告仓库里这份没有生效。想改用仓库里的、让流程跟着代码更新：
+
+1. 先对比两份。数据目录里那份有想保留的修改，就先改进仓库的 `.ares1/workflows/self-dev.yaml`，提交到目标分支（自己提交，或者建个 issue 让 Ares.1 做），等它进了目标分支。
+2. 删掉数据目录里的 `workflows/self-dev.yaml`。Master 自动重新加载，警告消失，之后新建的 Run 用仓库里的模板，「需求」页的模板来源变成仓库。已经建好的 Run 仍按建 Run 时的模板走。
+
+Master 只在数据目录里还没有 `workflows/` 目录时（第一次启动）写默认模板；`workflows/` 删空了也不会再写，删掉的模板重启后不会回来。想在这台机器上临时换一个流程，就反过来在数据目录里放一个同 id 的模板，删掉它就回到仓库里的。
 
 ## 接入 GitHub
 
@@ -133,6 +158,7 @@ stages:
   4. 评审通过时给的建议和对最近改动的修饰，相关的几条合成一条提案。
 - **配比**：第 1 类优先，`max_proposals` 放不下时以它为先。第 1 类之外，只要差距分析里有缺口，至少有一条提案是补能力的（category 为 `feature`），推进 README 的某个目标。缺口已经有未关闭的 issue 在做时换一个缺口；只有那个 issue 覆盖面很大、还在等人采纳时，才提它能独立合并的第一步（见下面的「接着往下提」）。第 4 类每次最多一条。
 - **证据**：补能力的提案不需要有出错的 Run，README 的目标加上限制这个能力的代码位置就是证据。
+- **风险**：`low` 只涉及文档、测试、看板展示或不改变行为的重构；`mid` 改变行为，但影响范围清楚；`high` 涉及数据库迁移、合并或回滚等 git 操作、Agent 权限、配置格式、对外发布，或者改动 `.ares1/` 下的文件（仓库自己的开发流程，见「仓库自带的流程模板」）。`auto_accept.max_risk` 按它决定自动采纳哪些。
 - **大能力拆成几步**：提示词写明这个仓库用的模板能不能拆分大需求（有没有一个 Agent 阶段是 `planning: auto` 或 `llm`；模板找不到时当作不能），以及 L 的提案会不会被自动采纳（`max_risk` 不是 `none`、`max_size` 是 `L` 时，风险在范围内的 L 会被自动采纳；否则如实写明 L 要等人处理）。按模板能不能拆分，要求不同：
   - 能拆分时：L 的需求在编码阶段会先拆成几步，在一个 Run 里一步一步做完。一个 Run 拆成几步能做完的能力，作为一条提案、大小标 L，不拆成几个 issue，免得多出几轮评估、评审、合并和升级。只有一个 Run 拆了也做不完，或者前面几步单独合并就有价值时，才拆成有先后的几个 issue，侦察只提第一步，第一步也可以是 L。
   - 不能拆分时：每条需求整个交给一个 Run 一次做完。一个 Run 做不完的能力拆成有先后的几步，侦察只提第一步，大小尽量是 S 或 M；那样也拆不开的才标 L。
@@ -288,7 +314,7 @@ defaults:
   - 错误文字的规则（不区分大小写）：含 usage limit、rate limit（rate-limit、rate limited、rate_limit 等写法）、too many requests、resource exhausted（`RESOURCE_EXHAUSTED`）、hit your limit，配额用尽的说法（quota exceeded、exceeded … quota、out of quota、insufficient quota；单独的 quota 不算，disk quota 磁盘配额也不算），或者紧跟在 HTTP、status、code 后面的 429（比如 `HTTP 429`、`status code 429`；4290、行号 429 之类的数字不算）。误判成限流的 Run 会一直等下去，所以规则宁紧勿松：没识别出来的限流照常按出错处理。
   - 错误文字里的重置时间按这个顺序找：Claude 老格式 `limit reached|<epoch>`、ISO 8601 时间、reset 或 retry 后面不远处 10 位的 epoch 秒数（13 位的毫秒数也行）。找不到、已经过去或在 31 天以后的，当作没给重置时间。
 
-数据目录里已经装好的 `workflows/self-dev.yaml` 不会自动更新。旧版本写的是 `on_agent_error: human`：出错时会先自动重试，重试用完后才卡住等人，加载时也会提示。想让它出错时也不等人，就手动改成 `switch_agent`。
+数据目录里已经装好的 `workflows/self-dev.yaml` 不会自动更新。旧版本写的是 `on_agent_error: human`：出错时会先自动重试，重试用完后才卡住等人，加载时也会提示。想让它出错时也不等人，就手动改成 `switch_agent`；给 Ares.1 自己用的，也可以改用仓库自带的 `.ares1/workflows/self-dev.yaml`，它跟着代码更新（见「从数据目录的模板切换到仓库自带的」）。
 
 ## 拆分任务
 
@@ -320,7 +346,7 @@ defaults:
 - 拆分要以只读方式运行，所以阶段的 Agent 要用支持只读的 CLI（claude-code），否则加载模板时报错、模板被停用。`planning: auto` 只拆分一部分 Run，但哪个 Run 都可能要拆分，所以同样要求。`planning: llm` 和 `planning: auto` 只能用在 `kind: agent` 阶段，写在评审、需求评估、命令、合并、占位阶段上同样报错。
 - 评审打回、审批驳回、命令阶段失败或合并冲突回退到这个阶段时，新一轮重新拆分；打回的原因既交给拆分，也交给每一步。新一轮的拆分还会读到这个阶段上一轮的计划：每一步的标题、说明、是否通过和「结果」（summary，每条最多 400 字；没通过的步骤没有）。上一轮没有拆分时，整个阶段算一步；只拆成一步的也照样写上；拆分格式出错后重试的每一次都有。上一轮通过的步骤都已经提交，改动还在工作目录里，所以提示词要求拆分只列出这次需要做的修改步骤：改正打回的问题、补上没通过的步骤，不要重做已经通过、和打回原因无关的步骤。拆分输出的格式和之后依次执行的方式都不变。
 - 拆分进行到一半被暂停、Master 重启或崩溃时，恢复后重新拆分。各步的 Task 和拆分的结果在同一个事务里记下，不会重复，也不会只建一半。
-- 默认的 `self-dev.yaml` 的编码阶段是 `planning: auto`。数据目录里已经装好的 `workflows/self-dev.yaml` 不会自动更新，旧版本写的是 `planning: single`：想让大需求先拆分，就手动把编码阶段的 `planning: single` 改成 `planning: auto`（编码阶段的 Agent 要用支持只读的 CLI，默认的 `claude-coder` 就是）。保存后 Master 自动重新加载，新建的 Run 生效；已经建好的 Run 仍按建 Run 时的模板走。带 `planning: auto` 的完整模板见 [`docs/examples/workflows/strict.yaml`](examples/workflows/strict.yaml) 的编码阶段。
+- 默认的 `self-dev.yaml` 的编码阶段是 `planning: auto`。数据目录里已经装好的 `workflows/self-dev.yaml` 不会自动更新，旧版本写的是 `planning: single`：想让大需求先拆分，就手动把编码阶段的 `planning: single` 改成 `planning: auto`（编码阶段的 Agent 要用支持只读的 CLI，默认的 `claude-coder` 就是）。保存后 Master 自动重新加载，新建的 Run 生效；已经建好的 Run 仍按建 Run 时的模板走。给 Ares.1 自己用的，也可以删掉数据目录里那份，改用仓库自带的 `.ares1/workflows/self-dev.yaml`（见「从数据目录的模板切换到仓库自带的」）。带 `planning: auto` 的完整模板见 [`docs/examples/workflows/strict.yaml`](examples/workflows/strict.yaml) 的编码阶段。
 
 ## 评审阶段不改代码
 
@@ -350,7 +376,7 @@ defaults:
 - 运行到一半被暂停或 Master 重启时，恢复后这一阶段的命令全部重新运行。
 - 这里不调用 Agent，所以 `escalate` 里出错重试、换 Agent、预算的设置对它不起作用，`timeout_minutes` 也不用于命令。
 
-默认的 `self-dev.yaml` 里 E2E 阶段仍是 `kind: placeholder`，注释写了怎样改成命令阶段。数据目录里已经装好的模板不会自动更新，需要时手动改。带命令阶段的完整模板见 [`docs/examples/workflows/with-e2e.yaml`](examples/workflows/with-e2e.yaml)。
+默认的 `self-dev.yaml` 里 E2E 阶段仍是 `kind: placeholder`，注释写了怎样改成命令阶段。数据目录里已经装好的模板不会自动更新，需要时手动改；放在仓库 `.ares1/workflows/` 里的模板跟着代码一起改（见「仓库自带的流程模板」）。带命令阶段的完整模板见 [`docs/examples/workflows/with-e2e.yaml`](examples/workflows/with-e2e.yaml)。
 
 ## 返工或回退用完时
 
