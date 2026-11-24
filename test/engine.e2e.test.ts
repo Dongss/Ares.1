@@ -2665,6 +2665,77 @@ stages:
     expect(eventData(run.id, 'task.retry_after_error').map((d) => d.error)).toEqual(['boom 1']);
     expect(failed.error).toContain('boom 2');
   });
+
+  describe('across a Master restart', () => {
+    const HOUR = 3_600_000;
+    const master = { rateLimitWait: { firstMs: 600_000, maxMs: 600_000, marginMs: 60_000 } };
+
+    /** A Run whose agent hit a limit the CLI says ends in an hour, waiting in the queue. */
+    async function limitedRun(): Promise<{ first: Harness; run: Run; resetAt: number }> {
+      const first = await harness({ workflow: WORKFLOW, master });
+      h = first;
+      const resetAt = Date.now() + HOUR;
+      first.scripts.coder = () => limited(new Date(resetAt).toISOString());
+      const run = first.run();
+      await waitFor(() => eventData(run.id, 'task.rate_limited').length === 1, 'the rate limit');
+      await first.waitStatus(run.id, 'queued');
+      await waitFor(() => first.master.engine.activeRunId === undefined, 'the engine to be idle');
+      return { first, run, resetAt };
+    }
+
+    it('waits on until the time it was given, then goes on', async () => {
+      const { first, run, resetAt } = await limitedRun();
+      const retryAt = new Date(resetAt + 60_000).toISOString();
+      expect(eventData(run.id, 'task.rate_limited')[0]?.retryAt).toBe(retryAt);
+      await first.close();
+
+      let now = Date.now();
+      h = await harness({
+        workflow: WORKFLOW,
+        home: first.home,
+        repoDir: first.repoDir,
+        master: { ...master, now: () => now },
+      });
+      h.scripts.coder = writeFeature;
+      // The dashboard still shows when it goes on.
+      expect(h.master.engine.rateLimited(h.master.store.getRun(run.id))).toEqual({
+        agentId: 'coder',
+        retryAt,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(h.fake.calls).toEqual([]);
+      expect(h.master.store.getRun(run.id).status).toBe('queued');
+
+      // Not before the reset time plus the margin.
+      now = Date.parse(retryAt) - 1000;
+      h.master.engine.kick();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(h.fake.calls).toEqual([]);
+      expect(h.master.engine.rateLimited(h.master.store.getRun(run.id))?.retryAt).toBe(retryAt);
+
+      now = Date.parse(retryAt) + 1000;
+      h.master.engine.kick();
+      const completed = await h.waitStatus(run.id, 'completed');
+      expect(h.fake.calls.map((c) => c.model)).toEqual(['coder']);
+      expect(h.master.engine.rateLimited(completed)).toBeNull();
+    });
+
+    it('no longer waits once the Run was paused and resumed', async () => {
+      const { first, run } = await limitedRun();
+      // With the work switch off the resumed Run stays in the queue until the restart.
+      first.master.engine.setWorking(false);
+      expect((await first.master.engine.pause(run.id)).status).toBe('paused');
+      expect(first.master.engine.resume(run.id).status).toBe('queued');
+      await first.close();
+
+      h = await harness({ workflow: WORKFLOW, home: first.home, repoDir: first.repoDir, master });
+      h.scripts.coder = writeFeature;
+      expect(h.master.engine.rateLimited(h.master.store.getRun(run.id))).toBeNull();
+      h.master.engine.setWorking(true);
+      await h.waitStatus(run.id, 'completed');
+      expect(h.fake.calls.map((c) => c.model)).toEqual(['coder']);
+    });
+  });
 });
 
 describe('engine: requirement assessment', () => {

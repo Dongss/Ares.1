@@ -7,6 +7,7 @@ import { brandName } from '../brand.js';
 import {
   isAutoAcceptable,
   issueRunOverrides,
+  limitedScout,
   redoDueAt,
   replyTimeoutHours,
   scoutBackoff,
@@ -230,12 +231,6 @@ export class IssueBridge {
   private readonly scouting = new Map<string, ScoutEntry>();
   /** Why no automatic scout started at the last poll, per repo name. */
   private readonly scoutWaiting = new Map<string, ScoutWait | null>();
-  /**
-   * When the quota of the agent of the repo's latest rate-limited scout comes back (epoch ms), if
-   * the CLI said; per repo id. Kept in memory only, like the engine's waits for a Run's quota:
-   * after a restart the wait goes by the scouts in a row that hit a limit (see scoutLimitWait).
-   */
-  private readonly scoutLimitResets = new Map<string, number>();
   private lastPollAt: string | null = null;
   /** Target branch commit last pushed, per repo path. */
   private readonly pushed = new Map<string, string>();
@@ -1262,7 +1257,7 @@ export class IssueBridge {
       }
     }
     wait = laterWait(wait, await this.scoutBackoffWait(repo, scouts));
-    wait = laterWait(wait, this.scoutQuotaWait(repo, scouts));
+    wait = laterWait(wait, this.scoutQuotaWait(scouts));
     if (wait) return wait;
     // Do not pile up work nobody has looked at: proposals and Runs stuck waiting for a human.
     const full = await this.issuesRepo(repo, cfg);
@@ -1283,8 +1278,10 @@ export class IssueBridge {
    * The wait for the quota after the scout's agent ran out of it or was rate-limited, if it holds
    * the scout now (see scoutLimitWait). `scouts`: the repo's, newest first.
    */
-  private scoutQuotaWait(repo: Repo, scouts: Scout[]): (ScoutWait & { until: string }) | null {
-    const limit = scoutLimitWait(scouts, this.scoutLimitResets.get(repo.id));
+  private scoutQuotaWait(scouts: Scout[]): (ScoutWait & { until: string }) | null {
+    const limited = limitedScout(scouts);
+    if (!limited) return null;
+    const limit = scoutLimitWait(scouts, this.scoutResetAt(limited));
     if (!limit || Date.parse(limit.until) <= Date.now()) return null;
     return {
       reason: t({
@@ -1293,6 +1290,19 @@ export class IssueBridge {
       }),
       until: limit.until,
     };
+  }
+
+  /**
+   * When the quota of the rate-limited scout's agent comes back (epoch ms), if the CLI said: from
+   * the scout's `scout.rate_limited` event, so that the wait holds across Master restarts.
+   */
+  private scoutResetAt(scout: Scout): number | undefined {
+    const event = this.deps.store
+      .listEventsOfType('scout.rate_limited', scout.startedAt)
+      .find((e) => e.data.scoutId === scout.id);
+    const retryAt = event?.data.retryAt;
+    const resetAt = typeof retryAt === 'string' ? Date.parse(retryAt) : Number.NaN;
+    return Number.isNaN(resetAt) ? undefined : resetAt;
   }
 
   /**
@@ -1518,7 +1528,6 @@ export class IssueBridge {
         scoutCfg.max_proposals,
       );
       const created = await this.fileProposals(scout, repo, cfg, proposals);
-      this.scoutLimitResets.delete(repo.id);
       store.tx(() => {
         store.updateScout(scout.id, { status: 'completed', proposals, endedAt: nowIso() });
         store.event(null, 'scout.completed', {
@@ -1533,7 +1542,6 @@ export class IssueBridge {
       if (created.some((p) => p.issue?.auto)) void this.poll();
     } catch (err) {
       const interrupted = err instanceof Interrupted || this.stopping;
-      if (!interrupted) this.scoutLimitResets.delete(repo.id);
       store.tx(() => {
         store.updateScout(scout.id, {
           status: interrupted ? 'interrupted' : 'failed',
@@ -1564,7 +1572,7 @@ export class IssueBridge {
    * The scout's agent ran out of quota or was rate-limited. That passes on its own and says
    * nothing about the repo, so the scout has not failed and does not count toward the back-off;
    * the automatic scout waits for the quota instead (see scoutLimitWait). The CLI's reset time is
-   * kept in memory only.
+   * in the `scout.rate_limited` event, which the wait reads it from (`scoutResetAt`).
    */
   private scoutRateLimited(
     scout: Scout,
@@ -1574,8 +1582,6 @@ export class IssueBridge {
   ): void {
     const parsed = result.retryAt ? Date.parse(result.retryAt) : Number.NaN;
     const resetAt = Number.isNaN(parsed) ? undefined : parsed;
-    if (resetAt === undefined) this.scoutLimitResets.delete(repo.id);
-    else this.scoutLimitResets.set(repo.id, resetAt);
     const store = this.deps.store;
     store.tx(() => {
       store.updateScout(scout.id, {

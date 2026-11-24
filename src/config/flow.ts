@@ -9,7 +9,13 @@
 
 import { replyDeadline } from '../engine/discussion.js';
 import { t } from '../i18n.js';
-import { type EventRow, FINISHED_RUN_STATUSES, type Run, type Scout } from '../store/types.js';
+import {
+  type Attempt,
+  type EventRow,
+  FINISHED_RUN_STATUSES,
+  type Run,
+  type Scout,
+} from '../store/types.js';
 import type { Escalate, RunOverrides, StageDef, WorkflowTemplate } from './schema.js';
 
 /** Risk of a proposal, ordered; auto-accept takes everything up to a chosen level. */
@@ -322,6 +328,45 @@ export function rateLimitDelayMs(
   return backoffMs(wait, inARow);
 }
 
+/** A queued Run waiting for its agent's quota: the agent, and when the Run goes on (epoch ms). */
+export interface RunLimitWait {
+  agentId: string;
+  until: number;
+}
+
+/**
+ * The wait for its agent's quota a queued Run is in, as its events record it: read back when the
+ * Master starts, so that a restart does not try the agent again before the quota is back. The
+ * Run's latest `task.rate_limited` holds while
+ * - the Run is still queued, and the only `run.status` after that event is the `queued` written
+ *   with it: whatever lifts the wait (a pause and resume, a cancel, a retry, the Run starting
+ *   again, its recovery after a restart while it ran) changes the Run's status;
+ * - the latest attempt of the event's task still hit the limit;
+ * - its `retryAt` (the CLI's reset time plus the margin, or the backoff) is still ahead of `now`.
+ * `events`: the Run's, oldest first; `attempts`: the Run's, oldest first. null: no wait.
+ */
+export function recordedLimitWait(
+  run: Pick<Run, 'status'>,
+  events: readonly Pick<EventRow, 'type' | 'data'>[],
+  attempts: readonly Pick<Attempt, 'taskId' | 'outcome'>[],
+  now: number,
+): RunLimitWait | null {
+  if (run.status !== 'queued') return null;
+  const at = events.findLastIndex((e) => e.type === 'task.rate_limited');
+  const limited = events[at];
+  if (!limited) return null;
+  const statuses = events.slice(at + 1).filter((e) => e.type === 'run.status');
+  if (statuses.length !== 1 || statuses[0]?.data.status !== 'queued') return null;
+  const { taskId, agentId, retryAt } = limited.data;
+  if (typeof taskId !== 'string' || typeof agentId !== 'string' || typeof retryAt !== 'string') {
+    return null;
+  }
+  if (attempts.findLast((a) => a.taskId === taskId)?.outcome !== 'rate_limited') return null;
+  const until = Date.parse(retryAt);
+  if (Number.isNaN(until) || until <= now) return null;
+  return { agentId, until };
+}
+
 export interface ScoutLimitWait {
   /** Scouts in a row, counting back from the newest, whose agent hit a limit. */
   count: number;
@@ -330,27 +375,40 @@ export interface ScoutLimitWait {
 }
 
 /**
+ * The scout the automatic scout's wait for the quota counts from (see scoutLimitWait): the newest
+ * scout that was not cut short by the Master stopping (nor is still running), when its agent hit
+ * a limit. `scouts` are newest first. undefined: no wait.
+ */
+export function limitedScout<S extends Pick<Scout, 'status'>>(scouts: readonly S[]): S | undefined {
+  for (const s of scouts) {
+    if (s.status === 'interrupted' || s.status === 'running') continue;
+    return s.status === 'rate_limited' ? s : undefined;
+  }
+  return undefined;
+}
+
+/**
  * How long the automatic scout waits after its agent ran out of quota or was rate-limited: the
- * same rule as a Run's (`rateLimitDelayMs`), counted from when the newest such scout ended. Until
- * `resetAt` (epoch ms, the reset time the CLI gave for that scout) plus the margin; without one,
- * 5, 10, 20, 40 minutes, then hourly over the scouts in a row that hit a limit. Only while the
- * newest scout that was not cut short by the Master stopping (nor is still running) hit a limit;
- * a scout that ends any other way ends the wait. `scouts` are newest first. null: no wait.
+ * same rule as a Run's (`rateLimitDelayMs`), counted from when the newest such scout
+ * (`limitedScout`) ended. Until `resetAt` (epoch ms, the reset time the CLI gave for that scout,
+ * which its `scout.rate_limited` event records) plus the margin; without one, 5, 10, 20, 40
+ * minutes, then hourly over the scouts in a row that hit a limit. Only while the newest scout
+ * that was not cut short by the Master stopping (nor is still running) hit a limit; a scout that
+ * ends any other way ends the wait. `scouts` are newest first. null: no wait.
  */
 export function scoutLimitWait(
   scouts: Pick<Scout, 'status' | 'startedAt' | 'endedAt'>[],
   resetAt?: number,
   wait: RateLimitWait = RATE_LIMIT_WAIT,
 ): ScoutLimitWait | null {
+  const newest = limitedScout(scouts);
+  if (!newest) return null;
   let count = 0;
-  let newest: (typeof scouts)[number] | undefined;
   for (const s of scouts) {
     if (s.status === 'interrupted' || s.status === 'running') continue;
     if (s.status !== 'rate_limited') break;
     count++;
-    newest ??= s;
   }
-  if (!newest) return null;
   const from = Date.parse(newest.endedAt ?? newest.startedAt);
   const until = from + rateLimitDelayMs(wait, from, resetAt, count);
   return { count, until: new Date(until).toISOString() };

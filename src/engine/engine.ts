@@ -19,7 +19,9 @@ import {
   leftoverWorkspaces,
   RATE_LIMIT_WAIT,
   type RateLimitWait,
+  type RunLimitWait,
   rateLimitDelayMs,
+  recordedLimitWait,
 } from '../config/flow.js';
 import type { HomePaths, LoadedConfig } from '../config/load.js';
 import {
@@ -237,13 +239,6 @@ interface Active {
   done: Promise<void>;
 }
 
-/** A queued Run waiting for its agent's quota (`Engine.limitWaits`). */
-interface RateLimitedRun {
-  agentId: string;
-  /** Not to start again before this, in epoch milliseconds. */
-  until: number;
-}
-
 /** A merge of the target branch in the worktree that a task's agent resolves (`conflictMerge`). */
 interface ConflictMerge extends MergeInProgress {
   /** The target branch's commit being merged in (MERGE_HEAD). */
@@ -321,9 +316,10 @@ export class Engine {
   private envAllPending = false;
   /**
    * Queued Runs whose agent was out of quota or rate-limited, by Run id: `kick` passes them by
-   * until `until` (epoch ms). Kept in memory only: after a Master restart they just try again.
+   * until `until` (epoch ms). `start` reads them back from the Runs' events (`recordedLimitWait`),
+   * so they hold across Master restarts.
    */
-  private readonly limitWaits = new Map<string, RateLimitedRun>();
+  private readonly limitWaits = new Map<string, RunLimitWait>();
   /** Wakes `kick` when the first wait in `limitWaits` ends. */
   private limitTimer: ReturnType<typeof setTimeout> | undefined;
   private readonly store: Store;
@@ -346,7 +342,10 @@ export class Engine {
   // Lifecycle
   // =========================================================================
 
-  /** Recover Runs that were executing when the Master stopped, then start scheduling. */
+  /**
+   * Recover Runs that were executing when the Master stopped and the waits of queued Runs for
+   * their agent's quota, then start scheduling.
+   */
   async start(): Promise<void> {
     for (const run of this.store.listRuns({ status: 'running' })) {
       for (const attempt of this.store.listRunAttempts(run.id, 'running')) {
@@ -363,6 +362,7 @@ export class Engine {
       await this.discardInFlight(this.store.getRun(run.id));
       this.requeueHead(run.id, 'run.recovered');
     }
+    this.restoreLimitWaits();
     // Discussions may have timed out while the Master was not running, and target branches may
     // have been cleaned up. Runs blocked on the environment try again in this Master's: it may
     // have been restarted on another node (after a version manager deleted the last one), or with
@@ -371,6 +371,24 @@ export class Engine {
     this.checkEnvironment({ all: true });
     this.kick();
     void this.checkDirtyTargets();
+  }
+
+  /**
+   * Queued Runs whose agent was out of quota or rate-limited when the last Master stopped wait on
+   * until the time they were given, as if it had not stopped: trying again earlier would most
+   * likely hit the limit again.
+   */
+  private restoreLimitWaits(): void {
+    const now = this.now();
+    for (const run of this.store.queuedRuns()) {
+      const wait = recordedLimitWait(
+        run,
+        this.store.listEvents(run.id),
+        this.store.listRunAttempts(run.id),
+        now,
+      );
+      if (wait) this.limitWaits.set(run.id, wait);
+    }
   }
 
   /** Graceful shutdown: stop the active agent like a manual pause and requeue its Run. */
@@ -2699,8 +2717,8 @@ export class Engine {
    * and feedback (a rework resumes the session of the attempt that hit the limit, which knows
    * what it did so far; the worktree keeps its changes, as after an agent error), and the Run
    * goes back to the head of the queue, giving up the execution slot until the quota is expected
-   * back (`rateLimitDelayMs`); other Runs go on meanwhile. The wait is kept in memory only
-   * (`limitWaits`).
+   * back (`rateLimitDelayMs`); other Runs go on meanwhile. The wait is in `limitWaits`, and its
+   * `task.rate_limited` event keeps it across a Master restart (`restoreLimitWaits`).
    */
   private waitForQuota(run: Run, task: Task, attempt: Attempt, result: AgentResult): void {
     this.store.updateAttempt(attempt.id, { outcome: 'rate_limited' });

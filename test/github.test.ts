@@ -169,10 +169,10 @@ function elapse(t: Harness, ms: number) {
 }
 
 /** A new Master on the closed one's home and repo, as after a restart. */
-async function restart(closed: Harness): Promise<Harness> {
+async function restart(closed: Harness, cfg = config()): Promise<Harness> {
   h = await harness({
     agents: AGENTS,
-    config: config(),
+    config: cfg,
     github: gh,
     home: closed.home,
     repoDir: closed.repoDir,
@@ -1137,6 +1137,39 @@ describe('issues: scout', () => {
       expect(waiting(t)).toEqual({ reason: QUOTA, until });
       vi.setSystemTime(resetAt + MIN + 1000);
       expect(await pollNewScout(t)).toMatchObject({ status: 'completed', trigger: 'auto' });
+    });
+
+    it("still waits for the CLI's reset time plus a minute after a Master restart", async () => {
+      const resetAt = Date.now() + 30 * MIN;
+      const first = await autoScouts(() => limited(new Date(resetAt).toISOString()));
+      expect((await pollNewScout(first)).status).toBe('rate_limited');
+      await first.close();
+
+      const t = await restart(first, config({ auto: true }));
+      t.scripts.scout = nothing;
+      expect(await pollScout(t)).toBeUndefined();
+      const until = new Date(resetAt + MIN).toISOString();
+      expect(waiting(t)).toEqual({ reason: QUOTA, until });
+      // Not the five minutes of a limit without a reset time.
+      elapse(t, 5 * MIN);
+      expect(await pollScout(t)).toBeUndefined();
+      expect(waiting(t)).toEqual({ reason: QUOTA, until });
+
+      vi.useFakeTimers({ toFake: ['Date'], shouldAdvanceTime: true });
+      vi.setSystemTime(resetAt + MIN + 1000);
+      expect(await pollNewScout(t)).toMatchObject({ status: 'completed', trigger: 'auto' });
+    });
+
+    it('takes the reset time of the newest rate-limited scout only', async () => {
+      const reset = new Date(Date.now() + 30 * MIN).toISOString();
+      const t = await autoScouts((n) => (n === 1 ? limited(reset) : limited()));
+      await pollNewScout(t);
+      // A scout started by hand hits a limit too, and the CLI gives no reset time this time.
+      const manual = await t.master.issues.startScout('demo', 'manual');
+      const second = await scoutDone(t, manual.id);
+      expect(second.status).toBe('rate_limited');
+      expect(await pollScout(t)).toBeUndefined();
+      expect(waiting(t)).toEqual({ reason: QUOTA, until: endPlus(second, 10 * MIN) });
     });
 
     it('without a reset time waits 5, then 10 minutes for limits in a row', async () => {

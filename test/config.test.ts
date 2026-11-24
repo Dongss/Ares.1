@@ -6,10 +6,12 @@ import {
   discussionReplyWait,
   issueRunOverrides,
   leftoverWorkspaces,
+  limitedScout,
   loopsExhausted,
   RATE_LIMIT_WAIT,
   REDO_BACKOFF_MAX_HOURS,
   rateLimitDelayMs,
+  recordedLimitWait,
   redoDelayMs,
   redoDueAt,
   scoutBackoff,
@@ -1517,6 +1519,84 @@ describe('scoutLimitWait', () => {
   it('counts from the start of a scout that has no end', () => {
     const scouts = [{ ...scout(10, 'rate_limited'), endedAt: null }];
     expect(scoutLimitWait(scouts)).toEqual({ count: 1, until: at(15) });
+  });
+
+  it('limitedScout: the newest rate-limited scout the wait counts from', () => {
+    const newest = { ...scout(30, 'rate_limited'), id: 'newest' };
+    const scouts = [scout(50, 'running'), scout(40, 'interrupted'), newest, scout(10, 'failed')];
+    expect(limitedScout(scouts)).toBe(newest);
+    expect(limitedScout([scout(20, 'failed'), scout(10, 'rate_limited')])).toBeUndefined();
+    expect(limitedScout([scout(10, 'interrupted')])).toBeUndefined();
+    expect(limitedScout([])).toBeUndefined();
+  });
+});
+
+describe('recordedLimitWait', () => {
+  const now = Date.parse('2026-11-20T10:00:00.000Z');
+  const retryAt = '2026-11-20T12:01:00.000Z';
+  const queued = { status: 'queued' as const };
+  const limited = (data: Record<string, unknown> = {}) => ({
+    type: 'task.rate_limited',
+    data: { taskId: 'task_1', agentId: 'coder', retryAt, delayMs: 1, resetAt: null, ...data },
+  });
+  const status = (s: string) => ({ type: 'run.status', data: { status: s } });
+  const other = (type: string) => ({ type, data: {} });
+  /** As waitForQuota leaves them: the limit, then the Run queued in the same transaction. */
+  const waiting = [status('running'), other('attempt.started'), limited(), status('queued')];
+  const attempts = [
+    { taskId: 'task_0', outcome: 'passed' as const },
+    { taskId: 'task_1', outcome: 'rate_limited' as const },
+  ];
+
+  it('gives back the agent and the time the Run goes on', () => {
+    expect(recordedLimitWait(queued, waiting, attempts, now)).toEqual({
+      agentId: 'coder',
+      until: Date.parse(retryAt),
+    });
+    // Events that do not touch the Run's status leave the wait as it was.
+    const later = [...waiting, other('issue.commented')];
+    expect(recordedLimitWait(queued, later, attempts, now)?.until).toBe(Date.parse(retryAt));
+  });
+
+  it('only the latest limit counts', () => {
+    const again = [
+      ...waiting,
+      status('running'),
+      limited({ agentId: 'coder2', retryAt: '2026-11-20T11:00:00.000Z' }),
+      status('queued'),
+    ];
+    expect(recordedLimitWait(queued, again, attempts, now)).toEqual({
+      agentId: 'coder2',
+      until: Date.parse('2026-11-20T11:00:00.000Z'),
+    });
+  });
+
+  it('no wait once anything changed the Run status after the limit', () => {
+    // Paused and resumed, recovered after a restart while running, started again.
+    for (const after of [
+      [status('paused'), status('queued'), other('run.resumed')],
+      [status('running'), status('queued'), other('run.recovered')],
+      [status('running')],
+    ]) {
+      expect(recordedLimitWait(queued, [...waiting, ...after], attempts, now)).toBeNull();
+    }
+    expect(recordedLimitWait({ status: 'paused' }, waiting, attempts, now)).toBeNull();
+    expect(recordedLimitWait({ status: 'running' }, waiting, attempts, now)).toBeNull();
+  });
+
+  it('no wait without a limit, past its time, or once the task got further', () => {
+    expect(recordedLimitWait(queued, [status('queued')], attempts, now)).toBeNull();
+    expect(recordedLimitWait(queued, waiting, attempts, Date.parse(retryAt))).toBeNull();
+    const passed = [...attempts, { taskId: 'task_1', outcome: 'passed' as const }];
+    expect(recordedLimitWait(queued, waiting, passed, now)).toBeNull();
+    expect(recordedLimitWait(queued, waiting, [], now)).toBeNull();
+    // Not as waitForQuota writes it: without the queued status after the limit.
+    expect(recordedLimitWait(queued, [limited()], attempts, now)).toBeNull();
+    for (const data of [{ retryAt: 'not a time' }, { retryAt: null }, { agentId: 1 }]) {
+      expect(
+        recordedLimitWait(queued, [limited(data), status('queued')], attempts, now),
+      ).toBeNull();
+    }
   });
 });
 
