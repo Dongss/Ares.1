@@ -232,6 +232,11 @@ export const StageSchema = z.strictObject({
   kind: z.enum(['agent', 'review', 'merge', 'placeholder', 'assess', 'command']).default('agent'),
   agent: z.string().optional(),
   agent_candidates: z.array(z.string()).optional(),
+  /**
+   * agent stages: `single` = the whole stage is one task; `llm` = every round, the stage's agent
+   * first splits it, read-only, into ordered tasks, each then executed, checked and committed on
+   * its own.
+   */
   planning: z.enum(['single', 'llm']).default('single'),
   instructions: z.string().optional(),
   inputs: z.array(z.string()).default([]),

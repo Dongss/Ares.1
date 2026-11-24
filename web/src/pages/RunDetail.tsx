@@ -969,6 +969,10 @@ function TaskBlock(props: { detail: RunDetail; task: Task; onShowCommit: (sha: s
   );
 }
 
+/** Checks a human most likely wants to read: a review, an assessment, a plan, a failure. */
+const readFirst = (c: CheckResult) =>
+  c.kind === 'review' || c.kind === 'assess' || c.kind === 'plan' || !c.passed;
+
 function AttemptBlock(props: {
   attempt: Attempt;
   checks: CheckResult[];
@@ -982,10 +986,7 @@ function AttemptBlock(props: {
   const live = attempt.status === 'running';
   const passed = checks.filter((c) => c.passed).length;
   // Open what a human most likely wants to read: live output, review comments, the last failure.
-  const notable =
-    props.latest &&
-    (checks.some((c) => c.kind === 'review' || c.kind === 'assess' || !c.passed) ||
-      !!attempt.error);
+  const notable = props.latest && (checks.some(readFirst) || !!attempt.error);
   return (
     <Collapsible
       defaultOpen={live || notable}
@@ -1048,7 +1049,7 @@ function CheckList({ checks }: { checks: CheckResult[] }) {
       {checks.map((c) => (
         <li key={c.id} className={c.passed ? 'check-pass' : 'check-fail'}>
           <Collapsible
-            defaultOpen={c.kind === 'review' || c.kind === 'assess' || !c.passed}
+            defaultOpen={readFirst(c)}
             title={
               <span>
                 <span

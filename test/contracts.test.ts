@@ -2,7 +2,11 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   deniedOperations,
   extractStructured,
+  formatPlan,
   formatReviewIssues,
+  MAX_PLAN_TASKS,
+  PLAN_REPORT_JSON_SCHEMA,
+  PlanReportSchema,
   parseReport,
   ReviewReportSchema,
   resultProblem,
@@ -83,6 +87,43 @@ describe('agent output contracts', () => {
     expect(formatReviewIssues(report)).toBe(
       '评审结论：基本可以\n1. [必须修改]（a.ts） 有 bug\n2. [建议] 命名可以更好',
     );
+  });
+
+  it('takes a plan of 1 to 8 steps, each with a title and instructions', () => {
+    const step = (n: number) => ({ title: ` 第 ${n} 步 `, instructions: `做第 ${n} 步` });
+    const ok = parseReport(PlanReportSchema, { tasks: [step(1), step(2)] }, '');
+    expect(ok).toEqual({
+      ok: true,
+      value: {
+        tasks: [
+          { title: '第 1 步', instructions: '做第 1 步' },
+          { title: '第 2 步', instructions: '做第 2 步' },
+        ],
+      },
+    });
+    if (ok.ok)
+      expect(formatPlan(ok.value)).toBe('1. 第 1 步\n\n做第 1 步\n\n2. 第 2 步\n\n做第 2 步');
+    expect(
+      parseReport(PlanReportSchema, { tasks: Array.from({ length: 8 }, (_, i) => step(i)) }, '').ok,
+    ).toBe(true);
+    // No step at all would leave the stage with nothing to do; more than 8 cost more than they save.
+    for (const tasks of [[], Array.from({ length: MAX_PLAN_TASKS + 1 }, (_, i) => step(i))]) {
+      const bad = parseReport(PlanReportSchema, { tasks }, '');
+      expect(bad.ok ? '' : bad.error).toMatch(/^JSON 结果不符合约定：tasks: /);
+    }
+    for (const broken of [
+      { title: '', instructions: 'x' },
+      { title: 'x', instructions: ' ' },
+      { title: 'x' },
+    ]) {
+      expect(parseReport(PlanReportSchema, { tasks: [broken] }, '').ok).toBe(false);
+    }
+    expect(PLAN_REPORT_JSON_SCHEMA).toMatchObject({
+      type: 'object',
+      required: ['tasks'],
+      properties: { tasks: { type: 'array', minItems: 1, maxItems: MAX_PLAN_TASKS } },
+    });
+    expect(PLAN_REPORT_JSON_SCHEMA).not.toHaveProperty('$schema');
   });
 });
 

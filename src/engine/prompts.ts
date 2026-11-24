@@ -7,6 +7,7 @@ import type {
   FailedAttempt,
   ReplyTimeoutEntry,
 } from '../store/types.js';
+import { MAX_PLAN_TASKS } from './contracts.js';
 import {
   assessmentRounds,
   conclusionLabel,
@@ -175,17 +176,78 @@ This requirement's branch conflicted when it was to be merged into ${merge.targe
   });
 }
 
+/** A work task of a stage its plan split into steps (`planning: llm`): which step it is. */
+export interface PlannedStep {
+  /** Position among the plan's tasks, from 1. */
+  index: number;
+  /** Titles of all the plan's tasks, in order. */
+  titles: string[];
+  /** What the plan says this step does. */
+  instructions: string;
+}
+
+function stepSection(step: PlannedStep | undefined): string {
+  if (!step) return '';
+  const total = step.titles.length;
+  const title = step.titles[step.index - 1] ?? '';
+  const plan = step.titles
+    .map((s, i) => {
+      const mark =
+        i + 1 < step.index
+          ? t({ zh: '（已完成）', en: ' (done)' })
+          : i + 1 === step.index
+            ? t({ zh: ' ← 这一步', en: ' ← this step' })
+            : '';
+      return `${i + 1}. ${s}${mark}`;
+    })
+    .join('\n');
+  return t({
+    zh: `## 这一步：第 ${step.index} 步（共 ${total} 步）「${title}」
+
+这个阶段的工作已经拆成按顺序执行的几步，每一步单独检查、单独提交。这次只做这一步：
+
+${step.instructions.trim()}
+
+整个计划：
+
+${plan}
+
+- 前面的步骤已经完成并提交，在它们的基础上继续。
+- 后面的步骤由之后的 Task 完成，现在不要做。
+- 这一步做完后代码要处在可用的状态：能构建，检查能通过。
+
+`,
+    en: `## This step: step ${step.index} of ${total}, "${title}"
+
+The work of this stage has been split into steps executed in order, each checked and committed on its own. This time, do only this step:
+
+${step.instructions.trim()}
+
+The whole plan:
+
+${plan}
+
+- The steps before this one are done and committed; build on them.
+- The steps after this one are left to later tasks; do not do them now.
+- When this step is done, the code must be in a working state: it builds and the checks pass.
+
+`,
+  });
+}
+
 /**
  * First prompt of a task in an agent stage (or any attempt that starts a new session).
  * @param permission the running agent's permission: a "safe" agent cannot run commands, so it is
  *   not told to run the verify commands itself.
  * @param merge a merge of the target branch the Master started for the agent to resolve.
+ * @param step the task's step when the stage's plan split it into several (`planning: llm`).
  */
 export function taskPrompt(
   ctx: PromptContext,
   feedback: string | null,
   permission: AgentPermission,
   merge?: MergeInProgress,
+  step?: PlannedStep,
 ): string {
   const stageName = ctx.stage.name ?? ctx.stage.id;
   const instructions = ctx.stage.instructions ? fill(ctx.stage.instructions, ctx.goal).trim() : '';
@@ -214,7 +276,7 @@ export function taskPrompt(
         en: `## The previous attempt did not pass\n\n${feedback}\n\n`,
       })
     : '';
-  const rest = `${inputsSection(ctx.inputs)}${earlierAttemptsSection(ctx.earlierAttempts, 'task')}${stageFeedback}${mergeSection(merge)}${lastFeedback}`;
+  const rest = `${stepSection(step)}${inputsSection(ctx.inputs)}${earlierAttemptsSection(ctx.earlierAttempts, 'task')}${stageFeedback}${mergeSection(merge)}${lastFeedback}`;
   return t({
     zh: `你是${brandName()}调度的开发 Agent，正在仓库的一个独立工作目录（git worktree）中工作。
 
@@ -271,6 +333,95 @@ ${taskReportFormat()}
 ${feedback}
 
 ${taskReportFormat()}
+`,
+  });
+}
+
+/**
+ * Prompt of a stage's plan (`planning: llm`): a read-only agent splits the stage into ordered
+ * steps, each executed, checked and committed on its own (`PlanReportSchema`).
+ * @param feedback what was wrong with the previous plan (its format, say), or a human's note.
+ */
+export function planPrompt(ctx: PromptContext, feedback: string | null): string {
+  const stageName = ctx.stage.name ?? ctx.stage.id;
+  const instructions = ctx.stage.instructions ? fill(ctx.stage.instructions, ctx.goal).trim() : '';
+  const requirements = instructions
+    ? t({
+        zh: `## 阶段要求\n\n${instructions}\n\n`,
+        en: `## Stage instructions\n\n${instructions}\n\n`,
+      })
+    : '';
+  const stageFeedback = ctx.stageFeedback
+    ? t({
+        zh: `## 上一轮被打回的原因\n\n这个阶段上一轮的工作被打回了，这一轮重新拆分。计划要覆盖下面的每一条问题：\n\n${ctx.stageFeedback}\n\n`,
+        en: `## Why the previous round was sent back\n\nThis stage's previous round was sent back, and this round is planned anew. The plan must cover every problem below:\n\n${ctx.stageFeedback}\n\n`,
+      })
+    : '';
+  const lastFeedback = feedback
+    ? t({
+        zh: `## 上一次拆分没有完成\n\n${feedback}\n\n`,
+        en: `## The previous plan did not complete\n\n${feedback}\n\n`,
+      })
+    : '';
+  const commands = join(ctx.verifyCommands.map((c) => `\`${c}\``));
+  const checks =
+    ctx.verifyCommands.length > 0
+      ? t({
+          zh: `Master 运行检查命令（${commands}），全部通过后单独提交`,
+          en: `the Master runs the verify commands (${commands}) and commits it on its own once all of them pass`,
+        })
+      : t({ zh: 'Master 单独提交', en: 'the Master commits it on its own' });
+  const rest = `${requirements}${inputsSection(ctx.inputs)}${earlierAttemptsSection(ctx.earlierAttempts, 'task')}${stageFeedback}${lastFeedback}`;
+  return t({
+    zh: `你是${brandName()}的「任务拆分」Agent。阶段「${stageName}」开始之前，先把下面的目标拆成按顺序执行的几步。你只能读文件和搜索，不能修改任何文件，也不能执行命令。
+
+## 目标
+
+${ctx.goal}
+
+${rest}## 怎么拆
+
+- 先读 README.md 和 AGENTS.md（有 CLAUDE.md 的也读），了解项目的约定，再读和目标相关的代码，弄清要改哪些地方。
+- 按依赖顺序排列：后面的步骤可以用前面步骤的成果，前面的步骤不能依赖后面的。
+- 每一步由一个开发 Agent 单独完成，完成后 ${checks}。所以每一步做完，代码都要能构建、检查都能通过，不能留下半截的改动；测试和它覆盖的代码放在同一步。
+- 每一步要小到一个 Agent 一次能做完，又要大到值得单独检查和提交。需求本来就小时只给一步，不要硬拆。最多 ${MAX_PLAN_TASKS} 步。
+- title 是这一步的一句话标题；instructions 写清这一步要做什么、改哪些文件或模块、怎样算做完。做这一步的 Agent 会读到目标、阶段要求和整个计划，instructions 里不用重复它们。
+${noGitHubRule()}
+## 输出格式
+
+最后一条回复以一个 JSON 代码块结束：
+
+\`\`\`json
+{"tasks": [{"title": "这一步的标题", "instructions": "这一步要做什么、怎样算做完"}]}
+\`\`\`
+
+- tasks 按执行顺序排列，1 到 ${MAX_PLAN_TASKS} 项。
+- title 和 instructions 用中文书写。
+`,
+    en: `You are the planning agent of ${brandName()}. Before the stage "${stageName}" starts, split the goal below into steps executed in order. You may only read files and search; you may not modify any file or run commands.
+
+## Goal
+
+${ctx.goal}
+
+${rest}## How to split
+
+- First read README.md and AGENTS.md (and CLAUDE.md if there is one) to learn the project's conventions, then read the code related to the goal to work out what has to change.
+- Order the steps by their dependencies: a later step may build on the earlier ones, an earlier step may not depend on a later one.
+- A development agent does each step on its own, after which ${checks}. So after every step the code must build and the checks must pass, with no half-done changes left; tests go in the same step as the code they cover.
+- Make each step small enough for one agent to finish in one go, and big enough to be worth checking and committing on its own. When the requirement is small to begin with, give a single step; do not split it for the sake of it. At most ${MAX_PLAN_TASKS} steps.
+- title is a one-line title of the step; instructions say what the step does, which files or modules it changes and when it is done. The agent doing the step reads the goal, the stage instructions and the whole plan, so instructions need not repeat them.
+${noGitHubRule()}
+## Output format
+
+End your last reply with a JSON code block:
+
+\`\`\`json
+{"tasks": [{"title": "the step's title", "instructions": "what the step does and when it is done"}]}
+\`\`\`
+
+- tasks are in the order they are executed, 1 to ${MAX_PLAN_TASKS} of them.
+- Write title and instructions in English.
 `,
   });
 }

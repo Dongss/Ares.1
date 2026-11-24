@@ -77,6 +77,18 @@ describe('configuration examples (docs/examples)', () => {
     }
   });
 
+  it('shows an agent stage split into tasks by its own agent, run read-only', () => {
+    const cfg = loadExamples();
+    const planned = [...cfg.templates.values()].flatMap((tpl) =>
+      tpl.stages.filter((s) => s.planning === 'llm'),
+    );
+    expect(planned.length).toBeGreaterThan(0);
+    for (const stage of planned) {
+      expect(stage.kind).toBe('agent');
+      expect(BUILTIN_READ_ONLY_CLIS).toContain(cfg.agents.get(stage.agent ?? '')?.cli);
+    }
+  });
+
   it('agents.yaml shows the kinds of agents the README lists', () => {
     const cfg = loadExamples();
     const entries = cfg.agentEntries;

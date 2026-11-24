@@ -813,8 +813,10 @@ export class Store {
 
   // ---- tasks ---------------------------------------------------------------
 
+  /** A task of the stage round, after its existing ones; a work task unless `kind` says so. */
   createTask(
-    input: Pick<Task, 'runId' | 'stageRunId' | 'title' | 'instructions' | 'agentId'>,
+    input: Pick<Task, 'runId' | 'stageRunId' | 'title' | 'instructions' | 'agentId'> &
+      Partial<Pick<Task, 'kind'>>,
   ): Task {
     const seq = this.db
       .prepare('SELECT COUNT(*) AS n FROM tasks WHERE stage_run_id = ?')
@@ -822,6 +824,7 @@ export class Store {
     const now = nowIso();
     const task: Task = {
       ...input,
+      kind: input.kind ?? 'work',
       id: newId('task'),
       seq: seq.n + 1,
       status: 'pending',

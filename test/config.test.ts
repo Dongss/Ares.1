@@ -306,6 +306,9 @@ stages:
     agent: off
   - id: b
     agent_candidates: [ok]
+  - id: r
+    kind: review
+    agent: ok
     planning: llm
   - id: m
     kind: merge
@@ -321,7 +324,7 @@ stages:
     const bad = cfg.errors['workflows/bad.yaml'] ?? [];
     expect(bad.join('\n')).toMatch(/Agent off 不存在或未启用/);
     expect(bad.join('\n')).toMatch(/agent_candidates/);
-    expect(bad.join('\n')).toMatch(/planning: llm/);
+    expect(bad.join('\n')).toMatch(/planning: llm（拆分任务）只能用在 agent（编码）阶段/);
     expect(bad.join('\n')).toMatch(/merge 阶段必须是最后一个/);
     expect(bad.join('\n')).toMatch(/回退目标 nowhere 不存在/);
     expect(cfg.templates.has('bad')).toBe(false);
@@ -598,6 +601,87 @@ stages:
     expect(stageVerifyCommands(assess, ['npm test'])).toEqual([]);
     expect(failTarget(t, 'assess')).toBeNull();
     expect(rollbackTarget(t, 'assess', 'reject')).toBe('assess');
+  });
+
+  it('accepts planning: llm on agent stages whose agent can run read-only, and nowhere else', () => {
+    const paths = home();
+    writeFile(
+      paths.agentsFile,
+      `agents:
+  claude: { cli: claude-code, model: opus }
+  grok: { cli: cursor-agent, model: grok-4.7-high }
+`,
+    );
+    const files: Record<string, string> = {
+      'self-dev.yaml': `id: ok
+stages:
+  - { id: implement, name: 编码, agent: claude, planning: llm }
+  - { id: review, kind: review, agent: grok }
+  - { id: merge, kind: merge }
+`,
+      'cursor.yaml': `id: a2
+stages:
+  - { id: implement, agent: grok, planning: llm }
+`,
+      'review.yaml': `id: a3
+stages:
+  - { id: implement, agent: claude }
+  - { id: review, kind: review, agent: grok, planning: llm }
+`,
+      'assess.yaml': `id: a4
+stages:
+  - { id: assess, kind: assess, agent: claude, planning: llm }
+  - { id: implement, agent: claude, inputs: [assessment] }
+`,
+      'placeholder.yaml': `id: a5
+stages:
+  - { id: implement, agent: claude }
+  - { id: e2e, kind: placeholder, planning: llm }
+`,
+      'merge.yaml': `id: a6
+stages:
+  - { id: implement, agent: claude }
+  - { id: merge, kind: merge, planning: llm }
+`,
+    };
+    for (const [file, yaml] of Object.entries(files)) {
+      writeFile(join(paths.workflowsDir, file), yaml);
+    }
+    const load = () => loadConfig(paths, ['claude-code', 'cursor-agent'], ['claude-code']);
+    const cfg = load();
+    const errors = (file: string) => cfg.errors[`workflows/${file}`];
+    // No longer "not implemented yet".
+    expect(errors('self-dev.yaml')).toBeUndefined();
+    expect(cfg.warnings['workflows/self-dev.yaml']).toBeUndefined();
+    expect(cfg.templates.get('ok')?.stages[0]?.planning).toBe('llm');
+    // The plan runs the stage's agent read-only, which only some CLIs can.
+    expect(errors('cursor.yaml')).toEqual([
+      '阶段 implement：planning: llm 先以只读方式运行阶段的 Agent 来拆分任务，Agent grok 的 CLI cursor-agent 不支持，请换用 claude-code 的 Agent',
+    ]);
+    // Only work that is checked and committed is split.
+    expect(errors('review.yaml')).toEqual([
+      '阶段 review：planning: llm（拆分任务）只能用在 agent（编码）阶段，review 阶段不能用',
+    ]);
+    expect(errors('assess.yaml')).toEqual([
+      '阶段 assess：planning: llm（拆分任务）只能用在 agent（编码）阶段，assess 阶段不能用',
+    ]);
+    expect(errors('placeholder.yaml')).toEqual([
+      '阶段 e2e：planning: llm（拆分任务）只能用在 agent（编码）阶段，placeholder 阶段不能用',
+    ]);
+    expect(errors('merge.yaml')).toEqual([
+      '阶段 merge：planning: llm（拆分任务）只能用在 agent（编码）阶段，merge 阶段不能用',
+    ]);
+    expect([...cfg.templates.keys()]).toEqual(['ok']);
+
+    // config.yaml sets the language in use while loading.
+    writeFile(paths.configFile, 'language: en\n');
+    const en = load();
+    expect(en.errors['workflows/cursor.yaml']).toEqual([
+      "Stage implement: planning: llm first runs the stage's agent read-only to split the stage into tasks, which the CLI cursor-agent of agent grok does not support; use an agent of claude-code",
+    ]);
+    expect(en.errors['workflows/review.yaml']).toEqual([
+      'Stage review: planning: llm (splitting the stage into tasks) only applies to agent stages, not to a review stage',
+    ]);
   });
 
   it('reads how long an assess stage waits for a reply: 24 hours unless it says otherwise', () => {

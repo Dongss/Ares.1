@@ -11,16 +11,18 @@ import {
   REDO_BACKOFF_MAX_HOURS,
   rateLimitDelayMs,
 } from '../src/config/flow.js';
+import { PLAN_REPORT_JSON_SCHEMA } from '../src/engine/contracts.js';
 import { AGENT_RETRY_BACKOFF, InvalidStateError } from '../src/engine/engine.js';
 import { LABELS, RETRIES_EXHAUSTED_MARKER } from '../src/github/issues.js';
 import { setLang } from '../src/i18n.js';
 import { noticeFor } from '../src/notify/notice.js';
 import { NotFoundError } from '../src/store/store.js';
-import type { Run, Task } from '../src/store/types.js';
+import type { Run, StageRun, Task } from '../src/store/types.js';
 import {
   ASSESS_AGENTS_YAML,
   ASSESS_WORKFLOW_YAML,
   assessment,
+  blockOnAgentError,
   done,
   FakeGitHub,
   git,
@@ -4787,5 +4789,344 @@ github:
     await engine.sweepLeftoverWorkspaces();
     expect(counts()).toEqual(before);
     check();
+  });
+});
+
+describe('engine: planning: llm', () => {
+  const eventData = (runId: string, type: string) =>
+    (h as Harness).master.store
+      .listEvents(runId)
+      .filter((e) => e.type === type)
+      .map((e) => e.data);
+  /** Coding split into steps by its own agent, review, then merging without approval. */
+  const PLANNED_WORKFLOW = `
+id: dev
+name: 测试流程
+defaults:
+  escalate:
+    max_retries: 2
+    on_agent_error: switch_agent
+  max_loops: 3
+stages:
+  - id: implement
+    name: 编码
+    kind: agent
+    agent: coder
+    planning: llm
+    instructions: 实现 {{goal}}
+  - id: review
+    name: 评审
+    kind: review
+    agent: reviewer
+    inputs: [diff]
+    on_fail: implement
+  - id: merge
+    name: 合并
+    kind: merge
+    on_reject: implement
+`;
+  /** What a planner reports: one step per title, each writing a file named after it. */
+  const plan = (titles: string[]): FakeOutcome => ({
+    finalMessage: `拆好了。\n\`\`\`json\n${JSON.stringify({
+      tasks: titles.map((title) => ({ title, instructions: `写 ${title}.txt` })),
+    })}\n\`\`\``,
+  });
+  /**
+   * The coder: read-only it plans `titles`; otherwise it does the step its prompt names, writing
+   * the file the step's instructions say and feature.txt, which the verify command looks for.
+   */
+  const planner = (titles: string[]): Script => {
+    let calls = 0;
+    return (ctx) => {
+      if (ctx.input.readOnly) return plan(titles);
+      calls++;
+      const file = /写 (\S+\.txt)/.exec(ctx.input.prompt)?.[1] ?? 'unknown.txt';
+      writeFile(join(ctx.input.workdir, file), `step ${calls}\n`);
+      writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+      return done(`写了 ${file}`);
+    };
+  };
+  const implementRounds = (runId: string) =>
+    (h as Harness).master.store.listStageRuns(runId).filter((sr) => sr.stageId === 'implement');
+  const tasksOf = (stageRunId: string) =>
+    (h as Harness).master.store
+      .listTasks(stageRunId)
+      .map((task) => [task.kind, task.title, task.status]);
+
+  it('plans read-only, then executes, checks and commits each step in order', async () => {
+    h = await harness({
+      workflow: PLANNED_WORKFLOW,
+      scripts: { coder: planner(['a', 'b', 'c']), reviewer: () => review() },
+    });
+    const run = h.run();
+    await h.waitStatus(run.id, 'completed');
+    const store = h.master.store;
+
+    // One read-only plan, then the three steps, each in a session of its own, then the review.
+    expect(h.fake.calls.map((c) => [c.model, c.readOnly === true])).toEqual([
+      ['coder', true],
+      ['coder', false],
+      ['coder', false],
+      ['coder', false],
+      ['reviewer', false],
+    ]);
+    const [planCall, ...stepCalls] = h.fake.calls;
+    expect(planCall?.prompt).toContain('「任务拆分」Agent');
+    expect(planCall?.prompt).toContain('## 阶段要求\n\n实现 添加 feature.txt');
+    expect(planCall?.outputSchema).toEqual(PLAN_REPORT_JSON_SCHEMA);
+    expect(planCall?.permission).toBe('safe');
+    expect(stepCalls[0]?.prompt).toContain('## 当前阶段：编码\n\n实现 添加 feature.txt');
+    expect(stepCalls[0]?.prompt).toContain('## 这一步：第 1 步（共 3 步）「a」');
+    expect(stepCalls[1]?.prompt).toContain('1. a（已完成）\n2. b ← 这一步\n3. c');
+    expect(stepCalls[2]?.prompt).toContain('这次只做这一步：\n\n写 c.txt');
+    expect(stepCalls.slice(0, 3).map((c) => c.resumeSessionId)).toEqual([
+      undefined,
+      undefined,
+      undefined,
+    ]);
+
+    const [implement] = implementRounds(run.id) as [StageRun];
+    expect(tasksOf(implement.id)).toEqual([
+      ['plan', '拆分任务', 'passed'],
+      ['work', 'a', 'passed'],
+      ['work', 'b', 'passed'],
+      ['work', 'c', 'passed'],
+    ]);
+    const [planTask, ...work] = store.listTasks(implement.id) as [Task, ...Task[]];
+    expect(eventData(run.id, 'stage.planned')).toEqual([
+      { stageId: 'implement', round: 1, taskId: planTask.id, tasks: ['a', 'b', 'c'] },
+    ]);
+
+    // The plan runs no verify command and commits nothing; each step does both on its own.
+    const checks = store.listChecks(run.id);
+    const checksOf = (task: Task) => {
+      const ids = new Set(store.listAttempts(task.id).map((a) => a.id));
+      return checks.filter((c) => c.attemptId && ids.has(c.attemptId)).map((c) => c.kind);
+    };
+    expect(checksOf(planTask)).toEqual(['plan']);
+    expect(checks.find((c) => c.kind === 'plan')?.detail).toBe(
+      '1. a\n\n写 a.txt\n\n2. b\n\n写 b.txt\n\n3. c\n\n写 c.txt',
+    );
+    expect(planTask.commitSha).toBeNull();
+    for (const task of work) expect(checksOf(task)).toEqual(['result', 'command']);
+
+    // One commit per step, in the plan's order, now on the target branch.
+    const shas = work.map((task) => task.commitSha as string);
+    expect(new Set(shas).size).toBe(3);
+    expect(git(h.repoDir, 'rev-parse', `${shas[1]}^`)).toBe(shas[0]);
+    expect(git(h.repoDir, 'rev-parse', `${shas[2]}^`)).toBe(shas[1]);
+    expect(git(h.repoDir, 'log', '-1', '--format=%B', shas[1] as string)).toContain(
+      '编码: 添加 feature.txt\n\n第 2/3 步：b\n\n写了 b.txt',
+    );
+    for (const file of ['a.txt', 'b.txt', 'c.txt', 'feature.txt']) {
+      expect(git(h.repoDir, 'show', `main:${file}`)).toBeTruthy();
+    }
+  });
+
+  it('retries a plan that does not match the format by on_agent_error, telling what was wrong', async () => {
+    const good = planner(['a']);
+    let plans = 0;
+    h = await harness({
+      workflow: PLANNED_WORKFLOW,
+      scripts: {
+        coder: (ctx) =>
+          ctx.input.readOnly && ++plans === 1
+            ? { finalMessage: '```json\n{"tasks": []}\n```' }
+            : good(ctx),
+        reviewer: () => review(),
+      },
+    });
+    const run = h.run();
+    await h.waitStatus(run.id, 'completed');
+    const store = h.master.store;
+    const [implement] = implementRounds(run.id) as [StageRun];
+    const [planTask] = store.listTasks(implement.id) as [Task];
+    expect(store.listAttempts(planTask.id).map((a) => a.outcome)).toEqual([
+      'agent_error',
+      'passed',
+    ]);
+    expect(eventData(run.id, 'task.retry_after_error')).toEqual([
+      {
+        taskId: planTask.id,
+        agentId: 'coder',
+        error: expect.stringMatching(/^JSON 结果不符合约定：tasks: /),
+        attempt: 1,
+        delayMs: 0,
+      },
+    ]);
+    const retried = h.fake.calls.filter((c) => c.readOnly)[1];
+    expect(retried?.prompt).toMatch(/## 上一次拆分没有完成\n\nJSON 结果不符合约定：tasks: /);
+    expect(
+      store
+        .listChecks(run.id)
+        .filter((c) => c.kind === 'plan')
+        .map((c) => c.passed),
+    ).toEqual([false, true]);
+    expect(tasksOf(implement.id)).toEqual([
+      ['plan', '拆分任务', 'passed'],
+      ['work', 'a', 'passed'],
+    ]);
+  });
+
+  it('creates no task from a plan that does not match the format', async () => {
+    h = await harness({
+      workflow: PLANNED_WORKFLOW,
+      scripts: {
+        coder: (ctx) => (ctx.input.readOnly ? { finalMessage: '拆不了' } : done()),
+        reviewer: () => review(),
+      },
+    });
+    const run = h.run('添加 feature.txt', blockOnAgentError());
+    const blocked = await h.waitStatus(run.id, 'blocked');
+    const [implement] = implementRounds(run.id) as [StageRun];
+    const [planTask] = h.master.store.listTasks(implement.id) as [Task];
+    expect(tasksOf(implement.id)).toEqual([['plan', '拆分任务', 'failed']]);
+    expect(blocked.blocked).toEqual({
+      kind: 'agent_error',
+      message: 'Agent coder 运行出错：没有找到约定格式的 JSON 结果',
+      taskId: planTask.id,
+    });
+    expect(eventData(run.id, 'stage.planned')).toEqual([]);
+
+    // A human retries: planned again, told what was wrong.
+    h.scripts.coder = planner(['a', 'b']);
+    await h.master.engine.retry(run.id);
+    await h.waitStatus(run.id, 'completed');
+    expect(tasksOf(implement.id)).toEqual([
+      ['plan', '拆分任务', 'passed'],
+      ['work', 'a', 'passed'],
+      ['work', 'b', 'passed'],
+    ]);
+    expect(h.fake.calls.filter((c) => c.readOnly)[1]?.prompt).toContain(
+      '## 上一次拆分没有完成\n\n没有找到约定格式的 JSON 结果',
+    );
+  });
+
+  it.each([
+    ['stops', 'stopped'],
+    ['crashes', 'interrupted'],
+  ])(
+    'plans again when the Master %s in the middle of planning, creating no task twice',
+    async (how, status) => {
+      const first = await harness({
+        workflow: PLANNED_WORKFLOW,
+        scripts: {
+          coder: async (ctx) => {
+            await new Promise((resolve) => ctx.signal.addEventListener('abort', resolve));
+            return plan(['never']);
+          },
+        },
+      });
+      const run = first.run();
+      await waitFor(() => first.fake.calls.length === 1, 'the plan to start');
+      // A crash leaves the database saying "running" when the next Master opens it.
+      if (how === 'stops') await first.close();
+
+      h = await harness({
+        home: first.home,
+        repoDir: first.repoDir,
+        workflow: PLANNED_WORKFLOW,
+        scripts: { coder: planner(['a', 'b']), reviewer: () => review() },
+      });
+      await h.waitStatus(run.id, 'completed');
+      const [implement] = implementRounds(run.id) as [StageRun];
+      expect(tasksOf(implement.id)).toEqual([
+        ['plan', '拆分任务', 'passed'],
+        ['work', 'a', 'passed'],
+        ['work', 'b', 'passed'],
+      ]);
+      const [planTask] = h.master.store.listTasks(implement.id) as [Task];
+      expect(h.master.store.listAttempts(planTask.id).map((a) => a.status)).toEqual([
+        status,
+        'completed',
+      ]);
+      expect(eventData(run.id, 'stage.planned')).toHaveLength(1);
+    },
+  );
+
+  it('plans every round anew after the review sends the work back, with the review', async () => {
+    let reviews = 0;
+    h = await harness({
+      workflow: PLANNED_WORKFLOW,
+      scripts: {
+        coder: planner(['a', 'b']),
+        reviewer: () =>
+          ++reviews === 1 ? review([{ severity: 'must', description: '少了 d.txt' }]) : review(),
+      },
+    });
+    const run = h.run();
+    await h.waitStatus(run.id, 'completed');
+    const rounds = implementRounds(run.id);
+    expect(rounds.map((sr) => sr.round)).toEqual([1, 2]);
+    for (const sr of rounds) {
+      expect(tasksOf(sr.id)).toEqual([
+        ['plan', '拆分任务', 'passed'],
+        ['work', 'a', 'passed'],
+        ['work', 'b', 'passed'],
+      ]);
+    }
+    expect(eventData(run.id, 'stage.planned').map((d) => d.round)).toEqual([1, 2]);
+    const plans = h.fake.calls.filter((c) => c.readOnly);
+    expect(plans).toHaveLength(2);
+    expect(plans[0]?.prompt).not.toContain('## 上一轮被打回的原因');
+    expect(plans[1]?.prompt).toContain('## 上一轮被打回的原因');
+    expect(plans[1]?.prompt).toContain('少了 d.txt');
+    // Each step of the new round gets the review too.
+    const steps = h.fake.calls.filter((c) => c.model === 'coder' && !c.readOnly);
+    expect(steps).toHaveLength(4);
+    for (const call of steps.slice(0, 2)) expect(call.prompt).not.toContain('少了 d.txt');
+    for (const call of steps.slice(2)) expect(call.prompt).toContain('少了 d.txt');
+  });
+
+  it('switches a plan whose agent cannot run read-only to one that can; the steps keep the stage agent', async () => {
+    const scripts: Record<string, Script> = {
+      coder: planner(['a']),
+      coder2: planner(['x']),
+      reviewer: () => review(),
+    };
+    const fake = new FakeAdapter((ctx) => (scripts[ctx.input.model] as Script)(ctx));
+    // A CLI that cannot run an agent read-only.
+    const writeOnly: AgentAdapter = { cli: 'fake-rw', start: (input) => fake.start(input) };
+    const agents = (coderCli: string) => `
+agents:
+  coder: { cli: ${coderCli}, model: coder }
+  coder2: { cli: fake, model: coder2 }
+  reviewer: { cli: fake, model: reviewer }
+`;
+    h = await harness({
+      agents: agents('fake'),
+      workflow: PLANNED_WORKFLOW,
+      scripts,
+      master: { adapters: [fake, writeOnly] },
+    });
+    h.master.engine.setWorking(false);
+    const run = h.run();
+    // Before the Run starts, the coder moves to a CLI that cannot run read-only.
+    writeFile(join(h.home, 'agents.yaml'), agents('fake-rw'));
+    h.master.configWatcher.reload();
+    h.master.engine.setWorking(true);
+    await h.waitStatus(run.id, 'completed');
+    expect(fake.calls.map((c) => [c.model, c.readOnly === true])).toEqual([
+      ['coder2', true],
+      ['coder', false],
+      ['reviewer', false],
+    ]);
+    expect(eventData(run.id, 'task.agent_switched')).toEqual([
+      {
+        taskId: expect.any(String),
+        from: 'coder',
+        to: 'coder2',
+        reason: 'unavailable',
+        unavailable: 'read_only_unsupported',
+        error: '拆分任务要以只读方式运行，Agent coder 的 CLI fake-rw 不支持',
+      },
+    ]);
+    const [implement] = implementRounds(run.id) as [StageRun];
+    expect(
+      h.master.store.listTasks(implement.id).map((task) => [task.kind, task.title, task.agentId]),
+    ).toEqual([
+      ['plan', '拆分任务', 'coder2'],
+      ['work', 'x', 'coder'],
+    ]);
   });
 });

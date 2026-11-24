@@ -79,6 +79,8 @@ describe('store', () => {
       actualModel: null,
       effort: null,
     });
+    // Recorded before stages could be planned: every task was work.
+    expect(store.getTask('task').kind).toBe('work');
     store.close();
     expect(readdirSync(dir).filter((f) => f.includes('.bak-v1-'))).toHaveLength(1);
   });

@@ -101,7 +101,10 @@ import {
   ASSESS_REPORT_JSON_SCHEMA,
   AssessReportSchema,
   formatFeedback,
+  formatPlan,
   formatReviewIssues,
+  PLAN_REPORT_JSON_SCHEMA,
+  PlanReportSchema,
   parseReport,
   REVIEW_REPORT_JSON_SCHEMA,
   ReviewReportSchema,
@@ -114,8 +117,10 @@ import {
   assessmentArtifact,
   assessPrompt,
   type MergeInProgress,
+  type PlannedStep,
   type PreviousReview,
   type PromptContext,
+  planPrompt,
   reviewPrompt,
   reworkPrompt,
   taskPrompt,
@@ -1659,14 +1664,27 @@ export class Engine {
       );
     }
     this.store.tx(() => {
-      // planning: single — the whole stage is one task.
-      this.store.createTask({
-        runId: run.id,
-        stageRunId: sr.id,
-        title: eff.def.name ?? eff.def.id,
-        instructions: eff.def.instructions ?? '',
-        agentId,
-      });
+      if (eff.def.kind === 'agent' && eff.def.planning === 'llm') {
+        // planning: llm — the stage's agent first splits it into tasks (`runPlanTask`). Every
+        // round plans anew, with the reason the previous one was sent back.
+        this.store.createTask({
+          runId: run.id,
+          stageRunId: sr.id,
+          kind: 'plan',
+          title: t({ zh: '拆分任务', en: 'Plan the tasks' }),
+          instructions: eff.def.instructions ?? '',
+          agentId,
+        });
+      } else {
+        // planning: single — the whole stage is one task.
+        this.store.createTask({
+          runId: run.id,
+          stageRunId: sr.id,
+          title: eff.def.name ?? eff.def.id,
+          instructions: eff.def.instructions ?? '',
+          agentId,
+        });
+      }
       this.store.updateStageRun(sr.id, { status: 'executing' });
     });
   }
@@ -1696,7 +1714,7 @@ export class Engine {
     }
     // Its agent finished before the Run was blocked on the environment: only the checks are left,
     // and they need no agent or budget.
-    if (task.status === 'verifying' && eff.def.kind === 'agent') {
+    if (task.status === 'verifying' && eff.def.kind === 'agent' && task.kind === 'work') {
       return this.resumeVerify(run, sr, eff, task, signal);
     }
     const agent = this.cfg.agents.get(task.agentId);
@@ -1707,6 +1725,12 @@ export class Engine {
     const budget = effectiveBudget(run.template, run.overrides);
     if (budget !== undefined && run.costUsd >= budget) {
       return this.budgetExceeded(run, sr, eff, budget);
+    }
+    if (task.kind === 'plan') {
+      if (!adapter.supportsReadOnly) {
+        return this.agentUnavailable(run, eff, task, 'read_only_unsupported');
+      }
+      return this.runPlanTask(run, sr, eff, task, agent, adapter, signal);
     }
     if (eff.def.kind === 'review')
       return this.runReviewTask(run, sr, eff, task, agent, adapter, signal);
@@ -1721,12 +1745,12 @@ export class Engine {
 
   /**
    * The task's agent cannot run at all: it is not in agents.yaml (any more), is disabled or
-   * invalid, has no adapter (`missing`), or cannot run read-only as an assessment needs
-   * (`read_only_unsupported`). Nothing was executed, so no retry is used up and the worktree is
-   * left as it is. By `on_agent_error`: `switch_agent` hands the task to another agent that can
-   * run the stage; `human` blocks the Run for a human; otherwise the Run ends as failed instead
-   * of waiting, so a Run from an issue is redone: nobody is left to switch to, or `retry`, where
-   * retrying the same agent could never succeed.
+   * invalid, has no adapter (`missing`), or cannot run read-only as an assessment or a stage's
+   * plan needs (`read_only_unsupported`). Nothing was executed, so no retry is used up and the
+   * worktree is left as it is. By `on_agent_error`: `switch_agent` hands the task to another agent
+   * that can run the stage; `human` blocks the Run for a human; otherwise the Run ends as failed
+   * instead of waiting, so a Run from an issue is redone: nobody is left to switch to, or `retry`,
+   * where retrying the same agent could never succeed.
    */
   private agentUnavailable(
     run: Run,
@@ -1741,10 +1765,15 @@ export class Engine {
             zh: `Agent ${task.agentId} 不存在、未启用或没有对应的 Adapter`,
             en: `Agent ${task.agentId} does not exist, is disabled or has no adapter`,
           })
-        : t({
-            zh: `需求评估要以只读方式运行，Agent ${task.agentId} 的 CLI ${cli} 不支持`,
-            en: `The requirement assessment runs read-only, which the CLI ${cli} of agent ${task.agentId} does not support`,
-          });
+        : task.kind === 'plan'
+          ? t({
+              zh: `拆分任务要以只读方式运行，Agent ${task.agentId} 的 CLI ${cli} 不支持`,
+              en: `Planning the tasks runs read-only, which the CLI ${cli} of agent ${task.agentId} does not support`,
+            })
+          : t({
+              zh: `需求评估要以只读方式运行，Agent ${task.agentId} 的 CLI ${cli} 不支持`,
+              en: `The requirement assessment runs read-only, which the CLI ${cli} of agent ${task.agentId} does not support`,
+            });
     const mode = eff.escalate.on_agent_error;
     if (mode === 'human') {
       const advice =
@@ -1874,6 +1903,23 @@ export class Engine {
     };
   }
 
+  /**
+   * Where a work task stands in the plan of its stage round (`planning: llm`); undefined when the
+   * round was not planned.
+   */
+  private plannedStep(sr: StageRun, task: Task): PlannedStep | undefined {
+    const tasks = this.store.listTasks(sr.id);
+    if (!tasks.some((candidate) => candidate.kind === 'plan')) return undefined;
+    const work = tasks.filter((candidate) => candidate.kind === 'work');
+    const index = work.findIndex((candidate) => candidate.id === task.id);
+    if (index < 0) return undefined;
+    return {
+      index: index + 1,
+      titles: work.map((candidate) => candidate.title),
+      instructions: task.instructions,
+    };
+  }
+
   private async runAgentTask(
     run: Run,
     sr: StageRun,
@@ -1901,7 +1947,13 @@ export class Engine {
         : undefined;
     const prompt = resume
       ? reworkPrompt(task.pendingFeedback ?? '')
-      : taskPrompt(ctx, task.pendingFeedback, agent.permission, merge ?? undefined);
+      : taskPrompt(
+          ctx,
+          task.pendingFeedback,
+          agent.permission,
+          merge ?? undefined,
+          this.plannedStep(sr, task),
+        );
 
     const { attempt, result } = await this.execute(run, task, agent, adapter, {
       prompt,
@@ -2063,6 +2115,7 @@ export class Engine {
     }
 
     // Passed: one commit per task, the merge commit when resolving a merge.
+    const step = this.plannedStep(sr, task);
     const sha = await commitAll(
       workdir,
       commitMessage({
@@ -2073,6 +2126,9 @@ export class Engine {
         runId: run.id,
         agent: done.agent,
         attempt: this.store.getAttempt(attempt.id),
+        ...(step
+          ? { step: { index: step.index, total: step.titles.length, title: task.title } }
+          : {}),
       }),
     );
     this.checkAbort(signal);
@@ -2439,6 +2495,103 @@ export class Engine {
     if (entry.verdict === 'ask' && waitHours) this.checkReplyTimeouts();
     // Nothing was done in the workspace.
     if (entry.verdict === 'drop') await this.removeMergedWorkspace(run);
+  }
+
+  /**
+   * The plan of an agent stage with `planning: llm`, its first task in every round: the stage's
+   * agent, read-only, splits the stage into ordered work tasks (`PlanReportSchema`), which then
+   * run one after another, each checked and committed on its own, with the stage's agent. The
+   * work tasks are created in the transaction that passes the plan, so a round has either its
+   * plan still to do or all its work tasks: a plan stopped halfway (a pause, a restart) runs
+   * again and leaves no task behind. A plan that errors, or whose output does not match the
+   * format, is handled by `on_agent_error` (`agentError`), and no work task is created; the
+   * format's problems go to the next attempt. Nothing is checked or committed.
+   */
+  private async runPlanTask(
+    run: Run,
+    sr: StageRun,
+    eff: EffectiveStage,
+    task: Task,
+    agent: AgentConfig,
+    adapter: AgentAdapter,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const workdir = this.workdir(run);
+    const repo = this.store.getRepo(run.repoId);
+    const ctx = this.promptContext(run, sr, eff, stageVerifyCommands(eff.def, repo.verifyCommands));
+    const { attempt, result } = await this.execute(run, task, agent, adapter, {
+      prompt: planPrompt(ctx, task.pendingFeedback),
+      outputSchema: PLAN_REPORT_JSON_SCHEMA,
+      timeoutMs: this.agentTimeoutMs(eff, agent),
+      readOnly: true,
+      signal,
+    });
+
+    // Read-only by the CLI; still, nothing a plan leaves behind is kept.
+    if (await hasChanges(workdir)) {
+      await resetHard(workdir, 'HEAD');
+      this.store.event(run.id, 'plan.changes_discarded', { attemptId: attempt.id });
+    }
+    this.checkAbort(signal);
+
+    if (result.status !== 'completed')
+      return this.agentError(run, eff, task, attempt, result, signal);
+    const name = t({ zh: '拆分任务', en: 'Plan' });
+    const report = parseReport(PlanReportSchema, result.structured, result.finalMessage);
+    if (!report.ok) {
+      const feedback = formatFeedback(report.error);
+      const current = this.store.tx(() => {
+        this.store.addCheck({
+          runId: run.id,
+          stageRunId: sr.id,
+          attemptId: attempt.id,
+          kind: 'plan',
+          name,
+          passed: false,
+          detail: feedback,
+        });
+        return this.store.updateTask(task.id, { pendingFeedback: feedback });
+      });
+      return this.agentError(
+        run,
+        eff,
+        current,
+        attempt,
+        { ...result, status: 'failed', error: report.error },
+        signal,
+      );
+    }
+    const planned = report.value.tasks;
+    // The stage's agent does the work, also when another one made the plan.
+    const agentId = eff.def.agent ?? task.agentId;
+    this.store.tx(() => {
+      this.store.addCheck({
+        runId: run.id,
+        stageRunId: sr.id,
+        attemptId: attempt.id,
+        kind: 'plan',
+        name,
+        passed: true,
+        detail: formatPlan(report.value),
+      });
+      this.store.updateAttempt(attempt.id, { outcome: 'passed' });
+      this.store.updateTask(task.id, { status: 'passed', pendingFeedback: null });
+      for (const step of planned) {
+        this.store.createTask({
+          runId: run.id,
+          stageRunId: sr.id,
+          title: step.title,
+          instructions: step.instructions,
+          agentId,
+        });
+      }
+      this.store.event(run.id, 'stage.planned', {
+        stageId: sr.stageId,
+        round: sr.round,
+        taskId: task.id,
+        tasks: planned.map((step) => step.title),
+      });
+    });
   }
 
   /**
@@ -2842,7 +2995,7 @@ export class Engine {
     task: Task,
     tried: readonly string[],
   ): AgentConfig | undefined {
-    const readOnly = eff.def.kind === 'assess';
+    const readOnly = eff.def.kind === 'assess' || task.kind === 'plan';
     return switchCandidate(
       this.cfg.agents.values(),
       this.cfg.agents.get(task.agentId),
@@ -3734,6 +3887,8 @@ export function commitMessage(input: {
   runId: string;
   agent: Pick<AgentConfig, 'id' | 'cli'>;
   attempt: Pick<Attempt, 'model' | 'actualModel' | 'effort'>;
+  /** The task's step when the stage's plan split it into several (`planning: llm`). */
+  step?: { index: number; total: number; title: string };
 }): string {
   // Before the cut, which could otherwise leave part of the home directory.
   const goalLine = redactForGitHub(input.goal).split('\n')[0]?.slice(0, 60) ?? '';
@@ -3744,11 +3899,17 @@ export function commitMessage(input: {
           en: `${input.stageName} (round ${input.round})`,
         })
       : input.stageName;
-  const { agent, attempt } = input;
+  const { agent, attempt, step } = input;
   const model = attempt.actualModel ?? attempt.model ?? t({ zh: '未知', en: 'unknown' });
   const effort = attempt.effort ?? t({ zh: '默认', en: 'default' });
+  const stepLine = step
+    ? t({
+        zh: `第 ${step.index}/${step.total} 步：${step.title}\n\n`,
+        en: `Step ${step.index}/${step.total}: ${step.title}\n\n`,
+      })
+    : '';
   return redactForGitHub(
-    `${stage}: ${goalLine}\n\n${input.summary}\n\nRun: ${input.runId}\nAgent: ${agent.id} (${agent.cli}, model: ${model}, effort: ${effort})\n`,
+    `${stage}: ${goalLine}\n\n${stepLine}${input.summary}\n\nRun: ${input.runId}\nAgent: ${agent.id} (${agent.cli}, model: ${model}, effort: ${effort})\n`,
   );
 }
 

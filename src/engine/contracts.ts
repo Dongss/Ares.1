@@ -45,6 +45,24 @@ export const AssessReportSchema = z
   });
 export type AssessReport = z.infer<typeof AssessReportSchema>;
 
+/** Most tasks a plan may split a stage into: more steps cost more than they save. */
+export const MAX_PLAN_TASKS = 8;
+
+export const PlannedTaskSchema = z.object({
+  title: z.string().trim().min(1),
+  instructions: z.string().trim().min(1),
+});
+export type PlannedTask = z.infer<typeof PlannedTaskSchema>;
+
+/**
+ * A stage with `planning: llm`: the ordered tasks a read-only agent split the stage into. Each one
+ * is executed, checked and committed on its own, in this order.
+ */
+export const PlanReportSchema = z.object({
+  tasks: z.array(PlannedTaskSchema).min(1).max(MAX_PLAN_TASKS),
+});
+export type PlanReport = z.infer<typeof PlanReportSchema>;
+
 /**
  * JSON Schema for `claude --json-schema`. The `$schema` (draft 2020-12) marker zod adds is
  * rejected by Claude Code ("no schema with key or ref"), so it is removed.
@@ -57,6 +75,7 @@ function toCliJsonSchema(schema: z.ZodType): object {
 export const TASK_REPORT_JSON_SCHEMA = toCliJsonSchema(TaskReportSchema);
 export const REVIEW_REPORT_JSON_SCHEMA = toCliJsonSchema(ReviewReportSchema);
 export const ASSESS_REPORT_JSON_SCHEMA = toCliJsonSchema(AssessReportSchema);
+export const PLAN_REPORT_JSON_SCHEMA = toCliJsonSchema(PlanReportSchema);
 
 /**
  * Find the structured result: the CLI's own structured output if any, otherwise the last
@@ -177,6 +196,13 @@ export function resultProblem(
     };
   }
   return null;
+}
+
+/** A stage's plan as people read it: each step's title, then what it does. */
+export function formatPlan(report: PlanReport): string {
+  return report.tasks
+    .map((task, i) => `${i + 1}. ${task.title}\n\n${task.instructions.trim()}`)
+    .join('\n\n');
 }
 
 export function formatReviewIssues(report: ReviewReport): string {

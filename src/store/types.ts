@@ -322,11 +322,19 @@ export interface StageRun {
   endedAt: string | null;
 }
 
+/**
+ * work: executed by the stage's agent, then checked and committed. plan: a stage with
+ * `planning: llm` first runs its agent read-only to split the stage into work tasks; it is
+ * neither checked nor committed.
+ */
+export type TaskKind = 'work' | 'plan';
+
 export interface Task {
   id: string;
   runId: string;
   stageRunId: string;
   seq: number;
+  kind: TaskKind;
   title: string;
   instructions: string;
   agentId: string;
@@ -429,7 +437,7 @@ export interface AgentScoutTotals {
   lastAt: string | null;
 }
 
-export type CheckKind = 'result' | 'command' | 'review' | 'merge' | 'assess';
+export type CheckKind = 'result' | 'command' | 'review' | 'merge' | 'assess' | 'plan';
 
 export interface CheckResult {
   id: string;

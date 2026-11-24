@@ -8,6 +8,7 @@ import {
   assessmentArtifact,
   assessPrompt,
   type PromptContext,
+  planPrompt,
   reviewPrompt,
   reworkPrompt,
   taskPrompt,
@@ -229,6 +230,65 @@ describe('prompts', () => {
   });
 });
 
+describe('planning prompts', () => {
+  const planned = (stage: Partial<StageDef> = {}) =>
+    ctx({ name: '编码', planning: 'llm', instructions: '实现 {{goal}}，补上测试。', ...stage });
+
+  it('asks a read-only planner for ordered steps that each pass the checks on their own', () => {
+    const prompt = planPrompt(
+      {
+        ...planned(),
+        inputs: [{ name: 'assessment', content: '评估：开工' }],
+        stageFeedback: '「评审」没有通过：\n1. [必须修改] 少了测试',
+      },
+      'JSON 结果不符合约定：tasks: 太少',
+    );
+    expect(prompt.startsWith('你是战神一号的「任务拆分」Agent。阶段「编码」开始之前')).toBe(true);
+    expect(prompt).toContain('你只能读文件和搜索，不能修改任何文件，也不能执行命令');
+    expect(prompt).toContain('## 目标\n\n添加 feature.txt');
+    // The stage's own instructions, inputs and the reason the last round was sent back.
+    expect(prompt).toContain('## 阶段要求\n\n实现 添加 feature.txt，补上测试。');
+    expect(prompt).toContain('### assessment\n\n评估：开工');
+    expect(prompt).toContain(
+      '计划要覆盖下面的每一条问题：\n\n「评审」没有通过：\n1. [必须修改] 少了测试',
+    );
+    expect(prompt).toContain('## 上一次拆分没有完成\n\nJSON 结果不符合约定：tasks: 太少');
+    expect(prompt).toContain('Master 运行检查命令（`npm test`），全部通过后单独提交');
+    expect(prompt).toContain('需求本来就小时只给一步，不要硬拆。最多 8 步');
+    expect(prompt).toContain('不要自己去 GitHub 读 issue 或评论');
+    expect(prompt).toContain('{"tasks": [{"title": "这一步的标题"');
+    expect(prompt).toContain('title 和 instructions 用中文书写');
+    expect(prompt).not.toContain('ares1');
+  });
+
+  it('leaves out what a plan does not have', () => {
+    const prompt = planPrompt({ ...ctx(), verifyCommands: [] }, null);
+    expect(prompt).not.toContain('## 阶段要求');
+    expect(prompt).not.toContain('## 参考资料');
+    expect(prompt).not.toContain('## 上一轮被打回的原因');
+    expect(prompt).not.toContain('## 上一次拆分没有完成');
+    expect(prompt).toContain('完成后 Master 单独提交');
+  });
+
+  it("tells a step's agent what the step is, what is done and what is left to later steps", () => {
+    const step = {
+      index: 2,
+      titles: ['加接口', '接上存储', '补文档'],
+      instructions: '把接口接到 store 上',
+    };
+    const prompt = taskPrompt(planned(), null, 'full', undefined, step);
+    // Still the goal and the stage's instructions, then the step.
+    expect(prompt).toContain('## 目标\n\n添加 feature.txt');
+    expect(prompt).toContain('## 当前阶段：编码\n\n实现 添加 feature.txt，补上测试。');
+    expect(prompt).toContain('## 这一步：第 2 步（共 3 步）「接上存储」');
+    expect(prompt).toContain('这次只做这一步：\n\n把接口接到 store 上');
+    expect(prompt).toContain('1. 加接口（已完成）\n2. 接上存储 ← 这一步\n3. 补文档');
+    expect(prompt).toContain('后面的步骤由之后的 Task 完成，现在不要做');
+    // A stage that is not planned has no step.
+    expect(taskPrompt(planned(), null, 'full')).not.toContain('## 这一步');
+  });
+});
+
 describe('commitMessage', () => {
   const base = {
     stageName: '编码',
@@ -248,6 +308,12 @@ describe('commitMessage', () => {
 
   it('marks later rounds in the title', () => {
     expect(commitMessage({ ...base, round: 2 }).split('\n')[0]).toBe('编码（第 2 轮）: 改进提示词');
+  });
+
+  it("names a planned task's step before the summary", () => {
+    expect(commitMessage({ ...base, step: { index: 2, total: 3, title: '接上存储' } })).toBe(
+      '编码: 改进提示词\n\n第 2/3 步：接上存储\n\n改了提示词。\n\nRun: run-1\nAgent: claude-coder (claude-code, model: claude-opus-5-5, effort: high)\n',
+    );
   });
 
   it('falls back to the configured model and the default effort', () => {
@@ -401,5 +467,47 @@ describe('prompts in English', () => {
     });
     expect(msg.startsWith('Coding (round 2): Add feature.txt')).toBe(true);
     expect(msg).toContain('model: unknown, effort: default');
+    const step = commitMessage({
+      stageName: 'Coding',
+      round: 1,
+      goal: 'Add feature.txt',
+      summary: 'Added it',
+      runId: 'r1',
+      agent: { id: 'claude-coder', cli: 'claude-code' },
+      attempt: { model: null, actualModel: null, effort: null },
+      step: { index: 1, total: 2, title: 'Add the API' },
+    });
+    expect(step).toContain('Add feature.txt\n\nStep 1/2: Add the API\n\nAdded it');
+    expect(step).not.toMatch(CJK);
+  });
+
+  it('writes the planning prompt and the step of a planned task in English', () => {
+    setLang('en');
+    const stage = { name: 'Coding', planning: 'llm', instructions: 'Implement {{goal}}.' } as const;
+    const prompts = {
+      plan: planPrompt(
+        {
+          ...enCtx(stage),
+          inputs: [{ name: 'assessment', content: 'Go ahead' }],
+          stageFeedback: '"Review" did not pass:\n1. [Must fix] add tests',
+          earlierAttempts: earlier,
+        },
+        'The JSON result does not match the agreed format: tasks: too small',
+      ),
+      planBare: planPrompt({ ...enCtx(), verifyCommands: [] }, null),
+      step: taskPrompt(enCtx(stage), null, 'full', undefined, {
+        index: 2,
+        titles: ['Add the API', 'Wire up the store', 'Document it'],
+        instructions: 'Connect the API to the store',
+      }),
+    };
+    for (const [name, prompt] of Object.entries(prompts)) expect(prompt, name).not.toMatch(CJK);
+    expect(prompts.plan.startsWith('You are the planning agent of Ares.1.')).toBe(true);
+    expect(prompts.plan).toContain('At most 8 steps');
+    expect(prompts.plan).toContain('Write title and instructions in English.');
+    expect(prompts.step).toContain('## This step: step 2 of 3, "Wire up the store"');
+    expect(prompts.step).toContain(
+      '1. Add the API (done)\n2. Wire up the store ← this step\n3. Document it',
+    );
   });
 });

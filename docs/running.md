@@ -233,12 +233,12 @@ defaults:
 
 - 出错后先等一会儿再用同一个 Agent 重试，最多 `max_retries` 次。第一次等 30 秒，之后每次翻倍，最长 10 分钟。等待期间 Run 仍占着执行位；暂停、终止或停止 Master 会马上结束等待。出错重试和返工分开计数，`max_retries` 对两者各自生效。
 - 同一个 Agent 的重试用完后，按 `on_agent_error` 处理：
-  - `switch_agent`（默认）：从 `agents.yaml` 里挑一个这个 Task 还没用过、已启用的 Agent 接着做，需求评估阶段只挑支持只读的。先挑档次（`tier`）不低于当前 Agent 的，同档次里挑成本（`cost`）低的，再一样就按文件里的顺序。换上的 Agent 同样有 `max_retries` 次重试。没有可换的 Agent 时，Run 结束、标为失败。
+  - `switch_agent`（默认）：从 `agents.yaml` 里挑一个这个 Task 还没用过、已启用的 Agent 接着做，需求评估阶段和拆分任务（见下面的「拆分任务」）只挑支持只读的。先挑档次（`tier`）不低于当前 Agent 的，同档次里挑成本（`cost`）低的，再一样就按文件里的顺序。换上的 Agent 同样有 `max_retries` 次重试。没有可换的 Agent 时，Run 结束、标为失败。
   - `retry`：不换 Agent，重试用完后 Run 结束、标为失败。
   - `human`：重试用完后 Run 卡住，等人重试（可以换 Agent）或终止。没人在场时 Run 会一直停在那里，加载模板时会提示改成 `switch_agent`。
 - Run 因此失败时，`error` 里写明最后是哪个 Agent 出了什么错、试过哪些 Agent。工作目录和分支保留，Master 接着做别的；issue 按 `max_run_attempts` 自动重做（见上面的「Run 失败后自动重做」），重做时这个错误会交给新 Run 的 Agent。
-- Agent 不可用（`agents.yaml` 里改了名、删掉、设了 `enabled: false` 或校验失败被停用，没有对应的 Adapter，或者需求评估阶段它的 CLI 不支持只读）时，Agent 根本没法启动，所以不重试、不消耗重试次数，直接按 `on_agent_error` 处理：
-  - `switch_agent`（默认）：按上面同样的规则换一个可用的 Agent 接着做，需求评估阶段只换到支持只读的；事件列表里记一条 `task.agent_switched`（数据里 `reason` 为 `unavailable`）。原来的 Agent 已不在 `agents.yaml` 里时，不看档次，直接挑成本低的。没有可换的 Agent 时，Run 结束、标为失败。
+- Agent 不可用（`agents.yaml` 里改了名、删掉、设了 `enabled: false` 或校验失败被停用，没有对应的 Adapter，或者需求评估阶段、拆分任务时它的 CLI 不支持只读）时，Agent 根本没法启动，所以不重试、不消耗重试次数，直接按 `on_agent_error` 处理：
+  - `switch_agent`（默认）：按上面同样的规则换一个可用的 Agent 接着做，需求评估阶段和拆分任务只换到支持只读的；事件列表里记一条 `task.agent_switched`（数据里 `reason` 为 `unavailable`）。原来的 Agent 已不在 `agents.yaml` 里时，不看档次，直接挑成本低的。没有可换的 Agent 时，Run 结束、标为失败。
   - `retry`：用同一个 Agent 重试也不会成功，Run 直接结束、标为失败。
   - `human`：Run 卡住（Agent 不可用），等人确认 Agent 可用或换一个 Agent 后重试。
   - Run 因此失败时，`error` 里写明是哪个 Task、哪个 Agent、为什么不可用，以及按哪种 `on_agent_error` 结束；还没开始执行，工作目录不回滚，和分支一起保留。issue 同样按 `max_run_attempts` 自动重做。
@@ -250,6 +250,27 @@ defaults:
   - 错误文字里的重置时间按这个顺序找：Claude 老格式 `limit reached|<epoch>`、ISO 8601 时间、reset 或 retry 后面不远处 10 位的 epoch 秒数（13 位的毫秒数也行）。找不到、已经过去或在 31 天以后的，当作没给重置时间。
 
 数据目录里已经装好的 `workflows/self-dev.yaml` 不会自动更新。旧版本写的是 `on_agent_error: human`：出错时会先自动重试，重试用完后才卡住等人，加载时也会提示。想让它出错时也不等人，就手动改成 `switch_agent`。
+
+## 拆分任务
+
+编码这类 `kind: agent` 阶段默认是 `planning: single`：整个阶段是一个 Task，由一个 Agent 一次做完、一次检查、一次提交。需求大了，容易超时，或者返工到 `max_retries` 用完。写成 `planning: llm` 后，阶段先拆分、再一步一步做：
+
+```yaml
+  - id: implement
+    name: 编码
+    kind: agent
+    agent: claude-coder
+    planning: llm        # 先由这个 Agent 以只读方式把需求拆成几步，再一步一步做
+    inputs: [assessment]
+```
+
+- 每一轮阶段开始时，先以只读方式运行阶段的 Agent 拆分任务，Run 详情页里是一个叫「拆分任务」的 Task。它读到目标、阶段的 `instructions`、`inputs`（比如 `assessment`）和上一轮被打回的原因，按依赖顺序拆成 1 到 8 步，每一步有标题和说明；需求本来就小时只给一步。拆分不改文件、不运行检查命令、不提交；它留下的改动会被丢掉（记一条 `plan.changes_discarded` 事件）。拆分的结果列在这次执行的检查里。
+- 拆好后，Master 按顺序为每一步建一个 Task，记一条 `stage.planned` 事件，数据里有阶段（`stageId`）、轮次（`round`）、拆分任务的 Task（`taskId`）和各步的标题（`tasks`）。然后一步一步执行，每一步都由阶段的 Agent 做（拆分换过 Agent 也一样）：提示词里有目标、阶段的 `instructions`、这一步的说明和整个计划（哪些已经完成，哪些留给后面的步骤）。做完后照常运行检查命令，通过后单独提交，提交信息里写着「第 2/3 步：标题」；没通过就在这一步里返工，`max_retries` 对每一步各自计算。
+- 拆分出错（CLI 报错、超时）或者输出不符合格式（没有 JSON、步数不在 1 到 8 之间、缺标题或说明）时，按 `on_agent_error` 处理（见上面的「Agent 出错时」），一步也不会建；格式的问题会交给下一次拆分。
+- 拆分要以只读方式运行，所以阶段的 Agent 要用支持只读的 CLI（claude-code），否则加载模板时报错、模板被停用。`planning: llm` 只能用在 `kind: agent` 阶段，写在评审、需求评估、命令、合并、占位阶段上同样报错。
+- 评审打回、审批驳回、命令阶段失败或合并冲突回退到这个阶段时，新一轮重新拆分；打回的原因既交给拆分，也交给每一步。
+- 拆分进行到一半被暂停、Master 重启或崩溃时，恢复后重新拆分。各步的 Task 和拆分的结果在同一个事务里记下，不会重复，也不会只建一半。
+- 默认的 `self-dev.yaml` 仍是 `planning: single`。带 `planning: llm` 的完整模板见 [`docs/examples/workflows/strict.yaml`](examples/workflows/strict.yaml) 的编码阶段。
 
 ## 评审阶段不改代码
 

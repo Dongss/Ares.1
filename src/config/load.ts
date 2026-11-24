@@ -447,11 +447,12 @@ export function validateTemplate(
         }),
       );
     }
-    if (s.planning === 'llm') {
+    if (s.planning === 'llm' && s.kind !== 'agent') {
+      // Only work that is checked and committed is worth splitting into steps.
       errors.push(
         where({
-          zh: 'planning: llm（LLM 拆任务）尚未实现，请改用 single',
-          en: 'planning: llm (an LLM splitting the task) is not implemented yet, use single',
+          zh: `planning: llm（拆分任务）只能用在 agent（编码）阶段，${s.kind} 阶段不能用`,
+          en: `planning: llm (splitting the stage into tasks) only applies to agent stages, not to a ${s.kind} stage`,
         }),
       );
     }
@@ -528,6 +529,14 @@ export function validateTemplate(
         where({
           zh: `assess（需求评估）阶段要以只读方式运行，Agent ${s.agent} 的 CLI ${agent.cli} 不支持，请换用 ${readOnlyClis.join('、') || '支持只读的 CLI'} 的 Agent`,
           en: `an assess stage runs read-only, which the CLI ${agent.cli} of agent ${s.agent} does not support; use an agent of ${readOnlyClis.join(', ') || 'a CLI that supports read-only'}`,
+        }),
+      );
+    }
+    if (s.kind === 'agent' && s.planning === 'llm' && !readOnlyClis.includes(agent.cli)) {
+      errors.push(
+        where({
+          zh: `planning: llm 先以只读方式运行阶段的 Agent 来拆分任务，Agent ${s.agent} 的 CLI ${agent.cli} 不支持，请换用 ${readOnlyClis.join('、') || '支持只读的 CLI'} 的 Agent`,
+          en: `planning: llm first runs the stage's agent read-only to split the stage into tasks, which the CLI ${agent.cli} of agent ${s.agent} does not support; use an agent of ${readOnlyClis.join(', ') || 'a CLI that supports read-only'}`,
         }),
       );
     }

@@ -190,4 +190,8 @@ export const MIGRATIONS: readonly string[] = [
   `
   ALTER TABLE scouts ADD COLUMN gaps TEXT;
   `,
+  // v8: what a task is: work (executed, checked and committed) or a stage's plan (planning: llm).
+  `
+  ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'work';
+  `,
 ];
