@@ -405,10 +405,18 @@ function previousPlanSection(previous: PreviousPlan | undefined): string {
       return [head, s.instructions?.trim(), result].filter(Boolean).join('\n\n');
     })
     .join('\n\n');
+  // A step that did not pass may have been left uncommitted or rolled back (a failed command
+  // stage, say), so the plan must not assume its changes are there.
+  const failed = previous.steps.some((s) => !s.passed)
+    ? t({
+        zh: '未通过的步骤的改动不一定还在工作目录里：可能没有提交，也可能已经回滚，要以当前代码为准。',
+        en: ' The changes of steps that did not pass may not be in the working directory: they may be uncommitted or rolled back, so go by the current code.',
+      })
+    : '';
   return t({
     zh: `## 上一轮的计划（第 ${previous.round} 轮）
 
-这个阶段上一轮的计划共 ${n} 步，下面是每一步的说明、是否通过，以及做完后写的 summary（「结果」）。通过的步骤都已经提交，它们的改动都还在工作目录里：这一轮在这些代码的基础上修改，不是从头再做。
+这个阶段上一轮的计划共 ${n} 步，下面是每一步的说明、是否通过，以及做完后写的 summary（「结果」）。通过的步骤都已经提交，它们的改动都还在工作目录里：这一轮在这些代码的基础上修改，不是从头再做。${failed}
 
 ${steps}
 
@@ -417,7 +425,7 @@ ${steps}
 `,
     en: `## The previous round's plan (round ${previous.round})
 
-This stage's previous round had a plan of ${n === 1 ? 'one step' : `${n} steps`}. Below are each step's instructions, whether it passed, and the summary written when it was done ("Result"). The steps that passed are committed, and their changes are all still in the working directory: this round changes that code; it does not start over.
+This stage's previous round had a plan of ${n === 1 ? 'one step' : `${n} steps`}. Below are each step's instructions, whether it passed, and the summary written when it was done ("Result"). The steps that passed are committed, and their changes are all still in the working directory: this round changes that code; it does not start over.${failed}
 
 ${steps}
 

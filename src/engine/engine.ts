@@ -1925,15 +1925,21 @@ export class Engine {
     const steps = planSteps(tasks);
     const step = steps.get(task.id);
     if (!step) return undefined;
+    // Each step's position comes from planSteps alone, so the order and which steps come before
+    // this one cannot drift from the rule there.
+    const planned = tasks
+      .flatMap((t) => {
+        const s = steps.get(t.id);
+        return s ? [{ task: t, index: s.index }] : [];
+      })
+      .sort((a, b) => a.index - b.index);
     return {
       index: step.index,
       total: step.total,
-      steps: tasks
-        .filter((t) => steps.has(t.id))
-        .map((t, i) => ({
-          title: t.title,
-          summary: i + 1 < step.index ? this.passedSummary(t) : null,
-        })),
+      steps: planned.map(({ task: t, index }) => ({
+        title: t.title,
+        summary: index < step.index ? this.passedSummary(t) : null,
+      })),
       instructions: task.instructions,
     };
   }

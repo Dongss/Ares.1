@@ -366,6 +366,10 @@ describe('planning prompts', () => {
       '### 第 1 步：加接口（已通过）\n\n在 src/api 加 GET /api/x\n\n结果：加了接口。\n\n### 第 2 步：补文档（未通过）\n\n写 docs\n\n这一轮只列出这次需要做的修改步骤',
     );
     expect(prompt).toContain('已经通过、和打回原因无关的步骤不要重做');
+    // A step did not pass: its changes may not be there, so the plan goes by the code.
+    expect(prompt).toContain(
+      '这一轮在这些代码的基础上修改，不是从头再做。未通过的步骤的改动不一定还在工作目录里：可能没有提交，也可能已经回滚，要以当前代码为准。\n\n### 第 1 步',
+    );
     // After why the round was sent back.
     expect(prompt.indexOf('## 上一轮的计划')).toBeGreaterThan(
       prompt.indexOf('## 上一轮被打回的原因'),
@@ -377,6 +381,11 @@ describe('planning prompts', () => {
     });
     expect(single).toContain('## 上一轮的计划（第 2 轮）\n\n这个阶段上一轮的计划共 1 步');
     expect(single).toContain('### 第 1 步：编码（已通过）\n\n结果：做完了。\n\n这一轮只列出');
+    // Every step passed: the text stays as it was.
+    expect(single).toContain(
+      '通过的步骤都已经提交，它们的改动都还在工作目录里：这一轮在这些代码的基础上修改，不是从头再做。\n\n### 第 1 步',
+    );
+    expect(single).not.toContain('未通过的步骤的改动');
     // The first round has none.
     expect(planPrompt(planned(), null)).not.toContain('## 上一轮的计划');
   });
@@ -638,7 +647,12 @@ describe('prompts in English', () => {
       '### Step 1: Add the API (passed)\n\nAdd GET /api/x\n\nResult: Added the endpoint.\n\n### Step 2: Document it (did not pass)\n\nWrite docs\n\nIn this round, list only the steps of the changes needed now',
     );
     expect(prompts.replan).toContain('Do not redo the steps that passed');
+    expect(prompts.replan).toContain(
+      'it does not start over. The changes of steps that did not pass may not be in the working directory: they may be uncommitted or rolled back, so go by the current code.\n\n### Step 1',
+    );
     expect(prompts.replanSingle).toContain('had a plan of one step.');
+    expect(prompts.replanSingle).toContain('it does not start over.\n\n### Step 1');
+    expect(prompts.replanSingle).not.toContain('did not pass may not be');
     expect(prompts.step).toContain('## This step: step 2 of 3, "Wire up the store"');
     expect(prompts.step).toContain(
       '1. Add the API (done)\n   Result: Added GET /api/x,\n   validated with zod.\n2. Wire up the store ← this step\n3. Document it',
