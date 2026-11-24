@@ -2,7 +2,7 @@
 // dashboard's browser notifications. Pure; the dashboard imports this file.
 
 import { SCOUT_FAILURE_NOTIFY_AFTER } from '../config/flow.js';
-import { type Lang, t } from '../i18n.js';
+import { join, type Lang, t } from '../i18n.js';
 import type { BlockKind, EventRow } from '../store/types.js';
 
 /**
@@ -140,11 +140,11 @@ export const NOTICE_KINDS: Record<NoticeKind, { label: string; when: string }> =
   pull: {
     zh: {
       label: '没能拉取 GitHub 上的新提交',
-      when: 'GitHub 上的目标分支有本地没有的提交，但 Master 没能把本地目标分支快进过去，标题后面写着仓库名：两边已经分叉（各有对方没有的提交），要你手动合并，合并前不再推送；或者目标分支检出的工作目录里有未提交的改动。同一次分叉、同一种原因只通知一次',
+      when: 'GitHub 上的目标分支有本地没有的提交，但 Master 没能把本地目标分支更新过去，标题后面写着仓库名：两边已经分叉（各有对方没有的提交），Master 自动合并时有冲突或者合并后检查没通过，要你手动合并，合并前不再推送；或者检查要用的程序找不到；或者目标分支检出的工作目录里有未提交的改动。同一次分叉、同一种原因只通知一次',
     },
     en: {
       label: 'Could not pull new commits from GitHub',
-      when: 'The target branch on GitHub has commits the local one lacks, but the Master could not fast-forward the local branch to them, with the repo after the title: the two have diverged (each has commits the other lacks) and need you to merge them, with nothing pushed until then; or the target branch is checked out with uncommitted changes. Each divergence and each reason is notified once',
+      when: "The target branch on GitHub has commits the local one lacks, but the Master could not bring the local branch up to them, with the repo after the title: the two have diverged (each has commits the other lacks) and the Master's merge of the two conflicts or fails the checks, so you need to merge them, with nothing pushed until then; or a program the checks start is missing; or the target branch is checked out with uncommitted changes. Each divergence and each reason is notified once",
     },
   },
   upgrade: {
@@ -183,6 +183,71 @@ export const firstLine = (text: string, max: number) => {
 
 /** A non-empty string from event data, or null. */
 const text = (v: unknown): string | null => (typeof v === 'string' && v !== '' ? v : null);
+
+/** How many of the conflicted files a text about a divergence names. */
+const FILES_SHOWN = 5;
+
+/**
+ * Why the Master could not merge GitHub's commits into a diverged target branch by itself, from
+ * the data of a github.diverged event: `conflict` (the merge conflicted in `files`), `failed`
+ * (a check failed on the merge) or `environment` (a check could not find a program it starts,
+ * tried again each round), with a clause that says so. null for an event without any, as
+ * recorded before the Master merged by itself. Shared by the notification and the dashboard.
+ */
+export function divergedCause(
+  data: Record<string, unknown>,
+): { kind: 'conflict' | 'failed' | 'environment'; text: string } | null {
+  if (data.conflict === true) {
+    const all = Array.isArray(data.files) ? data.files.filter((f) => typeof f === 'string') : [];
+    const shown = join(all.slice(0, FILES_SHOWN));
+    const more = all.length - FILES_SHOWN;
+    const files =
+      more > 0
+        ? t({
+            zh: `${shown} 等 ${all.length} 个文件`,
+            en: `${shown} and ${more} more file${more === 1 ? '' : 's'}`,
+          })
+        : shown;
+    return {
+      kind: 'conflict',
+      text: files
+        ? t({ zh: `自动合并有冲突（${files}）`, en: `the Master's merge conflicts in ${files}` })
+        : t({ zh: '自动合并有冲突', en: "the Master's merge conflicts" }),
+    };
+  }
+  const failed = data.failed;
+  if (typeof failed !== 'object' || failed === null) return null;
+  const f = failed as Record<string, unknown>;
+  const command = text(f.command) ?? '?';
+  const setup = f.kind === 'setup';
+  const what = setup
+    ? t({ zh: `准备命令 \`${command}\``, en: `setup command \`${command}\`` })
+    : t({ zh: `检查命令 \`${command}\``, en: `verify command \`${command}\`` });
+  const missing = text(f.missing);
+  if (missing) {
+    return {
+      kind: 'environment',
+      text: t({
+        zh: `自动合并后要运行的${what} 在运行环境里找不到 ${missing}`,
+        en: `the ${what} to run on the Master's merge cannot find ${missing}`,
+      }),
+    };
+  }
+  const why =
+    f.timedOut === true
+      ? t({ zh: '超时', en: 'timed out' })
+      : typeof f.exitCode === 'number'
+        ? t({ zh: `退出码 ${f.exitCode}`, en: `exit code ${f.exitCode}` })
+        : null;
+  const at = why ? t({ zh: `（${why}）`, en: ` (${why})` }) : '';
+  return {
+    kind: 'failed',
+    text: t({
+      zh: `自动合并后${what} 没通过${at}`,
+      en: `the ${what} failed on the Master's merge${at}`,
+    }),
+  };
+}
 
 /** The target branch could not take GitHub's new commits: titled with the repo. */
 function pullNotice(event: EventRow, body: string): Notice {
@@ -268,14 +333,42 @@ export function noticeFor(event: EventRow, goal: string | undefined): Notice | n
               en: ` (local ${local.slice(0, 7)}, GitHub ${remote.slice(0, 7)})`,
             })
           : '';
+      const until = t({
+        zh: '在此之前 Master 不推送，已完成 Run 的 issue 保持打开',
+        en: 'until then the Master pushes nothing and the issues of completed Runs stay open',
+      });
+      const cause = divergedCause(event.data);
+      if (cause?.kind === 'environment') {
+        return pullNotice(
+          event,
+          t({
+            zh: `${branch} 和 GitHub 上的已经分叉${at}，${cause.text}；装好后下一轮检查会自动再合并，${until}`,
+            en: `${branch} has diverged from GitHub's${at}, and ${cause.text}. Once it is installed, the next check merges by itself; ${until}`,
+          }),
+        );
+      }
+      if (cause) {
+        return pullNotice(
+          event,
+          t({
+            zh: `${branch} 和 GitHub 上的已经分叉${at}，${cause.text}，要你手动合并后推送；${until}`,
+            en: `${branch} has diverged from GitHub's${at}, and ${cause.text}. Merge the two by hand and push; ${until}`,
+          }),
+        );
+      }
       return pullNotice(
         event,
         t({
-          zh: `${branch} 和 GitHub 上的已经分叉${at}，要你手动合并后推送；在此之前 Master 不推送，已完成 Run 的 issue 保持打开`,
+          zh: `${branch} 和 GitHub 上的已经分叉${at}，要你手动合并后推送；${until}`,
           en: `${branch} has diverged from GitHub's${at}; merge the two by hand and push. Until then the Master pushes nothing and the issues of completed Runs stay open`,
         }),
       );
     }
+    case 'github.pulled':
+    case 'github.merged_remote':
+      // GitHub's new commits were taken in by themselves (the merge passed the repo's checks):
+      // nothing for a human to do.
+      return null;
     case 'github.pull_blocked': {
       const branch = text(event.data.branch) ?? t({ zh: '目标分支', en: 'The target branch' });
       const worktree = text(event.data.worktree);

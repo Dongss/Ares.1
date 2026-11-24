@@ -1,4 +1,5 @@
 import { join, t } from '../../../src/i18n.js';
+import { divergedCause } from '../../../src/notify/notice.js';
 import type { EventRow } from '../../../src/store/types.js';
 import { formatBytes, formatTime, shortSha, type Tone } from './format.js';
 import { href } from './router.js';
@@ -238,9 +239,38 @@ export function globalEventText(event: GlobalEvent, now = new Date()): string | 
               en: ` (local ${shortSha(local)}, GitHub ${shortSha(remote)})`,
             })
           : '';
+      const cause = divergedCause(d);
+      if (cause?.kind === 'environment') {
+        return t({
+          zh: `${branchOf(event)} 和 GitHub 上的已经分叉${at}，${cause.text}；装好后下一轮检查会自动再合并，在此之前不推送，已完成 Run 的 issue 保持打开`,
+          en: `Diverged from GitHub: ${branchOf(event)}${at} and the one on GitHub each have commits the other lacks, and ${cause.text}. Once it is installed, the next check merges by itself; until then nothing is pushed and the issues of completed Runs stay open`,
+        });
+      }
+      if (cause) {
+        return t({
+          zh: `${branchOf(event)} 和 GitHub 上的已经分叉${at}，${cause.text}，要你手动合并；在此之前不推送，已完成 Run 的 issue 保持打开`,
+          en: `Diverged from GitHub: ${branchOf(event)}${at} and the one on GitHub each have commits the other lacks, and ${cause.text}. Merge them by hand; until then nothing is pushed and the issues of completed Runs stay open`,
+        });
+      }
       return t({
         zh: `${branchOf(event)} 和 GitHub 上的已经分叉${at}，两边各有对方没有的提交，不会自动合并，要你手动合并；在此之前不推送，已完成 Run 的 issue 保持打开`,
         en: `Diverged from GitHub: ${branchOf(event)}${at} and the one on GitHub each have commits the other lacks, and they are not merged by themselves. Merge them by hand; until then nothing is pushed and the issues of completed Runs stay open`,
+      });
+    }
+    case 'github.merged_remote': {
+      const merge = str(d.merge);
+      const local = str(d.local);
+      const remote = str(d.remote);
+      const at =
+        merge && local && remote
+          ? t({
+              zh: `（本地 ${shortSha(local)} 和 GitHub ${shortSha(remote)} → ${shortSha(merge)}）`,
+              en: ` (local ${shortSha(local)} and GitHub ${shortSha(remote)} → ${shortSha(merge)})`,
+            })
+          : '';
+      return t({
+        zh: `${branchOf(event)} 和 GitHub 上的分叉了，Master 自己合并了 GitHub 上的新提交，仓库的检查通过后把分支快进到合并提交${at}，随后推送到 GitHub`,
+        en: `${branchOf(event)} had diverged from GitHub: the Master merged the new commits from GitHub, and with the repo's checks passing, fast-forwarded the branch to the merge${at}, to be pushed to GitHub`,
       });
     }
     case 'github.pull_blocked': {

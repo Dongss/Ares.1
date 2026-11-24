@@ -46,7 +46,7 @@ Agent CLI 的原始输出（stream-json）带着工具调用的完整结果：�
 
 ### 全局事件
 
-Master 把不属于任何 Run 的事记成全局事件（事件的 Run 为空）：上一个 Master 异常退出（`master.restarted`）、清理原始日志（`logs.pruned`）、恢复数据库备份（`store.backup_restored`）、node 不见了（`master.node_missing`）、打开或关闭工作开关（`master.working`）、配置重新加载（`config.reloaded`、`config.reload_failed`）、访问 GitHub 出错（`github.error`，同一串连续失败里同一个错误只记一次，见「通知」）、webhook 通知发送失败（`notify.webhook_failed`）、系统通知发送失败（`notify.system_failed`）、推送目标分支（`github.pushed`）、从 GitHub 拉取目标分支（`github.pulled`、`github.diverged`、`github.pull_blocked`，见「拉取 GitHub 上的新提交」）、自动采纳提案（`issue.auto_accepted`）、侦察（`scout.started`、`scout.completed`、`scout.failed`、`scout.rate_limited`）和升级（`upgrade.started`、`upgrade.done`、`upgrade.failed`）。这篇文档里说「事件列表里记一条」这些事件的地方，都指这里。
+Master 把不属于任何 Run 的事记成全局事件（事件的 Run 为空）：上一个 Master 异常退出（`master.restarted`）、清理原始日志（`logs.pruned`）、恢复数据库备份（`store.backup_restored`）、node 不见了（`master.node_missing`）、打开或关闭工作开关（`master.working`）、配置重新加载（`config.reloaded`、`config.reload_failed`）、访问 GitHub 出错（`github.error`，同一串连续失败里同一个错误只记一次，见「通知」）、webhook 通知发送失败（`notify.webhook_failed`）、系统通知发送失败（`notify.system_failed`）、推送目标分支（`github.pushed`）、从 GitHub 拉取目标分支（`github.pulled`、`github.merged_remote`、`github.diverged`、`github.pull_blocked`，见「拉取 GitHub 上的新提交」）、自动采纳提案（`issue.auto_accepted`）、侦察（`scout.started`、`scout.completed`、`scout.failed`、`scout.rate_limited`）和升级（`upgrade.started`、`upgrade.done`、`upgrade.failed`）。这篇文档里说「事件列表里记一条」这些事件的地方，都指这里。
 
 Master 大部分时间没人看着，人回来时在看板的「事件」页查这段时间发生过什么：
 
@@ -143,11 +143,28 @@ stages:
 - 两边一样，或者本地领先（有合并了、还没推送的提交）：什么都不改，照常推送。
 - 本地落后（本地目标分支是 GitHub 上那个提交的祖先）：把本地目标分支快进过去，事件列表里记一条 `github.pulled`（数据里有 `repo`、`branch`，快进前的提交 `from` 和快进后的 `to`），不通知。目标分支没在任何工作目录里检出时直接移动分支（比较并交换：分支在这期间被移动过就不动它，按一次普通的出错记录，下一轮再试）；检出在干净的工作目录里时在那里 `git merge --ff-only`，工作目录里的文件跟着更新。GitHub 上已经有这些提交，不会再推送一次。已经在执行的 Run 不受影响，它们合并时照常先合并目标分支的最新代码，有冲突走「合并冲突」的流程。
 - 本地落后，但目标分支检出在有未提交改动（只看已跟踪的文件）的工作目录里：不快进，事件列表里记一条 `github.pull_blocked`（数据里有 `repo`、`branch`、原因 `reason`（目前只有 `dirty`）、检出它的工作目录 `worktree`，以及 `git status --porcelain` 列出的改动 `status`），并通知「没能拉取 GitHub 上的新提交」。同一种原因在连续受阻的几轮里只记一次、只通知一次；快进成功、或者有一轮不再受阻后重新开始。提交或丢弃这些改动后，下一轮检查自动拉取。这期间也不推送：GitHub 上已经有本地的提交，推送只会因为不能快进被拒绝。
-- 两边分叉（各有对方没有的提交）：不自动合并，本地目标分支不变，事件列表里记一条 `github.diverged`（数据里有 `repo`、`branch`，两边的提交 `local`、`remote`），并通知一次「没能拉取 GitHub 上的新提交」，告诉你要手动合并。分叉期间不推送（推送每轮都会被拒绝），所以也不会每轮报推送失败。同一对提交只记一次；分叉期间本地或 GitHub 上又有了新提交（比如又有 Run 合并了），再记一条带 `repeated: true` 的 `github.diverged`，不再通知。分叉消失后，下一轮照常推送；之后再分叉会重新记录、重新通知。
-  - 分叉期间完成的 Run，代码合并进了本地目标分支，但还没推到 GitHub 上，所以它的 issue 保持打开，标签不变。你手动合并后（或者分叉因为别的原因消失后），下一轮检查推送上去，issue 随之关闭，评论里写明已推送到 GitHub。
-  - 合并的做法：在登记的仓库里 `git fetch`，再 `git merge origin/<目标分支>`，解决冲突后提交。推送可以自己做，也可以留给 Master 下一轮做。
+- 两边分叉（各有对方没有的提交，比如有人在 GitHub 上直接提交，同时 Master 合并了 Run）：Master 自己把 GitHub 上的提交合并进来，不建 Run，详见下面的「分叉时自动合并」。合并成功时本地目标分支快进到合并提交，同一轮随后推送到 GitHub；合并有冲突或者合并后检查没通过时，本地目标分支不变、不推送，等你手动合并。
 
-有 Run 正在执行合并阶段时，这个仓库这一轮不拉取，免得和合并抢目标分支；等审批合并的 Run 不算。拉取失败（网络不通、gh 没登录、GitHub 上没有这个分支等）和其他访问 GitHub 的失败一样记 `github.error`，按「一串连续失败」去重（见「通知」），这一轮的其他步骤照常进行。分叉和受阻的状态只记在 Master 的内存里：Master 重启后第一轮重新判断，还在分叉或受阻时会再记一条、再通知一次。
+#### 分叉时自动合并
+
+1. 在系统临时目录里建一个临时工作目录（`ares1-merge-*`，detached HEAD，不建分支），以本地目标分支的提交为起点，`git merge --no-ff` 合并拉取到的 GitHub 提交。合并提交的两个父提交依次是原来的本地提交和 GitHub 上的提交，提交信息按 Master 的语言写「合并 GitHub 上 <目标分支> 的新提交」（英文 `Merge new commits from <branch> on GitHub`），和 Master 发到 GitHub 的其他文字一样把用户主目录换成 `~`。
+2. 没有冲突时，在临时工作目录里依次运行仓库登记的准备命令和检查命令，和 Run 的检查一样：环境不带 GitHub 凭据（同 Agent），每条命令的超时是 `defaults.command_timeout_minutes`，有一条失败就停。输出写在数据目录的 `data/logs/github-merge-<仓库名>.log`，每次合并重新写。没有登记任何命令时直接算通过。
+3. 检查全部通过后，再看一次有没有 Run 开始合并这个仓库：有就这一轮不动，下一轮直接用这个已经检查过的合并提交，不再跑一遍检查。没有就像「本地落后」一样把本地目标分支快进到合并提交（比较并交换；检出在有未提交改动的工作目录里时记 `github.pull_blocked`，改动清掉后下一轮接着快进，同样不重跑检查），事件列表里记一条 `github.merged_remote`（数据里有 `repo`、`branch`，两边的提交 `local`、`remote` 和合并提交 `merge`），不通知。同一轮随后照常推送，记 `github.pushed`；之后已完成 Run 的 issue 照常关闭。
+4. 不管结果如何，临时工作目录都会删掉；合并提交本身留在仓库里，供快进用。Master 在检查途中被强行结束、没来得及删的，下次启动时删掉（登记的仓库里、系统临时目录下名字以 `ares1-merge-` 开头的工作目录）。
+
+没能自动合并时，本地目标分支不变，事件列表里记一条 `github.diverged`（数据里有 `repo`、`branch`，两边的提交 `local`、`remote`），并通知一次「没能拉取 GitHub 上的新提交」，正文写明原因：
+
+- 合并有冲突：中止合并，不运行任何命令，数据里有 `conflict: true` 和有冲突的文件 `files`。通知要你手动合并。
+- 合并后有命令没通过：数据里有 `failed`（命令 `command`、种类 `kind`（`setup` 准备命令或 `verify` 检查命令）、退出码 `exitCode`、是否超时 `timedOut`、输出末尾 `output`）和日志路径 `log`。通知要你手动处理后合并。
+- 有条命令要启动的程序在运行环境里找不到（比如没有 `npm`，和 Run 的「运行环境缺少命令」一样判断，能事先看出来的在合并前就判断，不建临时工作目录）：数据里的 `failed` 有命令、种类和找不到的程序 `missing`。这不怪代码，所以这一对提交之后每轮都再试；同一对只记一次。通知说装好后下一轮会自动再合并。
+- Master 运行的 node 不见了（见「换 Node 版本时」）：这一轮不合并，也不记录，等 node 回来后下一轮再试。Master 停止时正在运行的命令会被中止，下次启动后再试。
+
+冲突和命令失败的那一对提交（本地和 GitHub 上各自的提交）不再重试，免得每轮都跑一遍检查命令。分叉期间不推送（推送每轮都会被拒绝），所以也不会每轮报推送失败。分叉期间本地或 GitHub 上又有了新提交（比如又有 Run 合并了），就是新的一对，重新尝试合并；还是失败就再记一条带 `repeated: true` 的 `github.diverged`，不再通知（之前只是找不到程序、这次是冲突或命令失败时除外，那是新情况，会通知）。分叉消失后（自动合并成功，或你手动合并了），下一轮照常推送；之后再分叉会重新记录、重新通知。
+
+- 分叉期间完成的 Run，代码合并进了本地目标分支，但还没推到 GitHub 上，所以它的 issue 保持打开，标签不变。分叉消失后，下一轮检查推送上去，issue 随之关闭，评论里写明已推送到 GitHub。
+- 手动合并的做法：在登记的仓库里 `git fetch`，再 `git merge origin/<目标分支>`，解决冲突后提交。推送可以自己做，也可以留给 Master 下一轮做。
+
+有 Run 正在执行合并阶段时，这个仓库这一轮不拉取，也不自动合并，免得和合并抢目标分支；等审批合并的 Run 不算。拉取失败（网络不通、gh 没登录、GitHub 上没有这个分支等）和其他访问 GitHub 的失败一样记 `github.error`，按「一串连续失败」去重（见「通知」），这一轮的其他步骤照常进行；git 连合并都开始不了（不是冲突）时也这样记，下一轮再试。自动合并要跑检查命令时，这一轮后面的步骤（领取 issue、同步 issue 等）等它跑完再做，每对提交最多跑一次。分叉和受阻的状态只记在 Master 的内存里：Master 重启后第一轮重新判断，还在分叉时会再尝试一次自动合并，失败会再记一条、再通知一次。
 
 ### Run 期间改了 issue
 
@@ -219,7 +236,7 @@ github:
 
 ### Agent 拿不到 GitHub 凭据
 
-只把陌生人写的内容挡在提示词外面还不够：Agent 能执行命令，要是继承了本机 gh 的登录，它自己跑一下 `gh issue view 12 --comments`，陌生人的评论就又进来了；它还能以本机登录的所有 GitHub 账号读写这些账号能访问的所有仓库。Master 读 issue、发评论、推送都是自己做的，Agent 用不着 GitHub 凭据，所以 Agent（编码、评审、需求评估、侦察）和准备命令、检查命令（包括命令阶段的命令）都在去掉了 GitHub 凭据的环境里运行：
+只把陌生人写的内容挡在提示词外面还不够：Agent 能执行命令，要是继承了本机 gh 的登录，它自己跑一下 `gh issue view 12 --comments`，陌生人的评论就又进来了；它还能以本机登录的所有 GitHub 账号读写这些账号能访问的所有仓库。Master 读 issue、发评论、推送都是自己做的，Agent 用不着 GitHub 凭据，所以 Agent（编码、评审、需求评估、侦察）和准备命令、检查命令（包括命令阶段的命令，以及分叉时 Master 自动合并后运行的命令）都在去掉了 GitHub 凭据的环境里运行：
 
 - 去掉 `GH_TOKEN`、`GITHUB_TOKEN`、`GH_ENTERPRISE_TOKEN`、`GITHUB_ENTERPRISE_TOKEN`，再把 `GH_TOKEN` 设成一个无效的值 `ares1-agent-no-github-access`。gh 优先用 `GH_TOKEN`，GitHub 会拒绝它，gh 也就不会退回去用存在配置文件或 macOS 钥匙串里的登录。
 - `GH_CONFIG_DIR` 指向数据目录下的空目录 `data/agent-gh-config/`，gh 在里面是未登录状态。每次启动 Agent、运行命令之前都会把它清空，Agent 往里面写的东西留不到下一次。
@@ -388,7 +405,7 @@ Agent 出错且重试、换 Agent 都用完，Agent 不可用且没有可换的 
 
 访问 GitHub 失败（读写 issue、推送目标分支、侦察时搜索 issue 等）时，事件列表里记一条 `github.error`（数据是 `{ message }`，错误信息），并通知「GitHub 访问失败」，正文是错误信息的第一行，点开是「需求」页。一轮轮询要对每个登记的仓库做好几步，每一步都可能失败，所以按「一串连续失败」去重：从第一次失败起，到有一轮轮询对 GitHub 的访问全部成功为止，同一个错误只记一条、只通知一次，哪怕几种错误轮流出现（比如两个仓库一个返回 404、一个返回 502）也是每种各一条，不会每轮都通知。有一轮访问全部成功后重新开始，之后同样的错误再出现会再记、再通知。错误信息里可能带每次都变的内容（比如请求 id），所以一串失败最多记 20 种不同的错误，超过后这串失败不再记新的 `github.error`。看板「需求」页上的「GitHub 调用失败」不去重，始终显示最近一次失败的时间和信息，有一轮访问全部成功后消失。
 
-目标分支和 GitHub 上的分叉了（`github.diverged`），或者因为检出的工作目录有未提交的改动没能快进（`github.pull_blocked`）时，通知「没能拉取 GitHub 上的新提交：<仓库名>」，正文说明是要你手动合并，还是要处理那些改动，点开是「需求」页。同一次分叉、同一种原因只通知一次，细节见「拉取 GitHub 上的新提交」。快进成功（`github.pulled`）不通知。
+目标分支和 GitHub 上的分叉了、Master 没能自动合并（`github.diverged`），或者因为检出的工作目录有未提交的改动没能快进（`github.pull_blocked`）时，通知「没能拉取 GitHub 上的新提交：<仓库名>」，正文说明原因和要你做什么：自动合并有冲突（列出冲突的文件）或者合并后哪条命令没通过，要你手动合并；检查要用的程序找不到，装好后会自动再合并；或者要处理那些改动。点开是「需求」页。同一次分叉、同一种原因只通知一次，细节见「拉取 GitHub 上的新提交」。快进成功（`github.pulled`）和分叉后自动合并成功（`github.merged_remote`）不通知。
 
 通知有三条通道，用同一套规则（`src/notify/notice.ts`）：
 

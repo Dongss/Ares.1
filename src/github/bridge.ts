@@ -1,5 +1,6 @@
-import { readdirSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { basename, dirname, join } from 'node:path';
 import { prepareAgentEnv } from '../adapters/process.js';
 import type { AgentAdapter, AgentExecution, AgentResult } from '../adapters/types.js';
 import type { GitHubRepoStatus, GitHubStatus } from '../api/types.js';
@@ -37,11 +38,18 @@ import { isMasterSource, type MasterOrigin } from '../upgrade/source.js';
 import { lastUpgradeFailure, type UpgradeFailure } from '../upgrade/upgrader.js';
 import { errorMessage, nowIso } from '../util.js';
 import {
+  type CommandResult,
+  environmentProblem,
+  firstMissingCommand,
+  runCommands,
+} from '../verify/commands.js';
+import {
   addDetachedWorktree,
   commitTime,
   dropWorktree,
   fastForwardBranch,
   isAncestor,
+  mergeOrAbort,
   pruneWorktrees,
   revParse,
   git as runGit,
@@ -166,6 +174,71 @@ function busyText(moving: number, redo: number): string | null {
   return t({ zh: `${runs}，另外${issues}`, en: `${runs}; ${issues}` });
 }
 
+/**
+ * Start of the names of the temporary worktrees, in the system's temp directory, where GitHub's
+ * new commits are merged into a diverged target branch and checked.
+ */
+const MERGE_DIR_PREFIX = 'ares1-merge-';
+
+/** Message of the commit that merges GitHub's new commits into the local target branch. */
+export function mergeRemoteMessage(branch: string): string {
+  return redactForGitHub(
+    t({
+      zh: `合并 GitHub 上 ${branch} 的新提交`,
+      en: `Merge new commits from ${branch} on GitHub`,
+    }),
+  );
+}
+
+/**
+ * The target branch and GitHub's, each with commits the other lacks, as last seen, and what came
+ * of merging the two.
+ */
+interface Divergence {
+  local: string;
+  remote: string;
+  /**
+   * What github.diverged has told since the two began to diverge, by `outcome`: 'failed' once a
+   * hand merge was asked for. Later records of what was told already do not notify again.
+   */
+  reported?: 'failed' | 'environment';
+  /**
+   * What came of merging this pair:
+   * - failed: the merge conflicted or a check failed on it, recorded; not tried again;
+   * - environment: a program the checks start is missing, recorded; tried again each round, so
+   *   that it goes on by itself once the program is installed.
+   * Undefined: not tried yet, or put off.
+   */
+  outcome?: 'failed' | 'environment';
+  /**
+   * The merge commit, checked, when fast-forwarding the target branch to it had to wait: the
+   * next round tries the fast-forward again without merging and checking once more.
+   */
+  merge?: string;
+}
+
+/** What merging GitHub's commits into the target branch came to (`mergeRemote`). */
+type RemoteMerge =
+  | { kind: 'merged'; merge: string }
+  /** Conflicts or failed checks; `data` goes into the github.diverged event. */
+  | { kind: 'failed'; data: Record<string, unknown> }
+  /** A program the checks start is missing; `data` as for failed. */
+  | { kind: 'environment'; data: Record<string, unknown> }
+  /** Not tried, or cut short, for no fault of the commits (node gone, the Master stopping). */
+  | { kind: 'later' };
+
+/** A check that failed on the merge, as the github.diverged event gives it. */
+function failedCheck(result: CommandResult, kind: 'setup' | 'verify', missing?: string) {
+  return {
+    command: result.command,
+    kind,
+    exitCode: result.exitCode,
+    timedOut: result.timedOut,
+    ...(missing ? { missing } : {}),
+    output: result.outputTail,
+  };
+}
+
 /** A scout in progress: its agent once started, and the whole scout including the cleanup. */
 interface ScoutEntry {
   scoutId: string;
@@ -192,6 +265,11 @@ export interface BridgeDeps {
    * Master's own source; null when it does not run from one (then no repo is).
    */
   masterOrigin?: MasterOrigin | null;
+  /**
+   * Whether the node the Master runs on is gone: the checks of a merge of GitHub's commits then
+   * wait, as they would fail for the environment, not for the code.
+   */
+  nodeMissing?: () => boolean;
 }
 
 /** Start of the current day in the Master's local time, as ISO. */
@@ -238,9 +316,12 @@ export class IssueBridge {
   private readonly pushed = new Map<string, string>();
   /**
    * Repos (by id) whose target branch and the one on GitHub each have commits the other lacks,
-   * as last seen. Nothing is pushed while it lasts; cleared once the divergence is gone.
+   * as last seen. Nothing is pushed while it lasts; cleared once the divergence is gone, merged
+   * by the Master (see syncTarget) or by a human.
    */
-  private readonly diverged = new Map<string, { local: string; remote: string }>();
+  private readonly diverged = new Map<string, Divergence>();
+  /** Aborted when the Master stops: ends the checks of a merge of GitHub's commits. */
+  private readonly stopped = new AbortController();
   /**
    * Why fast-forwarding the target branch to GitHub's was refused, per repo id, as recorded:
    * each reason once per streak, which ends with a round the pull is no longer refused in.
@@ -312,12 +393,14 @@ export class IssueBridge {
       }
     }
     await this.removeLeftoverScoutDirs();
+    await this.removeLeftoverMergeDirs();
     this.deps.store.bus.on('event', this.onEvent);
     if (opts.poll) this.schedulePoll(2_000);
   }
 
   async stop(): Promise<void> {
     this.stopping = true;
+    this.stopped.abort();
     this.deps.store.bus.off('event', this.onEvent);
     clearTimeout(this.pollTimer);
     clearTimeout(this.syncTimer);
@@ -359,6 +442,32 @@ export class IssueBridge {
     }
     // Git forgets the worktrees whose directory is gone.
     for (const repo of repos) await pruneWorktrees(repo);
+  }
+
+  /**
+   * Temporary worktrees of merges of GitHub's commits (`mergeRemote`) that a previous Master did
+   * not get to delete, having stopped in the middle of the checks: the registered repos'
+   * worktrees named like them in the system's temp directory.
+   */
+  private async removeLeftoverMergeDirs(): Promise<void> {
+    const tmp = tmpdir();
+    // git may give the path with the temp directory's symlinks resolved (macOS: /private/var).
+    const parents = new Set([tmp, realpathSync(tmp)]);
+    for (const repo of this.deps.store.listRepos()) {
+      let list: string;
+      try {
+        list = await runGit(repo.path, ['worktree', 'list', '--porcelain']);
+      } catch {
+        continue; // not a repo any more: nothing of ours in it
+      }
+      for (const line of list.split('\n')) {
+        if (!line.startsWith('worktree ')) continue;
+        const path = line.slice('worktree '.length);
+        if (basename(path).startsWith(MERGE_DIR_PREFIX) && parents.has(dirname(path))) {
+          await dropWorktree(repo.path, path);
+        }
+      }
+    }
   }
 
   private scoutRepo(scoutId: string): Repo | undefined {
@@ -669,8 +778,8 @@ export class IssueBridge {
 
   /**
    * Push the target branch to GitHub when it moved since the last push. Returns whether GitHub
-   * has it: false only while the two have diverged (see syncTarget), when nothing is pushed,
-   * since GitHub would refuse it every round.
+   * has it: false only while the two have diverged and are not merged yet (see syncTarget), when
+   * nothing is pushed, since GitHub would refuse it every round.
    */
   private async pushTarget(name: string): Promise<boolean> {
     const { repo, cfg } = this.repoSetup(name);
@@ -712,9 +821,9 @@ export class IssueBridge {
    * - local behind: fast-forwarded (`github.pulled`). GitHub has it, so it is not pushed back,
    *   nor is the old commit while the fast-forward is refused because the branch is checked
    *   out with uncommitted changes (`github.pull_blocked`, each reason once per streak);
-   * - diverged: nothing is merged by itself. Recorded (`github.diverged`) once per pair of
-   *   commits, notified once until the divergence is gone; nothing is pushed until a human
-   *   merges (pushTarget).
+   * - diverged: GitHub's commits are merged in by the Master when they merge without conflicts
+   *   and the repo's checks pass on the result (`mergeDiverged`); the push later in the round
+   *   takes the merge to GitHub. Otherwise nothing is pushed until a human merges (pushTarget).
    * A fetch that fails is thrown, to be reported like every GitHub error.
    */
   private async syncTarget(name: string): Promise<void> {
@@ -732,18 +841,7 @@ export class IssueBridge {
       return;
     }
     if (!(await isAncestor(repo.path, local, remote))) {
-      this.pullBlocked.delete(repo.id);
-      const seen = this.diverged.get(repo.id);
-      if (seen?.local === local && seen.remote === remote) return;
-      this.diverged.set(repo.id, { local, remote });
-      store.event(null, 'github.diverged', {
-        repo: name,
-        branch,
-        local,
-        remote,
-        // Already told about this divergence: a Run merged meanwhile, or more was pushed.
-        ...(seen ? { repeated: true } : {}),
-      });
+      await this.mergeDiverged(repo, name, local, remote);
       return;
     }
     this.diverged.delete(repo.id);
@@ -751,24 +849,154 @@ export class IssueBridge {
     this.pushed.set(repo.path, local);
     // Looked at again: a Run may have started merging while GitHub answered.
     if (this.repoMerging(repo)) return;
-    const ff = await fastForwardBranch(repo.path, branch, remote);
-    if (ff.ok) {
-      this.pullBlocked.delete(repo.id);
+    if (await this.fastForwardTarget(repo, name, remote)) {
       this.pushed.set(repo.path, remote);
       store.event(null, 'github.pulled', { repo: name, branch, from: local, to: remote });
-      return;
     }
-    // The branch moved on meanwhile; the next round looks again.
-    if (ff.reason === 'diverged') return;
-    if (this.pullBlocked.get(repo.id) === ff.reason) return;
+  }
+
+  /**
+   * Fast-forward the target branch to `head` (fastForwardBranch); returns whether it moved. When
+   * the branch moved on meanwhile it is left to the next round; when it is checked out with
+   * uncommitted changes that is recorded (`github.pull_blocked`), each reason once per streak.
+   */
+  private async fastForwardTarget(repo: Repo, name: string, head: string): Promise<boolean> {
+    const ff = await fastForwardBranch(repo.path, repo.targetBranch, head);
+    if (ff.ok) {
+      this.pullBlocked.delete(repo.id);
+      return true;
+    }
+    if (ff.reason === 'diverged') return false;
+    if (this.pullBlocked.get(repo.id) === ff.reason) return false;
     this.pullBlocked.set(repo.id, ff.reason);
-    store.event(null, 'github.pull_blocked', {
+    this.deps.store.event(null, 'github.pull_blocked', {
       repo: name,
-      branch,
+      branch: repo.targetBranch,
       reason: ff.reason,
       worktree: ff.worktree,
       status: ff.status,
     });
+    return false;
+  }
+
+  /**
+   * The target branch (`local`) and GitHub's (`remote`) have diverged. Nothing is pushed until
+   * they are merged (pushTarget). The Master merges GitHub's commits in by itself (`mergeRemote`)
+   * and fast-forwards the target branch to the merge (`github.merged_remote`, not notified); the
+   * push later in the round takes it to GitHub. Not while a Run of the repo merges, looked at
+   * again after the checks; a fast-forward that has to wait is tried again next round with the
+   * same merge commit. When the merge conflicts or a check fails on it, the branch stays as it
+   * is: recorded (`github.diverged`, with the conflicted files or the failed command) and not
+   * tried again for the same pair of commits; a human merges. A check that cannot start for a
+   * missing program is recorded too, but tried again each round, to go on once it is installed.
+   * Each kind of record notifies once while the divergence lasts (`repeated` on the others).
+   */
+  private async mergeDiverged(
+    repo: Repo,
+    name: string,
+    local: string,
+    remote: string,
+  ): Promise<void> {
+    const seen = this.diverged.get(repo.id);
+    const same = seen?.local === local && seen.remote === remote ? seen : undefined;
+    if (same?.outcome === 'failed') return;
+    const divergence: Divergence = same ?? { local, remote, reported: seen?.reported };
+    this.diverged.set(repo.id, divergence);
+    let merge = divergence.merge;
+    // A merge commit kept for long may have been garbage-collected meanwhile.
+    if (merge && !(await revParse(repo.path, merge).catch(() => null))) merge = undefined;
+    if (!merge) {
+      const result = await this.mergeRemote(repo, local, remote);
+      if (result.kind === 'later') return;
+      if (result.kind !== 'merged') {
+        this.pullBlocked.delete(repo.id);
+        const before = divergence.outcome;
+        divergence.outcome = result.kind;
+        // The same pair still missing the same program: recorded already.
+        if (before === 'environment' && result.kind === 'environment') return;
+        const reported = divergence.reported;
+        // Already told: a hand merge was asked for, or the same kind of trouble was reported.
+        const repeated = reported === 'failed' || reported === result.kind;
+        divergence.reported = reported === 'failed' ? 'failed' : result.kind;
+        this.deps.store.event(null, 'github.diverged', {
+          repo: name,
+          branch: repo.targetBranch,
+          local,
+          remote,
+          ...result.data,
+          ...(repeated ? { repeated: true } : {}),
+        });
+        return;
+      }
+      merge = result.merge;
+      divergence.merge = merge;
+    }
+    // Looked at again: a Run may have started merging while the checks ran.
+    if (this.stopping || this.repoMerging(repo)) return;
+    if (!(await this.fastForwardTarget(repo, name, merge))) return;
+    this.diverged.delete(repo.id);
+    this.deps.store.event(null, 'github.merged_remote', {
+      repo: name,
+      branch: repo.targetBranch,
+      local,
+      remote,
+      merge,
+    });
+  }
+
+  /**
+   * Merge GitHub's commit `remote` into the target branch's `local` (`git merge --no-ff`, with
+   * `mergeRemoteMessage`) in a temporary worktree in the system's temp directory, and run the
+   * repo's setup and verify commands there on the result, as the Run's checks would: with the
+   * environment agents get (no GitHub credentials), their output in `github-merge-<repo>.log`
+   * under the logs directory, ended when the Master stops. The worktree is deleted whatever
+   * comes of it; the merge commit stays in the repo, to fast-forward the branch to. A merge git
+   * cannot even start is thrown, to be reported like other failures and tried again next round.
+   */
+  private async mergeRemote(repo: Repo, local: string, remote: string): Promise<RemoteMerge> {
+    const commands = [...repo.setupCommands, ...repo.verifyCommands];
+    // The checks would fail for the environment: tried again once node is back.
+    if (commands.length > 0 && this.deps.nodeMissing?.()) return { kind: 'later' };
+    const kindOf = (command: string) =>
+      repo.setupCommands.includes(command) ? ('setup' as const) : ('verify' as const);
+    const env = prepareAgentEnv(this.deps.paths.agentGhConfigDir);
+    const missing = firstMissingCommand(commands, env);
+    if (missing) {
+      const failed = { command: missing.command, kind: kindOf(missing.command) };
+      return { kind: 'environment', data: { failed: { ...failed, missing: missing.missing } } };
+    }
+    const dir = mkdtempSync(join(tmpdir(), MERGE_DIR_PREFIX));
+    try {
+      await addDetachedWorktree(repo.path, dir, local);
+      const merged = await mergeOrAbort(dir, remote, mergeRemoteMessage(repo.targetBranch));
+      if (!merged.ok) {
+        if (merged.files.length === 0) throw new Error(merged.error);
+        return { kind: 'failed', data: { conflict: true, files: merged.files } };
+      }
+      const merge = await revParse(dir, 'HEAD');
+      if (commands.length === 0) return { kind: 'merged', merge };
+      const logPath = join(this.deps.paths.logsDir, `github-merge-${repo.name}.log`);
+      mkdirSync(this.deps.paths.logsDir, { recursive: true });
+      writeFileSync(logPath, `# ${local} + ${remote} -> ${merge}\n`);
+      const opts = {
+        timeoutMs: this.cfg.master.defaults.command_timeout_minutes * 60_000,
+        logPath,
+        env,
+        signal: this.stopped.signal,
+      };
+      const setup = await runCommands(repo.setupCommands, dir, opts);
+      const failedSetup = setup.find((r) => !r.passed);
+      const verify = failedSetup ? [] : await runCommands(repo.verifyCommands, dir, opts);
+      if (this.stopped.signal.aborted) return { kind: 'later' };
+      const failed = failedSetup ?? verify.find((r) => !r.passed);
+      if (!failed) return { kind: 'merged', merge };
+      const program = environmentProblem(failed, env) ?? undefined;
+      const check = failedCheck(failed, failedSetup ? 'setup' : 'verify', program);
+      const data = { failed: check, log: logPath };
+      return program ? { kind: 'environment', data } : { kind: 'failed', data };
+    } finally {
+      await dropWorktree(repo.path, dir);
+    }
   }
 
   /** Some Run of the repo is merging into its target branch now. */
@@ -981,7 +1209,7 @@ export class IssueBridge {
     const stageName = this.stageNameOf(run);
     // The issue closes once the code is on GitHub; a failed push is retried on the next poll.
     // While the target branch has diverged from GitHub's, the issue waits as it is, open, until
-    // a human merges the two and the push goes through.
+    // the two are merged (by the Master, or by a human when that failed) and the push goes through.
     let pushed = false;
     if (run.status === 'completed') {
       const name = repo.name;

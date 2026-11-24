@@ -46,6 +46,34 @@ const SAMPLES: [string, Record<string, unknown>][] = [
   ['github.pulled', { repo: 'demo', branch: 'main', from: 'aaaaaaaa1111', to: 'bbbbbbbb2222' }],
   ['github.diverged', { repo: 'demo', branch: 'main', local: 'aaaaaaaa1111', remote: 'cccc3333' }],
   [
+    'github.diverged',
+    { repo: 'demo', branch: 'main', local: 'a1', remote: 'c3', conflict: true, files: ['a.ts'] },
+  ],
+  [
+    'github.diverged',
+    {
+      repo: 'demo',
+      branch: 'main',
+      local: 'a1',
+      remote: 'c3',
+      failed: { command: 'npm test', kind: 'verify', exitCode: 1, timedOut: false },
+    },
+  ],
+  [
+    'github.diverged',
+    {
+      repo: 'demo',
+      branch: 'main',
+      local: 'a1',
+      remote: 'c3',
+      failed: { command: 'npm ci', kind: 'setup', missing: 'npm' },
+    },
+  ],
+  [
+    'github.merged_remote',
+    { repo: 'demo', branch: 'main', local: 'aaaa1111', remote: 'cccc3333', merge: 'dddd4444' },
+  ],
+  [
     'github.pull_blocked',
     { repo: 'demo', branch: 'main', reason: 'dirty', worktree: '/w/demo', status: ' M a.ts' },
   ],
@@ -258,6 +286,61 @@ describe('globalEventText', () => {
       expect(globalEventTone(ev(type)), type).toBe('attention');
     }
     expect(globalEventTone(ev('github.pulled'))).toBe('neutral');
+  });
+
+  it("says how the Master's merge of a divergence went", () => {
+    const pair = { repo: 'demo', branch: 'main', local: 'aaaaaaaa1111', remote: 'cccc33334444' };
+    const conflict = { ...pair, conflict: true, files: ['a.ts', 'b.ts'] };
+    const failed = {
+      ...pair,
+      failed: { command: 'npm test', kind: 'verify', exitCode: 1, timedOut: false },
+    };
+    const timedOut = {
+      ...pair,
+      failed: { command: 'npm ci', kind: 'setup', exitCode: null, timedOut: true },
+    };
+    const missing = { ...pair, failed: { command: 'npm test', kind: 'verify', missing: 'npm' } };
+    const merged = { ...pair, merge: 'dddddddd5555' };
+    expect(text('github.diverged', conflict)).toBe(
+      'demo 的 main 和 GitHub 上的已经分叉（本地 aaaaaaaa，GitHub cccc3333），自动合并有冲突（a.ts、b.ts），要你手动合并；在此之前不推送，已完成 Run 的 issue 保持打开',
+    );
+    expect(text('github.diverged', failed)).toBe(
+      'demo 的 main 和 GitHub 上的已经分叉（本地 aaaaaaaa，GitHub cccc3333），自动合并后检查命令 `npm test` 没通过（退出码 1），要你手动合并；在此之前不推送，已完成 Run 的 issue 保持打开',
+    );
+    expect(text('github.diverged', timedOut)).toContain(
+      '自动合并后准备命令 `npm ci` 没通过（超时）',
+    );
+    expect(text('github.diverged', missing)).toBe(
+      'demo 的 main 和 GitHub 上的已经分叉（本地 aaaaaaaa，GitHub cccc3333），自动合并后要运行的检查命令 `npm test` 在运行环境里找不到 npm；装好后下一轮检查会自动再合并，在此之前不推送，已完成 Run 的 issue 保持打开',
+    );
+    expect(text('github.merged_remote', merged)).toBe(
+      'demo 的 main 和 GitHub 上的分叉了，Master 自己合并了 GitHub 上的新提交，仓库的检查通过后把分支快进到合并提交（本地 aaaaaaaa 和 GitHub cccc3333 → dddddddd），随后推送到 GitHub',
+    );
+    expect(globalEventTone(ev('github.merged_remote'))).toBe('neutral');
+    const many = { ...pair, conflict: true, files: ['1', '2', '3', '4', '5', '6', '7'] };
+    expect(text('github.diverged', many)).toContain('自动合并有冲突（1、2、3、4、5 等 7 个文件）');
+
+    setLang('en');
+    expect(text('github.diverged', conflict)).toBe(
+      "Diverged from GitHub: main of demo (local aaaaaaaa, GitHub cccc3333) and the one on GitHub each have commits the other lacks, and the Master's merge conflicts in a.ts, b.ts. Merge them by hand; until then nothing is pushed and the issues of completed Runs stay open",
+    );
+    expect(text('github.diverged', failed)).toBe(
+      "Diverged from GitHub: main of demo (local aaaaaaaa, GitHub cccc3333) and the one on GitHub each have commits the other lacks, and the verify command `npm test` failed on the Master's merge (exit code 1). Merge them by hand; until then nothing is pushed and the issues of completed Runs stay open",
+    );
+    expect(text('github.diverged', timedOut)).toContain(
+      "the setup command `npm ci` failed on the Master's merge (timed out)",
+    );
+    expect(text('github.diverged', missing)).toBe(
+      "Diverged from GitHub: main of demo (local aaaaaaaa, GitHub cccc3333) and the one on GitHub each have commits the other lacks, and the verify command `npm test` to run on the Master's merge cannot find npm. Once it is installed, the next check merges by itself; until then nothing is pushed and the issues of completed Runs stay open",
+    );
+    expect(text('github.merged_remote', merged)).toBe(
+      "main of demo had diverged from GitHub: the Master merged the new commits from GitHub, and with the repo's checks passing, fast-forwarded the branch to the merge (local aaaaaaaa and GitHub cccc3333 → dddddddd), to be pushed to GitHub",
+    );
+    expect(text('github.diverged', many)).toContain('in 1, 2, 3, 4, 5 and 2 more files');
+    for (const data of [conflict, failed, timedOut, missing]) {
+      expect(text('github.diverged', data)).not.toMatch(/[一-鿿]/);
+    }
+    expect(text('github.merged_remote', merged)).not.toMatch(/[一-鿿]/);
   });
 
   it('counts what a scout proposed, with English plurals', () => {

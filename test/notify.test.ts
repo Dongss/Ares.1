@@ -605,6 +605,46 @@ describe('the target branch cannot take the commits on GitHub', () => {
     ]);
     for (const text of [...texts, NOTICE_KINDS.pull.when]) expect(text).not.toMatch(/[一-鿿]/);
   });
+
+  const pair = { local: 'aaaaaaaa1111', remote: 'bbbbbbbb2222' };
+  const conflict = ev('github.diverged', { ...pair, conflict: true, files: ['a.ts', 'b.ts'] });
+  const failed = ev('github.diverged', {
+    ...pair,
+    failed: { command: 'npm test', kind: 'verify', exitCode: 1, timedOut: false },
+    log: '/h/data/logs/github-merge-demo.log',
+  });
+  const missing = ev('github.diverged', {
+    ...pair,
+    failed: { command: 'npm ci', kind: 'setup', missing: 'npm' },
+  });
+
+  it("says whether the Master's merge of a divergence conflicted or failed the checks", () => {
+    const body = (e: typeof diverged) => noticeFor(e, undefined)?.body;
+    expect(body(conflict)).toBe(
+      'main 和 GitHub 上的已经分叉（本地 aaaaaaa，GitHub bbbbbbb），自动合并有冲突（a.ts、b.ts），要你手动合并后推送；在此之前 Master 不推送，已完成 Run 的 issue 保持打开',
+    );
+    expect(body(failed)).toBe(
+      'main 和 GitHub 上的已经分叉（本地 aaaaaaa，GitHub bbbbbbb），自动合并后检查命令 `npm test` 没通过（退出码 1），要你手动合并后推送；在此之前 Master 不推送，已完成 Run 的 issue 保持打开',
+    );
+    expect(body(missing)).toBe(
+      'main 和 GitHub 上的已经分叉（本地 aaaaaaa，GitHub bbbbbbb），自动合并后要运行的准备命令 `npm ci` 在运行环境里找不到 npm；装好后下一轮检查会自动再合并，在此之前 Master 不推送，已完成 Run 的 issue 保持打开',
+    );
+    for (const e of [conflict, failed, missing]) {
+      expect(noticeFor({ ...e, data: { ...e.data, repeated: true } }, undefined)).toBeNull();
+    }
+    // A divergence the Master merged by itself is nobody's business.
+    const merged = ev('github.merged_remote', { ...pair, merge: 'cccccccc3333' });
+    expect(noticeFor(merged, undefined)).toBeNull();
+
+    setLang('en');
+    const texts = [conflict, failed, missing].map((e) => body(e) ?? '');
+    expect(texts).toEqual([
+      "main has diverged from GitHub's (local aaaaaaa, GitHub bbbbbbb), and the Master's merge conflicts in a.ts, b.ts. Merge the two by hand and push; until then the Master pushes nothing and the issues of completed Runs stay open",
+      "main has diverged from GitHub's (local aaaaaaa, GitHub bbbbbbb), and the verify command `npm test` failed on the Master's merge (exit code 1). Merge the two by hand and push; until then the Master pushes nothing and the issues of completed Runs stay open",
+      "main has diverged from GitHub's (local aaaaaaa, GitHub bbbbbbb), and the setup command `npm ci` to run on the Master's merge cannot find npm. Once it is installed, the next check merges by itself; until then the Master pushes nothing and the issues of completed Runs stay open",
+    ]);
+    for (const text of texts) expect(text).not.toMatch(/[一-鿿]/);
+  });
 });
 
 describe('notifications in English', () => {

@@ -805,8 +805,8 @@ function noticeHandling(kind: NoticeKind): string {
       });
     case 'pull':
       return t({
-        zh: '分叉时在仓库里把 GitHub 上的目标分支合并进本地目标分支（比如 git fetch 后 git merge origin/<分支>），下次检查 Master 会推送上去，已完成 Run 的 issue 随之关闭。有未提交的改动时提交或丢弃它们，下次检查会自动拉取',
-        en: 'When they have diverged, merge the target branch on GitHub into the local one in the repo (e.g. git fetch, then git merge origin/<branch>); the next check pushes it and the issues of completed Runs close. For uncommitted changes, commit or discard them; the next check pulls by itself',
+        zh: '分叉后自动合并有冲突或检查没通过时，在仓库里把 GitHub 上的目标分支合并进本地目标分支（比如 git fetch 后 git merge origin/<分支>），下次检查 Master 会推送上去，已完成 Run 的 issue 随之关闭。检查要用的程序找不到时装好它，下次检查会自动再合并。有未提交的改动时提交或丢弃它们，下次检查会自动拉取',
+        en: "When the Master's merge of the diverged branches conflicts or fails the checks, merge the target branch on GitHub into the local one in the repo (e.g. git fetch, then git merge origin/<branch>); the next check pushes it and the issues of completed Runs close. When a program the checks start is missing, install it; the next check merges by itself. For uncommitted changes, commit or discard them; the next check pulls by itself",
       });
     case 'upgrade':
       return t({

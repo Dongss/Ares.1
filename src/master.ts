@@ -270,6 +270,7 @@ export class Master {
       adapters,
       github: opts.github,
       masterOrigin,
+      nodeMissing,
     });
     const notifier = new SystemNotifier(store, config, opts.notice);
     const webhook = new WebhookNotifier(store, config, { fetch: opts.fetch });
