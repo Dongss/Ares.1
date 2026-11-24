@@ -32,139 +32,67 @@ npm run test:real    # tests that call the real Claude Code and cursor-agent: co
 
 ```
 src/
-  cli.ts              start command: parses --home / --port and starts the Master; everything else
-                      happens on the dashboard
-  master.ts           wires config, store, engine, GitHub bridge, notifications, auto-upgrade and API;
-                      records master.restarted when the last Master did not close
-  i18n.ts             language in use and t({ zh, en }) (shared by Master and dashboard)
-  brand.ts            display name and slogan in each language (shared by Master and dashboard)
+  cli.ts              start command: parses --home / --port and starts the Master
+  master.ts           wires config, store, engine, GitHub bridge, notifications, upgrade and API
+  i18n.ts             language in use and t({ zh, en }) (shared with the dashboard)
+  brand.ts            display name and slogan in each language (shared with the dashboard)
   util.ts             ids, time and other small helpers
   config/
-    schema.ts         formats of config.yaml / agents.yaml / workflows/*.yaml and Run overrides (zod)
+    schema.ts         formats of config.yaml, agents.yaml, workflows and Run overrides (zod)
     defaults.ts       default config and the self-dev template, written on first start
-    load.ts           load and validate config; invalid agents and templates are only disabled
-                      and reported; applies config.yaml's language
+    load.ts           load and validate config (invalid agents and templates are only disabled)
     watch.ts          reload config when its files change
-    flow.ts           effective stage settings, check commands, rollback targets, budgets,
-                      which proposals are accepted automatically, the automatic scout's
-                      back-off, how many scouts in a row failed (when a human is notified),
-                      how long a Run or a scout waits for an agent's quota (rate
-                      limits), how long a failed Run of an issue waits before it is redone,
-                      which Runs go on by themselves (redos to come included) and which only
-                      wait for a human, how long raw agent logs are kept (`RAW_LOG_KEEP_DAYS`),
-                      which worktrees of failed or cancelled Runs of issues are left over for the
-                      Master to remove (`leftoverWorkspaces`)
-                      (shared by engine, GitHub bridge, API and dashboard)
-    effort.ts         helpers for agent effort (shared by engine and dashboard)
+    flow.ts           workflow, scout, redo and retention rules (shared by Master and dashboard)
+    effort.ts         helpers for agent effort (shared with the dashboard)
   store/              SQLite store (node:sqlite): store.ts, migrations.ts, types.ts (entity types)
-  adapters/           agent adapters: types.ts (common interface), process.ts (child processes,
-                      process groups and the environment of agents: no GitHub credentials),
-                      claude-code.ts, cursor-agent.ts, fake.ts (fake agent for tests),
-                      rate-limit.ts (a CLI's error text → out of quota / rate-limited, and the
-                      reset time), tool-summary.ts
+  adapters/           agent adapters: types.ts (interface), claude-code.ts, cursor-agent.ts, fake.ts
+                      (tests), process.ts (processes, agents' env), rate-limit.ts, tool-summary.ts
   engine/
-    engine.ts         workflow engine: queue, state machine, checks, rework, agent errors (retry
-                      with backoff, switching agents), rollback, approvals, merge, recovery after
-                      restart, removing the worktrees of superseded, exhausted and goal-changed
-                      Runs (and again later what was left over: `sweepLeftoverWorkspaces`)
+    engine.ts         workflow engine: queue, state machine, checks, rework, agent errors, rollback,
+                      approvals, merge, recovery after restart, removing Runs' worktrees
     prompts.ts        prompts for the assess, coding and review agents
     contracts.ts      agents' structured output: contract and validation
-    discussion.ts     how an assessment's conclusion and discussion are found and named
-                      (shared by engine, GitHub bridge and dashboard)
-    times.ts          a Run's time split into agent execution, queueing, waiting for approval,
-                      stuck waiting for a human and paused, with the names and order of the parts
-                      and the three groups used by the issue completion comment
-                      (shared by scout summaries, issue completion comments and the Run page)
+    discussion.ts     an assessment's conclusion and discussion (shared with the dashboard)
+    times.ts          how a Run's time is split into parts (shared with the dashboard)
   github/
     client.ts         GitHub through the gh CLI (FakeGitHub in tests)
-    bridge.ts         polling, Runs from issues (terminated when a human closes the issue, started
-                      over when a human edits it before the merge), progress on issues,
-                      auto-accept, push, auto-scout
-    issues.ts         labels, issue texts (assessment questions and conclusions, hidden comment
-                      markers), Run status ↔ issue (pure functions)
+    bridge.ts         polling, Runs from issues, progress on issues, auto-accept, push, auto-scout
+    issues.ts         labels, issue texts, hidden comment markers, Run status ↔ issue (pure)
     redact.ts         text before it is published on GitHub: the user's home directory → ~
     scout.ts          the AI scout's prompt, output format and Run summary
   notify/
-    notice.ts         which events notify people (shared by system notifications, the webhook
-                      and dashboard)
-    system.ts         system notifications sent by the Master: osascript on macOS, notify-send
-                      (libnotify) on Linux, nothing elsewhere; which platforms are supported;
-                      the first failure of a streak is logged and recorded as the global event
-                      notify.system_failed (command and a one-line reason), told again after a
-                      notification got through; sendSystemNotice, which resolves with how one
-                      went (for the test notification: no log, no event, the streak left as it
-                      was)
-    webhook.ts        notifications the Master POSTs to notify.webhook in config.yaml (JSON or
-                      text, home directory as ~, 10 s timeout, no retry; the first failure of a
-                      streak, or of another address, is logged and recorded as the global event
-                      notify.webhook_failed, told again after a notification got through);
-                      drain, awaited by the Master's close before the store closes: no more
-                      notifications, the requests already out waited for (at most the timeout),
-                      those still out then aborted and logged but not recorded as failed;
-                      sendTest, the test notification (kind test, eventType notify.test), whose
-                      outcome goes back to the caller only: no log, no event, the streak left as
-                      it was; the webhook's settings as a curl config file, <home>/webhook.curl
-                      (0600, written atomically at start and on each reload, deleted without a
-                      webhook), for the scripts to notify when the Master is down
-    test-notice.ts    the test notification of the dashboard's button: its texts, sent through
-                      each channel the configuration in use enables, at once, with each outcome
+    notice.ts         which events notify people (shared by every channel and the dashboard)
+    system.ts         system notification channel: sending on each platform, recording failures
+    webhook.ts        webhook channel: sending, recording failures, waiting for sends on close, the
+                      test notification, the curl config file for the scripts
+    test-notice.ts    the dashboard's test notification through each enabled channel
   upgrade/
-    upgrader.ts       the Master upgrades itself: finds a new version, waits for the work in hand,
-                      hands over to scripts/self-upgrade.sh, keeps the last failed upgrade, retries
-                      a target that failed for the environment (no node or npm) after a wait;
-                      restarts on the same commit when the node it runs on is gone
-    source.ts         which registered repo is the Master's own source (from the install
-                      directory's origin), whose scout is shown failed upgrades
-  logs/prune.ts       deletes the raw agent output (CLI stream and stderr) of Runs and scouts past
-                      retention, at start and daily; records logs.pruned; each round also starts
-                      the engine's sweep of leftover worktrees (wired in master.ts)
+    upgrader.ts       self-upgrade: finds a new version, hands over to scripts/self-upgrade.sh,
+                      records failed upgrades, restarts when its node is gone
+    source.ts         which registered repo is the Master's own source
+  logs/prune.ts       deletes raw agent output past retention; each round also sweeps worktrees
   workspace/git.ts    git: worktrees, commits, rollback, merge, fast-forward
-  verify/commands.ts  run check commands and setup commands; whether a failed one failed for the
-                      environment (exit code 127, its first program not in PATH), and whether a
-                      command can find its first program without running it
+  verify/commands.ts  run check and setup commands; tell a missing program from a failing command
   api/
-    server.ts         HTTP API (Hono) and SSE; GET /api/events lists the global events (those of
-                      no Run: restarts, pruned logs, upgrades, GitHub errors, scouts...) newest
-                      first, paged with ?before=<id>; POST /api/notify/test sends a test
-                      notification and returns each channel's outcome (never the webhook's
-                      address or headers)
+    server.ts         HTTP API (Hono) and SSE
     types.ts          API data types, shared by Master and dashboard
-    agents.ts, stats.ts, workspaces.ts, diff.ts   data of the Agents, Stats and Workspaces pages
-                      and diffs
-    cost.ts           whether a cost is unknown (shared by Master and dashboard)
+    agents.ts, stats.ts, workspaces.ts, diff.ts   Agents, Stats and Workspaces page data, diffs
+    cost.ts           whether a cost is unknown (shared with the dashboard)
     static.ts         serves the built dashboard
 scripts/
-  self-upgrade.sh     auto-upgrade: pull, build, restart, watch the new version for a few minutes;
-                      back to the old version on failure or when it crashes meanwhile, with the
-                      node_modules from before the upgrade (moved aside, so nothing to download);
-                      when no Master could be started, a system notification and the webhook
-  keepalive.sh        called by a timer (launchd, systemd, cron) every minute: starts the Master
-                      when it does not answer, unless an upgrade runs or a Master process of the
-                      same home is there (hung or starting); logs to keepalive.log, notifies (a
-                      system notification and the webhook) once per outage when it cannot start it
-  find-node.sh        the one place that finds the node to run the Master with (the given one,
-                      PATH, nvm's default version, the usual places; engines.node checked),
-                      sourced by self-upgrade.sh and keepalive.sh; the Master copies it next to
-                      its copy of self-upgrade.sh
-  webhook.sh          the one place the scripts POST to the webhook (kind master_down) with the
-                      settings the last Master left in <home>/webhook.curl: curl only, no node or
-                      jq; home directory as ~; a failure logs curl's exit code only. Sourced and
-                      copied like find-node.sh
+  self-upgrade.sh     auto-upgrade: pull, build, restart, watch the new Master, roll back on failure
+  keepalive.sh        run by a timer every minute: starts the Master when it does not answer
+  find-node.sh        finds the node to run the Master with (sourced by the other scripts)
+  webhook.sh          the scripts' webhook notification when the Master is down
 web/                  dashboard (React + Vite)
-  src/App.tsx         top bar (navigation, work switch, notification switch, language switch)
-                      and routing
+  src/App.tsx         top bar (navigation, work, notification and language switches) and routing
   src/pages/          Home, RunDetail, Issues, Stats, Agents, Events, Workspaces, Repos, Config,
                       Guide
-  src/components/     ui.tsx (common components), AgentOutput, DiffPanel, FlowChart,
-                      Notifications, WorkSwitch
-  src/lib/            API calls, SSE, routing, language choice, formatting and the pure logic of
-                      each page (with *.test.ts next to them)
+  src/components/     ui.tsx (common), AgentOutput, DiffPanel, FlowChart, Notifications, WorkSwitch
+  src/lib/            API calls, SSE, routing, language choice, formatting, each page's pure logic
   src/styles.css      all styles
 docs/                 documents for people besides the README (in Chinese)
-  examples/           configuration examples laid out like a data directory: config.yaml,
-                      agents.yaml, workflows/ (light, strict, with-e2e, cross-review) and a
-                      README on copying them and on the repo registration per language;
-                      loaded by test/examples.test.ts
+  examples/           configuration examples laid out like a data directory
 test/
   helpers.ts          temp dirs and repos, a Master with fake agents (harness), FakeGitHub
   *.test.ts           tests run by npm test
@@ -191,13 +119,10 @@ test/
   - Prefer structured event data over rendered text, so that the dashboard can show events in its own language.
 - In the engine, after every `await`, if the Run may have been paused or cancelled meanwhile, call `checkAbort(signal)` before changing state.
 - Each rule lives in one place, shared by engine and dashboard:
-  - rollback targets, effective settings, which proposals are accepted automatically, the
-    automatic scout's back-off, the waits for an agent's quota (rate limits) of Runs and scouts,
-    the wait before a failed Run of an issue is redone (`redoDelayMs` / `redoDueAt`), which
-    unfinished Runs and redos the scout waits for, which raw agent logs are past retention
-    (`runRawLogsExpired` / `scoutRawLogExpired`), which worktrees of failed or cancelled Runs
-    are left over for the Master to remove (`leftoverWorkspaces`) and the like:
-    `src/config/flow.ts`
+  - rollback targets, effective settings, auto-accepted proposals, the automatic scout's back-off
+    and what it waits for, rate-limit waits of Runs and scouts, the redo wait (`redoDelayMs` /
+    `redoDueAt`), raw log retention (`runRawLogsExpired` / `scoutRawLogExpired`), leftover
+    worktrees (`leftoverWorkspaces`) and the like: `src/config/flow.ts`
   - notification rules: `src/notify/notice.ts`
   - assessment conclusion rules: `src/engine/discussion.ts`
   - how a Run's time is split, and the names and groups of the parts: `src/engine/times.ts`
@@ -230,6 +155,7 @@ test/
 
 - `README.md` (Chinese) holds the requirements and goals. Do not change the goals.
 - This file is for agents: layout, commands and conventions. Keep it in English, and update it when the layout, commands or conventions change.
+- A Layout entry says only what a file or directory is for, in one or two lines. Behavior and configuration details go in `docs/running.md` and in source comments (file headers, doc comments), not in the Layout: a new feature leaves the Layout alone unless it adds, removes or renames a file or changes what a file is responsible for.
 - Other documents go in `docs/`, written in Chinese only; no English copies. `docs/running.md` covers running, configuring and upgrading; update it when behavior, configuration or the API changes.
 - `docs/examples/` holds configuration examples people copy into their data directory, commented in Chinese only. Keep them in sync with the schema (`src/config/schema.ts`) and the loading rules (`src/config/load.ts`): `test/examples.test.ts` loads the directory as a Master home and fails on any error or warning, so a schema change that breaks an example also updates the example. When a new setting is worth showing, add it there too.
 
