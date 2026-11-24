@@ -9,7 +9,7 @@ import {
   type Risk,
 } from '../../../src/config/flow.js';
 import { join, t } from '../../../src/i18n.js';
-import type { RunIssue, ScoutProposal, ScoutStatus } from '../../../src/store/types.js';
+import type { RunIssue, ScoutGap, ScoutProposal, ScoutStatus } from '../../../src/store/types.js';
 import { formatCost, formatMinutes, formatTime, type Tone } from './format.js';
 
 // Display helpers for GitHub issues and AI scouts. Labels are getters, so they are picked in
@@ -59,6 +59,38 @@ export const CATEGORY: Readonly<Record<ScoutProposal['category'], string>> = {
     return t({ zh: '重构', en: 'Refactor' });
   },
 };
+
+/**
+ * A scout's gaps grouped by the README goal they stand in the way of. Goals come in the order
+ * their first gap does, so the group of the most important gap leads; gaps keep their order.
+ */
+export function gapsByGoal(gaps: readonly ScoutGap[]): { goal: string; gaps: ScoutGap[] }[] {
+  const groups: { goal: string; gaps: ScoutGap[] }[] = [];
+  for (const gap of gaps) {
+    const goal = gap.goal.trim();
+    const group = groups.find((g) => g.goal === goal);
+    if (group) group.gaps.push(gap);
+    else groups.push({ goal, gaps: [gap] });
+  }
+  return groups;
+}
+
+/**
+ * The heading of a scout's gap analysis, e.g. "差距分析：3 个缺口，涉及 2 个目标"; null for a
+ * scout without one (still running, failed, or recorded before there was one).
+ */
+export function gapsHeading(gaps: readonly ScoutGap[] | null): string | null {
+  if (gaps === null) return null;
+  const n = gaps.length;
+  if (n === 0) {
+    return t({ zh: '差距分析：没有找到能力缺口', en: 'Gap analysis: no capability gaps found' });
+  }
+  const goals = gapsByGoal(gaps).length;
+  return t({
+    zh: `差距分析：${n} 个缺口，涉及 ${goals} 个目标`,
+    en: `Gap analysis: ${n} gap${n === 1 ? '' : 's'} across ${goals} goal${goals === 1 ? '' : 's'}`,
+  });
+}
 
 /** Open issues of the repo on GitHub, optionally with one label. */
 export function issuesUrl(repo: string, label?: string): string {

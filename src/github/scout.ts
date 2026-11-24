@@ -37,12 +37,19 @@ import type {
   EventRow,
   Run,
   Scout,
+  ScoutGap,
   ScoutProposal,
   StageRun,
 } from '../store/types.js';
 import type { UpgradeFailure } from '../upgrade/upgrader.js';
 import type { GhAuthored, GhIssue } from './client.js';
-import { isRetriesExhaustedComment, isTrusted, LABELS, stripMarker } from './issues.js';
+import {
+  FOOTER_MARKER,
+  isRetriesExhaustedComment,
+  isTrusted,
+  LABELS,
+  stripMarker,
+} from './issues.js';
 import { redactForGitHub } from './redact.js';
 
 export const ProposalSchema = z.object({
@@ -56,15 +63,65 @@ export const ProposalSchema = z.object({
   acceptance: z.array(z.string().trim().min(1)).min(1),
 });
 
-export const ScoutReportSchema = z.object({ proposals: z.array(ProposalSchema) });
+/**
+ * A capability the project lacks for one of its README's goals, from the scout's gap analysis.
+ * The scout serves every registered repo, each with the goals of its own README, so `goal` names
+ * the goal as that README does rather than coming from a fixed list.
+ */
+export const GapSchema = z.object({
+  goal: z.string().trim().min(1).max(120),
+  gap: z.string().trim().min(1),
+  evidence: z.array(z.string().trim().min(1)).min(1),
+});
+
+export const ScoutReportSchema = z.object({
+  gaps: z.array(GapSchema),
+  proposals: z.array(ProposalSchema),
+});
 
 /** JSON schema of the scout's answer, its descriptions in the language in use. */
 export function scoutReportJsonSchema() {
   return {
     type: 'object',
-    required: ['proposals'],
+    required: ['gaps', 'proposals'],
     additionalProperties: false,
     properties: {
+      gaps: {
+        type: 'array',
+        description: t({
+          zh: '差距分析：对照 README.md 的目标，这个项目在能力层面还做不到的事，最重要的在前；没有就是空列表',
+          en: "Gap analysis: what the project cannot do yet, as capabilities, measured against README.md's goals, most important first; an empty list if there is nothing",
+        }),
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['goal', 'gap', 'evidence'],
+          properties: {
+            goal: {
+              type: 'string',
+              description: t({
+                zh: '缺口离的是 README.md 里的哪个目标，照 README 的说法简短写',
+                en: 'The goal in README.md this gap stands in the way of, named briefly as README.md names it',
+              }),
+            },
+            gap: {
+              type: 'string',
+              description: t({
+                zh: '缺什么能力：系统现在做不到什么',
+                en: 'The missing capability: what the system cannot do now',
+              }),
+            },
+            evidence: {
+              type: 'array',
+              items: { type: 'string' },
+              description: t({
+                zh: '限制这个能力的代码位置（文件:行号），或 README、文档中的段落',
+                en: 'Where the code limits this capability (file:line), or passages of README or other documents',
+              }),
+            },
+          },
+        },
+      },
       proposals: {
         type: 'array',
         items: {
@@ -99,15 +156,15 @@ export function scoutReportJsonSchema() {
               type: 'array',
               items: { type: 'string' },
               description: t({
-                zh: 'Run id、文件:行号、文档中的段落等可以核对的证据',
-                en: 'Verifiable evidence: Run ids, file:line, passages of documents',
+                zh: 'Run id、文件:行号、文档中的段落等可以核对的证据；补能力的提案可以是 README 的目标加上限制这个能力的代码位置',
+                en: 'Verifiable evidence: Run ids, file:line, passages of documents; for a proposal that adds a capability, a goal of README together with where the code limits the capability',
               }),
             },
             what: {
               type: 'string',
               description: t({
-                zh: '要做什么，写到 Agent 能直接动手的程度',
-                en: 'What to do, detailed enough for an agent to start right away',
+                zh: '要做什么，写到 Agent 能直接动手的程度；只是一个大能力的第一步时，末尾单独一行写「后续步骤：」，下面列出剩下的步骤',
+                en: 'What to do, detailed enough for an agent to start right away; when it is only the first step of a large capability, end it with a line reading "Next steps:" followed by the remaining steps',
               }),
             },
             acceptance: {
@@ -122,7 +179,10 @@ export function scoutReportJsonSchema() {
   } as const;
 }
 
-export function parseScoutReport(structured: unknown, finalMessage: string): ScoutProposal[] {
+export function parseScoutReport(
+  structured: unknown,
+  finalMessage: string,
+): { proposals: ScoutProposal[]; gaps: ScoutGap[] } {
   const parsed = parseReport(ScoutReportSchema, structured, finalMessage);
   if (!parsed.ok) {
     throw new Error(
@@ -132,7 +192,7 @@ export function parseScoutReport(structured: unknown, finalMessage: string): Sco
       }),
     );
   }
-  return parsed.value.proposals;
+  return { proposals: parsed.value.proposals, gaps: parsed.value.gaps };
 }
 
 const oneLine = (text: string, max: number) => {
@@ -610,6 +670,9 @@ export function runDigest(store: Store, repoId: string, limit = 15): string {
  * old. Those not among `closed` get a section of their own, so that old rejections and their
  * reasons stay in sight without crowding the recent ones. `notPlanned` is null when they could
  * not be fetched: the scout is told that only the recent rejections are in sight.
+ *
+ * Open and done issues carry their next steps (see nextSteps), so that the scout proposes the
+ * next step of a large capability once the one before it is done.
  */
 export function issueDigest(
   open: GhIssue[],
@@ -624,7 +687,9 @@ export function issueDigest(
     const ours = i.labels.filter((l) => l.startsWith('ares1:'));
     return ours.length ? ` [${ours.join(', ')}]` : '';
   };
-  const openLines = trusted(open).map((i) => `- #${i.number}${labels(i)} ${i.title}`);
+  const openLines = trusted(open).map(
+    (i) => `- #${i.number}${labels(i)} ${i.title}${nextStepsLines(i)}`,
+  );
   const closedLines = trusted(closed).map((i) => closedIssueLine(i, master));
   const olderLines = trusted(older).map((i) => closedIssueLine(i, master));
   const none = t({ zh: '（无）', en: '(none)' });
@@ -679,7 +744,66 @@ function closedIssueLine(i: GhIssue, master: string | null): string {
       : '';
     return `- #${i.number} ${t({ zh: '不做', en: 'Not planned' })}${colon()}${i.title}${why}`;
   }
-  return `- #${i.number} ${t({ zh: '已完成', en: 'Done' })}${colon()}${i.title}`;
+  return `- #${i.number} ${t({ zh: '已完成', en: 'Done' })}${colon()}${i.title}${nextStepsLines(i)}`;
+}
+
+/** Characters kept of the next steps an issue lists, in the scout's list of issues. */
+const NEXT_STEPS_CHARS = 600;
+
+/**
+ * The line that opens the next steps: a heading, a line of its own (bold or not, a colon after it
+ * or not), or the name, a colon and the first step on the same line. Both names count whatever
+ * the language in use: the issue may have been written in either.
+ */
+const NEXT_STEPS_HEAD =
+  /^(?:#{1,6}[ \t]+)?(?:\*\*|__)?(?:后续步骤|next steps)(?:\*\*|__)?[ \t]*(?:[:：](?:\*\*|__)?[ \t]*(.*))?$/i;
+
+/** The level of a Markdown heading; 0 for any other line. */
+const headingLevel = (line: string) => /^ {0,3}(#{1,6})(?:[ \t]|$)/.exec(line)?.[1]?.length ?? 0;
+
+/**
+ * The 「后续步骤」/"Next steps" of an issue's body, one string per line: the steps a scout left
+ * for later when it proposed only the first step of a large capability (a human may write them
+ * too). They run from the line that opens them (see NEXT_STEPS_HEAD) to the next heading (of the
+ * same level or higher when that line is a heading itself) or the end of the body, the proposal's
+ * footer left out; at most NEXT_STEPS_CHARS characters. Empty when there are none.
+ */
+export function nextSteps(body: string): string[] {
+  const cut = body.indexOf(FOOTER_MARKER);
+  const lines = (cut >= 0 ? body.slice(0, cut) : body).split(/\r?\n/);
+  const start = lines.findIndex((l) => NEXT_STEPS_HEAD.test(l.trim()));
+  if (start < 0) return [];
+  const head = lines[start] as string;
+  const level = headingLevel(head);
+  const steps = [NEXT_STEPS_HEAD.exec(head.trim())?.[1] ?? ''];
+  for (const line of lines.slice(start + 1)) {
+    const next = headingLevel(line);
+    if (next > 0 && (level === 0 || next <= level)) break;
+    steps.push(line);
+  }
+  const kept: string[] = [];
+  let left = NEXT_STEPS_CHARS;
+  for (const step of steps.map((s) => s.trimEnd()).filter((s) => s.trim())) {
+    if (step.length > left) {
+      kept.push(`${step.slice(0, left)}…`);
+      break;
+    }
+    kept.push(step);
+    left -= step.length;
+  }
+  return kept;
+}
+
+/**
+ * The next steps of an issue under its line in the scout's list, so that a later scout goes on
+ * with the next step once the issue is done; empty when it lists none. Only issues by people the
+ * Master trusts reach here.
+ */
+function nextStepsLines(i: GhIssue): string {
+  const steps = nextSteps(i.body);
+  if (steps.length === 0) return '';
+  const head = `\n  ${t({ zh: '后续步骤：', en: 'Next steps:' })}`;
+  return `${head}${steps.map((s) => `\n    ${s}`).join('')}`;
 }
 
 /** Proposals a human still has to look at. */
@@ -806,6 +930,18 @@ function codeFailureAdvice(toShort: string): string {
   });
 }
 
+/**
+ * The Master's failed upgrade among the problems that stop the system, when its section below
+ * asks to fix it first; a failure of the environment is retried by the Master and is no such lead.
+ */
+function upgradeLead(failure: UpgradeFailure | null | undefined): string {
+  if (!failure || failure.env) return '';
+  return t({
+    zh: '，以及下面的「Master 自动升级失败」',
+    en: ", and the Master's failed upgrade below",
+  });
+}
+
 /** A part of a Run's time, named as the dashboard and the Run summaries name it. */
 const part = (p: RunTimePart) => runTimePartLabels()[p];
 
@@ -816,17 +952,36 @@ const scoutPromptZh = (input: ScoutPromptInput) =>
 - 读 README.md 和 AGENTS.md（有 CLAUDE.md 的也读）。README.md 写着项目的目标，是一切决定的依据；AGENTS.md 写着目录结构、命令和约定。
 - 提案要服务于 README.md 里的目标，不提和目标无关或背离目标的事。
 
-## 线索（按价值从高到低）
-1. 下面附的最近 Run 记录：卡住、失败、返工多轮、评审反复提同类意见、费用或 Agent 执行用时异常，往往说明流程或代码有值得改进的地方。用时里「${part('stoppedMs')}」「${part('approvalMs')}」「${part('blockedMs')}」「${part('pausedMs')}」的部分是在等人处理，「${part('queuedMs')}」的部分是在等别的 Run 做完（也包括等升级、Master 没运行的时候），都不说明 Agent 慢。需求评估提了疑问、需求在讨论后改过或结论为不做，说明这条需求没写清楚或方向有偏差：留意其中的疑问和理由，新提案不要再犯。评审通过时给的建议是评审有意留到以后的改进（超出当时目标范围的缺陷、测试缺口、重复代码等），可以作为提案的来源，但要先到代码里核对它是否仍然存在、是否已经有 issue 覆盖。
-2. README.md 里的目标还没达到的地方，README.md、AGENTS.md 和代码不一致的地方，代码里的 TODO。
-3. 明显的缺陷、测试缺口、重复代码。
+## 先做差距分析
+提案之前，先对照 README.md 里的每个目标，在能力层面列出这个项目现在还做不到什么，写进结果的 gaps。要看的是缺了哪些能力，不是零碎的缺陷：比如能对接哪些外部工具和服务、能做多大的任务、能不能并行、能服务什么样的用户、场景和需求来源、出了问题能不能自己恢复。代码里定义了却没有实现的选项、只支持一种情况的地方、写死的上限，往往就是缺口。
+- 每个缺口写明：goal 是 README.md 里的哪个目标（照 README 的说法简短写），gap 是缺什么能力，evidence 是限制这个能力的代码位置（文件:行号）或 README、文档里的段落。
+- 最重要的缺口放在最前：越是挡住目标、越多事情依赖它，越重要。已经有 issue 在做的缺口也照样列出。
+- 认真对照每个目标后仍然找不到缺口，gaps 才是空列表。
+
+## 线索（按优先级从高到低）
+1. 让系统停转或空耗的问题：下面附的最近 Run 里卡住、失败、反复返工、评审反复提同类意见、费用或 Agent 执行用时异常的${upgradeLead(input.upgrade)}。用时里「${part('stoppedMs')}」「${part('approvalMs')}」「${part('blockedMs')}」「${part('pausedMs')}」的部分是在等人处理，「${part('queuedMs')}」的部分是在等别的 Run 做完（也包括等升级、Master 没运行的时候），都不说明 Agent 慢。需求评估提了疑问、需求在讨论后改过或结论为不做，说明这条需求没写清楚或方向有偏差：留意其中的疑问和理由，新提案不要再犯。
+2. 差距分析里最重要的能力缺口。
+3. 明显的缺陷和测试缺口，README.md、AGENTS.md 和代码不一致的地方，代码里的 TODO。
+4. 评审建议和对最近改动的修饰：评审通过时给的建议是评审有意留到以后的改进（超出当时目标范围的缺陷、测试缺口、重复代码等），对最近合并的改动还能再修一修的地方也归在这一类。要先到代码里核对它是否仍然存在、是否已经有 issue 覆盖；相关的几条合成一条提案，不要一条建议提一条。
+
+## 提案的配比
+- 第 1 类问题优先：有就先提；条数上限放不下时，以第 1 类为先。
+- 第 1 类之外，只要差距分析里有缺口，至少有一条提案是补能力的：category 为 feature，补上差距分析里的一个缺口，推进 README.md 的某个目标，而不是对最近改动的修补。缺口已经有未关闭的 issue 在做时，换一个缺口，或者按下面「拆一个大能力」的做法提它还没人提的一步。
+- 第 4 类每次最多一条。
+
+## 拆一个大能力
+一个能力一个 Run 做不完时，把它拆成有先后的几步。每一步都能单独合并，合并后系统照常可用，并且实际推进了这个能力，不能只是空壳（比如只加了配置项、类型或接口，却没有实际行为）。
+- 这次只提第一步，size 尽量是 S 或 M。
+- what 的末尾单独起一行写「后续步骤：」（不要写成标题），下面按顺序列出剩下的几步，每步一句话，以后的侦察从这里接着往下提。
+- 下面已有的 issue 里，列着「后续步骤」、而且已完成（前一步已经合并）的，优先考虑提它的下一步：在 why 里写明接着哪条 issue，what 末尾的「后续步骤」只列还剩下的步骤。还没关闭的 issue，前一步还没做完，不要提它后面的步骤。
+- 已有的 issue 覆盖的能力太大、一直没人做的（比如还在等人采纳的大提案），可以提它能独立合并的第一步，在 why 里注明对应哪条 issue，这不算重复。
 
 ## 要求
-- 最多 ${input.max} 条，宁缺毋滥；没有值得做的就返回空列表。按价值从高到低排列。
-- 每条都要有能核对的证据：Run id、文件:行号、README 或 AGENTS.md 中的段落。拿不出证据的不要提。
+- 最多 ${input.max} 条，宁缺毋滥；没有值得做的就返回空列表。按上面的优先级和配比排列，同一类里价值高的在前。
+- 每条都要有能核对的证据：Run id、文件:行号、README 或 AGENTS.md 中的段落。补能力的提案不需要有出错的 Run：README.md 里的目标加上限制这个能力的代码位置就是证据。拿不出证据的不要提。
 - 不要和下面已有的 issue 重复，包括已关闭的。被关闭为「不做」的 issue 是反例，注意其中的理由，不要换个说法再提。
 - 「多次失败后关闭」的 issue 不一样：它不是人拒绝的，而是 Run 尝试了几次都失败了，需求本身可能仍然需要。可以根据其中的失败原因换个思路重新提案（比如拆小、先补上缺的能力、换一种做法），在 why 里说明和上次的不同；不要原样再提。
-- 每条要能独立完成、独立合并，一个 Run 能做完。太大的拆成几条，实在拆不开就把 size 标为 L。
+- 每条要能独立完成、独立合并，一个 Run 能做完。太大的按上面「拆一个大能力」的做法拆开，只提第一步；那样也拆不开的，才把 size 标为 L。
 - risk 的含义：
   - low：只涉及文档、测试、看板展示，或不改变行为的重构；
   - mid：改变行为，但影响范围清楚；
@@ -847,17 +1002,36 @@ const scoutPromptEn = (input: ScoutPromptInput) =>
 - Read README.md and AGENTS.md (and CLAUDE.md if there is one). README.md states the project's goals and is the basis for every decision. AGENTS.md describes the layout, commands and conventions.
 - Proposals must serve the goals in README.md; do not propose anything unrelated to them or against them.
 
-## Leads (most valuable first)
-1. The recent Runs below: Runs that got stuck, failed, needed many rounds of rework, drew the same kind of review comments again and again, or took unusual cost or agent time often point at something in the process or the code worth improving. In the times, "${part('stoppedMs')}", "${part('approvalMs')}", "${part('blockedMs')}" and "${part('pausedMs')}" are time spent waiting for a human, and "${part('queuedMs')}" is time spent waiting for other Runs to finish (including while an upgrade is pending or the Master is not running): none of these mean the agents were slow. When the requirement assessment asked questions, the requirement was revised in the discussion, or the conclusion was to drop it, the requirement was unclear or off course: note the questions and reasons, and do not repeat those mistakes in new proposals. The suggestions given by a review that passed are improvements the reviewer left for later on purpose (bugs beyond the goal of the time, gaps in tests, duplicated code and the like): they can be a source of proposals, but first check in the code that each one is still there and that no existing issue covers it.
-2. Goals in README.md not reached yet, places where README.md, AGENTS.md and the code disagree, TODOs in the code.
-3. Obvious bugs, gaps in tests, duplicated code.
+## First, a gap analysis
+Before proposing anything, go through each goal in README.md and list, as capabilities, what the project cannot do yet; put them in the gaps of your answer. Look for missing capabilities, not scattered bugs: for example which outside tools and services it can work with, how large a task it can take on, whether it can do things in parallel, what users, situations and sources of requirements it can serve, and whether it can recover by itself when something goes wrong. Options defined in the code but never implemented, places that support only one case, and hard-coded limits are often gaps.
+- For each gap, give goal: the goal in README.md (named briefly, as README.md names it); gap: the missing capability; evidence: where the code limits this capability (file:line), or passages of README or other documents.
+- Put the most important gaps first: the more a gap stands in the way of a goal and the more depends on it, the more important it is. List gaps that existing issues already work on as well.
+- Leave gaps empty only if you find none after carefully going through every goal.
+
+## Leads (highest priority first)
+1. Problems that stop the system or make it spin without progress: Runs below that got stuck, failed, needed rework again and again, drew the same kind of review comments again and again, or took unusual cost or agent time${upgradeLead(input.upgrade)}. In the times, "${part('stoppedMs')}", "${part('approvalMs')}", "${part('blockedMs')}" and "${part('pausedMs')}" are time spent waiting for a human, and "${part('queuedMs')}" is time spent waiting for other Runs to finish (including while an upgrade is pending or the Master is not running): none of these mean the agents were slow. When the requirement assessment asked questions, the requirement was revised in the discussion, or the conclusion was to drop it, the requirement was unclear or off course: note the questions and reasons, and do not repeat those mistakes in new proposals.
+2. The most important capability gaps from your gap analysis.
+3. Obvious bugs and gaps in tests, places where README.md, AGENTS.md and the code disagree, TODOs in the code.
+4. Review suggestions and polish of recent changes: the suggestions given by a review that passed are improvements the reviewer left for later on purpose (bugs beyond the goal of the time, gaps in tests, duplicated code and the like), and whatever could still be touched up in recently merged changes belongs here too. First check in the code that each one is still there and that no existing issue covers it; merge related ones into one proposal rather than proposing each suggestion on its own.
+
+## Mix of proposals
+- Problems of lead 1 come first: propose them before anything else, and when the limit leaves no room for more, they take it.
+- Besides lead 1, as long as your gap analysis found a gap, at least one proposal must add a capability: category feature, closing a gap from your gap analysis and advancing a goal of README.md, not patching a recent change. When an open issue already works on a gap, take another gap, or a step of it nobody has proposed yet, split as described in "Splitting a large capability" below.
+- At most one proposal from lead 4 per scout.
+
+## Splitting a large capability
+When a capability is too much for one Run, split it into steps in order. Each step must be mergeable on its own, leave the system working as usual once merged, and actually advance the capability, not be an empty shell (for example a config option, a type or an interface without any real behavior).
+- Propose only the first step now, preferably of size S or M.
+- End what with a line of its own reading "Next steps:" (not a heading), followed by the remaining steps in order, one sentence each, for later scouts to go on from.
+- Among the existing issues below, when an issue lists "Next steps" and is done (its step was merged), consider its next step first: say in why which issue it follows, and list only the steps still left under "Next steps" at the end of what. An issue still open has not finished its step yet: do not propose the steps after it.
+- When an existing issue covers a capability too large to have been taken up (such as a large proposal still waiting for a human), you may propose a first step of it that can be merged on its own, saying in why which issue it belongs to; that is not a duplicate.
 
 ## Requirements
-- At most ${input.max}, and only ones that are worth it; return an empty list if nothing is. Order them by value, most valuable first.
-- Every proposal needs verifiable evidence: Run ids, file:line, passages of README or AGENTS.md. Do not propose anything you cannot back with evidence.
+- At most ${input.max}, and only ones that are worth it; return an empty list if nothing is. Order them by the priorities and the mix above, the more valuable first within each lead.
+- Every proposal needs verifiable evidence: Run ids, file:line, passages of README or AGENTS.md. A proposal that adds a capability needs no failed Run: a goal in README.md together with where the code limits the capability is evidence. Do not propose anything you cannot back with evidence.
 - Do not duplicate the existing issues below, including closed ones. Issues closed as not planned are counterexamples: note their reasons and do not propose them again in other words.
 - Issues "closed after repeated failures" are different: no human rejected them; their Runs failed attempt after attempt, and the requirement may well still be wanted. You may propose them again with another approach based on the failures (e.g. split them up, first add a missing capability, do it another way), saying in why what is different this time; do not propose them again as they were.
-- Each proposal must be doable and mergeable on its own, within one Run. Split anything too large; if it really cannot be split, set its size to L.
+- Each proposal must be doable and mergeable on its own, within one Run. Split anything too large as described in "Splitting a large capability" and propose only its first step; only if it cannot be split even that way, set its size to L.
 - What risk means:
   - low: only documentation, tests, how the dashboard shows things, or refactoring without behavior change;
   - mid: changes behavior, with a clear scope;

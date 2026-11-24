@@ -186,4 +186,8 @@ export const MIGRATIONS: readonly string[] = [
   ALTER TABLE runs ADD COLUMN discussion TEXT NOT NULL DEFAULT '[]';
   ALTER TABLE runs ADD COLUMN issue_discussion_synced INTEGER NOT NULL DEFAULT 0;
   `,
+  // v7: the scout's gap analysis against the README's goals; null for the scouts before it.
+  `
+  ALTER TABLE scouts ADD COLUMN gaps TEXT;
+  `,
 ];

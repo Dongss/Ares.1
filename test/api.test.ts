@@ -20,7 +20,7 @@ import { setLang } from '../src/i18n.js';
 import { type ExecFile, noticeScript } from '../src/notify/system.js';
 import { testNoticeText } from '../src/notify/test-notice.js';
 import type { Fetch } from '../src/notify/webhook.js';
-import type { Attempt, EventRow, Run, RunStatus } from '../src/store/types.js';
+import type { Attempt, EventRow, Run, RunStatus, Scout } from '../src/store/types.js';
 import {
   ASSESS_AGENTS_YAML,
   ASSESS_WORKFLOW_YAML,
@@ -1081,6 +1081,38 @@ describe('POST /api/notify/test', () => {
   });
 });
 
+describe('GET /api/scouts', () => {
+  it("returns each scout's gap analysis, null for a scout without one", async () => {
+    h = await harness();
+    const store = h.master.store;
+    const scout = (status: Scout['status']) =>
+      store.updateScout(
+        store.createScout({
+          repoId: (h as Harness).repo.id,
+          issuesRepo: 'me/demo',
+          trigger: 'auto',
+          agentId: 'scout',
+          model: null,
+          logPath: '/l',
+        }).id,
+        { status },
+      );
+    const failed = scout('failed');
+    const empty = store.updateScout(scout('completed').id, { gaps: [] });
+    const gaps = [
+      { goal: '永动', gap: '同一时间只跑一个 Run', evidence: ['src/engine/engine.ts:421'] },
+    ];
+    const found = store.updateScout(scout('completed').id, { gaps });
+
+    const res = await call('GET', '/api/scouts?repo=demo');
+    expect(res.status).toBe(200);
+    const byId = new Map((res.json as Scout[]).map((s) => [s.id, s.gaps]));
+    expect(byId.get(failed.id)).toBeNull();
+    expect(byId.get(empty.id)).toEqual([]);
+    expect(byId.get(found.id)).toEqual(gaps);
+  });
+});
+
 describe('GET /api/events', () => {
   it('lists the events of no Run, newest first, paged with before and limit', async () => {
     h = await harness();
@@ -1218,7 +1250,7 @@ github:
 
     // A scout proposes two issues; the low-risk one is accepted and becomes Run D.
     hh.scripts.scout = () => ({
-      structured: { proposals: [proposal('低风险', 'low'), proposal('中风险', 'mid')] },
+      structured: { gaps: [], proposals: [proposal('低风险', 'low'), proposal('中风险', 'mid')] },
       costUsd: 0.3,
     });
     const scout = await hh.master.issues.startScout('demo', 'manual');
@@ -1467,7 +1499,7 @@ github:
 
     // Two scouts: one with a cost, one that reports none.
     const costs = [0.3, undefined];
-    hh.scripts.scout = () => ({ structured: { proposals: [] }, costUsd: costs.shift() });
+    hh.scripts.scout = () => ({ structured: { gaps: [], proposals: [] }, costUsd: costs.shift() });
     for (let i = 0; i < 2; i++) {
       const scout = await hh.master.issues.startScout('demo', 'manual');
       // Also wait for the scout to delete its temporary worktree: until then the repo is busy.

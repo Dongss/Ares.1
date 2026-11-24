@@ -5,6 +5,8 @@ import {
   autoAcceptText,
   budgetText,
   CATEGORY,
+  gapsByGoal,
+  gapsHeading,
   issuesUrl,
   proposalKindsText,
   RISK,
@@ -127,6 +129,37 @@ describe('issues display', () => {
         message: '等正在执行的工作做完再升级',
       }),
     ).toBe('有新版本，等待中（aaaaaaa → bbbbbbb）：等正在执行的工作做完再升级');
+  });
+});
+
+describe("a scout's gap analysis", () => {
+  afterEach(() => setLang('zh'));
+
+  const gaps = [
+    { goal: '永动', gap: '同一时间只跑一个 Run', evidence: ['src/engine/engine.ts:421'] },
+    { goal: '适用于构建任何项目', gap: '内置的 CLI 只有两种', evidence: ['src/master.ts'] },
+    { goal: ' 永动 ', gap: '模板的 planning: llm 没有实现', evidence: ['a.ts:1', 'b.ts:2'] },
+  ];
+
+  it('groups the gaps by goal, in the order the goals first come', () => {
+    expect(gapsByGoal(gaps)).toEqual([
+      { goal: '永动', gaps: [gaps[0], gaps[2]] },
+      { goal: '适用于构建任何项目', gaps: [gaps[1]] },
+    ]);
+    expect(gapsByGoal([])).toEqual([]);
+  });
+
+  it('heads it with the counts, and tells a scout without one from one that found nothing', () => {
+    expect(gapsHeading(gaps)).toBe('差距分析：3 个缺口，涉及 2 个目标');
+    expect(gapsHeading([])).toBe('差距分析：没有找到能力缺口');
+    expect(gapsHeading(null)).toBeNull();
+  });
+
+  it('says so in English, with one gap or more', () => {
+    setLang('en');
+    expect(gapsHeading(gaps)).toBe('Gap analysis: 3 gaps across 2 goals');
+    expect(gapsHeading(gaps.slice(0, 1))).toBe('Gap analysis: 1 gap across 1 goal');
+    expect(gapsHeading([])).toBe('Gap analysis: no capability gaps found');
   });
 });
 

@@ -1,6 +1,6 @@
 import type { GitHubRepoStatus, GitHubStatus, UpgradeStatus } from '../../../src/api/types.js';
 import { t } from '../../../src/i18n.js';
-import type { Scout } from '../../../src/store/types.js';
+import type { Scout, ScoutGap } from '../../../src/store/types.js';
 import { Badge, Empty, ErrorBox } from '../components/ui.js';
 import { api } from '../lib/api.js';
 import { formatCost, formatTime } from '../lib/format.js';
@@ -9,6 +9,8 @@ import {
   autoAcceptText,
   budgetText,
   CATEGORY,
+  gapsByGoal,
+  gapsHeading,
   issuesUrl,
   RISK,
   SCOUT_STATUS,
@@ -404,6 +406,41 @@ function ScoutCard({ scout }: { scout: Scout }) {
           ))}
         </ul>
       )}
+      <GapAnalysis gaps={scout.gaps} />
     </section>
+  );
+}
+
+/**
+ * What the scout found the project cannot do yet, by README goal, with the evidence: the direction
+ * it judged before proposing. Folded, so that the list of scouts stays short.
+ */
+function GapAnalysis({ gaps }: { gaps: ScoutGap[] | null }) {
+  const heading = gapsHeading(gaps);
+  if (heading === null) return null;
+  if (!gaps || gaps.length === 0) return <div className="muted gaps-none">{heading}</div>;
+  return (
+    <details className="gaps">
+      <summary>{heading}</summary>
+      {gapsByGoal(gaps).map((group) => (
+        <div key={group.goal} className="gap-goal">
+          <div className="gap-goal-name">{group.goal}</div>
+          <ul>
+            {group.gaps.map((g, i) => (
+              // biome-ignore lint/suspicious/noArrayIndexKey: a recorded list that never changes
+              <li key={i}>
+                {g.gap}
+                <ul className="gap-evidence">
+                  {g.evidence.map((e, j) => (
+                    // biome-ignore lint/suspicious/noArrayIndexKey: a recorded list that never changes
+                    <li key={j}>{e}</li>
+                  ))}
+                </ul>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ))}
+    </details>
   );
 }

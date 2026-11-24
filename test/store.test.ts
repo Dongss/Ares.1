@@ -83,6 +83,42 @@ describe('store', () => {
     expect(readdirSync(dir).filter((f) => f.includes('.bak-v1-'))).toHaveLength(1);
   });
 
+  it("keeps a scout's gap analysis, and has none for scouts recorded before there was one", () => {
+    const dir = tmpDir('ares1-db-');
+    const file = join(dir, 'ares1.db');
+    const old = new DatabaseSync(file);
+    for (const m of MIGRATIONS.slice(0, 6)) old.exec(m);
+    old.exec('PRAGMA user_version = 6');
+    old.exec(`
+      INSERT INTO repos (id, name, path, target_branch, created_at) VALUES ('r', 'r', '/r', 'main', 't');
+      INSERT INTO scouts (id, repo_id, issues_repo, trigger, status, agent_id, log_path, started_at)
+        VALUES ('old', 'r', 'me/r', 'manual', 'completed', 's', '/l', 't');
+    `);
+    old.close();
+
+    const store = new Store(file);
+    expect(store.getScout('old')).toMatchObject({ proposals: [], gaps: null });
+    const scout = store.createScout({
+      repoId: 'r',
+      issuesRepo: 'me/r',
+      trigger: 'manual',
+      agentId: 's',
+      model: null,
+      logPath: '/l',
+    });
+    // Not answered yet.
+    expect(scout.gaps).toBeNull();
+    const gaps = [
+      { goal: '永动', gap: '同一时间只跑一个 Run', evidence: ['src/engine/engine.ts:421'] },
+    ];
+    store.updateScout(scout.id, { gaps });
+    expect(store.getScout(scout.id).gaps).toEqual(gaps);
+    // Found no gap: an empty analysis, not none.
+    store.updateScout(scout.id, { gaps: [] });
+    expect(store.getScout(scout.id).gaps).toEqual([]);
+    store.close();
+  });
+
   it('round-trips JSON and boolean columns', () => {
     const store = new Store(':memory:');
     const { repo, mk } = seed(store);

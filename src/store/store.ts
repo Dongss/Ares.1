@@ -41,7 +41,7 @@ const JSON_COLUMNS: Partial<Record<Table, readonly string[]>> = {
   repos: ['verify_commands', 'setup_commands'],
   runs: ['template', 'overrides', 'blocked', 'issue', 'discussion'],
   attempts: ['structured'],
-  scouts: ['proposals'],
+  scouts: ['proposals', 'gaps'],
 };
 const BOOL_COLUMNS: Partial<Record<Table, readonly string[]>> = {
   check_results: ['passed'],
@@ -1088,7 +1088,7 @@ export class Store {
   createScout(
     input: Omit<
       Scout,
-      'id' | 'status' | 'proposals' | 'costUsd' | 'error' | 'startedAt' | 'endedAt'
+      'id' | 'status' | 'proposals' | 'gaps' | 'costUsd' | 'error' | 'startedAt' | 'endedAt'
     >,
   ): Scout {
     const scout: Scout = {
@@ -1096,6 +1096,7 @@ export class Store {
       id: newId('scout'),
       status: 'running',
       proposals: [],
+      gaps: null,
       costUsd: null,
       error: null,
       startedAt: nowIso(),

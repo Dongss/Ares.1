@@ -1207,6 +1207,35 @@ button.flow-stage-body:hover:not(:disabled) {
 .proposals li {
   margin: 4px 0;
 }
+.gaps,
+.gaps-none {
+  margin-top: 10px;
+  font-size: 13px;
+}
+.gaps summary {
+  cursor: pointer;
+  color: var(--text-2);
+}
+.gap-goal {
+  margin-top: 8px;
+}
+.gap-goal-name {
+  font-weight: 600;
+}
+.gap-goal > ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+.gap-goal li {
+  margin: 4px 0;
+}
+.gap-evidence {
+  margin: 2px 0 0;
+  padding-left: 16px;
+  color: var(--text-2);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
 .error-text {
   color: var(--danger);
   font-size: 12px;

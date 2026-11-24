@@ -4,8 +4,13 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { storedRunTimes } from '../src/engine/times.js';
 import type { GhIssue } from '../src/github/client.js';
-import { markComment, RETRIES_EXHAUSTED_MARKER } from '../src/github/issues.js';
-import { issueDigest, runDigest, scoutPrompt } from '../src/github/scout.js';
+import {
+  FOOTER_MARKER,
+  markComment,
+  proposalBody,
+  RETRIES_EXHAUSTED_MARKER,
+} from '../src/github/issues.js';
+import { issueDigest, nextSteps, runDigest, scoutPrompt } from '../src/github/scout.js';
 import { setLang } from '../src/i18n.js';
 import type { Run, RunStatus } from '../src/store/types.js';
 import type { UpgradeFailure } from '../src/upgrade/upgrader.js';
@@ -29,6 +34,17 @@ afterEach(async () => {
 });
 
 const digest = (hh: Harness) => runDigest(hh.master.store, hh.repo.id);
+
+/** The first lead of a prompt: the problems that stop the system. */
+const firstLead = (text: string) => text.split('\n').find((l) => l.startsWith('1. ')) ?? '';
+
+/** The part of a prompt from `heading` to the next heading. */
+const section = (text: string, heading: string) => {
+  const start = text.indexOf(`\n${heading}\n`);
+  expect(start).toBeGreaterThanOrEqual(0);
+  const end = text.indexOf('\n## ', start + 1);
+  return text.slice(start + 1, end < 0 ? undefined : end);
+};
 
 /** A closed issue by the repo's owner "me", done unless `extra` says otherwise. */
 const issue = (number: number, title: string, extra: Partial<GhIssue> = {}): GhIssue => ({
@@ -1030,7 +1046,9 @@ describe('scoutPrompt', () => {
     expect(prompt).toContain('读 README.md 和 AGENTS.md');
     expect(prompt).toContain('README.md 写着项目的目标，是一切决定的依据');
     expect(prompt).toContain('提案要服务于 README.md 里的目标');
-    expect(prompt).toContain('README.md 里的目标还没达到的地方');
+    expect(prompt).toContain(
+      '先对照 README.md 里的每个目标，在能力层面列出这个项目现在还做不到什么',
+    );
     expect(prompt).not.toContain('当前方向');
   });
 
@@ -1049,18 +1067,79 @@ describe('scoutPrompt', () => {
     expect(prompt).toContain('## 已有的 issue\n（无）');
   });
 
-  it('takes the suggestions of passed reviews as leads, to be checked in the code first', () => {
-    const clue = prompt.split('\n').find((l) => l.startsWith('1. '));
+  it('takes the suggestions of passed reviews as the last leads, to be checked and merged', () => {
+    const clue = prompt.split('\n').find((l) => l.startsWith('4. '));
     expect(clue).toContain('评审通过时给的建议是评审有意留到以后的改进');
-    expect(clue).toContain(
-      '可以作为提案的来源，但要先到代码里核对它是否仍然存在、是否已经有 issue 覆盖',
-    );
+    expect(clue).toContain('对最近合并的改动还能再修一修的地方也归在这一类');
+    expect(clue).toContain('要先到代码里核对它是否仍然存在、是否已经有 issue 覆盖');
+    expect(clue).toContain('相关的几条合成一条提案，不要一条建议提一条');
+    expect(prompt.split('\n').find((l) => l.startsWith('1. '))).not.toContain('评审通过时');
   });
 
   it('counts the time with work switched off as waiting for a human, not the queue', () => {
     const clue = prompt.split('\n').find((l) => l.startsWith('1. '));
     expect(clue).toContain(
       '用时里「停工」「等审批」「卡住等人」「暂停」的部分是在等人处理，「排队」的部分是在等别的 Run 做完（也包括等升级、Master 没运行的时候）',
+    );
+  });
+
+  it('asks for a gap analysis against the goals before the leads, into gaps', () => {
+    const gaps = section(prompt, '## 先做差距分析');
+    expect(prompt.indexOf('## 先做差距分析')).toBeLessThan(prompt.indexOf('## 线索'));
+    expect(gaps).toContain('在能力层面列出这个项目现在还做不到什么，写进结果的 gaps');
+    expect(gaps).toContain('不是零碎的缺陷');
+    expect(gaps).toContain('能不能并行');
+    expect(gaps).toContain('出了问题能不能自己恢复');
+    expect(gaps).toContain(
+      'goal 是 README.md 里的哪个目标（照 README 的说法简短写），gap 是缺什么能力，evidence 是限制这个能力的代码位置（文件:行号）或 README、文档里的段落',
+    );
+    expect(gaps).toContain('最重要的缺口放在最前');
+  });
+
+  it('orders the leads: stopping the system, capability gaps, bugs, then polish', () => {
+    const leads = section(prompt, '## 线索（按优先级从高到低）')
+      .split('\n')
+      .filter((l) => /^\d\. /.test(l));
+    expect(leads).toHaveLength(4);
+    expect(leads[0]).toMatch(
+      /^1\. 让系统停转或空耗的问题：下面附的最近 Run 里卡住、失败、反复返工/,
+    );
+    // No failed upgrade to fix: not mentioned.
+    expect(leads[0]).not.toContain('升级失败');
+    expect(leads[1]).toBe('2. 差距分析里最重要的能力缺口。');
+    expect(leads[2]).toMatch(/^3\. 明显的缺陷和测试缺口/);
+    expect(leads[3]).toMatch(/^4\. 评审建议和对最近改动的修饰/);
+  });
+
+  it('asks for at least one capability and at most one polish, stopping the system first', () => {
+    const mix = section(prompt, '## 提案的配比');
+    expect(mix).toContain('第 1 类问题优先：有就先提；条数上限放不下时，以第 1 类为先');
+    expect(mix).toContain(
+      '第 1 类之外，只要差距分析里有缺口，至少有一条提案是补能力的：category 为 feature',
+    );
+    expect(mix).toContain('而不是对最近改动的修补');
+    expect(mix).toContain('第 4 类每次最多一条');
+  });
+
+  it('splits a large capability into steps, proposing the first and listing the rest', () => {
+    const split = section(prompt, '## 拆一个大能力');
+    expect(split).toContain('每一步都能单独合并，合并后系统照常可用，并且实际推进了这个能力');
+    expect(split).toContain('不能只是空壳');
+    expect(split).toContain('这次只提第一步，size 尽量是 S 或 M');
+    expect(split).toContain('what 的末尾单独起一行写「后续步骤：」');
+    expect(split).toContain(
+      '列着「后续步骤」、而且已完成（前一步已经合并）的，优先考虑提它的下一步',
+    );
+    expect(split).toContain('可以提它能独立合并的第一步，在 why 里注明对应哪条 issue，这不算重复');
+    // L only once splitting that way does not work.
+    expect(prompt).toContain(
+      '太大的按上面「拆一个大能力」的做法拆开，只提第一步；那样也拆不开的，才把 size 标为 L',
+    );
+  });
+
+  it('takes a goal of README and the code that limits it as evidence of a gap', () => {
+    expect(section(prompt, '## 要求')).toContain(
+      '补能力的提案不需要有出错的 Run：README.md 里的目标加上限制这个能力的代码位置就是证据',
     );
   });
 });
@@ -1080,7 +1159,7 @@ describe('scoutPrompt: failed upgrade of the Master', () => {
 
   it('leaves the prompt as it was without a failed upgrade', () => {
     expect(prompt(null)).toBe(prompt());
-    expect(prompt()).not.toContain('自动升级失败');
+    expect(prompt()).not.toContain('## Master 自动升级');
   });
 
   it('lists the failed commit, the message and the end of the output before the Runs', () => {
@@ -1140,6 +1219,8 @@ describe('scoutPrompt: failed upgrade of the Master', () => {
     expect(text).toContain('所以修复它是最高优先级，排在上面所有线索之前');
     expect(text).toContain('把修复作为第一条提案');
     expect(text).not.toContain('因运行环境失败');
+    // Among the problems that stop the system.
+    expect(firstLead(text)).toMatch(/的，以及下面的「Master 自动升级失败」。用时里/);
   });
 
   it('tells the scout not to spend a proposal on a failure of the environment', () => {
@@ -1164,6 +1245,7 @@ describe('scoutPrompt: failed upgrade of the Master', () => {
     expect(section).toContain('所以不要为此提代码修复，也不要把它排在上面的线索前面');
     expect(section).toContain('只有输出表明仓库里的脚本（比如 `scripts/find-node.sh`');
     expect(section).toContain('已有的 issue 已经覆盖时不要重复提');
+    expect(firstLead(text)).not.toContain('升级失败');
   });
 
   it('tells it in English too, with no Chinese left', () => {
@@ -1197,6 +1279,7 @@ describe('scoutPrompt: failed upgrade of the Master', () => {
       'a defect in a script of the repo itself (such as `scripts/find-node.sh`',
     );
     expect(text.indexOf('because of the environment')).toBeLessThan(text.indexOf('## Recent Runs'));
+    expect(firstLead(text)).not.toContain('failed upgrade');
 
     const code = english(false);
     expect(code).toBe(english());
@@ -1204,6 +1287,9 @@ describe('scoutPrompt: failed upgrade of the Master', () => {
     expect(code).toContain("## The Master's automatic upgrade failed\n");
     expect(code).toContain('fixing it comes first, before all the leads above');
     expect(code).not.toContain("This failure is the environment's");
+    expect(firstLead(code)).toMatch(
+      /agent time, and the Master's failed upgrade below\. In the times/,
+    );
   });
 });
 
@@ -1221,13 +1307,94 @@ describe('scout in English', () => {
     expect(prompt).toContain('## Recent Runs\n(no Runs yet)');
     const clue = prompt.split('\n').find((l) => l.startsWith('1. '));
     expect(clue).toContain(
-      'The suggestions given by a review that passed are improvements the reviewer left for later on purpose',
-    );
-    expect(clue).toContain(
-      'first check in the code that each one is still there and that no existing issue covers it',
-    );
-    expect(clue).toContain(
       '"Work switched off", "Awaiting approval", "Stuck, waiting for a human" and "Paused" are time spent waiting for a human, and "Queued" is time spent waiting for other Runs to finish (including while an upgrade is pending or the Master is not running)',
+    );
+    const polish = prompt.split('\n').find((l) => l.startsWith('4. '));
+    expect(polish).toContain(
+      'the suggestions given by a review that passed are improvements the reviewer left for later on purpose',
+    );
+    expect(polish).toContain(
+      'First check in the code that each one is still there and that no existing issue covers it',
+    );
+  });
+
+  it('has the gap analysis, the leads, the mix and the next steps in English too', () => {
+    setLang('en');
+    const prompt = scoutPrompt({ repoName: 'demo', max: 3, runs: '(no Runs yet)', issues: '' });
+    const zh = (() => {
+      setLang('zh');
+      const text = scoutPrompt({ repoName: 'demo', max: 3, runs: '', issues: '' });
+      setLang('en');
+      return text;
+    })();
+    // The same sections, in the same order.
+    const headings = (text: string) => text.split('\n').filter((l) => l.startsWith('## '));
+    expect(headings(prompt)).toEqual([
+      '## First, get the direction',
+      '## First, a gap analysis',
+      '## Leads (highest priority first)',
+      '## Mix of proposals',
+      '## Splitting a large capability',
+      '## Requirements',
+      '## Recent Runs',
+      '## Existing issues',
+    ]);
+    expect(headings(zh)).toHaveLength(headings(prompt).length);
+
+    const gaps = section(prompt, '## First, a gap analysis');
+    expect(gaps).toContain(
+      'go through each goal in README.md and list, as capabilities, what the project cannot do yet; put them in the gaps of your answer',
+    );
+    expect(gaps).toContain('not scattered bugs');
+    expect(gaps).toContain('whether it can do things in parallel');
+    expect(gaps).toContain('whether it can recover by itself when something goes wrong');
+    expect(gaps).toContain(
+      'goal: the goal in README.md (named briefly, as README.md names it); gap: the missing capability; evidence: where the code limits this capability (file:line), or passages of README or other documents',
+    );
+    expect(gaps).toContain('Put the most important gaps first');
+
+    const leads = section(prompt, '## Leads (highest priority first)')
+      .split('\n')
+      .filter((l) => /^\d\. /.test(l));
+    expect(leads).toHaveLength(4);
+    expect(leads[0]).toMatch(
+      /^1\. Problems that stop the system or make it spin without progress: Runs below that got stuck, failed, needed rework again and again/,
+    );
+    expect(leads[0]).not.toContain('failed upgrade');
+    expect(leads[1]).toBe('2. The most important capability gaps from your gap analysis.');
+    expect(leads[2]).toMatch(/^3\. Obvious bugs and gaps in tests/);
+    expect(leads[3]).toMatch(/^4\. Review suggestions and polish of recent changes/);
+    expect(leads[3]).toContain(
+      'merge related ones into one proposal rather than proposing each suggestion on its own',
+    );
+
+    const mix = section(prompt, '## Mix of proposals');
+    expect(mix).toContain(
+      'Problems of lead 1 come first: propose them before anything else, and when the limit leaves no room for more, they take it',
+    );
+    expect(mix).toContain(
+      'Besides lead 1, as long as your gap analysis found a gap, at least one proposal must add a capability: category feature',
+    );
+    expect(mix).toContain('not patching a recent change');
+    expect(mix).toContain('At most one proposal from lead 4 per scout');
+
+    const split = section(prompt, '## Splitting a large capability');
+    expect(split).toContain(
+      'Each step must be mergeable on its own, leave the system working as usual once merged, and actually advance the capability, not be an empty shell',
+    );
+    expect(split).toContain('Propose only the first step now, preferably of size S or M');
+    expect(split).toContain(
+      'End what with a line of its own reading "Next steps:" (not a heading)',
+    );
+    expect(split).toContain(
+      'when an issue lists "Next steps" and is done (its step was merged), consider its next step first',
+    );
+    expect(split).toContain('saying in why which issue it belongs to; that is not a duplicate');
+    expect(prompt).toContain(
+      'Split anything too large as described in "Splitting a large capability" and propose only its first step; only if it cannot be split even that way, set its size to L',
+    );
+    expect(section(prompt, '## Requirements')).toContain(
+      'A proposal that adds a capability needs no failed Run: a goal in README.md together with where the code limits the capability is evidence',
     );
   });
 
@@ -1358,6 +1525,129 @@ describe('issueDigest: older issues closed as not planned could not be fetched',
         '- #4 Done: Finished',
         '',
         '(Older issues closed as not planned could not be fetched this time; only the recently closed ones are listed above. Requirements turned down earlier are not here, so be careful with any proposal that may have been rejected before.)',
+      ].join('\n'),
+    );
+    expect(digest).not.toMatch(/[一-鿿]/);
+  });
+});
+
+describe('issueDigest: next steps of a large capability', () => {
+  afterEach(() => setLang('zh'));
+
+  /** A proposal's body as the Master files it, its what ending in next steps. */
+  const filed = (what: string) =>
+    proposalBody(
+      {
+        title: 'x',
+        category: 'feature',
+        size: 'M',
+        risk: 'mid',
+        why: '同一时间只能跑一个 Run',
+        evidence: ['src/engine/engine.ts:421'],
+        what,
+        acceptance: ['测试通过'],
+      },
+      'scout_1',
+      true,
+    );
+  const STEPS =
+    '先让引擎能同时跑两个 Run。\n\n后续步骤：\n1. 按仓库限制并行数\n2. 看板显示并行的 Run';
+
+  it('lists the next steps of done and open issues under their lines', () => {
+    const digest = issueDigest(
+      [issue(9, '并行的第二步', { state: 'open', stateReason: null, body: filed(STEPS) })],
+      [issue(8, '并行的第一步', { body: filed(STEPS) }), issue(7, '没有后续步骤的')],
+      'me',
+    );
+    expect(digest).toBe(
+      [
+        '### 未关闭',
+        '- #9 并行的第二步',
+        '  后续步骤：',
+        '    1. 按仓库限制并行数',
+        '    2. 看板显示并行的 Run',
+        '',
+        '### 最近关闭',
+        '- #8 已完成：并行的第一步',
+        '  后续步骤：',
+        '    1. 按仓库限制并行数',
+        '    2. 看板显示并行的 Run',
+        '- #7 已完成：没有后续步骤的',
+      ].join('\n'),
+    );
+  });
+
+  it('leaves out the next steps of issues by strangers, and of issues not done', () => {
+    const failed = markComment(`失败了 3 次\n\n${RETRIES_EXHAUSTED_MARKER}`);
+    const digest = issueDigest(
+      [
+        issue(4, '陌生人的', {
+          state: 'open',
+          stateReason: null,
+          body: filed(STEPS),
+          author: 'mallory',
+          authorAssociation: 'NONE',
+        }),
+      ],
+      [
+        issue(3, '陌生人完成的', {
+          body: filed(STEPS),
+          author: 'mallory',
+          authorAssociation: 'CONTRIBUTOR',
+        }),
+        issue(2, '被拒的', { stateReason: 'not_planned', body: filed(STEPS) }),
+        issue(1, '失败的', {
+          stateReason: 'not_planned',
+          body: filed(STEPS),
+          comments: [{ body: failed, author: 'me', authorAssociation: 'OWNER' }],
+        }),
+      ],
+      'me',
+    );
+    expect(digest).not.toContain('后续步骤');
+    expect(digest).not.toContain('陌生人');
+    expect(digest).toContain('- #2 不做：被拒的\n');
+  });
+
+  it('reads them as a heading, a bold line or inline, in either language', () => {
+    expect(nextSteps('## Next steps\n- B\n### 细节\n- C\n## Other\n- D')).toEqual([
+      '- B',
+      '### 细节',
+      '- C',
+    ]);
+    expect(nextSteps('做 A\n\n**后续步骤**\n1. B\n\n2. C')).toEqual(['1. B', '2. C']);
+    expect(nextSteps('**后续步骤：** 先 B，再 C')).toEqual(['先 B，再 C']);
+    expect(nextSteps('next steps: B, then C')).toEqual(['B, then C']);
+    // A line that only starts with the words is not the heading.
+    expect(nextSteps('后续步骤还没想好\n- B')).toEqual([]);
+    expect(nextSteps('Next steps are unclear')).toEqual([]);
+    // An empty part, or none.
+    expect(nextSteps('后续步骤：\n\n### 验收标准\n- 通过')).toEqual([]);
+    expect(nextSteps('做 A')).toEqual([]);
+  });
+
+  it('stops at the footer of a proposal, and keeps at most 600 characters', () => {
+    const body = filed(`做 A\n\n后续步骤：\n${'步'.repeat(500)}\n${'骤'.repeat(500)}\n- 不会出现`);
+    const steps = nextSteps(body);
+    expect(steps).toEqual(['步'.repeat(500), `${'骤'.repeat(100)}…`]);
+    // The acceptance criteria come under their own heading and are not part of it.
+    expect(nextSteps(filed(STEPS))).toEqual(['1. 按仓库限制并行数', '2. 看板显示并行的 Run']);
+    expect(nextSteps(`后续步骤：\n- B\n\n${FOOTER_MARKER}\n---\n- 页脚`)).toEqual(['- B']);
+  });
+
+  it('says so in English', () => {
+    setLang('en');
+    const what = 'Let the engine run two Runs at once.\n\nNext steps:\n1. Limit them per repo';
+    const digest = issueDigest([], [issue(8, 'First step', { body: filed(what) })], 'me');
+    expect(digest).toBe(
+      [
+        '### Open',
+        '(none)',
+        '',
+        '### Recently closed',
+        '- #8 Done: First step',
+        '  Next steps:',
+        '    1. Limit them per repo',
       ].join('\n'),
     );
     expect(digest).not.toMatch(/[一-鿿]/);

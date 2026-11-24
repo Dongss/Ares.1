@@ -1523,10 +1523,10 @@ export class IssueBridge {
             }),
         );
       }
-      const proposals = parseScoutReport(result.structured, result.finalMessage).slice(
-        0,
-        scoutCfg.max_proposals,
-      );
+      const report = parseScoutReport(result.structured, result.finalMessage);
+      const proposals = report.proposals.slice(0, scoutCfg.max_proposals);
+      // Kept before the issues are filed, so that a scout cut short there still shows them.
+      store.updateScout(scout.id, { gaps: report.gaps });
       const created = await this.fileProposals(scout, repo, cfg, proposals);
       store.tx(() => {
         store.updateScout(scout.id, { status: 'completed', proposals, endedAt: nowIso() });

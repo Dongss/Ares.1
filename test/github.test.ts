@@ -121,6 +121,16 @@ const proposal = (title: string, risk: 'low' | 'mid' | 'high', size: 'S' | 'M' |
   acceptance: ['测试通过'],
 });
 
+/** A gap analysis as a scout gives it. */
+const GAPS = [
+  {
+    goal: '永动',
+    gap: '整个 Master 同一时间只跑一个 Run',
+    evidence: ['src/engine/engine.ts:421', 'README.md：永动'],
+  },
+  { goal: '适用于构建任何项目', gap: '内置的 CLI 只有两种', evidence: ['src/master.ts'] },
+];
+
 let h: Harness | undefined;
 let gh: FakeGitHub;
 
@@ -469,6 +479,7 @@ describe('issues: scout', () => {
       expect(ctx.input.env.GH_CONFIG_DIR).toBe(t.master.paths.agentGhConfigDir);
       return {
         structured: {
+          gaps: GAPS,
           proposals: [
             proposal('低风险的', 'low'),
             proposal('高风险的', 'high'),
@@ -483,6 +494,10 @@ describe('issues: scout', () => {
     const done = await scoutDone(t, scout.id);
     expect(done.status).toBe('completed');
     expect(done.costUsd).toBe(1.5);
+    // The gap analysis is kept as the scout gave it, and the dashboard gets it.
+    expect(done.gaps).toEqual(GAPS);
+    const listed = (await (await t.master.app.request('/api/scouts')).json()) as Scout[];
+    expect(listed.find((s) => s.id === scout.id)?.gaps).toEqual(GAPS);
     expect(done.proposals.map((p) => p.issue?.number)).toEqual([3, 4, 5]);
 
     // Only the first low-risk one: high risk, and over today's limit of 1.
@@ -518,6 +533,7 @@ describe('issues: scout', () => {
     const dir = join(homedir(), '.ares1', 'worktrees', 'scouts', 'x');
     t.scripts.scout = () => ({
       structured: {
+        gaps: [],
         proposals: [
           {
             ...proposal(`修 ${dir}/a.ts 的报错`, 'high'),
@@ -562,7 +578,7 @@ describe('issues: scout', () => {
     await t.master.issues.poll();
     expect(t.master.store.listRuns()[0]?.blocked?.kind).toBe('untrusted_issue');
 
-    t.scripts.scout = () => ({ structured: { proposals: [] } });
+    t.scripts.scout = () => ({ structured: { gaps: [], proposals: [] } });
     const scout = await t.master.issues.startScout('demo', 'manual');
     await scoutDone(t, scout.id);
     const prompt = t.fake.calls.at(-1)?.prompt ?? '';
@@ -572,6 +588,32 @@ describe('issues: scout', () => {
     expect(prompt).toContain('#6（issue 的作者不是仓库成员，也没有人确认过，内容不列出）');
     expect(prompt).not.toContain('陌生人');
     expect(prompt).not.toContain('删掉 README');
+  });
+
+  it('shows the scout the next steps of a done step, not those of strangers', async () => {
+    const t = await start();
+    const steps = (first: string) =>
+      `${first}\n\n后续步骤：\n1. 按仓库限制并行数\n2. 看板显示并行的 Run`;
+    const done = gh.add({ title: '并行跑 Run 的第一步', body: steps('让引擎同时跑两个 Run') });
+    done.state = 'closed';
+    done.stateReason = 'completed';
+    const theirs = gh.add({
+      title: '陌生人的第一步',
+      body: steps('陌生人的做法'),
+      author: STRANGER,
+    });
+    theirs.state = 'closed';
+    theirs.stateReason = 'completed';
+
+    t.scripts.scout = () => ({ structured: { gaps: [], proposals: [] } });
+    const scout = await t.master.issues.startScout('demo', 'manual');
+    await scoutDone(t, scout.id);
+    const prompt = t.fake.calls.at(-1)?.prompt ?? '';
+    expect(prompt).toContain(
+      '- #1 已完成：并行跑 Run 的第一步\n  后续步骤：\n    1. 按仓库限制并行数\n    2. 看板显示并行的 Run',
+    );
+    expect(prompt.match(/按仓库限制并行数/g)).toHaveLength(1);
+    expect(prompt).not.toContain('陌生人');
   });
 
   it('keeps issues rejected before the latest 30 closed ones in sight, with their reasons', async () => {
@@ -597,7 +639,7 @@ describe('issues: scout', () => {
     gh.commentAs(5, STRANGER, '陌生人自己的理由');
     gh.commentAs(20, OWNER, '重复了');
 
-    t.scripts.scout = () => ({ structured: { proposals: [] } });
+    t.scripts.scout = () => ({ structured: { gaps: [], proposals: [] } });
     const scout = await t.master.issues.startScout('demo', 'manual');
     expect((await scoutDone(t, scout.id)).status).toBe('completed');
     expect(gh.calls).toContain('list not_planned');
@@ -644,7 +686,9 @@ describe('issues: scout', () => {
     expect(streak()).toBe(1);
 
     gh.failing.set('list not_planned', 'API rate limit exceeded for search');
-    t.scripts.scout = () => ({ structured: { proposals: [proposal('新的需求', 'high')] } });
+    t.scripts.scout = () => ({
+      structured: { gaps: [], proposals: [proposal('新的需求', 'high')] },
+    });
     const scout = await t.master.issues.startScout('demo', 'manual');
     const done = await scoutDone(t, scout.id);
     expect(gh.calls).toContain('list not_planned');
@@ -674,7 +718,7 @@ describe('issues: scout', () => {
 
     // The search works again: the older rejection is back, and no word of a failure.
     gh.failing.clear();
-    t.scripts.scout = () => ({ structured: { proposals: [] } });
+    t.scripts.scout = () => ({ structured: { gaps: [], proposals: [] } });
     const next = await t.master.issues.startScout('demo', 'manual');
     expect((await scoutDone(t, next.id)).status).toBe('completed');
     const again = t.fake.calls.at(-1)?.prompt ?? '';
@@ -686,7 +730,9 @@ describe('issues: scout', () => {
   it('records no search failure when listing the issues fails too and the scout fails', async () => {
     const t = await start();
     const store = t.master.store;
-    t.scripts.scout = () => ({ structured: { proposals: [proposal('新的需求', 'high')] } });
+    t.scripts.scout = () => ({
+      structured: { gaps: [], proposals: [proposal('新的需求', 'high')] },
+    });
     for (const call of ['list open', 'list closed']) {
       gh.failing.clear();
       gh.failing.set(call, `GitHub 不可用（${call}）`);
@@ -713,7 +759,9 @@ describe('issues: scout', () => {
   it('still fails the scout when listing the open or the latest closed issues fails', async () => {
     const t = await start();
     const store = t.master.store;
-    t.scripts.scout = () => ({ structured: { proposals: [proposal('新的需求', 'high')] } });
+    t.scripts.scout = () => ({
+      structured: { gaps: [], proposals: [proposal('新的需求', 'high')] },
+    });
     for (const call of ['list open', 'list closed']) {
       gh.failing.clear();
       gh.failing.set(call, `GitHub 不可用（${call}）`);
@@ -778,7 +826,7 @@ describe('issues: scout', () => {
     );
     h = await start();
     const t = h;
-    t.scripts.scout = () => ({ structured: { proposals: [] } });
+    t.scripts.scout = () => ({ structured: { gaps: [], proposals: [] } });
     const scoutPromptNow = async () => {
       const scout = await t.master.issues.startScout('demo', 'manual');
       await scoutDone(t, scout.id);
@@ -829,7 +877,7 @@ describe('issues: scout', () => {
   it('stops auto-accepting once the daily budget is spent', async () => {
     const t = await start(config({ maxPerDay: 5 }));
     t.scripts.scout = () => ({
-      structured: { proposals: [proposal('低风险的', 'low')] },
+      structured: { gaps: [], proposals: [proposal('低风险的', 'low')] },
       costUsd: 25,
     });
     const scout = await t.master.issues.startScout('demo', 'manual');
@@ -840,7 +888,7 @@ describe('issues: scout', () => {
 
   it('scouts by itself when idle, but not while proposals wait for a human', async () => {
     const t = await start(config({ auto: true }));
-    t.scripts.scout = () => ({ structured: { proposals: [] }, costUsd: 0.1 });
+    t.scripts.scout = () => ({ structured: { gaps: [], proposals: [] }, costUsd: 0.1 });
     for (const title of ['a', 'b', 'c']) gh.add({ title, labels: [LABELS.proposal] });
     await t.master.issues.poll();
     expect(t.master.store.listScouts()).toHaveLength(0);
@@ -859,6 +907,7 @@ describe('issues: scout', () => {
     let n = 0;
     t.scripts.scout = () => ({
       structured: {
+        gaps: [],
         proposals: n++ === 0 ? ['甲', '乙', '丙'].map((title) => proposal(title, 'low', 'L')) : [],
       },
       costUsd: 0.1,
@@ -905,7 +954,9 @@ describe('issues: scout', () => {
   it('scouts again right away while it keeps finding work', async () => {
     const t = await start(config({ auto: true }));
     let n = 0;
-    t.scripts.scout = () => ({ structured: { proposals: [proposal(`需求 ${++n}`, 'mid')] } });
+    t.scripts.scout = () => ({
+      structured: { gaps: [], proposals: [proposal(`需求 ${++n}`, 'mid')] },
+    });
     await t.master.issues.poll();
     await scoutDone(t, t.master.store.listScouts()[0]?.id ?? '');
     await t.master.issues.poll();
@@ -934,9 +985,9 @@ describe('issues: scout', () => {
       expect(first).toMatchObject({ status: 'completed', proposals: [], trigger: 'auto' });
       return { t, first };
     }
-    const nothing: Script = () => ({ structured: { proposals: [] } });
+    const nothing: Script = () => ({ structured: { gaps: [], proposals: [] } });
     const broken: Script = () => ({ structured: { proposals: [{ title: '缺字段' }] } });
-    const work: Script = () => ({ structured: { proposals: [proposal('有活', 'mid')] } });
+    const work: Script = () => ({ structured: { gaps: [], proposals: [proposal('有活', 'mid')] } });
 
     it('waits poll_minutes, twice as long after each further one in a row', async () => {
       const { t, first } = await emptyScout((n) => (n === 2 ? broken : nothing));
@@ -1073,7 +1124,7 @@ describe('issues: scout', () => {
         ...(retryAt ? { retryAt } : {}),
         costUsd: 0.05,
       });
-    const nothing: Script = () => ({ structured: { proposals: [] } });
+    const nothing: Script = () => ({ structured: { gaps: [], proposals: [] } });
     const broken: Script = () => ({ structured: { proposals: [{ title: '缺字段' }] } });
 
     /** Auto scouting on a repo whose last commit is old; the n-th scout does `scripts(n)`. */
@@ -1272,7 +1323,7 @@ describe('issues: scout', () => {
     t.scripts.scout = () =>
       ++n === 1
         ? { structured: { proposals: [{ title: '缺字段' }] } }
-        : { structured: { proposals: [proposal('有活', 'mid')] } };
+        : { structured: { gaps: [], proposals: [proposal('有活', 'mid')] } };
     await t.master.issues.poll();
     const failed = await scoutDone(t, t.master.store.listScouts()[0]?.id ?? '');
     expect(failed.status).toBe('failed');
@@ -1299,7 +1350,7 @@ describe('issues: scout', () => {
     const MIN = 60_000;
     const t = await start(config({ auto: true, intervalMinutes: 15 }));
     // Every scout finds work, so no back-off holds the next one: only the interval does.
-    t.scripts.scout = () => ({ structured: { proposals: [proposal('有活', 'mid')] } });
+    t.scripts.scout = () => ({ structured: { gaps: [], proposals: [proposal('有活', 'mid')] } });
     await t.master.issues.poll();
     const first = await scoutDone(t, t.master.store.listScouts()[0]?.id ?? '');
     expect(first.proposals[0]?.issue?.number).toBe(1);
@@ -1357,7 +1408,7 @@ describe('issues: scout', () => {
 
     it('scouts while the only unfinished Runs wait for a human, below max_proposals', async () => {
       const t = await start(config({ auto: true }));
-      t.scripts.scout = () => ({ structured: { proposals: [] } });
+      t.scripts.scout = () => ({ structured: { gaps: [], proposals: [] } });
       stuckRun(t, blocked('error'));
       stuckRun(t, blocked('setup_failed'));
       await t.master.issues.poll();
@@ -1418,7 +1469,7 @@ describe('issues: scout', () => {
       expect(forever).not.toBe(ASSESS_WORKFLOW_YAML);
       const t = await start(config({ auto: true }), forever);
       t.scripts.assessor = () => assessment('ask', { questions: ['写什么？'] });
-      t.scripts.scout = () => ({ structured: { proposals: [] } });
+      t.scripts.scout = () => ({ structured: { gaps: [], proposals: [] } });
       gh.add({ title: '加 feature', labels: [LABELS.ready] });
       await t.master.issues.poll();
       const [run] = t.master.store.listRuns();
@@ -1444,6 +1495,29 @@ describe('issues: scout', () => {
     await expect(t.master.issues.startScout('demo', 'manual')).resolves.toBeDefined();
   });
 
+  it('marks a scout without a gap analysis as failed, like any missing field', async () => {
+    const t = await start();
+    t.scripts.scout = () => ({ structured: { proposals: [proposal('有活', 'mid')] } });
+    const scout = await t.master.issues.startScout('demo', 'manual');
+    const done = await scoutDone(t, scout.id);
+    expect(done.status).toBe('failed');
+    expect(done.error).toContain('侦察结果不符合约定');
+    expect(done.error).toContain('gaps');
+    expect(done.gaps).toBeNull();
+    expect(gh.issues.size).toBe(0);
+
+    // A gap without evidence is no better.
+    const gap = { goal: '永动', gap: '只跑一个 Run', evidence: [] };
+    t.scripts.scout = () => ({ structured: { gaps: [gap], proposals: [] } });
+    const second = await t.master.issues.startScout('demo', 'manual');
+    expect(await scoutDone(t, second.id)).toMatchObject({ status: 'failed', gaps: null });
+
+    // An empty analysis is an answer: the scout found no gap.
+    t.scripts.scout = () => ({ structured: { gaps: [], proposals: [] } });
+    const third = await t.master.issues.startScout('demo', 'manual');
+    expect(await scoutDone(t, third.id)).toMatchObject({ status: 'completed', gaps: [] });
+  });
+
   it('counts scouts failed in a row, and notifies once when they reach 3', async () => {
     const sent: string[] = [];
     gh = new FakeGitHub();
@@ -1460,7 +1534,7 @@ describe('issues: scout', () => {
       error: 'You have hit your limit',
       errorKind: 'rate_limited',
     });
-    const nothing: Script = () => ({ structured: { proposals: [] } });
+    const nothing: Script = () => ({ structured: { gaps: [], proposals: [] } });
     const scripts = [broken, broken, limited, broken, broken, nothing, broken];
     let n = 0;
     t.scripts.scout = (ctx) => (scripts[n++] ?? nothing)(ctx);
@@ -1506,7 +1580,7 @@ describe('issues: scout', () => {
       seen.workdir = ctx.input.workdir;
       seen.readme = readFileSync(join(ctx.input.workdir, 'README.md'), 'utf8');
       seen.draft = existsSync(join(ctx.input.workdir, 'draft.txt'));
-      return { structured: { proposals: [] } };
+      return { structured: { gaps: [], proposals: [] } };
     };
 
     const scout = await t.master.issues.startScout('demo', 'manual');
@@ -1617,6 +1691,7 @@ describe('issues: scout', () => {
     const t = await start(config({ maxPerDay: null }));
     t.scripts.scout = () => ({
       structured: {
+        gaps: [],
         proposals: [
           proposal('中风险', 'mid'),
           proposal('高风险', 'high'),
@@ -1692,7 +1767,10 @@ describe('issues: scout', () => {
 
   it('has no spending limit when daily_budget_usd is left out', async () => {
     const t = await start(config({ budget: null }));
-    t.scripts.scout = () => ({ structured: { proposals: [proposal('x', 'low')] }, costUsd: 500 });
+    t.scripts.scout = () => ({
+      structured: { gaps: [], proposals: [proposal('x', 'low')] },
+      costUsd: 500,
+    });
     const scout = await t.master.issues.startScout('demo', 'manual');
     await scoutDone(t, scout.id);
     expect(gh.get(1).labels).toContain(LABELS.auto);
@@ -1713,7 +1791,7 @@ describe('issues: scout', () => {
 
   it('starts nothing while the work switch is off', async () => {
     const t = await start(config({ auto: true }));
-    t.scripts.scout = () => ({ structured: { proposals: [] } });
+    t.scripts.scout = () => ({ structured: { gaps: [], proposals: [] } });
     t.master.engine.setWorking(false);
     gh.add({ title: '加 feature', labels: [LABELS.ready] });
     const manual = t.run();
@@ -1743,7 +1821,7 @@ describe('issues: scout', () => {
 
   it('serves status and scouts over the API', async () => {
     const t = await start();
-    t.scripts.scout = () => ({ structured: { proposals: [proposal('x', 'mid')] } });
+    t.scripts.scout = () => ({ structured: { gaps: [], proposals: [proposal('x', 'mid')] } });
     const res = await t.master.app.request('/api/scouts', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -1952,7 +2030,9 @@ describe('issues: requirement assessment', () => {
 
   it('assesses issues proposed by the scout too', async () => {
     const t = await start(config(), ASSESS_WORKFLOW_YAML);
-    t.scripts.scout = () => ({ structured: { proposals: [proposal('低风险的', 'low')] } });
+    t.scripts.scout = () => ({
+      structured: { gaps: [], proposals: [proposal('低风险的', 'low')] },
+    });
     t.scripts.assessor = () => assessment('go');
     const scout = await t.master.issues.startScout('demo', 'manual');
     await scoutDone(t, scout.id);
@@ -2040,7 +2120,7 @@ describe('issues: closed by a human', () => {
   it('terminates a Run waiting in the discussion; the automatic scout stops waiting for it', async () => {
     const t = await start(config({ auto: true }), ASSESS_WORKFLOW_YAML);
     t.scripts.assessor = () => assessment('ask', { questions: ['写什么？'] });
-    t.scripts.scout = () => ({ structured: { proposals: [] } });
+    t.scripts.scout = () => ({ structured: { gaps: [], proposals: [] } });
     gh.add({ title: '加 feature', labels: [LABELS.ready] });
     await t.master.issues.poll();
     const run = runOf(t);
@@ -2654,7 +2734,7 @@ stages:
     expect(runsOf(t)).toHaveLength(2);
 
     // The scout reads it as given up after failures, not as a human's rejection.
-    t.scripts.scout = () => ({ structured: { proposals: [] } });
+    t.scripts.scout = () => ({ structured: { gaps: [], proposals: [] } });
     const scout = await t.master.issues.startScout('demo', 'manual');
     await scoutDone(t, scout.id);
     const prompt = t.fake.calls.at(-1)?.prompt ?? '';

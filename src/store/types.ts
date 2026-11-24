@@ -267,6 +267,17 @@ export interface ScoutProposal {
   error?: string;
 }
 
+/**
+ * A capability the project lacks, from the scout's gap analysis against its README's goals.
+ * `goal` is that goal as the README names it: each repo has goals of its own.
+ */
+export interface ScoutGap {
+  goal: string;
+  gap: string;
+  /** Where the code limits the capability, or passages of the README or other documents. */
+  evidence: string[];
+}
+
 /** An AI scout: a read-only agent run that proposes issues. */
 export interface Scout {
   id: string;
@@ -279,6 +290,11 @@ export interface Scout {
   agentId: string;
   model: string | null;
   proposals: ScoutProposal[];
+  /**
+   * The gap analysis the scout's agent gave, empty when it found no gap; null until it answered
+   * (and so for a scout that failed), and for scouts recorded before there was one.
+   */
+  gaps: ScoutGap[] | null;
   costUsd: number | null;
   error: string | null;
   logPath: string;
