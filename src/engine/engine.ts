@@ -1,5 +1,12 @@
 import { EventEmitter } from 'node:events';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { isOurProcess, killProcessGroup, prepareAgentEnv } from '../adapters/process.js';
@@ -233,6 +240,7 @@ export interface RetryInput {
   budgetUsd?: number;
 }
 
+/** An executing Run. */
 interface Active {
   runId: string;
   controller: AbortController;
@@ -291,13 +299,18 @@ type KeptWorkspaceRemoval = { manual: true } | LeftoverWorkspaceReason;
 const IN_FLIGHT_TASK = new Set<Task['status']>(['running', 'verifying']);
 
 /**
- * The workflow engine: a deterministic state machine that executes one Run at a time
- * in the Run's own worktree, one task and one commit at a time.
+ * The workflow engine: a deterministic state machine that executes one Run at a time per repo,
+ * each in the Run's own worktree, one task and one commit at a time. Runs of different repos
+ * execute side by side.
  */
 export class Engine {
   /** Live agent output for the dashboard; not persisted (raw logs are on disk). */
   readonly live = new EventEmitter<{ agent: [LiveAgentEvent] }>();
-  private active: Active | undefined;
+  /**
+   * The executing Runs by execution slot (`slotOf`), in the order they started: one per repo,
+   * since a repo's Runs share its git repository (worktrees, the target branch, merges).
+   */
+  private readonly active = new Map<string, Active>();
   private stopping = false;
   private holding = false;
   /** Workspace cleanups in progress, by Run id; a second request joins the first. */
@@ -391,7 +404,7 @@ export class Engine {
     }
   }
 
-  /** Graceful shutdown: stop the active agent like a manual pause and requeue its Run. */
+  /** Graceful shutdown: stop the active agents like a manual pause and requeue their Runs. */
   async stop(): Promise<void> {
     this.stopping = true;
     clearTimeout(this.replyTimer);
@@ -407,19 +420,31 @@ export class Engine {
     await Promise.all([this.stopActive(), this.sweeping?.catch(() => {})]);
   }
 
+  /**
+   * Stop every executing Run and put them back at the head of the queue in the order they
+   * started, so that the next Master goes on with them first, in the same order.
+   */
   private async stopActive(): Promise<void> {
-    const active = this.active;
-    if (!active) return;
-    await this.interrupt();
-    // It may have finished meanwhile, e.g. completed while removing superseded workspaces.
-    if (FINISHED_RUN_STATUSES.includes(this.store.getRun(active.runId).status)) return;
-    await this.discardInFlight(this.store.getRun(active.runId));
-    this.requeueHead(active.runId, 'run.interrupted');
+    const stopped = [...this.active.values()];
+    await Promise.all(stopped.map((active) => this.interrupt(active)));
+    // Each requeue goes in front of the ones before it, so the last started is requeued first.
+    for (const { runId } of stopped.reverse()) {
+      // It may have finished meanwhile, e.g. completed while removing superseded workspaces.
+      if (FINISHED_RUN_STATUSES.includes(this.store.getRun(runId).status)) continue;
+      await this.discardInFlight(this.store.getRun(runId));
+      this.requeueHead(runId, 'run.interrupted');
+    }
   }
 
-  /** The Run currently executing, if any. */
-  get activeRunId(): string | undefined {
-    return this.active?.runId;
+  /** The Runs currently executing, in the order they started. */
+  get activeRunIds(): string[] {
+    return [...this.active.values()].map((active) => active.runId);
+  }
+
+  /** The executing Run `runId`, if it is executing. */
+  private activeOf(runId: string): Active | undefined {
+    for (const active of this.active.values()) if (active.runId === runId) return active;
+    return undefined;
   }
 
   private async killOrphan(attempt: Attempt): Promise<void> {
@@ -435,8 +460,8 @@ export class Engine {
   }
 
   /**
-   * Hold the queue: the executing Run finishes, no next one starts. Used while an upgrade of the
-   * Master waits for the current Run.
+   * Hold the queue: the executing Runs finish, no next one starts in any repo. Used while an
+   * upgrade of the Master waits for the current Runs.
    */
   hold(on: boolean): void {
     this.holding = on;
@@ -448,56 +473,75 @@ export class Engine {
   }
 
   /**
-   * Start the next queued Run if nothing is executing and the work switch is on. Runs waiting for
-   * their agent's quota are passed by until their wait ends.
+   * While the work switch is on, start queued Runs in queue order: each one whose execution slot
+   * (`slotOf`) is free, so one per repo at a time. Runs waiting for their agent's quota are
+   * passed by until their wait ends; `kick` is woken up when the first wait ends.
    */
   kick(): void {
     clearTimeout(this.limitTimer);
     this.limitTimer = undefined;
     // Whatever ends the early returns (a Run finishing, the switch turned on, the hold lifted)
-    // kicks again.
-    if (this.active || this.stopping || this.holding || !this.store.working) return;
-    const next = this.nextDueRun();
-    if (!next) return;
-    this.limitWaits.delete(next.id);
-    this.setStatus(next.id, 'running', { queuePos: null });
-    const controller = new AbortController();
-    const active: Active = { runId: next.id, controller, done: Promise.resolve() };
-    this.active = active;
-    active.done = this.drive(next.id, controller.signal).finally(() => {
-      if (this.active === active) this.active = undefined;
-      setImmediate(() => this.kick());
-    });
-  }
-
-  /**
-   * The first queued Run that is not waiting for its agent's quota. When every queued Run is
-   * waiting, `kick` is woken up when the first wait ends.
-   */
-  private nextDueRun(): Run | undefined {
+    // kicks again; so does a Run finishing for the slot it frees.
+    if (this.stopping || this.holding || !this.store.working) return;
     const queued = this.store.queuedRuns();
     // A Run that left the queue meanwhile (paused, cancelled) waits no more.
     const ids = new Set(queued.map((r) => r.id));
     for (const id of this.limitWaits.keys()) if (!ids.has(id)) this.limitWaits.delete(id);
     const now = this.now();
     let wake: number | undefined;
+    const slots = new Map<string, string>();
     for (const run of queued) {
       const until = this.limitWaits.get(run.id)?.until;
-      if (until === undefined || until <= now) return run;
-      wake = Math.min(wake ?? until, until);
+      if (until !== undefined && until > now) {
+        wake = Math.min(wake ?? until, until);
+        continue;
+      }
+      let slot = slots.get(run.repoId);
+      if (slot === undefined) {
+        slot = this.slotOf(run);
+        slots.set(run.repoId, slot);
+      }
+      if (!this.active.has(slot)) this.launch(run.id, slot);
     }
     if (wake !== undefined) {
       const timer = setTimeout(() => this.kick(), Math.min(wake - now, MAX_TIMER_MS));
       timer.unref();
       this.limitTimer = timer;
     }
-    return undefined;
+  }
+
+  /** Execute the queued Run `runId` in the free execution slot `slot`. */
+  private launch(runId: string, slot: string): void {
+    this.limitWaits.delete(runId);
+    this.setStatus(runId, 'running', { queuePos: null });
+    const controller = new AbortController();
+    const active: Active = { runId, controller, done: Promise.resolve() };
+    this.active.set(slot, active);
+    active.done = this.drive(runId, controller.signal).finally(() => {
+      if (this.active.get(slot) === active) this.active.delete(slot);
+      setImmediate(() => this.kick());
+    });
+  }
+
+  /**
+   * The execution slot of a Run: its repo's path with symlinks resolved, so that two repos
+   * registered on the same git repository (e.g. with different target branches) share one and
+   * their git commands do not race. The registered path when it cannot be resolved (it is gone:
+   * the Run then fails on it as before).
+   */
+  private slotOf(run: Run): string {
+    const { path } = this.store.getRepo(run.repoId);
+    try {
+      return realpathSync(path);
+    } catch {
+      return path;
+    }
   }
 
   /**
    * A queued Run waiting for its agent's quota to come back: the agent and when the Run goes on
-   * (then also waiting for the execution slot if another Run has it). null when it does not
-   * wait (any more).
+   * (then also waiting for its repo's execution slot if another Run of the repo has it). null
+   * when it does not wait (any more).
    */
   rateLimited(run: Run): RateLimitedWait | null {
     const wait = this.limitWaits.get(run.id);
@@ -505,9 +549,8 @@ export class Engine {
     return { agentId: wait.agentId, retryAt: new Date(wait.until).toISOString() };
   }
 
-  private async interrupt(): Promise<void> {
-    const active = this.active;
-    if (!active) return;
+  /** Stop an executing Run's drive loop and wait until it has left it. */
+  private async interrupt(active: Active): Promise<void> {
     active.controller.abort();
     await active.done;
   }
@@ -517,8 +560,8 @@ export class Engine {
   // =========================================================================
 
   /**
-   * The work switch. Off: queued Runs wait and nothing new starts; the executing Run
-   * finishes (pause it to stop it now). On: the queue moves again.
+   * The work switch. Off: queued Runs wait and nothing new starts; the executing Runs
+   * finish (pause one to stop it now). On: the queue moves again.
    */
   setWorking(on: boolean): boolean {
     if (this.store.working !== on) this.store.setWorking(on);
@@ -1156,8 +1199,9 @@ export class Engine {
         }),
       );
     }
-    if (this.active?.runId === runId) {
-      await this.interrupt();
+    const active = this.activeOf(runId);
+    if (active) {
+      await this.interrupt(active);
       this.assertNotFinished(runId);
       await this.discardInFlight(this.store.getRun(runId));
     }
@@ -1195,8 +1239,9 @@ export class Engine {
     if (FINISHED_RUN_STATUSES.includes(run.status)) {
       throw new InvalidStateError(alreadyFinished(run.status));
     }
-    if (this.active?.runId === runId) {
-      await this.interrupt();
+    const active = this.activeOf(runId);
+    if (active) {
+      await this.interrupt(active);
       this.assertNotFinished(runId);
       await this.discardInFlight(this.store.getRun(runId));
     }
@@ -1231,8 +1276,8 @@ export class Engine {
    * again does no harm.
    *
    * Unlike the removal of superseded attempts this does not hold the execution slot: it is called
-   * from the GitHub bridge while another Run may execute, and is as safe as a removal by hand
-   * (`cleanupWorkspace`). It only touches each failed Run's own worktree and branch, never the
+   * from the GitHub bridge while other Runs may execute, and is as safe as a removal by hand
+   * (`cleanupWorkspace`). It only touches each failed Run's own worktree and branch, never an
    * executing Run's, and git's own locks keep concurrent commands from corrupting the repo; a
    * removal that loses a race for a lock only ends up recorded as `workspace.cleanup_failed`.
    */
@@ -1343,7 +1388,7 @@ export class Engine {
       );
     }
     // A Run that has just failed (budget abort) may still be leaving its drive loop.
-    if (this.active?.runId === runId) await this.active.done;
+    await this.activeOf(runId)?.done;
     const before = await this.inspectWorkspace(run);
     if (!before.worktreeExists && !before.branchExists) return run;
     const { path, branch } = before.workspace;
@@ -3214,8 +3259,8 @@ export class Engine {
    * completed Run's. Without this every failed attempt would keep its worktree (dependencies
    * included) for good while nobody is around. Cancelled Runs stay: a human ended them and may
    * still want to look. A removal that fails is recorded on that Run and passed by; the completed
-   * Run stays completed. Holds the execution slot meanwhile, so the next Run's git commands do
-   * not race with the removals.
+   * Run stays completed. Holds its repo's execution slot meanwhile, so the repo's next Run's git
+   * commands do not race with the removals.
    */
   private async removeSupersededWorkspaces(run: Run, signal: AbortSignal): Promise<void> {
     if (!run.issue) return;
@@ -3415,7 +3460,7 @@ export class Engine {
     return run;
   }
 
-  /** Put the Run first in the queue, to go on as soon as the execution slot is free. */
+  /** Put the Run first in the queue, to go on as soon as its repo's execution slot is free. */
   private requeueHead(runId: string, eventType: string): void {
     this.store.tx(() => {
       this.setStatus(runId, 'queued', { queuePos: this.store.queueHead(), blocked: null });

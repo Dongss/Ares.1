@@ -1,6 +1,6 @@
-import { chmodSync, existsSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, readdirSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { FakeAdapter, type FakeContext, type FakeOutcome } from '../src/adapters/fake.js';
 import { AGENT_GH_TOKEN } from '../src/adapters/process.js';
@@ -26,6 +26,7 @@ import {
   git,
   type Harness,
   harness,
+  initRepo,
   readEnvFile,
   review,
   type Script,
@@ -494,7 +495,7 @@ agents:
     target.master.engine.approve(run.id);
     const blocked = await target.waitStatus(run.id, 'blocked');
     expect(blocked.blocked?.kind).toBe('target_dirty');
-    await waitFor(() => target.master.engine.activeRunId === undefined, 'the Run to stop');
+    await waitFor(() => target.master.engine.activeRunIds.length === 0, 'the Run to stop');
     return blocked;
   }
 
@@ -2679,7 +2680,7 @@ stages:
       const run = first.run();
       await waitFor(() => eventData(run.id, 'task.rate_limited').length === 1, 'the rate limit');
       await first.waitStatus(run.id, 'queued');
-      await waitFor(() => first.master.engine.activeRunId === undefined, 'the engine to be idle');
+      await waitFor(() => first.master.engine.activeRunIds.length === 0, 'the engine to be idle');
       return { first, run, resetAt };
     }
 
@@ -3845,6 +3846,196 @@ describe('engine: restart', () => {
   });
 });
 
+describe('engine: Runs of different repos', () => {
+  /** Merges without waiting for an approval, so a Run that goes ahead completes on its own. */
+  const NO_GATE = { stages: { merge: { gate: false } } };
+
+  /** Registers another repo, on a new git repo unless `path` is given. */
+  const addRepo = (t: Harness, name: string, path = initRepo(), targetBranch = 'main') =>
+    t.master.store.createRepo({
+      name,
+      path,
+      targetBranch,
+      verifyCommands: ['grep -q ok feature.txt'],
+      setupCommands: [],
+      mergeMode: 'direct',
+    });
+
+  const runIn = (t: Harness, repo: string, goal = '添加 feature.txt') =>
+    t.master.engine.createRun({ repo, template: 'dev', goal, overrides: NO_GATE });
+
+  /**
+   * Writes feature.txt and a file of its own Run, so that a Run of a repo where an earlier Run
+   * already merged feature.txt still changes something.
+   */
+  const coder: Script = (ctx) => {
+    writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+    writeFile(join(ctx.input.workdir, `${basename(ctx.input.workdir)}.txt`), 'ok\n');
+    return done();
+  };
+
+  /** Coders wait until the returned function is called (or they are stopped), then `coder`. */
+  function slowCoder(t: Harness): () => void {
+    let release = () => {};
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    t.scripts.coder = async (ctx) => {
+      const stopped = new Promise((resolve) => ctx.signal.addEventListener('abort', resolve));
+      await Promise.race([released, stopped]);
+      return ctx.signal.aborted ? done() : coder(ctx);
+    };
+    return release;
+  }
+
+  const status = (t: Harness, run: Run) => t.master.store.getRun(run.id).status;
+
+  /** `run.status` changes as they happen, as `<runId>:<status>`. */
+  function statusLog(t: Harness): string[] {
+    const log: string[] = [];
+    t.master.store.bus.on('event', (e) => {
+      if (e.type === 'run.status') log.push(`${e.runId}:${e.data.status}`);
+    });
+    return log;
+  }
+
+  it('executes Runs of two repos at the same time, and both complete and merge', async () => {
+    h = await harness();
+    const t = h;
+    const other = addRepo(t, 'other');
+    const release = slowCoder(t);
+    const first = runIn(t, 'demo');
+    const second = runIn(t, 'other');
+    await waitFor(() => t.fake.calls.length === 2, 'both coders to start');
+    expect([status(t, first), status(t, second)]).toEqual(['running', 'running']);
+    expect(t.master.engine.activeRunIds).toEqual([first.id, second.id]);
+
+    release();
+    await t.waitStatus(first.id, 'completed');
+    await t.waitStatus(second.id, 'completed');
+    expect(git(t.repoDir, 'show', 'main:feature.txt')).toBe('ok');
+    expect(git(other.path, 'show', 'main:feature.txt')).toBe('ok');
+    await waitFor(() => t.master.engine.activeRunIds.length === 0, 'the slots to be free');
+  });
+
+  it('still executes one Run of a repo at a time', async () => {
+    h = await harness();
+    const t = h;
+    addRepo(t, 'other');
+    const log = statusLog(t);
+    const release = slowCoder(t);
+    const first = runIn(t, 'demo');
+    const second = runIn(t, 'demo', '第二个');
+    const third = runIn(t, 'other');
+    await waitFor(() => t.fake.calls.length === 2, 'two coders to start');
+    expect(t.master.engine.activeRunIds).toEqual([first.id, third.id]);
+    expect(status(t, second)).toBe('queued');
+
+    release();
+    await t.waitStatus(second.id, 'completed');
+    await t.waitStatus(third.id, 'completed');
+    // The second started only once the first of its repo was done.
+    expect(log.indexOf(`${second.id}:running`)).toBeGreaterThan(
+      log.indexOf(`${first.id}:completed`),
+    );
+    expect(git(t.repoDir, 'show', 'main:feature.txt')).toBe('ok');
+  });
+
+  it('shares one execution slot between repos registered on the same path', async () => {
+    h = await harness();
+    const t = h;
+    git(t.repoDir, 'branch', 'release');
+    // The same git repository through a symlink, merging into another branch.
+    const link = join(tmpDir(), 'link');
+    symlinkSync(t.repoDir, link);
+    addRepo(t, 'release', link, 'release');
+    const log = statusLog(t);
+    const release = slowCoder(t);
+    const first = runIn(t, 'demo');
+    const second = runIn(t, 'release');
+    await waitFor(() => t.fake.calls.length === 1, 'the first coder to start');
+    // Kicking again starts nothing: the second waits for the slot of the same path.
+    t.master.engine.kick();
+    expect(status(t, second)).toBe('queued');
+    expect(t.master.engine.activeRunIds).toEqual([first.id]);
+
+    release();
+    await t.waitStatus(first.id, 'completed');
+    await t.waitStatus(second.id, 'completed');
+    expect(log.indexOf(`${second.id}:running`)).toBeGreaterThan(
+      log.indexOf(`${first.id}:completed`),
+    );
+    expect(git(t.repoDir, 'show', 'release:feature.txt')).toBe('ok');
+  });
+
+  it("pausing or cancelling a Run leaves the other repo's executing Run alone", async () => {
+    h = await harness();
+    const t = h;
+    addRepo(t, 'other');
+    const release = slowCoder(t);
+    const first = runIn(t, 'demo');
+    const second = runIn(t, 'other');
+    await waitFor(() => t.fake.calls.length === 2, 'both coders to start');
+    const attempts = (run: Run) => t.master.store.listRunAttempts(run.id).map((a) => a.status);
+
+    await t.master.engine.pause(first.id);
+    expect(status(t, first)).toBe('paused');
+    expect(attempts(first)).toEqual(['stopped']);
+    expect(status(t, second)).toBe('running');
+    expect(attempts(second)).toEqual(['running']);
+    expect(t.master.engine.activeRunIds).toEqual([second.id]);
+
+    // Resumed, it gets its repo's slot back at once while the other still executes.
+    t.master.engine.resume(first.id);
+    await waitFor(() => t.fake.calls.length === 3, 'the resumed coder to start');
+    expect(t.master.engine.activeRunIds).toEqual([second.id, first.id]);
+
+    await t.master.engine.cancel(second.id);
+    expect(status(t, second)).toBe('cancelled');
+    expect(status(t, first)).toBe('running');
+    expect(attempts(first)).toEqual(['stopped', 'running']);
+    expect(t.master.engine.activeRunIds).toEqual([first.id]);
+
+    release();
+    await t.waitStatus(first.id, 'completed');
+    expect(git(t.repoDir, 'show', 'main:feature.txt')).toBe('ok');
+  });
+
+  it('a graceful stop requeues every executing Run at the head of the queue in order', async () => {
+    const first = await harness();
+    const otherPath = initRepo();
+    addRepo(first, 'other', otherPath);
+    slowCoder(first);
+    const a = runIn(first, 'demo', '第一个');
+    const b = runIn(first, 'other', '第二个');
+    // Queued behind the first, in the slot of its repo.
+    const c = runIn(first, 'demo', '第三个');
+    await waitFor(() => first.fake.calls.length === 2, 'both coders to start');
+    // Nothing starts when the next Master opens, so that its queue can be looked at.
+    first.master.engine.setWorking(false);
+    await first.close();
+
+    h = await harness({
+      home: first.home,
+      repoDir: first.repoDir,
+      scripts: { coder, reviewer: () => review() },
+    });
+    const t = h;
+    expect(t.master.store.queuedRuns().map((r) => r.id)).toEqual([a.id, b.id, c.id]);
+    for (const run of [a, b]) {
+      const events = t.master.store.listEvents(run.id).map((e) => e.type);
+      expect(events).toContain('run.interrupted');
+      expect(t.master.store.listRunAttempts(run.id).map((x) => x.status)).toEqual(['stopped']);
+    }
+
+    t.master.engine.setWorking(true);
+    expect(t.master.engine.activeRunIds).toEqual([a.id, b.id]);
+    for (const run of [a, b, c]) await t.waitStatus(run.id, 'completed');
+    expect(git(t.repoDir, 'show', 'main:feature.txt')).toBe('ok');
+    expect(git(otherPath, 'show', 'main:feature.txt')).toBe('ok');
+  });
+});
+
 describe('engine: workspace consistency', () => {
   const eventsOf = (runId: string, type: string) =>
     (h as Harness).master.store.listEvents(runId).filter((e) => e.type === type);
@@ -4149,7 +4340,7 @@ github:
   /** Completed, and done with what follows: the execution slot is free again. */
   const completed = async (t: Harness, runId: string) => {
     await t.waitStatus(runId, 'completed');
-    await waitFor(() => t.master.engine.activeRunId === undefined, 'the execution slot');
+    await waitFor(() => t.master.engine.activeRunIds.length === 0, 'the execution slot');
     return t.master.store.getRun(runId);
   };
   /** Whether the Run's worktree and branch are still there. */

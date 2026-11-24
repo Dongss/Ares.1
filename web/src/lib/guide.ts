@@ -360,8 +360,8 @@ export function cycleSteps(input: GuideInput, rule?: AutoAcceptRule): CycleStep[
         runActors,
         input.flow
           ? t({
-              zh: `Master 每 ${pollMinutes} 分钟查一次带 ares1:ready 的 issue，按模板「${input.flow.templateName}」建 Run，进展回写到 issue；同一时间只执行一个 Run`,
-              en: `Every ${pollMinutes} minutes the Master looks for issues labeled ares1:ready, creates Runs from them with the template "${input.flow.templateName}" and reports progress on the issue; one Run executes at a time`,
+              zh: `Master 每 ${pollMinutes} 分钟查一次带 ares1:ready 的 issue，按模板「${input.flow.templateName}」建 Run，进展回写到 issue；每个仓库同一时间只执行一个 Run，不同仓库的 Run 可以同时执行`,
+              en: `Every ${pollMinutes} minutes the Master looks for issues labeled ares1:ready, creates Runs from them with the template "${input.flow.templateName}" and reports progress on the issue; each repo executes one Run at a time, while Runs of different repos can execute side by side`,
             })
           : t({
               zh: `模板「${github.template}」不存在或无效，issue 建不了 Run：先修好配置`,

@@ -140,6 +140,9 @@ describe('the cycle', () => {
     expect(steps.run?.actors).toEqual(['ai', 'master', 'human']);
     expect(steps.run?.text).toContain('Master 每 5 分钟查一次带 ares1:ready 的 issue');
     expect(steps.run?.text).toContain('「自举开发」');
+    expect(steps.run?.text).toContain(
+      '每个仓库同一时间只执行一个 Run，不同仓库的 Run 可以同时执行',
+    );
   });
 
   it('hands every step to the AI or the Master when everything is automatic', () => {
@@ -1000,6 +1003,9 @@ describe('in English', () => {
       'Accepted automatically: low-risk proposals of size S or M (labeled ares1:ready and ares1:auto); once 3 proposals are accepted in a day, it pauses for the rest of the day and accepts the backlog by itself the next day. Up to you: size L proposals and medium- or high-risk proposals; add ares1:ready or close them',
     );
     expect(steps.push?.text).toContain('pushes the target branch (main) to GitHub');
+    expect(steps.run?.text).toContain(
+      'each repo executes one Run at a time, while Runs of different repos can execute side by side',
+    );
     expect(runStages(inputEn(manualRepo))?.find((s) => s.id === 'e2e')?.name).toBe(
       'E2E (placeholder)',
     );

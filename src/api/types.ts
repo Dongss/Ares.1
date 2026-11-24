@@ -89,8 +89,8 @@ export interface RunDetail {
   branchExists: boolean;
   /**
    * The Run is queued because its agent was out of quota or rate-limited, and goes on at
-   * `retryAt` (ISO; also waiting for the execution slot then if another Run has it). null when it
-   * is not waiting for a quota. The wait is not kept across a Master restart: the Run then just
+   * `retryAt` (ISO; also waiting for its repo's execution slot then if another Run of the repo
+   * has it). null when it is not waiting for a quota. The wait is not kept across a Master restart: the Run then just
    * tries again.
    */
   rateLimited: RateLimitedWait | null;
@@ -204,7 +204,10 @@ export interface AgentSummary {
 /** GET /api/health */
 export interface HealthView {
   ok: boolean;
+  /** The first of `activeRuns`, null when none executes; kept for older clients. */
   activeRun: string | null;
+  /** The Runs executing now, at most one per repo, in the order they started. */
+  activeRuns: string[];
   /** The work switch: off = nothing new starts. */
   working: boolean;
   /** The Master sends system notifications itself; the dashboard then stays quiet. */

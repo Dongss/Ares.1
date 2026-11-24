@@ -144,6 +144,50 @@ describe('upgrader', () => {
     expect(statuses(second.id)).not.toContain('running');
   });
 
+  it('waits while a Run of any repo executes', async () => {
+    const { t, launches, commit } = await installed();
+    t.master.store.createRepo({
+      name: 'other',
+      path: initRepo(),
+      targetBranch: 'main',
+      verifyCommands: ['grep -q ok feature.txt'],
+      setupCommands: [],
+      mergeMode: 'direct',
+    });
+    // Each repo's coder goes on when the test lets it.
+    const finish = new Map<string, () => void>();
+    const coder = t.scripts.coder as NonNullable<typeof t.scripts.coder>;
+    t.scripts.coder = (ctx) =>
+      new Promise((resolve) => {
+        const repo = ctx.input.prompt.includes('另一个仓库') ? 'other' : 'demo';
+        finish.set(repo, () => resolve(coder(ctx)));
+      });
+    const noGate = { stages: { merge: { gate: false } } };
+    const first = t.run('第一个', noGate);
+    const second = t.master.engine.createRun({
+      repo: 'other',
+      template: 'dev',
+      goal: '另一个仓库',
+      overrides: noGate,
+    });
+    await waitFor(() => finish.size === 2, 'both coders to start');
+    expect(t.master.engine.activeRunIds).toEqual([first.id, second.id]);
+    commit('new.txt');
+
+    await t.master.upgrader.check();
+    expect(t.master.upgrader.status().state).toBe('waiting');
+    finish.get('demo')?.();
+    await t.waitStatus(first.id, 'completed');
+    await waitFor(() => t.master.engine.activeRunIds.length === 1, 'the first Run to leave');
+    // The other repo's Run still executes.
+    await t.master.upgrader.check();
+    expect(t.master.upgrader.status().state).toBe('waiting');
+    expect(launches).toEqual([]);
+
+    finish.get('other')?.();
+    await waitFor(() => launches.length === 1, 'upgrade launch');
+  });
+
   it('reports the result left by the script, and does not retry a target that failed', async () => {
     const origin = initRepo();
     const installDir = join(tmpDir('ares1-install-'), 'stable');

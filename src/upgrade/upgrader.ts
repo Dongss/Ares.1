@@ -421,9 +421,9 @@ export class Upgrader {
         }),
       );
     }
-    // Let the executing Run (and a scout) finish; start nothing new meanwhile.
+    // Let the executing Runs of every repo (and a scout) finish; start nothing new meanwhile.
     engine.hold(true);
-    if (engine.activeRunId || this.deps.busy()) {
+    if (engine.activeRunIds.length > 0 || this.deps.busy()) {
       return this.set(
         'waiting',
         t({

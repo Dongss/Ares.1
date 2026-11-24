@@ -166,16 +166,20 @@ export function createApi(deps: ApiDeps): Hono {
     return c.json({ error: err.message }, status);
   });
 
-  const health = (): HealthView => ({
-    ok: true,
-    activeRun: engine.activeRunId ?? null,
-    working: store.working,
-    // Only where the Master can send them: elsewhere the dashboard keeps sending its own.
-    systemNotify: config().master.notify.system && systemNoticeSupported(platform),
-    // Only whether there is one: the address and headers may carry tokens.
-    webhookNotify: config().master.notify.webhook !== undefined,
-    version,
-  });
+  const health = (): HealthView => {
+    const activeRuns = engine.activeRunIds;
+    return {
+      ok: true,
+      activeRun: activeRuns[0] ?? null,
+      activeRuns,
+      working: store.working,
+      // Only where the Master can send them: elsewhere the dashboard keeps sending its own.
+      systemNotify: config().master.notify.system && systemNoticeSupported(platform),
+      // Only whether there is one: the address and headers may carry tokens.
+      webhookNotify: config().master.notify.webhook !== undefined,
+      version,
+    };
+  };
 
   app.get('/api/health', (c) => c.json(health()));
 

@@ -7,6 +7,7 @@ import type {
   AgentEventRecord,
   AgentSummary,
   ConfigView,
+  HealthView,
   KeptWorkspace,
   LiveAgentEvent,
   NotifyTestResult,
@@ -134,6 +135,37 @@ describe('HTTP API', () => {
     expect(health.json).toMatchObject({ webhookNotify: true, systemNotify: false });
     expect(health.text).not.toContain('ntfy');
     expect(health.text).not.toContain('tk_');
+  });
+
+  it('reports every executing Run, one per repo, and the first as activeRun', async () => {
+    h = await harness();
+    const t = h;
+    const idle: HealthView = (await call('GET', '/api/health')).json;
+    expect(idle).toMatchObject({ activeRun: null, activeRuns: [] });
+    t.master.store.createRepo({
+      name: 'other',
+      path: initRepo(),
+      targetBranch: 'main',
+      verifyCommands: [],
+      setupCommands: [],
+      mergeMode: 'direct',
+    });
+    // The coders run until they are stopped.
+    t.scripts.coder = (ctx) =>
+      new Promise((resolve) => ctx.signal.addEventListener('abort', () => resolve(done())));
+    const first = t.run();
+    const second = t.master.engine.createRun({ repo: 'other', template: 'dev', goal: 'g' });
+    const third = t.run('同一个仓库的第二个');
+    await waitFor(() => t.fake.calls.length === 2, 'both coders to start');
+    const busy: HealthView = (await call('GET', '/api/health')).json;
+    expect(busy).toMatchObject({ activeRun: first.id, activeRuns: [first.id, second.id] });
+    expect(busy.activeRuns).not.toContain(third.id);
+
+    await t.master.engine.pause(first.id);
+    await waitFor(() => t.fake.calls.length === 3, 'the next coder to start');
+    const paused: HealthView = (await call('GET', '/api/health')).json;
+    // The repo's next Run takes its slot, after the other repo's Run.
+    expect(paused).toMatchObject({ activeRun: second.id, activeRuns: [second.id, third.id] });
   });
 
   it('tells a raw log deleted past retention from a missing one, and keeps the events', async () => {

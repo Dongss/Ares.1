@@ -144,6 +144,7 @@ describe('CLI smoke test', () => {
     expect(health, m.output()).toMatchObject({
       ok: true,
       activeRun: null,
+      activeRuns: [],
       working: expect.any(Boolean),
       systemNotify: false,
       webhookNotify: false,

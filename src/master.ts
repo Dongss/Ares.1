@@ -358,7 +358,7 @@ export class Master {
   }
 
   /**
-   * Graceful shutdown: stop the active agent (its Run is requeued), let the webhook
+   * Graceful shutdown: stop the active agents (their Runs are requeued), let the webhook
    * notifications already sent finish (at most the webhook's timeout), close server and database.
    */
   async close(): Promise<void> {
