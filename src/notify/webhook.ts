@@ -227,6 +227,8 @@ function failureReason(err: unknown, webhook: WebhookConfig, timeoutMs: number):
 interface Failure {
   reason: string;
   status: number | null;
+  /** Cut off by `drain`: the Master is stopping, the webhook did not fail. */
+  stopped?: true;
 }
 
 /** How a request went: a failure, or the HTTP status of the webhook's answer. */
@@ -251,6 +253,8 @@ export interface WebhookTestOutcome {
  * back sees that notifications stopped) once per streak of failures: a dead webhook does not
  * fill the log with one line per notification, and one that comes back and breaks again is told
  * again. That event notifies nobody (see noticeFor), so a failure cannot set off another POST.
+ * When the Master stops, `drain` lets the notifications already sent finish before the store
+ * closes, for at most the timeout of a request.
  */
 export class WebhookNotifier {
   /**
@@ -259,6 +263,8 @@ export class WebhookNotifier {
    */
   private failingUrl: string | undefined;
   private readonly pending = new Set<Promise<void>>();
+  /** Aborted by `drain` when the requests still out at its deadline are given up on. */
+  private readonly closing = new AbortController();
   private readonly fetch: Fetch;
   private readonly log: (message: string) => void;
   private readonly timeoutMs: number;
@@ -306,14 +312,15 @@ export class WebhookNotifier {
     try {
       const outcome = await this.send(webhook, notice, event);
       if (outcome.reason !== null) {
-        this.failed(webhook, outcome);
+        // Given up on by `drain`: nothing to tell, and the streak of failures stays as it was.
+        if (!outcome.stopped) this.failed(webhook, outcome);
       } else {
         // It got through: the next failure starts a new streak, told again.
         this.failingUrl = undefined;
       }
     } catch {
-      // Logging and recording must not fail the Master either: the store is closed when the
-      // Master stopped while the request was out.
+      // Logging and recording must not fail the Master either. The Master drains the requests
+      // before it closes the store, but a notifier used without `drain` may outlive it.
     }
   }
 
@@ -329,7 +336,7 @@ export class WebhookNotifier {
         method: 'POST',
         headers,
         body,
-        signal: AbortSignal.timeout(this.timeoutMs),
+        signal: AbortSignal.any([AbortSignal.timeout(this.timeoutMs), this.closing.signal]),
       });
       // Nothing is read from the answer; let the connection go.
       await response.body?.cancel().catch(() => {});
@@ -339,8 +346,25 @@ export class WebhookNotifier {
         status: response.status,
       };
     } catch (err) {
+      if (this.stoppedBy(err)) {
+        return {
+          reason: t({ zh: 'Master 正在停止', en: 'the Master is stopping' }),
+          status: null,
+          stopped: true,
+        };
+      }
       return { reason: failureReason(err, webhook, this.timeoutMs), status: null };
     }
+  }
+
+  /**
+   * Whether a request failed because `drain` gave up on it. Its own timeout ends it with a
+   * TimeoutError, so after the abort an AbortError can only come from there.
+   */
+  private stoppedBy(err: unknown): boolean {
+    const { signal } = this.closing;
+    if (!signal.aborted) return false;
+    return err === signal.reason || (err instanceof Error && err.name === 'AbortError');
   }
 
   /**
@@ -348,7 +372,8 @@ export class WebhookNotifier {
    * configuration in use, for the dashboard's button, and resolves with how it went; null
    * without a webhook. Never rejects. It notifies of no event: a failure goes back to the button
    * only, neither logged nor recorded, and the streak of failures of the real notifications
-   * stays as it was, so that their next failure is told as it would have been.
+   * stays as it was, so that their next failure is told as it would have been. `drain` does not
+   * wait for it, but aborts it along with the notifications it gives up on.
    */
   async sendTest(title: string, body: string): Promise<WebhookTestOutcome | null> {
     const webhook = this.config().master.notify.webhook;
@@ -384,7 +409,42 @@ export class WebhookNotifier {
     this.store.bus.on('event', this.onEvent);
   }
 
+  /** Sends no more notifications; the requests already out go on (see `drain`). */
   stop(): void {
     this.store.bus.off('event', this.onEvent);
+  }
+
+  /**
+   * For the Master's shutdown, before the store closes: sends no more notifications and waits
+   * for the requests already out, for at most `maxMs` (default the timeout of a request), so that
+   * a notification sent just before the stop still gets through and a failure of one is still
+   * recorded. Those still out at the deadline are aborted, and waited for until they end so that
+   * none touches the store after it; they are logged in one line but not recorded as
+   * notify.webhook_failed: the Master stopping is no fault of the webhook. Resolves at once with
+   * nothing out; never rejects.
+   */
+  async drain(maxMs = this.timeoutMs): Promise<void> {
+    this.stop();
+    if (this.pending.size === 0) return;
+    let timer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<'late'>((resolve) => {
+      timer = setTimeout(() => resolve('late'), maxMs);
+    });
+    try {
+      const ended = await Promise.race([this.idle().then(() => 'idle' as const), deadline]);
+      if (ended === 'idle' || this.pending.size === 0) return;
+      const count = this.pending.size;
+      this.closing.abort();
+      await this.idle();
+      const seconds = maxMs / 1000;
+      this.log(
+        t({
+          zh: `[通知] Master 停止时还有 ${count} 条 webhook 通知 ${seconds} 秒内没有发完，已放弃。`,
+          en: `[notify] The Master stopped with ${count === 1 ? 'a webhook notification' : `${count} webhook notifications`} still unsent after ${seconds} seconds; gave up on ${count === 1 ? 'it' : 'them'}.`,
+        }),
+      );
+    } finally {
+      clearTimeout(timer);
+    }
   }
 }

@@ -357,7 +357,10 @@ export class Master {
     });
   }
 
-  /** Graceful shutdown: stop the active agent (its Run is requeued), close server and database. */
+  /**
+   * Graceful shutdown: stop the active agent (its Run is requeued), let the webhook
+   * notifications already sent finish (at most the webhook's timeout), close server and database.
+   */
   async close(): Promise<void> {
     if (this.closing) return this.closing;
     this.closing = this.doClose();
@@ -371,7 +374,10 @@ export class Master {
     this.upgrader.stop();
     this.logPruner.stop();
     this.notifier.stop();
-    this.webhook.stop();
+    // Meanwhile the rest stops: the webhook notifications already sent get through (or their
+    // failure is recorded) before the store closes, at most the webhook's timeout later. Never
+    // rejects.
+    const drained = this.webhook.drain();
     await this.issues.stop();
     await this.engine.stop();
     const server = this.server;
@@ -381,6 +387,7 @@ export class Master {
         server.closeAllConnections?.();
       });
     }
+    await drained;
     this.store.close();
     if (this.runningToken) unmarkRunning(this.paths, this.runningToken);
   }

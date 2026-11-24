@@ -1076,6 +1076,182 @@ describe('webhook notifications', () => {
   });
 });
 
+/**
+ * A fetch whose requests wait for the test to answer them; one whose signal is aborted fails as
+ * fetch does, with the signal's reason.
+ */
+function heldFetch() {
+  const requests: { url: string; signal: AbortSignal; answer: (response: Response) => void }[] = [];
+  const fetch: Fetch = (url, init) =>
+    new Promise<Response>((resolve, reject) => {
+      const signal = init.signal as AbortSignal;
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      requests.push({ url, signal, answer: resolve });
+    });
+  return { requests, fetch };
+}
+
+/** Whether `promise` is still pending after the tasks queued so far (and a little more) ran. */
+async function stillPending(promise: Promise<unknown>): Promise<boolean> {
+  let settled = false;
+  void promise.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  return !settled;
+}
+
+describe('webhook notifications when the Master stops', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    setLang('zh');
+  });
+
+  /** A notifier on the harness's store whose requests the test answers. */
+  function heldNotifier(timeoutMs = 60_000) {
+    if (!h) throw new Error('no harness');
+    const held = heldFetch();
+    const logs: string[] = [];
+    const notifier = new WebhookNotifier(
+      h.master.store,
+      withWebhook(
+        () => h?.master.config as LoadedConfig,
+        () => ({ url: `https://hooks.example.com/hook?auth=${TOKEN}` }),
+      ),
+      { fetch: held.fetch, log: (m) => logs.push(m), timeoutMs },
+    );
+    notifier.start();
+    const notify = () =>
+      h?.master.store.event(null, 'scout.failed', scoutFailed(SCOUT_FAILURE_NOTIFY_AFTER));
+    const failures = () => h?.master.store.listEventsOfType('notify.webhook_failed', '') ?? [];
+    return { held, logs, notifier, notify, failures };
+  }
+
+  it('waits for a notification already sent, and returns as soon as it got through', async () => {
+    h = await harness();
+    const { held, logs, notifier, notify, failures } = heldNotifier();
+    notify();
+    expect(held.requests).toHaveLength(1);
+    const drained = notifier.drain(20_000);
+    // It sends nothing more.
+    notify();
+    expect(held.requests).toHaveLength(1);
+    expect(await stillPending(drained)).toBe(true);
+    const answered = performance.now();
+    held.requests[0]?.answer(new Response('ok'));
+    await drained;
+    expect(performance.now() - answered).toBeLessThan(5_000);
+    expect(held.requests[0]?.signal.aborted).toBe(false);
+    expect(failures()).toEqual([]);
+    expect(logs).toEqual([]);
+  });
+
+  it('returns at once with nothing out', async () => {
+    h = await harness();
+    const { held, logs, notifier } = heldNotifier();
+    const started = performance.now();
+    await notifier.drain(20_000);
+    expect(performance.now() - started).toBeLessThan(1_000);
+    expect(held.requests).toEqual([]);
+    expect(logs).toEqual([]);
+  });
+
+  it('gives up on what is still out at its deadline without recording a failure', async () => {
+    h = await harness();
+    const { held, logs, notifier, notify, failures } = heldNotifier();
+    notify();
+    // The test notification is aborted with them, though not waited for.
+    const test = notifier.sendTest('测试', '正文');
+    expect(held.requests).toHaveLength(2);
+    const started = performance.now();
+    await notifier.drain(50);
+    const waited = performance.now() - started;
+    expect(waited).toBeGreaterThanOrEqual(45);
+    expect(waited).toBeLessThan(5_000);
+    expect(held.requests.map((r) => r.signal.aborted)).toEqual([true, true]);
+    expect(failures()).toEqual([]);
+    expect(logs).toEqual([
+      '[通知] Master 停止时还有 1 条 webhook 通知 0.05 秒内没有发完，已放弃。',
+    ]);
+    expect(await test).toEqual({ ok: false, status: null, reason: 'Master 正在停止' });
+  });
+
+  it('tells in English what it gave up on', async () => {
+    h = await harness({ config: 'language: en\n' });
+    const { held, logs, notifier, notify, failures } = heldNotifier();
+    notify();
+    notify();
+    await notifier.drain(50);
+    expect(held.requests.map((r) => r.signal.aborted)).toEqual([true, true]);
+    expect(failures()).toEqual([]);
+    expect(logs).toEqual([
+      '[notify] The Master stopped with 2 webhook notifications still unsent after 0.05 seconds; gave up on them.',
+    ]);
+    expect(logs[0]).not.toMatch(/[一-鿿]/);
+  });
+
+  it('still records a failure that happens while it waits', async () => {
+    h = await harness();
+    const { held, logs, notifier, notify, failures } = heldNotifier();
+    notify();
+    const drained = notifier.drain(20_000);
+    expect(await stillPending(drained)).toBe(true);
+    held.requests[0]?.answer(
+      new Response('no', { status: 500, statusText: 'Internal Server Error' }),
+    );
+    await drained;
+    expect(failures().map((e) => [e.runId, e.data])).toEqual([
+      [null, { reason: 'HTTP 500 Internal Server Error', status: 500 }],
+    ]);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatch(/^\[通知\] webhook 通知发送失败：HTTP 500/);
+  });
+
+  it('records a request that timed out by itself before the deadline as a failure', async () => {
+    h = await harness();
+    const { held, logs, notifier, notify, failures } = heldNotifier(50);
+    notify();
+    await notifier.drain(20_000);
+    expect(held.requests[0]?.signal.aborted).toBe(true);
+    expect(failures().map((e) => e.data)).toEqual([{ reason: '0.05 秒内没有响应', status: null }]);
+    expect(logs).toEqual([
+      '[通知] webhook 通知发送失败：0.05 秒内没有响应。之后的失败不再记录，直到有通知发送成功。',
+    ]);
+  });
+
+  it('closes the Master only after the notifications already sent, recording their failure', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const held = heldFetch();
+    const first = await harness({
+      config: webhookYaml('https://hooks.example.com'),
+      master: { fetch: held.fetch },
+    });
+    h = first;
+    first.master.store.event(null, 'scout.failed', scoutFailed(SCOUT_FAILURE_NOTIFY_AFTER));
+    expect(held.requests).toHaveLength(1);
+    const closed = first.master.close();
+    expect(await stillPending(closed)).toBe(true);
+    held.requests[0]?.answer(
+      new Response('no', { status: 503, statusText: 'Service Unavailable' }),
+    );
+    await closed;
+    // Recorded before the database closed: the next Master finds it on the Events page.
+    h = await harness({
+      home: first.home,
+      repoDir: first.repoDir,
+      master: { fetch: async () => new Response('ok') },
+    });
+    expect(h.master.store.listEventsOfType('notify.webhook_failed', '').map((e) => e.data)).toEqual(
+      [{ reason: 'HTTP 503 Service Unavailable', status: 503 }],
+    );
+  });
+});
+
 describe('webhook settings for the scripts (webhook.curl)', () => {
   afterEach(() => {
     vi.restoreAllMocks();

@@ -98,6 +98,9 @@ src/
                       text, home directory as ~, 10 s timeout, no retry; the first failure of a
                       streak, or of another address, is logged and recorded as the global event
                       notify.webhook_failed, told again after a notification got through);
+                      drain, awaited by the Master's close before the store closes: no more
+                      notifications, the requests already out waited for (at most the timeout),
+                      those still out then aborted and logged but not recorded as failed;
                       sendTest, the test notification (kind test, eventType notify.test), whose
                       outcome goes back to the caller only: no log, no event, the streak left as
                       it was; the webhook's settings as a curl config file, <home>/webhook.curl
