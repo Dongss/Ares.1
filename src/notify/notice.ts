@@ -164,7 +164,8 @@ const titleOf = (kind: NoticeKind, detail?: string) =>
     ? `${NOTICE_KINDS[kind].label}${t({ zh: '：', en: ': ' })}${detail}`
     : NOTICE_KINDS[kind].label;
 
-const firstLine = (text: string, max: number) => {
+/** The first line of `text` without its surrounding blanks, cut to `max` characters with "…". */
+export const firstLine = (text: string, max: number) => {
   const line = text.trim().split('\n')[0] ?? '';
   return line.length > max ? `${line.slice(0, max)}…` : line;
 };
@@ -238,8 +239,8 @@ export function noticeFor(event: EventRow, goal: string | undefined): Notice | n
         about: 'master',
       };
     default:
-      // notify.webhook_failed among them: notifying of it would POST to the failing webhook
-      // again, and fail again.
+      // notify.webhook_failed and notify.system_failed among them: notifying of a failed
+      // channel would send through the failing channel again, and fail again.
       return null;
   }
 }

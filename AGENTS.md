@@ -88,7 +88,10 @@ src/
     notice.ts         which events notify people (shared by system notifications, the webhook
                       and dashboard)
     system.ts         system notifications sent by the Master: osascript on macOS, notify-send
-                      (libnotify) on Linux, nothing elsewhere; which platforms are supported
+                      (libnotify) on Linux, nothing elsewhere; which platforms are supported;
+                      the first failure of a streak is logged and recorded as the global event
+                      notify.system_failed (command and a one-line reason), told again after a
+                      notification got through
     webhook.ts        notifications the Master POSTs to notify.webhook in config.yaml (JSON or
                       text, home directory as ~, 10 s timeout, no retry; the first failure of a
                       streak, or of another address, is logged and recorded as the global event

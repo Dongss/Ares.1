@@ -13,7 +13,10 @@ import { BLOCK_KIND, NOTICE_KINDS, noticeFor } from '../src/notify/notice.js';
 import {
   type ExecFile,
   makeSystemNotice,
+  NOTICE_TIMEOUT_MS,
+  type NoticeFailure,
   noticeScript,
+  SystemNotifier,
   systemNoticeSupported,
 } from '../src/notify/system.js';
 import {
@@ -37,12 +40,15 @@ import {
   writeFile,
 } from './helpers.js';
 
-/** An execFile that records its calls and answers each with `fail()`'s error, if any. */
-function fakeExecFile(fail: () => Error | null = () => null) {
+/**
+ * An execFile that records its calls and answers each with `fail()`'s error, if any, and
+ * `stderr()` as what the command wrote to its standard error.
+ */
+function fakeExecFile(fail: () => Error | null = () => null, stderr: () => string = () => '') {
   const calls: { file: string; args: string[]; timeout: number }[] = [];
   const execFile: ExecFile = (file, args, options, callback) => {
     calls.push({ file, args, timeout: options.timeout });
-    callback(fail());
+    callback(fail(), '', stderr());
   };
   return { calls, execFile };
 }
@@ -50,6 +56,17 @@ function fakeExecFile(fail: () => Error | null = () => null) {
 function enoent(file: string): Error {
   return Object.assign(new Error(`spawn ${file} ENOENT`), { code: 'ENOENT' });
 }
+
+/** The error Node's execFile gives for a command that exited with `code`: the command line in it. */
+function exited(code: number, commandLine: string): Error {
+  return Object.assign(new Error(`Command failed: ${commandLine}\n`), {
+    code,
+    killed: false,
+    signal: null,
+  });
+}
+
+const NO_NOTIFY_SEND = '找不到 notify-send，Linux 上需要安装 libnotify（提供 notify-send）';
 
 let h: Harness | undefined;
 
@@ -175,10 +192,10 @@ describe('system notifications', () => {
 
   it('sends through notify-send on Linux, passing the texts as they are, without a shell', () => {
     const { calls, execFile } = fakeExecFile();
-    const logs: string[] = [];
-    const send = makeSystemNotice({ platform: 'linux', execFile, log: (m) => logs.push(m) });
+    const results: (NoticeFailure | null)[] = [];
+    const send = makeSystemNotice({ platform: 'linux', execFile });
     const body = `做 "一件" 事 \\ 'x' $HOME \`id\``;
-    send('Run 卡住了', body);
+    send('Run 卡住了', body, (failure) => results.push(failure));
     expect(calls).toEqual([
       {
         file: 'notify-send',
@@ -186,12 +203,15 @@ describe('system notifications', () => {
         timeout: 10_000,
       },
     ]);
-    expect(logs).toEqual([]);
+    expect(NOTICE_TIMEOUT_MS).toBe(10_000);
+    expect(results).toEqual([null]);
+    // Nobody listening for the result is fine too.
+    expect(() => send('Run 卡住了', body)).not.toThrow();
   });
 
   it('still sends through osascript on macOS', () => {
     const { calls, execFile } = fakeExecFile();
-    const send = makeSystemNotice({ platform: 'darwin', execFile, log: () => {} });
+    const send = makeSystemNotice({ platform: 'darwin', execFile });
     send('Run 卡住了', '做 "一件" 事');
     expect(calls).toHaveLength(1);
     expect(calls[0]).toMatchObject({
@@ -200,61 +220,126 @@ describe('system notifications', () => {
     });
   });
 
-  it('runs nothing on other platforms', () => {
-    const { calls, execFile } = fakeExecFile();
-    const logs: string[] = [];
+  it('runs nothing on other platforms, and reports nothing', () => {
+    const { calls, execFile } = fakeExecFile(() => enoent('notify-send'));
+    const results: (NoticeFailure | null)[] = [];
     for (const platform of ['win32', 'freebsd', 'aix'] as const) {
-      makeSystemNotice({ platform, execFile, log: (m) => logs.push(m) })('标题', '正文');
+      makeSystemNotice({ platform, execFile })('标题', '正文', (f) => results.push(f));
     }
     expect(calls).toEqual([]);
-    expect(logs).toEqual([]);
+    expect(results).toEqual([]);
     expect(systemNoticeSupported('darwin')).toBe(true);
     expect(systemNoticeSupported('linux')).toBe(true);
     expect(systemNoticeSupported('win32')).toBe(false);
   });
 
-  it('logs only the first failure, never throwing (no notify-send installed)', () => {
+  it('reports each failure without throwing (no notify-send installed)', () => {
     const { calls, execFile } = fakeExecFile(() => enoent('notify-send'));
-    const logs: string[] = [];
-    const send = makeSystemNotice({ platform: 'linux', execFile, log: (m) => logs.push(m) });
-    for (let i = 0; i < 5; i++) expect(() => send('标题', `正文 ${i}`)).not.toThrow();
-    expect(calls).toHaveLength(5); // it keeps trying: the command may be installed later
-    expect(logs).toHaveLength(1);
-    expect(logs[0]).toContain('[通知]');
-    expect(logs[0]).toContain('找不到 notify-send');
-    expect(logs[0]).toContain('libnotify');
+    const results: (NoticeFailure | null)[] = [];
+    const send = makeSystemNotice({ platform: 'linux', execFile });
+    for (let i = 0; i < 3; i++) {
+      expect(() => send('标题', `正文 ${i}`, (f) => results.push(f))).not.toThrow();
+    }
+    expect(calls).toHaveLength(3); // it keeps trying: the command may be installed later
+    expect(results).toEqual(Array(3).fill({ command: 'notify-send', reason: NO_NOTIFY_SEND }));
   });
 
-  it('logs an error execFile throws right away once, without throwing it', () => {
-    const logs: string[] = [];
+  it('reports an error execFile throws right away, without throwing it', () => {
+    const results: (NoticeFailure | null)[] = [];
     const send = makeSystemNotice({
       platform: 'linux',
       execFile: () => {
-        throw new Error('参数里有 NUL');
+        throw new Error('参数里有 NUL\n第二行');
       },
-      log: (m) => logs.push(m),
     });
+    expect(() => send('标题', '正文\0', (f) => results.push(f))).not.toThrow();
     expect(() => send('标题', '正文\0')).not.toThrow();
-    expect(() => send('标题', '正文\0')).not.toThrow();
-    expect(logs).toHaveLength(1);
-    expect(logs[0]).toContain('参数里有 NUL');
+    expect(results).toEqual([{ command: 'notify-send', reason: '参数里有 NUL' }]);
   });
 
-  it('does not throw when notify-send really is missing', async () => {
-    const logs: string[] = [];
-    const missing = `ares1-no-such-command-${process.pid}`;
-    const send = makeSystemNotice({
-      platform: 'linux',
-      // The real execFile, running a command that does not exist.
-      execFile: (_file, args, options, callback) =>
-        execFile(missing, args, options, (err) => callback(err)),
-      log: (m) => logs.push(m),
+  it('hears the result once, even when the listener throws', () => {
+    for (const fail of [() => null, () => enoent('osascript')]) {
+      const { execFile } = fakeExecFile(fail);
+      let heard = 0;
+      const send = makeSystemNotice({ platform: 'darwin', execFile });
+      expect(() =>
+        send('标题', '正文', () => {
+          heard++;
+          throw new Error('炸了');
+        }),
+      ).not.toThrow();
+      expect(heard).toBe(1);
+    }
+  });
+
+  it('keeps the command line and the texts out of the reason: exit code and the first error line', () => {
+    const goal = '做一件不该进日志的事';
+    const script = noticeScript('Run 卡住了', goal);
+    const reasonOf = (err: Error, stderr = '') => {
+      const results: (NoticeFailure | null)[] = [];
+      const { execFile } = fakeExecFile(
+        () => err,
+        () => stderr,
+      );
+      makeSystemNotice({ platform: 'darwin', execFile })('Run 卡住了', goal, (f) =>
+        results.push(f),
+      );
+      expect(results).toHaveLength(1);
+      expect(results[0]?.command).toBe('osascript');
+      return results[0]?.reason;
+    };
+    const failed = exited(1, `osascript -e ${script}`);
+    expect(reasonOf(failed, '0:120: execution error: 不允许发送通知。 (-1743)\n更多\n')).toBe(
+      '退出码 1：0:120: execution error: 不允许发送通知。 (-1743)',
+    );
+    expect(reasonOf(failed)).toBe('退出码 1');
+    expect(reasonOf(failed, `  ${'x'.repeat(300)}`)).toBe(`退出码 1：${'x'.repeat(200)}…`);
+    const killed = Object.assign(new Error(`Command failed: osascript -e ${script}`), {
+      code: null,
+      killed: true,
+      signal: 'SIGTERM',
     });
-    send('标题', '正文');
-    send('标题', '正文');
-    await vi.waitFor(() => expect(logs).toHaveLength(1));
-    await new Promise((r) => setTimeout(r, 100));
-    expect(logs).toHaveLength(1);
+    expect(reasonOf(killed)).toBe('10 秒内无响应被终止');
+    const signalled = Object.assign(new Error(`Command failed: osascript -e ${script}`), {
+      code: null,
+      killed: false,
+      signal: 'SIGKILL',
+    });
+    expect(reasonOf(signalled)).toBe('被信号 SIGKILL 终止');
+    expect(reasonOf(signalled, 'oops')).toBe('被信号 SIGKILL 终止：oops');
+    expect(reasonOf(enoent('osascript'))).toBe('找不到 osascript');
+  });
+
+  it('reports how a real command failed: missing, exiting with an error, killed or hanging', async () => {
+    // The real execFile, running `file` in place of the notification command.
+    const result = (file: string, args: string[], timeout?: number) =>
+      new Promise<NoticeFailure | null>((resolve) => {
+        const send = makeSystemNotice({
+          platform: 'linux',
+          execFile: (_file, _args, options, callback) =>
+            execFile(file, args, { timeout: timeout ?? options.timeout }, callback),
+        });
+        send('标题', '正文', resolve);
+      });
+    const node = process.execPath;
+    const failure = (reason: string) => ({ command: 'notify-send', reason });
+    expect(await result(`ares1-no-such-command-${process.pid}`, [])).toEqual(
+      failure(NO_NOTIFY_SEND),
+    );
+    expect(
+      await result(node, [
+        '-e',
+        'process.stderr.write("Failed to connect to bus\\nmore"); process.exit(3)',
+      ]),
+    ).toEqual(failure('退出码 3：Failed to connect to bus'));
+    expect(await result(node, ['-e', 'process.exit(2)'])).toEqual(failure('退出码 2'));
+    expect(await result(node, ['-e', 'process.kill(process.pid, "SIGKILL")'])).toEqual(
+      failure('被信号 SIGKILL 终止'),
+    );
+    expect(await result(node, ['-e', 'setTimeout(() => {}, 10000)'], 200)).toEqual(
+      failure('10 秒内无响应被终止'),
+    );
+    expect(await result(node, ['-e', ''])).toBeNull();
   });
 
   it('stays quiet when notify.system is off', async () => {
@@ -264,6 +349,121 @@ describe('system notifications', () => {
     const run = h.run('添加 feature.txt', blockOnAgentError());
     await h.waitStatus(run.id, 'blocked');
     expect(sent).toEqual([]);
+  });
+});
+
+describe('system notifications that fail', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    setLang('zh');
+  });
+
+  const systemLogs = (warn: { mock: { calls: unknown[][] } }) =>
+    warn.mock.calls.map((c) => String(c[0])).filter((m) => m.startsWith('[通知] 系统通知'));
+
+  it('records the first failure of each streak on the Events page, notifying nobody of it', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const hook = await startHook();
+    // What the next notification command does: fail with this error (and stderr), or work.
+    let error: Error | null = enoent('notify-send');
+    let stderr = '';
+    const { calls, execFile } = fakeExecFile(
+      () => error,
+      () => stderr,
+    );
+    h = await harness({
+      config: `notify:\n  system: true\n  webhook:\n    url: ${hook.url}/hook\n`,
+      master: { notice: makeSystemNotice({ platform: 'linux', execFile }) },
+    });
+    const store = h.master.store;
+    const failures = () => store.listEventsOfType('notify.system_failed', '');
+    const notify = () =>
+      expect(() =>
+        store.event(null, 'scout.failed', scoutFailed(SCOUT_FAILURE_NOTIFY_AFTER)),
+      ).not.toThrow();
+
+    // Failures in a row: told once.
+    for (let i = 0; i < 3; i++) notify();
+    expect(calls).toHaveLength(3); // it keeps trying: the command may be installed later
+    expect(failures().map((e) => [e.runId, e.data])).toEqual([
+      [null, { command: 'notify-send', reason: NO_NOTIFY_SEND }],
+    ]);
+    expect(systemLogs(warn)).toEqual([
+      `[通知] 系统通知发送失败（notify-send）：${NO_NOTIFY_SEND}。之后的失败不再记录，直到有通知发送成功。`,
+    ]);
+
+    // One got through, then it broke again: told again, in the log and on the Events page.
+    error = null;
+    notify();
+    expect(failures()).toHaveLength(1);
+    error = exited(1, 'notify-send --app-name 战神一号 侦察连续失败：demo 侦察结果不符合约定');
+    stderr = 'Failed to connect to bus: No such file or directory\n';
+    notify();
+    notify();
+    expect(failures()).toHaveLength(2);
+    expect(failures()[1]?.data).toEqual({
+      command: 'notify-send',
+      reason: '退出码 1：Failed to connect to bus: No such file or directory',
+    });
+    expect(systemLogs(warn)).toHaveLength(2);
+
+    // The recorded failures notified nobody: no system notification, no POST to the webhook.
+    expect(calls).toHaveLength(6);
+    await h.master.webhook.idle();
+    expect(hook.received.map((r) => JSON.parse(r.body).eventType)).toEqual(
+      Array(6).fill('scout.failed'),
+    );
+    for (const e of failures()) expect(noticeFor(e, undefined)).toBeNull();
+  });
+
+  it('never notifies of a failed system notification, so a failure cannot set off another', () => {
+    const event: EventRow = {
+      id: 1,
+      runId: null,
+      ts: '2026-11-24T00:00:00.000Z',
+      type: 'notify.system_failed',
+      data: { command: 'notify-send', reason: NO_NOTIFY_SEND },
+    };
+    expect(noticeFor(event, undefined)).toBeNull();
+  });
+
+  it('records nothing where the platform has no system notifications', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { calls, execFile } = fakeExecFile(() => enoent('notify-send'));
+    h = await harness({
+      config: 'notify:\n  system: true\n',
+      master: { notice: makeSystemNotice({ platform: 'win32', execFile }) },
+    });
+    h.master.store.event(null, 'scout.failed', scoutFailed(SCOUT_FAILURE_NOTIFY_AFTER));
+    expect(calls).toEqual([]);
+    expect(h.master.store.listEventsOfType('notify.system_failed', '')).toEqual([]);
+    expect(systemLogs(warn)).toEqual([]);
+  });
+
+  it('records nothing while notify.system is off', async () => {
+    const { calls, execFile } = fakeExecFile(() => enoent('notify-send'));
+    h = await harness({ master: { notice: makeSystemNotice({ platform: 'linux', execFile }) } });
+    h.master.store.event(null, 'scout.failed', scoutFailed(SCOUT_FAILURE_NOTIFY_AFTER));
+    expect(calls).toEqual([]);
+    expect(h.master.store.listEventsOfType('notify.system_failed', '')).toEqual([]);
+  });
+
+  it('swallows a failure that comes back after the Master stopped', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // The commands answer only when the test says so.
+    const answers: (() => void)[] = [];
+    const execFile: ExecFile = (_file, _args, _options, callback) => {
+      answers.push(() => callback(enoent('notify-send'), '', ''));
+    };
+    h = await harness({
+      config: 'notify:\n  system: true\n',
+      master: { notice: makeSystemNotice({ platform: 'linux', execFile }) },
+    });
+    h.master.store.event(null, 'scout.failed', scoutFailed(SCOUT_FAILURE_NOTIFY_AFTER));
+    expect(answers).toHaveLength(1);
+    await h.close();
+    h = undefined;
+    expect(() => answers[0]?.()).not.toThrow();
   });
 });
 
@@ -338,16 +538,62 @@ describe('notifications in English', () => {
     expect(noticeScript('Run is stuck', 'Add a thing')).toContain('with title "Ares.1"');
   });
 
-  it('names the app and logs a failure in English', () => {
-    setLang('en');
+  it('names the app, and logs and records a failure in English', async () => {
+    h = await harness({ config: 'language: en\nnotify:\n  system: true\n' });
+    const store = h.master.store;
     const { calls, execFile } = fakeExecFile(() => enoent('notify-send'));
     const logs: string[] = [];
-    makeSystemNotice({ platform: 'linux', execFile, log: (m) => logs.push(m) })('Stuck', 'A thing');
-    expect(calls[0]?.args).toEqual(['--app-name', 'Ares.1', 'Stuck', 'A thing']);
-    expect(logs).toHaveLength(1);
-    expect(logs[0]).toContain('[notify]');
-    expect(logs[0]).toContain('install libnotify');
-    expect(logs[0]).not.toMatch(/[一-鿿]/);
+    const notifier = new SystemNotifier(
+      store,
+      () => h?.master.config as LoadedConfig,
+      makeSystemNotice({ platform: 'linux', execFile }),
+      { log: (m) => logs.push(m) },
+    );
+    notifier.start();
+    try {
+      store.event(null, 'scout.failed', { ...scoutFailed(3), message: 'A thing' });
+    } finally {
+      notifier.stop();
+    }
+    expect(calls[0]?.args).toEqual([
+      '--app-name',
+      'Ares.1',
+      'Scout keeps failing: demo',
+      'A thing',
+    ]);
+    expect(logs).toEqual([
+      '[notify] Sending a system notification failed (notify-send): notify-send was not found; on Linux, install libnotify (it provides notify-send). Later failures are not logged until a notification gets through.',
+    ]);
+    const [failure] = store.listEventsOfType('notify.system_failed', '');
+    expect(failure?.data).toEqual({
+      command: 'notify-send',
+      reason: 'notify-send was not found; on Linux, install libnotify (it provides notify-send)',
+    });
+    for (const text of [...logs, JSON.stringify(failure?.data)]) {
+      expect(text).not.toMatch(/[一-鿿]/);
+    }
+
+    const reasonOf = (err: Error, stderr = '') => {
+      const results: (NoticeFailure | null)[] = [];
+      const fake = fakeExecFile(
+        () => err,
+        () => stderr,
+      );
+      makeSystemNotice({ platform: 'darwin', execFile: fake.execFile })('Stuck', 'A thing', (f) =>
+        results.push(f),
+      );
+      return results[0]?.reason;
+    };
+    expect(reasonOf(exited(1, 'osascript -e …'), 'execution error')).toBe(
+      'exit code 1: execution error',
+    );
+    expect(reasonOf(Object.assign(new Error('x'), { killed: true, signal: 'SIGTERM' }))).toBe(
+      'killed after no answer within 10 seconds',
+    );
+    expect(reasonOf(Object.assign(new Error('x'), { killed: false, signal: 'SIGKILL' }))).toBe(
+      'terminated by signal SIGKILL',
+    );
+    expect(reasonOf(enoent('osascript'))).toBe('osascript was not found');
   });
 });
 

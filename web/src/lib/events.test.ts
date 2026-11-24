@@ -40,6 +40,8 @@ const SAMPLES: [string, Record<string, unknown>][] = [
   ['github.error', { message: 'HTTP 502' }],
   ['notify.webhook_failed', { reason: 'HTTP 500 Internal Server Error', status: 500 }],
   ['notify.webhook_failed', { reason: 'fetch failed (connect ECONNREFUSED ***)', status: null }],
+  ['notify.system_failed', { command: 'notify-send', reason: 'exit code 1: no bus' }],
+  ['notify.system_failed', { command: 'osascript', reason: 'exit code 1' }],
   ['github.pushed', { repo: 'demo', branch: 'main', head: 'abcdef1234567890' }],
   ['issue.auto_accepted', { repo: 'demo', issue: 12 }],
   ['scout.started', { scoutId: 's-1', repo: 'demo', trigger: 'auto' }],
@@ -181,6 +183,34 @@ describe('globalEventText', () => {
     );
   });
 
+  it('says a system notification failed, through which command and why, told once per streak', () => {
+    const data = {
+      command: 'notify-send',
+      reason: '找不到 notify-send，Linux 上需要安装 libnotify（提供 notify-send）',
+    };
+    expect(text('notify.system_failed', data)).toBe(
+      '系统通知发送失败（notify-send）：找不到 notify-send，Linux 上需要安装 libnotify（提供 notify-send）；之后的失败不再记录，直到有通知发送成功',
+    );
+    expect(text('notify.system_failed', {})).toBe(
+      '系统通知发送失败；之后的失败不再记录，直到有通知发送成功',
+    );
+    setLang('en');
+    const en = text('notify.system_failed', {
+      command: 'osascript',
+      reason: 'exit code 1: execution error (-1743)',
+    });
+    expect(en).toBe(
+      'A system notification could not be sent (osascript): exit code 1: execution error (-1743); later failures are not recorded until one gets through',
+    );
+    expect(en).not.toMatch(/[一-鿿]/);
+    expect(text('notify.system_failed', { command: null, reason: 'exit code 1' })).toBe(
+      'A system notification could not be sent: exit code 1; later failures are not recorded until one gets through',
+    );
+    expect(text('notify.system_failed', { command: 5, reason: null })).toBe(
+      'A system notification could not be sent; later failures are not recorded until one gets through',
+    );
+  });
+
   it('counts what a scout proposed, with English plurals', () => {
     const data = { repo: 'demo', created: 3, auto: 1, pending: 2 };
     expect(text('scout.completed', data)).toBe(
@@ -243,6 +273,7 @@ describe('globalEventTone', () => {
     for (const type of [
       'github.error',
       'notify.webhook_failed',
+      'notify.system_failed',
       'config.reload_failed',
       'upgrade.failed',
       'scout.failed',

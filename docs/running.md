@@ -46,12 +46,12 @@ Agent CLI 的原始输出（stream-json）带着工具调用的完整结果：�
 
 ### 全局事件
 
-Master 把不属于任何 Run 的事记成全局事件（事件的 Run 为空）：上一个 Master 异常退出（`master.restarted`）、清理原始日志（`logs.pruned`）、恢复数据库备份（`store.backup_restored`）、node 不见了（`master.node_missing`）、打开或关闭工作开关（`master.working`）、配置重新加载（`config.reloaded`、`config.reload_failed`）、访问 GitHub 出错（`github.error`）、webhook 通知发送失败（`notify.webhook_failed`）、推送目标分支（`github.pushed`）、自动采纳提案（`issue.auto_accepted`）、侦察（`scout.started`、`scout.completed`、`scout.failed`、`scout.rate_limited`）和升级（`upgrade.started`、`upgrade.done`、`upgrade.failed`）。这篇文档里说「事件列表里记一条」这些事件的地方，都指这里。
+Master 把不属于任何 Run 的事记成全局事件（事件的 Run 为空）：上一个 Master 异常退出（`master.restarted`）、清理原始日志（`logs.pruned`）、恢复数据库备份（`store.backup_restored`）、node 不见了（`master.node_missing`）、打开或关闭工作开关（`master.working`）、配置重新加载（`config.reloaded`、`config.reload_failed`）、访问 GitHub 出错（`github.error`）、webhook 通知发送失败（`notify.webhook_failed`）、系统通知发送失败（`notify.system_failed`）、推送目标分支（`github.pushed`）、自动采纳提案（`issue.auto_accepted`）、侦察（`scout.started`、`scout.completed`、`scout.failed`、`scout.rate_limited`）和升级（`upgrade.started`、`upgrade.done`、`upgrade.failed`）。这篇文档里说「事件列表里记一条」这些事件的地方，都指这里。
 
 Master 大部分时间没人看着，人回来时在看板的「事件」页查这段时间发生过什么：
 
 - 最新的在前，每页 200 条，底部「加载更早的」往前翻；有新的全局事件时自动刷新。
-- 每条有时间、类型和一句说明：比如删了几个原始日志、多大，上一个 Master 的 pid 和启动时间，恢复了哪个备份、较新的库移到了哪里。出错的（`github.error`、`notify.webhook_failed`、`config.reload_failed`、`upgrade.failed`、`scout.failed`）标成红色，值得留意的（`master.restarted`、`master.node_missing`、`store.backup_restored`，有无效配置项的 `config.reloaded`）标成橙色。升级失败带着脚本输出末尾时可以展开看。鼠标悬停在说明上能看到原始数据。
+- 每条有时间、类型和一句说明：比如删了几个原始日志、多大，上一个 Master 的 pid 和启动时间，恢复了哪个备份、较新的库移到了哪里。出错的（`github.error`、`notify.webhook_failed`、`notify.system_failed`、`config.reload_failed`、`upgrade.failed`、`scout.failed`）标成红色，值得留意的（`master.restarted`、`master.node_missing`、`store.backup_restored`，有无效配置项的 `config.reloaded`）标成橙色。升级失败带着脚本输出末尾时可以展开看。鼠标悬停在说明上能看到原始数据。
 - 侦察和自动采纳的事件带着去「需求」页的链接。
 - 看板还不认识的事件类型（以后新加的）照样列出，显示类型名和原始数据。
 - 每个 Run 自己的事件不在这里，在 Run 详情页。
@@ -343,7 +343,7 @@ notify:
 - Linux：`notify-send`，需要装 libnotify（Debian、Ubuntu 上是 `libnotify-bin` 包，Fedora 上是 `libnotify`），Master 也要能连上桌面会话（D-Bus）。应用名、标题和正文作为参数直接传给 `notify-send`，不经过 shell。
 - 其他平台（如 Windows）不支持。
 
-在 macOS 和 Linux 上打开 `notify.system` 后，`/api/health` 的 `systemNotify` 为 `true`，看板不再重复发浏览器通知；在不支持的平台上它为 `false`，看板照常由浏览器发，不会因为打开了这个设置反而什么都收不到。系统通知发送失败（比如 Linux 上没装 `notify-send`，或者没有桌面会话）不影响 Master，只在 Master 的输出里记一次原因（以 `[通知]` 开头，英文为 `[notify]`），之后的失败不再记。
+在 macOS 和 Linux 上打开 `notify.system` 后，`/api/health` 的 `systemNotify` 为 `true`，看板不再重复发浏览器通知；在不支持的平台上它为 `false`，看板照常由浏览器发，不会因为打开了这个设置反而什么都收不到。系统通知发送失败（比如 Linux 上没装 `notify-send`，没有桌面会话，`osascript` 出错，或者命令 10 秒内没有响应被终止）不重试，不影响 Master。一串连续的失败只记第一次：在 Master 的输出里记一行原因（以 `[通知]` 开头，英文为 `[notify]`），同时在事件列表里记一条全局事件 `notify.system_failed`（看板「事件」页能看到，标成红色；见上面的「全局事件」），数据是 `{ command, reason }`：`command` 是发通知的命令（`osascript` 或 `notify-send`），`reason` 是一行原因，比如找不到命令、10 秒内无响应被终止、被信号终止，或者退出码加上命令错误输出的第一行；不写完整的命令行，免得把通知正文（Run 的目标）也记进去。Master 多由保活脚本在后台启动，没人看它的输出，人回到看板时在「事件」页就能看到系统通知坏了以及原因。之后连续的失败不再记；有一条通知发送成功后，下次再失败重新记一次。这条事件本身不发通知（不发系统通知、webhook，看板也不发浏览器通知），免得失败了再发、再失败。不支持的平台上不发系统通知，也就不记这条事件。
 
 自动升级脚本（`scripts/self-upgrade.sh`）在 Master 一个都没能启动时（找不到安装目录，回退后找不到能用的 node，或者回退后旧版本也没能启动）也发一条系统通知：有 `osascript` 就用它，否则有 `notify-send` 就用它，两个都没有就不发。这时 Master 不在运行，自己发不了 webhook，所以升级脚本和保活脚本（见「保活」）会自己把这条通知也发到配置的 webhook（见下面「webhook」里的「Master 停了、起不来时」）。这些脚本发的系统通知不受 `notify.system` 开关影响。
 
