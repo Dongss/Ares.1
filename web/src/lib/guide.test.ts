@@ -545,6 +545,7 @@ describe('notifications', () => {
       ['proposals', ev('scout.completed', { pending: 2 }, null)],
       ['scout', ev('scout.failed', { repo: 'demo', message: 'x', streak: 3 }, null)],
       ['github', ev('github.error', { message: 'x' }, null)],
+      ['pull', ev('github.diverged', { repo: 'demo', local: 'a', remote: 'b' }, null)],
       ['upgrade', ev('upgrade.failed', { message: 'x' }, null)],
     ];
     expect(samples.map(([kind]) => kind).sort()).toEqual(Object.keys(NOTICE_KINDS).sort());

@@ -54,6 +54,7 @@ export type NoticeKind =
   | 'proposals'
   | 'scout'
   | 'github'
+  | 'pull'
   | 'upgrade';
 
 /**
@@ -136,6 +137,16 @@ export const NOTICE_KINDS: Record<NoticeKind, { label: string; when: string }> =
       when: 'Reading or writing issues, or pushing the target branch, failed. Within a streak of failures each error is notified once; the streak ends, and errors are notified again, after a round in which every GitHub call succeeds',
     },
   },
+  pull: {
+    zh: {
+      label: '没能拉取 GitHub 上的新提交',
+      when: 'GitHub 上的目标分支有本地没有的提交，但 Master 没能把本地目标分支快进过去，标题后面写着仓库名：两边已经分叉（各有对方没有的提交），要你手动合并，合并前不再推送；或者目标分支检出的工作目录里有未提交的改动。同一次分叉、同一种原因只通知一次',
+    },
+    en: {
+      label: 'Could not pull new commits from GitHub',
+      when: 'The target branch on GitHub has commits the local one lacks, but the Master could not fast-forward the local branch to them, with the repo after the title: the two have diverged (each has commits the other lacks) and need you to merge them, with nothing pushed until then; or the target branch is checked out with uncommitted changes. Each divergence and each reason is notified once',
+    },
+  },
   upgrade: {
     zh: {
       label: 'Master 自动升级失败',
@@ -170,10 +181,26 @@ export const firstLine = (text: string, max: number) => {
   return line.length > max ? `${line.slice(0, max)}…` : line;
 };
 
+/** A non-empty string from event data, or null. */
+const text = (v: unknown): string | null => (typeof v === 'string' && v !== '' ? v : null);
+
+/** The target branch could not take GitHub's new commits: titled with the repo. */
+function pullNotice(event: EventRow, body: string): Notice {
+  const repo = text(event.data.repo);
+  return {
+    kind: 'pull',
+    title: titleOf('pull', repo ?? undefined),
+    body,
+    runId: null,
+    about: 'issues',
+  };
+}
+
 /**
  * The notification for an event, or null when nobody has to act. Only things that wait for a
- * human: approvals, stuck or failed Runs, proposals the Master may not accept by itself, and
- * failures of the Master's own automation (GitHub, upgrades, a scout that keeps failing).
+ * human: approvals, stuck or failed Runs, proposals the Master may not accept by itself,
+ * failures of the Master's own automation (GitHub, upgrades, a scout that keeps failing), and a
+ * target branch that cannot take the new commits on GitHub by itself.
  * Finished Runs are not announced.
  */
 export function noticeFor(event: EventRow, goal: string | undefined): Notice | null {
@@ -228,6 +255,39 @@ export function noticeFor(event: EventRow, goal: string | undefined): Notice | n
         runId: null,
         about: 'issues',
       };
+    case 'github.diverged': {
+      // The same divergence, after a Run merged or more was pushed: told the first time.
+      if (event.data.repeated === true) return null;
+      const branch = text(event.data.branch) ?? t({ zh: '目标分支', en: 'The target branch' });
+      const local = text(event.data.local);
+      const remote = text(event.data.remote);
+      const at =
+        local && remote
+          ? t({
+              zh: `（本地 ${local.slice(0, 7)}，GitHub ${remote.slice(0, 7)}）`,
+              en: ` (local ${local.slice(0, 7)}, GitHub ${remote.slice(0, 7)})`,
+            })
+          : '';
+      return pullNotice(
+        event,
+        t({
+          zh: `${branch} 和 GitHub 上的已经分叉${at}，要你手动合并后推送；在此之前 Master 不推送，已完成 Run 的 issue 保持打开`,
+          en: `${branch} has diverged from GitHub's${at}; merge the two by hand and push. Until then the Master pushes nothing and the issues of completed Runs stay open`,
+        }),
+      );
+    }
+    case 'github.pull_blocked': {
+      const branch = text(event.data.branch) ?? t({ zh: '目标分支', en: 'The target branch' });
+      const worktree = text(event.data.worktree);
+      const where = worktree ? t({ zh: `在 ${worktree} `, en: ` in ${worktree}` }) : '';
+      return pullNotice(
+        event,
+        t({
+          zh: `${branch} 检出${where}有未提交的改动，不能快进到 GitHub 上的新提交；提交或丢弃这些改动后，下一轮检查会自动拉取`,
+          en: `${branch} is checked out${where} with uncommitted changes, so it cannot be fast-forwarded to the new commits on GitHub; once they are committed or discarded, the next check pulls by itself`,
+        }),
+      );
+    }
     case 'upgrade.failed':
       // The same environment problem failing the same target again: told the first time.
       if (event.data.repeated === true) return null;

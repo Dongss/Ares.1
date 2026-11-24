@@ -40,6 +40,8 @@ import {
   addDetachedWorktree,
   commitTime,
   dropWorktree,
+  fastForwardBranch,
+  isAncestor,
   pruneWorktrees,
   revParse,
   git as runGit,
@@ -234,6 +236,16 @@ export class IssueBridge {
   private lastPollAt: string | null = null;
   /** Target branch commit last pushed, per repo path. */
   private readonly pushed = new Map<string, string>();
+  /**
+   * Repos (by id) whose target branch and the one on GitHub each have commits the other lacks,
+   * as last seen. Nothing is pushed while it lasts; cleared once the divergence is gone.
+   */
+  private readonly diverged = new Map<string, { local: string; remote: string }>();
+  /**
+   * Why fast-forwarding the target branch to GitHub's was refused, per repo id, as recorded:
+   * each reason once per streak, which ends with a round the pull is no longer refused in.
+   */
+  private readonly pullBlocked = new Map<string, string>();
   private lastError: { message: string; at: string } | null = null;
   /**
    * The messages recorded as github.error since the last poll whose GitHub calls all went through.
@@ -429,10 +441,11 @@ export class IssueBridge {
   // ---- poll: intake, sync, scheduled scouts ----------------------------------
 
   /**
-   * One round: accept proposals the settings allow, start Runs for ready issues, terminate Runs
-   * whose issue a human closed and start over those whose issue a human changed, catch issues up,
-   * pass on replies to the assessments' questions, start a scout where the repo is idle. With the
-   * work switch off only the terminating and the catching up happen: neither starts new work.
+   * One round: catch the target branches up with GitHub (`syncTarget`), accept proposals the
+   * settings allow, start Runs for ready issues, terminate Runs whose issue a human closed and
+   * start over those whose issue a human changed, catch issues up, pass on replies to the
+   * assessments' questions, start a scout where the repo is idle. With the work switch off only
+   * the pulling, the terminating and the catching up happen: none of them starts new work.
    */
   poll(): Promise<void> {
     return this.serial(async () => {
@@ -450,6 +463,9 @@ export class IssueBridge {
           }
         }
       };
+      // First, so that the Runs taken this round start from GitHub's latest commits and the
+      // issues closed this round see whether the branch can be pushed.
+      await each((name) => this.syncTarget(name));
       if (working) {
         await each((name) => this.acceptBacklog(name));
         await each((name) => this.intake(name));
@@ -460,7 +476,9 @@ export class IssueBridge {
         await each((name) => this.collectReplies(name));
         await each((name) => this.redoFailedRuns(name));
       }
-      await each((name) => this.pushTarget(name));
+      await each(async (name) => {
+        await this.pushTarget(name);
+      });
       if (working) await each((name) => this.maybeAutoScout(name));
       else {
         for (const name of Object.keys(github.repos)) {
@@ -649,17 +667,30 @@ export class IssueBridge {
     }
   }
 
-  /** Push the target branch to GitHub when it moved since the last push. */
-  private async pushTarget(name: string): Promise<void> {
+  /**
+   * Push the target branch to GitHub when it moved since the last push. Returns whether GitHub
+   * has it: false only while the two have diverged (see syncTarget), when nothing is pushed,
+   * since GitHub would refuse it every round.
+   */
+  private async pushTarget(name: string): Promise<boolean> {
     const { repo, cfg } = this.repoSetup(name);
-    if (!cfg.push) return;
+    if (!cfg.push) return true;
+    if (this.diverged.has(repo.id)) return false;
     const head = await revParse(repo.path, repo.targetBranch);
-    if (this.pushed.get(repo.path) === head) return;
+    if (this.pushed.get(repo.path) === head) return true;
     const full = await this.issuesRepo(repo, cfg);
     await this.gh().push(repo.path, full, repo.targetBranch);
     this.pushed.set(repo.path, head);
     this.deps.store.event(null, 'github.pushed', { repo: name, branch: repo.targetBranch, head });
-    // Keep `git status` in the clone honest when its origin is that GitHub repo.
+    await this.trackOrigin(repo, full, head);
+    return true;
+  }
+
+  /**
+   * Keep `git status` in the clone honest when its origin is the GitHub repo `full`: its
+   * remote-tracking branch of the target branch is set to `head`, which GitHub has.
+   */
+  private async trackOrigin(repo: Repo, full: string, head: string): Promise<void> {
     try {
       const url = (await runGit(repo.path, ['remote', 'get-url', 'origin'])).replace(/\.git$/, '');
       if (url.endsWith(`github.com:${full}`) || url.endsWith(`github.com/${full}`)) {
@@ -668,6 +699,85 @@ export class IssueBridge {
     } catch {
       // no origin: nothing to keep in step
     }
+  }
+
+  /**
+   * Bring commits others pushed to the target branch on GitHub into the local one, so that later
+   * Runs build on them and the pushes keep fast-forwarding. Only for repos that push (without
+   * `push` the code need not be on GitHub at all), and only while no Run of the repo merges, so
+   * as not to race the engine for the branch (a merge that starts meanwhile is guarded by
+   * fastForwardBranch's compare-and-swap). Runs going on merge the new commits as usual when
+   * they merge. By GitHub's commit (remote) and the local one (local):
+   * - the same, or local ahead (not pushed yet): nothing to do, the push follows;
+   * - local behind: fast-forwarded (`github.pulled`). GitHub has it, so it is not pushed back,
+   *   nor is the old commit while the fast-forward is refused because the branch is checked
+   *   out with uncommitted changes (`github.pull_blocked`, each reason once per streak);
+   * - diverged: nothing is merged by itself. Recorded (`github.diverged`) once per pair of
+   *   commits, notified once until the divergence is gone; nothing is pushed until a human
+   *   merges (pushTarget).
+   * A fetch that fails is thrown, to be reported like every GitHub error.
+   */
+  private async syncTarget(name: string): Promise<void> {
+    const { repo, cfg } = this.repoSetup(name);
+    if (!cfg.push || this.repoMerging(repo)) return;
+    const store = this.deps.store;
+    const branch = repo.targetBranch;
+    const full = await this.issuesRepo(repo, cfg);
+    const remote = await this.gh().fetch(repo.path, full, branch);
+    await this.trackOrigin(repo, full, remote);
+    const local = await revParse(repo.path, branch);
+    if (remote === local || (await isAncestor(repo.path, remote, local))) {
+      this.diverged.delete(repo.id);
+      this.pullBlocked.delete(repo.id);
+      return;
+    }
+    if (!(await isAncestor(repo.path, local, remote))) {
+      this.pullBlocked.delete(repo.id);
+      const seen = this.diverged.get(repo.id);
+      if (seen?.local === local && seen.remote === remote) return;
+      this.diverged.set(repo.id, { local, remote });
+      store.event(null, 'github.diverged', {
+        repo: name,
+        branch,
+        local,
+        remote,
+        // Already told about this divergence: a Run merged meanwhile, or more was pushed.
+        ...(seen ? { repeated: true } : {}),
+      });
+      return;
+    }
+    this.diverged.delete(repo.id);
+    // GitHub has the local commit: pushing it would only be refused, as not a fast-forward.
+    this.pushed.set(repo.path, local);
+    // Looked at again: a Run may have started merging while GitHub answered.
+    if (this.repoMerging(repo)) return;
+    const ff = await fastForwardBranch(repo.path, branch, remote);
+    if (ff.ok) {
+      this.pullBlocked.delete(repo.id);
+      this.pushed.set(repo.path, remote);
+      store.event(null, 'github.pulled', { repo: name, branch, from: local, to: remote });
+      return;
+    }
+    // The branch moved on meanwhile; the next round looks again.
+    if (ff.reason === 'diverged') return;
+    if (this.pullBlocked.get(repo.id) === ff.reason) return;
+    this.pullBlocked.set(repo.id, ff.reason);
+    store.event(null, 'github.pull_blocked', {
+      repo: name,
+      branch,
+      reason: ff.reason,
+      worktree: ff.worktree,
+      status: ff.status,
+    });
+  }
+
+  /** Some Run of the repo is merging into its target branch now. */
+  private repoMerging(repo: Repo): boolean {
+    return this.deps.store.listRuns({ status: 'running', repoId: repo.id }).some((run) => {
+      if (!run.currentStageRunId) return false;
+      const sr = this.deps.store.getStageRun(run.currentStageRunId);
+      return sr.status === 'executing' && this.merging(run);
+    });
   }
 
   private dashboardUrl(): string {
@@ -870,11 +980,13 @@ export class IssueBridge {
     const repo = this.deps.store.getRepo(run.repoId);
     const stageName = this.stageNameOf(run);
     // The issue closes once the code is on GitHub; a failed push is retried on the next poll.
+    // While the target branch has diverged from GitHub's, the issue waits as it is, open, until
+    // a human merges the two and the push goes through.
     let pushed = false;
     if (run.status === 'completed') {
       const name = repo.name;
       if (this.cfg.master.github?.repos[name]?.push) {
-        await this.pushTarget(name);
+        if (!(await this.pushTarget(name))) return;
         pushed = true;
       }
     }

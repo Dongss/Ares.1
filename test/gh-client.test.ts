@@ -791,6 +791,66 @@ describe('GhCli push', () => {
   });
 });
 
+describe('GhCli fetch', () => {
+  it('uses gh as the credential helper and keeps the token out of the arguments', async () => {
+    const gh = fakeGh([{ when: ['auth', 'token', '--user', 'ares1-bot'], stdout: 'tok-2\n' }]);
+    const record = fakeGit();
+    const clone = tmpDir('ares1-clone-');
+
+    const err = await ghError(new GhCli(gh.bin, 'ares1-bot').fetch(clone, 'acme/widgets', 'main'));
+    expect(err.message).toBe(
+      '从 acme/widgets 拉取 main 失败：fatal: Authentication failed for https://github.com/acme/widgets.git/',
+    );
+    const call = JSON.parse(readFileSync(record, 'utf8')) as { args: string[]; token: string };
+    expect(call.args).toEqual([
+      '-c',
+      'credential.helper=',
+      '-c',
+      `credential.helper=!'${gh.bin}' auth git-credential`,
+      'fetch',
+      '-q',
+      '--no-tags',
+      'https://github.com/acme/widgets.git',
+      'refs/heads/main',
+    ]);
+    expect(call.token).toBe('tok-2');
+    expect(call.args.join(' ')).not.toContain('tok-2');
+    expect(err.message).not.toContain('tok-2');
+  });
+
+  it("returns the commit of GitHub's branch and moves no local ref", async () => {
+    const remotes = localGitHub();
+    const bare = join(remotes, 'widgets.git');
+    mkdirSync(bare);
+    git(bare, 'init', '-q', '--bare');
+    const theirs = initRepo();
+    writeFile(join(theirs, 'b.txt'), 'b\n');
+    git(theirs, 'add', '-A');
+    git(theirs, 'commit', '-q', '-m', 'b');
+    git(theirs, 'push', '-q', bare, 'main');
+    const remote = git(theirs, 'rev-parse', 'main');
+
+    const clone = initRepo();
+    const local = git(clone, 'rev-parse', 'main');
+    const refs = git(clone, 'for-each-ref');
+    expect(await new GhCli(fakeGh([]).bin).fetch(clone, 'acme/widgets', 'main')).toBe(remote);
+    // The commit is in the clone now, and no branch or tag moved.
+    expect(git(clone, 'cat-file', '-t', remote)).toBe('commit');
+    expect(git(clone, 'rev-parse', 'main')).toBe(local);
+    expect(git(clone, 'for-each-ref')).toBe(refs);
+  });
+
+  it('reports what git wrote to stderr when the branch is not on GitHub', async () => {
+    const clone = initRepo();
+    const remotes = localGitHub();
+    git(remotes, 'init', '-q', '--bare', 'widgets.git');
+
+    const err = await ghError(new GhCli(fakeGh([]).bin).fetch(clone, 'acme/widgets', 'no-such'));
+    expect(err.message).toMatch(/^从 acme\/widgets 拉取 no-such 失败：/);
+    expect(err.message).toContain('no-such');
+  });
+});
+
 describe('GhCli in English', () => {
   it('writes its errors without Chinese', async () => {
     setLang('en');
@@ -806,6 +866,8 @@ describe('GhCli in English', () => {
       { when: ['auth', 'token'], stdout: 'tok\n' },
     ]);
     const cli = new GhCli(gh.bin);
+    // One client for the push and the fetch: it asks gh for the token once.
+    const bot = new GhCli(gh.bin, 'ares1-bot');
     fakeGit();
 
     const messages = [
@@ -816,7 +878,8 @@ describe('GhCli in English', () => {
       (await ghError(cli.getIssue('acme/widgets', 42))).message,
       (await ghError(cli.createIssue('acme/widgets', { title: 't', body: 'b', labels: [] })))
         .message,
-      (await ghError(new GhCli(gh.bin, 'ares1-bot').push(tmpDir(), 'acme/widgets', 'b1'))).message,
+      (await ghError(bot.push(tmpDir(), 'acme/widgets', 'b1'))).message,
+      (await ghError(bot.fetch(tmpDir(), 'acme/widgets', 'b1'))).message,
     ];
     expect(messages).toEqual([
       'gh api user failed: HTTP 401: Bad credentials',
@@ -826,6 +889,7 @@ describe('GhCli in English', () => {
       'acme/widgets has no issue #42',
       'gh issue create returned no issue link: oops',
       'Pushing b1 to acme/widgets failed: fatal: Authentication failed for https://github.com/acme/widgets.git/',
+      'Fetching b1 from acme/widgets failed: fatal: Authentication failed for https://github.com/acme/widgets.git/',
     ]);
     for (const message of messages) expect(message).not.toMatch(CJK);
   });

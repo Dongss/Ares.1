@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -455,9 +455,28 @@ export class FakeGitHub implements GitHub {
 
   async push(path: string, _repo: string, branch: string): Promise<void> {
     this.call(`push ${branch}`);
-    this.pushes.push(
-      execFileSync('git', ['rev-parse', branch], { cwd: path, encoding: 'utf8' }).trim(),
-    );
+    const head = execFileSync('git', ['rev-parse', branch], { cwd: path, encoding: 'utf8' }).trim();
+    if (this.remoteHead !== null) {
+      // GitHub refuses what is not a fast-forward of what it has.
+      const ff = spawnSync('git', ['merge-base', '--is-ancestor', this.remoteHead, head], {
+        cwd: path,
+      });
+      if (ff.status !== 0) throw new Error(`push ${branch} rejected: not a fast-forward`);
+      this.remoteHead = head;
+    }
+    this.pushes.push(head);
+  }
+
+  /**
+   * The commit the branch points at on GitHub, as `fetch` returns it; null: the local branch's
+   * current commit, as if GitHub had what the clone has. The commit must exist in the clone.
+   */
+  remoteHead: string | null = null;
+
+  async fetch(path: string, _repo: string, branch: string): Promise<string> {
+    this.call(`fetch ${branch}`);
+    if (this.remoteHead !== null) return this.remoteHead;
+    return execFileSync('git', ['rev-parse', branch], { cwd: path, encoding: 'utf8' }).trim();
   }
 
   async listComments(_repo: string, number: number): Promise<GhComment[]> {

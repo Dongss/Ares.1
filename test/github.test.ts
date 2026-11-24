@@ -1841,6 +1841,229 @@ describe('issues: scout', () => {
   });
 });
 
+describe('issues: pulling the target branch from GitHub', () => {
+  /** A commit on top of `parent` that no local branch points at, as somebody pushed to GitHub. */
+  const pushedByOthers = (t: Harness, parent: string, file = 'theirs.txt') => {
+    const blob = execFileSync('git', ['hash-object', '-w', '--stdin'], {
+      cwd: t.repoDir,
+      input: `${file}\n`,
+      encoding: 'utf8',
+    }).trim();
+    const base = execFileSync('git', ['ls-tree', parent], { cwd: t.repoDir, encoding: 'utf8' });
+    const tree = execFileSync('git', ['mktree'], {
+      cwd: t.repoDir,
+      input: `${base}100644 blob ${blob}\t${file}\n`,
+      encoding: 'utf8',
+    }).trim();
+    return git(t.repoDir, 'commit-tree', tree, '-p', parent, '-m', `${file} on GitHub`);
+  };
+  const commitLocally = (t: Harness, file = 'ours.txt') => {
+    writeFile(join(t.repoDir, file), `${file}\n`);
+    git(t.repoDir, 'add', '-A');
+    git(t.repoDir, 'commit', '-q', '-m', file);
+    return git(t.repoDir, 'rev-parse', 'main');
+  };
+  const events = (t: Harness, type: string) => t.master.store.listGlobalEventsOfType(type);
+  const head = (t: Harness) => git(t.repoDir, 'rev-parse', 'main');
+
+  it('fast-forwards the target branch to new commits on GitHub and does not push them back', async () => {
+    const t = await start(config({ push: true }));
+    const before = head(t);
+    const remote = pushedByOthers(t, before);
+    gh.remoteHead = remote;
+    await t.master.issues.poll();
+    expect(head(t)).toBe(remote);
+    // The checked-out worktree moved along: the new file is there and nothing is left over.
+    expect(readFileSync(join(t.repoDir, 'theirs.txt'), 'utf8')).toBe('theirs.txt\n');
+    expect(git(t.repoDir, 'status', '--porcelain')).toBe('');
+    const pulled = events(t, 'github.pulled');
+    expect(pulled.map((e) => e.data)).toEqual([
+      { repo: 'demo', branch: 'main', from: before, to: remote },
+    ]);
+    expect(pulled[0] && noticeFor(pulled[0], undefined)).toBeNull();
+    expect(gh.calls).toContain('fetch main');
+    expect(gh.calls).not.toContain('push main');
+
+    await t.master.issues.poll();
+    expect(events(t, 'github.pulled')).toHaveLength(1);
+    expect(gh.pushes).toEqual([]);
+    expect(t.master.issues.status().lastError).toBeNull();
+  });
+
+  it('starts the Runs of the same round from the pulled commit', async () => {
+    const t = await start(config({ push: true }));
+    gh.add({ title: '加 feature', labels: [LABELS.ready] });
+    const remote = pushedByOthers(t, head(t));
+    gh.remoteHead = remote;
+    await t.master.issues.poll();
+    const [run] = t.master.store.listRuns();
+    if (!run) throw new Error('no run');
+    await waitFor(() => t.master.store.getRun(run.id).baseCommit !== null, 'the Run to start');
+    expect(t.master.store.getRun(run.id).baseCommit).toBe(remote);
+  });
+
+  it('pushes as usual and pulls nothing while the local branch is ahead', async () => {
+    const t = await start(config({ push: true }));
+    gh.remoteHead = head(t);
+    const local = commitLocally(t);
+    await t.master.issues.poll();
+    expect(head(t)).toBe(local);
+    expect(events(t, 'github.pulled')).toHaveLength(0);
+    expect(events(t, 'github.diverged')).toHaveLength(0);
+    expect(gh.pushes).toEqual([local]);
+  });
+
+  it('records a divergence once, notifies once and pushes nothing until a human merges', async () => {
+    const t = await start(config({ push: true }));
+    const base = head(t);
+    const remote = pushedByOthers(t, base);
+    gh.remoteHead = remote;
+    const local = commitLocally(t);
+    for (let i = 0; i < 3; i++) await t.master.issues.poll();
+    expect(head(t)).toBe(local);
+    const diverged = events(t, 'github.diverged');
+    expect(diverged.map((e) => e.data)).toEqual([{ repo: 'demo', branch: 'main', local, remote }]);
+    const notice = diverged[0] && noticeFor(diverged[0], undefined);
+    expect(notice).toMatchObject({ kind: 'pull', about: 'issues', runId: null });
+    expect(notice?.title).toBe('没能拉取 GitHub 上的新提交：demo');
+    expect(notice?.body).toContain('手动合并');
+    expect(gh.calls).not.toContain('push main');
+    // No GitHub failure: nothing was refused.
+    expect(t.master.issues.status().lastError).toBeNull();
+    expect(events(t, 'github.error')).toHaveLength(0);
+
+    // The local branch moves on meanwhile (a Run merged): recorded, not notified again.
+    const local2 = commitLocally(t, 'ours2.txt');
+    await t.master.issues.poll();
+    await t.master.issues.poll();
+    const later = events(t, 'github.diverged');
+    expect(later).toHaveLength(2);
+    expect(later[1]?.data).toMatchObject({ local: local2, remote, repeated: true });
+    expect(later[1] && noticeFor(later[1], undefined)).toBeNull();
+    expect(gh.calls).not.toContain('push main');
+
+    // A human merges GitHub's commit: the divergence is gone and the merge is pushed.
+    git(t.repoDir, 'merge', '-q', '--no-edit', remote);
+    const merged = head(t);
+    await t.master.issues.poll();
+    expect(gh.pushes).toEqual([merged]);
+    expect(events(t, 'github.diverged')).toHaveLength(2);
+
+    // Diverging again is recorded and notified again.
+    gh.remoteHead = pushedByOthers(t, merged, 'theirs2.txt');
+    const local3 = commitLocally(t, 'ours3.txt');
+    await t.master.issues.poll();
+    const again = events(t, 'github.diverged');
+    expect(again).toHaveLength(3);
+    expect(again[2]?.data).toEqual({
+      repo: 'demo',
+      branch: 'main',
+      local: local3,
+      remote: gh.remoteHead,
+    });
+    expect(again[2] && noticeFor(again[2], undefined)?.kind).toBe('pull');
+  });
+
+  it('keeps the issue of a completed Run open while diverged, and closes it once merged', async () => {
+    const t = await start(config({ autoMerge: true, push: true }));
+    const remote = pushedByOthers(t, head(t));
+    gh.remoteHead = remote;
+    commitLocally(t);
+    gh.add({ title: '加 feature', labels: [LABELS.ready] });
+    await t.master.issues.poll();
+    const [run] = t.master.store.listRuns();
+    if (!run) throw new Error('no run');
+    await t.waitStatus(run.id, 'completed');
+    await t.master.issues.sync();
+    await t.master.issues.poll();
+    expect(gh.get(1).state).toBe('open');
+    expect(gh.calls).not.toContain('push main');
+
+    git(t.repoDir, 'merge', '-q', '--no-edit', remote);
+    await t.master.issues.poll();
+    expect(gh.pushes).toEqual([head(t)]);
+    expect(gh.get(1).state).toBe('closed');
+    expect(gh.get(1).comments.at(-1)).toContain('并推送到 GitHub');
+  });
+
+  it('does not fast-forward over uncommitted changes, and records that once', async () => {
+    const t = await start(config({ push: true }));
+    const before = head(t);
+    const remote = pushedByOthers(t, before);
+    gh.remoteHead = remote;
+    writeFile(join(t.repoDir, 'README.md'), '# changed by hand\n');
+    await t.master.issues.poll();
+    await t.master.issues.poll();
+    expect(head(t)).toBe(before);
+    const blocked = events(t, 'github.pull_blocked');
+    expect(blocked).toHaveLength(1);
+    expect(blocked[0]?.data).toMatchObject({
+      repo: 'demo',
+      branch: 'main',
+      reason: 'dirty',
+      status: ' M README.md',
+    });
+    expect(String(blocked[0]?.data.worktree)).toMatch(/ares1-repo-/);
+    const notice = blocked[0] && noticeFor(blocked[0], undefined);
+    expect(notice?.kind).toBe('pull');
+    expect(notice?.body).toContain('未提交的改动');
+    expect(events(t, 'github.pulled')).toHaveLength(0);
+    // GitHub is ahead: pushing the old commit would only be refused.
+    expect(gh.calls).not.toContain('push main');
+    expect(t.master.issues.status().lastError).toBeNull();
+
+    // Once the changes are gone the next round pulls.
+    git(t.repoDir, 'checkout', '--', 'README.md');
+    await t.master.issues.poll();
+    expect(head(t)).toBe(remote);
+    expect(events(t, 'github.pulled')).toHaveLength(1);
+    expect(events(t, 'github.pull_blocked')).toHaveLength(1);
+  });
+
+  it('leaves the target branch alone while a Run of the repo merges', async () => {
+    const t = await start(config({ push: true }));
+    t.master.engine.setWorking(false);
+    const run = t.run();
+    const sr = t.master.store.createStageRun(run.id, 'merge', null);
+    t.master.store.updateStageRun(sr.id, { status: 'executing' });
+    t.master.store.updateRun(run.id, { status: 'running', currentStageRunId: sr.id });
+    const before = head(t);
+    gh.remoteHead = pushedByOthers(t, before);
+    await t.master.issues.poll();
+    expect(gh.calls).not.toContain('fetch main');
+    expect(head(t)).toBe(before);
+
+    // Not while it waits for the approval to merge: only while it merges.
+    t.master.store.updateStageRun(sr.id, { status: 'waiting_approval' });
+    t.master.store.updateRun(run.id, { status: 'waiting_approval' });
+    await t.master.issues.poll();
+    expect(head(t)).toBe(gh.remoteHead);
+  });
+
+  it('reports a failed fetch like any GitHub error and goes on with the round', async () => {
+    const t = await start(config({ push: true }));
+    gh.failing.set('fetch main', '拉取超时');
+    gh.add({ title: '加 feature', labels: [LABELS.ready] });
+    await t.master.issues.poll();
+    await t.master.issues.poll();
+    expect(events(t, 'github.error').map((e) => e.data.message)).toEqual(['拉取超时']);
+    expect(t.master.issues.status().lastError?.message).toBe('拉取超时');
+    expect(t.master.store.listRuns()).toHaveLength(1);
+    gh.failing.clear();
+    await t.master.issues.poll();
+    expect(t.master.issues.status().lastError).toBeNull();
+  });
+
+  it('does not fetch for repos that do not push', async () => {
+    const t = await start(config({ push: false }));
+    gh.remoteHead = pushedByOthers(t, head(t));
+    const before = head(t);
+    await t.master.issues.poll();
+    expect(gh.calls).not.toContain('fetch main');
+    expect(head(t)).toBe(before);
+  });
+});
+
 describe('issues: requirement assessment', () => {
   const startAssessing = () => start(config(), ASSESS_WORKFLOW_YAML);
   /** The Run of issue #1, once it is created. */

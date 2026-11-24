@@ -43,6 +43,12 @@ const SAMPLES: [string, Record<string, unknown>][] = [
   ['notify.system_failed', { command: 'notify-send', reason: 'exit code 1: no bus' }],
   ['notify.system_failed', { command: 'osascript', reason: 'exit code 1' }],
   ['github.pushed', { repo: 'demo', branch: 'main', head: 'abcdef1234567890' }],
+  ['github.pulled', { repo: 'demo', branch: 'main', from: 'aaaaaaaa1111', to: 'bbbbbbbb2222' }],
+  ['github.diverged', { repo: 'demo', branch: 'main', local: 'aaaaaaaa1111', remote: 'cccc3333' }],
+  [
+    'github.pull_blocked',
+    { repo: 'demo', branch: 'main', reason: 'dirty', worktree: '/w/demo', status: ' M a.ts' },
+  ],
   ['issue.auto_accepted', { repo: 'demo', issue: 12 }],
   ['scout.started', { scoutId: 's-1', repo: 'demo', trigger: 'auto' }],
   ['scout.started', { scoutId: 's-1', repo: 'demo', trigger: 'manual' }],
@@ -209,6 +215,49 @@ describe('globalEventText', () => {
     expect(text('notify.system_failed', { command: 5, reason: null })).toBe(
       'A system notification could not be sent; later failures are not recorded until one gets through',
     );
+  });
+
+  it('says what pulling the target branch from GitHub did, and what a human has to do', () => {
+    const pulled = { repo: 'demo', branch: 'main', from: 'aaaaaaaa1111', to: 'bbbbbbbb2222' };
+    const diverged = {
+      repo: 'demo',
+      branch: 'main',
+      local: 'aaaaaaaa1111',
+      remote: 'cccc33334444',
+    };
+    const blocked = {
+      repo: 'demo',
+      branch: 'main',
+      reason: 'dirty',
+      worktree: '/w/demo',
+      status: ' M a.ts',
+    };
+    expect(text('github.pulled', pulled)).toBe(
+      '从 GitHub 拉取了新提交，demo 的 main 快进了过去（aaaaaaaa → bbbbbbbb）；之后的 Run 以它为基础',
+    );
+    expect(text('github.diverged', diverged)).toBe(
+      'demo 的 main 和 GitHub 上的已经分叉（本地 aaaaaaaa，GitHub cccc3333），两边各有对方没有的提交，不会自动合并，要你手动合并；在此之前不推送，已完成 Run 的 issue 保持打开',
+    );
+    expect(text('github.pull_blocked', blocked)).toBe(
+      'GitHub 上有新提交，但 demo 的 main 检出在 /w/demo 有未提交的改动，没能快进；提交或丢弃这些改动后，下一轮检查会自动拉取',
+    );
+    setLang('en');
+    expect(text('github.pulled', pulled)).toBe(
+      'Pulled new commits from GitHub and fast-forwarded main of demo to them (aaaaaaaa → bbbbbbbb); later Runs build on them',
+    );
+    expect(text('github.diverged', diverged)).toBe(
+      'Diverged from GitHub: main of demo (local aaaaaaaa, GitHub cccc3333) and the one on GitHub each have commits the other lacks, and they are not merged by themselves. Merge them by hand; until then nothing is pushed and the issues of completed Runs stay open',
+    );
+    expect(text('github.pull_blocked', blocked)).toBe(
+      'GitHub has new commits, but main of demo is checked out in /w/demo with uncommitted changes and could not be fast-forwarded; once they are committed or discarded, the next check pulls by itself',
+    );
+    expect(text('github.pulled', {})).toBe(
+      'Pulled new commits from GitHub and fast-forwarded the target branch of a repo to them; later Runs build on them',
+    );
+    for (const type of ['github.diverged', 'github.pull_blocked']) {
+      expect(globalEventTone(ev(type)), type).toBe('attention');
+    }
+    expect(globalEventTone(ev('github.pulled'))).toBe('neutral');
   });
 
   it('counts what a scout proposed, with English plurals', () => {

@@ -21,6 +21,14 @@ function repoOf(event: GlobalEvent): string {
   return str(event.data.repo) ?? t({ zh: '某个仓库', en: 'a repo' });
 }
 
+/** 「demo 的 main」 / "main of demo", or the repo's target branch when the event names none. */
+function branchOf(event: GlobalEvent): string {
+  const branch = str(event.data.branch);
+  return branch
+    ? t({ zh: `${repoOf(event)} 的 ${branch}`, en: `${branch} of ${repoOf(event)}` })
+    : t({ zh: `${repoOf(event)} 的目标分支`, en: `the target branch of ${repoOf(event)}` });
+}
+
 /** "abc1234 → def5678" when both commits are known. */
 function commits(from: unknown, to: unknown): string | null {
   const a = str(from);
@@ -205,18 +213,42 @@ export function globalEventText(event: GlobalEvent, now = new Date()): string | 
       });
     }
     case 'github.pushed': {
-      const branch = str(d.branch);
       const head = str(d.head);
-      const what = branch
-        ? t({ zh: `${repoOf(event)} 的 ${branch}`, en: `${branch} of ${repoOf(event)}` })
-        : t({
-            zh: `${repoOf(event)} 的目标分支`,
-            en: `the target branch of ${repoOf(event)}`,
-          });
       const at = head ? t({ zh: `（${shortSha(head)}）`, en: ` (${shortSha(head)})` }) : '';
       return t({
-        zh: `把 ${what} 推送到了 GitHub${at}`,
-        en: `Pushed ${what} to GitHub${at}`,
+        zh: `把 ${branchOf(event)} 推送到了 GitHub${at}`,
+        en: `Pushed ${branchOf(event)} to GitHub${at}`,
+      });
+    }
+    case 'github.pulled': {
+      const range = commits(d.from, d.to);
+      const at = range ? t({ zh: `（${range}）`, en: ` (${range})` }) : '';
+      return t({
+        zh: `从 GitHub 拉取了新提交，${branchOf(event)} 快进了过去${at}；之后的 Run 以它为基础`,
+        en: `Pulled new commits from GitHub and fast-forwarded ${branchOf(event)} to them${at}; later Runs build on them`,
+      });
+    }
+    case 'github.diverged': {
+      const local = str(d.local);
+      const remote = str(d.remote);
+      const at =
+        local && remote
+          ? t({
+              zh: `（本地 ${shortSha(local)}，GitHub ${shortSha(remote)}）`,
+              en: ` (local ${shortSha(local)}, GitHub ${shortSha(remote)})`,
+            })
+          : '';
+      return t({
+        zh: `${branchOf(event)} 和 GitHub 上的已经分叉${at}，两边各有对方没有的提交，不会自动合并，要你手动合并；在此之前不推送，已完成 Run 的 issue 保持打开`,
+        en: `Diverged from GitHub: ${branchOf(event)}${at} and the one on GitHub each have commits the other lacks, and they are not merged by themselves. Merge them by hand; until then nothing is pushed and the issues of completed Runs stay open`,
+      });
+    }
+    case 'github.pull_blocked': {
+      const worktree = str(d.worktree);
+      const where = worktree ? t({ zh: `在 ${worktree} `, en: ` in ${worktree}` }) : '';
+      return t({
+        zh: `GitHub 上有新提交，但 ${branchOf(event)} 检出${where}有未提交的改动，没能快进；提交或丢弃这些改动后，下一轮检查会自动拉取`,
+        en: `GitHub has new commits, but ${branchOf(event)} is checked out${where} with uncommitted changes and could not be fast-forwarded; once they are committed or discarded, the next check pulls by itself`,
       });
     }
     case 'issue.auto_accepted': {
@@ -346,6 +378,8 @@ export function globalEventTone(event: GlobalEvent): Tone {
     case 'master.restarted':
     case 'master.node_missing':
     case 'store.backup_restored':
+    case 'github.diverged':
+    case 'github.pull_blocked':
       return 'attention';
     case 'config.reloaded':
       return (num(event.data.errors) ?? 0) > 0 ? 'attention' : 'neutral';

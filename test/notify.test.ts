@@ -551,6 +551,62 @@ describe('a scout that keeps failing', () => {
   });
 });
 
+describe('the target branch cannot take the commits on GitHub', () => {
+  afterEach(() => setLang('zh'));
+  const ev = (type: string, data: Record<string, unknown>) => ({
+    id: 8,
+    runId: null,
+    ts: '2026-11-19T00:00:00.000Z',
+    type,
+    data: { repo: 'demo', branch: 'main', ...data },
+  });
+  const diverged = ev('github.diverged', { local: 'aaaaaaaa1111', remote: 'bbbbbbbb2222' });
+  const blocked = ev('github.pull_blocked', {
+    reason: 'dirty',
+    worktree: '/w/demo',
+    status: ' M a.ts',
+  });
+
+  it('notifies a divergence the first time and a refused fast-forward, not a pull', () => {
+    expect(noticeFor(diverged, undefined)).toEqual({
+      kind: 'pull',
+      title: '没能拉取 GitHub 上的新提交：demo',
+      body: 'main 和 GitHub 上的已经分叉（本地 aaaaaaa，GitHub bbbbbbb），要你手动合并后推送；在此之前 Master 不推送，已完成 Run 的 issue 保持打开',
+      runId: null,
+      about: 'issues',
+    });
+    // The same divergence again, after a Run merged or more was pushed.
+    expect(noticeFor({ ...diverged, data: { ...diverged.data, repeated: true } }, undefined)).toBe(
+      null,
+    );
+    expect(noticeFor(blocked, undefined)).toEqual({
+      kind: 'pull',
+      title: '没能拉取 GitHub 上的新提交：demo',
+      body: 'main 检出在 /w/demo 有未提交的改动，不能快进到 GitHub 上的新提交；提交或丢弃这些改动后，下一轮检查会自动拉取',
+      runId: null,
+      about: 'issues',
+    });
+    expect(noticeFor(ev('github.pulled', { from: 'a', to: 'b' }), undefined)).toBeNull();
+    // Without the data it still says something.
+    expect(noticeFor(ev('github.diverged', { repo: null, branch: null }), undefined)?.title).toBe(
+      '没能拉取 GitHub 上的新提交',
+    );
+  });
+
+  it('is told in English without Chinese', () => {
+    setLang('en');
+    const texts = [diverged, blocked].map((e) => {
+      const notice = noticeFor(e, undefined);
+      return `${notice?.title}\n${notice?.body}`;
+    });
+    expect(texts).toEqual([
+      "Could not pull new commits from GitHub: demo\nmain has diverged from GitHub's (local aaaaaaa, GitHub bbbbbbb); merge the two by hand and push. Until then the Master pushes nothing and the issues of completed Runs stay open",
+      'Could not pull new commits from GitHub: demo\nmain is checked out in /w/demo with uncommitted changes, so it cannot be fast-forwarded to the new commits on GitHub; once they are committed or discarded, the next check pulls by itself',
+    ]);
+    for (const text of [...texts, NOTICE_KINDS.pull.when]) expect(text).not.toMatch(/[一-鿿]/);
+  });
+});
+
 describe('notifications in English', () => {
   afterEach(() => setLang('zh'));
 

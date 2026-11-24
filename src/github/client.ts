@@ -70,6 +70,11 @@ export interface GitHub {
   close(repo: string, number: number, reason: 'completed' | 'not_planned'): Promise<void>;
   /** Push `branch` of the local clone at `path` to the GitHub repo, as the same account. */
   push(path: string, repo: string, branch: string): Promise<void>;
+  /**
+   * Fetch `branch` of the GitHub repo into the local clone at `path`, as the same account, and
+   * return the commit it points at. No ref of the clone moves; the commit's objects are in it.
+   */
+  fetch(path: string, repo: string, branch: string): Promise<string>;
 }
 
 export class GhError extends Error {}
@@ -387,34 +392,57 @@ export class GhCli implements GitHub {
     await this.gh(['issue', 'close', String(number), '-R', repo, '--reason', flag]);
   }
 
-  async push(path: string, repo: string, branch: string): Promise<void> {
+  /**
+   * git in the clone at `path`, talking to GitHub with gh as the credential helper, so it acts
+   * as the same account as everything else and needs no SSH key; the token only travels through
+   * the environment, never in the arguments or the error. `failed`: the error's text, before
+   * what git wrote to stderr.
+   */
+  private async gitWithGh(
+    path: string,
+    args: string[],
+    failed: (detail: string) => string,
+  ): Promise<string> {
     const env = await this.env();
-    // gh is the credential helper, so the push acts as the same account as everything else and
-    // needs no SSH key; the token only travels through the environment.
-    const args = [
+    const all = [
       '-c',
       'credential.helper=',
       '-c',
       `credential.helper=!'${this.bin.replace(/'/g, `'\\''`)}' auth git-credential`,
-      'push',
-      '-q',
-      `https://github.com/${repo}.git`,
-      `refs/heads/${branch}:refs/heads/${branch}`,
+      ...args,
     ];
-    await new Promise<void>((resolve, reject) => {
-      execFile('git', args, { cwd: path, env }, (err, _stdout, stderr) => {
-        if (err) {
-          const detail = stderr.trim() || err.message;
-          reject(
-            new GhError(
-              t({
-                zh: `推送 ${branch} 到 ${repo} 失败：${detail}`,
-                en: `Pushing ${branch} to ${repo} failed: ${detail}`,
-              }),
-            ),
-          );
-        } else resolve();
+    return new Promise<string>((resolve, reject) => {
+      execFile('git', all, { cwd: path, env }, (err, stdout, stderr) => {
+        if (err) reject(new GhError(failed(stderr.trim() || err.message)));
+        else resolve(stdout.trim());
       });
     });
+  }
+
+  async push(path: string, repo: string, branch: string): Promise<void> {
+    await this.gitWithGh(
+      path,
+      ['push', '-q', `https://github.com/${repo}.git`, `refs/heads/${branch}:refs/heads/${branch}`],
+      (detail) =>
+        t({
+          zh: `推送 ${branch} 到 ${repo} 失败：${detail}`,
+          en: `Pushing ${branch} to ${repo} failed: ${detail}`,
+        }),
+    );
+  }
+
+  async fetch(path: string, repo: string, branch: string): Promise<string> {
+    const failed = (detail: string) =>
+      t({
+        zh: `从 ${repo} 拉取 ${branch} 失败：${detail}`,
+        en: `Fetching ${branch} from ${repo} failed: ${detail}`,
+      });
+    // Into FETCH_HEAD only: no ref of the clone changes, the caller decides what to move.
+    await this.gitWithGh(
+      path,
+      ['fetch', '-q', '--no-tags', `https://github.com/${repo}.git`, `refs/heads/${branch}`],
+      failed,
+    );
+    return this.gitWithGh(path, ['rev-parse', '--verify', 'FETCH_HEAD^{commit}'], failed);
   }
 }

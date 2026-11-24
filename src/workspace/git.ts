@@ -345,7 +345,12 @@ export async function fastForwardBranch(
   repo: string,
   target: string,
   newHead: string,
-): Promise<{ ok: true } | { ok: false; reason: 'dirty' | 'diverged'; detail: string }> {
+): Promise<
+  | { ok: true }
+  | { ok: false; reason: 'diverged'; detail: string }
+  // worktree: where target is checked out; status: its changes, as `git status --porcelain`
+  | { ok: false; reason: 'dirty'; detail: string; worktree: string; status: string }
+> {
   const oldHead = await revParse(repo, target);
   if (!(await isAncestor(repo, oldHead, newHead))) {
     return {
@@ -367,6 +372,8 @@ export async function fastForwardBranch(
     return {
       ok: false,
       reason: 'dirty',
+      worktree: wt,
+      status,
       detail: t({
         zh: `${target} 分支在 ${wt} 中检出，且有未提交的改动：\n${status}`,
         en: `Branch ${target} is checked out in ${wt} with uncommitted changes:\n${status}`,

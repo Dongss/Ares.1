@@ -803,6 +803,11 @@ function noticeHandling(kind: NoticeKind): string {
         zh: '看「需求」页的错误信息，多半是 gh 没登录、网络不通或推送不能快进；修好后下次检查会自动重试',
         en: 'See the error on the Issues page; usually gh is not logged in, the network is down or a push cannot fast-forward. Once fixed, the next check retries by itself',
       });
+    case 'pull':
+      return t({
+        zh: '分叉时在仓库里把 GitHub 上的目标分支合并进本地目标分支（比如 git fetch 后 git merge origin/<分支>），下次检查 Master 会推送上去，已完成 Run 的 issue 随之关闭。有未提交的改动时提交或丢弃它们，下次检查会自动拉取',
+        en: 'When they have diverged, merge the target branch on GitHub into the local one in the repo (e.g. git fetch, then git merge origin/<branch>); the next check pushes it and the issues of completed Runs close. For uncommitted changes, commit or discard them; the next check pulls by itself',
+      });
     case 'upgrade':
       return t({
         zh: '看「需求」页的升级状态和 upgrade.log；安装目录有改动或分叉时手动整理好稳定副本，有新提交时会再试',

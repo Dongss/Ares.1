@@ -46,12 +46,12 @@ Agent CLI 的原始输出（stream-json）带着工具调用的完整结果：�
 
 ### 全局事件
 
-Master 把不属于任何 Run 的事记成全局事件（事件的 Run 为空）：上一个 Master 异常退出（`master.restarted`）、清理原始日志（`logs.pruned`）、恢复数据库备份（`store.backup_restored`）、node 不见了（`master.node_missing`）、打开或关闭工作开关（`master.working`）、配置重新加载（`config.reloaded`、`config.reload_failed`）、访问 GitHub 出错（`github.error`，同一串连续失败里同一个错误只记一次，见「通知」）、webhook 通知发送失败（`notify.webhook_failed`）、系统通知发送失败（`notify.system_failed`）、推送目标分支（`github.pushed`）、自动采纳提案（`issue.auto_accepted`）、侦察（`scout.started`、`scout.completed`、`scout.failed`、`scout.rate_limited`）和升级（`upgrade.started`、`upgrade.done`、`upgrade.failed`）。这篇文档里说「事件列表里记一条」这些事件的地方，都指这里。
+Master 把不属于任何 Run 的事记成全局事件（事件的 Run 为空）：上一个 Master 异常退出（`master.restarted`）、清理原始日志（`logs.pruned`）、恢复数据库备份（`store.backup_restored`）、node 不见了（`master.node_missing`）、打开或关闭工作开关（`master.working`）、配置重新加载（`config.reloaded`、`config.reload_failed`）、访问 GitHub 出错（`github.error`，同一串连续失败里同一个错误只记一次，见「通知」）、webhook 通知发送失败（`notify.webhook_failed`）、系统通知发送失败（`notify.system_failed`）、推送目标分支（`github.pushed`）、从 GitHub 拉取目标分支（`github.pulled`、`github.diverged`、`github.pull_blocked`，见「拉取 GitHub 上的新提交」）、自动采纳提案（`issue.auto_accepted`）、侦察（`scout.started`、`scout.completed`、`scout.failed`、`scout.rate_limited`）和升级（`upgrade.started`、`upgrade.done`、`upgrade.failed`）。这篇文档里说「事件列表里记一条」这些事件的地方，都指这里。
 
 Master 大部分时间没人看着，人回来时在看板的「事件」页查这段时间发生过什么：
 
 - 最新的在前，每页 200 条，底部「加载更早的」往前翻；有新的全局事件时自动刷新。
-- 每条有时间、类型和一句说明：比如删了几个原始日志、多大，上一个 Master 的 pid 和启动时间，恢复了哪个备份、较新的库移到了哪里。出错的（`github.error`、`notify.webhook_failed`、`notify.system_failed`、`config.reload_failed`、`upgrade.failed`、`scout.failed`）标成红色，值得留意的（`master.restarted`、`master.node_missing`、`store.backup_restored`，有无效配置项的 `config.reloaded`）标成橙色。升级失败带着脚本输出末尾时可以展开看。鼠标悬停在说明上能看到原始数据。
+- 每条有时间、类型和一句说明：比如删了几个原始日志、多大，上一个 Master 的 pid 和启动时间，恢复了哪个备份、较新的库移到了哪里。出错的（`github.error`、`notify.webhook_failed`、`notify.system_failed`、`config.reload_failed`、`upgrade.failed`、`scout.failed`）标成红色，值得留意的（`master.restarted`、`master.node_missing`、`store.backup_restored`、`github.diverged`、`github.pull_blocked`，有无效配置项的 `config.reloaded`）标成橙色。升级失败带着脚本输出末尾时可以展开看。鼠标悬停在说明上能看到原始数据。
 - 侦察和自动采纳的事件带着去「需求」页的链接。
 - 看板还不认识的事件类型（以后新加的）照样列出，显示类型名和原始数据。
 - 每个 Run 自己的事件不在这里，在 Run 详情页。
@@ -133,6 +133,21 @@ stages:
 - **证据**：补能力的提案不需要有出错的 Run，README 的目标加上限制这个能力的代码位置就是证据。
 - **大能力拆成几步**：一个 Run 做不完的能力，拆成有先后的几步，每一步都能单独合并，合并后系统照常可用，并且确实推进了这个能力，不是空壳。侦察只提第一步，大小尽量是 S 或 M，这样能被自动采纳（L 不会被自动采纳，只能等人）；那样也拆不开的才标 L。提案的「要做什么」末尾单独一行写「后续步骤：」（英文是 `Next steps:`），列出剩下的几步。
 - **接着往下提**：侦察看到的已有 issue 里，未关闭的和最近完成的 issue 正文里有「后续步骤」时，那一行下面附上这一节。中英文两种写法都认，可以是标题，也可以是单独一行（加粗或带冒号都行），截到下一个标题或正文末尾，最多 600 字；提案的页脚不算。提示词要求侦察：前一步已完成的，优先提它的下一步，在 why 里写明接着哪条 issue；已经拆好、还没关闭的，说明这一步正在做，不提它后面的步骤。这和没拆过的大 issue 不同：已有的大 issue 一直没人做时（比如等人采纳的 L 提案），也可以提它能独立合并的第一步，在 why 里注明对应哪条 issue，不算重复。和其他 issue 内容一样，只有受信任的人或 Master 建的 issue 才会列出（见「只信任仓库成员写的内容」）。
+
+### 拉取 GitHub 上的新提交
+
+`push: true` 的仓库，人和 Ares.1 可以一起往同一个目标分支提交。Master 每轮检查（每 `poll_minutes` 分钟一次，工作开关关着时也做）先从 GitHub 拉取目标分支，再做这一轮的其他事，所以这一轮领取的 issue 建出的 Run 以 GitHub 上的最新代码为基础。拉取和推送一样用 gh 的登录作 git 的凭据（`git fetch https://github.com/<仓库>.git refs/heads/<目标分支>`），只把提交取到本地仓库，不动任何分支；本地仓库的 `origin` 就是这个 GitHub 仓库时，顺带把 `origin/<目标分支>` 更新到 GitHub 上的提交，`git status` 能看出两边的差别。`push: false` 的仓库不拉取：那时 GitHub 仓库可能只用来放 issue，代码不在上面。
+
+拉取后按 GitHub 上的提交和本地目标分支的关系处理：
+
+- 两边一样，或者本地领先（有合并了、还没推送的提交）：什么都不改，照常推送。
+- 本地落后（本地目标分支是 GitHub 上那个提交的祖先）：把本地目标分支快进过去，事件列表里记一条 `github.pulled`（数据里有 `repo`、`branch`，快进前的提交 `from` 和快进后的 `to`），不通知。目标分支没在任何工作目录里检出时直接移动分支（比较并交换：分支在这期间被移动过就不动它，按一次普通的出错记录，下一轮再试）；检出在干净的工作目录里时在那里 `git merge --ff-only`，工作目录里的文件跟着更新。GitHub 上已经有这些提交，不会再推送一次。已经在执行的 Run 不受影响，它们合并时照常先合并目标分支的最新代码，有冲突走「合并冲突」的流程。
+- 本地落后，但目标分支检出在有未提交改动（只看已跟踪的文件）的工作目录里：不快进，事件列表里记一条 `github.pull_blocked`（数据里有 `repo`、`branch`、原因 `reason`（目前只有 `dirty`）、检出它的工作目录 `worktree`，以及 `git status --porcelain` 列出的改动 `status`），并通知「没能拉取 GitHub 上的新提交」。同一种原因在连续受阻的几轮里只记一次、只通知一次；快进成功、或者有一轮不再受阻后重新开始。提交或丢弃这些改动后，下一轮检查自动拉取。这期间也不推送：GitHub 上已经有本地的提交，推送只会因为不能快进被拒绝。
+- 两边分叉（各有对方没有的提交）：不自动合并，本地目标分支不变，事件列表里记一条 `github.diverged`（数据里有 `repo`、`branch`，两边的提交 `local`、`remote`），并通知一次「没能拉取 GitHub 上的新提交」，告诉你要手动合并。分叉期间不推送（推送每轮都会被拒绝），所以也不会每轮报推送失败。同一对提交只记一次；分叉期间本地或 GitHub 上又有了新提交（比如又有 Run 合并了），再记一条带 `repeated: true` 的 `github.diverged`，不再通知。分叉消失后，下一轮照常推送；之后再分叉会重新记录、重新通知。
+  - 分叉期间完成的 Run，代码合并进了本地目标分支，但还没推到 GitHub 上，所以它的 issue 保持打开，标签不变。你手动合并后（或者分叉因为别的原因消失后），下一轮检查推送上去，issue 随之关闭，评论里写明已推送到 GitHub。
+  - 合并的做法：在登记的仓库里 `git fetch`，再 `git merge origin/<目标分支>`，解决冲突后提交。推送可以自己做，也可以留给 Master 下一轮做。
+
+有 Run 正在执行合并阶段时，这个仓库这一轮不拉取，免得和合并抢目标分支；等审批合并的 Run 不算。拉取失败（网络不通、gh 没登录、GitHub 上没有这个分支等）和其他访问 GitHub 的失败一样记 `github.error`，按「一串连续失败」去重（见「通知」），这一轮的其他步骤照常进行。分叉和受阻的状态只记在 Master 的内存里：Master 重启后第一轮重新判断，还在分叉或受阻时会再记一条、再通知一次。
 
 ### Run 期间改了 issue
 
@@ -364,11 +379,13 @@ Agent 出错且重试、换 Agent 都用完，Agent 不可用且没有可换的 
 
 ## 通知
 
-只在需要你做点什么时通知：Run 卡住或失败、等审批、提案等人决定、侦察连续失败、推送或升级失败；Run 完成、侦察完成都不通知。
+只在需要你做点什么时通知：Run 卡住或失败、等审批、提案等人决定、侦察连续失败、推送或升级失败、目标分支没能拉取 GitHub 上的新提交；Run 完成、侦察完成、拉取成功都不通知。
 
 侦察失败（Agent 出错或超时、输出不符合约定、建临时工作目录失败等）时，事件列表里记一条 `scout.failed`（看板「事件」页能看到，标成红色），数据里有 `scoutId`、`repo`、`message`（错误信息）和 `streak`：这个仓库从最近一次侦察往回数连续失败的次数（包括这一次；自动和手动触发的都算）。额度用尽或被限流的、被 Master 停止打断的、还在进行的侦察既不计数，也不打断计数；正常结束的侦察（哪怕没找到需求）让计数从头开始。`streak` 正好到 3 时通知一次「侦察连续失败：<仓库名>」，正文是错误信息的第一行，点开是「需求」页；之后接着失败不再通知，直到有侦察正常结束、又连续失败 3 次。被 Master 停止打断的侦察也记 `scout.failed`，但不带 `streak`，不通知。
 
 访问 GitHub 失败（读写 issue、推送目标分支、侦察时搜索 issue 等）时，事件列表里记一条 `github.error`（数据是 `{ message }`，错误信息），并通知「GitHub 访问失败」，正文是错误信息的第一行，点开是「需求」页。一轮轮询要对每个登记的仓库做好几步，每一步都可能失败，所以按「一串连续失败」去重：从第一次失败起，到有一轮轮询对 GitHub 的访问全部成功为止，同一个错误只记一条、只通知一次，哪怕几种错误轮流出现（比如两个仓库一个返回 404、一个返回 502）也是每种各一条，不会每轮都通知。有一轮访问全部成功后重新开始，之后同样的错误再出现会再记、再通知。错误信息里可能带每次都变的内容（比如请求 id），所以一串失败最多记 20 种不同的错误，超过后这串失败不再记新的 `github.error`。看板「需求」页上的「GitHub 调用失败」不去重，始终显示最近一次失败的时间和信息，有一轮访问全部成功后消失。
+
+目标分支和 GitHub 上的分叉了（`github.diverged`），或者因为检出的工作目录有未提交的改动没能快进（`github.pull_blocked`）时，通知「没能拉取 GitHub 上的新提交：<仓库名>」，正文说明是要你手动合并，还是要处理那些改动，点开是「需求」页。同一次分叉、同一种原因只通知一次，细节见「拉取 GitHub 上的新提交」。快进成功（`github.pulled`）不通知。
 
 通知有三条通道，用同一套规则（`src/notify/notice.ts`）：
 
@@ -422,7 +439,7 @@ notify:
   }
   ```
 
-  `kind` 是通知的种类（`approval`、`discussion`、`blocked`、`failed`、`proposals`、`scout`、`github`、`upgrade`；只由脚本在 Master 停了、起不来时发的 `master_down`，见下面；以及人在看板上点「发一条测试通知」时发的 `test`，见下面的「测试通知」），`title`、`body` 是通知的标题和正文（按 `language` 的语言），`text` 是「标题\n正文」，`runId` 是相关的 Run（没有时为 `null`），`about` 说明点开该去哪里（`run` 是 Run 详情页，`issues` 是「需求」页，`master` 没有特定页面），`eventType` 是引起通知的事件类型，`at` 是事件发生的时间。Slack 的入站 webhook 会显示 `text`、忽略其他字段，可以直接接。
+  `kind` 是通知的种类（`approval`、`discussion`、`blocked`、`failed`、`proposals`、`scout`、`github`、`pull`、`upgrade`；只由脚本在 Master 停了、起不来时发的 `master_down`，见下面；以及人在看板上点「发一条测试通知」时发的 `test`，见下面的「测试通知」），`title`、`body` 是通知的标题和正文（按 `language` 的语言），`text` 是「标题\n正文」，`runId` 是相关的 Run（没有时为 `null`），`about` 说明点开该去哪里（`run` 是 Run 详情页，`issues` 是「需求」页，`master` 没有特定页面），`eventType` 是引起通知的事件类型，`at` 是事件发生的时间。Slack 的入站 webhook 会显示 `text`、忽略其他字段，可以直接接。
 - `format: text`：`Content-Type: text/plain; charset=utf-8`，正文就是「标题\n正文」，适合 ntfy 这类直接显示正文的服务。
 - 飞书、钉钉的机器人 webhook 要求固定的消息格式，不能直接接：要经过一层转发（自己的小服务把正文改成它们要的格式），或者先发到 ntfy 这类服务。
 - 发出去的标题、正文和 `text` 都先把用户目录下的路径换成 `~`（和发到 GitHub 的文字一样，见「发到 GitHub 的文字不带用户目录」），不把系统用户名发给外部服务。
