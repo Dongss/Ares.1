@@ -671,6 +671,10 @@ textarea:focus {
 .task-title {
   font-weight: 600;
 }
+.task-step {
+  color: var(--text-2);
+  font-size: 13px;
+}
 
 .collapsible {
   margin: 4px 0;

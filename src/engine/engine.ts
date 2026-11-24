@@ -113,6 +113,7 @@ import {
   TaskReportSchema,
 } from './contracts.js';
 import { assessmentProblem, formatAssessment, takeAssessment, waitText } from './discussion.js';
+import { planSteps } from './plan.js';
 import {
   assessmentArtifact,
   assessPrompt,
@@ -1905,17 +1906,16 @@ export class Engine {
 
   /**
    * Where a work task stands in the plan of its stage round (`planning: llm`); undefined when the
-   * round was not planned.
+   * round was not split into several steps (`planSteps`): a plan of a single step is the whole
+   * stage, prompted and committed as without a plan.
    */
   private plannedStep(sr: StageRun, task: Task): PlannedStep | undefined {
     const tasks = this.store.listTasks(sr.id);
-    if (!tasks.some((candidate) => candidate.kind === 'plan')) return undefined;
-    const work = tasks.filter((candidate) => candidate.kind === 'work');
-    const index = work.findIndex((candidate) => candidate.id === task.id);
-    if (index < 0) return undefined;
+    const step = planSteps(tasks).get(task.id);
+    if (!step) return undefined;
     return {
-      index: index + 1,
-      titles: work.map((candidate) => candidate.title),
+      index: step.index,
+      titles: tasks.filter((t) => t.kind === 'work').map((t) => t.title),
       instructions: task.instructions,
     };
   }

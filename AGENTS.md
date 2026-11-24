@@ -54,6 +54,7 @@ src/
     contracts.ts      agents' structured output: contract and validation
     discussion.ts     an assessment's conclusion and discussion (shared with the dashboard)
     times.ts          how a Run's time is split into parts (shared with the dashboard)
+    plan.ts           which step of its round's plan a task is (shared with the dashboard)
   github/
     client.ts         GitHub through the gh CLI (FakeGitHub in tests)
     bridge.ts         polling, Runs from issues, progress on issues, auto-accept, push, auto-scout
@@ -126,6 +127,8 @@ test/
   - notification rules: `src/notify/notice.ts`
   - assessment conclusion rules: `src/engine/discussion.ts`
   - how a Run's time is split, and the names and groups of the parts: `src/engine/times.ts`
+  - which step of a stage round's plan a task is, and how many steps it has: `planSteps` in
+    `src/engine/plan.ts`
   - how the scripts find the node to run the Master with: `scripts/find-node.sh`
   - how the scripts send to the webhook when the Master is down: `scripts/webhook.sh`, reading
     the curl config file `webhookCurlConfig` (`src/notify/webhook.ts`) writes
@@ -137,7 +140,7 @@ test/
 - No natively compiled dependencies (e.g. better-sqlite3): keep `npm install` simple.
 - Dashboard:
   - Import API data types from `src/api/types.ts` and `src/store/types.ts`; don't redefine them in `web/`. These two files hold type declarations only and must not import Node modules.
-  - The dashboard also imports `src/i18n.ts`, `src/brand.ts`, `src/config/flow.ts`, `src/config/effort.ts`, `src/api/cost.ts`, `src/notify/notice.ts`, `src/engine/discussion.ts` and `src/engine/times.ts`. They may contain only pure logic and type imports. Don't even import types from files that pull in Node modules, such as `src/store/store.ts`.
+  - The dashboard also imports `src/i18n.ts`, `src/brand.ts`, `src/config/flow.ts`, `src/config/effort.ts`, `src/api/cost.ts`, `src/notify/notice.ts`, `src/engine/discussion.ts`, `src/engine/times.ts` and `src/engine/plan.ts`. They may contain only pure logic and type imports. Don't even import types from files that pull in Node modules, such as `src/store/store.ts`.
   - Hash routing (`#/runs/<id>`); no router or UI component library. Styles go in `web/src/styles.css`, and colors use its CSS variables, which adapt to dark mode.
   - No browser `alert` / `confirm`; dangerous actions use `ConfirmButton` to confirm.
   - Load page data with `useResource` and refresh it on relevant events with `useReloadOn`.

@@ -14,6 +14,7 @@ import {
 import { PLAN_REPORT_JSON_SCHEMA } from '../src/engine/contracts.js';
 import { AGENT_RETRY_BACKOFF, InvalidStateError } from '../src/engine/engine.js';
 import { LABELS, RETRIES_EXHAUSTED_MARKER } from '../src/github/issues.js';
+import { runDigest } from '../src/github/scout.js';
 import { setLang } from '../src/i18n.js';
 import { noticeFor } from '../src/notify/notice.js';
 import { NotFoundError } from '../src/store/store.js';
@@ -5076,6 +5077,106 @@ stages:
     expect(steps).toHaveLength(4);
     for (const call of steps.slice(0, 2)) expect(call.prompt).not.toContain('少了 d.txt');
     for (const call of steps.slice(2)) expect(call.prompt).toContain('少了 d.txt');
+  });
+
+  /**
+   * The coder: read-only it plans `titles`, otherwise it writes feature.txt, wrong in the
+   * executions numbered in `wrong` (from 1, the plan not counted), so the verify command sends
+   * them back.
+   */
+  const failing = (titles: string[], wrong: (n: number) => boolean): Script => {
+    let calls = 0;
+    return (ctx) => {
+      if (ctx.input.readOnly) return plan(titles);
+      calls++;
+      writeFile(join(ctx.input.workdir, 'feature.txt'), wrong(calls) ? 'wrong\n' : 'ok\n');
+      return done();
+    };
+  };
+
+  it("gives the scout each step's own rework, and the plan's apart", async () => {
+    const steps = failing(['a', 'b'], (n) => n === 2);
+    let plans = 0;
+    h = await harness({
+      workflow: PLANNED_WORKFLOW,
+      scripts: {
+        // The first plan is not in the format, so the plan is executed twice.
+        coder: (ctx) =>
+          ctx.input.readOnly && ++plans === 1
+            ? { finalMessage: '```json\n{"tasks": []}\n```' }
+            : steps(ctx),
+        reviewer: () => review(),
+      },
+    });
+    const run = h.run();
+    await h.waitStatus(run.id, 'completed');
+
+    const text = runDigest(h.master.store, h.repo.id);
+    const lines = text.split('\n');
+    const at = lines.indexOf('  编码第 1 轮：拆成 2 步');
+    expect(at).toBeGreaterThan(0);
+    expect(lines.slice(at, at + 3)).toEqual([
+      '  编码第 1 轮：拆成 2 步',
+      '    编码第 1 轮的拆分：执行 2 次，返工原因：Agent 出错 ×1',
+      '    第 2/2 步「b」：执行 2 次，返工原因：`grep -q ok feature.txt` 未通过 ×1',
+    ]);
+    // The first step passed at once; the round's executions are not counted together.
+    expect(text).not.toContain('第 1/2 步');
+    expect(text).not.toContain('编码第 1 轮：执行');
+    // A round of the review, not split, as before.
+    expect(text).not.toContain('评审第 1 轮');
+  });
+
+  it('tells the scout which step failed and which the Run never reached', async () => {
+    h = await harness({
+      workflow: PLANNED_WORKFLOW,
+      scripts: { coder: failing(['a', 'b', 'c'], (n) => n > 1), reviewer: () => review() },
+    });
+    const run = h.run();
+    await h.waitStatus(run.id, 'failed');
+
+    const lines = runDigest(h.master.store, h.repo.id).split('\n');
+    const at = lines.indexOf('  编码第 1 轮：拆成 3 步');
+    expect(at).toBeGreaterThan(0);
+    expect(lines.slice(at + 1)).toEqual([
+      '    第 2/3 步「b」：执行 3 次，返工原因：`grep -q ok feature.txt` 未通过 ×3',
+      '    第 2/3 步「b」：失败',
+      '    第 3/3 步「c」：Run 结束时还没执行到',
+    ]);
+  });
+
+  it('writes the steps in the digest in English', async () => {
+    const english = PLANNED_WORKFLOW.replace('name: 测试流程', 'name: Test flow')
+      .replace('name: 编码', 'name: Coding')
+      .replace('name: 评审', 'name: Review')
+      .replace('name: 合并', 'name: Merge')
+      .replace('实现 {{goal}}', 'Implement {{goal}}');
+    // Before the Run, so that the error the Run ends with is in English too.
+    setLang('en');
+    try {
+      h = await harness({
+        workflow: english,
+        scripts: {
+          coder: failing(['a', 'b', 'c'], (n) => n === 2 || n > 3),
+          reviewer: () => review(),
+        },
+      });
+      const run = h.run('Add feature.txt');
+      await h.waitStatus(run.id, 'failed');
+
+      const text = runDigest(h.master.store, h.repo.id);
+      const lines = text.split('\n');
+      const at = lines.indexOf('  Coding round 1: split into 3 steps');
+      expect(at).toBeGreaterThan(0);
+      expect(lines.slice(at + 1)).toEqual([
+        '    Step 2/3 "b": 2 executions, reworked because of: `grep -q ok feature.txt` failed ×1',
+        '    Step 3/3 "c": 3 executions, reworked because of: `grep -q ok feature.txt` failed ×3',
+        '    Step 3/3 "c": failed',
+      ]);
+      expect(text).not.toMatch(/\p{Script=Han}/u);
+    } finally {
+      setLang('zh');
+    }
   });
 
   it('switches a plan whose agent cannot run read-only to one that can; the steps keep the stage agent', async () => {

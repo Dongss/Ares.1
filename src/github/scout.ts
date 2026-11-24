@@ -18,6 +18,7 @@ import {
   conclusionOf,
   humanReplies,
 } from '../engine/discussion.js';
+import { planSteps } from '../engine/plan.js';
 import {
   minutes,
   type RunTimePart,
@@ -40,6 +41,7 @@ import type {
   ScoutGap,
   ScoutProposal,
   StageRun,
+  Task,
 } from '../store/types.js';
 import type { UpgradeFailure } from '../upgrade/upgrader.js';
 import type { GhAuthored, GhIssue } from './client.js';
@@ -272,8 +274,11 @@ const MAX_SUGGESTIONS = 3;
  */
 const REVIEW_ISSUE_CHARS = 400;
 
-/** Denied operations listed per stage round; more are only counted. */
+/** Denied operations listed per stage round (or step of it); more are only counted. */
 const MAX_DENIED = 3;
+
+/** Characters kept of a plan step's title on its lines. */
+const STEP_TITLE_CHARS = 60;
 
 /** Questions listed per assessment round; more are only counted. */
 const MAX_QUESTIONS = 3;
@@ -309,15 +314,16 @@ function reworkReasons(attempt: Attempt, failedChecks: CheckResult[]): string[] 
 }
 
 /**
- * Executions within one stage round, when some of them had to be redone: rework inside a stage
- * (failed verify commands, bad output, agent errors, quota or rate limits) never shows up in the
- * stage rounds. The operations denied in the round follow, one per line, so the scout can tell
- * what was refused.
+ * Executions within one stage round, or one step of it, when some of them had to be redone:
+ * rework inside a stage (failed verify commands, bad output, agent errors, quota or rate limits)
+ * never shows up in the stage rounds. The operations denied in them follow, one per line, so the
+ * scout can tell what was refused. `indent` is the indent of the line.
  */
 function reworkLines(
   head: string,
   attempts: Attempt[],
   failedChecks: Map<string, CheckResult[]>,
+  indent = '  ',
 ): string[] {
   const counts = new Map<string, number>();
   const denied = new Set<string>();
@@ -338,13 +344,13 @@ function reworkLines(
     zh: `${head}：执行 ${n} 次，返工原因：${reasons}`,
     en: `${head}: ${n} execution${n === 1 ? '' : 's'}, reworked because of: ${reasons}`,
   });
-  const lines = [`  ${oneLine(line, 200)}`];
+  const lines = [`${indent}${oneLine(line, 200)}`];
   const operations = [...denied];
   for (const operation of operations.slice(0, MAX_DENIED)) {
-    lines.push(`    - ${t({ zh: '被拒绝：', en: 'Denied: ' })}${operation}`);
+    lines.push(`${indent}  - ${t({ zh: '被拒绝：', en: 'Denied: ' })}${operation}`);
   }
   if (operations.length > MAX_DENIED) {
-    lines.push(`    ${moreText(operations.length - MAX_DENIED)}`);
+    lines.push(`${indent}  ${moreText(operations.length - MAX_DENIED)}`);
   }
   return lines;
 }
@@ -352,6 +358,66 @@ function reworkLines(
 /** 「编码第 2 轮」, a stage round as the digest names it. */
 const roundName = (stageName: string, round: number) =>
   t({ zh: `${stageName}第 ${round} 轮`, en: `${stageName} round ${round}` });
+
+/**
+ * Why a step of a plan has not passed, or null when it passed or may still pass: it failed, the
+ * Run was terminated or failed on it, or the Run ended before the step was reached or finished.
+ */
+function stepStatusText(task: Task, executions: number, runEnded: boolean): string | null {
+  if (task.status === 'passed') return null;
+  if (task.status === 'failed') return t({ zh: '失败', en: 'failed' });
+  if (task.status !== 'cancelled' && !runEnded) return null;
+  if (executions === 0) {
+    return t({ zh: 'Run 结束时还没执行到', en: 'not reached before the Run ended' });
+  }
+  return task.status === 'cancelled'
+    ? t({ zh: '没做完就被终止', en: 'terminated before it was done' })
+    : t({ zh: 'Run 结束时还没做完', en: 'not done when the Run ended' });
+}
+
+/**
+ * Rework within a stage round. A round its plan split into steps (`planSteps`) says how many,
+ * then gives each step's own rework and each step that did not pass a line of its own, so the
+ * scout sees how the split worked out and where it got stuck; rework of the plan itself counts
+ * toward no step. Any other round counts all its executions together. `showTitles` says whether
+ * the steps' titles may be shown: the plan wrote them from the goal.
+ */
+function roundReworkLines(
+  run: Run,
+  sr: StageRun,
+  stageName: string,
+  tasks: { task: Task; attempts: Attempt[] }[],
+  failedChecks: Map<string, CheckResult[]>,
+  showTitles: boolean,
+): string[] {
+  const round = roundName(stageName, sr.round);
+  const steps = planSteps(tasks.map(({ task }) => task));
+  if (steps.size === 0) {
+    const attempts = tasks.flatMap((x) => x.attempts);
+    return reworkLines(round, attempts, failedChecks);
+  }
+  const total = steps.size;
+  const lines = [
+    `  ${t({ zh: `${round}：拆成 ${total} 步`, en: `${round}: split into ${total} steps` })}`,
+  ];
+  for (const { task, attempts } of tasks) {
+    const step = steps.get(task.id);
+    if (!step) {
+      const head = t({ zh: `${round}的拆分`, en: `${round} planning` });
+      lines.push(...reworkLines(head, attempts, failedChecks, '    '));
+      continue;
+    }
+    const name = showTitles ? oneLine(task.title, STEP_TITLE_CHARS) : '';
+    const head = t({
+      zh: `第 ${step.index}/${total} 步${name ? `「${name}」` : ''}`,
+      en: `Step ${step.index}/${total}${name ? ` "${name}"` : ''}`,
+    });
+    lines.push(...reworkLines(head, attempts, failedChecks, '    '));
+    const status = stepStatusText(task, attempts.length, run.finishedAt !== null);
+    if (status) lines.push(`    ${head}${colon()}${status}`);
+  }
+  return lines;
+}
 
 /**
  * The review given in a stage round, as the last reviewer that finished gave it; null if none
@@ -648,8 +714,11 @@ export function runDigest(store: Store, repoId: string, limit = 15): string {
       }
       lines.push(...discussionLines(run));
       for (const sr of stageRuns) {
-        const attempts = store.listTasks(sr.id).flatMap((task) => store.listAttempts(task.id));
-        lines.push(...reworkLines(roundName(name(sr.stageId), sr.round), attempts, failedChecks));
+        const tasks = store
+          .listTasks(sr.id)
+          .map((task) => ({ task, attempts: store.listAttempts(task.id) }));
+        const attempts = tasks.flatMap((x) => x.attempts);
+        lines.push(...roundReworkLines(run, sr, name(sr.stageId), tasks, failedChecks, trusted));
         lines.push(...failLines(sr, name(sr.stageId), attempts));
         // Reviewers read the goal: from an untrusted one, their suggestions may carry its text.
         if (trusted && stage(sr.stageId)?.kind === 'review') {

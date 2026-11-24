@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { isCostUnknown } from '../../../src/api/cost.js';
 import type { ConfigView, RunDetail } from '../../../src/api/types.js';
 import { effectiveBudget, REDO_BACKOFF_MAX_HOURS } from '../../../src/config/flow.js';
+import type { PlanStep } from '../../../src/engine/plan.js';
 import { t } from '../../../src/i18n.js';
 import type {
   Approval,
@@ -41,6 +42,7 @@ import {
   TASK_STATUS,
 } from '../lib/format.js';
 import { useAction, useReloadOn, useResource, useTick } from '../lib/hooks.js';
+import { roundTasks, stepLabel, stepsDoneText, taskTitle } from '../lib/plan.js';
 import {
   assessmentHeadline,
   canCleanUpWorkspace,
@@ -844,7 +846,8 @@ function StageBlock(props: {
 }) {
   const { detail, sr } = props;
   const status = STAGE_STATUS[sr.status];
-  const tasks = detail.tasks.filter((x) => x.stageRunId === sr.id);
+  const tasks = roundTasks(detail.tasks.filter((x) => x.stageRunId === sr.id));
+  const stepsDone = stepsDoneText(tasks);
   const checks = detail.checks.filter((c) => c.stageRunId === sr.id && !c.attemptId);
   const approvals = detail.approvals.filter((a) => a.stageRunId === sr.id);
   const artifacts = detail.artifacts.filter((a) => a.stageRunId === sr.id);
@@ -858,6 +861,7 @@ function StageBlock(props: {
           {sr.round > 1 && (
             <span className="round">{t({ zh: `第 ${sr.round} 轮`, en: `Round ${sr.round}` })}</span>
           )}
+          {stepsDone && <span className="round">{stepsDone}</span>}
         </h3>
         <Badge tone={status.tone}>{status.label}</Badge>
         {sr.failReason && <span className="fail-reason">{FAIL_REASON[sr.failReason]}</span>}
@@ -894,8 +898,14 @@ function StageBlock(props: {
           <Pre>{sr.feedback}</Pre>
         </Collapsible>
       )}
-      {tasks.map((task) => (
-        <TaskBlock key={task.id} detail={detail} task={task} onShowCommit={props.onShowCommit} />
+      {tasks.map(({ task, step }) => (
+        <TaskBlock
+          key={task.id}
+          detail={detail}
+          task={task}
+          step={step}
+          onShowCommit={props.onShowCommit}
+        />
       ))}
       {checks.length > 0 && <CheckList checks={checks} />}
       {approvals.map((a) => (
@@ -925,8 +935,14 @@ function StageBlock(props: {
   );
 }
 
-function TaskBlock(props: { detail: RunDetail; task: Task; onShowCommit: (sha: string) => void }) {
-  const { detail, task } = props;
+function TaskBlock(props: {
+  detail: RunDetail;
+  task: Task;
+  /** Its step when the round's plan split it into several. */
+  step: PlanStep | undefined;
+  onShowCommit: (sha: string) => void;
+}) {
+  const { detail, task, step } = props;
   const status = TASK_STATUS[task.status];
   const attempts = detail.attempts.filter((a) => a.taskId === task.id);
   const commit = task.commitSha;
@@ -934,7 +950,8 @@ function TaskBlock(props: { detail: RunDetail; task: Task; onShowCommit: (sha: s
   return (
     <div className="task">
       <div className="task-head">
-        <span className="task-title">{task.title}</span>
+        {step && <span className="task-step">{stepLabel(step)}</span>}
+        <span className="task-title">{taskTitle(task)}</span>
         <Badge tone={status.tone}>{status.label}</Badge>
         <span className="muted">{task.agentId}</span>
         {task.retries > 0 && (
