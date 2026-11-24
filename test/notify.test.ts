@@ -14,6 +14,7 @@ import {
   type ExecFile,
   makeSystemNotice,
   noticeScript,
+  sendSystemNotice,
   systemNoticeSupported,
 } from '../src/notify/system.js';
 import {
@@ -49,6 +50,24 @@ function fakeExecFile(fail: () => Error | null = () => null) {
 
 function enoent(file: string): Error {
   return Object.assign(new Error(`spawn ${file} ENOENT`), { code: 'ENOENT' });
+}
+
+/** An execFile that fails every command with `err`. */
+const fail =
+  (err: Error): ExecFile =>
+  (_file, _args, _options, callback) =>
+    callback(err);
+
+/** An error as execFile gives for a command that ran and failed: the command line comes first. */
+function commandFailed(
+  file: string,
+  printed: string,
+  how: { code?: number; killed?: boolean; signal?: string },
+): Error {
+  return Object.assign(
+    new Error(`Command failed: ${file} -e display notification "正文"\n${printed}`),
+    { code: how.code ?? null, killed: how.killed ?? false, signal: how.signal ?? null },
+  );
 }
 
 let h: Harness | undefined;
@@ -348,6 +367,80 @@ describe('notifications in English', () => {
     expect(logs[0]).toContain('[notify]');
     expect(logs[0]).toContain('install libnotify');
     expect(logs[0]).not.toMatch(/[一-鿿]/);
+  });
+
+  it('tells how a system notification failed in English', async () => {
+    setLang('en');
+    const reason = async (err: Error) =>
+      (await sendSystemNotice('Test', 'A thing', { platform: 'darwin', execFile: fail(err) }))
+        ?.reason;
+    expect(await reason(commandFailed('osascript', 'execution error', { code: 1 }))).toBe(
+      'osascript exited with code 1: execution error',
+    );
+    expect(await reason(commandFailed('osascript', '', { killed: true }))).toBe(
+      'osascript did not finish within 10 seconds',
+    );
+    expect(await reason(commandFailed('osascript', '', { signal: 'SIGKILL' }))).toBe(
+      'osascript was ended by SIGKILL',
+    );
+  });
+});
+
+describe('a system notification whose outcome is wanted (the test notification)', () => {
+  it('resolves with how it went, running nothing where the platform has no command', async () => {
+    const { calls, execFile } = fakeExecFile();
+    expect(sendSystemNotice('标题', '正文', { platform: 'win32', execFile })).toBeNull();
+    expect(calls).toEqual([]);
+    expect(await sendSystemNotice('标题', '正文', { platform: 'darwin', execFile })).toEqual({
+      ok: true,
+      file: 'osascript',
+      reason: null,
+    });
+    expect(calls).toEqual([
+      { file: 'osascript', args: ['-e', noticeScript('标题', '正文')], timeout: 10_000 },
+    ]);
+  });
+
+  it('says why it failed, without the command line and the texts it carried', async () => {
+    const outcome = (err: Error, platform: NodeJS.Platform = 'darwin') =>
+      sendSystemNotice('标题', '正文', { platform, execFile: fail(err) });
+    expect(
+      await outcome(
+        commandFailed('osascript', '0:5: execution error: 出错了 (-1728)\n', { code: 1 }),
+      ),
+    ).toEqual({
+      ok: false,
+      file: 'osascript',
+      reason: 'osascript 退出码 1：0:5: execution error: 出错了 (-1728)',
+    });
+    expect(
+      (await outcome(commandFailed('notify-send', '', { killed: true }), 'linux'))?.reason,
+    ).toBe('notify-send 在 10 秒内没有结束');
+    expect((await outcome(enoent('notify-send'), 'linux'))?.reason).toContain('libnotify');
+    // Not execFile's own wording: as it is.
+    expect((await outcome(new Error('参数里有 NUL')))?.reason).toBe('参数里有 NUL');
+    // execFile throwing right away fails it the same.
+    const throwing = await sendSystemNotice('标题', '正文\0', {
+      platform: 'linux',
+      execFile: () => {
+        throw new Error('参数里有 NUL');
+      },
+    });
+    expect(throwing).toEqual({ ok: false, file: 'notify-send', reason: '参数里有 NUL' });
+  });
+
+  it('reads a command that really failed', async () => {
+    const outcome = await sendSystemNotice('标题', '正文', {
+      platform: 'linux',
+      // The real execFile, running a command that prints why and exits 3.
+      execFile: (_file, _args, options, callback) =>
+        execFile('sh', ['-c', 'echo 没有桌面会话 >&2; exit 3'], options, (err) => callback(err)),
+    });
+    expect(outcome).toEqual({
+      ok: false,
+      file: 'notify-send',
+      reason: 'notify-send 退出码 3：没有桌面会话',
+    });
   });
 });
 
@@ -833,7 +926,7 @@ describe('webhook settings for the scripts (webhook.curl)', () => {
       headers: webhookRequest(
         webhook,
         { kind: 'scout', title: 't', body: 'b', runId: null, about: 'issues' },
-        { id: 1, runId: null, ts: '', type: 'scout.failed', data: {} },
+        { ts: '', type: 'scout.failed' },
       ).headers,
     });
     expect(hook.received).toHaveLength(1);

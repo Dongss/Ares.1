@@ -10,7 +10,9 @@ import { type Engine, InvalidStateError, readAttemptEvents } from '../engine/eng
 import { storedRunTimes } from '../engine/times.js';
 import type { IssueBridge } from '../github/bridge.js';
 import { t } from '../i18n.js';
-import { systemNoticeSupported } from '../notify/system.js';
+import { type ExecFile, systemNoticeSupported } from '../notify/system.js';
+import { sendTestNotice } from '../notify/test-notice.js';
+import type { WebhookNotifier } from '../notify/webhook.js';
 import { ConflictError, NotFoundError, type Store } from '../store/store.js';
 import type { EventRow, RunStatus } from '../store/types.js';
 import type { Upgrader } from '../upgrade/upgrader.js';
@@ -27,6 +29,7 @@ import type {
   HealthView,
   KeptWorkspace,
   LiveAgentEvent,
+  NotifyTestResult,
   RawLogMissing,
   RunDetail,
   RunSummary,
@@ -51,6 +54,10 @@ export interface ApiDeps {
   configStatus?: () => ConfigStatus;
   /** Platform the Master runs on, for whether it sends system notifications (tests change it). */
   platform?: NodeJS.Platform;
+  /** The Master's webhook notifications, which also send the test notification. */
+  webhook: WebhookNotifier;
+  /** Runs the test notification's system notification command (tests replace it). */
+  execFile?: ExecFile;
   /** The clock, in epoch milliseconds, e.g. for whether raw logs are past retention. */
   now?: () => number;
 }
@@ -171,6 +178,18 @@ export function createApi(deps: ApiDeps): Hono {
   });
 
   app.get('/api/health', (c) => c.json(health()));
+
+  // A test notification through each channel the Master notifies by, so that a human can check
+  // them right after changing config.yaml; answers once every channel has ended.
+  app.post('/api/notify/test', async (c) => {
+    const result = await sendTestNotice({
+      config: config(),
+      platform,
+      webhook: deps.webhook,
+      execFile: deps.execFile,
+    });
+    return c.json(result satisfies NotifyTestResult);
+  });
 
   // The work switch.
   app.put('/api/working', async (c) => {

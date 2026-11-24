@@ -9,12 +9,17 @@ import type {
   ConfigView,
   KeptWorkspace,
   LiveAgentEvent,
+  NotifyTestResult,
   RawLogMissing,
   RunSummary,
   StatsView,
 } from '../src/api/types.js';
+import { SCOUT_FAILURE_NOTIFY_AFTER } from '../src/config/flow.js';
 import { storedRunTimes } from '../src/engine/times.js';
 import { setLang } from '../src/i18n.js';
+import { type ExecFile, noticeScript } from '../src/notify/system.js';
+import { testNoticeText } from '../src/notify/test-notice.js';
+import type { Fetch } from '../src/notify/webhook.js';
 import type { Attempt, EventRow, Run, RunStatus } from '../src/store/types.js';
 import {
   ASSESS_AGENTS_YAML,
@@ -843,6 +848,236 @@ agents:
     }
     await reader.cancel();
     expect(text).toContain('event: event');
+  });
+});
+
+describe('POST /api/notify/test', () => {
+  /** The token in the webhook's address and headers: never to be returned. */
+  const TOKEN = 'tk_secret_token';
+  const WEBHOOK_URL = `https://hooks.example.com/hook?auth=${TOKEN}`;
+  const notifyYaml = (opts: { system?: boolean; webhook?: boolean }) =>
+    [
+      'notify:',
+      `  system: ${opts.system ?? false}`,
+      ...(opts.webhook
+        ? [
+            '  webhook:',
+            `    url: ${WEBHOOK_URL}`,
+            `    headers: { Authorization: Bearer ${TOKEN} }`,
+          ]
+        : []),
+      '',
+    ].join('\n');
+
+  /** A fetch that records its requests and answers each with `answer()`. */
+  function fakeFetch(answer: () => Response = () => new Response('ok')) {
+    const requests: { url: string; headers: Headers; body: string }[] = [];
+    const fetch: Fetch = async (url, init) => {
+      requests.push({
+        url,
+        headers: new Headers(init.headers),
+        body: String(init.body),
+      });
+      return answer();
+    };
+    return { requests, fetch };
+  }
+
+  /** An execFile that records its calls and answers each with `fail()`'s error, if any. */
+  function fakeExecFile(fail: () => Error | null = () => null) {
+    const calls: { file: string; args: string[] }[] = [];
+    const execFile: ExecFile = (file, args, _options, callback) => {
+      calls.push({ file, args });
+      callback(fail());
+    };
+    return { calls, execFile };
+  }
+
+  const failures = () => h?.master.store.listEventsOfType('notify.webhook_failed', '') ?? [];
+  const globalEventIds = () => h?.master.store.listGlobalEvents({ limit: 500 }).map((e) => e.id);
+  const scoutFailed = () =>
+    h?.master.store.event(null, 'scout.failed', {
+      scoutId: 'scout_1',
+      repo: 'demo',
+      message: '侦察结果不符合约定',
+      streak: SCOUT_FAILURE_NOTIFY_AFTER,
+    });
+
+  async function sendTest() {
+    const res = await call('POST', '/api/notify/test');
+    expect(res.status).toBe(200);
+    // Neither the address nor the headers of the webhook come back.
+    expect(res.text).not.toContain(TOKEN);
+    expect(res.text).not.toContain('example.com');
+    expect(res.text).not.toContain('Bearer');
+    return res.json as NotifyTestResult;
+  }
+
+  it('sends through both channels and tells how each went, recording nothing', async () => {
+    const hook = fakeFetch();
+    const exec = fakeExecFile();
+    h = await harness({
+      config: notifyYaml({ system: true, webhook: true }),
+      master: { platform: 'darwin', fetch: hook.fetch, execFile: exec.execFile },
+    });
+    const before = globalEventIds();
+    const startedAt = new Date().toISOString();
+    expect(await sendTest()).toEqual({
+      system: { enabled: true, supported: true, ok: true, reason: null },
+      webhook: { enabled: true, ok: true, status: 200, reason: null },
+    } satisfies NotifyTestResult);
+
+    expect(exec.calls).toEqual([
+      { file: 'osascript', args: ['-e', noticeScript('测试通知', testNoticeText().body)] },
+    ]);
+    expect(hook.requests).toHaveLength(1);
+    const [request] = hook.requests;
+    expect(request?.url).toBe(WEBHOOK_URL);
+    expect(request?.headers.get('authorization')).toBe(`Bearer ${TOKEN}`);
+    expect(request?.headers.get('content-type')).toBe('application/json');
+    const payload = JSON.parse(request?.body ?? '');
+    expect(payload).toEqual({
+      kind: 'test',
+      title: '测试通知',
+      body: '这是一条测试通知，收到说明通知通道可用。',
+      text: '测试通知\n这是一条测试通知，收到说明通知通道可用。',
+      runId: null,
+      about: 'master',
+      eventType: 'notify.test',
+      at: expect.any(String),
+    });
+    expect(payload.at >= startedAt).toBe(true);
+    // A check of the channels, not something that happened: no event.
+    expect(globalEventIds()).toEqual(before);
+  });
+
+  it('returns the HTTP status of a failing webhook without recording notify.webhook_failed', async () => {
+    let answer = () => new Response('no', { status: 500, statusText: 'Internal Server Error' });
+    const hook = fakeFetch(() => answer());
+    h = await harness({
+      config: notifyYaml({ webhook: true }),
+      master: { platform: 'darwin', fetch: hook.fetch },
+    });
+    const before = globalEventIds();
+    expect(await sendTest()).toEqual({
+      system: { enabled: false, supported: true, ok: false, reason: null },
+      webhook: { enabled: true, ok: false, status: 500, reason: 'HTTP 500 Internal Server Error' },
+    } satisfies NotifyTestResult);
+    expect(globalEventIds()).toEqual(before);
+
+    // Not answering at all: the reason hides the address it names.
+    answer = () => {
+      throw Object.assign(new TypeError('fetch failed'), {
+        cause: Object.assign(new Error(`connect ECONNREFUSED ${WEBHOOK_URL}`), {
+          code: 'ECONNREFUSED',
+        }),
+      });
+    };
+    expect((await sendTest()).webhook).toEqual({
+      enabled: true,
+      ok: false,
+      status: null,
+      reason: 'fetch failed (connect ECONNREFUSED ***)',
+    });
+    expect(failures()).toEqual([]);
+
+    // The streak of the real notifications was left alone: their first failure is still told.
+    scoutFailed();
+    await h.master.webhook.idle();
+    expect(failures()).toHaveLength(1);
+    // A test getting through does not end their streak either: the next one is not told again.
+    answer = () => new Response('ok', { status: 202 });
+    expect((await sendTest()).webhook).toEqual({
+      enabled: true,
+      ok: true,
+      status: 202,
+      reason: null,
+    });
+    answer = () => new Response('no', { status: 500 });
+    scoutFailed();
+    await h.master.webhook.idle();
+    expect(failures()).toHaveLength(1);
+    expect(hook.requests.map((r) => JSON.parse(r.body).kind)).toEqual([
+      'test',
+      'test',
+      'scout',
+      'test',
+      'scout',
+    ]);
+  });
+
+  it('sends no webhook when none is set, and tells why a system notification failed', async () => {
+    const hook = fakeFetch();
+    let fail: Error | null = null;
+    const exec = fakeExecFile(() => fail);
+    h = await harness({
+      config: notifyYaml({ system: true }),
+      master: { platform: 'linux', fetch: hook.fetch, execFile: exec.execFile },
+    });
+    expect(await sendTest()).toEqual({
+      system: { enabled: true, supported: true, ok: true, reason: null },
+      webhook: { enabled: false, ok: false, status: null, reason: null },
+    } satisfies NotifyTestResult);
+    expect(hook.requests).toEqual([]);
+    expect(exec.calls).toEqual([
+      { file: 'notify-send', args: ['--app-name', '战神一号', '测试通知', testNoticeText().body] },
+    ]);
+
+    fail = Object.assign(new Error('spawn notify-send ENOENT'), { code: 'ENOENT' });
+    const { system } = await sendTest();
+    expect(system).toMatchObject({ enabled: true, ok: false });
+    expect(system.reason).toContain('libnotify');
+  });
+
+  it('sends no system notification where the platform has none', async () => {
+    const hook = fakeFetch();
+    const exec = fakeExecFile();
+    h = await harness({
+      config: notifyYaml({ system: true, webhook: true }),
+      master: { platform: 'win32', fetch: hook.fetch, execFile: exec.execFile },
+    });
+    expect(await sendTest()).toEqual({
+      system: { enabled: false, supported: false, ok: false, reason: null },
+      webhook: { enabled: true, ok: true, status: 200, reason: null },
+    } satisfies NotifyTestResult);
+    expect(exec.calls).toEqual([]);
+    expect(hook.requests).toHaveLength(1);
+  });
+
+  it('sends nothing without a channel', async () => {
+    const hook = fakeFetch();
+    const exec = fakeExecFile();
+    h = await harness({
+      config: notifyYaml({}),
+      master: { platform: 'darwin', fetch: hook.fetch, execFile: exec.execFile },
+    });
+    expect(await sendTest()).toEqual({
+      system: { enabled: false, supported: true, ok: false, reason: null },
+      webhook: { enabled: false, ok: false, status: null, reason: null },
+    } satisfies NotifyTestResult);
+    expect(exec.calls).toEqual([]);
+    expect(hook.requests).toEqual([]);
+  });
+
+  it('follows the language of config.yaml', async () => {
+    const hook = fakeFetch(() => new Response('no', { status: 503 }));
+    const exec = fakeExecFile(() =>
+      Object.assign(new Error('spawn notify-send ENOENT'), { code: 'ENOENT' }),
+    );
+    h = await harness({
+      config: `language: en\n${notifyYaml({ system: true, webhook: true })}`,
+      master: { platform: 'linux', fetch: hook.fetch, execFile: exec.execFile },
+    });
+    const res = await call('POST', '/api/notify/test');
+    expect(res.text).not.toMatch(/[一-鿿]/);
+    expect(res.json.system.reason).toContain('install libnotify');
+    expect(JSON.parse(hook.requests[0]?.body ?? '')).toMatchObject({
+      kind: 'test',
+      title: 'Test notification',
+      text: `Test notification\n${testNoticeText().body}`,
+    });
+    expect(hook.requests[0]?.body).not.toMatch(/[一-鿿]/);
+    expect(exec.calls[0]?.args).toContain('Test notification');
   });
 });
 

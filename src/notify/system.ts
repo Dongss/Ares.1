@@ -49,8 +49,15 @@ export function noticeCommand(
   return null;
 }
 
-function failureReason(file: string, err: Error): string {
-  if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+/** What execFile's error carries besides the message. */
+interface CommandError extends Error {
+  code?: unknown;
+  killed?: unknown;
+  signal?: unknown;
+}
+
+function failureReason(file: string, err: CommandError): string {
+  if (err.code === 'ENOENT') {
     return file === 'notify-send'
       ? t({
           zh: '找不到 notify-send，Linux 上需要安装 libnotify（提供 notify-send）',
@@ -58,7 +65,87 @@ function failureReason(file: string, err: Error): string {
         })
       : t({ zh: `找不到 ${file}`, en: `${file} was not found` });
   }
-  return err.message;
+  // execFile's message starts with the whole command line, the notification's texts included;
+  // what the command printed comes after it.
+  const newline = err.message.indexOf('\n');
+  if (!err.message.startsWith('Command failed:') || newline < 0) return err.message;
+  const printed = err.message.slice(newline + 1).trim();
+  const ended =
+    err.killed === true
+      ? t({
+          zh: `${file} 在 ${NOTICE_TIMEOUT_MS / 1000} 秒内没有结束`,
+          en: `${file} did not finish within ${NOTICE_TIMEOUT_MS / 1000} seconds`,
+        })
+      : typeof err.code === 'number'
+        ? t({ zh: `${file} 退出码 ${err.code}`, en: `${file} exited with code ${err.code}` })
+        : typeof err.signal === 'string'
+          ? t({ zh: `${file} 被 ${err.signal} 结束`, en: `${file} was ended by ${err.signal}` })
+          : t({ zh: `${file} 运行失败`, en: `${file} failed` });
+  return printed ? `${ended}${t({ zh: '：', en: ': ' })}${printed}` : ended;
+}
+
+/** How sending one system notification went. */
+export interface SystemNoticeOutcome {
+  /** The command was run and ended well. */
+  ok: boolean;
+  /** The command run, e.g. notify-send. */
+  file: string;
+  /** Why it failed; null when it did not. */
+  reason: string | null;
+}
+
+/**
+ * Runs the command that shows a notification on `platform` and hands `done` how it went
+ * (at once when execFile answers at once). Never throws. Returns false, running nothing and
+ * calling nothing, where the platform has no command.
+ */
+function runNoticeCommand(
+  platform: NodeJS.Platform,
+  execFile: ExecFile,
+  title: string,
+  body: string,
+  done: (outcome: SystemNoticeOutcome) => void,
+): boolean {
+  const command = noticeCommand(platform, title, body);
+  if (!command) return false;
+  const { file } = command;
+  const failed = (err: unknown) =>
+    done({
+      ok: false,
+      file,
+      reason: failureReason(file, err instanceof Error ? err : new Error(String(err))),
+    });
+  try {
+    execFile(file, command.args, { timeout: NOTICE_TIMEOUT_MS }, (err) => {
+      if (err) failed(err);
+      else done({ ok: true, file, reason: null });
+    });
+  } catch (err) {
+    // execFile throws right away on arguments it cannot pass (e.g. a NUL character).
+    failed(err);
+  }
+  return true;
+}
+
+/**
+ * Sends one system notification and resolves with how it went, for the dashboard's test
+ * notification; null where the platform has no command. Never rejects and logs nothing: the
+ * outcome goes back to whoever asked.
+ */
+export function sendSystemNotice(
+  title: string,
+  body: string,
+  opts: { platform?: NodeJS.Platform; execFile?: ExecFile } = {},
+): Promise<SystemNoticeOutcome> | null {
+  const { promise, resolve } = Promise.withResolvers<SystemNoticeOutcome>();
+  const ran = runNoticeCommand(
+    opts.platform ?? process.platform,
+    opts.execFile ?? nodeExecFile,
+    title,
+    body,
+    resolve,
+  );
+  return ran ? promise : null;
 }
 
 /**
@@ -73,10 +160,9 @@ export function makeSystemNotice(
   const execFile: ExecFile = opts.execFile ?? nodeExecFile;
   const log = opts.log ?? ((message: string) => console.warn(message));
   let logged = false;
-  const failed = (file: string, err: unknown) => {
-    if (logged) return;
+  const done = ({ ok, file, reason }: SystemNoticeOutcome) => {
+    if (ok || logged) return;
     logged = true;
-    const reason = failureReason(file, err instanceof Error ? err : new Error(String(err)));
     log(
       t({
         zh: `[通知] 系统通知发送失败（${file}）：${reason}。之后的失败不再记录。`,
@@ -85,16 +171,7 @@ export function makeSystemNotice(
     );
   };
   return (title, body) => {
-    const command = noticeCommand(platform, title, body);
-    if (!command) return;
-    try {
-      execFile(command.file, command.args, { timeout: NOTICE_TIMEOUT_MS }, (err) => {
-        if (err) failed(command.file, err);
-      });
-    } catch (err) {
-      // execFile throws right away on arguments it cannot pass (e.g. a NUL character).
-      failed(command.file, err);
-    }
+    runNoticeCommand(platform, execFile, title, body, done);
   };
 }
 

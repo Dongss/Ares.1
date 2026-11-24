@@ -6,6 +6,7 @@ import type {
   GitHubStatus,
   HealthView,
   KeptWorkspace,
+  NotifyTestResult,
   RunDetail,
   RunSummary,
   StatsView,
@@ -72,6 +73,8 @@ export type RepoPatch = Partial<Pick<Repo, 'targetBranch' | 'verifyCommands' | '
 export const api = {
   health: () => request<HealthView>('GET', '/api/health'),
   setWorking: (on: boolean) => request<HealthView>('PUT', '/api/working', { on }),
+  /** Sends a test notification through each channel the Master notifies by. */
+  notifyTest: () => request<NotifyTestResult>('POST', '/api/notify/test'),
   config: () => request<ConfigView>('GET', '/api/config'),
   agents: () => request<AgentSummary[]>('GET', '/api/agents'),
 

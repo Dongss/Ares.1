@@ -6,7 +6,7 @@ import { redactForGitHub } from '../github/redact.js';
 import { t } from '../i18n.js';
 import type { Store } from '../store/store.js';
 import type { EventRow } from '../store/types.js';
-import { errorMessage } from '../util.js';
+import { errorMessage, nowIso } from '../util.js';
 import { type Notice, type NoticeKind, noticeFor } from './notice.js';
 
 /** The part of the global fetch the notifier uses (tests may replace it). */
@@ -16,11 +16,20 @@ export type Fetch = (url: string, init: RequestInit) => Promise<Response>;
 export const WEBHOOK_TIMEOUT_MS = 10_000;
 
 /**
- * The kinds of webhook notifications: those of the Master (notice.ts), and `master_down`, which
- * only the scripts send (scripts/webhook.sh) when the Master is down and they cannot start it.
- * The Master never makes that one itself, so it is not a NoticeKind.
+ * The kinds of webhook notifications: those of the Master (notice.ts); `master_down`, which only
+ * the scripts send (scripts/webhook.sh) when the Master is down and they cannot start it; and
+ * `test`, the test notification a human asks for on the dashboard. No event makes either of the
+ * last two, so they are not NoticeKinds.
  */
-export type WebhookKind = NoticeKind | 'master_down';
+export type WebhookKind = NoticeKind | 'master_down' | 'test';
+
+/** A notification as it goes to the webhook: one of the Master's (notice.ts) or a test one. */
+export interface WebhookNotice extends Omit<Notice, 'kind'> {
+  kind: WebhookKind;
+}
+
+/** The event type of the test notification, as `eventType` of its JSON body. */
+export const TEST_NOTICE_EVENT = 'notify.test';
 
 /** The JSON body of a webhook notification (`format: json`). */
 export interface WebhookPayload {
@@ -56,8 +65,8 @@ export function webhookHeaders(webhook: WebhookConfig): Headers {
  */
 export function webhookRequest(
   webhook: WebhookConfig,
-  notice: Notice,
-  event: EventRow,
+  notice: WebhookNotice,
+  event: Pick<EventRow, 'type' | 'ts'>,
   home?: string,
 ): { headers: Headers; body: string } {
   const title = redactForGitHub(notice.title, home);
@@ -220,6 +229,19 @@ interface Failure {
   status: number | null;
 }
 
+/** How a request went: a failure, or the HTTP status of the webhook's answer. */
+type Outcome = Failure | { reason: null; status: number };
+
+/** How the test notification went (the dashboard's button). */
+export interface WebhookTestOutcome {
+  /** The webhook answered with a 2xx status. */
+  ok: boolean;
+  /** The HTTP status of the answer; null when there was none. */
+  status: number | null;
+  /** Why it failed, without the address or the headers; null when it did not. */
+  reason: string | null;
+}
+
 /**
  * Notifications POSTed to the address in `notify.webhook` (config.yaml), so that a human is
  * reached even away from this machine or on a server without a desktop: only when a human is
@@ -282,14 +304,9 @@ export class WebhookNotifier {
   /** Never rejects: every failure ends in `failed`. */
   private async post(webhook: WebhookConfig, notice: Notice, event: EventRow): Promise<void> {
     try {
-      const failure = await this.send(webhook, notice, event).catch(
-        (err: unknown): Failure => ({
-          reason: failureReason(err, webhook, this.timeoutMs),
-          status: null,
-        }),
-      );
-      if (failure) {
-        this.failed(webhook, failure);
+      const outcome = await this.send(webhook, notice, event);
+      if (outcome.reason !== null) {
+        this.failed(webhook, outcome);
       } else {
         // It got through: the next failure starts a new streak, told again.
         this.failingUrl = undefined;
@@ -300,26 +317,48 @@ export class WebhookNotifier {
     }
   }
 
-  /** null when the webhook took the notification; throws when it gave no answer. */
+  /** POSTs one notification; never rejects: a webhook that gave no answer is a failure too. */
   private async send(
     webhook: WebhookConfig,
-    notice: Notice,
-    event: EventRow,
-  ): Promise<Failure | null> {
-    const { headers, body } = webhookRequest(webhook, notice, event, this.home);
-    const response = await this.fetch(webhook.url, {
-      method: 'POST',
-      headers,
-      body,
-      signal: AbortSignal.timeout(this.timeoutMs),
+    notice: WebhookNotice,
+    event: Pick<EventRow, 'type' | 'ts'>,
+  ): Promise<Outcome> {
+    try {
+      const { headers, body } = webhookRequest(webhook, notice, event, this.home);
+      const response = await this.fetch(webhook.url, {
+        method: 'POST',
+        headers,
+        body,
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+      // Nothing is read from the answer; let the connection go.
+      await response.body?.cancel().catch(() => {});
+      if (response.ok) return { reason: null, status: response.status };
+      return {
+        reason: `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ''}`,
+        status: response.status,
+      };
+    } catch (err) {
+      return { reason: failureReason(err, webhook, this.timeoutMs), status: null };
+    }
+  }
+
+  /**
+   * POSTs a test notification (kind `test`, eventType `notify.test`) to the webhook of the
+   * configuration in use, for the dashboard's button, and resolves with how it went; null
+   * without a webhook. Never rejects. It notifies of no event: a failure goes back to the button
+   * only, neither logged nor recorded, and the streak of failures of the real notifications
+   * stays as it was, so that their next failure is told as it would have been.
+   */
+  async sendTest(title: string, body: string): Promise<WebhookTestOutcome | null> {
+    const webhook = this.config().master.notify.webhook;
+    if (!webhook) return null;
+    const notice: WebhookNotice = { kind: 'test', title, body, runId: null, about: 'master' };
+    const { reason, status } = await this.send(webhook, notice, {
+      type: TEST_NOTICE_EVENT,
+      ts: nowIso(),
     });
-    // Nothing is read from the answer; let the connection go.
-    await response.body?.cancel().catch(() => {});
-    if (response.ok) return null;
-    return {
-      reason: `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ''}`,
-      status: response.status,
-    };
+    return { ok: reason === null, status, reason };
   }
 
   /** The first failure of a streak (or of another address) is logged and recorded; later ones not. */

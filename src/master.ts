@@ -24,8 +24,8 @@ import { IssueBridge } from './github/bridge.js';
 import type { GitHub } from './github/client.js';
 import { type Lang, lang, setLang, t } from './i18n.js';
 import { RawLogPruner } from './logs/prune.js';
-import { type SendNotice, SystemNotifier } from './notify/system.js';
-import { saveWebhookCurlFile, WebhookNotifier } from './notify/webhook.js';
+import { type ExecFile, type SendNotice, SystemNotifier } from './notify/system.js';
+import { type Fetch, saveWebhookCurlFile, WebhookNotifier } from './notify/webhook.js';
 import { backupRestoredNotice, Store } from './store/store.js';
 import {
   copyUpgradeScript,
@@ -73,6 +73,13 @@ export interface MasterOptions {
   nodeMissing?: () => boolean;
   /** Send a system notification (tests replace it); default: the platform's (notify/system.ts). */
   notice?: SendNotice;
+  /**
+   * Run the system notification command of the dashboard's test notification (tests replace it);
+   * default child_process.execFile.
+   */
+  execFile?: ExecFile;
+  /** Send the webhook's requests (tests replace it); default the global fetch. */
+  fetch?: Fetch;
   /**
    * Platform the API reports system notifications as supported on (default process.platform);
    * tests change it. Where they are not, the dashboard sends its own.
@@ -265,7 +272,7 @@ export class Master {
       masterOrigin,
     });
     const notifier = new SystemNotifier(store, config, opts.notice);
-    const webhook = new WebhookNotifier(store, config);
+    const webhook = new WebhookNotifier(store, config, { fetch: opts.fetch });
     let master: Master | undefined;
     const upgrader = new Upgrader({
       store,
@@ -295,6 +302,8 @@ export class Master {
       configStatus: () => watcher.status(),
       webDir: opts.webDir ?? defaultWebDir(),
       platform: opts.platform,
+      webhook,
+      execFile: opts.execFile,
       now: opts.now,
     });
     // Leftover worktrees of failed and cancelled Runs go with the raw logs: at start, once the

@@ -88,14 +88,20 @@ src/
     notice.ts         which events notify people (shared by system notifications, the webhook
                       and dashboard)
     system.ts         system notifications sent by the Master: osascript on macOS, notify-send
-                      (libnotify) on Linux, nothing elsewhere; which platforms are supported
+                      (libnotify) on Linux, nothing elsewhere; which platforms are supported;
+                      sendSystemNotice, which resolves with how one went (for the test
+                      notification)
     webhook.ts        notifications the Master POSTs to notify.webhook in config.yaml (JSON or
                       text, home directory as ~, 10 s timeout, no retry; the first failure of a
                       streak, or of another address, is logged and recorded as the global event
-                      notify.webhook_failed, told again after a notification got through); the
-                      webhook's settings as a curl config file, <home>/webhook.curl (0600, written
-                      atomically at start and on each reload, deleted without a webhook), for the
-                      scripts to notify when the Master is down
+                      notify.webhook_failed, told again after a notification got through);
+                      sendTest, the test notification (kind test, eventType notify.test), whose
+                      outcome goes back to the caller only: no log, no event, the streak left as
+                      it was; the webhook's settings as a curl config file, <home>/webhook.curl
+                      (0600, written atomically at start and on each reload, deleted without a
+                      webhook), for the scripts to notify when the Master is down
+    test-notice.ts    the test notification of the dashboard's button: its texts, sent through
+                      each channel the configuration in use enables, at once, with each outcome
   upgrade/
     upgrader.ts       the Master upgrades itself: finds a new version, waits for the work in hand,
                       hands over to scripts/self-upgrade.sh, keeps the last failed upgrade, retries
@@ -113,7 +119,9 @@ src/
   api/
     server.ts         HTTP API (Hono) and SSE; GET /api/events lists the global events (those of
                       no Run: restarts, pruned logs, upgrades, GitHub errors, scouts...) newest
-                      first, paged with ?before=<id>
+                      first, paged with ?before=<id>; POST /api/notify/test sends a test
+                      notification and returns each channel's outcome (never the webhook's
+                      address or headers)
     types.ts          API data types, shared by Master and dashboard
     agents.ts, stats.ts, workspaces.ts, diff.ts   data of the Agents, Stats and Workspaces pages
                       and diffs
