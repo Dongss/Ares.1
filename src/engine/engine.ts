@@ -27,6 +27,7 @@ import {
   plansStage,
   RATE_LIMIT_WAIT,
   type RateLimitWait,
+  REPO_WORKFLOWS_DIR,
   type RunLimitWait,
   rateLimitDelayMs,
   recordedLimitWait,
@@ -35,6 +36,7 @@ import {
   findTemplate,
   type HomePaths,
   type LoadedConfig,
+  loadRepoTemplates,
   repoTemplateKey,
 } from '../config/load.js';
 import {
@@ -53,6 +55,7 @@ import {
   rollbackTarget,
   type StageDef,
   stageVerifyCommands,
+  type TemplateFile,
 } from '../config/schema.js';
 import { redactForGitHub } from '../github/redact.js';
 import { join as joinList, t } from '../i18n.js';
@@ -85,6 +88,7 @@ import {
   branchExists,
   commitAll,
   commitsBetween,
+  committedYamlFiles,
   conflictedFiles,
   currentBranch,
   diffStat,
@@ -96,6 +100,7 @@ import {
   listBranches,
   mergeBase,
   mergeOrAbort,
+  pathDiffers,
   removeWorktree,
   resetHard,
   restoreTo,
@@ -3340,11 +3345,13 @@ export class Engine {
   }
 
   /**
-   * Merge stage: bring in the latest target branch, re-run checks if it moved,
-   * then fast-forward the target branch. A conflict goes back to an agent stage to resolve, or
-   * ends the Run when no agent stage can (`mergeConflict`). Holds the repo's merge lock
-   * throughout (`withMergeLock`), the checks included: the Runs of a repo executing side by side
-   * merge one at a time, and each brings in what the ones before it merged.
+   * Merge stage: bring in the latest target branch, try loading the repo's own templates when the
+   * Run changed them (a broken one goes back to an agent stage to fix, so that it never reaches
+   * the target branch), re-run checks if the target moved, then fast-forward the target branch.
+   * A conflict goes back to an agent stage to resolve, or ends the Run when no agent stage can
+   * (`mergeConflict`). Holds the repo's merge lock throughout (`withMergeLock`), the checks
+   * included: the Runs of a repo executing side by side merge one at a time, and each brings in
+   * what the ones before it merged.
    */
   private executeMerge(
     run: Run,
@@ -3389,10 +3396,23 @@ export class Engine {
       this.store.event(run.id, 'merge.synced', { target, targetHead });
     }
 
+    const head2 = await revParse(workdir, 'HEAD');
+    this.checkAbort(signal);
+    // Keep broken templates out of the target branch: the repo's own templates take effect from
+    // there (`RepoWorkflows`), where a broken one leaves the repo's Runs with an older version or
+    // none. The work goes back to be fixed instead, as when a check fails. A merge of the target
+    // branch just made is kept and taken as checked, like after failed checks: the agent fixing
+    // the templates works on top of it.
+    const broken = await this.brokenRepoTemplates(repo.name, workdir, targetHead, head2);
+    this.checkAbort(signal);
+    if (broken.length > 0) {
+      this.failOnBrokenTemplates(run, sr, target, head2, broken);
+      return;
+    }
+
     // Check what has not been checked yet: the target's new commits just merged in, or commits
     // made outside an agent task (e.g. a conflict resolved by hand). Until the checks finish the
     // merge commit is not accepted, so an interruption resets to before it and syncs again.
-    const head2 = await revParse(workdir, 'HEAD');
     if (synced || (run.headCommit !== null && head2 !== run.headCommit)) {
       const commands = stageVerifyCommands(eff.def, repo.verifyCommands);
       // Blocked on the environment, the merge stage goes on later like after an interruption:
@@ -3479,6 +3499,74 @@ export class Engine {
     });
     this.store.event(run.id, 'merge.done', { target, head: newHead });
     this.passStage(run, sr);
+  }
+
+  /**
+   * The template files the repo keeps in .ares1/workflows/, as committed at `head`, that fail to
+   * load with the agents configured now; none when `head` changes nothing there from `base`.
+   * Each file is tried as it is: unlike on the target branch, no version that loaded before
+   * stands in for a broken one.
+   */
+  private async brokenRepoTemplates(
+    repoName: string,
+    workdir: string,
+    base: string,
+    head: string,
+  ): Promise<TemplateFile[]> {
+    if (!(await pathDiffers(workdir, base, head, REPO_WORKFLOWS_DIR))) return [];
+    const files = await committedYamlFiles(workdir, head, REPO_WORKFLOWS_DIR);
+    // The configuration is loaded with the same: the CLIs whose adapter runs agents read-only.
+    const readOnlyClis = [...this.deps.adapters.values()]
+      .filter((a) => a.supportsReadOnly)
+      .map((a) => a.cli);
+    const loaded = loadRepoTemplates(repoName, files, this.cfg.agents, readOnlyClis);
+    return loaded.files.filter((f) => f.errors.length > 0);
+  }
+
+  /**
+   * The merge stage fails on the repo's templates on the Run's branch that do not load
+   * (`brokenRepoTemplates`), with each file and its errors as feedback; `rollback` goes back to
+   * `failTarget` like after failed checks, counted toward max_loops. `head` is the commit they
+   * were read from, which later work builds on; `target` the branch they were kept out of.
+   */
+  private failOnBrokenTemplates(
+    run: Run,
+    sr: StageRun,
+    target: string,
+    head: string,
+    broken: readonly TemplateFile[],
+  ): void {
+    const sep = t({ zh: '；', en: '; ' });
+    const list = broken.map((f) => `- ${f.path}: ${f.errors.join(sep)}`).join('\n');
+    this.store.tx(() => {
+      this.store.addCheck({
+        runId: run.id,
+        stageRunId: sr.id,
+        attemptId: null,
+        kind: 'merge',
+        name: t({
+          zh: `流程模板（${REPO_WORKFLOWS_DIR}/）`,
+          en: `Workflow templates (${REPO_WORKFLOWS_DIR}/)`,
+        }),
+        passed: false,
+        detail: list,
+      });
+      this.store.updateRun(run.id, { headCommit: head });
+      this.store.updateStageRun(sr.id, {
+        status: 'failed',
+        failReason: 'check',
+        failFeedback: t({
+          zh: `Run 分支上 ${REPO_WORKFLOWS_DIR}/ 里的流程模板加载失败。为了不让坏模板进入 ${target}，没有合并：\n${list}\n\n修好这些文件，或者撤回对它们的改动。`,
+          en: `Workflow templates in ${REPO_WORKFLOWS_DIR}/ on the Run's branch fail to load. To keep broken templates out of ${target}, nothing was merged:\n${list}\n\nFix these files, or undo the changes to them.`,
+        }),
+        endedAt: nowIso(),
+      });
+      this.store.event(run.id, 'stage.failed', {
+        stageId: sr.stageId,
+        reason: 'check',
+        templates: broken.map((f) => f.path),
+      });
+    });
   }
 
   /**

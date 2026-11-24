@@ -1048,6 +1048,249 @@ describe('engine: command stages', () => {
   });
 });
 
+describe("engine: the merge tries the repo's templates the Run changed", () => {
+  const store = () => (h as Harness).master.store;
+  const stagesOf = (runId: string) =>
+    store()
+      .listStageRuns(runId)
+      .map((sr) => [sr.stageId, sr.status]);
+  const failedMerge = (runId: string) =>
+    store()
+      .listStageRuns(runId)
+      .find((sr) => sr.stageId === 'merge' && sr.status === 'failed');
+  /** Merges without approval, so a Run goes from coding to merging on its own. */
+  const noGate = { stages: { merge: { gate: false } } };
+  /** A template of the harness's fake agents; `agent` names its coding agent. */
+  const template = (agent = 'coder') => `id: x
+name: Repo flow
+stages:
+  - id: implement
+    name: Code
+    kind: agent
+    agent: ${agent}
+  - id: merge
+    name: Merge
+    kind: merge
+`;
+  const workflowPath = (dir: string, file = 'x.yaml') => join(dir, '.ares1', 'workflows', file);
+  /** Commit `content` as `.ares1/workflows/<file>` on the target branch. */
+  const commitWorkflow = (file: string, content: string) => {
+    const repoDir = (h as Harness).repoDir;
+    writeFile(workflowPath(repoDir, file), content);
+    git(repoDir, 'add', '-A');
+    git(repoDir, 'commit', '-q', '-m', `workflow ${file}`);
+  };
+  const mainHead = () => git((h as Harness).repoDir, 'rev-parse', 'main');
+
+  it('does not merge templates that fail to load; the coder fixes them and the Run merges', async () => {
+    h = await harness();
+    commitWorkflow('x.yaml', template());
+    const repoDir = h.repoDir;
+    const before = mainHead();
+    let round = 0;
+    let mainAtRework = '';
+    h.scripts.coder = (ctx) => {
+      round++;
+      const dir = ctx.input.workdir;
+      writeFile(join(dir, 'feature.txt'), 'ok\n');
+      if (round === 1) {
+        // An agent that does not exist, and a file that is not YAML.
+        writeFile(workflowPath(dir), template('ghost'));
+        writeFile(workflowPath(dir, 'broken.yaml'), 'id: [broken\n');
+      } else {
+        mainAtRework = mainHead();
+        writeFile(workflowPath(dir), template('coder2'));
+        rmSync(workflowPath(dir, 'broken.yaml'));
+      }
+      return done();
+    };
+    const run = h.run('改流程模板', noGate);
+    await h.waitStatus(run.id, 'completed');
+
+    expect(stagesOf(run.id)).toEqual([
+      ['implement', 'passed'],
+      ['review', 'passed'],
+      ['merge', 'failed'],
+      ['implement', 'passed'],
+      ['review', 'passed'],
+      ['merge', 'passed'],
+    ]);
+    // Nothing reached main while the templates were broken.
+    expect(mainAtRework).toBe(before);
+    const failed = failedMerge(run.id);
+    expect(failed?.failReason).toBe('check');
+    const feedback = failed?.failFeedback ?? '';
+    expect(feedback).toContain('流程模板加载失败');
+    expect(feedback).toContain('- .ares1/workflows/x.yaml: ');
+    expect(feedback).toContain('Agent ghost 不存在或未启用');
+    expect(feedback).toContain('- .ares1/workflows/broken.yaml: ');
+    expect(feedback).toContain('不是合法的 YAML');
+    const checks = store()
+      .listChecks(run.id)
+      .filter((c) => c.stageRunId === failed?.id);
+    expect(checks.map((c) => [c.kind, c.passed])).toEqual([['merge', false]]);
+    expect(checks[0]?.detail).toContain('Agent ghost 不存在或未启用');
+    const stageFailed = store()
+      .listEvents(run.id)
+      .find((e) => e.type === 'stage.failed');
+    expect(stageFailed?.data).toEqual({
+      stageId: 'merge',
+      reason: 'check',
+      templates: ['.ares1/workflows/broken.yaml', '.ares1/workflows/x.yaml'],
+    });
+    const rollback = store()
+      .listEvents(run.id)
+      .find((e) => e.type === 'stage.rollback');
+    expect(rollback?.data).toEqual({ from: 'merge', to: 'implement' });
+    // The coder got the load errors back as feedback.
+    expect(h.fake.calls.map((c) => c.model)).toEqual(['coder', 'reviewer', 'coder', 'reviewer']);
+    const prompt = h.fake.calls[2]?.prompt ?? '';
+    expect(prompt).toContain('「合并」没有通过');
+    expect(prompt).toContain('.ares1/workflows/x.yaml');
+    expect(prompt).toContain('Agent ghost 不存在或未启用');
+    // The fixed templates were merged.
+    expect(readFileSync(workflowPath(repoDir), 'utf8')).toBe(template('coder2'));
+    expect(existsSync(workflowPath(repoDir, 'broken.yaml'))).toBe(false);
+  });
+
+  it('keeps a merge of the target branch made just before, which the fix builds on', async () => {
+    h = await harness();
+    const repoDir = h.repoDir;
+    let round = 0;
+    h.scripts.coder = (ctx) => {
+      round++;
+      const dir = ctx.input.workdir;
+      writeFile(join(dir, 'feature.txt'), 'ok\n');
+      writeFile(workflowPath(dir), template(round === 1 ? 'ghost' : 'coder'));
+      return done();
+    };
+    // Waits for approval before the merge, so that main moves in between.
+    const run = h.run('加流程模板');
+    await h.waitStatus(run.id, 'waiting_approval');
+    writeFile(join(repoDir, 'other.txt'), 'from main\n');
+    git(repoDir, 'add', '-A');
+    git(repoDir, 'commit', '-q', '-m', 'main moved');
+    const moved = mainHead();
+    h.master.engine.approve(run.id);
+    // Back at the gate after the rework.
+    await waitFor(
+      () => store().listStageRuns(run.id).length === 6,
+      'the Run to get back to the merge gate',
+    );
+    const waiting = await h.waitStatus(run.id, 'waiting_approval');
+    expect(stagesOf(run.id)).toEqual([
+      ['implement', 'passed'],
+      ['review', 'passed'],
+      ['merge', 'failed'],
+      ['implement', 'passed'],
+      ['review', 'passed'],
+      ['merge', 'waiting_approval'],
+    ]);
+    expect(mainHead()).toBe(moved);
+    // The rework was done on top of main's latest code, which was not merged again.
+    const worktree = waiting.worktreePath as string;
+    expect(readFileSync(join(worktree, 'other.txt'), 'utf8')).toBe('from main\n');
+    expect(git(worktree, 'merge-base', '--is-ancestor', moved, 'HEAD')).toBe('');
+    expect(waiting.headCommit).toBe(git(worktree, 'rev-parse', 'HEAD'));
+    h.master.engine.approve(run.id);
+    await h.waitStatus(run.id, 'completed');
+    expect(
+      store()
+        .listEvents(run.id)
+        .filter((e) => e.type === 'merge.synced'),
+    ).toHaveLength(1);
+    expect(readFileSync(workflowPath(repoDir), 'utf8')).toBe(template());
+    expect(readFileSync(join(repoDir, 'feature.txt'), 'utf8')).toBe('ok\n');
+  });
+
+  it('counts toward max_loops like failed checks', async () => {
+    h = await harness();
+    h.scripts.coder = (ctx) => {
+      writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+      writeFile(workflowPath(ctx.input.workdir), template('ghost'));
+      return done();
+    };
+    const before = mainHead();
+    const run = h.run('改坏流程模板', { ...noGate, max_loops: 1 });
+    const failed = await h.waitStatus(run.id, 'failed');
+    expect(stagesOf(run.id)).toEqual([
+      ['implement', 'passed'],
+      ['review', 'passed'],
+      ['merge', 'failed'],
+      ['implement', 'passed'],
+      ['review', 'passed'],
+      ['merge', 'failed'],
+    ]);
+    expect(failed.error).toContain('超过回退上限 1');
+    expect(failed.error).toContain('Agent ghost 不存在或未启用');
+    expect(mainHead()).toBe(before);
+  });
+
+  it('does not try them when the Run leaves .ares1/workflows/ alone', async () => {
+    h = await harness();
+    // Broken on main already: tried, it would keep the Run from merging.
+    commitWorkflow('broken.yaml', 'id: [broken\n');
+    const run = h.run();
+    await h.waitStatus(run.id, 'waiting_approval');
+    // main moves meanwhile, with templates of its own: the merge brings them in and goes on.
+    commitWorkflow('other.yaml', template('ghost'));
+    h.master.engine.approve(run.id);
+    await h.waitStatus(run.id, 'completed');
+    expect(stagesOf(run.id)).toEqual([
+      ['implement', 'passed'],
+      ['review', 'passed'],
+      ['merge', 'passed'],
+    ]);
+    expect(
+      store()
+        .listEvents(run.id)
+        .some((e) => e.type === 'merge.synced'),
+    ).toBe(true);
+    // The checks run again on main's latest code, and nothing else is checked.
+    expect(
+      store()
+        .listChecks(run.id)
+        .map((c) => [c.kind, c.passed]),
+    ).toEqual([
+      ['result', true],
+      ['command', true],
+      ['review', true],
+      ['command', true],
+      ['merge', true],
+    ]);
+    expect(readFileSync(join(h.repoDir, 'feature.txt'), 'utf8')).toBe('ok\n');
+  });
+
+  describe('in English', () => {
+    afterEach(() => setLang('zh'));
+
+    it('words the feedback in English', async () => {
+      setLang('en');
+      h = await harness();
+      let round = 0;
+      h.scripts.coder = (ctx) => {
+        round++;
+        writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+        writeFile(workflowPath(ctx.input.workdir), template(round === 1 ? 'ghost' : 'coder'));
+        return done();
+      };
+      const run = h.run('Add a workflow', noGate);
+      await h.waitStatus(run.id, 'completed');
+      const failed = failedMerge(run.id);
+      const feedback = failed?.failFeedback ?? '';
+      expect(feedback).toContain("on the Run's branch fail to load");
+      expect(feedback).toContain(
+        '- .ares1/workflows/x.yaml: Stage implement: agent ghost does not exist or is disabled',
+      );
+      const check = store()
+        .listChecks(run.id)
+        .find((c) => c.stageRunId === failed?.id);
+      expect(check?.name).toBe('Workflow templates (.ares1/workflows/)');
+      expect(`${feedback}${check?.name}${check?.detail}`).not.toMatch(/[一-鿿]/);
+    });
+  });
+});
+
 describe('engine: a reviewer does not change the work', () => {
   const store = () => (h as Harness).master.store;
   const discardedOf = (runId: string) =>
