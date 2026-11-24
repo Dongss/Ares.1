@@ -40,6 +40,7 @@ import {
 } from '../src/github/issues.js';
 import { filedProposal, issueDigest, proposalsHoldingScout } from '../src/github/scout.js';
 import { setLang } from '../src/i18n.js';
+import { noticeFor } from '../src/notify/notice.js';
 import type { AssessmentEntry, BlockKind, Run, Scout, ScoutProposal } from '../src/store/types.js';
 import {
   ASSESS_AGENTS_YAML,
@@ -400,6 +401,56 @@ stages:
     await t.master.issues.poll();
     expect(t.master.issues.status().lastError).toBeNull();
     expect(t.master.store.listRuns()).toHaveLength(1);
+  });
+
+  it('records and notifies each error once per streak when errors take turns', async () => {
+    const t = await start(config({ push: true }));
+    const githubErrors = () => t.master.store.listGlobalEventsOfType('github.error');
+    // Two failures at once: within each poll reading the ready issues fails, then the push.
+    const failBoth = () => {
+      gh.failing.set(`list open ${LABELS.ready}`, '读取 issue 超时');
+      gh.failing.set('push main', '推送认证失败');
+    };
+    failBoth();
+    for (let i = 0; i < 3; i++) await t.master.issues.poll();
+    expect(gh.calls.filter((c) => c === 'push main')).toHaveLength(3);
+    const first = githubErrors();
+    expect(first.map((e) => e.data.message)).toEqual(['读取 issue 超时', '推送认证失败']);
+    const notices = first.map((e) => noticeFor(e, undefined));
+    expect(notices.map((n) => n?.kind)).toEqual(['github', 'github']);
+    // The dashboard still shows the latest failure.
+    expect(t.master.issues.status().lastError?.message).toBe('推送认证失败');
+
+    // A round with every call through ends the streak.
+    gh.failing.clear();
+    await t.master.issues.poll();
+    expect(t.master.issues.status().lastError).toBeNull();
+    expect(githubErrors()).toHaveLength(2);
+
+    // The same errors again: a new streak, recorded and notified again. A new commit on the
+    // target branch, so that the push is tried again.
+    writeFile(join(t.repoDir, 'more.txt'), 'more\n');
+    git(t.repoDir, 'add', '-A');
+    git(t.repoDir, 'commit', '-q', '-m', 'more');
+    failBoth();
+    await t.master.issues.poll();
+    await t.master.issues.poll();
+    expect(githubErrors()).toHaveLength(4);
+    expect(t.master.issues.status().lastError?.message).toBe('推送认证失败');
+  });
+
+  it('records at most a capped number of different errors in one streak', async () => {
+    const t = await start();
+    let n = 0;
+    // Each call fails with another message, as when GitHub puts a request id in its errors.
+    gh.listIssues = async () => {
+      n++;
+      throw new Error(`请求 ${n} 失败`);
+    };
+    for (let i = 0; i < 30; i++) await t.master.issues.poll();
+    expect(n).toBeGreaterThan(20);
+    expect(t.master.store.listGlobalEventsOfType('github.error')).toHaveLength(20);
+    expect(t.master.issues.status().lastError?.message).toBe(`请求 ${n} 失败`);
   });
 });
 

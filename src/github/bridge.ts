@@ -83,6 +83,12 @@ const stoppedWhileScouting = () =>
 const SCOUT_RECENT_CLOSED = 30;
 /** How many issues closed as not planned the scout sees besides, with their reasons. */
 const SCOUT_NOT_PLANNED = 300;
+/**
+ * How many different GitHub errors one streak of failures records (and notifies). Error messages
+ * may carry what changes on every call, such as a request id; without a cap such a streak would
+ * keep growing the set and keep notifying. Past it, the streak records no new github.error.
+ */
+const MAX_REPORTED_ERRORS = 20;
 
 const pad = (n: number) => String(n).padStart(2, '0');
 
@@ -234,6 +240,12 @@ export class IssueBridge {
   /** Target branch commit last pushed, per repo path. */
   private readonly pushed = new Map<string, string>();
   private lastError: { message: string; at: string } | null = null;
+  /**
+   * The messages recorded as github.error since the last poll whose GitHub calls all went through.
+   * A round calls GitHub for every step and repo, so two failures at once (one repo answering 404,
+   * another 502) take turns: comparing with the last error only would record and notify each turn.
+   */
+  private readonly reportedErrors = new Set<string>();
   private stopping = false;
   private readonly onEvent = (e: EventRow) => {
     // An assessment's result changes the discussion, not always the Run status (go keeps running).
@@ -406,9 +418,14 @@ export class IssueBridge {
     return this.gh().comment(repo, number, markComment(redactForGitHub(body)));
   }
 
+  /**
+   * Record a GitHub failure: each message once per streak of failures (a github.error notifies),
+   * the latest one always (the dashboard shows it). The streak ends with a poll that had no error.
+   */
   private report(err: unknown): void {
     const message = errorMessage(err);
-    if (this.lastError?.message !== message) {
+    if (!this.reportedErrors.has(message) && this.reportedErrors.size < MAX_REPORTED_ERRORS) {
+      this.reportedErrors.add(message);
       this.deps.store.event(null, 'github.error', { message });
     }
     this.lastError = { message, at: nowIso() };
@@ -459,7 +476,10 @@ export class IssueBridge {
       }
       this.scheduleRedo();
       this.lastPollAt = nowIso();
-      if (!failed) this.lastError = null;
+      if (!failed) {
+        this.lastError = null;
+        this.reportedErrors.clear();
+      }
     });
   }
 

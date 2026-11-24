@@ -129,11 +129,11 @@ export const NOTICE_KINDS: Record<NoticeKind, { label: string; when: string }> =
   github: {
     zh: {
       label: 'GitHub 访问失败',
-      when: '读写 issue 或推送目标分支失败（同一个错误只通知一次）',
+      when: '读写 issue 或推送目标分支失败。同一串连续失败里，同一个错误只通知一次；有一轮访问全部成功后重新开始',
     },
     en: {
       label: 'GitHub access failed',
-      when: 'Reading or writing issues, or pushing the target branch, failed (each error is notified once)',
+      when: 'Reading or writing issues, or pushing the target branch, failed. Within a streak of failures each error is notified once; a round in which every GitHub call succeeds starts over',
     },
   },
   upgrade: {
