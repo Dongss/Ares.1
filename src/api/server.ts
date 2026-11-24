@@ -60,6 +60,11 @@ export interface ApiDeps {
   execFile?: ExecFile;
   /** The clock, in epoch milliseconds, e.g. for whether raw logs are past retention. */
   now?: () => number;
+  /**
+   * A repo was registered, changed (e.g. its target branch) or deleted: read the templates the
+   * repos keep again (`RepoWorkflows.refresh`; never rejects). Answered once it is done.
+   */
+  reposChanged?: () => Promise<void>;
 }
 
 class BadRequestError extends Error {}
@@ -260,6 +265,7 @@ export function createApi(deps: ApiDeps): Hono {
       setupCommands: input.setupCommands,
       mergeMode: 'direct',
     });
+    await deps.reposChanged?.();
     return c.json(repo, 201);
   });
 
@@ -269,12 +275,15 @@ export function createApi(deps: ApiDeps): Hono {
     if (input.targetBranch && !(await branchExists(repo.path, input.targetBranch))) {
       throw new BadRequestError(noBranch(input.targetBranch));
     }
-    return c.json(store.updateRepo(repo.id, input));
+    const updated = store.updateRepo(repo.id, input);
+    await deps.reposChanged?.();
+    return c.json(updated);
   });
 
-  app.delete('/api/repos/:id', (c) => {
+  app.delete('/api/repos/:id', async (c) => {
     const repo = store.getRepo(c.req.param('id'));
     store.deleteRepo(repo.id);
+    await deps.reposChanged?.();
     return c.body(null, 204);
   });
 

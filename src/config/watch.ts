@@ -1,7 +1,7 @@
 import { type FSWatcher, watch } from 'node:fs';
 import { t } from '../i18n.js';
 import { errorMessage, nowIso } from '../util.js';
-import { type HomePaths, type LoadedConfig, loadConfig } from './load.js';
+import { type HomePaths, type LoadedConfig, loadConfig, type RepoTemplateSource } from './load.js';
 
 export interface ConfigStatus {
   /** When the configuration in use was loaded. */
@@ -16,11 +16,41 @@ export type ConfigChange =
   | { type: 'reloaded'; config: LoadedConfig }
   | { type: 'reload_failed'; message: string };
 
+/** Whether two sets of repos' template files have the same repos with the same files. */
+function sameFiles(
+  a: ReadonlyMap<string, RepoTemplateSource>,
+  b: ReadonlyMap<string, RepoTemplateSource>,
+): boolean {
+  if (a.size !== b.size) return false;
+  for (const [name, x] of a) {
+    const y = b.get(name);
+    if (!y || x.files.length !== y.files.length) return false;
+    if (x.files.some((f, i) => f.file !== y.files[i]?.file || f.source !== y.files[i]?.source)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Whether every repo's files were read from the same branch and commit in both. */
+function sameCommits(
+  a: ReadonlyMap<string, RepoTemplateSource>,
+  b: ReadonlyMap<string, RepoTemplateSource>,
+): boolean {
+  for (const [name, x] of a) {
+    const y = b.get(name);
+    if (y?.branch !== x.branch || y.sha !== x.sha) return false;
+  }
+  return a.size === b.size;
+}
+
 /**
  * Holds the configuration in use and reloads it when config.yaml, agents.yaml or workflows/
- * change. A reload that throws keeps the previous configuration; invalid
- * agents or templates are disabled as at startup. Runs keep the template snapshot they were
- * created with; agent settings apply from the next execution.
+ * change, or the templates the repos keep in .ares1/workflows/ (`setRepoSources`). A reload that
+ * throws keeps the previous configuration; invalid agents or templates are disabled as at
+ * startup, except that a repo's template file that fails keeps its version that last loaded.
+ * Runs keep the template snapshot they were created with; agent settings apply from the next
+ * execution.
  */
 export class ConfigWatcher {
   private config: LoadedConfig;
@@ -29,6 +59,8 @@ export class ConfigWatcher {
   private readonly startup: LoadedConfig['master'];
   private watchers: FSWatcher[] = [];
   private timer: ReturnType<typeof setTimeout> | undefined;
+  /** The template files of every registered repo, by repo name, as last read. */
+  private repoSources: ReadonlyMap<string, RepoTemplateSource> = new Map();
 
   constructor(
     private readonly paths: HomePaths,
@@ -59,18 +91,48 @@ export class ConfigWatcher {
 
   /** Load the files again now. Returns whether the new configuration is in use. */
   reload(): boolean {
+    return this.load(true);
+  }
+
+  /**
+   * Take the template files of the repos (`RepoWorkflows`): every registered repo's, by name;
+   * those left out have none, as have those without files (most repos), which never cause a
+   * load. When they differ from the files in use, the configuration is loaded again (`reload`;
+   * told unless `notify` is false, as before the Master has started). When only the commits they
+   * were read from moved, it is loaded again without telling, so that it names the commits the
+   * templates now stand for.
+   */
+  setRepoSources(
+    sources: ReadonlyMap<string, RepoTemplateSource>,
+    opts: { notify?: boolean } = {},
+  ): void {
+    const before = this.repoSources;
+    this.repoSources = new Map([...sources].filter(([, s]) => s.files.length > 0));
+    if (!sameFiles(before, this.repoSources)) this.load(opts.notify ?? true);
+    else if (!sameCommits(before, this.repoSources)) this.load(false);
+  }
+
+  /**
+   * Load the configuration files, with the repos' template files and the configuration in use as
+   * the last loaded (whose versions stand in for repo files that now fail). `notify`: tell
+   * `onChange`. Returns whether the new configuration is in use.
+   */
+  private load(notify: boolean): boolean {
     let next: LoadedConfig;
     try {
-      next = loadConfig(this.paths, this.knownClis, this.readOnlyClis);
+      next = loadConfig(this.paths, this.knownClis, this.readOnlyClis, {
+        repoSources: this.repoSources,
+        previous: this.config,
+      });
     } catch (err) {
       this.reloadError = { message: errorMessage(err), at: nowIso() };
-      this.onChange({ type: 'reload_failed', message: this.reloadError.message });
+      if (notify) this.onChange({ type: 'reload_failed', message: this.reloadError.message });
       return false;
     }
     this.config = next;
     this.loadedAt = nowIso();
     this.reloadError = null;
-    this.onChange({ type: 'reloaded', config: next });
+    if (notify) this.onChange({ type: 'reloaded', config: next });
     return true;
   }
 

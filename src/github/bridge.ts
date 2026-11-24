@@ -18,8 +18,13 @@ import {
   splitUnfinishedRuns,
   templateSplits,
 } from '../config/flow.js';
-import { githubConfigKey, type HomePaths, type LoadedConfig } from '../config/load.js';
-import type { GitHubRepoConfig } from '../config/schema.js';
+import {
+  findTemplate,
+  githubConfigKey,
+  type HomePaths,
+  type LoadedConfig,
+} from '../config/load.js';
+import type { GitHubRepoConfig, WorkflowTemplate } from '../config/schema.js';
 import { type Engine, estimateCost, InvalidStateError } from '../engine/engine.js';
 import { storedRunTimes } from '../engine/times.js';
 import { t } from '../i18n.js';
@@ -272,6 +277,11 @@ export interface BridgeDeps {
    * wait, as they would fail for the environment, not for the code.
    */
   nodeMissing?: () => boolean;
+  /**
+   * Read the templates the repos keep in .ares1/workflows/ again where their target branch
+   * moved (`RepoWorkflows.refresh`); never rejects. Each poll does it before it creates Runs.
+   */
+  refreshTemplates?: () => Promise<void>;
 }
 
 /** Start of the current day in the Master's local time, as ISO. */
@@ -574,9 +584,13 @@ export class IssueBridge {
           }
         }
       };
+      // The templates of commits a human made on a target branch, and of repos registered since.
+      await this.deps.refreshTemplates?.();
       // First, so that the Runs taken this round start from GitHub's latest commits and the
       // issues closed this round see whether the branch can be pushed.
       await each((name) => this.syncTarget(name));
+      // And of GitHub's commits just pulled, for the Runs taken this round.
+      await this.deps.refreshTemplates?.();
       if (working) {
         await each((name) => this.acceptBacklog(name));
         await each((name) => this.intake(name));
@@ -699,7 +713,7 @@ export class IssueBridge {
           },
           untrusted ? untrustedGoalMessage(issue) : undefined,
         );
-        const templateName = this.templateName(cfg);
+        const templateName = this.templateName(name, cfg);
         const runUrl = `${this.dashboardUrl()}/#/runs/${run.id}`;
         await this.comment(
           full,
@@ -732,15 +746,23 @@ export class IssueBridge {
       repo: repo.name,
       template: cfg.template,
       goal,
-      overrides: issueRunOverrides(this.cfg.templates.get(cfg.template), cfg.auto_merge),
+      overrides: issueRunOverrides(this.template(repo.name, cfg), cfg.auto_merge),
       issue,
       confirmGoal,
     });
   }
 
+  /**
+   * The template the repo's Runs get (`findTemplate`): the home directory's, else the one the
+   * repo keeps; undefined when neither has it.
+   */
+  private template(name: string, cfg: GitHubRepoConfig): WorkflowTemplate | undefined {
+    return findTemplate(this.cfg, name, cfg.template)?.template;
+  }
+
   /** Name of the repo's template, as the comments on its issues give it. */
-  private templateName(cfg: GitHubRepoConfig): string {
-    return this.cfg.templates.get(cfg.template)?.name ?? cfg.template;
+  private templateName(name: string, cfg: GitHubRepoConfig): string {
+    return this.template(name, cfg)?.name ?? cfg.template;
   }
 
   /**
@@ -1077,11 +1099,7 @@ export class IssueBridge {
     const repo = store.getRepo(stale.repoId);
     const cfg = this.cfg.master.github?.repos[repo.name];
     // The new Run could not be created: the old one goes on rather than leave the issue without.
-    if (
-      !cfg ||
-      this.cfg.errors[githubConfigKey(repo.name)] ||
-      !this.cfg.templates.has(cfg.template)
-    ) {
+    if (!cfg || this.cfg.errors[githubConfigKey(repo.name)] || !this.template(repo.name, cfg)) {
       return;
     }
     if (!isTrusted(latest, await this.masterLogin()) || this.stopping) return;
@@ -1147,7 +1165,7 @@ export class IssueBridge {
           goalChangedComment({
             oldRunId: run.id,
             runId: next.id,
-            templateName: this.templateName(cfg),
+            templateName: this.templateName(repo.name, cfg),
             dashboardUrl: this.dashboardUrl(),
           }),
         ),
@@ -1408,7 +1426,7 @@ export class IssueBridge {
           runId: next.id,
           attempt,
           max,
-          templateName: this.templateName(cfg),
+          templateName: this.templateName(name, cfg),
           dashboardUrl: this.dashboardUrl(),
         }),
       );
@@ -1821,7 +1839,7 @@ export class IssueBridge {
         );
       }
       // A repo whose template is gone gets no Runs anyway; such a scout is told nothing splits.
-      const template = this.cfg.templates.get(cfg.template);
+      const template = this.template(repo.name, cfg);
       const prompt = scoutPrompt({
         repoName: repo.name,
         max: scoutCfg.max_proposals,

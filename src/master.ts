@@ -18,6 +18,7 @@ import {
   type LoadedConfig,
   loadConfig,
 } from './config/load.js';
+import { RepoWorkflows } from './config/repo-workflows.js';
 import { ConfigWatcher } from './config/watch.js';
 import { Engine } from './engine/engine.js';
 import { IssueBridge } from './github/bridge.js';
@@ -27,6 +28,7 @@ import { RawLogPruner } from './logs/prune.js';
 import { type ExecFile, type SendNotice, SystemNotifier } from './notify/system.js';
 import { type Fetch, saveWebhookCurlFile, WebhookNotifier } from './notify/webhook.js';
 import { backupRestoredNotice, Store } from './store/store.js';
+import type { EventRow } from './store/types.js';
 import {
   copyUpgradeScript,
   execPathMissing,
@@ -35,6 +37,9 @@ import {
 } from './upgrade/upgrader.js';
 import { errorMessage, newId, nowIso, parseJson } from './util.js';
 import { git, revParse } from './workspace/git.js';
+
+/** Events after which a target branch is at another commit: a Run merged, GitHub's pulled. */
+const TARGET_MOVED = new Set(['merge.done', 'github.pulled', 'github.merged_remote']);
 
 /** CLIs with a built-in adapter. */
 export const BUILTIN_CLIS = ['claude-code', 'cursor-agent'];
@@ -188,10 +193,16 @@ export class Master {
   private server: Server | undefined;
   /** Token of the mark this Master left in the data directory (`runningFile`). */
   private runningToken: string | undefined;
+  /** A target branch moved, merged into or pulled: the templates it keeps may have changed. */
+  private readonly onEvent = (e: EventRow) => {
+    if (TARGET_MOVED.has(e.type)) void this.repoWorkflows.refresh();
+  };
 
   private constructor(
     readonly paths: HomePaths,
     readonly configWatcher: ConfigWatcher,
+    /** The templates the repos keep in .ares1/workflows/, kept in step with their branches. */
+    readonly repoWorkflows: RepoWorkflows,
     readonly store: Store,
     readonly engine: Engine,
     readonly issues: IssueBridge,
@@ -246,6 +257,15 @@ export class Master {
       readOnlyClis,
     );
     const config = () => watcher.current;
+    // The first read, at startup, is taken without telling: telling kicks the engine, which must
+    // not start queued Runs before it has recovered them.
+    let started = false;
+    const repoWorkflows = new RepoWorkflows({
+      repos: () => store.listRepos(),
+      apply: (sources) => watcher.setRepoSources(sources, { notify: started }),
+      warn: (message) => console.warn(message),
+    });
+    const refreshTemplates = () => repoWorkflows.refresh();
     const nodeMissing = opts.nodeMissing ?? execPathMissing;
     const engine = new Engine({
       store,
@@ -273,6 +293,7 @@ export class Master {
       github: opts.github,
       masterOrigin,
       nodeMissing,
+      refreshTemplates,
     });
     const notifier = new SystemNotifier(store, config, opts.notice);
     const webhook = new WebhookNotifier(store, config, { fetch: opts.fetch });
@@ -308,6 +329,7 @@ export class Master {
       webhook,
       execFile: opts.execFile,
       now: opts.now,
+      reposChanged: refreshTemplates,
     });
     // Leftover worktrees of failed and cancelled Runs go with the raw logs: at start, once the
     // engine has recovered the Runs, and then daily.
@@ -324,6 +346,7 @@ export class Master {
     master = new Master(
       paths,
       watcher,
+      repoWorkflows,
       store,
       engine,
       issues,
@@ -337,6 +360,10 @@ export class Master {
     master.runningToken = markRunning(paths, store);
     notifier.start();
     webhook.start();
+    // The Runs the engine recovers and the first poll see the templates the repos keep.
+    await refreshTemplates();
+    started = true;
+    store.bus.on('event', master.onEvent);
     await engine.start();
     await issues.start({ poll: opts.pollIssues !== false });
     upgrader.start({ timer: opts.upgradeTimer !== false });
@@ -373,6 +400,7 @@ export class Master {
   private closing: Promise<void> | undefined;
 
   private async doClose(): Promise<void> {
+    this.store.bus.off('event', this.onEvent);
     this.configWatcher.stop();
     this.upgrader.stop();
     this.logPruner.stop();
@@ -383,6 +411,7 @@ export class Master {
     const drained = this.webhook.drain();
     await this.issues.stop();
     await this.engine.stop();
+    await this.repoWorkflows.stop();
     const server = this.server;
     if (server) {
       await new Promise<void>((resolve) => {

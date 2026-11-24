@@ -16,7 +16,7 @@ import {
   scoutBackoff,
   scoutFailureStreak,
 } from '../src/config/flow.js';
-import { githubConfigKey } from '../src/config/load.js';
+import { findTemplate, githubConfigKey } from '../src/config/load.js';
 import { mergeRemoteMessage } from '../src/github/bridge.js';
 import type { GhComment, GhIssue } from '../src/github/client.js';
 import {
@@ -4528,5 +4528,108 @@ describe('issues: texts', () => {
       expect(defs.map((d) => d.name)).toEqual(Object.values(LABELS));
       for (const d of defs) expect(d.description).not.toMatch(cjk);
     });
+  });
+});
+
+describe('issues: templates the repo keeps', () => {
+  const key = 'demo:.ares1/workflows/x.yaml';
+  /** A template with id x named `name`; waits for approval before merging. */
+  const workflow = (name: string, id = 'x') => `id: ${id}
+name: ${name}
+stages:
+  - id: implement
+    name: 编码
+    kind: agent
+    agent: coder
+  - id: merge
+    name: 合并
+    kind: merge
+    gate: true
+    on_reject: implement
+`;
+  const workflowFile = (dir: string, file = 'x.yaml') => join(dir, '.ares1', 'workflows', file);
+  /** Commit `content` as the template file x.yaml on the checked-out target branch. */
+  const commitWorkflow = (dir: string, content: string) => {
+    writeFile(workflowFile(dir), content);
+    git(dir, 'add', '-A');
+    git(dir, 'commit', '-q', '-m', 'workflow');
+    return git(dir, 'rev-parse', 'HEAD');
+  };
+  /** A commit on top of the target branch writing x.yaml, as somebody pushed to GitHub. */
+  const onGitHub = (t: Harness, content: string) => {
+    const clone = tmpDir('ares1-clone-');
+    git(clone, 'clone', '-q', t.repoDir, '.');
+    writeFile(workflowFile(clone), content);
+    git(clone, 'add', '-A');
+    git(clone, '-c', 'user.email=t@example.com', '-c', 'user.name=T', 'commit', '-q', '-m', 'x');
+    git(t.repoDir, 'fetch', '-q', clone, 'HEAD');
+    return git(clone, 'rev-parse', 'HEAD');
+  };
+  const templateName = (t: Harness) => findTemplate(t.master.config, 'demo', 'x')?.template.name;
+  const ready = (title: string) =>
+    gh.add({ title, body: '写 feature.txt', labels: [LABELS.ready] });
+
+  it('creates Runs of issues with the template as committed on the target branch', async () => {
+    const t = await start(config({ template: 'x' }));
+    commitWorkflow(t.repoDir, workflow('仓库流程'));
+    // Uncommitted changes and untracked files of the checkout play no part.
+    writeFile(workflowFile(t.repoDir), workflow('没提交的改动'));
+    writeFile(workflowFile(t.repoDir, 'y.yaml'), workflow('没提交的新文件', 'y'));
+    ready('加 feature');
+    await t.master.issues.poll();
+    const [run] = t.master.store.listRuns();
+    expect(run?.templateId).toBe('x');
+    expect(run?.template).toEqual(findTemplate(t.master.config, 'demo', 'x')?.template);
+    expect(run?.template.name).toBe('仓库流程');
+    expect(gh.get(1).comments[0]).toContain('（模板「仓库流程」）');
+    expect(findTemplate(t.master.config, 'demo', 'y')).toBeNull();
+    expect(t.master.config.errors).toEqual({});
+    // Read before the round looked at the repo: nothing went wrong for want of the template.
+    expect(t.master.issues.status().lastError).toBeNull();
+  });
+
+  it('is not seen by other repos', async () => {
+    const t = await start(`${config({ template: 'x' })}    other:\n      template: x\n`);
+    commitWorkflow(t.repoDir, workflow('仓库流程'));
+    t.master.store.createRepo({
+      name: 'other',
+      path: initRepo(),
+      targetBranch: 'main',
+      verifyCommands: [],
+      setupCommands: [],
+      mergeMode: 'direct',
+    });
+    await t.master.issues.poll();
+    expect(t.master.config.errors[githubConfigKey('demo')]).toBeUndefined();
+    expect(t.master.config.errors[githubConfigKey('other')]).toEqual(['模板 x 不存在或无效']);
+  });
+
+  it('keeps the version that last loaded while the target branch has it broken', async () => {
+    const t = await start(config({ template: 'x', push: true }));
+    const good = commitWorkflow(t.repoDir, workflow('第一版'));
+    await t.master.issues.poll();
+    expect(templateName(t)).toBe('第一版');
+
+    // A human commits a broken version: the next round reads it and keeps the first.
+    commitWorkflow(t.repoDir, 'id: x\nstages: [\n');
+    ready('加 feature');
+    await t.master.issues.poll();
+    expect(templateName(t)).toBe('第一版');
+    expect(t.master.config.warnings[key]?.[0]).toContain(
+      `继续使用上次加载成功的版本（提交 ${good.slice(0, 7)}）`,
+    );
+    expect(t.master.config.errors).toEqual({});
+    expect(t.master.store.listRuns()[0]?.template.name).toBe('第一版');
+
+    // Fixed on GitHub: the round that pulls it reads it before taking issues.
+    gh.remoteHead = onGitHub(t, workflow('第二版'));
+    ready('再加一个');
+    await t.master.issues.poll();
+    expect(t.master.store.listGlobalEventsOfType('github.pulled')).toHaveLength(1);
+    expect(templateName(t)).toBe('第二版');
+    expect(t.master.config.warnings[key]).toBeUndefined();
+    const second = t.master.store.listRuns().find((r) => r.issue?.number === 2);
+    expect(second?.template.name).toBe('第二版');
+    expect(t.master.store.listGlobalEventsOfType('config.reloaded').length).toBeGreaterThan(0);
   });
 });

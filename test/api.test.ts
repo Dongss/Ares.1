@@ -17,6 +17,7 @@ import type {
   StatsView,
 } from '../src/api/types.js';
 import { SCOUT_FAILURE_NOTIFY_AFTER } from '../src/config/flow.js';
+import { findTemplate } from '../src/config/load.js';
 import { storedRunTimes } from '../src/engine/times.js';
 import { setLang } from '../src/i18n.js';
 import { type ExecFile, noticeScript } from '../src/notify/system.js';
@@ -93,6 +94,35 @@ describe('HTTP API', () => {
     expect((await call('PATCH', '/api/repos/demo', { targetBranch: 'nope' })).status).toBe(400);
     expect((await call('PATCH', '/api/repos/demo', { path: '/elsewhere' })).status).toBe(400);
     expect((await call('PATCH', '/api/repos/nope', {})).status).toBe(404);
+  });
+
+  it('reads the templates a repo keeps when it is registered, changed or deleted', async () => {
+    h = await harness();
+    const dir = initRepo();
+    const commitWorkflow = (name: string) => {
+      writeFile(
+        join(dir, '.ares1', 'workflows', 'x.yaml'),
+        TEST_WORKFLOW_YAML.replace('id: dev', 'id: x').replace('name: 测试流程', `name: ${name}`),
+      );
+      git(dir, 'add', '-A');
+      git(dir, 'commit', '-q', '-m', name);
+    };
+    commitWorkflow('主干的流程');
+    git(dir, 'checkout', '-q', '-b', 'next');
+    commitWorkflow('next 的流程');
+    git(dir, 'checkout', '-q', 'main');
+    const master = h.master;
+    const name = () => findTemplate(master.config, 'mine', 'x')?.template.name;
+
+    const created = await call('POST', '/api/repos', { name: 'mine', path: dir });
+    expect(created.status).toBe(201);
+    expect(name()).toBe('主干的流程');
+    expect(findTemplate(master.config, 'demo', 'x')).toBeNull();
+    expect((await call('PATCH', '/api/repos/mine', { targetBranch: 'next' })).status).toBe(200);
+    expect(name()).toBe('next 的流程');
+    expect((await call('DELETE', '/api/repos/mine')).status).toBe(204);
+    expect(name()).toBeUndefined();
+    expect(master.config.repoTemplates.has('mine')).toBe(false);
   });
 
   it('has no endpoint for creating runs: they only come from GitHub issues', async () => {

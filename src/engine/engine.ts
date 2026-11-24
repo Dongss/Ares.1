@@ -31,7 +31,12 @@ import {
   rateLimitDelayMs,
   recordedLimitWait,
 } from '../config/flow.js';
-import type { HomePaths, LoadedConfig } from '../config/load.js';
+import {
+  findTemplate,
+  type HomePaths,
+  type LoadedConfig,
+  repoTemplateKey,
+} from '../config/load.js';
 import {
   type AgentConfig,
   agentEffort,
@@ -663,10 +668,13 @@ export class Engine {
         t({ zh: `仓库 ${input.repo} 不存在`, en: `Repo ${input.repo} not found` }),
       );
     }
-    const template = this.cfg.templates.get(input.template);
+    // The home directory's first, else the one the repo keeps on its target branch.
+    const template = findTemplate(this.cfg, repo.name, input.template)?.template;
     if (!template) {
+      // The files that might have held it: the home directory's and this repo's own.
+      const repoFiles = repoTemplateKey(repo.name, '');
       const problems = Object.entries(this.cfg.errors)
-        .filter(([key]) => key.startsWith('workflows/'))
+        .filter(([key]) => key.startsWith('workflows/') || key.startsWith(repoFiles))
         .map(([key, errs]) => `${key}: ${errs.join(t({ zh: '；', en: '; ' }))}`);
       const why = problems.length ? problems.join(' | ') : '';
       throw new NotFoundError(
