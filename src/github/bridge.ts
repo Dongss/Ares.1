@@ -6,6 +6,7 @@ import type { AgentAdapter, AgentExecution, AgentResult } from '../adapters/type
 import type { GitHubRepoStatus, GitHubStatus } from '../api/types.js';
 import { brandName } from '../brand.js';
 import {
+  autoAcceptsL,
   isAutoAcceptable,
   issueRunOverrides,
   limitedScout,
@@ -15,6 +16,7 @@ import {
   scoutFailureStreak,
   scoutLimitWait,
   splitUnfinishedRuns,
+  templateSplits,
 } from '../config/flow.js';
 import { githubConfigKey, type HomePaths, type LoadedConfig } from '../config/load.js';
 import type { GitHubRepoConfig } from '../config/schema.js';
@@ -1818,11 +1820,15 @@ export class IssueBridge {
           ),
         );
       }
+      // A repo whose template is gone gets no Runs anyway; such a scout is told nothing splits.
+      const template = this.cfg.templates.get(cfg.template);
       const prompt = scoutPrompt({
         repoName: repo.name,
         max: scoutCfg.max_proposals,
         runs: runDigest(store, repo.id),
         issues: issueDigest(open, closed, await this.masterLogin(), notPlanned),
+        splits: template ? templateSplits(template) : false,
+        autoAcceptsL: autoAcceptsL(cfg.auto_accept),
         upgrade: this.upgradeFailureFor(repo, scout.issuesRepo),
       });
       // Read the target branch as committed, like a Run does, not whatever the main worktree has

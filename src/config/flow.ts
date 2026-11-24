@@ -85,6 +85,15 @@ export const isAutoAcceptable: AutoAcceptRule = (p, limits) => {
 };
 
 /**
+ * Whether size L proposals are accepted without a human at all (those of low risk, so whatever
+ * risk `max_risk` allows): false with `max_risk: none` or a `max_size` below L. The config warning
+ * about templates that cannot split L and the scout's prompt both go by it.
+ */
+export function autoAcceptsL(limits: AutoAcceptLimits): boolean {
+  return isAutoAcceptable({ risk: 'low', size: 'L' }, limits);
+}
+
+/**
  * Every kind of proposal (risk × size), split into those the Master accepts by itself under
  * `limits` and those left to a human. `rule` is the auto-accept rule; tests may pass another.
  */

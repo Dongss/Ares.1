@@ -4,7 +4,7 @@ import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
 import { join as joinList, type Lang, setLang, t } from '../i18n.js';
 import { defaultAgentsYaml, defaultConfigYaml, defaultSelfDevYaml } from './defaults.js';
-import { conflictTarget, failTarget, runsAgent, templateSplits } from './flow.js';
+import { autoAcceptsL, conflictTarget, failTarget, runsAgent, templateSplits } from './flow.js';
 import {
   type AgentConfig,
   type AgentEntry,
@@ -269,7 +269,6 @@ export function loadConfig(
   };
 }
 
-/** Key of a GitHub repo's problems in `errors`. */
 /**
  * Whether a repo auto-accepts size L proposals with a template that cannot split them into steps
  * (`templateSplits`), so a whole L requirement would go to one Run unseen by a human.
@@ -278,9 +277,10 @@ function wholeLAutoAccepted(
   limits: GitHubRepoConfig['auto_accept'],
   template: WorkflowTemplate,
 ): boolean {
-  return limits.max_risk !== 'none' && limits.max_size === 'L' && !templateSplits(template);
+  return autoAcceptsL(limits) && !templateSplits(template);
 }
 
+/** Key of a GitHub repo's problems in `errors`. */
 export function githubConfigKey(repoName: string): string {
   return `config.yaml#github.repos.${repoName}`;
 }

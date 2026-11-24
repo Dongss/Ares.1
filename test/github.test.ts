@@ -62,6 +62,7 @@ import {
   review,
   type Script,
   STRANGER,
+  TEST_WORKFLOW_YAML,
   tmpDir,
   waitFor,
   writeFile,
@@ -885,6 +886,41 @@ describe('issues: scout', () => {
       `- 失败消息：新版本 ${failed.slice(0, 7)} 启动后 1 分钟内退出（退出码 1），已回退到 ${from.slice(0, 7)}`,
     );
     expect(prompt).toContain('~/ares1-stable/src/a.ts(3,1): error TS1005: "," expected.');
+  });
+
+  it("tells the scout whether the repo's template splits L and whether L is auto-accepted", async () => {
+    const scoutPromptOf = async (t: Harness) => {
+      t.scripts.scout = () => ({ structured: { gaps: [], proposals: [] } });
+      const scout = await t.master.issues.startScout('demo', 'manual');
+      await scoutDone(t, scout.id);
+      return t.fake.calls.at(-1)?.prompt ?? '';
+    };
+    const planning = TEST_WORKFLOW_YAML.replace(
+      '    agent: coder\n',
+      '    agent: coder\n    planning: auto\n',
+    );
+    expect(planning).toContain('planning: auto');
+
+    // The coding stage plans and L is within auto_accept: one proposal of size L.
+    const splits = await scoutPromptOf(await start(config({ maxRisk: 'high' }), planning));
+    expect(splits).toContain('这个仓库用的模板能拆分大需求');
+    expect(splits).toContain('作为一条提案，size 标 L，不要拆成几个 issue');
+    expect(splits).toContain('风险在自动采纳范围内的 L 提案也会被自动采纳。');
+    expect(splits).not.toContain('尽量是 S 或 M');
+    await h?.close();
+
+    // No stage plans, and max_size keeps L for a human: the first step only, and L waits.
+    const whole = await scoutPromptOf(await start(config({ maxRisk: 'high', maxSize: 'M' })));
+    expect(whole).toContain('这个仓库用的模板不拆分需求');
+    expect(whole).toContain('这次只提第一步，size 尽量是 S 或 M');
+    expect(whole).toContain('L 的提案不会被自动采纳，要等人处理。');
+    expect(whole).not.toContain('size 标 L');
+    await h?.close();
+
+    // max_risk: none accepts nothing, L included.
+    const none = await scoutPromptOf(await start(config({ maxRisk: 'none' }), planning));
+    expect(none).toContain('这个仓库用的模板能拆分大需求');
+    expect(none).toContain('L 的提案不会被自动采纳，要等人处理。');
   });
 
   it('stops auto-accepting once the daily budget is spent', async () => {

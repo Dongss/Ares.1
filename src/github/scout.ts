@@ -936,6 +936,14 @@ interface ScoutPromptInput {
   runs: string;
   issues: string;
   /**
+   * Whether the repo's template splits an L requirement into steps done in one Run
+   * (`templateSplits`). Then a capability one Run finishes that way is one proposal of size L,
+   * not several issues; without it, large capabilities are split into issues as before.
+   */
+  splits: boolean;
+  /** Whether size L proposals within `max_risk` are accepted without a human (`autoAcceptsL`). */
+  autoAcceptsL: boolean;
+  /**
    * The Master's last failed upgrade, given only to the scout of the Master's own repo while no
    * upgrade has succeeded since.
    */
@@ -1028,6 +1036,69 @@ function upgradeLead(failure: UpgradeFailure | null | undefined): string {
 /** A part of a Run's time, named as the dashboard and the Run summaries name it. */
 const part = (p: RunTimePart) => runTimePartLabels()[p];
 
+/** Whether size L proposals are accepted automatically or wait for a human, as one sentence. */
+function autoAcceptLNote(autoAcceptsL: boolean): string {
+  return autoAcceptsL
+    ? t({
+        zh: '风险在自动采纳范围内的 L 提案也会被自动采纳。',
+        en: 'Proposals of size L are accepted automatically too when their risk is within what auto-accept takes.',
+      })
+    : t({
+        zh: 'L 的提案不会被自动采纳，要等人处理。',
+        en: 'Proposals of size L are not accepted automatically: they wait for a human.',
+      });
+}
+
+/** What makes a step of a large capability worth an issue of its own. */
+function stepRule(): string {
+  return t({
+    zh: '每一步都能单独合并，合并后系统照常可用，并且实际推进了这个能力，不能只是空壳（比如只加了配置项、类型或接口，却没有实际行为）。',
+    en: 'Each step must be mergeable on its own, leave the system working as usual once merged, and actually advance the capability, not be an empty shell (for example a config option, a type or an interface without any real behavior).',
+  });
+}
+
+/**
+ * The start of the section on splitting a large capability: whether the repo's template splits
+ * an L requirement in one Run, whether L is accepted automatically, and when to split a capability
+ * into several issues. A template that splits finishes in one Run what would otherwise take
+ * several issues, each with its own assessment, review, merge and upgrade, so a capability is
+ * split into issues only when one Run cannot finish it or its first steps are worth merging alone.
+ */
+function splitIntro(input: ScoutPromptInput): string {
+  const note = autoAcceptLNote(input.autoAcceptsL);
+  if (input.splits) {
+    return t({
+      zh: `这个仓库用的模板能拆分大需求：size 为 L 的需求，在编码阶段会先拆成几步，再一步一步做、一步一步检查，一个 Run 就能做完。${note}
+- 一个能力一个 Run 拆成几步能做完的，作为一条提案，size 标 L，不要拆成几个 issue：每多一个 issue，就多一轮评估、评审、合并和升级。
+- 只有一个 Run 拆了也做不完，或者前面几步单独合并就有价值时，才把它拆成有先后的几个 issue。${stepRule()}这次只提第一步，第一步也可以是 L。`,
+      en: `The template this repo uses can split large requirements: a requirement of size L is first split into steps in the coding stage, then done and checked step by step, all in one Run. ${note}
+- When one Run can finish a capability by splitting it into steps, make it one proposal of size L; do not split it into several issues: every extra issue costs another round of assessment, review, merge and upgrade.
+- Only when one Run cannot finish it even split up, or when its first steps are worth merging on their own, split it into several issues in order. ${stepRule()} Propose only the first step now; it may be of size L too.`,
+    });
+  }
+  return t({
+    zh: `这个仓库用的模板不拆分需求：每条需求都整个交给一个 Run 一次做完。${note}
+一个能力一个 Run 做不完时，把它拆成有先后的几步。${stepRule()}
+- 这次只提第一步，size 尽量是 S 或 M。`,
+    en: `The template this repo uses does not split requirements: each one goes to one Run as a whole, done in one go. ${note}
+When a capability is too much for one Run, split it into steps in order. ${stepRule()}
+- Propose only the first step now, preferably of size S or M.`,
+  });
+}
+
+/** The requirement on how large a proposal is, by whether the repo's template splits. */
+function sizeRequirement(splits: boolean): string {
+  return splits
+    ? t({
+        zh: '每条要能独立完成、独立合并，一个 Run 能做完。一个 Run 拆成几步能做完的能力，作为一条提案、size 标 L，不要拆成几个 issue；什么时候才拆成几个 issue，见上面「拆一个大能力」。',
+        en: 'Each proposal must be doable and mergeable on its own, within one Run. A capability one Run can finish by splitting it into steps is one proposal of size L, not several issues; when to split it into issues anyway is described in "Splitting a large capability".',
+      })
+    : t({
+        zh: '每条要能独立完成、独立合并，一个 Run 能做完。太大的按上面「拆一个大能力」的做法拆开，只提第一步；那样也拆不开的，才把 size 标为 L。',
+        en: 'Each proposal must be doable and mergeable on its own, within one Run. Split anything too large as described in "Splitting a large capability" and propose only its first step; only if it cannot be split even that way, set its size to L.',
+      });
+}
+
 const scoutPromptZh = (input: ScoutPromptInput) =>
   `你是${brandName()}的「侦察」：为仓库 ${input.repoName} 找出接下来最值得做的事，写成需求提案。提案会成为 GitHub issue，被采纳后由 Agent 按「编码 → 评审 → 合并」完成。你只能读代码和文档，不能修改任何文件。
 
@@ -1053,8 +1124,7 @@ const scoutPromptZh = (input: ScoutPromptInput) =>
 - 第 4 类每次最多一条。
 
 ## 拆一个大能力
-一个能力一个 Run 做不完时，把它拆成有先后的几步。每一步都能单独合并，合并后系统照常可用，并且实际推进了这个能力，不能只是空壳（比如只加了配置项、类型或接口，却没有实际行为）。
-- 这次只提第一步，size 尽量是 S 或 M。
+${splitIntro(input)}
 - what 的末尾单独起一行写「后续步骤：」（不要写成标题），下面按顺序列出剩下的几步，每步一句话，以后的侦察从这里接着往下提。
 - 下面已有的 issue 里，列着「后续步骤」、而且已完成（前一步已经合并）的，优先考虑提它的下一步：在 why 里写明接着哪条 issue，what 末尾的「后续步骤」只列还剩下的步骤。已经拆好、列着「后续步骤」但还没关闭的 issue，说明这一步正在做、还没合并，不要提它后面的步骤。
 - 这和还在等人采纳的大 issue 不同：已有的 issue 覆盖的能力太大、没有拆过、一直没人做的（比如还在等人采纳的大提案），可以提它能独立合并的第一步，在 why 里注明对应哪条 issue，这不算重复。
@@ -1064,7 +1134,7 @@ const scoutPromptZh = (input: ScoutPromptInput) =>
 - 每条都要有能核对的证据：Run id、文件:行号、README 或 AGENTS.md 中的段落。补能力的提案不需要有出错的 Run：README.md 里的目标加上限制这个能力的代码位置就是证据。拿不出证据的不要提。
 - 不要和下面已有的 issue 重复，包括已关闭的。被关闭为「不做」的 issue 是反例，注意其中的理由，不要换个说法再提。
 - 「多次失败后关闭」的 issue 不一样：它不是人拒绝的，而是 Run 尝试了几次都失败了，需求本身可能仍然需要。可以根据其中的失败原因换个思路重新提案（比如拆小、先补上缺的能力、换一种做法），在 why 里说明和上次的不同；不要原样再提。
-- 每条要能独立完成、独立合并，一个 Run 能做完。太大的按上面「拆一个大能力」的做法拆开，只提第一步；那样也拆不开的，才把 size 标为 L。
+- ${sizeRequirement(input.splits)}
 - risk 的含义：
   - low：只涉及文档、测试、看板展示，或不改变行为的重构；
   - mid：改变行为，但影响范围清楚；
@@ -1103,8 +1173,7 @@ Before proposing anything, list the goals README.md states, in its own words (on
 - At most one proposal from lead 4 per scout.
 
 ## Splitting a large capability
-When a capability is too much for one Run, split it into steps in order. Each step must be mergeable on its own, leave the system working as usual once merged, and actually advance the capability, not be an empty shell (for example a config option, a type or an interface without any real behavior).
-- Propose only the first step now, preferably of size S or M.
+${splitIntro(input)}
 - End what with a line of its own reading "Next steps:" (not a heading), followed by the remaining steps in order, one sentence each, for later scouts to go on from.
 - Among the existing issues below, when an issue lists "Next steps" and is done (its step was merged), consider its next step first: say in why which issue it follows, and list only the steps still left under "Next steps" at the end of what. An issue already split up, listing "Next steps" and still open, has its step in progress and not merged yet: do not propose the steps after it.
 - A large issue still waiting for a human is different: when an existing issue covers a capability too large to have been taken up, was never split, and nobody has worked on it (such as a large proposal still waiting for a human), you may propose a first step of it that can be merged on its own, saying in why which issue it belongs to; that is not a duplicate.
@@ -1114,7 +1183,7 @@ When a capability is too much for one Run, split it into steps in order. Each st
 - Every proposal needs verifiable evidence: Run ids, file:line, passages of README or AGENTS.md. A proposal that adds a capability needs no failed Run: a goal in README.md together with where the code limits the capability is evidence. Do not propose anything you cannot back with evidence.
 - Do not duplicate the existing issues below, including closed ones. Issues closed as not planned are counterexamples: note their reasons and do not propose them again in other words.
 - Issues "closed after repeated failures" are different: no human rejected them; their Runs failed attempt after attempt, and the requirement may well still be wanted. You may propose them again with another approach based on the failures (e.g. split them up, first add a missing capability, do it another way), saying in why what is different this time; do not propose them again as they were.
-- Each proposal must be doable and mergeable on its own, within one Run. Split anything too large as described in "Splitting a large capability" and propose only its first step; only if it cannot be split even that way, set its size to L.
+- ${sizeRequirement(input.splits)}
 - What risk means:
   - low: only documentation, tests, how the dashboard shows things, or refactoring without behavior change;
   - mid: changes behavior, with a clear scope;

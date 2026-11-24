@@ -11,7 +11,7 @@ import {
   RETRIES_EXHAUSTED_MARKER,
 } from '../src/github/issues.js';
 import { issueDigest, nextSteps, runDigest, scoutPrompt } from '../src/github/scout.js';
-import { setLang } from '../src/i18n.js';
+import { setLang, t } from '../src/i18n.js';
 import type { Run, RunStatus } from '../src/store/types.js';
 import type { UpgradeFailure } from '../src/upgrade/upgrader.js';
 import {
@@ -1035,6 +1035,8 @@ describe('scoutPrompt', () => {
     max: 3,
     runs: '（还没有 Run）',
     issues: '（无）',
+    splits: false,
+    autoAcceptsL: false,
   });
 
   it('introduces the project by its display name, not the technical one', () => {
@@ -1161,6 +1163,110 @@ describe('scoutPrompt', () => {
   });
 });
 
+describe('scoutPrompt: whether the template splits and L is accepted automatically', () => {
+  afterEach(() => setLang('zh'));
+
+  const prompt = (splits: boolean, autoAcceptsL: boolean) =>
+    scoutPrompt({ repoName: 'demo', max: 3, runs: '', issues: '', splits, autoAcceptsL });
+  const split = (text: string) =>
+    section(text, t({ zh: '## 拆一个大能力', en: '## Splitting a large capability' }));
+  const requirements = (text: string) => section(text, t({ zh: '## 要求', en: '## Requirements' }));
+
+  it('asks for one proposal of size L for what one Run finishes split up, when the template splits', () => {
+    const text = prompt(true, true);
+    expect(split(text)).toContain(
+      '这个仓库用的模板能拆分大需求：size 为 L 的需求，在编码阶段会先拆成几步，再一步一步做、一步一步检查，一个 Run 就能做完。',
+    );
+    expect(split(text)).toContain(
+      '一个能力一个 Run 拆成几步能做完的，作为一条提案，size 标 L，不要拆成几个 issue',
+    );
+    expect(split(text)).toContain(
+      '只有一个 Run 拆了也做不完，或者前面几步单独合并就有价值时，才把它拆成有先后的几个 issue',
+    );
+    expect(split(text)).toContain('每一步都能单独合并，合并后系统照常可用');
+    expect(split(text)).toContain('这次只提第一步，第一步也可以是 L');
+    expect(text).not.toContain('尽量是 S 或 M');
+    expect(text).not.toContain('那样也拆不开的，才把 size 标为 L');
+    expect(requirements(text)).toContain(
+      '一个 Run 拆成几步能做完的能力，作为一条提案、size 标 L，不要拆成几个 issue',
+    );
+    // The steps of split issues stay as they were.
+    expect(split(text)).toContain('what 的末尾单独起一行写「后续步骤：」');
+    expect(split(text)).toContain(
+      '已经拆好、列着「后续步骤」但还没关闭的 issue，说明这一步正在做、还没合并，不要提它后面的步骤',
+    );
+    expect(split(text)).toContain('这和还在等人采纳的大 issue 不同');
+  });
+
+  it('keeps proposing only a first step of S or M when the template does not split', () => {
+    const text = prompt(false, true);
+    expect(split(text)).toContain(
+      '这个仓库用的模板不拆分需求：每条需求都整个交给一个 Run 一次做完。',
+    );
+    expect(split(text)).toContain('一个能力一个 Run 做不完时，把它拆成有先后的几步');
+    expect(split(text)).toContain('这次只提第一步，size 尽量是 S 或 M');
+    expect(requirements(text)).toContain(
+      '太大的按上面「拆一个大能力」的做法拆开，只提第一步；那样也拆不开的，才把 size 标为 L',
+    );
+    expect(text).not.toContain('能拆分大需求');
+    expect(text).not.toContain('size 标 L');
+    expect(split(text)).toContain('what 的末尾单独起一行写「后续步骤：」');
+  });
+
+  it('says whether L is accepted automatically, apart from whether the template splits', () => {
+    const accepted = '风险在自动采纳范围内的 L 提案也会被自动采纳。';
+    const waits = 'L 的提案不会被自动采纳，要等人处理。';
+    for (const splits of [true, false]) {
+      expect(split(prompt(splits, true))).toContain(accepted);
+      expect(split(prompt(splits, true))).not.toContain(waits);
+      expect(split(prompt(splits, false))).toContain(waits);
+      expect(split(prompt(splits, false))).not.toContain(accepted);
+      // Only that sentence differs.
+      expect(prompt(splits, false).replace(waits, accepted)).toBe(prompt(splits, true));
+    }
+  });
+
+  it('says it all in English too, with no Chinese left', () => {
+    setLang('en');
+    for (const autoAcceptsL of [true, false]) {
+      for (const splits of [true, false]) {
+        expect(prompt(splits, autoAcceptsL)).not.toMatch(/[一-鿿]/);
+      }
+    }
+    const splitting = prompt(true, true);
+    expect(split(splitting)).toContain(
+      'The template this repo uses can split large requirements: a requirement of size L is first split into steps in the coding stage, then done and checked step by step, all in one Run.',
+    );
+    expect(split(splitting)).toContain(
+      'When one Run can finish a capability by splitting it into steps, make it one proposal of size L; do not split it into several issues',
+    );
+    expect(split(splitting)).toContain(
+      'Only when one Run cannot finish it even split up, or when its first steps are worth merging on their own, split it into several issues in order.',
+    );
+    expect(split(splitting)).toContain('Propose only the first step now; it may be of size L too.');
+    expect(split(splitting)).toContain(
+      'Proposals of size L are accepted automatically too when their risk is within what auto-accept takes.',
+    );
+    expect(splitting).not.toContain('preferably of size S or M');
+    expect(requirements(splitting)).toContain(
+      'A capability one Run can finish by splitting it into steps is one proposal of size L, not several issues',
+    );
+
+    const whole = prompt(false, false);
+    expect(split(whole)).toContain(
+      'The template this repo uses does not split requirements: each one goes to one Run as a whole, done in one go.',
+    );
+    expect(split(whole)).toContain('Propose only the first step now, preferably of size S or M.');
+    expect(split(whole)).toContain(
+      'Proposals of size L are not accepted automatically: they wait for a human.',
+    );
+    expect(whole).not.toContain('one proposal of size L');
+    expect(requirements(whole)).toContain(
+      'only if it cannot be split even that way, set its size to L',
+    );
+  });
+});
+
 describe('scoutPrompt: failed upgrade of the Master', () => {
   afterEach(() => setLang('zh'));
 
@@ -1172,7 +1278,15 @@ describe('scoutPrompt: failed upgrade of the Master', () => {
     at: '2026-11-20T08:00:00.000Z',
   });
   const prompt = (upgrade?: UpgradeFailure | null) =>
-    scoutPrompt({ repoName: 'demo', max: 3, runs: '（还没有 Run）', issues: '（无）', upgrade });
+    scoutPrompt({
+      repoName: 'demo',
+      max: 3,
+      runs: '（还没有 Run）',
+      issues: '（无）',
+      splits: true,
+      autoAcceptsL: true,
+      upgrade,
+    });
 
   it('leaves the prompt as it was without a failed upgrade', () => {
     expect(prompt(null)).toBe(prompt());
@@ -1214,6 +1328,8 @@ describe('scoutPrompt: failed upgrade of the Master', () => {
       max: 3,
       runs: '(no Runs yet)',
       issues: '',
+      splits: true,
+      autoAcceptsL: true,
       upgrade: {
         ...failure('npm ERR! code ELIFECYCLE'),
         message: 'Pulling or building bbbbbbb failed; rolled back to aaaaaaa',
@@ -1273,6 +1389,8 @@ describe('scoutPrompt: failed upgrade of the Master', () => {
         max: 3,
         runs: '(no Runs yet)',
         issues: '',
+        splits: true,
+        autoAcceptsL: true,
         upgrade: {
           ...failure('node: command not found'),
           message: 'Building bbbbbbb found no usable node or npm; rolled back to aaaaaaa',
@@ -1315,7 +1433,14 @@ describe('scout in English', () => {
 
   it('asks in English for proposals written in English, serving the README goals', () => {
     setLang('en');
-    const prompt = scoutPrompt({ repoName: 'demo', max: 3, runs: '(no Runs yet)', issues: '' });
+    const prompt = scoutPrompt({
+      repoName: 'demo',
+      max: 3,
+      runs: '(no Runs yet)',
+      issues: '',
+      splits: true,
+      autoAcceptsL: true,
+    });
     expect(prompt.startsWith('You are the scout of Ares.1: ')).toBe(true);
     expect(prompt).not.toMatch(/[\u4e00-\u9fff]/);
     expect(prompt).toContain('Proposals must serve the goals in README.md');
@@ -1337,10 +1462,11 @@ describe('scout in English', () => {
 
   it('has the gap analysis, the leads, the mix and the next steps in English too', () => {
     setLang('en');
-    const prompt = scoutPrompt({ repoName: 'demo', max: 3, runs: '(no Runs yet)', issues: '' });
+    const input = { repoName: 'demo', max: 3, splits: false, autoAcceptsL: false };
+    const prompt = scoutPrompt({ ...input, runs: '(no Runs yet)', issues: '' });
     const zh = (() => {
       setLang('zh');
-      const text = scoutPrompt({ repoName: 'demo', max: 3, runs: '', issues: '' });
+      const text = scoutPrompt({ ...input, runs: '', issues: '' });
       setLang('en');
       return text;
     })();
