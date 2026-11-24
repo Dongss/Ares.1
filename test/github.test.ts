@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -2830,6 +2830,212 @@ stages:
     expect(diverged).toHaveLength(1);
     expect(diverged[0]?.data.runId).toBeUndefined();
     expect(diverged[0] && noticeFor(diverged[0], undefined)?.body).toContain('手动合并');
+  });
+
+  describe('end to end: the Run a divergence is handed to merges it, then the push goes through', () => {
+    /** MERGE_HEAD of the worktree; null when no merge is in progress. */
+    const mergeHead = (dir: string): string | null =>
+      spawnSync('git', ['rev-parse', '-q', '--verify', 'MERGE_HEAD'], {
+        cwd: dir,
+        encoding: 'utf8',
+      }).stdout.trim() || null;
+    /** Whether `commit` is in the history of the local target branch. */
+    const inMain = (t: Harness, commit: string) =>
+      spawnSync('git', ['merge-base', '--is-ancestor', commit, 'main'], { cwd: t.repoDir })
+        .status === 0;
+    const parents = (t: Harness, commit: string) =>
+      git(t.repoDir, 'rev-list', '--parents', '-n', '1', commit).split(' ').slice(1);
+    /** The Run the Master created to merge GitHub's commit `remote`. */
+    const mergingRun = (t: Harness, remote: string): Run => {
+      const run = t.master.store.listRuns().find((r) => r.mergeRemote === remote);
+      if (!run) throw new Error('no Run to merge the commit');
+      return run;
+    };
+    /** The commit of the Run's coding task. */
+    const codingCommit = (t: Harness, run: Run): string => {
+      const task = t.master.store.listRunTasks(run.id).find((x) => x.title === '编码');
+      if (!task?.commitSha) throw new Error('no coding commit');
+      return task.commitSha;
+    };
+
+    it.each([
+      ['without', TEST_WORKFLOW_YAML],
+      ['with', ASSESS_WORKFLOW_YAML],
+    ])(
+      'conflicts (%s a requirement assessment): the agent keeps both sides, and the round after the merge pushes it',
+      async (assessed, workflow) => {
+        const t = await start(config({ push: true, autoMerge: true }), workflow);
+        // Pass once README.md keeps both sides; conflict markers left are the engine's to catch.
+        t.master.store.updateRepo(t.repo.id, {
+          verifyCommands: ['grep -q ours README.md', 'grep -q theirs README.md'],
+        });
+        const assessing: (string | null)[] = [];
+        t.scripts.assessor = (ctx) => {
+          assessing.push(mergeHead(ctx.input.workdir));
+          return assessment('go');
+        };
+        const seen: { head: string | null; readme: string }[] = [];
+        t.scripts.coder = (ctx) => {
+          const dir = ctx.input.workdir;
+          seen.push({ head: mergeHead(dir), readme: readFileSync(join(dir, 'README.md'), 'utf8') });
+          writeFile(join(dir, 'README.md'), '# ours\n# theirs\n');
+          return done('两边的改动都保留了');
+        };
+        const { local, remote } = conflicting(t, head(t));
+        gh.remoteHead = remote;
+        await t.master.issues.poll();
+        const run = mergingRun(t, remote);
+        expect(t.master.store.listRuns()).toHaveLength(1);
+        expect(events(t, 'github.diverged').map((e) => e.data.runId)).toEqual([run.id]);
+        await t.waitStatus(run.id, 'completed');
+
+        // The assessment, read-only, came before the merge: the coding stage started it.
+        expect(assessing).toEqual(assessed === 'with' ? [null] : []);
+        // The coding agent found GitHub's commit being merged, the conflict left in the file.
+        expect(seen).toHaveLength(1);
+        expect(seen[0]?.head).toBe(remote);
+        expect(seen[0]?.readme).toMatch(/^<<<<<<< /m);
+        expect(seen[0]?.readme).toMatch(/^>>>>>>> /m);
+        // Its commit is the merge, and the target branch has both sides now.
+        expect(parents(t, codingCommit(t, run))).toEqual([local, remote]);
+        const merged = head(t);
+        expect(inMain(t, local)).toBe(true);
+        expect(inMain(t, remote)).toBe(true);
+        expect(readFileSync(join(t.repoDir, 'README.md'), 'utf8')).toBe('# ours\n# theirs\n');
+        expect(git(t.repoDir, 'status', '--porcelain')).toBe('');
+        // Nothing went to GitHub meanwhile.
+        expect(gh.calls).not.toContain('push main');
+
+        // The next round finds the target branch ahead of GitHub's and pushes it.
+        await t.master.issues.poll();
+        expect(events(t, 'github.diverged')).toHaveLength(1);
+        expect(events(t, 'github.diverged_run')).toHaveLength(1);
+        expect(events(t, 'github.merged_remote')).toHaveLength(0);
+        expect(t.master.store.listRuns().map((r) => r.id)).toEqual([run.id]);
+        expect(events(t, 'github.pushed').map((e) => e.data)).toEqual([
+          { repo: 'demo', branch: 'main', head: merged },
+        ]);
+        expect(gh.pushes).toEqual([merged]);
+        expect(gh.remoteHead).toBe(merged);
+        expect(head(t)).toBe(merged);
+        expect(t.master.issues.status().lastError).toBeNull();
+        expect(events(t, 'github.error')).toHaveLength(0);
+
+        // And the one after has nothing left to do.
+        await t.master.issues.poll();
+        expect(gh.pushes).toEqual([merged]);
+        expect(events(t, 'github.diverged')).toHaveLength(1);
+        expect(t.master.store.listRuns()).toHaveLength(1);
+        expect(extraWorktrees(t).filter((w) => w.includes('ares1-merge-'))).toEqual([]);
+      },
+    );
+
+    it('checks fail without conflicts: the agent fixes them, and the push follows the approval', async () => {
+      const t = await start(config({ push: true }));
+      // Neither side has feature.txt: the Master's merge goes through but fails the checks.
+      t.master.store.updateRepo(t.repo.id, { verifyCommands: ['grep -q ok feature.txt'] });
+      const heads: (string | null)[] = [];
+      t.scripts.coder = (ctx) => {
+        heads.push(mergeHead(ctx.input.workdir));
+        writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+        return done('修好了检查');
+      };
+      const remote = pushedByOthers(t, head(t));
+      gh.remoteHead = remote;
+      const local = commitLocally(t);
+      await t.master.issues.poll();
+      const run = mergingRun(t, remote);
+      expect(events(t, 'github.diverged').map((e) => e.data)).toEqual([
+        expect.objectContaining({
+          failed: expect.objectContaining({ command: 'grep -q ok feature.txt' }),
+          runId: run.id,
+        }),
+      ]);
+
+      // While it waits for the approval to merge, the two stay diverged: nothing is pushed.
+      await t.waitStatus(run.id, 'waiting_approval');
+      await t.master.issues.poll();
+      expect(gh.calls).not.toContain('push main');
+      expect(events(t, 'github.diverged')).toHaveLength(1);
+      expect(head(t)).toBe(local);
+
+      t.master.engine.approve(run.id);
+      await t.waitStatus(run.id, 'completed');
+      // GitHub's commit was being merged, without conflicts, when the agent started.
+      expect(heads).toEqual([remote]);
+      expect(parents(t, codingCommit(t, run))).toEqual([local, remote]);
+      const merged = head(t);
+      expect(inMain(t, remote)).toBe(true);
+      for (const file of ['ours.txt', 'theirs.txt', 'feature.txt']) {
+        expect(existsSync(join(t.repoDir, file))).toBe(true);
+      }
+
+      await t.master.issues.poll();
+      expect(events(t, 'github.diverged')).toHaveLength(1);
+      expect(events(t, 'github.merged_remote')).toHaveLength(0);
+      expect(t.master.store.listRuns()).toHaveLength(1);
+      expect(events(t, 'github.pushed').map((e) => e.data.head)).toEqual([merged]);
+      expect(gh.pushes).toEqual([merged]);
+      expect(gh.remoteHead).toBe(merged);
+    });
+
+    it('closes the issue of a Run completed meanwhile once the merge is pushed', async () => {
+      const t = await start(config({ push: true }));
+      t.master.store.updateRepo(t.repo.id, { verifyCommands: ['grep -q ours README.md'] });
+      // The Run of the issue writes feature.txt; the one merging GitHub's commit keeps both sides.
+      t.scripts.coder = (ctx) => {
+        const dir = ctx.input.workdir;
+        if (mergeHead(dir)) writeFile(join(dir, 'README.md'), '# ours\n# theirs\n');
+        else writeFile(join(dir, 'feature.txt'), 'ok\n');
+        return done();
+      };
+      const { local, remote } = conflicting(t, head(t));
+      gh.remoteHead = remote;
+      gh.add({ title: '加 feature', labels: [LABELS.ready] });
+      await t.master.issues.poll();
+      const merging = mergingRun(t, remote);
+      const run = t.master.store.listRuns().find((r) => r.issue);
+      if (!run) throw new Error('no Run of the issue');
+      await t.waitStatus(merging.id, 'waiting_approval');
+      await t.waitStatus(run.id, 'waiting_approval');
+
+      // The Run of the issue is merged first: the issue stays open while the two diverge.
+      t.master.engine.approve(run.id);
+      await t.waitStatus(run.id, 'completed');
+      const local2 = head(t);
+      expect(parents(t, local2)).toContain(local);
+      await t.master.issues.sync();
+      expect(gh.get(1).state).toBe('open');
+      expect(gh.calls).not.toContain('push main');
+      // The target branch moved: the merge is tried again and stays with the same Run.
+      await t.master.issues.poll();
+      expect(gh.get(1).state).toBe('open');
+      expect(events(t, 'github.diverged').at(-1)?.data).toMatchObject({
+        local: local2,
+        remote,
+        runId: merging.id,
+        repeated: true,
+      });
+      expect(t.master.store.listRuns()).toHaveLength(2);
+      expect(gh.calls).not.toContain('push main');
+
+      // Then the one merging GitHub's commit, on top of it.
+      t.master.engine.approve(merging.id);
+      await t.waitStatus(merging.id, 'completed');
+      const merged = head(t);
+      for (const commit of [local, local2, remote]) expect(inMain(t, commit)).toBe(true);
+      expect(readFileSync(join(t.repoDir, 'README.md'), 'utf8')).toBe('# ours\n# theirs\n');
+      expect(readFileSync(join(t.repoDir, 'feature.txt'), 'utf8')).toBe('ok\n');
+
+      await t.master.issues.poll();
+      expect(gh.pushes).toEqual([merged]);
+      expect(gh.remoteHead).toBe(merged);
+      expect(events(t, 'github.diverged')).toHaveLength(2);
+      expect(events(t, 'github.merged_remote')).toHaveLength(0);
+      expect(t.master.store.listRuns()).toHaveLength(2);
+      expect(gh.get(1).state).toBe('closed');
+      expect(gh.get(1).comments.at(-1)).toContain('并推送到 GitHub');
+    });
   });
 });
 
