@@ -6,6 +6,7 @@ import {
   runRawLogsExpired,
 } from '../../../src/config/flow.js';
 import {
+  assessedSize,
   conclusionLabel,
   conclusionOf,
   formatAssessment,
@@ -236,8 +237,19 @@ export function assessmentHeadline(
 }
 
 /**
- * 「规模 L」 and what the size means, shown beside the assessment's conclusion; null when the
- * round gave no size (left out, or recorded before assessments gave sizes).
+ * The requirement's size the Run detail shows beside the assessment: the one stages planning by
+ * size go by (`assessedSize`, the latest go round's), so the page tells why a round was split or
+ * not. Undefined when the assessment concluded drop, even if that round gave a size: nothing is
+ * planned for a dropped requirement.
+ */
+export function assessmentSize(run: Pick<Run, 'discussion'>): RequirementSize | undefined {
+  if (conclusionOf(run.discussion)?.verdict === 'drop') return undefined;
+  return assessedSize(run.discussion);
+}
+
+/**
+ * 「规模 L」 and what the size means, shown beside the assessment's conclusion; null without a
+ * size (`assessmentSize`).
  */
 export function sizeText(
   size: RequirementSize | undefined,

@@ -52,21 +52,23 @@ export function autoPlanText(
 ): string | null {
   if (def.kind !== 'agent' || def.planning !== 'auto') return null;
   const size = assessedSize(discussion.filter((e) => e.at <= startedAt));
+  // A neutral opening: the text says whether the round was split only after it, so that it is not
+  // read as split at first glance.
   if (plansStage(def, size)) {
     return t({
-      zh: `按需求规模拆分：需求评估给出的规模是 ${size}，这一轮先拆分任务，再一步一步做。`,
-      en: `Split by the requirement's size: the assessment sized it ${size}, so this round is planned first and done step by step.`,
+      zh: `按需求规模决定是否拆分：需求评估给出的规模是 ${size}，这一轮先拆分任务，再一步一步做。`,
+      en: `By the requirement's size: the assessment sized it ${size}, so this round is planned first and done step by step.`,
     });
   }
   if (size) {
     return t({
-      zh: `按需求规模拆分：需求评估给出的规模是 ${size}，只有 L 才拆分，这一轮整个阶段一次做完。`,
-      en: `Split by the requirement's size: the assessment sized it ${size}, and only an L is split, so this round does the whole stage in one go.`,
+      zh: `按需求规模决定是否拆分：需求评估给出的规模是 ${size}，只有 L 才拆分，这一轮整个阶段一次做完。`,
+      en: `By the requirement's size: the assessment sized it ${size}, and only an L is split, so this round does the whole stage in one go.`,
     });
   }
   return t({
-    zh: '按需求规模拆分：没有需求评估给出的规模，这一轮不拆分，整个阶段一次做完。',
-    en: "Split by the requirement's size: no assessment gave a size, so this round is not split and does the whole stage in one go.",
+    zh: '按需求规模决定是否拆分：没有需求评估给出的规模，这一轮不拆分，整个阶段一次做完。',
+    en: "By the requirement's size: no assessment gave a size, so this round is not split and does the whole stage in one go.",
   });
 }
 

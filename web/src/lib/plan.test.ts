@@ -96,16 +96,16 @@ describe('autoPlanText', () => {
 
   it('says the round was split for a requirement sized L', () => {
     expect(autoPlanText(auto, [assessed('go', 'L')], at(2))).toBe(
-      '按需求规模拆分：需求评估给出的规模是 L，这一轮先拆分任务，再一步一步做。',
+      '按需求规模决定是否拆分：需求评估给出的规模是 L，这一轮先拆分任务，再一步一步做。',
     );
   });
 
   it('says the round was done in one go for S, M or no size', () => {
     expect(autoPlanText(auto, [assessed('go', 'M')], at(2))).toBe(
-      '按需求规模拆分：需求评估给出的规模是 M，只有 L 才拆分，这一轮整个阶段一次做完。',
+      '按需求规模决定是否拆分：需求评估给出的规模是 M，只有 L 才拆分，这一轮整个阶段一次做完。',
     );
     expect(autoPlanText(auto, [assessed('go', 'S')], at(2))).toContain('规模是 S');
-    const none = '按需求规模拆分：没有需求评估给出的规模，这一轮不拆分，整个阶段一次做完。';
+    const none = '按需求规模决定是否拆分：没有需求评估给出的规模，这一轮不拆分，整个阶段一次做完。';
     expect(autoPlanText(auto, [assessed('go', undefined)], at(2))).toBe(none);
     // Without an assessment, or with only one that did not go ahead.
     expect(autoPlanText(auto, [], at(2))).toBe(none);
@@ -161,10 +161,14 @@ describe('in English', () => {
       autoPlanText(auto, [go()], started),
     ];
     expect(texts).toEqual([
-      "Split by the requirement's size: the assessment sized it L, so this round is planned first and done step by step.",
-      "Split by the requirement's size: the assessment sized it M, and only an L is split, so this round does the whole stage in one go.",
-      "Split by the requirement's size: no assessment gave a size, so this round is not split and does the whole stage in one go.",
+      "By the requirement's size: the assessment sized it L, so this round is planned first and done step by step.",
+      "By the requirement's size: the assessment sized it M, and only an L is split, so this round does the whole stage in one go.",
+      "By the requirement's size: no assessment gave a size, so this round is not split and does the whole stage in one go.",
     ]);
-    for (const text of texts) expect(text).not.toMatch(/\p{Script=Han}/u);
+    for (const text of texts) {
+      expect(text).not.toMatch(/\p{Script=Han}/u);
+      // A neutral opening, whether the round was split or not.
+      expect(text).not.toMatch(/^Split by/);
+    }
   });
 });

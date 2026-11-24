@@ -1,10 +1,10 @@
 // How a workflow template flows: effective stage settings, budgets, verify commands, rollback
-// targets and which stage rounds are split into tasks; also the overrides of Runs from issues, which proposals are accepted automatically, how
-// long the automatic scout backs off and which Runs it waits for, after how many failed scouts in
-// a row a human is notified, how long a failed Run of an issue waits before it is redone, how long
-// a Run or a scout waits for an agent that is out of quota or rate-limited, how long the raw
-// output of agents is kept, and which worktrees of failed or cancelled Runs of issues are left
-// over for the Master to remove.
+// targets and which stage rounds are split into tasks; also the overrides of Runs from issues,
+// which proposals are accepted automatically, how long the automatic scout backs off and which
+// Runs it waits for, after how many failed scouts in a row a human is notified, how long a failed
+// Run of an issue waits before it is redone, how long a Run or a scout waits for an agent that is
+// out of quota or rate-limited, how long the raw output of agents is kept, and which worktrees of
+// failed or cancelled Runs of issues are left over for the Master to remove.
 // Pure logic (type imports, src/i18n.ts, src/store/types.ts and src/engine/discussion.ts only),
 // so the dashboard shows the same rules the engine applies.
 

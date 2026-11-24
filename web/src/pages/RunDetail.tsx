@@ -45,6 +45,7 @@ import { useAction, useReloadOn, useResource, useTick } from '../lib/hooks.js';
 import { autoPlanText, roundTasks, stepLabel, stepsDoneText, taskTitle } from '../lib/plan.js';
 import {
   assessmentHeadline,
+  assessmentSize,
   canCleanUpWorkspace,
   discussionItems,
   eventText,
@@ -655,7 +656,7 @@ function AssessmentCard({ detail }: { detail: RunDetail }) {
   const headline = assessmentHeadline(run);
   if (!headline) return null;
   const { conclusion } = headline;
-  const size = sizeText(conclusion?.size);
+  const size = sizeText(assessmentSize(run));
   const items = discussionItems(run.discussion);
   return (
     <section className="card assessment">

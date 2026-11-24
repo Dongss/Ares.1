@@ -90,7 +90,8 @@ export interface RunDetail {
   /**
    * The Run is queued because its agent was out of quota or rate-limited, and goes on at
    * `retryAt` (ISO; then also waiting for room if `concurrency.per_repo` other Runs of the repo
-   * execute). null when it is not waiting for a quota. The wait holds across a Master restart.
+   * execute). null when it is not waiting for a quota. The wait holds across a Master restart:
+   * the new Master restores it from the Run's recorded `task.rate_limited` event.
    */
   rateLimited: RateLimitedWait | null;
   /**

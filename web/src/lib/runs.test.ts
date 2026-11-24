@@ -4,6 +4,7 @@ import { setLang } from '../../../src/i18n.js';
 import type { AssessmentEntry, DiscussionEntry } from '../../../src/store/types.js';
 import {
   assessmentHeadline,
+  assessmentSize,
   attentionCount,
   canCleanUpWorkspace,
   discussionItems,
@@ -387,11 +388,6 @@ describe('requirement assessment', () => {
       label: '规模 L',
       meaning: '要改多个模块，一次做完容易超时或返工',
     });
-    // The page shows the size of the conclusion it heads with.
-    const sized = assessed({ verdict: 'go', questions: [], size: 'L' });
-    expect(
-      assessmentHeadline({ discussion: [sized], status: 'running', blocked: null }),
-    ).toMatchObject({ conclusion: { size: 'L' } });
     setLang('en');
     const english = (['S', 'M', 'L'] as const).map((size) => sizeText(size));
     expect(english).toEqual([
@@ -403,6 +399,29 @@ describe('requirement assessment', () => {
       },
     ]);
     expect(JSON.stringify(english)).not.toMatch(/[一-鿿]/);
+  });
+
+  it('shows the size stages planning by size go by, none for a dropped requirement', () => {
+    const size = (...discussion: DiscussionEntry[]) => assessmentSize({ discussion });
+    expect(size(assessed({ verdict: 'go', questions: [], size: 'L' }))).toBe('L');
+    // A drop gave a size, but nothing is planned for a dropped requirement.
+    expect(size(assessed({ verdict: 'drop', questions: [], size: 'M' }))).toBeUndefined();
+    expect(
+      size(
+        assessed({ verdict: 'go', questions: [], size: 'L' }),
+        reply,
+        assessed({ verdict: 'drop', questions: [], size: 'S' }),
+      ),
+    ).toBeUndefined();
+    // Asking again after a go: the stages still go by that go's size.
+    expect(size(assessed({ verdict: 'go', questions: [], size: 'M' }), reply, assessed({}))).toBe(
+      'M',
+    );
+    // An ask on its own decides nothing, whatever size it gave.
+    expect(size(assessed({ size: 'L' }))).toBeUndefined();
+    // No size given, or no assessment at all.
+    expect(size(assessed({ verdict: 'go', questions: [] }))).toBeUndefined();
+    expect(size()).toBeUndefined();
   });
 });
 
