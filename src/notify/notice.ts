@@ -133,7 +133,7 @@ export const NOTICE_KINDS: Record<NoticeKind, { label: string; when: string }> =
     },
     en: {
       label: 'GitHub access failed',
-      when: 'Reading or writing issues, or pushing the target branch, failed. Within a streak of failures each error is notified once; a round in which every GitHub call succeeds starts over',
+      when: 'Reading or writing issues, or pushing the target branch, failed. Within a streak of failures each error is notified once; the streak ends, and errors are notified again, after a round in which every GitHub call succeeds',
     },
   },
   upgrade: {

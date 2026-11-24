@@ -37,7 +37,8 @@ export interface Notifications {
 }
 
 /**
- * Show a system notification for live events that need a human or finish a Run.
+ * Show a browser notification for live events that need a human (the shared rule is noticeFor
+ * in src/notify/notice.ts; finished Runs are not announced).
  * Only events that arrive while the page is open are notified, so a reconnect or reload does
  * not repeat old ones.
  */
