@@ -17,6 +17,7 @@ port: 4870
 bins:
   claude-code: claude
   cursor-agent: cursor-agent
+  codex: codex
 
 defaults:
   timeout_minutes: 60          # 单次 Agent 执行的超时（分钟），默认 60。agents.yaml 里 Agent 的 timeout_minutes、
@@ -43,7 +44,7 @@ github:
       issues_repo: my-org/my-web # 在哪个 GitHub 仓库读写 issue（owner/name）；不写 = 由 gh 按本地仓库的 remote 推断
       template: with-e2e       # 从 issue 建 Run 用的模板，即 workflows/ 里模板的 id
       scout:                   # AI 侦察：读代码、文档和 Run 记录，把发现的需求提成带 ares1:proposal 标签的 issue；不写 = 不侦察
-        agent: claude-reviewer # 只能用 claude-code 的 Agent，以只读方式运行
+        agent: claude-reviewer # 以只读方式运行，要用支持只读的 CLI（claude-code、codex）的 Agent
         auto: true             # true（默认）= 仓库没有会自己往下走的 Run 时自动侦察；false = 只在看板上手动触发
         interval_minutes: 360  # 两次自动侦察至少间隔几分钟，默认 0（不限）。没找到需求或失败后另有退避，最长 6 小时
         max_proposals: 3       # 一次最多提几条，默认 5（1 到 20）；等你处理的提案加上卡住的 Run 达到这个数就不再自动侦察
@@ -65,7 +66,7 @@ github:
     my-api:
       template: strict
       scout:
-        agent: claude-reviewer
+        agent: codex-reviewer  # 换一家的模型来侦察：Codex CLI 也能以只读方式运行
         auto: false            # 只在看板上手动触发侦察
       auto_accept:
         max_risk: none         # 所有提案都由人决定

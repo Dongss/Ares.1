@@ -50,8 +50,9 @@ src/
     flow.ts           workflow, scout, redo and retention rules (shared by Master and dashboard)
     effort.ts         helpers for agent effort (shared with the dashboard)
   store/              SQLite store (node:sqlite): store.ts, migrations.ts, types.ts (entity types)
-  adapters/           agent adapters: types.ts (interface), claude-code.ts, cursor-agent.ts, fake.ts
-                      (tests), process.ts (processes, agents' env), rate-limit.ts, tool-summary.ts
+  adapters/           agent adapters: types.ts (interface), claude-code.ts, cursor-agent.ts, codex.ts,
+                      fake.ts (tests), process.ts (processes, agents' env), rate-limit.ts,
+                      tool-summary.ts
   engine/
     engine.ts         workflow engine: queue, state machine, checks, rework, agent errors, rollback,
                       approvals, merge, recovery after restart, removing Runs' worktrees

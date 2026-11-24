@@ -186,6 +186,9 @@ main {
 .text-danger {
   color: var(--danger);
 }
+.text-attention {
+  color: var(--attention);
+}
 
 .count {
   display: inline-block;

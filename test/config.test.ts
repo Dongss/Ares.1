@@ -45,6 +45,7 @@ import {
   type WorkflowTemplate,
 } from '../src/config/schema.js';
 import { setLang } from '../src/i18n.js';
+import { BUILTIN_CLIS, BUILTIN_READ_ONLY_CLIS } from '../src/master.js';
 import type {
   AssessmentEntry,
   BlockKind,
@@ -828,6 +829,59 @@ stages:
     expect(loadConfig(paths, ['claude-code']).errors['agents.yaml#grok']?.[0]).toMatch(
       /不支持的 cli：cursor-agent/,
     );
+  });
+
+  it('accepts codex agents for read-only stages, the scout and coding, warning about "safe"', () => {
+    const paths = home();
+    writeFile(
+      paths.agentsFile,
+      `agents:
+  codex-coder: { cli: codex, model: gpt-5.5, effort: max }
+  codex-reviewer: { cli: codex, model: gpt-5.5, effort: high }
+  codex-docs: { cli: codex, model: gpt-5.5, permission: safe }
+`,
+    );
+    // The default template names claude agents.
+    rmSync(join(paths.workflowsDir, 'self-dev.yaml'));
+    writeFile(
+      join(paths.workflowsDir, 'codex.yaml'),
+      `id: codex
+stages:
+  - { id: assess, kind: assess, agent: codex-reviewer }
+  - { id: implement, kind: agent, agent: codex-coder, planning: auto, inputs: [assessment] }
+  - { id: review, kind: review, agent: codex-reviewer, inputs: [diff, assessment], on_fail: implement }
+  - { id: merge, kind: merge, gate: true }
+`,
+    );
+    writeFile(
+      paths.configFile,
+      `github:
+  repos:
+    app:
+      template: codex
+      scout: { agent: codex-reviewer }
+`,
+    );
+    const cfg = loadConfig(paths, BUILTIN_CLIS, BUILTIN_READ_ONLY_CLIS);
+    expect(BUILTIN_CLIS).toContain('codex');
+    expect(BUILTIN_READ_ONLY_CLIS).toContain('codex');
+    expect([...cfg.agents.keys()]).toEqual(['codex-coder', 'codex-reviewer', 'codex-docs']);
+    expect(cfg.errors).toEqual({});
+    expect(cfg.templates.has('codex')).toBe(true);
+    // "safe" runs, but Codex cannot keep it from running commands: said where it is shown.
+    const docs = cfg.agentEntries.find((e) => e.id === 'codex-docs');
+    expect(docs?.state).toBe('enabled');
+    expect(docs?.warnings).toHaveLength(1);
+    expect(docs?.warnings[0]).toMatch(/Codex 没有「只改文件、不执行命令」的模式/);
+    expect(cfg.warnings).toEqual({ 'agents.yaml#codex-docs': docs?.warnings });
+    expect(cfg.agentEntries.find((e) => e.id === 'codex-coder')?.warnings).toEqual([]);
+
+    // Loading follows config.yaml's language.
+    writeFile(paths.configFile, 'language: en\n');
+    const en = loadConfig(paths, BUILTIN_CLIS, BUILTIN_READ_ONLY_CLIS);
+    const warning = en.warnings['agents.yaml#codex-docs']?.join('\n') ?? '';
+    expect(warning).toMatch(/Codex has no "edits only, no commands" mode/);
+    expect(warning).not.toMatch(/[一-鿿]/);
   });
 
   it('accepts placeholder stages, which take no agent and no checks', () => {

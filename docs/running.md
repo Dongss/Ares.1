@@ -2,7 +2,7 @@
 
 ## 安装和启动
 
-需要 Node.js >= 24 和 git。要用的 Agent CLI（Claude Code 的 `claude`、`cursor-agent`）需要先装好并登录。
+需要 Node.js >= 24 和 git。要用的 Agent CLI（Claude Code 的 `claude`、`cursor-agent`、Codex CLI 的 `codex`）需要先装好并登录，各自的用法见下面的「Agent 用的 CLI」。
 
 ```bash
 npm install
@@ -274,7 +274,7 @@ github:
 - 去掉 `GH_TOKEN`、`GITHUB_TOKEN`、`GH_ENTERPRISE_TOKEN`、`GITHUB_ENTERPRISE_TOKEN`，再把 `GH_TOKEN` 设成一个无效的值 `ares1-agent-no-github-access`。gh 优先用 `GH_TOKEN`，GitHub 会拒绝它，gh 也就不会退回去用存在配置文件或 macOS 钥匙串里的登录。
 - `GH_CONFIG_DIR` 指向数据目录下的空目录 `data/agent-gh-config/`，gh 在里面是未登录状态。每次启动 Agent、运行命令之前都会把它清空，Agent 往里面写的东西留不到下一次。
 - git 的凭据助手（钥匙串、gh 等）全部清掉，去掉 `GIT_ASKPASS`、`SSH_ASKPASS`，并设置 `GIT_TERMINAL_PROMPT=0`：通过 https 访问需要登录的仓库会直接失败，不会弹出要密码的提示。
-- 其他环境变量原样保留，包括 `PATH`、`HOME`，以及 Claude Code 和 cursor-agent 自己的登录信息。
+- 其他环境变量原样保留，包括 `PATH`、`HOME`，以及 Claude Code、cursor-agent 和 Codex CLI 自己的登录信息（比如 `CODEX_HOME`、`OPENAI_API_KEY`）。
 - 给 Agent 的提示词也写明：需求、讨论和 issue 的内容都已经在提示词里，不要自己去 GitHub 读。
 
 副作用：准备命令和检查命令里需要 GitHub 凭据的操作会失败，比如通过 https 安装 GitHub 上的私有依赖、在测试里调用需要登录的 GitHub API。
@@ -284,6 +284,40 @@ github:
 ### 发到 GitHub 的文字不带用户目录
 
 错误输出和 Agent 写的总结常带着本机的绝对路径，比如 `/Users/<用户名>/.ares1/worktrees/run-…`，发到公开仓库就会把系统用户名和目录结构公开出去。所以 Master 发到 GitHub 的文字（issue 评论、侦察提案 issue 的标题和正文、Master 提交的提交信息）里，以用户目录开头的路径都换成 `~`，比如 `~/.ares1/worktrees/run-…`；不在用户目录下的路径保持原样。看板和本地日志照旧显示完整路径，方便排查。提交信息是提交时就替换好的，所以看板上看到的提交信息也是 `~`。
+
+## Agent 用的 CLI
+
+`agents.yaml` 里每个 Agent 的 `cli` 决定用哪个 CLI 运行它。可执行文件默认从 PATH 里找，不在 PATH 上时在 `config.yaml` 的 `bins` 里写路径（键就是 `cli` 的值，改了要重启 Master）。看板「配置」页的 Agent 一节列出了 Master 支持的 CLI 和其中能以只读方式运行的（API `GET /api/config` 的 `clis`：每项是 `{ cli, readOnly }`）；某个 Agent 的设置它的 CLI 做不到时（比如下面 Codex 的 `permission: safe`），「配置」页和「Agent」页在这个 Agent 的状态下面写明，API 里是 `agentEntries` 各项的 `warnings`，键为 `agents.yaml#<id>` 的 `warnings` 里也有一份。
+
+| `cli` | 默认的可执行文件 | 能以只读方式运行 | `effort` | 花费 |
+|---|---|---|---|---|
+| `claude-code` | `claude` | 能 | 传给 `--effort` | CLI 自己报 |
+| `cursor-agent` | `cursor-agent` | 不能 | 写在模型名里（比如 `grok-4.7-high`），不能配 `effort` 字段 | 不报，配了 `price` 由 Master 估算 |
+| `codex` | `codex` | 能 | 传给 `-c model_reasoning_effort=…` | 不报，配了 `price` 由 Master 估算 |
+
+需求评估、拆分任务（`planning: auto` / `llm`）和侦察都以只读方式运行，只能用能以只读方式运行的 CLI 的 Agent，否则加载模板时报错、侦察不启动；出错换 Agent 时，这几步也只换到这些 CLI 的 Agent。同时配上 claude-code 和 codex 的 Agent，一家的额度用完时，这几步还能换另一家接着做。
+
+### Codex CLI
+
+Master 用 `codex exec` 非交互地运行它（按 codex-cli 0.172 的 `codex exec --help` 核对过）：
+
+```
+codex exec --json --skip-git-repo-check --ignore-user-config --ignore-rules --model <model>
+  --sandbox <read-only | workspace-write> -c approval_policy="never"
+  [-c sandbox_workspace_write.network_access=true] [-c model_reasoning_effort="<effort>"]
+  [--ephemeral] [--output-schema <临时文件>] [<args>] [resume <会话 id>] -
+```
+
+- 提示词从 stdin 传入（最后的 `-`），工作目录就是进程的当前目录。
+- 只读运行（需求评估、拆分任务、侦察）：只读沙箱（`--sandbox read-only`），Codex 仍会运行读文件、搜索的命令，但写不了任何东西；加 `--ephemeral`，不保留会话，也从不恢复会话。不看 Agent 的 `permission`。
+- `permission: full`（默认）：工作目录可写的沙箱（`--sandbox workspace-write`），可以改工作目录里的文件、执行命令、联网；`approval_policy="never"`，不等交互审批（没人能审批）。不用 `--dangerously-bypass-approvals-and-sandbox`：命令照样在沙箱里运行，写不了工作目录以外的地方（临时目录除外）。
+- `permission: safe`：Codex 没有「只改文件、不执行命令」的模式，它改文件本身就要用命令或补丁工具，所以同样用工作目录可写的沙箱，只是不能联网。加载 `agents.yaml` 时会对 `cli: codex` 配 `permission: safe` 给出警告，看板「配置」页和「Agent」页都会显示。只拿它做需求评估、拆分任务和侦察时不受影响。
+- `effort`：`low` / `medium` / `high` / `xhigh` / `max` 也是 Codex 自己的推理强度名，原样传过去；模型不一定每档都支持（比如有的模型没有 `max`），配了模型不支持的档位时以 Codex 的处理为准，它报错的话这次执行按出错处理。
+- 输出格式：Master 要的 JSON Schema 写到一个临时文件里，用 `--output-schema` 传入，执行结束后删掉。Codex 背后的接口只接受严格形式的 Schema（每个对象列出全部属性、不允许多余的属性），所以传过去之前先改写：可选的属性改成必填、可以为 `null`，去掉 `minLength`、`default` 这类约束；结果回来后再把这些 `null` 去掉，照常按完整的格式校验。Codex 最后一条回复就是这个 JSON。
+- 返工时用 `codex exec … resume <会话 id> -` 接着上一次的会话。
+- 不读 `~/.codex/config.toml` 和执行规则（`--ignore-user-config`、`--ignore-rules`），就像 Claude Code 不读用户级设置一样：个人配的 MCP 服务器、hooks、交互时批准过的命令不会带进 Agent 的执行，它们可能带着 GitHub 凭据，或者能在沙箱外执行命令。登录信息照常从 `~/.codex`（`CODEX_HOME`）读。需要改 Codex 的设置时写在 Agent 的 `args` 里，比如 `args: ["-c", "model_verbosity=low"]`；`args` 加在 `resume` 之前，`--add-dir` 这类 `codex exec` 自己的选项也能用。`--sandbox` 由上面的规则决定，不要写在 `args` 里。
+- Master 解析它的 JSONL 输出：`thread.started` 里的 `thread_id` 是会话 id；`item.completed` 里的 `agent_message` 是回复，`command_execution`、`file_change`、`mcp_tool_call`、`web_search` 显示成工具调用；`turn.completed` 的 `usage` 是 token 用量（`cached_input_tokens` 单独记为缓存，不算进输入）。Codex 的 JSONL 不报实际用的模型，看板上显示配置的模型。
+- 环境变量和别的 Agent 一样去掉了 GitHub 凭据（见「Agent 拿不到 GitHub 凭据」），Master 不另外给它任何凭据。
 
 ## Agent 出错时
 
@@ -311,8 +345,9 @@ defaults:
 - 额度用尽或被限流不算出错：不消耗重试次数，不换 Agent，也不卡住等人。Run 回到队首排队，不再算在正在执行的 Run 里，别的 Run 照常执行；CLI 给了额度重置时间就等到那时再多等 1 分钟，没给就按连续被限流的次数等 5、10、20、40 分钟，之后每次 1 小时。到时间后从同一个 Task 接着做（返工意见不变）。等待期间 Run 详情页和事件列表会写明「额度用尽或被限流，预计 HH:mm 继续」。这个时间记在 `task.rate_limited` 事件的 `retryAt` 里，Master 重启（自动升级、保活脚本拉起、崩溃）后从事件里取回，Run 照样等到那时再继续，详情页也照样显示预计时间。想马上再试，可以暂停后再恢复，等待就此解除，重启后也不会再等。侦察遇到额度用尽或限流时按同样的规则等待，见上面「接入 GitHub」里侦察退避之后的一段。各个 CLI 的限流这样识别：
   - Claude Code：以它输出的限流事件（`rate_limit_event`）为准，重置时间也从事件里取。没有限流事件时，再看失败结果里 CLI 自己的错误文字，按下面同样的规则兜底。
   - cursor-agent：它不输出限流事件，只看失败时 CLI 自己的错误文字：失败的 `result` 事件里的文字，没有 `result` 事件、进程自己退出时则看 stderr 的末尾。超时、被停止或没能启动的不算限流。Agent 在回复里写的文字一律不看（Agent 讨论限流时不会被误判），成功的结果也不看。
+  - Codex CLI：同样只看失败时 CLI 自己的错误文字：`turn.failed` 事件和最后一个 `error` 事件里的文字，没有这些事件、进程自己退出时则看 stderr 的末尾（比如额度用完时它报 `Quota exceeded. Check your plan and billing details.`）。中途重连时它也会发 `error` 事件（比如 `Reconnecting... 1/5 (… 429 …)`），这一轮最后完成了就不算失败，也不算限流。超时、被停止或没能启动的不算限流，Agent 回复的文字一律不看。
   - 错误文字的规则（不区分大小写）：含 usage limit、rate limit（rate-limit、rate limited、rate_limit 等写法）、too many requests、resource exhausted（`RESOURCE_EXHAUSTED`）、hit your limit，配额用尽的说法（quota exceeded、exceeded … quota、out of quota、insufficient quota；单独的 quota 不算，disk quota 磁盘配额也不算），或者紧跟在 HTTP、status、code 后面的 429（比如 `HTTP 429`、`status code 429`；4290、行号 429 之类的数字不算）。误判成限流的 Run 会一直等下去，所以规则宁紧勿松：没识别出来的限流照常按出错处理。
-  - 错误文字里的重置时间按这个顺序找：Claude 老格式 `limit reached|<epoch>`、ISO 8601 时间、reset 或 retry 后面不远处 10 位的 epoch 秒数（13 位的毫秒数也行）。找不到、已经过去或在 31 天以后的，当作没给重置时间。
+  - 错误文字里的重置时间按这个顺序找：Claude 老格式 `limit reached|<epoch>`、ISO 8601 时间、reset 或 retry 后面不远处 10 位的 epoch 秒数（13 位的毫秒数也行），然后是 Codex 的两种写法：`try again in 2 hours 5 minutes`（`retry in 90s` 之类也行，从现在算起）和 `try again at 3:15 PM`、`try again at Nov 25th, 2026 3:15 PM`（按本机时区；只有钟点时取下一次到这个钟点的时间）。找不到、已经过去或在 31 天以后的，当作没给重置时间。
 
 数据目录里已经装好的 `workflows/self-dev.yaml` 不会自动更新。旧版本写的是 `on_agent_error: human`：出错时会先自动重试，重试用完后才卡住等人，加载时也会提示。想让它出错时也不等人，就手动改成 `switch_agent`；给 Ares.1 自己用的，也可以改用仓库自带的 `.ares1/workflows/self-dev.yaml`，它跟着代码更新（见「从数据目录的模板切换到仓库自带的」）。
 
@@ -343,7 +378,7 @@ defaults:
   - Run 详情页：拆分任务排在这一轮的最前面，每一步的标题前写着「第 2/3 步」，阶段标题旁写着「已完成 1/3 步」（数的是已通过的步骤）。
   - 侦察摘要（侦察提示词里的「最近的 Run」）：拆成几步的轮次先写一行「编码第 1 轮：拆成 3 步」，下面每一步只算自己的执行：返工过的写「第 2/3 步「标题」：执行 2 次，返工原因：…」，没通过的写一行状态（失败，或者 Run 结束时还没执行到、还没做完；Run 被终止或者因为别的原因失败时，没做完的步骤都算后两种），顺利通过的不写；拆分本身返工过也单独写一行「编码第 1 轮的拆分：…」，不算进任何一步。没拆分、只拆成一步的轮次和以前一样，整轮的执行合在一起写一行。这样侦察和人都能看出拆得好不好、卡在哪一步。
 - 拆分出错（CLI 报错、超时）或者输出不符合格式（没有 JSON、步数不在 1 到 8 之间、缺标题或说明）时，按 `on_agent_error` 处理（见上面的「Agent 出错时」），一步也不会建；格式的问题会交给下一次拆分。
-- 拆分要以只读方式运行，所以阶段的 Agent 要用支持只读的 CLI（claude-code），否则加载模板时报错、模板被停用。`planning: auto` 只拆分一部分 Run，但哪个 Run 都可能要拆分，所以同样要求。`planning: llm` 和 `planning: auto` 只能用在 `kind: agent` 阶段，写在评审、需求评估、命令、合并、占位阶段上同样报错。
+- 拆分要以只读方式运行，所以阶段的 Agent 要用支持只读的 CLI（claude-code、codex），否则加载模板时报错、模板被停用。`planning: auto` 只拆分一部分 Run，但哪个 Run 都可能要拆分，所以同样要求。`planning: llm` 和 `planning: auto` 只能用在 `kind: agent` 阶段，写在评审、需求评估、命令、合并、占位阶段上同样报错。
 - 评审打回、审批驳回、命令阶段失败或合并冲突回退到这个阶段时，新一轮重新拆分；打回的原因既交给拆分，也交给每一步。新一轮的拆分还会读到这个阶段上一轮的计划：每一步的标题、说明、是否通过和「结果」（summary，每条最多 400 字；没通过的步骤没有）。上一轮没有拆分时，整个阶段算一步；只拆成一步的也照样写上；拆分格式出错后重试的每一次都有。上一轮通过的步骤都已经提交，改动还在工作目录里，所以提示词要求拆分只列出这次需要做的修改步骤：改正打回的问题、补上没通过的步骤，不要重做已经通过、和打回原因无关的步骤。拆分输出的格式和之后依次执行的方式都不变。
 - 拆分进行到一半被暂停、Master 重启或崩溃时，恢复后重新拆分。各步的 Task 和拆分的结果在同一个事务里记下，不会重复，也不会只建一半。
 - 默认的 `self-dev.yaml` 的编码阶段是 `planning: auto`。数据目录里已经装好的 `workflows/self-dev.yaml` 不会自动更新，旧版本写的是 `planning: single`：想让大需求先拆分，就手动把编码阶段的 `planning: single` 改成 `planning: auto`（编码阶段的 Agent 要用支持只读的 CLI，默认的 `claude-coder` 就是）。保存后 Master 自动重新加载，新建的 Run 生效；已经建好的 Run 仍按建 Run 时的模板走。给 Ares.1 自己用的，也可以删掉数据目录里那份，改用仓库自带的 `.ares1/workflows/self-dev.yaml`（见「从数据目录的模板切换到仓库自带的」）。带 `planning: auto` 的完整模板见 [`docs/examples/workflows/strict.yaml`](examples/workflows/strict.yaml) 的编码阶段。
@@ -670,7 +705,7 @@ scripts/keepalive.sh <安装目录> <数据目录> [<端口>] [<node 路径>] [<
 - 观察期内新版本崩溃仍由升级脚本回退；回退后旧版本也起不来时，升级脚本发通知后退出，之后保活脚本每分钟再试一次。
 - 想有意停掉 Master（比如下面的「手动升级」），要先停掉定时任务，否则一分钟内它又会被拉起来，做完再打开。
 
-下面的例子假设稳定副本在 `~/ares1-stable`、数据目录是 `~/.ares1`，换成你自己的路径。定时任务的 PATH 很短，例子里都显式设了 PATH，要包含 node、git、gh、claude、cursor-agent 所在的目录（用 `command -v node git gh claude cursor-agent` 查）；node 不在 PATH 里时，也可以作为第四个参数传进去。
+下面的例子假设稳定副本在 `~/ares1-stable`、数据目录是 `~/.ares1`，换成你自己的路径。定时任务的 PATH 很短，例子里都显式设了 PATH，要包含 node、git、gh 和用到的 Agent CLI（claude、cursor-agent、codex）所在的目录（用 `command -v node git gh claude cursor-agent codex` 查）；node 不在 PATH 里时，也可以作为第四个参数传进去。
 
 node 参数怎么填最稳：
 

@@ -876,6 +876,8 @@ agents:
     expect(json.warnings['config.yaml']).toEqual([
       expect.stringMatching(/^未知的配置项 upgarde，已忽略/),
     ]);
+    // The CLIs it has adapters for, and whether they run read-only.
+    expect(json.clis).toEqual([{ cli: 'fake', readOnly: true }]);
   });
 
   it('exposes config sources, disabled agents and invalid template files', async () => {

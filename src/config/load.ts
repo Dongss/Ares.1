@@ -160,6 +160,20 @@ function effortInModelName(cli: string): string | undefined {
 }
 
 /**
+ * Settings of a valid agent its CLI cannot honor exactly. Codex has no "edits only" mode: its
+ * adapter runs "safe" in the same sandbox as "full", without network access.
+ */
+function agentWarnings(agent: { cli: string; permission: string }): string[] {
+  if (agent.cli !== 'codex' || agent.permission !== 'safe') return [];
+  return [
+    t({
+      zh: 'Codex 没有「只改文件、不执行命令」的模式：permission: safe 时它在工作目录可写的沙箱里运行（不能联网），仍然能执行命令。只用它做需求评估、拆分任务和侦察（都以只读方式运行）时不受影响，可以去掉 permission: safe 消除这条警告',
+      en: 'Codex has no "edits only, no commands" mode: with permission: safe it runs in the workspace-write sandbox (no network access) and can still run commands. Agents used only to assess, plan and scout (which run read-only) are not affected; remove permission: safe to get rid of this warning',
+    }),
+  ];
+}
+
+/**
  * @param knownClis CLIs with an adapter; agents of other CLIs are invalid.
  * @param readOnlyClis CLIs whose adapter can run an agent read-only, as assess stages need.
  * @param options the repos' own template files, and the configuration loaded before them.
@@ -192,6 +206,7 @@ export function loadConfig(
         rawCli: rawString(raw, 'cli'),
         rawModel: rawString(raw, 'model'),
         errors: [],
+        warnings: [],
       };
       agentEntries.push(entry);
       const parsed = AgentSchema.safeParse(raw);
@@ -214,6 +229,8 @@ export function loadConfig(
         entry.errors = errors[key] = [effortProblem];
         continue;
       }
+      entry.warnings = agentWarnings(parsed.data);
+      if (entry.warnings.length > 0) warnings[key] = entry.warnings;
       entry.state = parsed.data.enabled ? 'enabled' : 'disabled';
       if (parsed.data.enabled) agents.set(id, entry.config);
     }

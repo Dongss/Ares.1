@@ -144,6 +144,11 @@ function AgentTable(props: { rows: AgentPageRow[]; totals: ReturnType<typeof age
                     {row.reason}
                   </div>
                 )}
+                {row.warnings.map((w) => (
+                  <div key={w} className="text-attention hint">
+                    {w}
+                  </div>
+                ))}
               </td>
               <td className="num">
                 {row.attempts}

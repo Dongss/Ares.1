@@ -5,6 +5,7 @@ import { setLang } from '../../../src/i18n.js';
 import {
   AGENT_STATE,
   agentRows,
+  cliNote,
   configFileWarnings,
   findRepoTemplate,
   REPO_TEMPLATE_STATE,
@@ -53,6 +54,7 @@ const view: ConfigView = {
       rawCli: 'claude-code',
       rawModel: 'sonnet',
       errors: [],
+      warnings: [],
     },
     {
       id: 'legacy',
@@ -68,6 +70,7 @@ const view: ConfigView = {
       rawCli: 'claude-code',
       rawModel: 'opus',
       errors: [],
+      warnings: [],
     },
     {
       id: 'typo',
@@ -76,7 +79,22 @@ const view: ConfigView = {
       rawCli: 'claude-code',
       rawModel: null,
       errors: ['tierr: 多余', 'model: 必填'],
+      warnings: [],
     },
+    {
+      id: 'codex-docs',
+      state: 'enabled',
+      config: agent('codex-docs', { cli: 'codex', model: 'gpt-5.5', permission: 'safe' }),
+      rawCli: 'codex',
+      rawModel: 'gpt-5.5',
+      errors: [],
+      warnings: ['Codex 没有「只改文件、不执行命令」的模式'],
+    },
+  ],
+  clis: [
+    { cli: 'claude-code', readOnly: true },
+    { cli: 'cursor-agent', readOnly: false },
+    { cli: 'codex', readOnly: true },
   ],
   templateFiles: [
     {
@@ -398,6 +416,7 @@ describe('agentRows', () => {
         cost: 'mid',
         tags: ['coding'],
         reason: null,
+        warnings: [],
       },
       {
         id: 'legacy',
@@ -409,6 +428,7 @@ describe('agentRows', () => {
         cost: 'high',
         tags: [],
         reason: '配置了 enabled: false',
+        warnings: [],
       },
       {
         id: 'typo',
@@ -420,8 +440,46 @@ describe('agentRows', () => {
         cost: null,
         tags: [],
         reason: 'tierr: 多余；model: 必填',
+        warnings: [],
+      },
+      {
+        id: 'codex-docs',
+        state: 'enabled',
+        cli: 'codex',
+        model: 'gpt-5.5',
+        effort: null,
+        tier: 'mid',
+        cost: 'mid',
+        tags: [],
+        reason: null,
+        // In use, with what to know about it.
+        warnings: ['Codex 没有「只改文件、不执行命令」的模式'],
       },
     ]);
+  });
+});
+
+describe('cliNote', () => {
+  afterEach(() => setLang('zh'));
+
+  it('lists the CLIs and the ones that run read-only', () => {
+    expect(cliNote(view.clis)).toBe(
+      'cli 可以写 claude-code、cursor-agent、codex。需求评估、拆分任务和侦察以只读方式运行，只能用 claude-code、codex 的 Agent。',
+    );
+    setLang('en');
+    expect(cliNote(view.clis)).toBe(
+      'cli can be claude-code, cursor-agent, codex. Assessments, task plans and scouts run read-only, which only agents of claude-code, codex can do.',
+    );
+  });
+
+  it('says when no CLI runs read-only, and says nothing without CLIs', () => {
+    const clis = [{ cli: 'cursor-agent', readOnly: false }];
+    expect(cliNote(clis)).toBe(
+      'cli 可以写 cursor-agent。其中没有能以只读方式运行的，所以需求评估、拆分任务和侦察都没法做。',
+    );
+    setLang('en');
+    expect(cliNote(clis)).not.toMatch(/[一-鿿]/);
+    expect(cliNote([])).toBeNull();
   });
 });
 

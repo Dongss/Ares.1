@@ -23,7 +23,8 @@ afterEach(() => setLang('zh'));
 
 describe('configuration examples (docs/examples)', () => {
   it('load without any error or warning', () => {
-    expect(BUILTIN_CLIS).toEqual(['claude-code', 'cursor-agent']);
+    expect(BUILTIN_CLIS).toEqual(['claude-code', 'cursor-agent', 'codex']);
+    expect(BUILTIN_READ_ONLY_CLIS).toEqual(['claude-code', 'codex']);
     const cfg = loadExamples();
     expect(cfg.configFile.source).not.toBeNull();
     expect(cfg.agentsFile.source).not.toBeNull();
@@ -102,6 +103,9 @@ describe('configuration examples (docs/examples)', () => {
     const configs = entries.flatMap((e) => (e.config ? [e.config] : []));
     expect(configs.some((a) => a.cli === 'claude-code')).toBe(true);
     expect(configs.some((a) => a.cli === 'cursor-agent')).toBe(true);
+    expect(configs.some((a) => a.cli === 'codex')).toBe(true);
+    // Every built-in CLI has its executable shown in config.yaml's bins.
+    expect(Object.keys(cfg.master.bins)).toEqual(BUILTIN_CLIS);
     expect(configs.some((a) => a.permission === 'safe')).toBe(true);
     expect(configs.some((a) => !a.enabled)).toBe(true);
     expect(configs.some((a) => a.price !== undefined)).toBe(true);

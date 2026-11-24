@@ -19,6 +19,7 @@ port: 4870
 # bins:
 #   claude-code: /usr/local/bin/claude
 #   cursor-agent: /usr/local/bin/cursor-agent
+#   codex: /usr/local/bin/codex
 
 defaults:
   timeout_minutes: 60          # 单次 Agent 执行的超时
@@ -36,7 +37,7 @@ defaults:
 #     my-repo:                   # 看板上登记的仓库名
 #       template: self-dev       # 从 issue 建 Run 用的模板
 #       scout:                   # AI 侦察：读代码、文档和 Run 记录，提 issue
-#         agent: claude-reviewer # 只能用 claude-code 的 Agent，以只读方式运行
+#         agent: claude-reviewer # 以只读方式运行，要用支持只读的 CLI（claude-code、codex）的 Agent
 #         auto: true             # 仓库没有会自己往下走的 Run 时自动侦察（只等人的 Run 不挡，计入 max_proposals）；false = 只在看板上手动触发
 #         interval_minutes: 0    # 两次自动侦察至少间隔几分钟；0 = 不限（侦察没找到需求或失败后另会退避，最长 6 小时；遇到额度用尽或限流则等额度恢复）
 #         max_proposals: 5       # 一次最多提几条；未处理的提案加上只等人的 Run 达到这个数就不再自动侦察（开了自动采纳时提案只算在采纳范围内的）
@@ -70,6 +71,7 @@ port: 4870
 # bins:
 #   claude-code: /usr/local/bin/claude
 #   cursor-agent: /usr/local/bin/cursor-agent
+#   codex: /usr/local/bin/codex
 
 defaults:
   timeout_minutes: 60          # timeout of a single agent execution
@@ -87,7 +89,7 @@ defaults:
 #     my-repo:                   # the repo name registered on the dashboard
 #       template: self-dev       # template of the Runs created from issues
 #       scout:                   # AI scout: reads code, docs and Run records, files issues
-#         agent: claude-reviewer # must be a claude-code agent; it runs read-only
+#         agent: claude-reviewer # runs read-only, so it needs an agent of a CLI that supports that (claude-code, codex)
 #         auto: true             # scout whenever no Run of the repo goes on by itself (Runs only a human moves on count toward max_proposals instead); false = only from the dashboard
 #         interval_minutes: 0    # at least this many minutes between automatic scouts; 0 = no minimum (scouts that find nothing or fail still back off, up to 6 hours; out of quota or rate-limited, it waits for the quota)
 #         max_proposals: 5       # proposals per scout; no automatic scout while this many proposals and Runs stuck waiting for a human await you (with auto-accept on, only proposals within its range count)
@@ -116,6 +118,7 @@ defaults:
 export function defaultAgentsYaml(): string {
   return t({
     zh: `# Agent = CLI + 模型 + 运行参数：同一个 CLI 换了模型或 effort 就是另一个 Agent
+# cli 可以写 claude-code、cursor-agent 或 codex；需求评估、拆分任务和侦察以只读方式运行，要用 claude-code 或 codex 的 Agent
 agents:
   claude-coder:
     cli: claude-code
@@ -134,6 +137,7 @@ agents:
     tags: [review]
 `,
     en: `# Agent = CLI + model + run settings: the same CLI with another model or effort is another agent
+# cli can be claude-code, cursor-agent or codex; assessments, task plans and scouts run read-only, which needs a claude-code or codex agent
 agents:
   claude-coder:
     cli: claude-code
@@ -175,13 +179,13 @@ stages:
   - id: assess
     name: 需求评估
     kind: assess               # 只读地评估需求：go 开工；ask 在 issue / 看板上讨论；人同意后 drop 不做
-    agent: claude-reviewer     # 以只读方式运行，要用支持只读的 CLI（claude-code）
+    agent: claude-reviewer     # 以只读方式运行，要用支持只读的 CLI（claude-code 或 codex）
     reply_timeout_hours: 24    # 提出疑问后等人回复几小时，超时由评估自己决定（写明假设后开工，或者不做）；0 = 不等人；null = 一直等
 
   - id: implement
     name: 编码
     kind: agent
-    agent: claude-coder        # planning: auto 要以只读方式拆分，要用支持只读的 CLI（claude-code）
+    agent: claude-coder        # planning: auto 要以只读方式拆分，要用支持只读的 CLI（claude-code 或 codex）
     planning: auto             # 按需求评估给出的规模：L（要改多个模块）先由这个 Agent 只读地拆成几步，再一步一步做、
                                # 一步一步检查和提交；S、M 或没给规模时整个阶段一次做完。single = 从不拆分，llm = 总是拆分
     inputs: [assessment]       # 评估结论（讨论后修改的需求）放进提示词
@@ -232,13 +236,13 @@ stages:
   - id: assess
     name: Requirement assessment
     kind: assess               # judges the requirement read-only: go starts; ask discusses on the issue / dashboard; drop (once a human agrees) skips it
-    agent: claude-reviewer     # runs read-only, so it needs a CLI that supports that (claude-code)
+    agent: claude-reviewer     # runs read-only, so it needs a CLI that supports that (claude-code or codex)
     reply_timeout_hours: 24    # hours to wait for a reply to its questions; then the assessment decides on its own (goes ahead on written-down assumptions, or drops it); 0 = no wait; null = wait forever
 
   - id: implement
     name: Coding
     kind: agent
-    agent: claude-coder        # planning: auto splits read-only, so it needs a CLI that supports that (claude-code)
+    agent: claude-coder        # planning: auto splits read-only, so it needs a CLI that supports that (claude-code or codex)
     planning: auto             # by the size the assessment gave: an L (changes across modules) is first split into steps by this
                                # agent, read-only, each then done, checked and committed on its own; S, M or no size is done in
                                # one go. single = never split, llm = always split

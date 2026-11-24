@@ -5,8 +5,9 @@ import { join } from 'node:path';
 import { serve } from '@hono/node-server';
 import type { Hono } from 'hono';
 import { ClaudeCodeAdapter } from './adapters/claude-code.js';
+import { CodexAdapter } from './adapters/codex.js';
 import { CursorAgentAdapter } from './adapters/cursor-agent.js';
-import type { AgentAdapter } from './adapters/types.js';
+import { type AgentAdapter, readOnlyClis as readOnlyClisOf } from './adapters/types.js';
 import { createApi } from './api/server.js';
 import { defaultWebDir } from './api/static.js';
 import { brandName } from './brand.js';
@@ -41,10 +42,19 @@ import { git, revParse } from './workspace/git.js';
 /** Events after which a target branch is at another commit: a Run merged, GitHub's pulled. */
 const TARGET_MOVED = new Set(['merge.done', 'github.pulled', 'github.merged_remote']);
 
+/** The built-in adapters, with the executables config.yaml's `bins` sets. */
+export function builtinAdapters(bins: Record<string, string> = {}): AgentAdapter[] {
+  return [
+    new ClaudeCodeAdapter(bins['claude-code'] ?? 'claude'),
+    new CursorAgentAdapter(bins['cursor-agent'] ?? 'cursor-agent'),
+    new CodexAdapter(bins.codex ?? 'codex'),
+  ];
+}
+
 /** CLIs with a built-in adapter. */
-export const BUILTIN_CLIS = ['claude-code', 'cursor-agent'];
+export const BUILTIN_CLIS = builtinAdapters().map((a) => a.cli);
 /** Built-in CLIs whose adapter can run an agent read-only (`supportsReadOnly`). */
-export const BUILTIN_READ_ONLY_CLIS = ['claude-code'];
+export const BUILTIN_READ_ONLY_CLIS = readOnlyClisOf(builtinAdapters());
 
 export interface MasterOptions {
   home: string;
@@ -223,18 +233,14 @@ export class Master {
     const paths = homePaths(opts.home);
     if (opts.language) setLang(opts.language);
     initHome(paths);
-    const builtin = (cfg: LoadedConfig['master']): AgentAdapter[] => [
-      new ClaudeCodeAdapter(cfg.bins['claude-code'] ?? 'claude'),
-      new CursorAgentAdapter(cfg.bins['cursor-agent'] ?? 'cursor-agent'),
-    ];
     const knownClis = opts.adapters ? opts.adapters.map((a) => a.cli) : BUILTIN_CLIS;
-    const readOnlyClis = opts.adapters
-      ? opts.adapters.filter((a) => a.supportsReadOnly).map((a) => a.cli)
-      : BUILTIN_READ_ONLY_CLIS;
+    const readOnlyClis = opts.adapters ? readOnlyClisOf(opts.adapters) : BUILTIN_READ_ONLY_CLIS;
     const initial = loadConfig(paths, knownClis, readOnlyClis);
     // For the scripts that notify when this Master is down (keepalive.sh, self-upgrade.sh).
     saveWebhookCurlFile(paths.home, initial.master.notify.webhook);
-    const adapters = new Map((opts.adapters ?? builtin(initial.master)).map((a) => [a.cli, a]));
+    const adapters = new Map(
+      (opts.adapters ?? builtinAdapters(initial.master.bins)).map((a) => [a.cli, a]),
+    );
     const store = new Store(paths.dbFile);
     if (store.restoredBackup) console.warn(backupRestoredNotice(store.restoredBackup));
     const watcher = new ConfigWatcher(
@@ -330,6 +336,10 @@ export class Master {
       execFile: opts.execFile,
       now: opts.now,
       reposChanged: refreshTemplates,
+      clis: [...adapters.values()].map((a) => ({
+        cli: a.cli,
+        readOnly: a.supportsReadOnly === true,
+      })),
     });
     // Leftover worktrees of failed and cancelled Runs go with the raw logs: at start, once the
     // engine has recovered the Runs, and then daily.

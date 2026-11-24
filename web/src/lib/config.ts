@@ -1,8 +1,8 @@
-import type { ConfigView, RepoTemplatesView } from '../../../src/api/types.js';
+import type { CliInfo, ConfigView, RepoTemplatesView } from '../../../src/api/types.js';
 import { agentEffort } from '../../../src/config/effort.js';
 import { resolveTemplate, type TemplateSource } from '../../../src/config/flow.js';
 import type { AgentEntry, TemplateFile, WorkflowTemplate } from '../../../src/config/schema.js';
-import { t } from '../../../src/i18n.js';
+import { join, t } from '../../../src/i18n.js';
 import { shortSha, type Tone } from './format.js';
 
 // The read-only config page: templates with their source files (the home directory's and those
@@ -288,6 +288,8 @@ export interface AgentRow {
   tags: string[];
   /** Why the agent is not in use; null when it is. */
   reason: string | null;
+  /** What to know about a valid agent, e.g. a setting its CLI cannot honor exactly. */
+  warnings: string[];
 }
 
 /** A badge whose label is picked in the language in use when read, not at import. */
@@ -315,6 +317,26 @@ export const AGENT_STATE: Record<AgentEntry['state'], { readonly label: string; 
   invalid: badge('无效', 'Invalid', 'danger'),
 };
 
+/**
+ * Which CLIs an agent's `cli` may name, and which of them can run an agent read-only, in the
+ * language in use; null when the Master told none.
+ */
+export function cliNote(clis: readonly CliInfo[]): string | null {
+  if (clis.length === 0) return null;
+  const all = join(clis.map((c) => c.cli));
+  const readOnly = join(clis.filter((c) => c.readOnly).map((c) => c.cli));
+  if (!readOnly) {
+    return t({
+      zh: `cli 可以写 ${all}。其中没有能以只读方式运行的，所以需求评估、拆分任务和侦察都没法做。`,
+      en: `cli can be ${all}. No CLI here can run read-only, so assessments, task plans and scouts cannot run.`,
+    });
+  }
+  return t({
+    zh: `cli 可以写 ${all}。需求评估、拆分任务和侦察以只读方式运行，只能用 ${readOnly} 的 Agent。`,
+    en: `cli can be ${all}. Assessments, task plans and scouts run read-only, which only agents of ${readOnly} can do.`,
+  });
+}
+
 /** One table row per agents.yaml entry, in file order. */
 export function agentRows(view: ConfigView): AgentRow[] {
   return view.agentEntries.map(agentRow);
@@ -339,5 +361,6 @@ export function agentRow(entry: AgentEntry): AgentRow {
         : entry.state === 'disabled'
           ? t({ zh: '配置了 enabled: false', en: 'Set to enabled: false' })
           : null,
+    warnings: entry.state === 'invalid' ? [] : entry.warnings,
   };
 }

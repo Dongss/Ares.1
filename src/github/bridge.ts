@@ -2,7 +2,12 @@ import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { prepareAgentEnv } from '../adapters/process.js';
-import type { AgentAdapter, AgentExecution, AgentResult } from '../adapters/types.js';
+import {
+  type AgentAdapter,
+  type AgentExecution,
+  type AgentResult,
+  readOnlyClis,
+} from '../adapters/types.js';
 import type { GitHubRepoStatus, GitHubStatus } from '../api/types.js';
 import { brandName } from '../brand.js';
 import {
@@ -27,7 +32,7 @@ import {
 import type { GitHubRepoConfig, WorkflowTemplate } from '../config/schema.js';
 import { type Engine, estimateCost, InvalidStateError } from '../engine/engine.js';
 import { storedRunTimes } from '../engine/times.js';
-import { t } from '../i18n.js';
+import { join as joinList, t } from '../i18n.js';
 import { NotFoundError, type Store } from '../store/store.js';
 import {
   type DiscussionEntry,
@@ -1738,11 +1743,17 @@ export class IssueBridge {
     }
     const adapter = this.deps.adapters.get(agent.cli);
     if (!adapter?.supportsReadOnly) {
+      const readOnly = joinList(readOnlyClis(this.deps.adapters.values()));
       throw new InvalidStateError(
-        t({
-          zh: `侦察要以只读方式运行，${agent.cli} 不支持，请换用 claude-code 的 Agent`,
-          en: `The scout runs read-only, which ${agent.cli} does not support; use a claude-code agent`,
-        }),
+        readOnly
+          ? t({
+              zh: `侦察要以只读方式运行，${agent.cli} 不支持，请换用 ${readOnly} 的 Agent`,
+              en: `The scout runs read-only, which ${agent.cli} does not support; use an agent of ${readOnly}`,
+            })
+          : t({
+              zh: `侦察要以只读方式运行，${agent.cli} 不支持，请换用支持只读的 CLI 的 Agent`,
+              en: `The scout runs read-only, which ${agent.cli} does not support; use an agent of a CLI that supports read-only`,
+            }),
       );
     }
     this.scouting.set(repo.id, { scoutId: '' });

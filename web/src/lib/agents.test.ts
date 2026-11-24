@@ -31,6 +31,7 @@ const entry = (id: string, raw: Record<string, unknown>): AgentSummary['entry'] 
   rawCli: String(raw.cli),
   rawModel: String(raw.model),
   errors: [],
+  warnings: raw.cli === 'codex' && raw.permission === 'safe' ? ['Codex 没有只改文件的模式'] : [],
 });
 
 const summary = (
@@ -78,6 +79,7 @@ describe('agentPageRow', () => {
       effort: 'xhigh',
       defaultEffort: false,
       reason: null,
+      warnings: [],
       attempts: 13,
       outcomes: '9 / 2 / 1',
       rates: '返工 17%、出错 8%',
@@ -125,6 +127,18 @@ describe('agentPageRow', () => {
     expect(both.totalCost).toBe('$1.50 + 未知');
   });
 
+  it('carries what to know about an agent in use', () => {
+    const row = agentPageRow(
+      summary('codex', entry('codex', { cli: 'codex', model: 'gpt-5.5', permission: 'safe' })),
+    );
+    expect(row).toMatchObject({
+      state: 'enabled',
+      cli: 'codex',
+      reason: null,
+      warnings: ['Codex 没有只改文件的模式'],
+    });
+  });
+
   it('shows dashes for what an agent never did', () => {
     const row = agentPageRow(
       summary('off', entry('off', { cli: 'claude-code', model: 'haiku', enabled: false })),
@@ -153,6 +167,7 @@ describe('agentPageRow', () => {
         rawCli: 'claude-code',
         rawModel: null,
         errors: ['model: 必填'],
+        warnings: [],
       }),
     );
     expect(invalid).toMatchObject({
@@ -161,6 +176,7 @@ describe('agentPageRow', () => {
       effort: null,
       defaultEffort: false,
       reason: 'model: 必填',
+      warnings: [],
     });
     const removed = agentPageRow(summary('old', null, { attempts: 2, rework: 1, agentError: 1 }));
     expect(removed).toMatchObject({

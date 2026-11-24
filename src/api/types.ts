@@ -194,6 +194,8 @@ export interface ConfigView {
   agentsFile: SourceFile;
   /** Every entry of agents.yaml, including disabled and invalid ones. */
   agentEntries: AgentEntry[];
+  /** The CLIs the Master has an adapter for, which agents.yaml's `cli` may name. */
+  clis: CliInfo[];
   /** Every file in workflows/ with its source, including invalid ones. */
   templateFiles: TemplateFile[];
   /**
@@ -208,6 +210,17 @@ export interface ConfigView {
   reloadError: { message: string; at: string } | null;
   /** Changed settings that need a Master restart to take effect. */
   restartNeeded: string[];
+}
+
+/** A CLI the Master has an adapter for. */
+export interface CliInfo {
+  /** As agents.yaml's `cli` names it, e.g. "codex". */
+  cli: string;
+  /**
+   * Whether its adapter can run an agent read-only, as assessments, plans of a stage's tasks and
+   * scouts need.
+   */
+  readOnly: boolean;
 }
 
 /**

@@ -26,7 +26,7 @@ export const GitHubRepoSchema = z.strictObject({
   /** The AI scout that proposes issues; omitted = no scouting. */
   scout: z
     .strictObject({
-      /** A claude-code agent; it runs with read-only tools. */
+      /** An agent of a CLI that can run read-only (claude-code, codex); it runs read-only. */
       agent: z.string().min(1),
       /** Scout on its own whenever the repo is idle; false = only from the dashboard. */
       auto: z.boolean().default(true),
@@ -169,7 +169,10 @@ export type MasterConfig = z.infer<typeof MasterConfigSchema>;
 // agents.yaml
 // ---------------------------------------------------------------------------
 
-/** Reasoning effort passed to the CLI (Claude Code: --effort). */
+/**
+ * Reasoning effort passed to the CLI (Claude Code: --effort; Codex: -c model_reasoning_effort,
+ * which has the same names).
+ */
 export const Effort = z.enum(['low', 'medium', 'high', 'xhigh', 'max']);
 export type Effort = z.infer<typeof Effort>;
 
@@ -186,7 +189,7 @@ export const AgentSchema = z
     enabled: z.boolean().default(true),
     /**
      * "full" = the agent may run commands (Claude Code's auto mode may still deny some);
-     * "safe" = edits only, no commands.
+     * "safe" = edits only, no commands (Codex cannot tell the two apart: loading warns).
      */
     permission: z.enum(['full', 'safe']).default('full'),
     /** Extra CLI arguments appended as-is. */
@@ -315,6 +318,8 @@ export interface AgentEntry {
   rawModel: string | null;
   /** Why the entry is invalid. */
   errors: string[];
+  /** What to know about a valid entry, e.g. a setting its CLI cannot honor exactly. */
+  warnings: string[];
 }
 
 /**

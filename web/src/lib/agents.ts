@@ -27,6 +27,8 @@ export interface AgentPageRow {
   defaultEffort: boolean;
   /** Why the agent is not in use; null when it is. */
   reason: string | null;
+  /** What to know about a valid agent, e.g. a setting its CLI cannot honor exactly. */
+  warnings: string[];
   /** Executions in Runs, running ones included. */
   attempts: number;
   /** Passed / rework / error counts as "9 / 2 / 1"; null without executions. */
@@ -87,6 +89,7 @@ export function agentPageRow(agent: AgentSummary): AgentPageRow {
           zh: 'agents.yaml 中已经没有这一项，这里是它留下的记录',
           en: 'No longer in agents.yaml; this is the record it left behind',
         }),
+    warnings: config?.warnings ?? [],
     attempts: runs.attempts,
     outcomes: runs.attempts > 0 ? `${runs.passed} / ${runs.rework} / ${runs.agentError}` : null,
     rates: outcomeRates(runs),

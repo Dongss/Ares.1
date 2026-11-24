@@ -88,3 +88,8 @@ export interface AgentAdapter {
 }
 
 export const EMPTY_USAGE: AgentUsage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
+
+/** The CLIs of these adapters that can run an agent read-only (`supportsReadOnly`). */
+export function readOnlyClis(adapters: Iterable<AgentAdapter>): string[] {
+  return [...adapters].filter((a) => a.supportsReadOnly === true).map((a) => a.cli);
+}

@@ -8,13 +8,13 @@
 #
 # 模板设了 on_agent_error: switch_agent（默认就是）时，Agent 出错且重试用完后，Master 从这里
 # 挑一个这个 Task 还没用过、已启用的 Agent 接着做：先挑档次（tier）不低于当前 Agent 的，
-# 同档次里挑成本（cost）低的，再一样就按这个文件里的顺序；需求评估阶段只挑 claude-code 的。
-# 所以 tier、cost 和顺序决定了出错时换给谁。
+# 同档次里挑成本（cost）低的，再一样就按这个文件里的顺序；需求评估和拆分任务只挑支持只读的 CLI
+# （claude-code、codex）的 Agent。所以 tier、cost 和顺序决定了出错时换给谁。
 
 agents:
   # 主力编码：最强的模型配高 effort，贵，但返工少
   claude-coder:
-    cli: claude-code          # 用哪个 CLI 运行：claude-code（Claude Code）或 cursor-agent
+    cli: claude-code          # 用哪个 CLI 运行：claude-code（Claude Code）、cursor-agent 或 codex（Codex CLI）
     model: opus               # 传给 claude --model：opus / sonnet / haiku 这类别名，或完整的模型名
     effort: xhigh             # 推理强度，传给 claude --effort：low / medium / high / xhigh / max；不写则用 CLI 的默认值
     tier: high                # 能力档次：low / mid / high，默认 mid；出错换 Agent 时先找不低于这个档次的
@@ -33,7 +33,7 @@ agents:
     tier: mid
     cost: mid
     tags: [review, assess, scout]
-    # 需求评估和侦察都以只读方式运行，只有 claude-code 支持，所以它们要用 claude-code 的 Agent
+    # 需求评估、拆分任务和侦察都以只读方式运行，要用支持只读的 CLI（claude-code、codex）的 Agent
 
   # 只改文件、不执行命令的 Agent：适合改文档这类不用跑命令的小活（见 workflows/light.yaml）
   claude-docs:
@@ -58,6 +58,25 @@ agents:
       input: 3                # 配了价格 Master 才能估算花费、执行预算（budget_usd、daily_budget_usd）；
       output: 15              # 这里的数字只是示例，按你账号的实际价格填写。Claude Code 自己报花费，不用配
     timeout_minutes: 60
+
+  # 另一家能以只读方式运行的 CLI（Codex CLI）：Claude 的额度用完时，出错换 Agent 能把需求评估、拆分任务
+  # 换给它接着做，侦察也可以用它（见 config.yaml 的 my-api）；编码、评审也能用
+  codex-reviewer:
+    cli: codex
+    model: gpt-5.5            # 传给 codex exec --model；账号能用哪些模型，在 codex 里用 /model 查看
+    effort: high              # 传给 codex 的 model_reasoning_effort：low / medium / high / xhigh / max，名字和 Claude Code
+                              # 的一样，模型不一定每档都支持；不写则用 codex 的默认值
+    tier: mid
+    cost: mid
+    tags: [review, assess, scout]
+    price:                    # Codex 只报 token 数、不报花费，和 cursor-agent 一样，配了价格 Master 才能估算花费；
+      input: 1.25             # 数字只是示例，按你账号的实际价格填写
+      output: 10
+    # permission 不写 = full：在工作目录可写的沙箱里改文件、执行命令（可以联网），不等交互审批。
+    # Codex 没有「只改文件、不执行命令」的模式，写 safe 也照样能执行命令（只是不能联网），加载时会警告。
+    # 以只读方式运行时（需求评估、拆分任务、侦察）不看 permission：只读沙箱，不保留会话。
+    # 不读 ~/.codex/config.toml（个人的 MCP 服务器、hooks 不带进 Agent 的执行），要改 Codex 的设置就在 args 里
+    # 用 -c 传，比如 args: ["-c", "model_verbosity=low"]；登录信息照常用 ~/.codex 里的
 
   # 停用的 Agent：最强的配置，留着给难啃的需求，需要时把 enabled 改成 true（或删掉这一行）
   claude-max:

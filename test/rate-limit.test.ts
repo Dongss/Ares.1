@@ -112,6 +112,59 @@ describe('rateLimitFromText', () => {
     ).toEqual({ retryAt: AT });
   });
 
+  it('reads Codex\'s "try again in <duration>"', () => {
+    const limit =
+      "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro) or";
+    expect(rateLimitFromText(`${limit} try again in 2 hours 5 minutes.`, NOW)).toEqual({
+      retryAt: new Date(NOW + (2 * 60 + 5) * 60_000).toISOString(),
+    });
+    expect(rateLimitFromText(`${limit} try again in 4 days 2 hours 3 minutes.`, NOW)).toEqual({
+      retryAt: new Date(NOW + ((4 * 24 + 2) * 60 + 3) * 60_000).toISOString(),
+    });
+    expect(rateLimitFromText('rate limited, retry in 90 seconds', NOW)).toEqual({
+      retryAt: new Date(NOW + 90_000).toISOString(),
+    });
+    expect(rateLimitFromText('rate limited, retry in 1h 30m', NOW)).toEqual({
+      retryAt: new Date(NOW + 90 * 60_000).toISOString(),
+    });
+    // No number, or no unit it knows: no reset time.
+    expect(rateLimitFromText(`${limit} try again in less than a minute.`, NOW)).toEqual({});
+    expect(rateLimitFromText('usage limit reached, try again in 2 weeks', NOW)).toEqual({});
+  });
+
+  it('reads Codex\'s "try again at <time>" in local time, the next time the clock shows it', () => {
+    /** "3:05 PM" for a local time. */
+    const clock = (d: Date) =>
+      `${d.getHours() % 12 || 12}:${String(d.getMinutes()).padStart(2, '0')} ${d.getHours() < 12 ? 'AM' : 'PM'}`;
+    const later = new Date(NOW + 90 * 60_000);
+    expect(rateLimitFromText(`usage limit reached; try again at ${clock(later)}.`, NOW)).toEqual({
+      retryAt: later.toISOString(),
+    });
+    // Earlier today on the clock: tomorrow.
+    const earlier = new Date(NOW - 60 * 60_000);
+    const tomorrow = new Date(earlier);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    expect(rateLimitFromText(`usage limit reached; try again at ${clock(earlier)}.`, NOW)).toEqual({
+      retryAt: tomorrow.toISOString(),
+    });
+    // With a date, as Codex writes it when the reset is not today.
+    expect(
+      rateLimitFromText(
+        "You've hit your usage limit. Visit settings or try again at Nov 25th, 2026 3:15 PM.",
+        NOW,
+      ),
+    ).toEqual({ retryAt: new Date(2026, 10, 25, 15, 15).toISOString() });
+    // A 24-hour clock.
+    const evening = new Date(NOW);
+    evening.setHours(23, 59, 0, 0);
+    if (evening.getTime() <= NOW) evening.setDate(evening.getDate() + 1);
+    expect(rateLimitFromText('rate limit hit, resets at 23:59', NOW)).toEqual({
+      retryAt: evening.toISOString(),
+    });
+    // Not a time.
+    expect(rateLimitFromText('usage limit reached; try again at 13:15 PM', NOW)).toEqual({});
+  });
+
   it('drops a reset time that has passed, or one too far ahead to be one', () => {
     const past = new Date(NOW - 60_000).toISOString();
     expect(rateLimitFromText(`usage limit reached, resets at ${past}`, NOW)).toEqual({});

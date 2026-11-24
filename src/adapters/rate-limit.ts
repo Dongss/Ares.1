@@ -48,17 +48,18 @@ export function rateLimitFromText(
   const limited =
     LIMIT_PATTERNS.some((p) => p.test(text)) || QUOTA_PATTERNS.some((p) => p.test(noDisk));
   if (!limited) return undefined;
-  const reset = resetFromText(text);
+  const reset = resetFromText(text, now);
   if (reset === undefined || reset <= now || reset - now > MAX_RESET_AHEAD_MS) return {};
   return { retryAt: new Date(reset).toISOString() };
 }
 
 /**
  * The reset time written in an error text, in epoch milliseconds. In this order: Claude's old
- * "…limit reached|<epoch>", an ISO time, then epoch seconds (10 digits) or milliseconds
- * (13 digits) shortly after the word reset or retry.
+ * "…limit reached|<epoch>", an ISO time, epoch seconds (10 digits) or milliseconds (13 digits)
+ * shortly after the word reset or retry, then Codex's "try again in 2 hours 5 minutes" and
+ * "try again at 3:15 PM" (or "at Nov 25th, 2026 3:15 PM", in local time).
  */
-function resetFromText(text: string): number | undefined {
+function resetFromText(text: string, now: number): number | undefined {
   const piped = /limit\s+reached\s*\|\s*(\d{10}|\d{13})(?!\d)/i.exec(text);
   if (piped?.[1]) return resetTime(Number(piped[1]));
   const iso = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?/i.exec(
@@ -70,7 +71,50 @@ function resetFromText(text: string): number | undefined {
   }
   const epoch = /(?:reset|retry)[^\n]{0,30}?(?<!\d)(\d{10}|\d{13})(?!\d)/i.exec(text);
   if (epoch?.[1]) return resetTime(Number(epoch[1]));
-  return undefined;
+  return relativeReset(text, now) ?? clockReset(text, now);
+}
+
+const DURATION_PART =
+  /(\d+)\s*(days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)(?![a-z])/gi;
+const UNIT_MS: Record<string, number> = { d: 86_400_000, h: 3_600_000, m: 60_000, s: 1000 };
+
+/** "try again in 2 days 3 hours 5 minutes", "retry in 90s": that long after `now`. */
+function relativeReset(text: string, now: number): number | undefined {
+  const m =
+    /\b(?:try\s+again|retry|resets?)\s+in\s+((?:\d+\s*[a-z]+(?:\s*,\s*|\s+and\s+|\s+)?)+)/i.exec(
+      text,
+    );
+  if (!m?.[1]) return undefined;
+  let ms = 0;
+  for (const [, n, unit] of m[1].matchAll(DURATION_PART)) {
+    ms += Number(n) * (UNIT_MS[(unit as string)[0]?.toLowerCase() ?? ''] ?? 0);
+  }
+  return ms > 0 ? now + ms : undefined;
+}
+
+/**
+ * "try again at 3:15 PM" (the next time the clock shows it), or with a date, "try again at
+ * Nov 25th, 2026 3:15 PM": local time, as the CLI runs on the Master's machine.
+ */
+function clockReset(text: string, now: number): number | undefined {
+  const m =
+    /\b(?:try\s+again|resets?)\s+at\s+(?:([a-z]{3,9}\.?\s+\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\s+)?(\d{1,2}):(\d{2})(?:\s*([ap])\.?m\.?)?/i.exec(
+      text,
+    );
+  if (!m) return undefined;
+  const [, day, year, h, min, half] = m;
+  let hours = Number(h);
+  const minutes = Number(min);
+  if (half) {
+    if (hours < 1 || hours > 12) return undefined;
+    hours = (hours % 12) + (half.toLowerCase() === 'p' ? 12 : 0);
+  }
+  if (hours > 23 || minutes > 59) return undefined;
+  const at = day && year ? new Date(`${day} ${year}`) : new Date(now);
+  if (Number.isNaN(at.getTime())) return undefined;
+  at.setHours(hours, minutes, 0, 0);
+  if (!day && at.getTime() <= now) at.setDate(at.getDate() + 1);
+  return at.getTime();
 }
 
 /**

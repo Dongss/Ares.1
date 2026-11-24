@@ -9,6 +9,7 @@ import {
   AGENT_STATE,
   type AgentRow,
   agentRows,
+  cliNote,
   configFileWarnings,
   type RepoTemplateCard,
   type RepoTemplateGroup,
@@ -48,6 +49,7 @@ export function ConfigPage(props: {
   const { valid, invalid } = templateCards(config);
   const repoGroups = repoTemplateGroups(config);
   const agents = agentRows(config);
+  const clis = cliNote(config.clis);
   const fileErrors = config.errors['agents.yaml'];
   const configWarnings = configFileWarnings(config);
 
@@ -157,6 +159,7 @@ export function ConfigPage(props: {
         </h2>
         <div className="card">
           <SourceLine path={config.agentsFile.path} />
+          {clis && <p className="hint">{clis}</p>}
           {fileErrors && (
             <ErrorBox>
               {t({ zh: 'agents.yaml 无效：', en: 'agents.yaml is invalid: ' })}
@@ -381,6 +384,11 @@ function AgentTable({ rows }: { rows: AgentRow[] }) {
                       {row.reason}
                     </div>
                   )}
+                  {row.warnings.map((w) => (
+                    <div key={w} className="text-attention hint">
+                      {w}
+                    </div>
+                  ))}
                 </td>
               </tr>
             );

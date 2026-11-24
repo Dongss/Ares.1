@@ -24,6 +24,7 @@ import { mountDashboard } from './static.js';
 import { collectStats, STATS_RANGES } from './stats.js';
 import type {
   AgentSummary,
+  CliInfo,
   ConfigView,
   GitHubStatus,
   HealthView,
@@ -65,6 +66,8 @@ export interface ApiDeps {
    * repos keep again (`RepoWorkflows.refresh`; never rejects). Answered once it is done.
    */
   reposChanged?: () => Promise<void>;
+  /** The CLIs the Master has an adapter for; omitted = none told. */
+  clis?: readonly CliInfo[];
 }
 
 class BadRequestError extends Error {}
@@ -221,6 +224,7 @@ export function createApi(deps: ApiDeps): Hono {
       configFile: cfg.configFile,
       agentsFile: cfg.agentsFile,
       agentEntries: cfg.agentEntries,
+      clis: [...(deps.clis ?? [])],
       templateFiles: cfg.templateFiles,
       repoTemplates: [...cfg.repoTemplates.values()]
         .sort((a, b) => (a.repo < b.repo ? -1 : a.repo > b.repo ? 1 : 0))

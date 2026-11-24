@@ -13,13 +13,13 @@ stages:
   - id: assess
     name: 需求评估
     kind: assess               # 只读地评估需求：go 开工；ask 在 issue / 看板上讨论；人同意后 drop 不做
-    agent: claude-reviewer     # 以只读方式运行，要用支持只读的 CLI（claude-code）
+    agent: claude-reviewer     # 以只读方式运行，要用支持只读的 CLI（claude-code 或 codex）
     reply_timeout_hours: 24    # 提出疑问后等人回复几小时，超时由评估自己决定（写明假设后开工，或者不做）；0 = 不等人；null = 一直等
 
   - id: implement
     name: 编码
     kind: agent
-    agent: claude-coder        # planning: auto 要以只读方式拆分，要用支持只读的 CLI（claude-code）
+    agent: claude-coder        # planning: auto 要以只读方式拆分，要用支持只读的 CLI（claude-code 或 codex）
     planning: auto             # 按需求评估给出的规模：L（要改多个模块）先由这个 Agent 只读地拆成几步，再一步一步做、
                                # 一步一步检查和提交；S、M 或没给规模时整个阶段一次做完。single = 从不拆分，llm = 总是拆分
     inputs: [assessment]       # 评估结论（讨论后修改的需求）放进提示词

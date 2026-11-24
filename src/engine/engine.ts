@@ -10,7 +10,7 @@ import {
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { isOurProcess, killProcessGroup, prepareAgentEnv } from '../adapters/process.js';
-import type { AgentAdapter, AgentResult } from '../adapters/types.js';
+import { type AgentAdapter, type AgentResult, readOnlyClis } from '../adapters/types.js';
 import type {
   AgentEventRecord,
   LiveAgentEvent,
@@ -1878,13 +1878,16 @@ export class Engine {
             });
     const mode = eff.escalate.on_agent_error;
     if (mode === 'human') {
+      const readOnly = joinList(readOnlyClis(this.deps.adapters.values()));
       const advice =
-        reason === 'read_only_unsupported'
-          ? t({
-              zh: '，请换用支持只读的 Agent（如 claude-code）',
-              en: '; use an agent that supports read-only (such as claude-code)',
-            })
-          : '';
+        reason !== 'read_only_unsupported'
+          ? ''
+          : readOnly
+            ? t({
+                zh: `，请换用支持只读的 Agent（${readOnly} 的 Agent）`,
+                en: `; use an agent that supports read-only (an agent of ${readOnly})`,
+              })
+            : t({ zh: '，请换用支持只读的 Agent', en: '; use an agent that supports read-only' });
       this.block(run.id, { kind: 'agent_unavailable', message: why + advice, taskId: task.id });
       return;
     }
@@ -3516,10 +3519,8 @@ export class Engine {
     if (!(await pathDiffers(workdir, base, head, REPO_WORKFLOWS_DIR))) return [];
     const files = await committedYamlFiles(workdir, head, REPO_WORKFLOWS_DIR);
     // The configuration is loaded with the same: the CLIs whose adapter runs agents read-only.
-    const readOnlyClis = [...this.deps.adapters.values()]
-      .filter((a) => a.supportsReadOnly)
-      .map((a) => a.cli);
-    const loaded = loadRepoTemplates(repoName, files, this.cfg.agents, readOnlyClis);
+    const readOnly = readOnlyClis(this.deps.adapters.values());
+    const loaded = loadRepoTemplates(repoName, files, this.cfg.agents, readOnly);
     return loaded.files.filter((f) => f.errors.length > 0);
   }
 

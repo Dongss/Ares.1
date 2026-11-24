@@ -5,7 +5,7 @@
 | 文件 | 内容 |
 |---|---|
 | [`config.yaml`](config.yaml) | 全局配置：语言、端口、CLI 路径、超时、同时执行几个 Run、通知、自动升级；GitHub 里登记了 4 个仓库，分别用下面 4 个模板，侦察、自动采纳、自动合并、推送、每日预算的设置各不相同 |
-| [`agents.yaml`](agents.yaml) | 5 个 Agent：编码用的强模型配高 effort（`claude-coder`），评审、需求评估、侦察用的便宜一档的模型（`claude-reviewer`），只改文件不执行命令的 `permission: safe`（`claude-docs`），cursor-agent 的另一家模型（`cursor-grok`，带 `price`），停用的 `enabled: false`（`claude-max`）；也演示了 `timeout_minutes`、`args` 的写法 |
+| [`agents.yaml`](agents.yaml) | 6 个 Agent：编码用的强模型配高 effort（`claude-coder`），评审、需求评估、侦察用的便宜一档的模型（`claude-reviewer`），只改文件不执行命令的 `permission: safe`（`claude-docs`），cursor-agent 的另一家模型（`cursor-grok`，带 `price`），同样能以只读方式运行的 Codex CLI（`codex-reviewer`，Claude 额度用完时接着做需求评估、拆分任务和侦察），停用的 `enabled: false`（`claude-max`）；也演示了 `timeout_minutes`、`args` 的写法 |
 | [`workflows/light.yaml`](workflows/light.yaml) | 轻量：编码 → 评审 → 合并，不做需求评估。适合文档、小改动 |
 | [`workflows/strict.yaml`](workflows/strict.yaml) | 严格：需求评估 → 编码 → 评审 → 人工审批 → 合并。适合生产仓库；编码阶段用 `planning: auto`：需求评估给出的规模是 L 时先把需求拆成几步，再一步一步做、一步一步检查和提交 |
 | [`workflows/with-e2e.yaml`](workflows/with-e2e.yaml) | 带 E2E：编码 → 评审 → E2E（`kind: command`，比如 playwright，或 `docker compose up` 之后探活）→ 合并，E2E 失败时回到编码 |
