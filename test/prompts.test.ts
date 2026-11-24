@@ -16,7 +16,12 @@ import {
 } from '../src/engine/prompts.js';
 import { scoutReportJsonSchema } from '../src/github/scout.js';
 import { setLang } from '../src/i18n.js';
-import type { AssessmentEntry, FailedAttempt, ReplyTimeoutEntry } from '../src/store/types.js';
+import type {
+  AssessmentEntry,
+  DiscussionEntry,
+  FailedAttempt,
+  ReplyTimeoutEntry,
+} from '../src/store/types.js';
 
 const ctx = (stage: Partial<StageDef> = {}): PromptContext => ({
   goal: '添加 feature.txt',
@@ -200,7 +205,33 @@ describe('prompts', () => {
       expect(prompt).toContain(
         '- L：要改多个模块、一次做完容易超时或返工的需求，可能先拆成几步，再一步一步做。',
       );
-      expect(prompt).toContain('{"verdict": "go", "size": "M", "summary": ');
+      expect(prompt).toContain('{"verdict": "go", "size": "M", "difficulty": "mid", "summary": ');
+    }
+  });
+
+  it('asks a go for the difficulty of the requirement, low, mid or high, in every round', () => {
+    const replied: DiscussionEntry[] = [
+      asked,
+      { role: 'human', text: '只改首页', source: 'issue', at: '2026-11-20T01:00:00Z' },
+    ];
+    const prompts = {
+      first: assessPrompt(ctx({ id: 'assess', kind: 'assess' }), [], null),
+      afterReply: assessPrompt(ctx({ id: 'assess', kind: 'assess' }), replied, null),
+      alone: assessPrompt(ctx({ id: 'assess', kind: 'assess' }), [asked, timeout], null),
+    };
+    for (const [name, prompt] of Object.entries(prompts)) {
+      expect(prompt, name).toContain(
+        'verdict 为 go 时还要给出 difficulty，估计需求的难度，只能是 low、mid、high 三者之一。',
+      );
+      expect(prompt, name).toContain('从候选 Agent 里挑档次够用、费用最低的一个');
+      expect(prompt, name).toContain('- low：局部的小改动，比如改一处文案、补测试；');
+      expect(prompt, name).toContain('- mid：跨模块的行为改动；');
+      expect(prompt, name).toContain('- high：涉及核心的状态机、git 操作、数据库迁移');
+      // Right after the size rule.
+      expect(prompt.indexOf('verdict 为 go 时还要给出 difficulty'), name).toBeGreaterThan(
+        prompt.indexOf('- L：'),
+      );
+      expect(prompt, name).toContain('"difficulty": "mid"');
     }
   });
 
@@ -537,7 +568,16 @@ describe('prompts in English', () => {
         'With verdict go, also give size, how big you judge the requirement, as one of the letters S, M and L:',
       );
       expect(prompt).toContain('- L: changes across several modules');
-      expect(prompt).toContain('{"verdict": "go", "size": "M", "summary": ');
+      expect(prompt).toContain('{"verdict": "go", "size": "M", "difficulty": "mid", "summary": ');
+    }
+    for (const prompt of [prompts.assess, prompts.assessAfterReply, prompts.assessAlone]) {
+      expect(prompt).toContain(
+        'With verdict go, also give difficulty, how hard you judge the requirement, as one of low, mid and high.',
+      );
+      expect(prompt).toContain('the cheapest one capable enough');
+      expect(prompt).toContain('- low: a small, local change, such as rewording some text');
+      expect(prompt).toContain('- mid: a change of behavior across modules;');
+      expect(prompt).toContain('- high: changes to a core state machine, git operations');
     }
     expect(prompts.assessAlone).toContain('### Nobody replied within 2 hours');
     expect(prompts.assessAlone).toContain(

@@ -727,6 +727,24 @@ function sizeRule(): string {
 }
 
 /**
+ * How an assessment that goes ahead judges the requirement's difficulty (`difficulty`,
+ * `DIFFICULTIES`): the stages with `agent_candidates` pick the cheapest candidate whose tier is
+ * at least that.
+ */
+function difficultyRule(): string {
+  return t({
+    zh: `verdict 为 go 时还要给出 difficulty，估计需求的难度，只能是 low、mid、high 三者之一。后面的阶段按难度从候选 Agent 里挑档次够用、费用最低的一个：估低了可能做不好，估高了会多花钱。
+- low：局部的小改动，比如改一处文案、补测试；
+- mid：跨模块的行为改动；
+- high：涉及核心的状态机、git 操作、数据库迁移，或者对正确性要求很高的改动。`,
+    en: `With verdict go, also give difficulty, how hard you judge the requirement, as one of low, mid and high. Later stages go by it to pick, among their candidate agents, the cheapest one capable enough: too low and the work may not be done well, too high and it costs more than it needs to.
+- low: a small, local change, such as rewording some text or adding tests;
+- mid: a change of behavior across modules;
+- high: changes to a core state machine, git operations or database migrations, or work that has to be exactly right.`,
+  });
+}
+
+/**
  * The conclusion and output format of the round after nobody replied in time: go with the
  * assumptions written down, or drop; asking again is not accepted (`assessmentProblem`).
  */
@@ -747,6 +765,8 @@ ${why}，这一轮由你自己决定，不能再给 ask。verdict 二选一：
 
 ${sizeRule()}
 
+${difficultyRule()}
+
 summary 用中文书写。
 
 ## 输出格式
@@ -754,7 +774,7 @@ summary 用中文书写。
 最后一条回复以一个 JSON 代码块结束：
 
 \`\`\`json
-{"verdict": "go", "size": "M", "summary": "评估意见，以及对每个疑问做了什么假设"}
+{"verdict": "go", "size": "M", "difficulty": "mid", "summary": "评估意见，以及对每个疑问做了什么假设"}
 \`\`\`
 `,
     en: `## Conclusion
@@ -765,6 +785,8 @@ ${why}, so you decide this round on your own, and ask is not allowed. Pick one v
 
 ${sizeRule()}
 
+${difficultyRule()}
+
 Write summary in English.
 
 ## Output format
@@ -772,7 +794,7 @@ Write summary in English.
 End your last reply with a JSON code block:
 
 \`\`\`json
-{"verdict": "go", "size": "M", "summary": "your assessment, and the assumption made for each question"}
+{"verdict": "go", "size": "M", "difficulty": "mid", "summary": "your assessment, and the assumption made for each question"}
 \`\`\`
 `,
   });
@@ -866,6 +888,8 @@ verdict 三选一：
 
 ${sizeRule()}
 
+${difficultyRule()}
+
 summary、questions、suggestions 和 revisedGoal 都用中文书写。
 
 ## 输出格式
@@ -876,7 +900,7 @@ summary、questions、suggestions 和 revisedGoal 都用中文书写。
 {"verdict": "ask", "summary": "评估意见", "questions": ["疑问或顾虑"], "suggestions": ["建议怎么改"]}
 \`\`\`
 
-go 时写成 \`{"verdict": "go", "size": "M", "summary": "评估意见"}\` 这样。
+go 时写成 \`{"verdict": "go", "size": "M", "difficulty": "mid", "summary": "评估意见"}\` 这样。
 `,
     en: `## Conclusion
 
@@ -886,6 +910,8 @@ Pick one verdict:
 - drop: ${replied ? 'only when the human has agreed in the discussion not to do it; give the reasons in summary.' : 'not allowed before any discussion with the human; give ask when you think it should not be done.'}
 
 ${sizeRule()}
+
+${difficultyRule()}
 
 Write summary, questions, suggestions and revisedGoal in English.
 
@@ -897,7 +923,7 @@ End your last reply with a JSON code block, for example:
 {"verdict": "ask", "summary": "your assessment", "questions": ["a question or concern"], "suggestions": ["how to change it"]}
 \`\`\`
 
-With go, it looks like \`{"verdict": "go", "size": "M", "summary": "your assessment"}\`.
+With go, it looks like \`{"verdict": "go", "size": "M", "difficulty": "mid", "summary": "your assessment"}\`.
 `,
   })}`;
 }

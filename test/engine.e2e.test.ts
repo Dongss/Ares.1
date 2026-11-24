@@ -5995,7 +5995,7 @@ describe('engine: planning: auto', () => {
       agents: ASSESS_AGENTS_YAML,
       workflow: withPlanning(ASSESS_WORKFLOW_YAML, 'auto'),
       scripts: {
-        assessor: () => assessment('go', { size: 'L' }),
+        assessor: () => assessment('go', { size: 'L', difficulty: 'high' }),
         coder: coder(['a', 'b']),
         // Sends the first round back: the next round is split again.
         reviewer: () =>
@@ -6004,7 +6004,10 @@ describe('engine: planning: auto', () => {
     });
     const run = h.run();
     const completed = await h.waitStatus(run.id, 'completed');
-    expect(completed.discussion).toMatchObject([{ role: 'assessor', verdict: 'go', size: 'L' }]);
+    // The difficulty is kept with the size in the Run's discussion.
+    expect(completed.discussion).toMatchObject([
+      { role: 'assessor', verdict: 'go', size: 'L', difficulty: 'high' },
+    ]);
     expect(h.fake.calls.map((c) => [c.model, c.readOnly === true])).toEqual([
       ['assessor', true],
       ['coder', true],

@@ -201,6 +201,13 @@ export type AssessVerdict = 'go' | 'ask' | 'drop';
 export const REQUIREMENT_SIZES = ['S', 'M', 'L'] as const;
 export type RequirementSize = (typeof REQUIREMENT_SIZES)[number];
 
+/**
+ * How hard an assessment judged the requirement, ordered from easy to hard: the stages with
+ * `agent_candidates` pick an agent whose tier is at least this. The same words in every language.
+ */
+export const DIFFICULTIES = ['low', 'mid', 'high'] as const;
+export type Difficulty = (typeof DIFFICULTIES)[number];
+
 /** The result of one round of a requirement assessment. */
 export interface AssessmentEntry {
   role: 'assessor';
@@ -219,6 +226,11 @@ export interface AssessmentEntry {
    * in entries recorded before assessments gave sizes.
    */
   size?: RequirementSize;
+  /**
+   * How hard the agent judged the requirement (asked for with go). Missing when it gave none, and
+   * in entries recorded before assessments gave difficulties.
+   */
+  difficulty?: Difficulty;
   /** The agent said drop before any human reply; a human is asked to confirm instead. */
   proposedDrop: boolean;
   /**

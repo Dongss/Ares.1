@@ -6,6 +6,7 @@ import { t } from '../i18n.js';
 import type {
   AssessmentEntry,
   AssessVerdict,
+  Difficulty,
   DiscussionEntry,
   ReplyEntry,
   ReplyTimeoutEntry,
@@ -52,6 +53,16 @@ export function conclusionOf(discussion: readonly DiscussionEntry[]): Assessment
  */
 export function assessedSize(discussion: readonly DiscussionEntry[]): RequirementSize | undefined {
   return assessmentRounds(discussion).findLast((e) => e.verdict === 'go')?.size;
+}
+
+/**
+ * The requirement's difficulty as the latest go round gave it, which stages with
+ * `agent_candidates` go by to pick the cheapest candidate whose tier is enough. Undefined without
+ * a go round, or when that round gave no difficulty (it left it out, or was recorded before
+ * assessments gave difficulties).
+ */
+export function assessedDifficulty(discussion: readonly DiscussionEntry[]): Difficulty | undefined {
+  return assessmentRounds(discussion).findLast((e) => e.verdict === 'go')?.difficulty;
 }
 
 /**
@@ -170,6 +181,7 @@ export interface ReportedAssessment {
   suggestions: string[];
   revisedGoal?: string;
   size?: RequirementSize;
+  difficulty?: Difficulty;
 }
 
 /**
@@ -201,7 +213,8 @@ export function assessmentProblem(
  * original requirement holds until a human agreed to change it). After nobody replied in time it
  * decides alone: a drop stands, and a changed goal is still ignored (its assumptions are in the
  * summary, which the later stages read). An ask then is refused before (`assessmentProblem`).
- * A size is recorded with any verdict; only that of a go decides anything (`assessedSize`).
+ * A size and a difficulty are recorded with any verdict; only those of a go decide anything
+ * (`assessedSize`, `assessedDifficulty`).
  */
 export function takeAssessment(
   report: ReportedAssessment,
@@ -220,6 +233,7 @@ export function takeAssessment(
     suggestions: report.suggestions,
     revisedGoal: report.verdict === 'go' && replied && !alone && revised ? revised : null,
     ...(report.size ? { size: report.size } : {}),
+    ...(report.difficulty ? { difficulty: report.difficulty } : {}),
     proposedDrop,
     ...(alone && report.verdict !== 'ask' ? { decidedAlone: true } : {}),
     stageRunId: where.stageRunId,

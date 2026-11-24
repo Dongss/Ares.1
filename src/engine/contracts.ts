@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { LANGUAGES, type Lang, t } from '../i18n.js';
-import { REQUIREMENT_SIZES } from '../store/types.js';
+import { DIFFICULTIES, REQUIREMENT_SIZES } from '../store/types.js';
 
 // Structured results agents must end with (prompt contract + parse/validate,
 // plus --json-schema for CLIs that support it).
@@ -36,6 +36,11 @@ export const AssessReportSchema = z
      * size only means the stages that plan by size (`planning: auto`) do not split it.
      */
     size: z.enum(REQUIREMENT_SIZES).optional(),
+    /**
+     * How hard the requirement is (`DIFFICULTIES`); asked for with go. Optional: without one, the
+     * stages with `agent_candidates` take their first usable candidate.
+     */
+    difficulty: z.enum(DIFFICULTIES).optional(),
   })
   .superRefine((report, ctx) => {
     if (report.verdict === 'ask' && report.questions.length === 0) {

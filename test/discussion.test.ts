@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  assessedDifficulty,
   assessedSize,
   assessmentProblem,
   assessmentRounds,
@@ -136,6 +137,29 @@ describe('takeAssessment', () => {
       const proposedDrop = takeAssessment(report('drop', { size: 'M' }), [], where);
       expect(proposedDrop).toMatchObject({ verdict: 'ask', proposedDrop: true, size: 'M' });
       expect(takeAssessment(report('go'), [], where)).not.toHaveProperty('size');
+    });
+
+    it('records the difficulty with any verdict, and none when not given', () => {
+      expect(takeAssessment(report('go', { difficulty: 'low' }), [], where).difficulty).toBe('low');
+      expect(takeAssessment(report('ask', { difficulty: 'high' }), [], where).difficulty).toBe(
+        'high',
+      );
+      const proposedDrop = takeAssessment(report('drop', { difficulty: 'mid' }), [], where);
+      expect(proposedDrop).toMatchObject({ verdict: 'ask', proposedDrop: true, difficulty: 'mid' });
+      expect(takeAssessment(report('go'), [], where)).not.toHaveProperty('difficulty');
+      // Next to the size, after a human reply and after a timeout alike.
+      const replied = takeAssessment(
+        report('go', { size: 'S', difficulty: 'low' }),
+        [assessor('ask'), human()],
+        where,
+      );
+      expect(replied).toMatchObject({ verdict: 'go', size: 'S', difficulty: 'low' });
+      const alone = takeAssessment(
+        report('go', { difficulty: 'high' }),
+        [assessor('ask'), timeout()],
+        where,
+      );
+      expect(alone).toMatchObject({ verdict: 'go', decidedAlone: true, difficulty: 'high' });
     });
   });
 
@@ -339,6 +363,24 @@ describe('the discussion so far', () => {
     expect(assessedSize([goL, reply2, go])).toBeUndefined();
     // The latest go counts even when a later round asks again.
     expect(assessedSize([goL, reply2, ask2])).toBe('L');
+  });
+
+  it('assessedDifficulty: the difficulty of the latest go round', () => {
+    expect(assessedDifficulty([])).toBeUndefined();
+    // Difficulties of rounds that did not go ahead decide nothing.
+    const askHigh = assessor('ask', { difficulty: 'high' });
+    expect(assessedDifficulty([askHigh, reply1])).toBeUndefined();
+    expect(assessedDifficulty([assessor('drop', { difficulty: 'high' })])).toBeUndefined();
+    // A go without a difficulty (left out, or recorded before difficulties) has none.
+    expect(assessedDifficulty([askHigh, reply1, go])).toBeUndefined();
+    const goLow = assessor('go', { difficulty: 'low', at: at(4) });
+    const goHigh = assessor('go', { difficulty: 'high', at: at(6) });
+    expect(assessedDifficulty([askHigh, reply1, goLow])).toBe('low');
+    expect(assessedDifficulty([goLow, reply2])).toBe('low');
+    expect(assessedDifficulty([goLow, reply2, goHigh])).toBe('high');
+    expect(assessedDifficulty([goHigh, reply2, go])).toBeUndefined();
+    // The latest go counts even when a later round asks again.
+    expect(assessedDifficulty([goHigh, reply2, ask2])).toBe('high');
   });
 
   it('pendingTimeout: only when the discussion ends with a timeout', () => {

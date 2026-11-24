@@ -148,6 +148,31 @@ describe('agent output contracts', () => {
     });
     expect((ASSESS_REPORT_JSON_SCHEMA as { required: string[] }).required).not.toContain('size');
   });
+
+  it('takes an optional difficulty of low, mid or high in an assessment', () => {
+    const base = { verdict: 'go', summary: 'fine' };
+    for (const difficulty of ['low', 'mid', 'high']) {
+      const parsed = parseReport(AssessReportSchema, { ...base, difficulty }, '');
+      expect(parsed.ok && parsed.value.difficulty).toBe(difficulty);
+    }
+    // A go without one is not a format error.
+    const without = parseReport(AssessReportSchema, base, '');
+    expect(without.ok).toBe(true);
+    expect(without.ok && without.value.difficulty).toBeUndefined();
+    // Also with ask and drop.
+    expect(
+      parseReport(AssessReportSchema, { verdict: 'drop', summary: 's', difficulty: 'high' }, '').ok,
+    ).toBe(true);
+    for (const difficulty of ['medium', 'LOW', '低', '', 2]) {
+      expect(parseReport(AssessReportSchema, { ...base, difficulty }, '').ok).toBe(false);
+    }
+    expect(ASSESS_REPORT_JSON_SCHEMA).toMatchObject({
+      properties: { difficulty: { type: 'string', enum: ['low', 'mid', 'high'] } },
+    });
+    expect((ASSESS_REPORT_JSON_SCHEMA as { required: string[] }).required).not.toContain(
+      'difficulty',
+    );
+  });
 });
 
 describe('agent output contracts in English', () => {
