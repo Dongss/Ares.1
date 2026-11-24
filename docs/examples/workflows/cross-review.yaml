@@ -1,46 +1,71 @@
-# 交叉评审流程：编码 → 另一家模型评审 → 合并。
+# 交叉评审流程：需求评估 → 编码 → 另一家模型评审 → 合并。
 #
-# 适合想减少同一个模型「看不出自己的错」的项目：编码用 Claude（claude-coder，通过 Claude Code），
-# 评审用 Grok（cursor-grok，通过 cursor-agent），两家的盲点不一样，评审更容易挑出问题。
-# 某一家的服务宕机或额度用完时，出错换 Agent 也能换到另一家接着做（见下面的 on_agent_error）。
+# 适合想减少同一个模型「看不出自己的错」的项目：编码用 Claude（通过 Claude Code），评审用别家的模型
+# （Codex 或 Grok，分别通过 Codex CLI 和 cursor-agent），两家的盲点不一样，评审更容易挑出问题。
 #
-# 关于 agent_candidates：模板格式里有这个字段（给一个阶段列出几个候选 Agent），但还没有实现，
-# 写了它的模板会被停用，看板「配置」页会报错。现在出错时换 Agent 靠 on_agent_error: switch_agent，
-# 换给谁由 agents.yaml 里各 Agent 的 tier、cost 和顺序决定。
+# 也演示了 agent_candidates：编码和评审阶段各列几个候选 Agent，Master 按需求评估给出的难度，
+# 从中挑档次够用、成本最低的一个。小需求交给便宜的 Agent，同样的预算能做更多 Run。规则是：
+#   - 只看已启用、能跑这个阶段的候选；
+#   - 在档次（tier）不低于难度的候选里挑成本（cost）最低的，成本一样就按列表的顺序；
+#   - 没有档次够的候选时，挑档次最高的；
+#   - Run 没有难度时（需求评估没给，或者模板里没有需求评估阶段），用列表里第一个能用的。
+# 各 Agent 的 tier、cost 见示例的 agents.yaml。阶段开始时选定 Agent 后，返工都由它做；
+# Run 详情页的事件里写着每一轮选了谁、按什么难度、从哪些候选里选的（事件 agent.selected）。
 
 id: cross-review
 name: 交叉评审
-description: 编码和评审用不同厂商的 Agent，出错时换 Agent 再试
+description: 按难度从候选里挑编码和评审的 Agent，两者用不同厂商，出错时在候选里换一个再试
 
 defaults:
   escalate:
-    max_retries: 1               # Agent 出错时同一个 Agent 只重试 1 次就换 Agent，比默认的 2 次更快换到另一家；
+    max_retries: 1               # Agent 出错时同一个 Agent 只重试 1 次就换 Agent，比默认的 2 次更快换人；
                                  # 检查没过时也最多返工 1 次（两者分开计数）
-    on_agent_error: switch_agent # 重试用完后换一个这个 Task 还没用过的 Agent：先挑档次（tier）不低于当前 Agent 的，
-                                 # 同档次挑成本（cost）低的。按示例的 agents.yaml：
-                                 #   编码的 claude-coder 出错 → 换成 cursor-grok（同为 high，成本更低）
-                                 #   评审的 cursor-grok 出错 → 换成 claude-coder（这时评审和编码是同一个 Agent，
-                                 #   交叉评审就失效了；介意的话在 agents.yaml 里再加一个 high 档次的评审 Agent）
+    on_agent_error: switch_agent # 重试用完后换一个这个 Task 还没用过的 Agent。写了 agent_candidates 的阶段
+                                 # 只在这个阶段的候选里换：先挑档次不低于当前 Agent 的，其中挑成本低的，
+                                 # 再一样就按列表的顺序；没有档次不低于它的，就挑成本低的。按示例的 agents.yaml：
+                                 #   编码的 claude-docs 出错 → 换成 claude-reviewer（档次够的里成本最低）
+                                 #   编码的 claude-reviewer 出错 → 换成 claude-coder（候选里唯一档次不低于 mid 的）
+                                 #   编码的 claude-coder 出错 → 换成 claude-docs（候选里没有 high 的，挑成本最低的；
+                                 #   介意的话在候选里再加一个 high 档次的 Agent，比如启用 agents.yaml 里的 claude-max）
+                                 #   评审的 codex-reviewer 出错 → 换成 cursor-grok；cursor-grok 出错 → 换成 codex-reviewer
+                                 # 评审的候选里没有 Claude，换过 Agent 也还是交叉评审。
+                                 # 只写 agent 的阶段（这里的需求评估）在 agents.yaml 的所有已启用 Agent 里换。
                                  # 换过的 Agent 都出错，Run 结束、标为失败，从 issue 来的过一会儿自动重做
-    on_budget_exceeded: abort    # 花费达到 budget_usd 后结束 Run、标为失败。cursor-agent 不报花费，
-                                 # 要在 agents.yaml 里给 cursor-grok 配 price，它的花费才算得进预算
+    on_budget_exceeded: abort    # 花费达到 budget_usd 后结束 Run、标为失败。cursor-agent 和 Codex 不报花费，
+                                 # 要在 agents.yaml 里给 cursor-grok、codex-reviewer 配 price，它们的花费才算得进预算
     on_exhausted: fail           # 返工或回退用完后结束 Run、标为失败
   max_loops: 3                 # 评审打回、审批驳回后，同一阶段最多回退重做 3 轮
   budget_usd: 30               # 单个 Run 的预算（美元）；不写 = 不限
 
 stages:
+  - id: assess
+    name: 需求评估
+    kind: assess               # 评估给出 go 时同时给出难度 difficulty：low = 局部的小改动，比如改一处文案、补测试；
+                               # mid = 跨模块的行为改动；high = 涉及核心的状态机、git 操作、数据库迁移，
+                               # 或者对正确性要求很高的改动。后面写了 agent_candidates 的阶段按它挑 Agent
+    agent: claude-reviewer     # 以只读方式运行，要用支持只读的 CLI（claude-code、codex）的 Agent；
+                               # 这里写 agent_candidates 也行，每个候选都要支持只读（评估前还没有难度，一般用第一个）
+
   - id: implement
     name: 编码
     kind: agent
-    agent: claude-coder
+    agent_candidates:          # 和 agent 只能写一个。按难度挑（括号里是 tier / cost）：
+      - claude-coder           #   high → claude-coder（high / high），只有它档次够
+      - claude-reviewer        #   mid  → claude-reviewer（mid / mid），比 claude-coder 便宜
+      - claude-docs            #   low  → claude-docs（low / low），最便宜；它是 permission: safe，不能执行命令，
+                               #          检查命令照样由 Master 在它改完后运行，没通过就带着输出返工
+                               #   没有难度 → 列表里第一个 claude-coder：拿不准时交给最强的
+    inputs: [assessment]       # 有需求评估阶段时，后面的编码、评审阶段都要带上 assessment
     instructions: |
       实现目标中描述的需求，并补充必要的测试。
 
   - id: review
     name: 交叉评审
     kind: review
-    agent: cursor-grok         # 和编码不同厂商的模型
-    inputs: [diff]
+    agent_candidates:          # 和编码的候选不重叠，都是别家的模型（重叠时加载会警告评审和编码是同一个 Agent）：
+      - codex-reviewer         #   low、mid、没有难度 → codex-reviewer（mid / mid）：和 cursor-grok 成本一样，按列表顺序
+      - cursor-grok            #   high → cursor-grok（high / mid），只有它档次够
+    inputs: [diff, assessment]
     on_fail: implement
 
   - id: merge

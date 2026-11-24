@@ -9,9 +9,9 @@
 | [`workflows/light.yaml`](workflows/light.yaml) | 轻量：编码 → 评审 → 合并，不做需求评估。适合文档、小改动 |
 | [`workflows/strict.yaml`](workflows/strict.yaml) | 严格：需求评估 → 编码 → 评审 → 人工审批 → 合并。适合生产仓库；编码阶段用 `planning: auto`：需求评估给出的规模是 L 时先把需求拆成几步，再一步一步做、一步一步检查和提交 |
 | [`workflows/with-e2e.yaml`](workflows/with-e2e.yaml) | 带 E2E：编码 → 评审 → E2E（`kind: command`，比如 playwright，或 `docker compose up` 之后探活）→ 合并，E2E 失败时回到编码 |
-| [`workflows/cross-review.yaml`](workflows/cross-review.yaml) | 交叉评审：编码用 Claude、评审用 Grok，Agent 出错时换一个再试 |
+| [`workflows/cross-review.yaml`](workflows/cross-review.yaml) | 交叉评审：需求评估 → 编码 → 评审 → 合并。编码阶段从三个 Claude 的 Agent 里按难度挑（`claude-docs` / `claude-reviewer` / `claude-coder`），评审阶段从别家的 `codex-reviewer`、`cursor-grok` 里挑；Agent 出错时只在这个阶段的候选里换一个再试 |
 
-模板里的 `agent_candidates`（给一个阶段列几个候选 Agent）还没有实现，写了它的模板会被停用，所以交叉评审的示例用 `on_agent_error: switch_agent` 换 Agent，换给谁由 `agents.yaml` 里的 `tier`、`cost` 和顺序决定，模板里的注释写了具体规则。
+`cross-review.yaml` 演示了 `agent_candidates`：一个阶段列几个候选 Agent，Master 按需求评估给出的难度从中挑档次（`tier`）够用、成本（`cost`）最低的一个，模板里的注释写了每种难度会挑到谁。
 
 ## 复制到数据目录
 

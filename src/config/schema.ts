@@ -5,7 +5,11 @@ import { PROPOSAL_SIZES, RISKS } from './flow.js';
 
 export { agentEffort } from './effort.js';
 
-/** Capability / cost level of an agent (later also the difficulty of a task). */
+/**
+ * A level, low < mid < high (`levelRank` in src/config/flow.ts): an agent's capability (`tier`)
+ * and cost (`cost`); a requirement's difficulty (`DIFFICULTIES`) uses the same three values, so a
+ * stage's `agent_candidates` are matched to it by tier.
+ */
 export const Level = z.enum(['low', 'mid', 'high']);
 
 // ---------------------------------------------------------------------------
@@ -249,7 +253,14 @@ export const StageSchema = z.strictObject({
    * nearest earlier agent stage by default) with the command and the end of its output.
    */
   kind: z.enum(['agent', 'review', 'merge', 'placeholder', 'assess', 'command']).default('agent'),
+  /** Agent, review and assess stages: the one agent that always does the stage's work. */
   agent: z.string().optional(),
+  /**
+   * Agent, review and assess stages, instead of `agent`: the agents to pick from by the
+   * requirement's assessed difficulty when a round of the stage starts (`chooseStageAgent` in
+   * src/config/flow.ts); switch_agent then switches only among them. Load rules are in
+   * `validateTemplate` (src/config/load.ts).
+   */
   agent_candidates: z.array(z.string()).optional(),
   /**
    * agent stages: `single` = the whole stage is one task; `llm` = every round, the stage's agent

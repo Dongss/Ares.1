@@ -319,6 +319,48 @@ codex exec --json --skip-git-repo-check --ignore-user-config --ignore-rules --mo
 - Master 解析它的 JSONL 输出：`thread.started` 里的 `thread_id` 是会话 id；`item.completed` 里的 `agent_message` 是回复，`command_execution`、`file_change`、`mcp_tool_call`、`web_search` 显示成工具调用；`turn.completed` 的 `usage` 是 token 用量（`cached_input_tokens` 单独记为缓存，不算进输入）。Codex 的 JSONL 不报实际用的模型，看板上显示配置的模型。
 - 环境变量和别的 Agent 一样去掉了 GitHub 凭据（见「Agent 拿不到 GitHub 凭据」），Master 不另外给它任何凭据。
 
+## 按难度选 Agent
+
+模板里由 Agent 执行的阶段（`kind` 为 `agent`、`review`、`assess`）可以用 `agent` 指定一个 Agent，总由它做；也可以改写 `agent_candidates`，列出几个候选，由 Master 按需求的难度挑一个。小需求交给档次低、便宜的 Agent，同样的预算（`budget_usd`、`daily_budget_usd`）就能做更多 Run，自动侦察、自动采纳和重做也不容易因为当天的预算用完而停下：
+
+```yaml
+stages:
+  - id: assess
+    kind: assess
+    agent: claude-reviewer
+  - id: implement
+    kind: agent
+    agent_candidates: [claude-coder, claude-reviewer, claude-docs]
+    inputs: [assessment]
+```
+
+- 难度来自需求评估：`kind: assess` 给出 go 时还要给出需求的难度 `difficulty`，三档的值在各种语言下都一样：
+  - `low`：局部的小改动，比如改一处文案、补测试；
+  - `mid`：跨模块的行为改动；
+  - `high`：涉及核心的状态机、git 操作、数据库迁移，或者对正确性要求很高的改动。
+
+  评估提示词里的说明和 Run 详情页显示的含义来自 `src/config/flow.ts` 的同一个定义。难度记在讨论记录里，Run 详情页「需求评估」的结论旁边、规模后面显示「难度 mid」和它的含义。起作用的是最近一次 go 的难度；评估没给难度不算出错，照常开工，按没有难度处理；ask、drop 时给了也照样记下，但不起作用。
+- 写了 `agent_candidates` 的阶段每一轮开始时挑一次（规则在 `src/config/flow.ts` 的 `chooseStageAgent`），只看能跑这一轮的候选：已启用（在 `agents.yaml` 里、没被停用），CLI 有对应的 Adapter，这一轮要以只读方式运行（需求评估、要拆分的轮次）时 CLI 还要支持只读。在这些候选里：
+  - 有难度时，在档次（`tier`）不低于难度的候选里挑成本（`cost`）最低的，成本一样就按列表的顺序；
+  - 没有一个候选的档次够时，挑档次最高的，再一样挑成本低的，再一样按列表的顺序；
+  - 没有难度时（模板里没有需求评估阶段，评估没给，Run 的评估是在评估会给出难度之前做的，或者是需求评估阶段自己，它在给出 go 之前还没有难度），用列表里第一个。
+
+  按示例的 `agents.yaml`，上面的编码阶段难度为 `low` 时挑 `claude-docs`（low / low），`mid` 时挑 `claude-reviewer`（mid / mid），`high` 时挑 `claude-coder`（high / high），没有难度时用第一个 `claude-coder`。所以把拿不准时想用的 Agent 写在第一个。
+- 选中的 Agent 做完这一轮：检查没过的返工沿用同一个 Agent，不重新挑；只有出错换 Agent（见下面）会换人。评审打回、审批驳回等回退到这个阶段时，新一轮重新挑一次；难度在 Run 里不变，通常还是同一个，除非这期间 `agents.yaml` 变了（比如候选被停用）。
+- 要拆分的轮次（`planning: llm`，或者规模为 L 时的 `planning: auto`，见下面的「拆分任务」）只在支持只读的候选里挑，拆分和拆出的各步都交给选中的这个 Agent；拆分时换过 Agent，各步也仍由它做。
+- 没有一个候选能跑这一轮时，先交给列表里第一个，它没法启动，按 `on_agent_error` 处理（见下面「Agent 出错时」里的「Agent 不可用」）。
+- 每次挑选都和建这一轮的 Task 在同一个事务里记一条 `agent.selected` 事件，数据有：阶段（`stageId`）、轮次（`round`）、这一轮的第一个 Task（`taskId`，要拆分时是拆分任务）、选中的 Agent（`agentId`）、难度（`difficulty`，没有难度时为 `null`）、为什么选它（`reason`：`fit` = 档次够的里成本最低，`highest` = 没有档次够的、挑了档次最高的，`first` = 没有难度、用第一个，`unavailable` = 没有能用的候选、先交给第一个）和候选列表（`candidates`，模板里的顺序）。Run 详情页的事件里用看板的语言写成一句话，比如「阶段 implement 第 1 轮：按难度 mid，从候选（claude-coder、claude-reviewer、claude-docs）里选了 claude-reviewer：档次够用、成本最低」。只写 `agent` 的阶段不记。
+- 看板的流程图（「配置」页和 Run 详情页）里，写了候选的阶段按模板的顺序列出每个候选的模型、effort、档次和成本，并写明按难度挑选的规则；「说明」页讲到这个阶段由谁做时也写成「按难度从……中选出的 Agent」。
+- 出错换 Agent（`on_agent_error: switch_agent`）时只在这个阶段的候选里换，见下面的「Agent 出错时」。
+- 加载模板时检查，有错误的模板被停用，看板「配置」页写明原因：
+  - `agent` 和 `agent_candidates` 只能写一个；Agent 执行的阶段两个都不写也是错误。
+  - `agent_candidates` 不能是空列表，同一个 Agent 不能写两次。
+  - `command`、`merge`、`placeholder` 阶段不调用 Agent，不能写 `agent_candidates`（也不能写 `agent`）。
+  - 每个候选都要在 `agents.yaml` 里存在且已启用。
+  - 要以只读方式运行的阶段，每个候选都要用支持只读的 CLI（claude-code、codex），因为哪个候选都可能被选中：需求评估阶段，以及 `planning: llm` 或 `auto` 的 Agent 阶段。评审阶段不以只读方式运行，没有这个要求。
+  - 评审阶段的候选和它前面编码阶段的 Agent 或候选有重叠时给出警告：选中的可能正好是写代码的那个，等于评审自己的代码。这只是提醒，模板照常可用。
+- 带 `agent_candidates` 的完整模板见 [`docs/examples/workflows/cross-review.yaml`](examples/workflows/cross-review.yaml)，注释写了每种难度会挑到谁、出错时换给谁。
+
 ## Agent 出错时
 
 Agent 执行出错（CLI 报错、超时等）时怎么处理，由流程模板的 `escalate` 决定，可以写在 `defaults` 里，也可以按阶段写：
@@ -332,12 +374,12 @@ defaults:
 
 - 出错后先等一会儿再用同一个 Agent 重试，最多 `max_retries` 次。第一次等 30 秒，之后每次翻倍，最长 10 分钟。等待期间 Run 仍算在正在执行的 Run 里，占着仓库 `concurrency.per_repo` 的一个名额；暂停、终止或停止 Master 会马上结束等待。出错重试和返工分开计数，`max_retries` 对两者各自生效。
 - 同一个 Agent 的重试用完后，按 `on_agent_error` 处理：
-  - `switch_agent`（默认）：从 `agents.yaml` 里挑一个这个 Task 还没用过、已启用的 Agent 接着做，需求评估阶段和拆分任务（见下面的「拆分任务」）只挑支持只读的。先挑档次（`tier`）不低于当前 Agent 的，同档次里挑成本（`cost`）低的，再一样就按文件里的顺序。换上的 Agent 同样有 `max_retries` 次重试。没有可换的 Agent 时，Run 结束、标为失败。
+  - `switch_agent`（默认）：挑一个这个 Task 还没用过、已启用的 Agent 接着做，需求评估阶段和拆分任务（见下面的「拆分任务」）只挑支持只读的。先挑档次（`tier`）不低于当前 Agent 的，其中挑成本（`cost`）低的，再一样就按顺序；没有档次不低于它的，就在剩下的里挑成本低的。从哪些 Agent 里挑看阶段怎么写：只写 `agent` 时在 `agents.yaml` 的所有 Agent 里挑，按文件里的顺序；写了 `agent_candidates` 时只在这个阶段的候选里挑，按候选列表的顺序，不会换到候选以外的 Agent（见上面的「按难度选 Agent」）。换上的 Agent 同样有 `max_retries` 次重试。没有可换的 Agent 时，Run 结束、标为失败。
   - `retry`：不换 Agent，重试用完后 Run 结束、标为失败。
   - `human`：重试用完后 Run 卡住，等人重试（可以换 Agent）或终止。没人在场时 Run 会一直停在那里，加载模板时会提示改成 `switch_agent`。
 - Run 因此失败时，`error` 里写明最后是哪个 Agent 出了什么错、试过哪些 Agent。工作目录和分支保留，Master 接着做别的；issue 按 `max_run_attempts` 自动重做（见上面的「Run 失败后自动重做」），重做时这个错误会交给新 Run 的 Agent。
 - Agent 不可用（`agents.yaml` 里改了名、删掉、设了 `enabled: false` 或校验失败被停用，没有对应的 Adapter，或者需求评估阶段、拆分任务时它的 CLI 不支持只读）时，Agent 根本没法启动，所以不重试、不消耗重试次数，直接按 `on_agent_error` 处理：
-  - `switch_agent`（默认）：按上面同样的规则换一个可用的 Agent 接着做，需求评估阶段和拆分任务只换到支持只读的；事件列表里记一条 `task.agent_switched`（数据里 `reason` 为 `unavailable`）。原来的 Agent 已不在 `agents.yaml` 里时，不看档次，直接挑成本低的。没有可换的 Agent 时，Run 结束、标为失败。
+  - `switch_agent`（默认）：按上面同样的规则换一个可用的 Agent 接着做，需求评估阶段和拆分任务只换到支持只读的，写了 `agent_candidates` 的阶段只在候选里换；事件列表里记一条 `task.agent_switched`（数据里 `reason` 为 `unavailable`）。原来的 Agent 已不在 `agents.yaml` 里时，不看档次，直接挑成本低的。没有可换的 Agent 时，Run 结束、标为失败。
   - `retry`：用同一个 Agent 重试也不会成功，Run 直接结束、标为失败。
   - `human`：Run 卡住（Agent 不可用），等人确认 Agent 可用或换一个 Agent 后重试。
   - Run 因此失败时，`error` 里写明是哪个 Task、哪个 Agent、为什么不可用，以及按哪种 `on_agent_error` 结束；还没开始执行，工作目录不回滚，和分支一起保留。issue 同样按 `max_run_attempts` 自动重做。
@@ -370,15 +412,17 @@ defaults:
   - `L`：要改多个模块、一次做完容易超时或返工的需求，可能先拆成几步，再一步一步做。
 
   侦察给提案标的大小用的是同一套字母和含义（两处的说明来自 `src/config/flow.ts` 的同一个定义），所以侦察和评估对同一条需求的判断一致。规模记在讨论记录里，Run 详情页「需求评估」的结论旁边显示「规模 L」和它的含义。评估没给规模不算出错，照常开工。ask、drop 时给了规模也照样记下，但不起作用。
+
+  go 时评估还会给出难度 `difficulty`（`low` / `mid` / `high`），写了 `agent_candidates` 的阶段按它挑 Agent，见上面的「按难度选 Agent」。规模决定要不要拆分，难度决定交给哪个 Agent，两者各自判断。
 - `planning: auto` 的阶段每一轮开始时，看这个 Run 最近一次 go 的评估结论：规模是 `L` 就和 `planning: llm` 一样先拆分；`S`、`M`、没给规模，或者模板里没有需求评估阶段时，和 `planning: single` 一样整个阶段是一个 Task，提示词和提交信息也和 `single` 完全一样。评审打回、审批驳回后的新一轮重新判断一次；评估结论在 Run 里不变，所以每一轮的结果都一样。小需求拆分只会多花钱，所以只拆 `L`。Run 详情页里，这种阶段的每一轮都写明按规模拆分了还是没拆；流程图在阶段的「拆分」一行写着它怎么拆分。
 - 下面说的拆分和一步一步执行，对 `planning: llm` 和要拆分时的 `planning: auto` 都一样。
 - 每一轮阶段开始时，先以只读方式运行阶段的 Agent 拆分任务，Run 详情页里是一个叫「拆分任务」的 Task。它读到目标、阶段的 `instructions`、`inputs`（比如 `assessment`），从第 2 轮起还有上一轮被打回的原因和上一轮的计划（见下面），按依赖顺序拆成 1 到 8 步，每一步有标题和说明；需求本来就小时只给一步。拆分不改文件、不运行检查命令、不提交；它留下的改动会被丢掉（记一条 `plan.changes_discarded` 事件）。拆分的结果列在这次执行的检查里。
-- 拆好后，Master 按顺序为每一步建一个 Task，记一条 `stage.planned` 事件，数据里有阶段（`stageId`）、轮次（`round`）、拆分任务的 Task（`taskId`）和各步的标题（`tasks`）。然后一步一步执行，每一步都由阶段的 Agent 做（拆分换过 Agent 也一样）：提示词里有目标、阶段的 `instructions`、这一步的说明和整个计划（哪些已经完成，哪些留给后面的步骤）。已完成的步骤下面附着它的「结果」，也就是做那一步的 Agent 最后一次通过时写的 summary（每条最多 400 字），后面的步骤由此知道前面实际做了什么、做了哪些取舍。做完后照常运行检查命令，通过后单独提交，提交信息里写着「第 2/3 步：标题」；没通过就在这一步里返工，`max_retries` 对每一步各自计算。只拆成一步时，这一步就是整个阶段，提示词和提交信息都和不拆分时一样。
+- 拆好后，Master 按顺序为每一步建一个 Task，记一条 `stage.planned` 事件，数据里有阶段（`stageId`）、轮次（`round`）、拆分任务的 Task（`taskId`）和各步的标题（`tasks`）。然后一步一步执行，每一步都由阶段的 Agent 做（写了 `agent_candidates` 时是这一轮开始时选中的那个；拆分换过 Agent 也一样）：提示词里有目标、阶段的 `instructions`、这一步的说明和整个计划（哪些已经完成，哪些留给后面的步骤）。已完成的步骤下面附着它的「结果」，也就是做那一步的 Agent 最后一次通过时写的 summary（每条最多 400 字），后面的步骤由此知道前面实际做了什么、做了哪些取舍。做完后照常运行检查命令，通过后单独提交，提交信息里写着「第 2/3 步：标题」；没通过就在这一步里返工，`max_retries` 对每一步各自计算。只拆成一步时，这一步就是整个阶段，提示词和提交信息都和不拆分时一样。
 - 步骤的进度在两处能看到：
   - Run 详情页：拆分任务排在这一轮的最前面，每一步的标题前写着「第 2/3 步」，阶段标题旁写着「已完成 1/3 步」（数的是已通过的步骤）。
   - 侦察摘要（侦察提示词里的「最近的 Run」）：拆成几步的轮次先写一行「编码第 1 轮：拆成 3 步」，下面每一步只算自己的执行：返工过的写「第 2/3 步「标题」：执行 2 次，返工原因：…」，没通过的写一行状态（失败，或者 Run 结束时还没执行到、还没做完；Run 被终止或者因为别的原因失败时，没做完的步骤都算后两种），顺利通过的不写；拆分本身返工过也单独写一行「编码第 1 轮的拆分：…」，不算进任何一步。没拆分、只拆成一步的轮次和以前一样，整轮的执行合在一起写一行。这样侦察和人都能看出拆得好不好、卡在哪一步。
 - 拆分出错（CLI 报错、超时）或者输出不符合格式（没有 JSON、步数不在 1 到 8 之间、缺标题或说明）时，按 `on_agent_error` 处理（见上面的「Agent 出错时」），一步也不会建；格式的问题会交给下一次拆分。
-- 拆分要以只读方式运行，所以阶段的 Agent 要用支持只读的 CLI（claude-code、codex），否则加载模板时报错、模板被停用。`planning: auto` 只拆分一部分 Run，但哪个 Run 都可能要拆分，所以同样要求。`planning: llm` 和 `planning: auto` 只能用在 `kind: agent` 阶段，写在评审、需求评估、命令、合并、占位阶段上同样报错。
+- 拆分要以只读方式运行，所以阶段的 Agent 要用支持只读的 CLI（claude-code、codex），写了 `agent_candidates` 时每个候选都要，否则加载模板时报错、模板被停用。`planning: auto` 只拆分一部分 Run，但哪个 Run 都可能要拆分，所以同样要求。`planning: llm` 和 `planning: auto` 只能用在 `kind: agent` 阶段，写在评审、需求评估、命令、合并、占位阶段上同样报错。
 - 评审打回、审批驳回、命令阶段失败或合并冲突回退到这个阶段时，新一轮重新拆分；打回的原因既交给拆分，也交给每一步。新一轮的拆分还会读到这个阶段上一轮的计划：每一步的标题、说明、是否通过和「结果」（summary，每条最多 400 字；没通过的步骤没有）。上一轮没有拆分时，整个阶段算一步；只拆成一步的也照样写上；拆分格式出错后重试的每一次都有。上一轮通过的步骤都已经提交，改动还在工作目录里，所以提示词要求拆分只列出这次需要做的修改步骤：改正打回的问题、补上没通过的步骤，不要重做已经通过、和打回原因无关的步骤。拆分输出的格式和之后依次执行的方式都不变。
 - 拆分进行到一半被暂停、Master 重启或崩溃时，恢复后重新拆分。各步的 Task 和拆分的结果在同一个事务里记下，不会重复，也不会只建一半。
 - 默认的 `self-dev.yaml` 的编码阶段是 `planning: auto`。数据目录里已经装好的 `workflows/self-dev.yaml` 不会自动更新，旧版本写的是 `planning: single`：想让大需求先拆分，就手动把编码阶段的 `planning: single` 改成 `planning: auto`（编码阶段的 Agent 要用支持只读的 CLI，默认的 `claude-coder` 就是）。保存后 Master 自动重新加载，新建的 Run 生效；已经建好的 Run 仍按建 Run 时的模板走。给 Ares.1 自己用的，也可以删掉数据目录里那份，改用仓库自带的 `.ares1/workflows/self-dev.yaml`（见「从数据目录的模板切换到仓库自带的」）。带 `planning: auto` 的完整模板见 [`docs/examples/workflows/strict.yaml`](examples/workflows/strict.yaml) 的编码阶段。

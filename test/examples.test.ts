@@ -4,10 +4,13 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { parse as parseYaml } from 'yaml';
 import { defaultSelfDevYaml } from '../src/config/defaults.js';
+import { chooseStageAgent } from '../src/config/flow.js';
 import { homePaths, loadConfig, validateTemplate } from '../src/config/load.js';
 import { TemplateSchema } from '../src/config/schema.js';
+import { switchCandidate } from '../src/engine/engine.js';
 import { setLang } from '../src/i18n.js';
 import { BUILTIN_CLIS, BUILTIN_READ_ONLY_CLIS } from '../src/master.js';
+import { DIFFICULTIES, type Difficulty } from '../src/store/types.js';
 
 // docs/examples is laid out like a Master home. Loading it reads config.yaml, agents.yaml and
 // workflows/ only and writes nothing, so the directory is used in place.
@@ -94,6 +97,51 @@ describe('configuration examples (docs/examples)', () => {
     );
     expect(bySize.length).toBeGreaterThan(0);
     for (const tpl of bySize) expect(tpl.stages.some((s) => s.kind === 'assess')).toBe(true);
+  });
+
+  it('shows stages picking their agent by difficulty from agent_candidates', () => {
+    const cfg = loadExamples();
+    const tpl = cfg.templates.get('cross-review');
+    // A difficulty comes from an assessment, so the template has one.
+    expect(tpl?.stages.some((s) => s.kind === 'assess')).toBe(true);
+    const stage = (id: string) => {
+      const s = tpl?.stages.find((x) => x.id === id);
+      expect(s?.agent_candidates, id).toBeDefined();
+      return s?.agent_candidates ?? [];
+    };
+    const pick = (id: string, difficulty: Difficulty | undefined) =>
+      chooseStageAgent(stage(id), cfg.agents, difficulty, () => true)?.id;
+    // What the template's comments say each difficulty picks.
+    expect(DIFFICULTIES.map((d) => pick('implement', d))).toEqual([
+      'claude-docs',
+      'claude-reviewer',
+      'claude-coder',
+    ]);
+    expect(pick('implement', undefined)).toBe('claude-coder');
+    expect(DIFFICULTIES.map((d) => pick('review', d))).toEqual([
+      'codex-reviewer',
+      'codex-reviewer',
+      'cursor-grok',
+    ]);
+    expect(pick('review', undefined)).toBe('codex-reviewer');
+    // What the comments say switch_agent switches each candidate to, among the stage's candidates.
+    const switched = (id: string, from: string) =>
+      switchCandidate(
+        stage(id).flatMap((a) => cfg.agents.get(a) ?? []),
+        cfg.agents.get(from),
+        new Set([from]),
+        () => true,
+      )?.id;
+    expect(switched('implement', 'claude-docs')).toBe('claude-reviewer');
+    expect(switched('implement', 'claude-reviewer')).toBe('claude-coder');
+    expect(switched('implement', 'claude-coder')).toBe('claude-docs');
+    expect(switched('review', 'codex-reviewer')).toBe('cursor-grok');
+    expect(switched('review', 'cursor-grok')).toBe('codex-reviewer');
+    // Cross review: no reviewer is of the coders' CLI, also after switching among candidates.
+    const coderClis = new Set(stage('implement').map((id) => cfg.agents.get(id)?.cli));
+    for (const id of stage('review')) {
+      expect(coderClis.has(cfg.agents.get(id)?.cli), id).toBe(false);
+    }
   });
 
   it('agents.yaml shows the kinds of agents the README lists', () => {

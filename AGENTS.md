@@ -128,7 +128,10 @@ test/
 - Each rule lives in one place, shared by engine and dashboard:
   - rollback targets, effective settings, auto-accepted proposals, the automatic scout's back-off
     and what it waits for, whether a stage round is split into tasks (`plansStage`; the size it
-    goes by is `assessedSize` in `src/engine/discussion.ts`), rate-limit waits of Runs and scouts,
+    goes by is `assessedSize` in `src/engine/discussion.ts`), which agents a stage may run with
+    and which of them does a round by the requirement's difficulty (`stageAgentIds` /
+    `chooseStageAgent`; the difficulty it goes by is `assessedDifficulty` in
+    `src/engine/discussion.ts`), rate-limit waits of Runs and scouts,
     the redo wait (`redoDelayMs` / `redoDueAt`), raw log retention (`runRawLogsExpired` /
     `scoutRawLogExpired`), leftover worktrees (`leftoverWorkspaces`), which template a repo's
     Runs get by id, the home directory's or the repo's own (`resolveTemplate`), and the like:
