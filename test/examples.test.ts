@@ -80,13 +80,19 @@ describe('configuration examples (docs/examples)', () => {
   it('shows an agent stage split into tasks by its own agent, run read-only', () => {
     const cfg = loadExamples();
     const planned = [...cfg.templates.values()].flatMap((tpl) =>
-      tpl.stages.filter((s) => s.planning === 'llm'),
+      tpl.stages.filter((s) => s.planning !== 'single'),
     );
     expect(planned.length).toBeGreaterThan(0);
     for (const stage of planned) {
       expect(stage.kind).toBe('agent');
       expect(BUILTIN_READ_ONLY_CLIS).toContain(cfg.agents.get(stage.agent ?? '')?.cli);
     }
+    // Planning by size goes by an assessment, so its template has one.
+    const bySize = [...cfg.templates.values()].filter((tpl) =>
+      tpl.stages.some((s) => s.planning === 'auto'),
+    );
+    expect(bySize.length).toBeGreaterThan(0);
+    for (const tpl of bySize) expect(tpl.stages.some((s) => s.kind === 'assess')).toBe(true);
   });
 
   it('agents.yaml shows the kinds of agents the README lists', () => {

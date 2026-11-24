@@ -49,6 +49,8 @@ export interface FlowStage extends FlowStageRef {
   commands: string[] | null;
   /** The commands are the repo default, not the stage's own. */
   commandsFromRepo: boolean;
+  /** Whether an agent stage splits its rounds into steps (`planning`); null for other stages. */
+  planning: StageDef['planning'] | null;
   /** How many times a task is reworked before giving up (agent stages). */
   maxRetries: number;
   /** What happens once the reworks are used up: the Run fails, or waits for a human. */
@@ -131,6 +133,7 @@ export function buildFlow({
             },
       commands,
       commandsFromRepo: usesRepoDefault,
+      planning: def.kind === 'agent' ? def.planning : null,
       maxRetries: eff.escalate.max_retries,
       onExhausted: eff.escalate.on_exhausted,
       replyTimeoutHours: def.kind === 'assess' ? replyTimeoutHours(def) : null,
@@ -169,6 +172,26 @@ export function reworkText(
         en: `${times}, then the Run ends as failed (a Run from an issue is redone)`,
       })
     : t({ zh: `${times}，仍不通过时等人处理`, en: `${times}, then wait for a human` });
+}
+
+/**
+ * How an agent stage splits its rounds into steps (`planning`); null when it does not (`single`,
+ * or a stage of another kind).
+ */
+export function planningText(planning: StageDef['planning'] | null): string | null {
+  if (planning === 'llm') {
+    return t({
+      zh: '每一轮先由 Agent 只读地拆成几步，再一步一步做、检查和提交',
+      en: 'Every round, the agent first splits it read-only into steps, each then done, checked and committed on its own',
+    });
+  }
+  if (planning === 'auto') {
+    return t({
+      zh: '按需求规模：需求评估给出的规模为 L 时先拆成几步再一步一步做，S、M 或没有规模时一次做完',
+      en: "By the requirement's size: split into steps done one by one when the assessment sized it L; done in one go for S, M or no size",
+    });
+  }
+  return null;
 }
 
 /**

@@ -33,9 +33,10 @@ stages:
     name: 编码
     kind: agent
     agent: claude-coder
-    planning: llm              # 先拆分再做：每一轮开始时，这个 Agent 以只读方式把需求按依赖顺序拆成 1 到 8 步，
-                               # 每一步单独执行、单独跑检查命令、单独提交；需求小就只拆一步。拆分要只读运行，
-                               # 只能用 claude-code 的 Agent。不写 = single：整个阶段一个 Task，一次做完
+    planning: auto             # 按需求评估给出的规模拆分：规模是 L（要改多个模块）时，每一轮开始时这个 Agent 以只读方式
+                               # 把需求按依赖顺序拆成 1 到 8 步，每一步单独执行、单独跑检查命令、单独提交；规模是 S、M
+                               # 或没给时整个阶段一个 Task，一次做完。llm = 不看规模，每一轮都拆分。拆分要只读运行，
+                               # 只能用 claude-code 的 Agent。不写 = single：从不拆分，整个阶段一个 Task，一次做完
     inputs: [assessment]       # 有需求评估阶段时，后面的编码、评审阶段都要带上 assessment：
                                # 讨论后修改的需求只通过它交给 Agent（漏了加载时会警告）
     instructions: |

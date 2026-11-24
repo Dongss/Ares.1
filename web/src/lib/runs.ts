@@ -19,6 +19,7 @@ import {
   type DiscussionEntry,
   type EventRow,
   FINISHED_RUN_STATUSES,
+  type RequirementSize,
   type Run,
 } from '../../../src/store/types.js';
 import { formatTime, missingCommandText, type Tone } from './format.js';
@@ -232,6 +233,29 @@ export function assessmentHeadline(
     };
   }
   return { label: t({ zh: '重新评估中', en: 'Reassessing' }), tone: 'active', conclusion: null };
+}
+
+/**
+ * 「规模 L」 and what the size means, shown beside the assessment's conclusion; null when the
+ * round gave no size (left out, or recorded before assessments gave sizes).
+ */
+export function sizeText(
+  size: RequirementSize | undefined,
+): { label: string; meaning: string } | null {
+  if (!size) return null;
+  const meanings: Record<RequirementSize, string> = t({
+    zh: {
+      S: '一处小改动',
+      M: '一个 Run 能做完的普通需求',
+      L: '要改多个模块，一次做完容易超时或返工',
+    },
+    en: {
+      S: 'One small change',
+      M: 'An ordinary requirement one Run can finish',
+      L: 'Changes across several modules, likely to time out or need rework in one go',
+    },
+  });
+  return { label: t({ zh: `规模 ${size}`, en: `Size ${size}` }), meaning: meanings[size] };
 }
 
 /**

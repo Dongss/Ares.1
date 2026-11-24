@@ -699,6 +699,23 @@ export function formatDiscussion(discussion: readonly DiscussionEntry[], level =
 }
 
 /**
+ * How an assessment that goes ahead sizes the requirement (`size`, `REQUIREMENT_SIZES`). A stage
+ * with `planning: auto` splits only an L into steps.
+ */
+function sizeRule(): string {
+  return t({
+    zh: `verdict 为 go 时还要给出 size，估计需求的规模，只能是 S、M、L 三个字母之一：
+- S：一处小改动，比如改一个函数、一段文字或一项配置；
+- M：一个 Run 能做完的普通需求；
+- L：要改多个模块，一次做完容易超时或返工的需求；这样的需求可能先拆成几步，再一步一步做。`,
+    en: `With verdict go, also give size, how big you judge the requirement, as one of the letters S, M and L:
+- S: one small change, such as a function, a passage of text or a setting;
+- M: an ordinary requirement one Run can finish;
+- L: changes across several modules, likely to time out or need rework when done in one go; such a requirement may be split into steps done one after another.`,
+  });
+}
+
+/**
  * The conclusion and output format of the round after nobody replied in time: go with the
  * assumptions written down, or drop; asking again is not accepted (`assessmentProblem`).
  */
@@ -717,6 +734,8 @@ ${why}，这一轮由你自己决定，不能再给 ask。verdict 二选一：
 - go（开工）：按你认为最合理的理解开工。summary 写评估意见，并逐条写明你对之前的疑问做了哪些假设；后面的编码和评审会读到 summary，按这些假设去做。不要写 revisedGoal。
 - drop（不做）：认为不该做时给出，summary 写明理由。
 
+${sizeRule()}
+
 summary 用中文书写。
 
 ## 输出格式
@@ -724,7 +743,7 @@ summary 用中文书写。
 最后一条回复以一个 JSON 代码块结束：
 
 \`\`\`json
-{"verdict": "go", "summary": "评估意见，以及对每个疑问做了什么假设"}
+{"verdict": "go", "size": "M", "summary": "评估意见，以及对每个疑问做了什么假设"}
 \`\`\`
 `,
     en: `## Conclusion
@@ -733,6 +752,8 @@ ${why}, so you decide this round on your own, and ask is not allowed. Pick one v
 - go: start on what you think is the most sensible reading. Write your assessment in summary, and for each of the earlier questions the assumption you made; coding and review read summary and go by these assumptions. Do not write revisedGoal.
 - drop: when you think it should not be done; give the reasons in summary.
 
+${sizeRule()}
+
 Write summary in English.
 
 ## Output format
@@ -740,7 +761,7 @@ Write summary in English.
 End your last reply with a JSON code block:
 
 \`\`\`json
-{"verdict": "go", "summary": "your assessment, and the assumption made for each question"}
+{"verdict": "go", "size": "M", "summary": "your assessment, and the assumption made for each question"}
 \`\`\`
 `,
   });
@@ -832,15 +853,19 @@ verdict 三选一：
 - ask（需要讨论）：有疑问或顾虑，要人回答或确认。questions 列出疑问和顾虑，suggestions 写建议怎么改。认为不该做时也给 ask，在 summary 里写明理由，并在 questions 里请人确认是否不做。
 - drop（不做）：${replied ? '只有讨论记录里人已经同意不做时才能给出，summary 写明理由。' : '还没有和人讨论过，不能给出 drop；认为不该做就给 ask。'}
 
+${sizeRule()}
+
 summary、questions、suggestions 和 revisedGoal 都用中文书写。
 
 ## 输出格式
 
-最后一条回复以一个 JSON 代码块结束：
+最后一条回复以一个 JSON 代码块结束，例如：
 
 \`\`\`json
 {"verdict": "ask", "summary": "评估意见", "questions": ["疑问或顾虑"], "suggestions": ["建议怎么改"]}
 \`\`\`
+
+go 时写成 \`{"verdict": "go", "size": "M", "summary": "评估意见"}\` 这样。
 `,
     en: `## Conclusion
 
@@ -849,15 +874,19 @@ Pick one verdict:
 - ask: there are questions or concerns for the human to answer or confirm. List them in questions, and how you suggest changing it in suggestions. Also give ask when you think it should not be done, with the reasons in summary and a question asking the human to confirm dropping it.
 - drop: ${replied ? 'only when the human has agreed in the discussion not to do it; give the reasons in summary.' : 'not allowed before any discussion with the human; give ask when you think it should not be done.'}
 
+${sizeRule()}
+
 Write summary, questions, suggestions and revisedGoal in English.
 
 ## Output format
 
-End your last reply with a JSON code block:
+End your last reply with a JSON code block, for example:
 
 \`\`\`json
 {"verdict": "ask", "summary": "your assessment", "questions": ["a question or concern"], "suggestions": ["how to change it"]}
 \`\`\`
+
+With go, it looks like \`{"verdict": "go", "size": "M", "summary": "your assessment"}\`.
 `,
   })}`;
 }

@@ -5439,3 +5439,144 @@ agents:
     ]);
   });
 });
+
+describe('engine: planning: auto', () => {
+  /** `yaml` whose coding stage has `planning: <planning>`. */
+  const withPlanning = (yaml: string, planning: 'auto' | 'single') => {
+    const changed = yaml.replace(
+      '    kind: agent\n    agent: coder\n',
+      `    kind: agent\n    agent: coder\n    planning: ${planning}\n`,
+    );
+    expect(changed).not.toBe(yaml);
+    return changed;
+  };
+  /**
+   * The coder: read-only it plans `titles`; otherwise it writes the file its step names (if any)
+   * and feature.txt, which the verify command looks for, different every time.
+   */
+  const coder = (titles: string[]): Script => {
+    let calls = 0;
+    return (ctx) => {
+      if (ctx.input.readOnly) {
+        const tasks = titles.map((title) => ({ title, instructions: `写 ${title}.txt` }));
+        return { finalMessage: `\`\`\`json\n${JSON.stringify({ tasks })}\n\`\`\`` };
+      }
+      calls++;
+      const file = /写 (\S+\.txt)/.exec(ctx.input.prompt)?.[1];
+      if (file) writeFile(join(ctx.input.workdir, file), `step ${calls}\n`);
+      writeFile(join(ctx.input.workdir, 'feature.txt'), `ok ${calls}\n`);
+      return done(file ? `写了 ${file}` : '写了 feature.txt');
+    };
+  };
+  const implementTasks = (t: Harness, runId: string) =>
+    t.master.store
+      .listStageRuns(runId)
+      .filter((sr) => sr.stageId === 'implement')
+      .map((sr) => t.master.store.listTasks(sr.id).map((task) => [task.kind, task.title]));
+
+  it('splits the coding of a requirement sized L every round, then does the steps in order', async () => {
+    let reviews = 0;
+    h = await harness({
+      agents: ASSESS_AGENTS_YAML,
+      workflow: withPlanning(ASSESS_WORKFLOW_YAML, 'auto'),
+      scripts: {
+        assessor: () => assessment('go', { size: 'L' }),
+        coder: coder(['a', 'b']),
+        // Sends the first round back: the next round is split again.
+        reviewer: () =>
+          ++reviews === 1 ? review([{ severity: 'must', description: '补上 c' }]) : review(),
+      },
+    });
+    const run = h.run();
+    const completed = await h.waitStatus(run.id, 'completed');
+    expect(completed.discussion).toMatchObject([{ role: 'assessor', verdict: 'go', size: 'L' }]);
+    expect(h.fake.calls.map((c) => [c.model, c.readOnly === true])).toEqual([
+      ['assessor', true],
+      ['coder', true],
+      ['coder', false],
+      ['coder', false],
+      ['reviewer', false],
+      ['coder', true],
+      ['coder', false],
+      ['coder', false],
+      ['reviewer', false],
+    ]);
+    const round = [
+      ['plan', '拆分任务'],
+      ['work', 'a'],
+      ['work', 'b'],
+    ];
+    expect(implementTasks(h, run.id)).toEqual([round, round]);
+    const [, , second] = h.master.store.listTasks(
+      h.master.store.listStageRuns(run.id).find((sr) => sr.stageId === 'implement')?.id ?? '',
+    ) as [Task, Task, Task];
+    expect(git(h.repoDir, 'log', '-1', '--format=%B', second.commitSha as string)).toContain(
+      '编码: 添加 feature.txt\n\n第 2/2 步：b\n\n写了 b.txt',
+    );
+  });
+
+  it.each([
+    ['S', 'S'],
+    ['M', 'M'],
+    ['no', undefined],
+  ] as const)(
+    'does the coding of a requirement with %s size as one task, just as planning: single',
+    async (_name, size) => {
+      /** What the coder was prompted and committed with the coding stage planning so. */
+      const codingOf = async (planning: 'auto' | 'single') => {
+        const t = await harness({
+          agents: ASSESS_AGENTS_YAML,
+          workflow: withPlanning(ASSESS_WORKFLOW_YAML, planning),
+          scripts: {
+            assessor: () => assessment('go', size ? { size } : {}),
+            coder: coder(['a', 'b']),
+            reviewer: () => review(),
+          },
+        });
+        h = t;
+        const run = t.run();
+        const completed = await t.waitStatus(run.id, 'completed');
+        expect(completed.discussion).toHaveLength(1);
+        expect((completed.discussion[0] as { size?: string }).size).toBe(size);
+        expect(t.fake.calls.map((c) => [c.model, c.readOnly === true])).toEqual([
+          ['assessor', true],
+          ['coder', false],
+          ['reviewer', false],
+        ]);
+        expect(implementTasks(t, run.id)).toEqual([[['work', '编码']]]);
+        const [task] = t.master.store.listTasks(
+          t.master.store.listStageRuns(run.id).find((sr) => sr.stageId === 'implement')?.id ?? '',
+        ) as [Task];
+        // The Run's id is all that may differ.
+        const coded = {
+          prompt: t.fake.calls[1]?.prompt.replaceAll(run.id, '<run>'),
+          message: git(t.repoDir, 'log', '-1', '--format=%B', task.commitSha as string).replaceAll(
+            run.id,
+            '<run>',
+          ),
+        };
+        await t.close();
+        h = undefined;
+        return coded;
+      };
+      const auto = await codingOf('auto');
+      const single = await codingOf('single');
+      expect(auto.message.startsWith('编码: 添加 feature.txt\n\n写了 feature.txt')).toBe(true);
+      expect(auto).toEqual(single);
+    },
+  );
+
+  it('does the coding as one task in a template without an assessment', async () => {
+    h = await harness({
+      workflow: withPlanning(TEST_WORKFLOW_YAML, 'auto'),
+      scripts: { coder: coder(['a', 'b']), reviewer: () => review() },
+    });
+    const run = h.run();
+    await h.waitStatus(run.id, 'waiting_approval');
+    expect(h.fake.calls.map((c) => [c.model, c.readOnly === true])).toEqual([
+      ['coder', false],
+      ['reviewer', false],
+    ]);
+    expect(implementTasks(h, run.id)).toEqual([[['work', '编码']]]);
+  });
+});

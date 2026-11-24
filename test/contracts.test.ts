@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  ASSESS_REPORT_JSON_SCHEMA,
+  AssessReportSchema,
   deniedOperations,
   extractStructured,
   formatPlan,
@@ -124,6 +126,27 @@ describe('agent output contracts', () => {
       properties: { tasks: { type: 'array', minItems: 1, maxItems: MAX_PLAN_TASKS } },
     });
     expect(PLAN_REPORT_JSON_SCHEMA).not.toHaveProperty('$schema');
+  });
+
+  it('takes an optional size of S, M or L in an assessment', () => {
+    const base = { verdict: 'go', summary: 'fine' };
+    for (const size of ['S', 'M', 'L']) {
+      const parsed = parseReport(AssessReportSchema, { ...base, size }, '');
+      expect(parsed.ok && parsed.value.size).toBe(size);
+    }
+    const without = parseReport(AssessReportSchema, base, '');
+    expect(without.ok && without.value.size).toBeUndefined();
+    // Also with ask and drop.
+    expect(
+      parseReport(AssessReportSchema, { verdict: 'drop', summary: 's', size: 'M' }, '').ok,
+    ).toBe(true);
+    for (const size of ['XL', 's', '', 3]) {
+      expect(parseReport(AssessReportSchema, { ...base, size }, '').ok).toBe(false);
+    }
+    expect(ASSESS_REPORT_JSON_SCHEMA).toMatchObject({
+      properties: { size: { type: 'string', enum: ['S', 'M', 'L'] } },
+    });
+    expect((ASSESS_REPORT_JSON_SCHEMA as { required: string[] }).required).not.toContain('size');
   });
 });
 

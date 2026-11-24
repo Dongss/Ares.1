@@ -8,6 +8,7 @@ import {
   leftoverWorkspaces,
   limitedScout,
   loopsExhausted,
+  plansStage,
   RATE_LIMIT_WAIT,
   REDO_BACKOFF_MAX_HOURS,
   rateLimitDelayMs,
@@ -82,6 +83,8 @@ describe('config', () => {
     // Coding and review work from the requirement as the assessment confirmed it.
     expect(t?.stages.find((s) => s.id === 'implement')?.inputs).toEqual(['assessment']);
     expect(t?.stages.find((s) => s.id === 'review')?.inputs).toEqual(['diff', 'assessment']);
+    // Coding is split into steps when the assessment sized the requirement L.
+    expect(t?.stages.find((s) => s.id === 'implement')?.planning).toBe('auto');
     // The assessment runs read-only, which only some CLIs can.
     expect(loadConfig(paths, ['claude-code']).errors['workflows/self-dev.yaml']?.[0]).toMatch(
       /assess（需求评估）阶段要以只读方式运行/,
@@ -684,6 +687,76 @@ stages:
     ]);
   });
 
+  it('checks planning: auto as planning: llm, naming the value it has', () => {
+    const paths = home();
+    writeFile(
+      paths.agentsFile,
+      `agents:
+  claude: { cli: claude-code, model: opus }
+  grok: { cli: cursor-agent, model: grok-4.7-high }
+`,
+    );
+    const files: Record<string, string> = {
+      'self-dev.yaml': `id: ok
+stages:
+  - { id: assess, kind: assess, agent: claude }
+  - { id: implement, agent: claude, planning: auto, inputs: [assessment] }
+`,
+      'no-assess.yaml': `id: ok2
+stages:
+  - { id: implement, agent: claude, planning: auto }
+`,
+      'cursor.yaml': `id: a2
+stages:
+  - { id: implement, agent: grok, planning: auto }
+`,
+      'review.yaml': `id: a3
+stages:
+  - { id: implement, agent: claude }
+  - { id: review, kind: review, agent: grok, planning: auto }
+`,
+      'command.yaml': `id: a4
+stages:
+  - { id: implement, agent: claude }
+  - { id: e2e, kind: command, planning: auto, verify: { commands: ['npm test'] } }
+`,
+    };
+    for (const [file, yaml] of Object.entries(files)) {
+      writeFile(join(paths.workflowsDir, file), yaml);
+    }
+    const load = () => loadConfig(paths, ['claude-code', 'cursor-agent'], ['claude-code']);
+    const cfg = load();
+    const errors = (file: string) => cfg.errors[`workflows/${file}`];
+    expect(errors('self-dev.yaml')).toBeUndefined();
+    expect(cfg.warnings['workflows/self-dev.yaml']).toBeUndefined();
+    expect(cfg.templates.get('ok')?.stages[1]?.planning).toBe('auto');
+    // Without an assessment it never splits, which is no error.
+    expect(errors('no-assess.yaml')).toBeUndefined();
+    expect(cfg.warnings['workflows/no-assess.yaml']).toBeUndefined();
+    expect(errors('cursor.yaml')).toEqual([
+      '阶段 implement：planning: auto 先以只读方式运行阶段的 Agent 来拆分任务，Agent grok 的 CLI cursor-agent 不支持，请换用 claude-code 的 Agent',
+    ]);
+    expect(errors('review.yaml')).toEqual([
+      '阶段 review：planning: auto（拆分任务）只能用在 agent（编码）阶段，review 阶段不能用',
+    ]);
+    expect(errors('command.yaml')).toEqual([
+      '阶段 e2e：command（命令）阶段只运行命令、不调用 Agent，不能指定 planning: auto',
+    ]);
+    expect([...cfg.templates.keys()].sort()).toEqual(['ok', 'ok2']);
+
+    writeFile(paths.configFile, 'language: en\n');
+    const en = load();
+    expect(en.errors['workflows/cursor.yaml']).toEqual([
+      "Stage implement: planning: auto first runs the stage's agent read-only to split the stage into tasks, which the CLI cursor-agent of agent grok does not support; use an agent of claude-code",
+    ]);
+    expect(en.errors['workflows/review.yaml']).toEqual([
+      'Stage review: planning: auto (splitting the stage into tasks) only applies to agent stages, not to a review stage',
+    ]);
+    expect(en.errors['workflows/command.yaml']).toEqual([
+      'Stage e2e: a command stage only runs commands and calls no agent, it cannot have planning: auto',
+    ]);
+  });
+
   it('reads how long an assess stage waits for a reply: 24 hours unless it says otherwise', () => {
     const stage = (extra: object) =>
       TemplateSchema.safeParse({
@@ -1241,6 +1314,40 @@ stages:
     expect(stageVerifyCommands(stage('code'), ['npm run lint'])).toEqual(['npm test']);
     expect(stageVerifyCommands(stage('review'), ['npm run lint'])).toEqual([]);
     expect(stageVerifyCommands(stage('merge'), ['npm run lint'])).toEqual(['npm run lint']);
+  });
+});
+
+describe('plansStage', () => {
+  const SIZES = [undefined, 'S', 'M', 'L'] as const;
+
+  it('splits planning: llm always, auto only for an L, single never', () => {
+    for (const size of SIZES) {
+      expect(plansStage({ kind: 'agent', planning: 'llm' }, size)).toBe(true);
+      expect(plansStage({ kind: 'agent', planning: 'auto' }, size)).toBe(size === 'L');
+      expect(plansStage({ kind: 'agent', planning: 'single' }, size)).toBe(false);
+    }
+  });
+
+  it('never splits stages other than agent stages', () => {
+    const kinds = ['review', 'assess', 'merge', 'command', 'placeholder'] as const;
+    for (const kind of kinds) {
+      for (const planning of ['single', 'llm', 'auto'] as const) {
+        expect(plansStage({ kind, planning }, 'L')).toBe(false);
+      }
+    }
+  });
+
+  it('takes a stage as the template parses it: single unless it says', () => {
+    const t = TemplateSchema.parse({
+      id: 't',
+      stages: [
+        { id: 'a', agent: 'x' },
+        { id: 'b', agent: 'x', planning: 'auto' },
+      ],
+    });
+    expect(plansStage(effectiveStage(t, 'a', {}).def, 'L')).toBe(false);
+    expect(plansStage(effectiveStage(t, 'b', {}).def, 'L')).toBe(true);
+    expect(plansStage(effectiveStage(t, 'b', {}).def, 'M')).toBe(false);
   });
 });
 

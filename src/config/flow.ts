@@ -1,5 +1,5 @@
-// How a workflow template flows: effective stage settings, budgets, verify commands and rollback
-// targets; also the overrides of Runs from issues, which proposals are accepted automatically, how
+// How a workflow template flows: effective stage settings, budgets, verify commands, rollback
+// targets and which stage rounds are split into tasks; also the overrides of Runs from issues, which proposals are accepted automatically, how
 // long the automatic scout backs off and which Runs it waits for, after how many failed scouts in
 // a row a human is notified, how long a failed Run of an issue waits before it is redone, how long
 // a Run or a scout waits for an agent that is out of quota or rate-limited, how long the raw
@@ -14,6 +14,7 @@ import {
   type Attempt,
   type EventRow,
   FINISHED_RUN_STATUSES,
+  type RequirementSize,
   type Run,
   type Scout,
 } from '../store/types.js';
@@ -223,6 +224,20 @@ export function budgetPauses(template: WorkflowTemplate, overrides: RunOverrides
       runsAgent(s.kind) &&
       effectiveStage(template, s.id, overrides).escalate.on_budget_exceeded === 'pause',
   );
+}
+
+/**
+ * Whether a round of the stage first splits it into tasks (a plan task, then one work task per
+ * step) rather than doing it as one task: agent stages with `planning: llm` always; with
+ * `planning: auto` only when the requirement's assessed size (`assessedSize`) is L, as splitting
+ * a smaller one only costs more. Without an assessment, or one that gave no size, it is not split.
+ */
+export function plansStage(
+  def: Pick<StageDef, 'kind' | 'planning'>,
+  size: RequirementSize | undefined,
+): boolean {
+  if (def.kind !== 'agent') return false;
+  return def.planning === 'llm' || (def.planning === 'auto' && size === 'L');
 }
 
 /**

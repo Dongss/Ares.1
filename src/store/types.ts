@@ -193,6 +193,14 @@ export interface FailedAttempt {
  */
 export type AssessVerdict = 'go' | 'ask' | 'drop';
 
+/**
+ * How big an assessment judged the requirement: S one small change, M an ordinary requirement one
+ * Run finishes, L changes across several modules, likely to time out or run out of reworks in one
+ * go. The same letters in every language.
+ */
+export const REQUIREMENT_SIZES = ['S', 'M', 'L'] as const;
+export type RequirementSize = (typeof REQUIREMENT_SIZES)[number];
+
 /** The result of one round of a requirement assessment. */
 export interface AssessmentEntry {
   role: 'assessor';
@@ -206,6 +214,11 @@ export interface AssessmentEntry {
   suggestions: string[];
   /** go after a discussion that changed the requirement: the complete new requirement. */
   revisedGoal: string | null;
+  /**
+   * How big the agent judged the requirement (asked for with go). Missing when it gave none, and
+   * in entries recorded before assessments gave sizes.
+   */
+  size?: RequirementSize;
   /** The agent said drop before any human reply; a human is asked to confirm instead. */
   proposedDrop: boolean;
   /**

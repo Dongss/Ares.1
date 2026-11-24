@@ -16,6 +16,7 @@ import {
   rawLogPrunedText,
   redoText,
   replyDeadlineOf,
+  sizeText,
   splitPatch,
   untrustedIssueText,
   workspaceLines,
@@ -376,6 +377,32 @@ describe('requirement assessment', () => {
     } finally {
       setLang('zh');
     }
+  });
+
+  it('shows the size beside the conclusion, with what it means', () => {
+    expect(sizeText(undefined)).toBeNull();
+    expect(sizeText('S')).toEqual({ label: '规模 S', meaning: '一处小改动' });
+    expect(sizeText('M')).toEqual({ label: '规模 M', meaning: '一个 Run 能做完的普通需求' });
+    expect(sizeText('L')).toEqual({
+      label: '规模 L',
+      meaning: '要改多个模块，一次做完容易超时或返工',
+    });
+    // The page shows the size of the conclusion it heads with.
+    const sized = assessed({ verdict: 'go', questions: [], size: 'L' });
+    expect(
+      assessmentHeadline({ discussion: [sized], status: 'running', blocked: null }),
+    ).toMatchObject({ conclusion: { size: 'L' } });
+    setLang('en');
+    const english = (['S', 'M', 'L'] as const).map((size) => sizeText(size));
+    expect(english).toEqual([
+      { label: 'Size S', meaning: 'One small change' },
+      { label: 'Size M', meaning: 'An ordinary requirement one Run can finish' },
+      {
+        label: 'Size L',
+        meaning: 'Changes across several modules, likely to time out or need rework in one go',
+      },
+    ]);
+    expect(JSON.stringify(english)).not.toMatch(/[一-鿿]/);
   });
 });
 

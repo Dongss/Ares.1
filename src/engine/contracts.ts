@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { LANGUAGES, type Lang, t } from '../i18n.js';
+import { REQUIREMENT_SIZES } from '../store/types.js';
 
 // Structured results agents must end with (prompt contract + parse/validate,
 // plus --json-schema for CLIs that support it).
@@ -30,6 +31,11 @@ export const AssessReportSchema = z
     suggestions: z.array(z.string().trim().min(1)).default([]),
     /** go after a discussion that changed the requirement: the complete new requirement. */
     revisedGoal: z.string().optional(),
+    /**
+     * How big the requirement is (`REQUIREMENT_SIZES`); asked for with go. Optional: a missing
+     * size only means the stages that plan by size (`planning: auto`) do not split it.
+     */
+    size: z.enum(REQUIREMENT_SIZES).optional(),
   })
   .superRefine((report, ctx) => {
     if (report.verdict === 'ask' && report.questions.length === 0) {

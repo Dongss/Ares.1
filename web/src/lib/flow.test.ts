@@ -2,7 +2,14 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { TemplateSchema } from '../../../src/config/schema.js';
 import { setLang } from '../../../src/i18n.js';
 import type { StageRun } from '../../../src/store/types.js';
-import { assessInDoubt, buildFlow, FLOW_STATUS, reworkText, stageProgress } from './flow.js';
+import {
+  assessInDoubt,
+  buildFlow,
+  FLOW_STATUS,
+  planningText,
+  reworkText,
+  stageProgress,
+} from './flow.js';
 
 const template = TemplateSchema.parse({
   id: 'dev',
@@ -132,6 +139,37 @@ describe('buildFlow', () => {
         for (const mode of ['fail', 'human'] as const) {
           expect(reworkText(n, mode)).not.toMatch(/[一-鿿]/);
         }
+      }
+    } finally {
+      setLang('zh');
+    }
+  });
+
+  it('shows how agent stages split their rounds into steps', () => {
+    const planned = TemplateSchema.parse({
+      id: 'planned',
+      stages: [
+        { id: 'assess', kind: 'assess', agent: 'reviewer' },
+        { id: 'single', agent: 'coder' },
+        { id: 'llm', agent: 'coder', planning: 'llm' },
+        { id: 'auto', agent: 'coder', planning: 'auto' },
+        { id: 'merge', kind: 'merge' },
+      ],
+    });
+    const flow = buildFlow({ template: planned, repoVerifyCommands: [], agents });
+    expect(flow.map((s) => s.planning)).toEqual([null, 'single', 'llm', 'auto', null]);
+    expect(flow.map((s) => planningText(s.planning))).toEqual([
+      null,
+      null,
+      '每一轮先由 Agent 只读地拆成几步，再一步一步做、检查和提交',
+      '按需求规模：需求评估给出的规模为 L 时先拆成几步再一步一步做，S、M 或没有规模时一次做完',
+      null,
+    ]);
+    setLang('en');
+    try {
+      for (const planning of ['llm', 'auto'] as const) {
+        expect(planningText(planning)).toMatch(/^(Every round|By the requirement's size)/);
+        expect(planningText(planning)).not.toMatch(/[一-鿿]/);
       }
     } finally {
       setLang('zh');

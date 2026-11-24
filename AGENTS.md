@@ -121,9 +121,11 @@ test/
 - In the engine, after every `await`, if the Run may have been paused or cancelled meanwhile, call `checkAbort(signal)` before changing state.
 - Each rule lives in one place, shared by engine and dashboard:
   - rollback targets, effective settings, auto-accepted proposals, the automatic scout's back-off
-    and what it waits for, rate-limit waits of Runs and scouts, the redo wait (`redoDelayMs` /
-    `redoDueAt`), raw log retention (`runRawLogsExpired` / `scoutRawLogExpired`), leftover
-    worktrees (`leftoverWorkspaces`) and the like: `src/config/flow.ts`
+    and what it waits for, whether a stage round is split into tasks (`plansStage`; the size it
+    goes by is `assessedSize` in `src/engine/discussion.ts`), rate-limit waits of Runs and scouts,
+    the redo wait (`redoDelayMs` / `redoDueAt`), raw log retention (`runRawLogsExpired` /
+    `scoutRawLogExpired`), leftover worktrees (`leftoverWorkspaces`) and the like:
+    `src/config/flow.ts`
   - notification rules: `src/notify/notice.ts`
   - assessment conclusion rules: `src/engine/discussion.ts`
   - how a Run's time is split, and the names and groups of the parts: `src/engine/times.ts`

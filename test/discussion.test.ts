@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  assessedSize,
   assessmentProblem,
   assessmentRounds,
   conclusionLabel,
@@ -127,6 +128,14 @@ describe('takeAssessment', () => {
         stageRunId: 'sr-new',
         at: at(30),
       });
+    });
+
+    it('records the size with any verdict, and none when not given', () => {
+      expect(takeAssessment(report('go', { size: 'L' }), [], where).size).toBe('L');
+      expect(takeAssessment(report('ask', { size: 'S' }), [], where).size).toBe('S');
+      const proposedDrop = takeAssessment(report('drop', { size: 'M' }), [], where);
+      expect(proposedDrop).toMatchObject({ verdict: 'ask', proposedDrop: true, size: 'M' });
+      expect(takeAssessment(report('go'), [], where)).not.toHaveProperty('size');
     });
   });
 
@@ -312,6 +321,24 @@ describe('the discussion so far', () => {
     expect(conclusionOf([ask1, reply1, drop])).toBe(drop);
     // A later round that asks again replaces an earlier conclusion.
     expect(conclusionOf([go, reply1, ask2])).toBeNull();
+  });
+
+  it('assessedSize: the size of the latest go round', () => {
+    expect(assessedSize([])).toBeUndefined();
+    // Sizes of rounds that did not go ahead decide nothing.
+    const askL = assessor('ask', { size: 'L' });
+    expect(assessedSize([askL, reply1])).toBeUndefined();
+    expect(assessedSize([assessor('drop', { size: 'L' })])).toBeUndefined();
+    // A go without a size (left out, or recorded before sizes) has none.
+    expect(assessedSize([askL, reply1, go])).toBeUndefined();
+    const goM = assessor('go', { size: 'M', at: at(4) });
+    const goL = assessor('go', { size: 'L', at: at(6) });
+    expect(assessedSize([askL, reply1, goM])).toBe('M');
+    expect(assessedSize([goM, reply2])).toBe('M');
+    expect(assessedSize([goM, reply2, goL])).toBe('L');
+    expect(assessedSize([goL, reply2, go])).toBeUndefined();
+    // The latest go counts even when a later round asks again.
+    expect(assessedSize([goL, reply2, ask2])).toBe('L');
   });
 
   it('pendingTimeout: only when the discussion ends with a timeout', () => {

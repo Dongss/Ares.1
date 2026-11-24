@@ -9,6 +9,7 @@ import type {
   DiscussionEntry,
   ReplyEntry,
   ReplyTimeoutEntry,
+  RequirementSize,
 } from '../store/types.js';
 
 /** What a verdict is called, in the language in use. */
@@ -42,6 +43,15 @@ export function assessmentRounds(discussion: readonly DiscussionEntry[]): Assess
 export function conclusionOf(discussion: readonly DiscussionEntry[]): AssessmentEntry | null {
   const last = assessmentRounds(discussion).at(-1);
   return last && last.verdict !== 'ask' ? last : null;
+}
+
+/**
+ * The requirement's size as the latest go round gave it, which stages planning by size
+ * (`planning: auto`, `plansStage`) go by. Undefined without a go round, or when that round gave
+ * no size (it left it out, or was recorded before assessments gave sizes).
+ */
+export function assessedSize(discussion: readonly DiscussionEntry[]): RequirementSize | undefined {
+  return assessmentRounds(discussion).findLast((e) => e.verdict === 'go')?.size;
 }
 
 /**
@@ -159,6 +169,7 @@ export interface ReportedAssessment {
   questions: string[];
   suggestions: string[];
   revisedGoal?: string;
+  size?: RequirementSize;
 }
 
 /**
@@ -190,6 +201,7 @@ export function assessmentProblem(
  * original requirement holds until a human agreed to change it). After nobody replied in time it
  * decides alone: a drop stands, and a changed goal is still ignored (its assumptions are in the
  * summary, which the later stages read). An ask then is refused before (`assessmentProblem`).
+ * A size is recorded with any verdict; only that of a go decides anything (`assessedSize`).
  */
 export function takeAssessment(
   report: ReportedAssessment,
@@ -207,6 +219,7 @@ export function takeAssessment(
     questions: report.questions,
     suggestions: report.suggestions,
     revisedGoal: report.verdict === 'go' && replied && !alone && revised ? revised : null,
+    ...(report.size ? { size: report.size } : {}),
     proposedDrop,
     ...(alone && report.verdict !== 'ask' ? { decidedAlone: true } : {}),
     stageRunId: where.stageRunId,

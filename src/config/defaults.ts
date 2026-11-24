@@ -168,8 +168,9 @@ stages:
   - id: implement
     name: 编码
     kind: agent
-    agent: claude-coder
-    planning: single
+    agent: claude-coder        # planning: auto 要以只读方式拆分，要用支持只读的 CLI（claude-code）
+    planning: auto             # 按需求评估给出的规模：L（要改多个模块）先由这个 Agent 只读地拆成几步，再一步一步做、
+                               # 一步一步检查和提交；S、M 或没给规模时整个阶段一次做完。single = 从不拆分，llm = 总是拆分
     inputs: [assessment]       # 评估结论（讨论后修改的需求）放进提示词
     instructions: |
       实现目标中描述的需求，并补充必要的测试。
@@ -224,8 +225,10 @@ stages:
   - id: implement
     name: Coding
     kind: agent
-    agent: claude-coder
-    planning: single
+    agent: claude-coder        # planning: auto splits read-only, so it needs a CLI that supports that (claude-code)
+    planning: auto             # by the size the assessment gave: an L (changes across modules) is first split into steps by this
+                               # agent, read-only, each then done, checked and committed on its own; S, M or no size is done in
+                               # one go. single = never split, llm = always split
     inputs: [assessment]       # the assessment (the requirement as revised in the discussion) goes into the prompt
     instructions: |
       Implement the requirement described in the goal, and add the tests it needs.

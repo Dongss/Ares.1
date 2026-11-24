@@ -187,6 +187,19 @@ describe('prompts', () => {
     );
   });
 
+  it('asks a go for the size of the requirement, S, M or L, in every round', () => {
+    const first = assessPrompt(ctx({ id: 'assess', kind: 'assess' }), [], null);
+    const alone = assessPrompt(ctx({ id: 'assess', kind: 'assess' }), [asked, timeout], null);
+    for (const prompt of [first, alone]) {
+      expect(prompt).toContain(
+        'verdict 为 go 时还要给出 size，估计需求的规模，只能是 S、M、L 三个字母之一：\n- S：一处小改动',
+      );
+      expect(prompt).toContain('- M：一个 Run 能做完的普通需求；');
+      expect(prompt).toContain('- L：要改多个模块，一次做完容易超时或返工的需求；');
+      expect(prompt).toContain('{"verdict": "go", "size": "M", "summary": ');
+    }
+  });
+
   it('carries the timeout into the assessment artifact of a go decided alone', () => {
     const go: AssessmentEntry = {
       ...asked,
@@ -468,6 +481,13 @@ describe('prompts in English', () => {
       'Write summary, questions, suggestions and revisedGoal in English.',
     );
     expect(prompts.assess).toContain('the goals in the README are the basis');
+    for (const prompt of [prompts.assess, prompts.assessAlone]) {
+      expect(prompt).toContain(
+        'With verdict go, also give size, how big you judge the requirement, as one of the letters S, M and L:',
+      );
+      expect(prompt).toContain('- L: changes across several modules');
+      expect(prompt).toContain('{"verdict": "go", "size": "M", "summary": ');
+    }
     expect(prompts.assessAlone).toContain('### Nobody replied within 2 hours');
     expect(prompts.assessAlone).toContain(
       'Nobody replied to the questions above within 2 hours, so you decide this round on your own, and ask is not allowed.',

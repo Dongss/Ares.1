@@ -235,9 +235,10 @@ export const StageSchema = z.strictObject({
   /**
    * agent stages: `single` = the whole stage is one task; `llm` = every round, the stage's agent
    * first splits it, read-only, into ordered tasks, each then executed, checked and committed on
-   * its own.
+   * its own; `auto` = like `llm` when the Run's requirement assessment sized it L, otherwise like
+   * `single` (`plansStage` in src/config/flow.ts).
    */
-  planning: z.enum(['single', 'llm']).default('single'),
+  planning: z.enum(['single', 'llm', 'auto']).default('single'),
   instructions: z.string().optional(),
   inputs: z.array(z.string()).default([]),
   outputs: z.array(z.string()).default([]),

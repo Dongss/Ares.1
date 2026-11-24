@@ -42,7 +42,7 @@ import {
   TASK_STATUS,
 } from '../lib/format.js';
 import { useAction, useReloadOn, useResource, useTick } from '../lib/hooks.js';
-import { roundTasks, stepLabel, stepsDoneText, taskTitle } from '../lib/plan.js';
+import { autoPlanText, roundTasks, stepLabel, stepsDoneText, taskTitle } from '../lib/plan.js';
 import {
   assessmentHeadline,
   canCleanUpWorkspace,
@@ -53,6 +53,7 @@ import {
   rawLogPrunedText,
   redoText,
   replyDeadlineOf,
+  sizeText,
   untrustedIssueText,
   workspaceLines,
 } from '../lib/runs.js';
@@ -654,12 +655,19 @@ function AssessmentCard({ detail }: { detail: RunDetail }) {
   const headline = assessmentHeadline(run);
   if (!headline) return null;
   const { conclusion } = headline;
+  const size = sizeText(conclusion?.size);
   const items = discussionItems(run.discussion);
   return (
     <section className="card assessment">
       <div className="stage-head">
         <h2>{t({ zh: '需求评估', en: 'Requirement assessment' })}</h2>
         <Badge tone={headline.tone}>{headline.label}</Badge>
+        {size && (
+          <>
+            <Badge tone="muted">{size.label}</Badge>
+            <span className="muted">{size.meaning}</span>
+          </>
+        )}
       </div>
       {conclusion && <div className="assessment-summary">{conclusion.summary}</div>}
       {conclusion?.revisedGoal && (
@@ -851,8 +859,10 @@ function StageBlock(props: {
   const checks = detail.checks.filter((c) => c.stageRunId === sr.id && !c.attemptId);
   const approvals = detail.approvals.filter((a) => a.stageRunId === sr.id);
   const artifacts = detail.artifacts.filter((a) => a.stageRunId === sr.id);
-  const kind = detail.run.template.stages.find((s) => s.id === sr.stageId)?.kind;
+  const def = detail.run.template.stages.find((s) => s.id === sr.stageId);
+  const kind = def?.kind;
   const placeholder = kind === 'placeholder';
+  const autoPlan = def ? autoPlanText(def, detail.run.discussion, sr.startedAt) : null;
   return (
     <section id={stageRunAnchor(sr.id)} className={`card stage stage-${sr.status}`}>
       <div className="stage-head">
@@ -893,6 +903,7 @@ function StageBlock(props: {
           })}
         </p>
       )}
+      {autoPlan && <p className="hint">{autoPlan}</p>}
       {sr.feedback && (
         <Collapsible title={t({ zh: '这一轮要处理的反馈', en: 'Feedback for this round' })}>
           <Pre>{sr.feedback}</Pre>

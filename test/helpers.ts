@@ -173,6 +173,7 @@ export const assessment = (
     questions?: string[];
     suggestions?: string[];
     revisedGoal?: string;
+    size?: 'S' | 'M' | 'L';
   } = {},
 ): FakeOutcome => ({
   finalMessage: `\`\`\`json\n${JSON.stringify({
@@ -181,6 +182,7 @@ export const assessment = (
     questions: extra.questions ?? [],
     suggestions: extra.suggestions ?? [],
     ...(extra.revisedGoal ? { revisedGoal: extra.revisedGoal } : {}),
+    ...(extra.size ? { size: extra.size } : {}),
   })}\n\`\`\``,
 });
 

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { setLang } from '../../../src/i18n.js';
-import type { Task } from '../../../src/store/types.js';
-import { roundTasks, stepLabel, stepsDoneText, taskTitle } from './plan.js';
+import type { AssessmentEntry, RequirementSize, Task } from '../../../src/store/types.js';
+import { autoPlanText, roundTasks, stepLabel, stepsDoneText, taskTitle } from './plan.js';
 
 afterEach(() => setLang('zh'));
 
@@ -74,6 +74,58 @@ describe('taskTitle', () => {
   });
 });
 
+describe('autoPlanText', () => {
+  const at = (hour: number) => `2026-11-24T${String(hour).padStart(2, '0')}:00:00.000Z`;
+  const assessed = (
+    verdict: AssessmentEntry['verdict'],
+    size: RequirementSize | undefined,
+    hour = 1,
+  ): AssessmentEntry => ({
+    role: 'assessor',
+    verdict,
+    summary: 's',
+    questions: [],
+    suggestions: [],
+    revisedGoal: null,
+    ...(size ? { size } : {}),
+    proposedDrop: false,
+    stageRunId: 'sr-assess',
+    at: at(hour),
+  });
+  const auto = { kind: 'agent', planning: 'auto' } as const;
+
+  it('says the round was split for a requirement sized L', () => {
+    expect(autoPlanText(auto, [assessed('go', 'L')], at(2))).toBe(
+      '按需求规模拆分：需求评估给出的规模是 L，这一轮先拆分任务，再一步一步做。',
+    );
+  });
+
+  it('says the round was done in one go for S, M or no size', () => {
+    expect(autoPlanText(auto, [assessed('go', 'M')], at(2))).toBe(
+      '按需求规模拆分：需求评估给出的规模是 M，只有 L 才拆分，这一轮整个阶段一次做完。',
+    );
+    expect(autoPlanText(auto, [assessed('go', 'S')], at(2))).toContain('规模是 S');
+    const none = '按需求规模拆分：没有需求评估给出的规模，这一轮不拆分，整个阶段一次做完。';
+    expect(autoPlanText(auto, [assessed('go', undefined)], at(2))).toBe(none);
+    // Without an assessment, or with only one that did not go ahead.
+    expect(autoPlanText(auto, [], at(2))).toBe(none);
+    expect(autoPlanText(auto, [assessed('ask', 'L')], at(2))).toBe(none);
+  });
+
+  it('goes by the assessments before the round started', () => {
+    const discussion = [assessed('go', 'M', 1), assessed('go', 'L', 3)];
+    expect(autoPlanText(auto, discussion, at(2))).toContain('规模是 M');
+    expect(autoPlanText(auto, discussion, at(3))).toContain('规模是 L，这一轮先拆分');
+  });
+
+  it('says nothing for stages that do not plan by size', () => {
+    const discussion = [assessed('go', 'L')];
+    expect(autoPlanText({ kind: 'agent', planning: 'single' }, discussion, at(2))).toBeNull();
+    expect(autoPlanText({ kind: 'agent', planning: 'llm' }, discussion, at(2))).toBeNull();
+    expect(autoPlanText({ kind: 'review', planning: 'auto' }, discussion, at(2))).toBeNull();
+  });
+});
+
 describe('in English', () => {
   it('has no Chinese characters left', () => {
     setLang('en');
@@ -84,6 +136,35 @@ describe('in English', () => {
       taskTitle(plan()),
     ];
     expect(texts).toEqual(['Step 1/2', 'Step 2/2', '1 of 2 steps done', 'Plan the tasks']);
+    for (const text of texts) expect(text).not.toMatch(/\p{Script=Han}/u);
+  });
+
+  it('says whether a round planning by size was split, without Chinese characters', () => {
+    setLang('en');
+    const auto = { kind: 'agent', planning: 'auto' } as const;
+    const go = (size?: RequirementSize): AssessmentEntry => ({
+      role: 'assessor',
+      verdict: 'go',
+      summary: '需求清楚',
+      questions: [],
+      suggestions: [],
+      revisedGoal: null,
+      ...(size ? { size } : {}),
+      proposedDrop: false,
+      stageRunId: 'sr-assess',
+      at: '2026-11-24T01:00:00.000Z',
+    });
+    const started = '2026-11-24T02:00:00.000Z';
+    const texts = [
+      autoPlanText(auto, [go('L')], started),
+      autoPlanText(auto, [go('M')], started),
+      autoPlanText(auto, [go()], started),
+    ];
+    expect(texts).toEqual([
+      "Split by the requirement's size: the assessment sized it L, so this round is planned first and done step by step.",
+      "Split by the requirement's size: the assessment sized it M, and only an L is split, so this round does the whole stage in one go.",
+      "Split by the requirement's size: no assessment gave a size, so this round is not split and does the whole stage in one go.",
+    ]);
     for (const text of texts) expect(text).not.toMatch(/\p{Script=Han}/u);
   });
 });

@@ -24,6 +24,7 @@ import {
   LEFTOVER_WORKSPACE_EVENTS,
   type LeftoverWorkspaceReason,
   leftoverWorkspaces,
+  plansStage,
   RATE_LIMIT_WAIT,
   type RateLimitWait,
   type RunLimitWait,
@@ -112,7 +113,13 @@ import {
   TASK_REPORT_JSON_SCHEMA,
   TaskReportSchema,
 } from './contracts.js';
-import { assessmentProblem, formatAssessment, takeAssessment, waitText } from './discussion.js';
+import {
+  assessedSize,
+  assessmentProblem,
+  formatAssessment,
+  takeAssessment,
+  waitText,
+} from './discussion.js';
 import { planSteps } from './plan.js';
 import {
   assessmentArtifact,
@@ -1666,10 +1673,12 @@ export class Engine {
       );
     }
     this.store.tx(() => {
-      if (eff.def.kind === 'agent' && eff.def.planning === 'llm') {
-        // planning: llm — the stage's agent first splits it into tasks (`runPlanTask`). Every
-        // round plans anew, with the reason the previous one was sent back and that round's
-        // plan and results (`previousPlan`), listing only the steps that change something.
+      // planning: auto goes by the size the Run's assessment gave, decided anew every round.
+      if (plansStage(eff.def, assessedSize(run.discussion))) {
+        // planning: llm (or auto for a requirement sized L) — the stage's agent first splits it
+        // into tasks (`runPlanTask`). Every round plans anew, with the reason the previous one
+        // was sent back and that round's plan and results (`previousPlan`), listing only the
+        // steps that change something.
         this.store.createTask({
           runId: run.id,
           stageRunId: sr.id,
@@ -1679,7 +1688,7 @@ export class Engine {
           agentId,
         });
       } else {
-        // planning: single — the whole stage is one task.
+        // planning: single (or auto for any other size) — the whole stage is one task.
         this.store.createTask({
           runId: run.id,
           stageRunId: sr.id,

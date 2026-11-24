@@ -286,27 +286,35 @@ defaults:
 
 ## 拆分任务
 
-编码这类 `kind: agent` 阶段默认是 `planning: single`：整个阶段是一个 Task，由一个 Agent 一次做完、一次检查、一次提交。需求大了，容易超时，或者返工到 `max_retries` 用完、回退超过 `max_loops`。写成 `planning: llm` 后，阶段先拆分、再一步一步做：
+编码这类 `kind: agent` 阶段不写 `planning` 时是 `planning: single`：整个阶段是一个 Task，由一个 Agent 一次做完、一次检查、一次提交。需求大了，容易超时，或者返工到 `max_retries` 用完、回退超过 `max_loops`。写成 `planning: llm` 后，阶段每一轮都先拆分、再一步一步做；写成 `planning: auto` 后，按需求评估给出的规模决定，只有大需求才拆分：
 
 ```yaml
   - id: implement
     name: 编码
     kind: agent
     agent: claude-coder
-    planning: llm        # 先由这个 Agent 以只读方式把需求拆成几步，再一步一步做
+    planning: auto       # 需求评估给出的规模是 L 时，先由这个 Agent 以只读方式把需求拆成几步，再一步一步做
     inputs: [assessment]
 ```
 
+- 需求评估（`kind: assess`）给出 go 时还会给出需求的规模 `size`，三档的字母在各种语言下都一样：
+  - `S`：一处小改动，比如改一个函数、一段文字或一项配置；
+  - `M`：一个 Run 能做完的普通需求；
+  - `L`：要改多个模块，一次做完容易超时或返工的需求。
+
+  规模记在讨论记录里，Run 详情页「需求评估」的结论旁边显示「规模 L」和它的含义。评估没给规模不算出错，照常开工。ask、drop 时给了规模也照样记下，但不起作用。
+- `planning: auto` 的阶段每一轮开始时，看这个 Run 最近一次 go 的评估结论：规模是 `L` 就和 `planning: llm` 一样先拆分；`S`、`M`、没给规模，或者模板里没有需求评估阶段时，和 `planning: single` 一样整个阶段是一个 Task，提示词和提交信息也和 `single` 完全一样。评审打回、审批驳回后的新一轮重新判断一次；评估结论在 Run 里不变，所以每一轮的结果都一样。小需求拆分只会多花钱，所以只拆 `L`。Run 详情页里，这种阶段的每一轮都写明按规模拆分了还是没拆；流程图在阶段的「拆分」一行写着它怎么拆分。
+- 下面说的拆分和一步一步执行，对 `planning: llm` 和要拆分时的 `planning: auto` 都一样。
 - 每一轮阶段开始时，先以只读方式运行阶段的 Agent 拆分任务，Run 详情页里是一个叫「拆分任务」的 Task。它读到目标、阶段的 `instructions`、`inputs`（比如 `assessment`），从第 2 轮起还有上一轮被打回的原因和上一轮的计划（见下面），按依赖顺序拆成 1 到 8 步，每一步有标题和说明；需求本来就小时只给一步。拆分不改文件、不运行检查命令、不提交；它留下的改动会被丢掉（记一条 `plan.changes_discarded` 事件）。拆分的结果列在这次执行的检查里。
 - 拆好后，Master 按顺序为每一步建一个 Task，记一条 `stage.planned` 事件，数据里有阶段（`stageId`）、轮次（`round`）、拆分任务的 Task（`taskId`）和各步的标题（`tasks`）。然后一步一步执行，每一步都由阶段的 Agent 做（拆分换过 Agent 也一样）：提示词里有目标、阶段的 `instructions`、这一步的说明和整个计划（哪些已经完成，哪些留给后面的步骤）。已完成的步骤下面附着它的「结果」，也就是做那一步的 Agent 最后一次通过时写的 summary（每条最多 400 字），后面的步骤由此知道前面实际做了什么、做了哪些取舍。做完后照常运行检查命令，通过后单独提交，提交信息里写着「第 2/3 步：标题」；没通过就在这一步里返工，`max_retries` 对每一步各自计算。只拆成一步时，这一步就是整个阶段，提示词和提交信息都和不拆分时一样。
 - 步骤的进度在两处能看到：
   - Run 详情页：拆分任务排在这一轮的最前面，每一步的标题前写着「第 2/3 步」，阶段标题旁写着「已完成 1/3 步」（数的是已通过的步骤）。
   - 侦察摘要（侦察提示词里的「最近的 Run」）：拆成几步的轮次先写一行「编码第 1 轮：拆成 3 步」，下面每一步只算自己的执行：返工过的写「第 2/3 步「标题」：执行 2 次，返工原因：…」，没通过的写一行状态（失败，或者 Run 结束时还没执行到、还没做完；Run 被终止或者因为别的原因失败时，没做完的步骤都算后两种），顺利通过的不写；拆分本身返工过也单独写一行「编码第 1 轮的拆分：…」，不算进任何一步。没拆分、只拆成一步的轮次和以前一样，整轮的执行合在一起写一行。这样侦察和人都能看出拆得好不好、卡在哪一步。
 - 拆分出错（CLI 报错、超时）或者输出不符合格式（没有 JSON、步数不在 1 到 8 之间、缺标题或说明）时，按 `on_agent_error` 处理（见上面的「Agent 出错时」），一步也不会建；格式的问题会交给下一次拆分。
-- 拆分要以只读方式运行，所以阶段的 Agent 要用支持只读的 CLI（claude-code），否则加载模板时报错、模板被停用。`planning: llm` 只能用在 `kind: agent` 阶段，写在评审、需求评估、命令、合并、占位阶段上同样报错。
+- 拆分要以只读方式运行，所以阶段的 Agent 要用支持只读的 CLI（claude-code），否则加载模板时报错、模板被停用。`planning: auto` 只拆分一部分 Run，但哪个 Run 都可能要拆分，所以同样要求。`planning: llm` 和 `planning: auto` 只能用在 `kind: agent` 阶段，写在评审、需求评估、命令、合并、占位阶段上同样报错。
 - 评审打回、审批驳回、命令阶段失败或合并冲突回退到这个阶段时，新一轮重新拆分；打回的原因既交给拆分，也交给每一步。新一轮的拆分还会读到这个阶段上一轮的计划：每一步的标题、说明、是否通过和「结果」（summary，每条最多 400 字；没通过的步骤没有）。上一轮没有拆分时，整个阶段算一步；只拆成一步的也照样写上；拆分格式出错后重试的每一次都有。上一轮通过的步骤都已经提交，改动还在工作目录里，所以提示词要求拆分只列出这次需要做的修改步骤：改正打回的问题、补上没通过的步骤，不要重做已经通过、和打回原因无关的步骤。拆分输出的格式和之后依次执行的方式都不变。
 - 拆分进行到一半被暂停、Master 重启或崩溃时，恢复后重新拆分。各步的 Task 和拆分的结果在同一个事务里记下，不会重复，也不会只建一半。
-- 默认的 `self-dev.yaml` 仍是 `planning: single`。带 `planning: llm` 的完整模板见 [`docs/examples/workflows/strict.yaml`](examples/workflows/strict.yaml) 的编码阶段。
+- 默认的 `self-dev.yaml` 的编码阶段是 `planning: auto`。数据目录里已经装好的 `workflows/self-dev.yaml` 不会自动更新，旧版本写的是 `planning: single`：想让大需求先拆分，就手动把编码阶段的 `planning: single` 改成 `planning: auto`（编码阶段的 Agent 要用支持只读的 CLI，默认的 `claude-coder` 就是）。保存后 Master 自动重新加载，新建的 Run 生效；已经建好的 Run 仍按建 Run 时的模板走。带 `planning: auto` 的完整模板见 [`docs/examples/workflows/strict.yaml`](examples/workflows/strict.yaml) 的编码阶段。
 
 ## 评审阶段不改代码
 
@@ -326,7 +334,7 @@ defaults:
     # gate: true           # 命令通过后等人审批
 ```
 
-- 命令写在 `verify.commands` 里，和其他阶段一样；不写就运行仓库登记的检查命令。写成空列表是配置错误。命令阶段不能指定 `agent`、`agent_candidates`、`planning: llm` 和 `verify.llm_check`。
+- 命令写在 `verify.commands` 里，和其他阶段一样；不写就运行仓库登记的检查命令。写成空列表是配置错误。命令阶段不能指定 `agent`、`agent_candidates`、`planning: llm` 或 `planning: auto` 和 `verify.llm_check`。
 - 命令按顺序运行，有一条失败就不再往下跑。和检查命令一样不带 GitHub 凭据（见上面的「Agent 拿不到 GitHub 凭据」），每条命令的超时是 `config.yaml` 里的 `defaults.command_timeout_minutes`。输出写进数据目录的 `logs/<Run id>/command-<阶段轮次 id>.log`，Run 详情页在这一阶段下列出每条命令是否通过和输出的末尾。
 - 全部通过：阶段通过，进入下一阶段。设了 `gate: true` 时先等人审批，审批在命令通过之后；驳回时回到 `on_reject` 指向的阶段，不写就是前面最近的 Agent 阶段。
 - 有命令失败：阶段标为没通过（原因是「检查没有通过」），回退到 `on_fail` 指向的阶段，不写就是它前面最近的 Agent 阶段（通常是编码）。失败的命令、退出码和输出的末尾作为反馈交给那个阶段的 Agent。和评审打回一样计入 `max_loops`，用完后按 `on_exhausted` 处理（见下面的「返工或回退用完时」）。

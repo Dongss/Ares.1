@@ -7,6 +7,7 @@ import {
   FLOW_STATUS,
   type FlowProgress,
   type FlowStage,
+  planningText,
   reworkText,
 } from '../lib/flow.js';
 import { Badge } from './ui.js';
@@ -56,6 +57,7 @@ export function FlowChart(props: {
 
 function FlowStageBody({ stage, progress }: { stage: FlowStage; progress?: FlowProgress }) {
   const status = progress && FLOW_STATUS[progress.status];
+  const planning = planningText(stage.planning);
   return (
     <>
       <span className="flow-head">
@@ -157,6 +159,7 @@ function FlowStageBody({ stage, progress }: { stage: FlowStage; progress?: FlowP
           )}
         </Line>
       )}
+      {planning && <Line label={t({ zh: '拆分', en: 'Steps' })}>{planning}</Line>}
       {stage.kind === 'agent' && (
         <Line label={failLabel()}>{reworkText(stage.maxRetries, stage.onExhausted)}</Line>
       )}

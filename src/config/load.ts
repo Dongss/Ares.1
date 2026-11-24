@@ -418,7 +418,7 @@ export function validateTemplate(
       const agentOnly = [
         s.agent !== undefined && 'agent',
         s.agent_candidates !== undefined && 'agent_candidates',
-        s.planning === 'llm' && 'planning: llm',
+        s.planning !== 'single' && `planning: ${s.planning}`,
         s.verify?.llm_check && 'verify.llm_check',
       ].filter((field): field is string => typeof field === 'string');
       if (agentOnly.length > 0) {
@@ -447,12 +447,12 @@ export function validateTemplate(
         }),
       );
     }
-    if (s.planning === 'llm' && s.kind !== 'agent') {
+    if (s.planning !== 'single' && s.kind !== 'agent') {
       // Only work that is checked and committed is worth splitting into steps.
       errors.push(
         where({
-          zh: `planning: llm（拆分任务）只能用在 agent（编码）阶段，${s.kind} 阶段不能用`,
-          en: `planning: llm (splitting the stage into tasks) only applies to agent stages, not to a ${s.kind} stage`,
+          zh: `planning: ${s.planning}（拆分任务）只能用在 agent（编码）阶段，${s.kind} 阶段不能用`,
+          en: `planning: ${s.planning} (splitting the stage into tasks) only applies to agent stages, not to a ${s.kind} stage`,
         }),
       );
     }
@@ -532,11 +532,12 @@ export function validateTemplate(
         }),
       );
     }
-    if (s.kind === 'agent' && s.planning === 'llm' && !readOnlyClis.includes(agent.cli)) {
+    // auto splits only some Runs, but any of them may need the read-only run.
+    if (s.kind === 'agent' && s.planning !== 'single' && !readOnlyClis.includes(agent.cli)) {
       errors.push(
         where({
-          zh: `planning: llm 先以只读方式运行阶段的 Agent 来拆分任务，Agent ${s.agent} 的 CLI ${agent.cli} 不支持，请换用 ${readOnlyClis.join('、') || '支持只读的 CLI'} 的 Agent`,
-          en: `planning: llm first runs the stage's agent read-only to split the stage into tasks, which the CLI ${agent.cli} of agent ${s.agent} does not support; use an agent of ${readOnlyClis.join(', ') || 'a CLI that supports read-only'}`,
+          zh: `planning: ${s.planning} 先以只读方式运行阶段的 Agent 来拆分任务，Agent ${s.agent} 的 CLI ${agent.cli} 不支持，请换用 ${readOnlyClis.join('、') || '支持只读的 CLI'} 的 Agent`,
+          en: `planning: ${s.planning} first runs the stage's agent read-only to split the stage into tasks, which the CLI ${agent.cli} of agent ${s.agent} does not support; use an agent of ${readOnlyClis.join(', ') || 'a CLI that supports read-only'}`,
         }),
       );
     }
