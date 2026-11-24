@@ -65,8 +65,9 @@ export const ProposalSchema = z.object({
 
 /**
  * A capability the project lacks for one of its README's goals, from the scout's gap analysis.
- * The scout serves every registered repo, each with the goals of its own README, so `goal` names
- * the goal as that README does rather than coming from a fixed list.
+ * The scout serves every registered repo, each with the goals of its own README, so `goal` copies
+ * the goal word for word from that README rather than coming from a fixed list: the dashboard
+ * groups gaps by it.
  */
 export const GapSchema = z.object({
   goal: z.string().trim().min(1).max(120),
@@ -100,8 +101,8 @@ export function scoutReportJsonSchema() {
             goal: {
               type: 'string',
               description: t({
-                zh: '缺口离的是 README.md 里的哪个目标，照 README 的说法简短写',
-                en: 'The goal in README.md this gap stands in the way of, named briefly as README.md names it',
+                zh: '缺口挡住的是 README.md 里的哪个目标：一字不差地照抄 README.md 里这个目标的原文，同一个目标在每个缺口里写法相同',
+                en: 'The goal in README.md this gap stands in the way of, copied word for word as README.md writes it; the same goal is written the same way in every gap',
               }),
             },
             gap: {
@@ -953,8 +954,8 @@ const scoutPromptZh = (input: ScoutPromptInput) =>
 - 提案要服务于 README.md 里的目标，不提和目标无关或背离目标的事。
 
 ## 先做差距分析
-提案之前，先对照 README.md 里的每个目标，在能力层面列出这个项目现在还做不到什么，写进结果的 gaps。要看的是缺了哪些能力，不是零碎的缺陷：比如能对接哪些外部工具和服务、能做多大的任务、能不能并行、能服务什么样的用户、场景和需求来源、出了问题能不能自己恢复。代码里定义了却没有实现的选项、只支持一种情况的地方、写死的上限，往往就是缺口。
-- 每个缺口写明：goal 是 README.md 里的哪个目标（照 README 的说法简短写），gap 是缺什么能力，evidence 是限制这个能力的代码位置（文件:行号）或 README、文档里的段落。
+提案之前，先按 README.md 的原文列出它写的目标（只用来对照，不写进结果），再对照其中的每个目标，在能力层面列出这个项目现在还做不到什么，写进结果的 gaps。要看的是缺了哪些能力，不是零碎的缺陷：比如能对接哪些外部工具和服务、能做多大的任务、能不能并行、能服务什么样的用户、场景和需求来源、出了问题能不能自己恢复。代码里定义了却没有实现的选项、只支持一种情况的地方、写死的上限，往往就是缺口。
+- 每个缺口写明：goal 是上面列出的哪个目标，一字不差地照抄 README.md 里这个目标的原文，同一个目标在每个缺口里写法相同；gap 是缺什么能力，evidence 是限制这个能力的代码位置（文件:行号）或 README、文档里的段落。
 - 最重要的缺口放在最前：越是挡住目标、越多事情依赖它，越重要。已经有 issue 在做的缺口也照样列出。
 - 认真对照每个目标后仍然找不到缺口，gaps 才是空列表。
 
@@ -966,15 +967,15 @@ const scoutPromptZh = (input: ScoutPromptInput) =>
 
 ## 提案的配比
 - 第 1 类问题优先：有就先提；条数上限放不下时，以第 1 类为先。
-- 第 1 类之外，只要差距分析里有缺口，至少有一条提案是补能力的：category 为 feature，补上差距分析里的一个缺口，推进 README.md 的某个目标，而不是对最近改动的修补。缺口已经有未关闭的 issue 在做时，换一个缺口，或者按下面「拆一个大能力」的做法提它还没人提的一步。
+- 第 1 类之外，只要差距分析里有缺口，至少有一条提案是补能力的：category 为 feature，补上差距分析里的一个缺口，推进 README.md 的某个目标，而不是对最近改动的修补。缺口已经有未关闭的 issue 在做时，换一个缺口；只有那个 issue 覆盖面很大、还在等人采纳时，才提它能独立合并的第一步（见下面「拆一个大能力」里等人采纳的大 issue 那一条）。
 - 第 4 类每次最多一条。
 
 ## 拆一个大能力
 一个能力一个 Run 做不完时，把它拆成有先后的几步。每一步都能单独合并，合并后系统照常可用，并且实际推进了这个能力，不能只是空壳（比如只加了配置项、类型或接口，却没有实际行为）。
 - 这次只提第一步，size 尽量是 S 或 M。
 - what 的末尾单独起一行写「后续步骤：」（不要写成标题），下面按顺序列出剩下的几步，每步一句话，以后的侦察从这里接着往下提。
-- 下面已有的 issue 里，列着「后续步骤」、而且已完成（前一步已经合并）的，优先考虑提它的下一步：在 why 里写明接着哪条 issue，what 末尾的「后续步骤」只列还剩下的步骤。还没关闭的 issue，前一步还没做完，不要提它后面的步骤。
-- 已有的 issue 覆盖的能力太大、一直没人做的（比如还在等人采纳的大提案），可以提它能独立合并的第一步，在 why 里注明对应哪条 issue，这不算重复。
+- 下面已有的 issue 里，列着「后续步骤」、而且已完成（前一步已经合并）的，优先考虑提它的下一步：在 why 里写明接着哪条 issue，what 末尾的「后续步骤」只列还剩下的步骤。已经拆好、列着「后续步骤」但还没关闭的 issue，说明这一步正在做、还没合并，不要提它后面的步骤。
+- 这和还在等人采纳的大 issue 不同：已有的 issue 覆盖的能力太大、没有拆过、一直没人做的（比如还在等人采纳的大提案），可以提它能独立合并的第一步，在 why 里注明对应哪条 issue，这不算重复。
 
 ## 要求
 - 最多 ${input.max} 条，宁缺毋滥；没有值得做的就返回空列表。按上面的优先级和配比排列，同一类里价值高的在前。
@@ -1003,8 +1004,8 @@ const scoutPromptEn = (input: ScoutPromptInput) =>
 - Proposals must serve the goals in README.md; do not propose anything unrelated to them or against them.
 
 ## First, a gap analysis
-Before proposing anything, go through each goal in README.md and list, as capabilities, what the project cannot do yet; put them in the gaps of your answer. Look for missing capabilities, not scattered bugs: for example which outside tools and services it can work with, how large a task it can take on, whether it can do things in parallel, what users, situations and sources of requirements it can serve, and whether it can recover by itself when something goes wrong. Options defined in the code but never implemented, places that support only one case, and hard-coded limits are often gaps.
-- For each gap, give goal: the goal in README.md (named briefly, as README.md names it); gap: the missing capability; evidence: where the code limits this capability (file:line), or passages of README or other documents.
+Before proposing anything, list the goals README.md states, in its own words (only to go by, not part of your answer); then go through each of them and list, as capabilities, what the project cannot do yet; put them in the gaps of your answer. Look for missing capabilities, not scattered bugs: for example which outside tools and services it can work with, how large a task it can take on, whether it can do things in parallel, what users, situations and sources of requirements it can serve, and whether it can recover by itself when something goes wrong. Options defined in the code but never implemented, places that support only one case, and hard-coded limits are often gaps.
+- For each gap, give goal: one of the goals you listed, copied word for word as README.md writes it, and written the same way in every gap of that goal; gap: the missing capability; evidence: where the code limits this capability (file:line), or passages of README or other documents.
 - Put the most important gaps first: the more a gap stands in the way of a goal and the more depends on it, the more important it is. List gaps that existing issues already work on as well.
 - Leave gaps empty only if you find none after carefully going through every goal.
 
@@ -1016,15 +1017,15 @@ Before proposing anything, go through each goal in README.md and list, as capabi
 
 ## Mix of proposals
 - Problems of lead 1 come first: propose them before anything else, and when the limit leaves no room for more, they take it.
-- Besides lead 1, as long as your gap analysis found a gap, at least one proposal must add a capability: category feature, closing a gap from your gap analysis and advancing a goal of README.md, not patching a recent change. When an open issue already works on a gap, take another gap, or a step of it nobody has proposed yet, split as described in "Splitting a large capability" below.
+- Besides lead 1, as long as your gap analysis found a gap, at least one proposal must add a capability: category feature, closing a gap from your gap analysis and advancing a goal of README.md, not patching a recent change. When an open issue already works on a gap, take another gap; only when that issue covers a lot and is still waiting for a human to accept it, propose a first step of it that can be merged on its own (see the point on large issues waiting for a human in "Splitting a large capability" below).
 - At most one proposal from lead 4 per scout.
 
 ## Splitting a large capability
 When a capability is too much for one Run, split it into steps in order. Each step must be mergeable on its own, leave the system working as usual once merged, and actually advance the capability, not be an empty shell (for example a config option, a type or an interface without any real behavior).
 - Propose only the first step now, preferably of size S or M.
 - End what with a line of its own reading "Next steps:" (not a heading), followed by the remaining steps in order, one sentence each, for later scouts to go on from.
-- Among the existing issues below, when an issue lists "Next steps" and is done (its step was merged), consider its next step first: say in why which issue it follows, and list only the steps still left under "Next steps" at the end of what. An issue still open has not finished its step yet: do not propose the steps after it.
-- When an existing issue covers a capability too large to have been taken up (such as a large proposal still waiting for a human), you may propose a first step of it that can be merged on its own, saying in why which issue it belongs to; that is not a duplicate.
+- Among the existing issues below, when an issue lists "Next steps" and is done (its step was merged), consider its next step first: say in why which issue it follows, and list only the steps still left under "Next steps" at the end of what. An issue already split up, listing "Next steps" and still open, has its step in progress and not merged yet: do not propose the steps after it.
+- A large issue still waiting for a human is different: when an existing issue covers a capability too large to have been taken up, was never split, and nobody has worked on it (such as a large proposal still waiting for a human), you may propose a first step of it that can be merged on its own, saying in why which issue it belongs to; that is not a duplicate.
 
 ## Requirements
 - At most ${input.max}, and only ones that are worth it; return an empty list if nothing is. Order them by the priorities and the mix above, the more valuable first within each lead.

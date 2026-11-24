@@ -269,7 +269,7 @@ export interface ScoutProposal {
 
 /**
  * A capability the project lacks, from the scout's gap analysis against its README's goals.
- * `goal` is that goal as the README names it: each repo has goals of its own.
+ * `goal` is that goal copied word for word from the README: each repo has goals of its own.
  */
 export interface ScoutGap {
   goal: string;

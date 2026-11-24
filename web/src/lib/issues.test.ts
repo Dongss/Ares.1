@@ -149,6 +149,31 @@ describe("a scout's gap analysis", () => {
     expect(gapsByGoal([])).toEqual([]);
   });
 
+  it('puts goals differing only in whitespace or trailing punctuation in one group', () => {
+    const gap = (goal: string, text: string) => ({ goal, gap: text, evidence: ['a.ts:1'] });
+    const loose = [
+      gap(' 适用于构建 任何项目', 'a'),
+      gap('Can build any project', 'b'),
+      gap('适用于构建任何项目。', 'c'),
+      gap('Can build  any project.', 'd'),
+      gap('适用于构建　任何项目；', 'e'),
+      gap('Can build any project!?', 'f'),
+      gap('永动', 'g'),
+      gap('永动机', 'h'),
+      gap('can build any project', 'i'),
+    ];
+    expect(gapsByGoal(loose)).toEqual([
+      // Headed by the first gap's goal, trimmed; gaps keep their order.
+      { goal: '适用于构建 任何项目', gaps: [loose[0], loose[2], loose[4]] },
+      { goal: 'Can build any project', gaps: [loose[1], loose[3], loose[5]] },
+      // No merging by meaning or case.
+      { goal: '永动', gaps: [loose[6]] },
+      { goal: '永动机', gaps: [loose[7]] },
+      { goal: 'can build any project', gaps: [loose[8]] },
+    ]);
+    expect(gapsHeading(loose)).toBe('差距分析：9 个缺口，涉及 5 个目标');
+  });
+
   it('heads it with the counts, and tells a scout without one from one that found nothing', () => {
     expect(gapsHeading(gaps)).toBe('差距分析：3 个缺口，涉及 2 个目标');
     expect(gapsHeading([])).toBe('差距分析：没有找到能力缺口');

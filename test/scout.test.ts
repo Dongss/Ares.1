@@ -1047,7 +1047,7 @@ describe('scoutPrompt', () => {
     expect(prompt).toContain('README.md 写着项目的目标，是一切决定的依据');
     expect(prompt).toContain('提案要服务于 README.md 里的目标');
     expect(prompt).toContain(
-      '先对照 README.md 里的每个目标，在能力层面列出这个项目现在还做不到什么',
+      '先按 README.md 的原文列出它写的目标（只用来对照，不写进结果），再对照其中的每个目标，在能力层面列出这个项目现在还做不到什么',
     );
     expect(prompt).not.toContain('当前方向');
   });
@@ -1091,8 +1091,9 @@ describe('scoutPrompt', () => {
     expect(gaps).toContain('能不能并行');
     expect(gaps).toContain('出了问题能不能自己恢复');
     expect(gaps).toContain(
-      'goal 是 README.md 里的哪个目标（照 README 的说法简短写），gap 是缺什么能力，evidence 是限制这个能力的代码位置（文件:行号）或 README、文档里的段落',
+      'goal 是上面列出的哪个目标，一字不差地照抄 README.md 里这个目标的原文，同一个目标在每个缺口里写法相同；gap 是缺什么能力，evidence 是限制这个能力的代码位置（文件:行号）或 README、文档里的段落',
     );
+    expect(gaps).not.toContain('简短写');
     expect(gaps).toContain('最重要的缺口放在最前');
   });
 
@@ -1119,6 +1120,22 @@ describe('scoutPrompt', () => {
     );
     expect(mix).toContain('而不是对最近改动的修补');
     expect(mix).toContain('第 4 类每次最多一条');
+  });
+
+  it('takes another gap when an open issue works on it, unless that issue waits for a human', () => {
+    const mix = section(prompt, '## 提案的配比');
+    expect(mix).toContain(
+      '缺口已经有未关闭的 issue 在做时，换一个缺口；只有那个 issue 覆盖面很大、还在等人采纳时，才提它能独立合并的第一步（见下面「拆一个大能力」里等人采纳的大 issue 那一条）',
+    );
+    // No longer reads as proposing any step of an open issue, against the split section.
+    expect(mix).not.toContain('还没人提的一步');
+    const split = section(prompt, '## 拆一个大能力');
+    expect(split).toContain(
+      '已经拆好、列着「后续步骤」但还没关闭的 issue，说明这一步正在做、还没合并，不要提它后面的步骤',
+    );
+    expect(split).toContain(
+      '这和还在等人采纳的大 issue 不同：已有的 issue 覆盖的能力太大、没有拆过、一直没人做的',
+    );
   });
 
   it('splits a large capability into steps, proposing the first and listing the rest', () => {
@@ -1343,14 +1360,15 @@ describe('scout in English', () => {
 
     const gaps = section(prompt, '## First, a gap analysis');
     expect(gaps).toContain(
-      'go through each goal in README.md and list, as capabilities, what the project cannot do yet; put them in the gaps of your answer',
+      'list the goals README.md states, in its own words (only to go by, not part of your answer); then go through each of them and list, as capabilities, what the project cannot do yet; put them in the gaps of your answer',
     );
     expect(gaps).toContain('not scattered bugs');
     expect(gaps).toContain('whether it can do things in parallel');
     expect(gaps).toContain('whether it can recover by itself when something goes wrong');
     expect(gaps).toContain(
-      'goal: the goal in README.md (named briefly, as README.md names it); gap: the missing capability; evidence: where the code limits this capability (file:line), or passages of README or other documents',
+      'goal: one of the goals you listed, copied word for word as README.md writes it, and written the same way in every gap of that goal; gap: the missing capability; evidence: where the code limits this capability (file:line), or passages of README or other documents',
     );
+    expect(gaps).not.toContain('named briefly');
     expect(gaps).toContain('Put the most important gaps first');
 
     const leads = section(prompt, '## Leads (highest priority first)')
@@ -1377,6 +1395,10 @@ describe('scout in English', () => {
     );
     expect(mix).toContain('not patching a recent change');
     expect(mix).toContain('At most one proposal from lead 4 per scout');
+    expect(mix).toContain(
+      'When an open issue already works on a gap, take another gap; only when that issue covers a lot and is still waiting for a human to accept it, propose a first step of it that can be merged on its own (see the point on large issues waiting for a human in "Splitting a large capability" below)',
+    );
+    expect(mix).not.toContain('nobody has proposed yet');
 
     const split = section(prompt, '## Splitting a large capability');
     expect(split).toContain(
@@ -1390,6 +1412,12 @@ describe('scout in English', () => {
       'when an issue lists "Next steps" and is done (its step was merged), consider its next step first',
     );
     expect(split).toContain('saying in why which issue it belongs to; that is not a duplicate');
+    expect(split).toContain(
+      'An issue already split up, listing "Next steps" and still open, has its step in progress and not merged yet: do not propose the steps after it',
+    );
+    expect(split).toContain(
+      'A large issue still waiting for a human is different: when an existing issue covers a capability too large to have been taken up, was never split, and nobody has worked on it',
+    );
     expect(prompt).toContain(
       'Split anything too large as described in "Splitting a large capability" and propose only its first step; only if it cannot be split even that way, set its size to L',
     );

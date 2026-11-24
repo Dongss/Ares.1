@@ -61,18 +61,28 @@ export const CATEGORY: Readonly<Record<ScoutProposal['category'], string>> = {
 };
 
 /**
- * A scout's gaps grouped by the README goal they stand in the way of. Goals come in the order
- * their first gap does, so the group of the most important gap leads; gaps keep their order.
+ * What two goals are compared by: no whitespace anywhere (half- or full-width) and no trailing
+ * punctuation, Chinese or not. Only these small slips are ignored; case, synonyms and meaning are
+ * left alone.
+ */
+const goalKey = (goal: string) =>
+  goal.replace(/\s+/g, '').replace(/[。．.，,；;：:！!？?、]+$/, '');
+
+/**
+ * A scout's gaps grouped by the README goal they stand in the way of. Goals that differ only in
+ * whitespace or trailing punctuation (see `goalKey`) fall in one group, headed by its first gap's
+ * goal, trimmed. Goals come in the order their first gap does, so the group of the most important
+ * gap leads; gaps keep their order.
  */
 export function gapsByGoal(gaps: readonly ScoutGap[]): { goal: string; gaps: ScoutGap[] }[] {
-  const groups: { goal: string; gaps: ScoutGap[] }[] = [];
+  const groups: { goal: string; key: string; gaps: ScoutGap[] }[] = [];
   for (const gap of gaps) {
-    const goal = gap.goal.trim();
-    const group = groups.find((g) => g.goal === goal);
+    const key = goalKey(gap.goal);
+    const group = groups.find((g) => g.key === key);
     if (group) group.gaps.push(gap);
-    else groups.push({ goal, gaps: [gap] });
+    else groups.push({ goal: gap.goal.trim(), key, gaps: [gap] });
   }
-  return groups;
+  return groups.map(({ goal, gaps }) => ({ goal, gaps }));
 }
 
 /**
