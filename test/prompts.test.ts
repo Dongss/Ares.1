@@ -274,7 +274,11 @@ describe('planning prompts', () => {
     const step = {
       index: 2,
       total: 3,
-      titles: ['加接口', '接上存储', '补文档'],
+      steps: [
+        { title: '加接口', summary: '加了 GET /api/x，返回值用 zod 校验。' },
+        { title: '接上存储', summary: null },
+        { title: '补文档', summary: null },
+      ],
       instructions: '把接口接到 store 上',
     };
     const prompt = taskPrompt(planned(), null, 'full', undefined, step);
@@ -283,10 +287,85 @@ describe('planning prompts', () => {
     expect(prompt).toContain('## 当前阶段：编码\n\n实现 添加 feature.txt，补上测试。');
     expect(prompt).toContain('## 这一步：第 2 步（共 3 步）「接上存储」');
     expect(prompt).toContain('这次只做这一步：\n\n把接口接到 store 上');
-    expect(prompt).toContain('1. 加接口（已完成）\n2. 接上存储 ← 这一步\n3. 补文档');
+    // The steps done carry what their agents wrote they did.
+    expect(prompt).toContain(
+      '1. 加接口（已完成）\n   结果：加了 GET /api/x，返回值用 zod 校验。\n2. 接上存储 ← 这一步\n3. 补文档\n',
+    );
+    expect(prompt).toContain('每一步下面的「结果」是做那一步的 Agent 完成后写的 summary');
     expect(prompt).toContain('后面的步骤由之后的 Task 完成，现在不要做');
     // A stage that is not planned has no step.
     expect(taskPrompt(planned(), null, 'full')).not.toContain('## 这一步');
+  });
+
+  it("cuts each step's summary to size and keeps a multi-line one under its step", () => {
+    const long = `${'很长的说明'.repeat(100)}结尾`;
+    const prompt = taskPrompt(planned(), null, 'full', undefined, {
+      index: 3,
+      total: 3,
+      steps: [
+        { title: '一', summary: `第一行\n第二行` },
+        { title: '二', summary: long },
+        { title: '三', summary: null },
+      ],
+      instructions: '做三',
+    });
+    expect(prompt).toContain(
+      '1. 一（已完成）\n   结果：第一行\n   第二行\n2. 二（已完成）\n   结果：很长',
+    );
+    const cut = /2\. 二（已完成）\n {3}结果：(.*)\n3\. 三 ← 这一步/.exec(prompt)?.[1] ?? '';
+    expect(cut).toBe(`${long.slice(0, 400)}…`);
+    expect(prompt).not.toContain('结尾');
+    // A step done without a summary is listed without a result.
+    const bare = taskPrompt(planned(), null, 'full', undefined, {
+      index: 2,
+      total: 2,
+      steps: [
+        { title: '一', summary: '  ' },
+        { title: '二', summary: null },
+      ],
+      instructions: '做二',
+    });
+    expect(bare).toContain('1. 一（已完成）\n2. 二 ← 这一步');
+  });
+
+  it('gives a plan after the round was sent back the previous plan, and asks only for changes', () => {
+    const prompt = planPrompt(
+      { ...planned(), stageFeedback: '「评审」没有通过：\n1. [必须修改] 少了测试' },
+      null,
+      {
+        round: 1,
+        steps: [
+          {
+            title: '加接口',
+            instructions: '在 src/api 加 GET /api/x',
+            passed: true,
+            summary: '加了接口。',
+          },
+          { title: '补文档', instructions: '写 docs', passed: false, summary: null },
+        ],
+      },
+    );
+    expect(prompt).toContain('## 上一轮被打回的原因');
+    expect(prompt).toContain(
+      '## 上一轮的计划（第 1 轮）\n\n这个阶段上一轮的计划共 2 步，下面是每一步的说明、是否通过，以及做完后写的 summary（「结果」）。通过的步骤都已经提交，它们的改动都还在工作目录里',
+    );
+    expect(prompt).toContain(
+      '### 第 1 步：加接口（已通过）\n\n在 src/api 加 GET /api/x\n\n结果：加了接口。\n\n### 第 2 步：补文档（未通过）\n\n写 docs\n\n这一轮只列出这次需要做的修改步骤',
+    );
+    expect(prompt).toContain('已经通过、和打回原因无关的步骤不要重做');
+    // After why the round was sent back.
+    expect(prompt.indexOf('## 上一轮的计划')).toBeGreaterThan(
+      prompt.indexOf('## 上一轮被打回的原因'),
+    );
+    // A previous round that was not planned is its one task, with no instructions of its own.
+    const single = planPrompt(planned(), null, {
+      round: 2,
+      steps: [{ title: '编码', instructions: null, passed: true, summary: '做完了。' }],
+    });
+    expect(single).toContain('## 上一轮的计划（第 2 轮）\n\n这个阶段上一轮的计划共 1 步');
+    expect(single).toContain('### 第 1 步：编码（已通过）\n\n结果：做完了。\n\n这一轮只列出');
+    // The first round has none.
+    expect(planPrompt(planned(), null)).not.toContain('## 上一轮的计划');
   });
 });
 
@@ -496,10 +575,34 @@ describe('prompts in English', () => {
         'The JSON result does not match the agreed format: tasks: too small',
       ),
       planBare: planPrompt({ ...enCtx(), verifyCommands: [] }, null),
+      replan: planPrompt(
+        { ...enCtx(stage), stageFeedback: '"Review" did not pass:\n1. [Must fix] add tests' },
+        null,
+        {
+          round: 1,
+          steps: [
+            {
+              title: 'Add the API',
+              instructions: 'Add GET /api/x',
+              passed: true,
+              summary: 'Added the endpoint.',
+            },
+            { title: 'Document it', instructions: 'Write docs', passed: false, summary: null },
+          ],
+        },
+      ),
+      replanSingle: planPrompt(enCtx(stage), null, {
+        round: 2,
+        steps: [{ title: 'Coding', instructions: null, passed: true, summary: 'Done.' }],
+      }),
       step: taskPrompt(enCtx(stage), null, 'full', undefined, {
         index: 2,
         total: 3,
-        titles: ['Add the API', 'Wire up the store', 'Document it'],
+        steps: [
+          { title: 'Add the API', summary: 'Added GET /api/x,\nvalidated with zod.' },
+          { title: 'Wire up the store', summary: null },
+          { title: 'Document it', summary: null },
+        ],
         instructions: 'Connect the API to the store',
       }),
     };
@@ -507,9 +610,21 @@ describe('prompts in English', () => {
     expect(prompts.plan.startsWith('You are the planning agent of Ares.1.')).toBe(true);
     expect(prompts.plan).toContain('At most 8 steps');
     expect(prompts.plan).toContain('Write title and instructions in English.');
+    expect(prompts.plan).not.toContain("## The previous round's plan");
+    expect(prompts.replan).toContain(
+      "## The previous round's plan (round 1)\n\nThis stage's previous round had a plan of 2 steps.",
+    );
+    expect(prompts.replan).toContain(
+      '### Step 1: Add the API (passed)\n\nAdd GET /api/x\n\nResult: Added the endpoint.\n\n### Step 2: Document it (did not pass)\n\nWrite docs\n\nIn this round, list only the steps of the changes needed now',
+    );
+    expect(prompts.replan).toContain('Do not redo the steps that passed');
+    expect(prompts.replanSingle).toContain('had a plan of one step.');
     expect(prompts.step).toContain('## This step: step 2 of 3, "Wire up the store"');
     expect(prompts.step).toContain(
-      '1. Add the API (done)\n2. Wire up the store ← this step\n3. Document it',
+      '1. Add the API (done)\n   Result: Added GET /api/x,\n   validated with zod.\n2. Wire up the store ← this step\n3. Document it',
+    );
+    expect(prompts.step).toContain(
+      'The "Result" under each of them is the summary its agent wrote',
     );
   });
 });

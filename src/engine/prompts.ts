@@ -176,14 +176,43 @@ This requirement's branch conflicted when it was to be merged into ${merge.targe
   });
 }
 
+/**
+ * Characters kept of the summary of each step a prompt lists: enough for what the step did and
+ * the choices it made, while a plan of many steps keeps the prompt bounded.
+ */
+const MAX_STEP_SUMMARY = 400;
+
+/** `text` trimmed, cut to `max` characters with an ellipsis. */
+function clip(text: string, max: number): string {
+  const trimmed = text.trim();
+  return trimmed.length > max ? `${trimmed.slice(0, max).trimEnd()}…` : trimmed;
+}
+
+/** The summary a step's agent reported, cut to size, as listed with the step; '' when none. */
+function stepResult(summary: string | null): string {
+  if (!summary?.trim()) return '';
+  const text = clip(summary, MAX_STEP_SUMMARY);
+  return t({ zh: `结果：${text}`, en: `Result: ${text}` });
+}
+
+/** One step of a stage round's plan, with what came of it so far. */
+export interface StepOutcome {
+  title: string;
+  /**
+   * The summary of the step's last passing attempt, as its agent wrote it; null when the step
+   * has not passed or said nothing.
+   */
+  summary: string | null;
+}
+
 /** A work task of a stage its plan split into steps (`planning: llm`): which step it is. */
 export interface PlannedStep {
   /** Position among the plan's tasks, from 1. */
   index: number;
   /** How many steps the plan has. */
   total: number;
-  /** Titles of all the plan's tasks, in order. */
-  titles: string[];
+  /** All the plan's steps, in order; the ones before this step carry their summaries. */
+  steps: StepOutcome[];
   /** What the plan says this step does. */
   instructions: string;
 }
@@ -191,16 +220,18 @@ export interface PlannedStep {
 function stepSection(step: PlannedStep | undefined): string {
   if (!step) return '';
   const { total } = step;
-  const title = step.titles[step.index - 1] ?? '';
-  const plan = step.titles
+  const title = step.steps[step.index - 1]?.title ?? '';
+  const plan = step.steps
     .map((s, i) => {
-      const mark =
-        i + 1 < step.index
-          ? t({ zh: '（已完成）', en: ' (done)' })
-          : i + 1 === step.index
-            ? t({ zh: ' ← 这一步', en: ' ← this step' })
-            : '';
-      return `${i + 1}. ${s}${mark}`;
+      const n = i + 1;
+      const head = `${n}. ${s.title}`;
+      if (n < step.index) {
+        // Indented under its item, every line of it, so a multi-line summary stays there.
+        const result = stepResult(s.summary).replaceAll('\n', '\n   ');
+        return `${head}${t({ zh: '（已完成）', en: ' (done)' })}${result ? `\n   ${result}` : ''}`;
+      }
+      if (n === step.index) return `${head}${t({ zh: ' ← 这一步', en: ' ← this step' })}`;
+      return head;
     })
     .join('\n');
   return t({
@@ -214,7 +245,7 @@ ${step.instructions.trim()}
 
 ${plan}
 
-- 前面的步骤已经完成并提交，在它们的基础上继续。
+- 前面的步骤已经完成并提交，在它们的基础上继续。每一步下面的「结果」是做那一步的 Agent 完成后写的 summary，从中可以知道它实际做了什么、做了哪些取舍。
 - 后面的步骤由之后的 Task 完成，现在不要做。
 - 这一步做完后代码要处在可用的状态：能构建，检查能通过。
 
@@ -229,7 +260,7 @@ The whole plan:
 
 ${plan}
 
-- The steps before this one are done and committed; build on them.
+- The steps before this one are done and committed; build on them. The "Result" under each of them is the summary its agent wrote when done: what the step actually did and the choices it made.
 - The steps after this one are left to later tasks; do not do them now.
 - When this step is done, the code must be in a working state: it builds and the checks pass.
 
@@ -339,12 +370,74 @@ ${taskReportFormat()}
   });
 }
 
+/** A step of the previous round of a stage, as the next round's plan reads it. */
+export interface PreviousStep extends StepOutcome {
+  /** What the plan said the step does; null when the round was not planned (the whole stage). */
+  instructions: string | null;
+  passed: boolean;
+}
+
+/**
+ * The previous round of a stage with `planning: llm`, handed to the plan of the round after it
+ * was sent back, so that the new plan only lists what has to change.
+ */
+export interface PreviousPlan {
+  round: number;
+  /** Its steps in order; a round that was not planned is its one task. */
+  steps: PreviousStep[];
+}
+
+function previousPlanSection(previous: PreviousPlan | undefined): string {
+  if (!previous || previous.steps.length === 0) return '';
+  const n = previous.steps.length;
+  const steps = previous.steps
+    .map((s, i) => {
+      const head = s.passed
+        ? t({
+            zh: `### 第 ${i + 1} 步：${s.title}（已通过）`,
+            en: `### Step ${i + 1}: ${s.title} (passed)`,
+          })
+        : t({
+            zh: `### 第 ${i + 1} 步：${s.title}（未通过）`,
+            en: `### Step ${i + 1}: ${s.title} (did not pass)`,
+          });
+      const result = stepResult(s.summary);
+      return [head, s.instructions?.trim(), result].filter(Boolean).join('\n\n');
+    })
+    .join('\n\n');
+  return t({
+    zh: `## 上一轮的计划（第 ${previous.round} 轮）
+
+这个阶段上一轮的计划共 ${n} 步，下面是每一步的说明、是否通过，以及做完后写的 summary（「结果」）。通过的步骤都已经提交，它们的改动都还在工作目录里：这一轮在这些代码的基础上修改，不是从头再做。
+
+${steps}
+
+这一轮只列出这次需要做的修改步骤：改正被打回的问题，补上没通过的步骤。已经通过、和打回原因无关的步骤不要重做，也不要再列进计划；要改的地方不多时只给一步。
+
+`,
+    en: `## The previous round's plan (round ${previous.round})
+
+This stage's previous round had a plan of ${n === 1 ? 'one step' : `${n} steps`}. Below are each step's instructions, whether it passed, and the summary written when it was done ("Result"). The steps that passed are committed, and their changes are all still in the working directory: this round changes that code; it does not start over.
+
+${steps}
+
+In this round, list only the steps of the changes needed now: fixing the problems the round was sent back for, and finishing the steps that did not pass. Do not redo the steps that passed and have nothing to do with why the round was sent back, and do not list them in the plan again; when little has to change, give a single step.
+
+`,
+  });
+}
+
 /**
  * Prompt of a stage's plan (`planning: llm`): a read-only agent splits the stage into ordered
  * steps, each executed, checked and committed on its own (`PlanReportSchema`).
  * @param feedback what was wrong with the previous plan (its format, say), or a human's note.
+ * @param previous from round 2 on, the stage's previous round step by step.
  */
-export function planPrompt(ctx: PromptContext, feedback: string | null): string {
+export function planPrompt(
+  ctx: PromptContext,
+  feedback: string | null,
+  previous?: PreviousPlan,
+): string {
   const stageName = ctx.stage.name ?? ctx.stage.id;
   const instructions = ctx.stage.instructions ? fill(ctx.stage.instructions, ctx.goal).trim() : '';
   const requirements = instructions
@@ -373,7 +466,7 @@ export function planPrompt(ctx: PromptContext, feedback: string | null): string 
           en: `the Master runs the verify commands (${commands}) and commits it on its own once all of them pass`,
         })
       : t({ zh: 'Master 单独提交', en: 'the Master commits it on its own' });
-  const rest = `${requirements}${inputsSection(ctx.inputs)}${earlierAttemptsSection(ctx.earlierAttempts, 'task')}${stageFeedback}${lastFeedback}`;
+  const rest = `${requirements}${inputsSection(ctx.inputs)}${earlierAttemptsSection(ctx.earlierAttempts, 'task')}${stageFeedback}${previousPlanSection(previous)}${lastFeedback}`;
   return t({
     zh: `你是${brandName()}的「任务拆分」Agent。阶段「${stageName}」开始之前，先把下面的目标拆成按顺序执行的几步。你只能读文件和搜索，不能修改任何文件，也不能执行命令。
 

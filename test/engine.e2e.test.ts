@@ -4878,7 +4878,14 @@ stages:
     expect(planCall?.permission).toBe('safe');
     expect(stepCalls[0]?.prompt).toContain('## 当前阶段：编码\n\n实现 添加 feature.txt');
     expect(stepCalls[0]?.prompt).toContain('## 这一步：第 1 步（共 3 步）「a」');
-    expect(stepCalls[1]?.prompt).toContain('1. a（已完成）\n2. b ← 这一步\n3. c');
+    expect(stepCalls[0]?.prompt).not.toContain('结果：');
+    // Each later step reads what the steps before it wrote they did.
+    expect(stepCalls[1]?.prompt).toContain(
+      '1. a（已完成）\n   结果：写了 a.txt\n2. b ← 这一步\n3. c\n',
+    );
+    expect(stepCalls[2]?.prompt).toContain(
+      '1. a（已完成）\n   结果：写了 a.txt\n2. b（已完成）\n   结果：写了 b.txt\n3. c ← 这一步\n',
+    );
     expect(stepCalls[2]?.prompt).toContain('这次只做这一步：\n\n写 c.txt');
     expect(stepCalls.slice(0, 3).map((c) => c.resumeSessionId)).toEqual([
       undefined,
@@ -5080,13 +5087,167 @@ stages:
     const plans = h.fake.calls.filter((c) => c.readOnly);
     expect(plans).toHaveLength(2);
     expect(plans[0]?.prompt).not.toContain('## 上一轮被打回的原因');
+    expect(plans[0]?.prompt).not.toContain('## 上一轮的计划');
     expect(plans[1]?.prompt).toContain('## 上一轮被打回的原因');
     expect(plans[1]?.prompt).toContain('少了 d.txt');
+    // The new plan reads the previous one step by step, with what came of each, and is asked to
+    // list only the changes: the commits of the round before are still there.
+    expect(plans[1]?.prompt).toContain(
+      '## 上一轮的计划（第 1 轮）\n\n这个阶段上一轮的计划共 2 步，下面是每一步的说明、是否通过，以及做完后写的 summary（「结果」）。通过的步骤都已经提交，它们的改动都还在工作目录里',
+    );
+    expect(plans[1]?.prompt).toContain(
+      '### 第 1 步：a（已通过）\n\n写 a.txt\n\n结果：写了 a.txt\n\n### 第 2 步：b（已通过）\n\n写 b.txt\n\n结果：写了 b.txt\n\n这一轮只列出这次需要做的修改步骤',
+    );
+    expect(plans[1]?.prompt).toContain('已经通过、和打回原因无关的步骤不要重做，也不要再列进计划');
     // Each step of the new round gets the review too.
     const steps = h.fake.calls.filter((c) => c.model === 'coder' && !c.readOnly);
     expect(steps).toHaveLength(4);
     for (const call of steps.slice(0, 2)) expect(call.prompt).not.toContain('少了 d.txt');
     for (const call of steps.slice(2)) expect(call.prompt).toContain('少了 d.txt');
+  });
+
+  it('gives every plan after a rejected approval the previous plan, a single step too, still prompting and committing a single step as no plan', async () => {
+    let plans = 0;
+    let works = 0;
+    h = await harness({
+      workflow: PLANNED_WORKFLOW,
+      scripts: {
+        coder: (ctx) => {
+          if (ctx.input.readOnly) {
+            plans++;
+            // The second round's first plan is not in the format, so it is planned twice.
+            if (plans === 2) return { finalMessage: '```json\n{"tasks": []}\n```' };
+            return plan(plans === 1 ? ['a'] : ['fix']);
+          }
+          works++;
+          // The first execution fails the verify command; its summary is not the step's.
+          writeFile(join(ctx.input.workdir, 'feature.txt'), works === 1 ? 'wrong\n' : 'ok\n');
+          writeFile(join(ctx.input.workdir, `work-${works}.txt`), 'done\n');
+          return done(['第一次没写对', '写好了 feature.txt', '改好了'][works - 1]);
+        },
+        reviewer: () => review(),
+      },
+    });
+    const run = h.run('添加 feature.txt', { stages: { merge: { gate: true } } });
+    await h.waitStatus(run.id, 'waiting_approval');
+    h.master.engine.reject(run.id, '文件名要改成 feature.md');
+    await waitFor(() => h?.master.store.countStageRounds(run.id, 'merge') === 2, 'second merge');
+    await h.waitStatus(run.id, 'waiting_approval');
+    h.master.engine.approve(run.id);
+    await h.waitStatus(run.id, 'completed');
+    const store = h.master.store;
+
+    const rounds = implementRounds(run.id);
+    expect(rounds.map((sr) => tasksOf(sr.id))).toEqual([
+      [
+        ['plan', '拆分任务', 'passed'],
+        ['work', 'a', 'passed'],
+      ],
+      [
+        ['plan', '拆分任务', 'passed'],
+        ['work', 'fix', 'passed'],
+      ],
+    ]);
+    const planCalls = h.fake.calls.filter((c) => c.readOnly);
+    expect(planCalls).toHaveLength(3);
+    expect(planCalls[0]?.prompt).not.toContain('## 上一轮的计划');
+    // Both plans of the second round, the retry after the bad format too: the previous plan of a
+    // single step, with the summary of the execution that passed.
+    for (const call of planCalls.slice(1)) {
+      expect(call.prompt).toContain('审批被驳回');
+      expect(call.prompt).toContain('文件名要改成 feature.md');
+      expect(call.prompt).toContain('## 上一轮的计划（第 1 轮）\n\n这个阶段上一轮的计划共 1 步');
+      expect(call.prompt).toContain(
+        '### 第 1 步：a（已通过）\n\n写 a.txt\n\n结果：写好了 feature.txt\n\n这一轮只列出这次需要做的修改步骤',
+      );
+      expect(call.prompt).not.toContain('第一次没写对');
+    }
+    expect(planCalls[2]?.prompt).toContain('## 上一次拆分没有完成');
+
+    // A plan of a single step is the whole stage, in every round: prompted and committed as
+    // without a plan.
+    const workCalls = h.fake.calls.filter((c) => c.model === 'coder' && !c.readOnly);
+    expect(workCalls).toHaveLength(3);
+    for (const call of workCalls) {
+      expect(call.prompt).not.toContain('## 这一步');
+      expect(call.prompt).not.toContain('整个计划');
+    }
+    const messages = rounds.map((sr) => {
+      const work = store.listTasks(sr.id).find((task) => task.kind === 'work') as Task;
+      return git(h?.repoDir as string, 'log', '-1', '--format=%B', work.commitSha as string);
+    });
+    expect(messages[0]?.startsWith('编码: 添加 feature.txt\n\n写好了 feature.txt\n')).toBe(true);
+    expect(messages[1]?.startsWith('编码（第 2 轮）: 添加 feature.txt\n\n改好了\n')).toBe(true);
+    for (const message of messages) expect(message).not.toMatch(/第 \d+\/\d+ 步/);
+  });
+
+  it('writes the steps, their summaries and the previous plan in English', async () => {
+    const english = PLANNED_WORKFLOW.replace('name: 测试流程', 'name: Test flow')
+      .replace('name: 编码', 'name: Coding')
+      .replace('name: 评审', 'name: Review')
+      .replace('name: 合并', 'name: Merge')
+      .replace('实现 {{goal}}', 'Implement {{goal}}');
+    const json = (value: unknown) => ({
+      finalMessage: `Done.\n\`\`\`json\n${JSON.stringify(value)}\n\`\`\``,
+    });
+    let plans = 0;
+    let reviews = 0;
+    try {
+      h = await harness({
+        config: 'language: en\n',
+        workflow: english,
+        scripts: {
+          coder: (ctx) => {
+            if (ctx.input.readOnly) {
+              const titles = ++plans === 1 ? ['api', 'docs'] : ['fix'];
+              return json({
+                tasks: titles.map((title) => ({ title, instructions: `Write ${title}.txt` })),
+              });
+            }
+            const file = /Write (\S+\.txt)/.exec(ctx.input.prompt)?.[1] ?? 'all.txt';
+            writeFile(join(ctx.input.workdir, file), 'step\n');
+            writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+            return json({ status: 'done', summary: `Wrote ${file}` });
+          },
+          reviewer: () =>
+            ++reviews === 1
+              ? json({
+                  summary: 'Not yet',
+                  issues: [{ severity: 'must', description: 'docs.txt needs a heading' }],
+                })
+              : json({ summary: 'Fine', issues: [] }),
+        },
+      });
+      const run = h.run('Add feature.txt');
+      await h.waitStatus(run.id, 'completed');
+
+      const coder = h.fake.calls.filter((c) => c.model === 'coder');
+      for (const call of coder) expect(call.prompt).not.toMatch(/\p{Script=Han}/u);
+      const planCalls = coder.filter((c) => c.readOnly);
+      const workCalls = coder.filter((c) => !c.readOnly);
+      expect(planCalls).toHaveLength(2);
+      expect(workCalls).toHaveLength(3);
+      expect(workCalls[1]?.prompt).toContain(
+        '1. api (done)\n   Result: Wrote api.txt\n2. docs ← this step\n',
+      );
+      expect(planCalls[0]?.prompt).not.toContain("## The previous round's plan");
+      expect(planCalls[1]?.prompt).toContain('docs.txt needs a heading');
+      expect(planCalls[1]?.prompt).toContain(
+        "## The previous round's plan (round 1)\n\nThis stage's previous round had a plan of 2 steps.",
+      );
+      expect(planCalls[1]?.prompt).toContain(
+        '### Step 1: api (passed)\n\nWrite api.txt\n\nResult: Wrote api.txt\n\n### Step 2: docs (passed)\n\nWrite docs.txt\n\nResult: Wrote docs.txt\n\nIn this round, list only the steps of the changes needed now',
+      );
+      // The second round's plan of a single step: no step, as without a plan.
+      expect(workCalls[2]?.prompt).not.toContain('## This step');
+      const [, second] = implementRounds(run.id) as [StageRun, StageRun];
+      const fix = h.master.store.listTasks(second.id).find((task) => task.kind === 'work') as Task;
+      const message = git(h.repoDir, 'log', '-1', '--format=%B', fix.commitSha as string);
+      expect(message.startsWith('Coding (round 2): Add feature.txt\n\nWrote all.txt\n')).toBe(true);
+      expect(message).not.toContain('Step 1/1');
+    } finally {
+      setLang('zh');
+    }
   });
 
   /**

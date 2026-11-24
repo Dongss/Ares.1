@@ -119,6 +119,7 @@ import {
   assessPrompt,
   type MergeInProgress,
   type PlannedStep,
+  type PreviousPlan,
   type PreviousReview,
   type PromptContext,
   planPrompt,
@@ -1667,7 +1668,8 @@ export class Engine {
     this.store.tx(() => {
       if (eff.def.kind === 'agent' && eff.def.planning === 'llm') {
         // planning: llm — the stage's agent first splits it into tasks (`runPlanTask`). Every
-        // round plans anew, with the reason the previous one was sent back.
+        // round plans anew, with the reason the previous one was sent back and that round's
+        // plan and results (`previousPlan`), listing only the steps that change something.
         this.store.createTask({
           runId: run.id,
           stageRunId: sr.id,
@@ -1905,9 +1907,9 @@ export class Engine {
   }
 
   /**
-   * Where a work task stands in the plan of its stage round (`planning: llm`); undefined when the
-   * round was not split into several steps (`planSteps`): a plan of a single step is the whole
-   * stage, prompted and committed as without a plan.
+   * Where a work task stands in the plan of its stage round (`planning: llm`), with the summaries
+   * of the steps before it; undefined when the round was not split into several steps
+   * (`planSteps`): a plan of a single step is the whole stage, prompted as without a plan.
    */
   private plannedStep(sr: StageRun, task: Task): PlannedStep | undefined {
     const tasks = this.store.listTasks(sr.id);
@@ -1917,9 +1919,47 @@ export class Engine {
     return {
       index: step.index,
       total: step.total,
-      titles: tasks.filter((t) => steps.has(t.id)).map((t) => t.title),
+      steps: tasks
+        .filter((t) => steps.has(t.id))
+        .map((t, i) => ({
+          title: t.title,
+          summary: i + 1 < step.index ? this.passedSummary(t) : null,
+        })),
       instructions: task.instructions,
     };
+  }
+
+  /**
+   * From round 2 on, for the plan of a stage with `planning: llm`: the stage's previous round step
+   * by step, with whether each passed and its summary, so that the new plan only lists what has
+   * to change. A previous round that was not planned is its one task, whose instructions are the
+   * stage's own.
+   */
+  private previousPlan(run: Run, sr: StageRun): PreviousPlan | undefined {
+    if (sr.round <= 1) return undefined;
+    const previous = this.store
+      .listStageRuns(run.id)
+      .findLast((s) => s.stageId === sr.stageId && s.round < sr.round);
+    if (!previous) return undefined;
+    const tasks = this.store.listTasks(previous.id);
+    const planned = tasks.some((t) => t.kind === 'plan');
+    const steps = tasks
+      .filter((t) => t.kind === 'work')
+      .map((t) => ({
+        title: t.title,
+        instructions: planned ? t.instructions : null,
+        passed: t.status === 'passed',
+        summary: this.passedSummary(t),
+      }));
+    return steps.length > 0 ? { round: previous.round, steps } : undefined;
+  }
+
+  /** The summary of a task's last passing attempt; null when none passed or it is empty. */
+  private passedSummary(task: Task): string | null {
+    const attempt = this.store.listAttempts(task.id).findLast((a) => a.outcome === 'passed');
+    if (!attempt) return null;
+    const report = parseReport(TaskReportSchema, attempt.structured, attempt.finalMessage ?? '');
+    return report.ok && report.value.summary.trim() ? report.value.summary.trim() : null;
   }
 
   private async runAgentTask(
@@ -2116,8 +2156,9 @@ export class Engine {
       return this.rework(run, eff, task, attempt, formatCommandFailure(failed));
     }
 
-    // Passed: one commit per task, the merge commit when resolving a merge.
-    const step = this.plannedStep(sr, task);
+    // Passed: one commit per task, the merge commit when resolving a merge. A plan of a single
+    // step is the whole stage, committed as without a plan.
+    const step = planSteps(this.store.listTasks(sr.id)).get(task.id);
     const sha = await commitAll(
       workdir,
       commitMessage({
@@ -2505,7 +2546,8 @@ export class Engine {
    * plan still to do or all its work tasks: a plan stopped halfway (a pause, a restart) runs
    * again and leaves no task behind. A plan that errors, or whose output does not match the
    * format, is handled by `on_agent_error` (`agentError`), and no work task is created; the
-   * format's problems go to the next attempt. Nothing is checked or committed.
+   * format's problems go to the next attempt. Nothing is checked or committed. From round 2 on,
+   * every attempt reads the previous round's plan and results (`previousPlan`).
    */
   private async runPlanTask(
     run: Run,
@@ -2520,7 +2562,7 @@ export class Engine {
     const repo = this.store.getRepo(run.repoId);
     const ctx = this.promptContext(run, sr, eff, stageVerifyCommands(eff.def, repo.verifyCommands));
     const { attempt, result } = await this.execute(run, task, agent, adapter, {
-      prompt: planPrompt(ctx, task.pendingFeedback),
+      prompt: planPrompt(ctx, task.pendingFeedback, this.previousPlan(run, sr)),
       outputSchema: PLAN_REPORT_JSON_SCHEMA,
       timeoutMs: this.agentTimeoutMs(eff, agent),
       readOnly: true,
