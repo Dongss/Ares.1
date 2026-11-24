@@ -72,7 +72,7 @@ src/
                       records failed upgrades, restarts when its node is gone
     source.ts         which registered repo is the Master's own source
   logs/prune.ts       deletes raw agent output past retention; each round also sweeps worktrees
-  workspace/git.ts    git: worktrees, commits, rollback, merge, fast-forward
+  workspace/git.ts    git: worktrees, commits, rollback, merge, fast-forward, committed files
   verify/commands.ts  run check and setup commands; tell a missing program from a failing command
   api/
     server.ts         HTTP API (Hono) and SSE
@@ -124,7 +124,8 @@ test/
     and what it waits for, whether a stage round is split into tasks (`plansStage`; the size it
     goes by is `assessedSize` in `src/engine/discussion.ts`), rate-limit waits of Runs and scouts,
     the redo wait (`redoDelayMs` / `redoDueAt`), raw log retention (`runRawLogsExpired` /
-    `scoutRawLogExpired`), leftover worktrees (`leftoverWorkspaces`) and the like:
+    `scoutRawLogExpired`), leftover worktrees (`leftoverWorkspaces`), which template a repo's
+    Runs get by id, the home directory's or the repo's own (`resolveTemplate`), and the like:
     `src/config/flow.ts`
   - notification rules: `src/notify/notice.ts`
   - assessment conclusion rules: `src/engine/discussion.ts`

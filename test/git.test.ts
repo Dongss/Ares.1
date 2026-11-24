@@ -6,12 +6,14 @@ import {
   addWorktree,
   commitAll,
   commitTime,
+  committedYamlFiles,
   conflictedFiles,
   fastForwardBranch,
   filesWithConflictMarkers,
   hasChanges,
   isMerging,
   mergeOrAbort,
+  pathDiffers,
   removeWorktree,
   resetHard,
   revParse,
@@ -99,6 +101,67 @@ describe('git workspace', () => {
     // Not checked out anywhere: nothing to disturb.
     git(repo, 'checkout', '-q', '-b', 'other');
     expect(await targetCheckoutDirty(repo, 'main')).toBeUndefined();
+  });
+
+  it('reads the YAML files of a directory as committed, untouched by the worktree', async () => {
+    const repo = initRepo();
+    const dir = '.ares1/workflows';
+    // No such directory: no files, no error.
+    expect(await committedYamlFiles(repo, 'main', dir)).toEqual([]);
+
+    writeFile(join(repo, dir, 'b.yml'), 'id: b\n');
+    writeFile(join(repo, dir, 'a.yaml'), 'id: a\n\n');
+    writeFile(join(repo, dir, 'notes.md'), 'not a template\n');
+    writeFile(join(repo, dir, 'nested', 'c.yaml'), 'id: c\n');
+    git(repo, 'add', '-A');
+    git(repo, 'commit', '-q', '-m', 'templates');
+    const committed = [
+      // Sorted by name, content as committed (the trailing blank line included).
+      { file: 'a.yaml', source: 'id: a\n\n' },
+      { file: 'b.yml', source: 'id: b\n' },
+    ];
+    expect(await committedYamlFiles(repo, 'main', dir)).toEqual(committed);
+
+    // Uncommitted changes, new and deleted files of the checkout play no part.
+    writeFile(join(repo, dir, 'a.yaml'), 'id: changed\n');
+    writeFile(join(repo, dir, 'new.yaml'), 'id: new\n');
+    rmSync(join(repo, dir, 'b.yml'));
+    expect(await committedYamlFiles(repo, 'main', dir)).toEqual(committed);
+    // Nor does staging them.
+    git(repo, 'add', '-A');
+    expect(await committedYamlFiles(repo, 'main', dir)).toEqual(committed);
+    // Any commit can be read, and the directory is from the repo's root wherever git runs.
+    const before = await revParse(repo, 'main');
+    git(repo, 'commit', '-q', '-m', 'change');
+    expect(await committedYamlFiles(repo, before, dir)).toEqual(committed);
+    expect(await committedYamlFiles(join(repo, dir), before, dir)).toEqual(committed);
+    expect(await committedYamlFiles(repo, 'main', dir)).toEqual([
+      { file: 'a.yaml', source: 'id: changed\n' },
+      { file: 'new.yaml', source: 'id: new\n' },
+    ]);
+    await expect(committedYamlFiles(repo, 'nope', dir)).rejects.toThrow();
+  });
+
+  it('tells whether a directory differs between two commits', async () => {
+    const repo = initRepo();
+    const dir = '.ares1/workflows';
+    const init = await revParse(repo, 'main');
+    writeFile(join(repo, 'other.txt'), 'other\n');
+    git(repo, 'add', '-A');
+    git(repo, 'commit', '-q', '-m', 'other');
+    const other = await revParse(repo, 'main');
+    expect(await pathDiffers(repo, init, other, dir)).toBe(false);
+
+    writeFile(join(repo, dir, 'a.yaml'), 'id: a\n');
+    git(repo, 'add', '-A');
+    git(repo, 'commit', '-q', '-m', 'template');
+    const added = await revParse(repo, 'main');
+    expect(await pathDiffers(repo, other, added, dir)).toBe(true);
+    expect(await pathDiffers(repo, added, other, dir)).toBe(true);
+    // Uncommitted changes are not compared.
+    writeFile(join(repo, dir, 'a.yaml'), 'id: changed\n');
+    expect(await pathDiffers(repo, added, 'main', dir)).toBe(false);
+    await expect(pathDiffers(repo, added, 'nope', dir)).rejects.toThrow();
   });
 
   it('removeWorktree removes the worktree and branch and tolerates missing ones', async () => {

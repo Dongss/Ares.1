@@ -15,6 +15,7 @@ import {
   recordedLimitWait,
   redoDelayMs,
   redoDueAt,
+  resolveTemplate,
   scoutBackoff,
   scoutFailureStreak,
   scoutLimitWait,
@@ -23,10 +24,13 @@ import {
 } from '../src/config/flow.js';
 import {
   ConfigError,
+  findTemplate,
   githubConfigKey,
   homePaths,
   initHome,
+  type LoadedConfig,
   loadConfig,
+  type RepoTemplateSource,
 } from '../src/config/load.js';
 import {
   agentEffort,
@@ -384,6 +388,258 @@ stages:
         load('{ template: whole }');
       }
     });
+  });
+
+  describe("repos' own templates", () => {
+    /** A template the default agents can run, without warnings. */
+    const X = `id: x
+stages:
+  - { id: implement, agent: claude-coder }
+  - { id: review, kind: review, agent: claude-reviewer }
+  - { id: merge, kind: merge }
+`;
+    const BROKEN_YAML = 'id: x\nstages: [\n';
+    const UNKNOWN_AGENT = X.replace('agent: claude-coder', 'agent: nobody');
+    const SHA1 = '1'.repeat(40);
+    const SHA2 = '2'.repeat(40);
+    const SHA3 = '3'.repeat(40);
+
+    function source(sha: string, files: Record<string, string>): RepoTemplateSource {
+      return {
+        branch: 'main',
+        sha,
+        files: Object.entries(files).map(([file, source]) => ({ file, source })),
+      };
+    }
+
+    /** Load with `repos` registered for GitHub and the repos' files `sources`. */
+    function load(
+      paths: ReturnType<typeof homePaths>,
+      repos: string,
+      sources: Record<string, RepoTemplateSource>,
+      previous?: LoadedConfig,
+    ) {
+      writeFile(paths.configFile, `github:\n  repos:\n${repos}`);
+      return loadConfig(paths, ['claude-code'], ['claude-code'], {
+        repoSources: new Map(Object.entries(sources)),
+        previous,
+      });
+    }
+
+    it("finds a repo's template by the repo's template id, only for that repo", () => {
+      const paths = home();
+      const repos = '    app: { template: x }\n    other: { template: x }\n';
+      const cfg = load(paths, repos, { app: source(SHA1, { 'x.yaml': X }) });
+      // The other repo does not see app's template.
+      expect(cfg.errors).toEqual({ [githubConfigKey('other')]: ['模板 x 不存在或无效'] });
+      expect(cfg.warnings).toEqual({});
+      expect(cfg.templates.has('x')).toBe(false);
+      expect(findTemplate(cfg, 'app', 'x')).toMatchObject({
+        source: 'repo',
+        template: { id: 'x' },
+      });
+      expect(findTemplate(cfg, 'other', 'x')).toBeNull();
+      // The home directory's templates are seen by every repo.
+      expect(findTemplate(cfg, 'other', 'self-dev')?.source).toBe('home');
+      expect(cfg.repoTemplates.get('app')).toMatchObject({
+        repo: 'app',
+        branch: 'main',
+        sha: SHA1,
+        files: [
+          {
+            key: 'app:.ares1/workflows/x.yaml',
+            file: 'x.yaml',
+            path: '.ares1/workflows/x.yaml',
+            source: X,
+            templateId: 'x',
+            errors: [],
+            warnings: [],
+          },
+        ],
+      });
+      expect([...(cfg.repoTemplates.get('app')?.templates.keys() ?? [])]).toEqual(['x']);
+      expect(cfg.repoTemplates.has('other')).toBe(false);
+
+      // Each repo has its own, even with the same id.
+      const both = load(paths, repos, {
+        app: source(SHA1, { 'x.yaml': X }),
+        other: source(SHA2, { 'x.yaml': X.replace('{ id: merge', '{ id: land') }),
+      });
+      expect(both.errors).toEqual({});
+      expect(findTemplate(both, 'other', 'x')?.template.stages.map((s) => s.id)).toContain('land');
+      expect(findTemplate(both, 'app', 'x')?.template.stages.map((s) => s.id)).toContain('merge');
+
+      // Without the repos' files, nothing changes from before.
+      const without = loadConfig(paths, ['claude-code'], ['claude-code']);
+      expect(without.repoTemplates.size).toBe(0);
+      expect(without.errors).toEqual({
+        [githubConfigKey('app')]: ['模板 x 不存在或无效'],
+        [githubConfigKey('other')]: ['模板 x 不存在或无效'],
+      });
+    });
+
+    it("prefers the home directory's template with the same id, and warns", () => {
+      const paths = home();
+      const repoSelfDev = X.replace('id: x', 'id: self-dev');
+      const cfg = load(paths, '    app: { template: self-dev }\n', {
+        app: source(SHA1, { 'self-dev.yaml': repoSelfDev }),
+      });
+      expect(cfg.errors).toEqual({});
+      const found = findTemplate(cfg, 'app', 'self-dev');
+      expect(found?.source).toBe('home');
+      expect(found?.template).toBe(cfg.templates.get('self-dev'));
+      const key = 'app:.ares1/workflows/self-dev.yaml';
+      expect(cfg.warnings).toEqual({
+        [key]: [
+          '数据目录里也有 id 为 self-dev 的模板（workflows/self-dev.yaml），用的是数据目录那份，仓库里这份没有生效。想改用仓库里的，就删掉数据目录里的那个文件',
+        ],
+      });
+      const [file] = cfg.repoTemplates.get('app')?.files ?? [];
+      expect(file).toMatchObject({ key, templateId: 'self-dev', shadowed: true });
+      expect(file?.warnings).toEqual(cfg.warnings[key]);
+    });
+
+    it('keeps the version that last loaded when a file breaks, and warns', () => {
+      const paths = home();
+      const repos = '    app: { template: x }\n';
+      const key = 'app:.ares1/workflows/x.yaml';
+      const first = load(paths, repos, { app: source(SHA1, { 'x.yaml': X }) });
+      const good = first.repoTemplates.get('app')?.templates.get('x');
+
+      // Invalid YAML on the target branch: the template of SHA1 stays in use.
+      const broken = load(paths, repos, { app: source(SHA2, { 'x.yaml': BROKEN_YAML }) }, first);
+      expect(broken.errors).toEqual({});
+      expect(findTemplate(broken, 'app', 'x')?.template).toEqual(good);
+      const [file] = broken.repoTemplates.get('app')?.files ?? [];
+      expect(file).toMatchObject({
+        key,
+        source: BROKEN_YAML,
+        templateId: 'x',
+        errors: [],
+        lastGood: { sha: SHA1, source: X },
+      });
+      expect(file?.lastGood?.errors).toEqual([
+        expect.stringMatching(/^app:\.ares1\/workflows\/x\.yaml 不是合法的 YAML：/),
+      ]);
+      expect(broken.warnings[key]).toEqual([
+        `这次加载失败，继续使用上次加载成功的版本（提交 1111111）。失败原因：${file?.lastGood?.errors[0]}`,
+      ]);
+
+      // Still broken on the next commit, in another way: still the version of SHA1.
+      const still = load(paths, repos, { app: source(SHA3, { 'x.yaml': UNKNOWN_AGENT }) }, broken);
+      expect(still.errors).toEqual({});
+      expect(findTemplate(still, 'app', 'x')?.template).toEqual(good);
+      expect(still.repoTemplates.get('app')?.files[0]?.lastGood).toEqual({
+        sha: SHA1,
+        source: X,
+        errors: ['阶段 implement：Agent nobody 不存在或未启用'],
+      });
+      expect(still.warnings[key]?.[0]).toBe(
+        '这次加载失败，继续使用上次加载成功的版本（提交 1111111）。失败原因：阶段 implement：Agent nobody 不存在或未启用',
+      );
+
+      // Fixed: the file as written is used again.
+      const fixed = X.replace('{ id: merge', '{ id: land');
+      const again = load(paths, repos, { app: source(SHA3, { 'x.yaml': fixed }) }, still);
+      expect(again.warnings).toEqual({});
+      expect(again.repoTemplates.get('app')?.files[0]?.lastGood).toBeUndefined();
+      expect(findTemplate(again, 'app', 'x')?.template.stages.map((s) => s.id)).toContain('land');
+    });
+
+    it('treats a file that never loaded as missing', () => {
+      const paths = home();
+      const repos = '    app: { template: x }\n';
+      const key = 'app:.ares1/workflows/x.yaml';
+      const first = load(paths, repos, { app: source(SHA1, { 'x.yaml': UNKNOWN_AGENT }) });
+      expect(first.errors).toEqual({
+        [key]: ['阶段 implement：Agent nobody 不存在或未启用'],
+        [githubConfigKey('app')]: ['模板 x 不存在或无效'],
+      });
+      expect(first.warnings).toEqual({});
+      expect(findTemplate(first, 'app', 'x')).toBeNull();
+      expect(first.repoTemplates.get('app')?.files[0]).toMatchObject({ key, templateId: null });
+
+      // Still broken: there is no earlier version to fall back to.
+      const second = load(paths, repos, { app: source(SHA2, { 'x.yaml': BROKEN_YAML }) }, first);
+      expect(second.errors[key]).toEqual([expect.stringMatching(/不是合法的 YAML/)]);
+      expect(findTemplate(second, 'app', 'x')).toBeNull();
+
+      // A version that loaded once but no longer does with the agents of now stands in for
+      // nothing either.
+      const loaded = load(paths, repos, { app: source(SHA1, { 'x.yaml': X }) });
+      writeFile(
+        paths.agentsFile,
+        readFileSync(paths.agentsFile, 'utf8').replace(/claude-reviewer:/, 'claude-reviewer-2:'),
+      );
+      const gone = load(paths, repos, { app: source(SHA2, { 'x.yaml': BROKEN_YAML }) }, loaded);
+      expect(gone.errors[key]).toEqual([expect.stringMatching(/不是合法的 YAML/)]);
+      expect(gone.repoTemplates.get('app')?.files[0]?.lastGood).toBeUndefined();
+      expect(findTemplate(gone, 'app', 'x')).toBeNull();
+    });
+
+    it("rejects the same id twice in one repo, and checks auto-accepting L with the repo's", () => {
+      const paths = home();
+      const cfg = load(paths, '    app: { template: x, auto_accept: { max_risk: low } }\n', {
+        app: source(SHA1, { 'a.yaml': X, 'b.yaml': X }),
+      });
+      expect(cfg.errors).toEqual({ 'app:.ares1/workflows/b.yaml': ['模板 id x 与其他模板重复'] });
+      expect(cfg.warnings['config.yaml']).toEqual([
+        expect.stringMatching(/^仓库 app 会自动采纳大小为 L 的提案/),
+      ]);
+    });
+
+    it('warns in English when config.yaml says so', () => {
+      const paths = home();
+      try {
+        writeFile(join(paths.workflowsDir, 'x.yaml'), X);
+        writeFile(
+          paths.configFile,
+          'language: en\ngithub:\n  repos:\n    app: { template: x }\n    web: { template: y }\n',
+        );
+        const cfg = loadConfig(paths, ['claude-code'], ['claude-code'], {
+          repoSources: new Map([
+            ['app', source(SHA1, { 'x.yaml': X })],
+            ['web', source(SHA2, { 'y.yaml': X.replace('id: x', 'id: y') })],
+          ]),
+        });
+        expect(cfg.errors).toEqual({});
+        expect(cfg.warnings).toEqual({
+          'app:.ares1/workflows/x.yaml': [
+            "The home directory also has a template with id x (workflows/x.yaml), which is the one in use: this one in the repo has no effect. To use the repo's, delete that file from the home directory",
+          ],
+        });
+        const broken = loadConfig(paths, ['claude-code'], ['claude-code'], {
+          repoSources: new Map([['web', source(SHA3, { 'y.yaml': UNKNOWN_AGENT })]]),
+          previous: cfg,
+        });
+        const warning = broken.warnings['web:.ares1/workflows/y.yaml'];
+        expect(warning).toEqual([
+          `Failed to load, so the version that last loaded (commit ${SHA2.slice(0, 7)}) stays in use. Why it failed: Stage implement: agent nobody does not exist or is disabled`,
+        ]);
+        expect(JSON.stringify([cfg.warnings, broken.warnings])).not.toMatch(/[一-鿿]/);
+      } finally {
+        // Back to the default language, zod's messages included, for the other tests.
+        loadConfig(home(), ['claude-code'], ['claude-code']);
+      }
+    });
+  });
+
+  it('resolveTemplate looks in the home directory first, then in the repo', () => {
+    const fromHome = new Map([['a', 'home a']]);
+    const fromRepo = new Map([
+      ['a', 'repo a'],
+      ['b', 'repo b'],
+    ]);
+    expect(resolveTemplate('a', fromHome, fromRepo)).toEqual({
+      template: 'home a',
+      source: 'home',
+    });
+    expect(resolveTemplate('b', fromHome, fromRepo)).toEqual({
+      template: 'repo b',
+      source: 'repo',
+    });
+    expect(resolveTemplate('b', fromHome, undefined)).toBeNull();
+    expect(resolveTemplate('c', fromHome, fromRepo)).toBeNull();
   });
 
   it('gives an issue 3 Runs by default, and at least 1', () => {

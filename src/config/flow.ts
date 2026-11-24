@@ -1,4 +1,5 @@
-// How a workflow template flows: effective stage settings, budgets, verify commands, rollback
+// How a workflow template flows: which template a repo's Runs get by id (the home directory's or
+// the repo's own), effective stage settings, budgets, verify commands, rollback
 // targets, which stage rounds are split into tasks and whether a template can split an L
 // requirement at all; also the overrides of Runs from issues, which proposals are accepted
 // automatically, how long the automatic scout backs off and which Runs it waits for, after how
@@ -298,6 +299,32 @@ export function plansStage(
  */
 export function templateSplits(template: Pick<WorkflowTemplate, 'stages'>): boolean {
   return template.stages.some((s) => plansStage(s, 'L'));
+}
+
+/**
+ * Where a registered repo keeps its own workflow templates, from its root; they are read as
+ * committed on its target branch.
+ */
+export const REPO_WORKFLOWS_DIR = '.ares1/workflows';
+
+/** Where a template comes from: the home directory's workflows/, or the repo's own. */
+export type TemplateSource = 'home' | 'repo';
+
+/**
+ * The template a repo's Runs get by id: the home directory's first, as this machine's override
+ * of the repo's, then the repo's own (`repo`: the templates of that repo only, so no repo sees
+ * another's). Null when neither has it.
+ */
+export function resolveTemplate<T>(
+  id: string,
+  home: ReadonlyMap<string, T>,
+  repo: ReadonlyMap<string, T> | undefined,
+): { template: T; source: TemplateSource } | null {
+  const fromHome = home.get(id);
+  if (fromHome !== undefined) return { template: fromHome, source: 'home' };
+  const fromRepo = repo?.get(id);
+  if (fromRepo !== undefined) return { template: fromRepo, source: 'repo' };
+  return null;
 }
 
 /**

@@ -4,7 +4,16 @@ import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
 import { join as joinList, type Lang, setLang, t } from '../i18n.js';
 import { defaultAgentsYaml, defaultConfigYaml, defaultSelfDevYaml } from './defaults.js';
-import { autoAcceptsL, conflictTarget, failTarget, runsAgent, templateSplits } from './flow.js';
+import {
+  autoAcceptsL,
+  conflictTarget,
+  failTarget,
+  REPO_WORKFLOWS_DIR,
+  resolveTemplate,
+  runsAgent,
+  type TemplateSource,
+  templateSplits,
+} from './flow.js';
 import {
   type AgentConfig,
   type AgentEntry,
@@ -82,11 +91,14 @@ export interface LoadedConfig {
   master: MasterConfig;
   /** Valid and enabled agents. */
   agents: Map<string, AgentConfig>;
-  /** Valid templates (may still carry warnings). */
+  /** Valid templates of the home directory (may still carry warnings). */
   templates: Map<string, WorkflowTemplate>;
-  /** Problems keyed by "agents.yaml#<id>" or "workflows/<file>". Those items are disabled. */
+  /**
+   * Problems keyed by "agents.yaml#<id>", "workflows/<file>" or a repo's
+   * "<repo>:.ares1/workflows/<file>". Those items are disabled.
+   */
   errors: Record<string, string[]>;
-  /** Problems that disable nothing, keyed by "config.yaml" or "workflows/<file>". */
+  /** Problems that disable nothing, keyed by "config.yaml" or a template file's key. */
   warnings: Record<string, string[]>;
   /** The configuration directory (Master home). */
   dir: string;
@@ -96,6 +108,39 @@ export interface LoadedConfig {
   agentEntries: AgentEntry[];
   /** Every file in workflows/, including invalid ones, sorted by file name. */
   templateFiles: TemplateFile[];
+  /**
+   * The templates registered repos keep in their own .ares1/workflows/, by repo name: those of
+   * the repos whose files were given to `loadConfig`. Each is seen by its own repo only.
+   */
+  repoTemplates: Map<string, RepoTemplates>;
+}
+
+/** The files of a repo's .ares1/workflows/ as committed on its target branch. */
+export interface RepoTemplateSource {
+  branch: string;
+  /** The commit of `branch` they were read from. */
+  sha: string;
+  /** Sorted by file name. */
+  files: readonly { file: string; source: string }[];
+}
+
+/** The templates a repo keeps in its own .ares1/workflows/, loaded. */
+export interface RepoTemplates {
+  /** The repo's name. */
+  repo: string;
+  branch: string;
+  sha: string;
+  /** Templates in use (may still carry warnings), including earlier versions (`lastGood`). */
+  templates: Map<string, WorkflowTemplate>;
+  /** Every file, including invalid ones, sorted by file name. */
+  files: TemplateFile[];
+}
+
+export interface LoadOptions {
+  /** Each repo's template files, by repo name; repos left out have none. */
+  repoSources?: ReadonlyMap<string, RepoTemplateSource>;
+  /** The configuration loaded before, whose repo templates stand in for files that now fail. */
+  previous?: LoadedConfig;
 }
 
 /**
@@ -114,11 +159,13 @@ function effortInModelName(cli: string): string | undefined {
 /**
  * @param knownClis CLIs with an adapter; agents of other CLIs are invalid.
  * @param readOnlyClis CLIs whose adapter can run an agent read-only, as assess stages need.
+ * @param options the repos' own template files, and the configuration loaded before them.
  */
 export function loadConfig(
   paths: HomePaths,
   knownClis: readonly string[],
   readOnlyClis: readonly string[] = [],
+  options: LoadOptions = {},
 ): LoadedConfig {
   const errors: Record<string, string[]> = {};
   const warnings: Record<string, string[]> = {};
@@ -179,45 +226,46 @@ export function loadConfig(
   for (const file of files) {
     const key = `workflows/${file}`;
     const path = join(paths.workflowsDir, file);
+    let source = '';
+    let loaded: TemplateLoad;
+    try {
+      source = readSource(path) ?? '';
+      loaded = loadTemplateSource(source, key, agents, readOnlyClis, templates);
+    } catch (err) {
+      loaded = { template: null, errors: [(err as Error).message], warnings: [] };
+    }
     const entry: TemplateFile = {
       key,
       file,
       path,
-      source: '',
-      templateId: null,
-      errors: [],
-      warnings: [],
+      source,
+      templateId: loaded.template?.id ?? null,
+      errors: loaded.errors,
+      warnings: loaded.warnings,
     };
     templateFiles.push(entry);
-    let raw: unknown;
-    try {
-      entry.source = readSource(path) ?? '';
-      raw = parseSource(entry.source, key);
-    } catch (err) {
-      entry.errors = errors[key] = [(err as Error).message];
-      continue;
+    if (loaded.template) templates.set(loaded.template.id, loaded.template);
+  }
+  recordProblems(templateFiles, errors, warnings);
+
+  const repoTemplates = new Map<string, RepoTemplates>();
+  for (const [name, source] of options.repoSources ?? []) {
+    const previous = options.previous?.repoTemplates.get(name);
+    const loaded = loadRepoTemplates(name, source.files, agents, readOnlyClis, previous);
+    // The home directory's template wins: this machine's override of the repo's.
+    for (const entry of loaded.files) {
+      if (entry.templateId === null || !templates.has(entry.templateId)) continue;
+      entry.shadowed = true;
+      entry.warnings.push(shadowedWarning(entry.templateId, templateFiles));
     }
-    const parsed = TemplateSchema.safeParse(raw);
-    if (!parsed.success) {
-      entry.errors = errors[key] = formatZod(parsed.error);
-      continue;
-    }
-    const result = validateTemplate(parsed.data, agents, readOnlyClis);
-    if (templates.has(parsed.data.id)) {
-      result.errors.push(
-        t({
-          zh: `模板 id ${parsed.data.id} 与其他模板重复`,
-          en: `Template id ${parsed.data.id} is used by another template`,
-        }),
-      );
-    }
-    if (result.warnings.length > 0) entry.warnings = warnings[key] = result.warnings;
-    if (result.errors.length > 0) {
-      entry.errors = errors[key] = result.errors;
-      continue;
-    }
-    entry.templateId = parsed.data.id;
-    templates.set(parsed.data.id, parsed.data);
+    recordProblems(loaded.files, errors, warnings);
+    repoTemplates.set(name, {
+      repo: name,
+      branch: source.branch,
+      sha: source.sha,
+      templates: loaded.templates,
+      files: loaded.files,
+    });
   }
 
   // GitHub repos refer to templates and agents; a broken reference disables that repo only.
@@ -225,7 +273,7 @@ export function loadConfig(
   const repoWarnings: string[] = [];
   for (const [name, repo] of Object.entries(master.github?.repos ?? {})) {
     const problems: string[] = [];
-    const template = templates.get(repo.template);
+    const template = findTemplate({ templates, repoTemplates }, name, repo.template)?.template;
     if (!template) {
       problems.push(
         t({
@@ -266,6 +314,157 @@ export function loadConfig(
     agentsFile: { path: paths.agentsFile, source: readSource(paths.agentsFile) },
     agentEntries,
     templateFiles,
+    repoTemplates,
+  };
+}
+
+/**
+ * The template a repo's Runs get by id, and where it comes from (`resolveTemplate`): the home
+ * directory's first, then the repo's own. Null when neither has it.
+ */
+export function findTemplate(
+  cfg: Pick<LoadedConfig, 'templates' | 'repoTemplates'>,
+  repoName: string,
+  id: string,
+): { template: WorkflowTemplate; source: TemplateSource } | null {
+  return resolveTemplate(id, cfg.templates, cfg.repoTemplates.get(repoName)?.templates);
+}
+
+/** Key of a repo's template file in `errors` / `warnings`. */
+export function repoTemplateKey(repoName: string, file: string): string {
+  return `${repoName}:${REPO_WORKFLOWS_DIR}/${file}`;
+}
+
+/**
+ * Load a repo's own template files (`files`, as committed) like those of the home directory,
+ * except that a file failing to load keeps its template as last loaded (`previous`: this repo's
+ * last load) when that version still loads with the agents of now: a broken change on the target
+ * branch must not stop the repo's work. The file is then marked with `lastGood` and warned about.
+ * A file that never loaded is invalid, as in the home directory. Ids are only checked against the
+ * repo's other files, not against the home directory's.
+ */
+export function loadRepoTemplates(
+  repoName: string,
+  files: readonly { file: string; source: string }[],
+  agents: Map<string, AgentConfig>,
+  readOnlyClis: readonly string[],
+  previous?: Pick<RepoTemplates, 'sha' | 'files'>,
+): { templates: Map<string, WorkflowTemplate>; files: TemplateFile[] } {
+  const templates = new Map<string, WorkflowTemplate>();
+  const entries: TemplateFile[] = [];
+  const sorted = [...files].sort((a, b) => (a.file < b.file ? -1 : 1));
+  for (const { file, source } of sorted) {
+    const key = repoTemplateKey(repoName, file);
+    const entry: TemplateFile = {
+      key,
+      file,
+      path: `${REPO_WORKFLOWS_DIR}/${file}`,
+      source,
+      templateId: null,
+      errors: [],
+      warnings: [],
+    };
+    entries.push(entry);
+    const loaded = loadTemplateSource(source, key, agents, readOnlyClis, templates);
+    const good = loaded.template ? undefined : lastGood(previous, file);
+    const earlier = good && loadTemplateSource(good.source, key, agents, readOnlyClis, templates);
+    if (good && earlier?.template) {
+      entry.templateId = earlier.template.id;
+      entry.lastGood = { ...good, errors: loaded.errors };
+      entry.warnings = [lastGoodWarning(good.sha, loaded.errors), ...earlier.warnings];
+      templates.set(earlier.template.id, earlier.template);
+      continue;
+    }
+    entry.errors = loaded.errors;
+    entry.warnings = loaded.warnings;
+    if (loaded.template) {
+      entry.templateId = loaded.template.id;
+      templates.set(loaded.template.id, loaded.template);
+    }
+  }
+  return { templates, files: entries };
+}
+
+/** The version of a repo's file that last loaded, and the commit it was read from. */
+function lastGood(
+  previous: Pick<RepoTemplates, 'sha' | 'files'> | undefined,
+  file: string,
+): { sha: string; source: string } | undefined {
+  const entry = previous?.files.find((f) => f.file === file);
+  if (!previous || !entry || entry.templateId === null) return undefined;
+  if (entry.lastGood) return { sha: entry.lastGood.sha, source: entry.lastGood.source };
+  return { sha: previous.sha, source: entry.source };
+}
+
+function lastGoodWarning(sha: string, errors: readonly string[]): string {
+  const commit = sha.slice(0, 7);
+  return t({
+    zh: `这次加载失败，继续使用上次加载成功的版本（提交 ${commit}）。失败原因：${errors.join('；')}`,
+    en: `Failed to load, so the version that last loaded (commit ${commit}) stays in use. Why it failed: ${errors.join('; ')}`,
+  });
+}
+
+function shadowedWarning(id: string, homeFiles: readonly TemplateFile[]): string {
+  const home = homeFiles.find((f) => f.templateId === id)?.key ?? 'workflows/';
+  return t({
+    zh: `数据目录里也有 id 为 ${id} 的模板（${home}），用的是数据目录那份，仓库里这份没有生效。想改用仓库里的，就删掉数据目录里的那个文件`,
+    en: `The home directory also has a template with id ${id} (${home}), which is the one in use: this one in the repo has no effect. To use the repo's, delete that file from the home directory`,
+  });
+}
+
+/** Copy the problems of template files into `errors` / `warnings`, under their keys. */
+function recordProblems(
+  files: readonly TemplateFile[],
+  errors: Record<string, string[]>,
+  warnings: Record<string, string[]>,
+): void {
+  for (const f of files) {
+    if (f.errors.length > 0) errors[f.key] = f.errors;
+    if (f.warnings.length > 0) warnings[f.key] = f.warnings;
+  }
+}
+
+interface TemplateLoad {
+  /** Null when the file has an error. */
+  template: WorkflowTemplate | null;
+  errors: string[];
+  warnings: string[];
+}
+
+/**
+ * Load one template file: its YAML, the schema, `validateTemplate`, and its id against `loaded`,
+ * the templates loaded beside it so far. `key` names the file in the problems.
+ */
+function loadTemplateSource(
+  source: string,
+  key: string,
+  agents: Map<string, AgentConfig>,
+  readOnlyClis: readonly string[],
+  loaded: ReadonlyMap<string, WorkflowTemplate>,
+): TemplateLoad {
+  let raw: unknown;
+  try {
+    raw = parseSource(source, key);
+  } catch (err) {
+    return { template: null, errors: [(err as Error).message], warnings: [] };
+  }
+  const parsed = TemplateSchema.safeParse(raw);
+  if (!parsed.success) {
+    return { template: null, errors: formatZod(parsed.error), warnings: [] };
+  }
+  const result = validateTemplate(parsed.data, agents, readOnlyClis);
+  if (loaded.has(parsed.data.id)) {
+    result.errors.push(
+      t({
+        zh: `模板 id ${parsed.data.id} 与其他模板重复`,
+        en: `Template id ${parsed.data.id} is used by another template`,
+      }),
+    );
+  }
+  return {
+    template: result.errors.length > 0 ? null : parsed.data,
+    errors: result.errors,
+    warnings: result.warnings,
   };
 }
 

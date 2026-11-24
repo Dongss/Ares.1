@@ -13,7 +13,12 @@ export class GitError extends Error {
 }
 
 /** Run git and return trimmed stdout; throws GitError on a non-zero exit. */
-export function git(cwd: string, args: string[]): Promise<string> {
+export async function git(cwd: string, args: string[]): Promise<string> {
+  return (await gitRaw(cwd, args)).trimEnd();
+}
+
+/** Run git and return its stdout as is, e.g. a file's content; throws GitError like `git`. */
+function gitRaw(cwd: string, args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile('git', args, { cwd, maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) {
@@ -30,7 +35,7 @@ export function git(cwd: string, args: string[]): Promise<string> {
         );
         return;
       }
-      resolve(stdout.trimEnd());
+      resolve(stdout);
     });
   });
 }
@@ -229,6 +234,68 @@ export async function diffRange(
     git(repo, ['diff', '--no-color', '--no-ext-diff', base, head]),
   ]);
   return { stat, patch };
+}
+
+/** A file as committed: its name and its content. */
+export interface CommittedFile {
+  /** The file name, without the directory. */
+  file: string;
+  source: string;
+}
+
+/**
+ * The YAML files (*.yaml, *.yml) right inside `dir` (relative to the repo's root, e.g.
+ * ".ares1/workflows") as committed at `ref`, sorted by file name. Read from the commit only:
+ * uncommitted changes and untracked files of any worktree play no part. Subdirectories and
+ * symlinks are skipped; a `dir` the commit lacks has no files. Throws when `ref` is unknown.
+ */
+export async function committedYamlFiles(
+  repo: string,
+  ref: string,
+  dir: string,
+): Promise<CommittedFile[]> {
+  const commit = await revParse(repo, ref);
+  // --full-tree: `dir` is from the root wherever `repo` is; the trailing slash lists its content.
+  const out = await gitRaw(repo, ['ls-tree', '-z', '--full-tree', commit, '--', `${dir}/`]);
+  const blobs: { file: string; object: string }[] = [];
+  for (const record of out.split('\0')) {
+    // "<mode> <type> <object>\t<path>"
+    const tab = record.indexOf('\t');
+    if (tab < 0) continue;
+    const [mode, type, object] = record.slice(0, tab).split(' ');
+    const path = record.slice(tab + 1);
+    const file = path.slice(path.lastIndexOf('/') + 1);
+    if (type !== 'blob' || mode === '120000' || !object) continue;
+    if (!file.endsWith('.yaml') && !file.endsWith('.yml')) continue;
+    blobs.push({ file, object });
+  }
+  // Names in one directory are unique.
+  blobs.sort((a, b) => (a.file < b.file ? -1 : 1));
+  const files: CommittedFile[] = [];
+  for (const { file, object } of blobs) {
+    files.push({ file, source: await gitRaw(repo, ['cat-file', 'blob', object]) });
+  }
+  return files;
+}
+
+/**
+ * Whether anything under `path` (relative to the repo's root) differs between commits `a` and
+ * `b`. Throws when either is unknown.
+ */
+export async function pathDiffers(
+  repo: string,
+  a: string,
+  b: string,
+  path: string,
+): Promise<boolean> {
+  try {
+    await git(repo, ['diff', '--quiet', '--no-ext-diff', a, b, '--', `:(top)${path}`]);
+    return false;
+  } catch (err) {
+    // --quiet exits 1 when there are differences, 128 on errors.
+    if (err instanceof GitError && err.exitCode === 1) return true;
+    throw err;
+  }
 }
 
 export type MergeOutcome =

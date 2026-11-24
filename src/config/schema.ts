@@ -317,18 +317,39 @@ export interface AgentEntry {
   errors: string[];
 }
 
-/** One file in workflows/, valid or not. */
+/**
+ * One template file, valid or not: in workflows/ of the home directory, or in a repo's
+ * .ares1/workflows/ as committed on its target branch.
+ */
 export interface TemplateFile {
-  /** "workflows/<file>", also the key of its problems in `errors` / `warnings`. */
+  /**
+   * "workflows/<file>", or "<repo>:.ares1/workflows/<file>" for a repo's; also the key of its
+   * problems in `errors` / `warnings`.
+   */
   key: string;
   file: string;
+  /** Absolute in the home directory; from the repo's root for a repo's file. */
   path: string;
   /** The YAML as written. */
   source: string;
-  /** Id of the template loaded from this file; null when the file is invalid. */
+  /**
+   * Id of the template loaded from this file; null when the file is invalid (and no earlier
+   * version stands in for it, see `lastGood`).
+   */
   templateId: string | null;
   errors: string[];
   warnings: string[];
+  /**
+   * Only a repo's file that failed to load this time while an earlier version of it had loaded:
+   * that version is the template in use. `sha`: the commit it was read from; `errors`: why the
+   * file as written failed (also told in `warnings`).
+   */
+  lastGood?: { sha: string; source: string; errors: string[] };
+  /**
+   * Only a repo's file whose template id the home directory also has: the home one is used, so
+   * this one has no effect.
+   */
+  shadowed?: boolean;
 }
 
 // ---------------------------------------------------------------------------
