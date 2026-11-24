@@ -200,7 +200,7 @@ export function acceptStep(github: GitHubRepoStatus | null, rule?: AutoAcceptRul
       }),
     };
   }
-  const { auto, human } = acceptRanges(github.autoAccept.maxRisk, rule);
+  const { auto, human } = acceptRanges(github.autoAccept, rule);
   if (auto === null) {
     // Nothing is accepted automatically, so every proposal is left to you.
     const all = human ?? '';
@@ -631,7 +631,7 @@ export function autonomy(
   // Accepting can be split: some proposals by itself, the others by you.
   const accepting = (kinds: string) =>
     t({ zh: `采纳${afterChinese(kinds)}`, en: `Accepting ${kinds}` });
-  const ranges = acceptRanges(github?.autoAccept.maxRisk ?? 'none', rule);
+  const ranges = acceptRanges(github?.autoAccept ?? { maxRisk: 'none', maxSize: 'L' }, rule);
   if (ranges.auto !== null) auto.push(accepting(ranges.auto));
   if (ranges.human !== null) {
     you.push(
@@ -706,7 +706,7 @@ export function scoutGuide(
   }
   const { budget } = github;
   const { pollMinutes } = input;
-  const leftToYou = acceptRanges(github.autoAccept.maxRisk).human;
+  const leftToYou = acceptRanges(github.autoAccept).human;
   const conditions = [
     t({ zh: '工作开关是「工作中」', en: 'The work switch is on ("Working")' }),
     t({
@@ -949,11 +949,11 @@ export function notifyTestLines(result: NotifyTestResult): NotifyTestLine[] {
 
 /** The labels the Master puts on issues; ares1:auto as auto_accept is set now. */
 export function labelHelp(autoAccept: GitHubRepoStatus['autoAccept'] | null): [string, string][] {
-  const range = autoAccept && acceptRanges(autoAccept.maxRisk).auto;
+  const range = autoAccept && acceptRanges(autoAccept).auto;
   const auto = !autoAccept
     ? t({
-        zh: '按自动采纳设置（auto_accept）采纳的：哪些提案会被自动采纳，由 max_risk 决定',
-        en: 'Accepted by the auto-accept setting (auto_accept): max_risk decides which proposals are accepted automatically',
+        zh: '按自动采纳设置（auto_accept）采纳的：哪些提案会被自动采纳，由 max_risk 和 max_size 决定',
+        en: 'Accepted by the auto-accept setting (auto_accept): max_risk and max_size decide which proposals are accepted automatically',
       })
     : range === null
       ? t({
@@ -961,8 +961,8 @@ export function labelHelp(autoAccept: GitHubRepoStatus['autoAccept'] | null): [s
           en: `Accepted by the auto-accept setting (auto_accept). Auto-accept is off now (max_risk: ${autoAccept.maxRisk}), so this label is not added any more`,
         })
       : t({
-          zh: `按自动采纳设置（auto_accept）采纳的：现在是${afterChinese(range)}（max_risk: ${autoAccept.maxRisk}）`,
-          en: `Accepted by the auto-accept setting (auto_accept): now ${range} (max_risk: ${autoAccept.maxRisk})`,
+          zh: `按自动采纳设置（auto_accept）采纳的：现在是${afterChinese(range)}（max_risk: ${autoAccept.maxRisk}，max_size: ${autoAccept.maxSize}）`,
+          en: `Accepted by the auto-accept setting (auto_accept): now ${range} (max_risk: ${autoAccept.maxRisk}, max_size: ${autoAccept.maxSize})`,
         });
   return [
     [

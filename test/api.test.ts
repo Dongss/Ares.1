@@ -7,6 +7,7 @@ import type {
   AgentEventRecord,
   AgentSummary,
   ConfigView,
+  GitHubStatus,
   HealthView,
   KeptWorkspace,
   LiveAgentEvent,
@@ -1157,6 +1158,40 @@ describe('GET /api/scouts', () => {
     expect(byId.get(failed.id)).toBeNull();
     expect(byId.get(empty.id)).toEqual([]);
     expect(byId.get(found.id)).toEqual(gaps);
+  });
+});
+
+describe('GET /api/github', () => {
+  it("gives each repo's auto-accept limits, max_size L by default", async () => {
+    const config = (acceptLines: string) => `
+github:
+  repos:
+    demo:
+      template: dev
+      auto_accept:
+${acceptLines}
+`;
+    h = await harness({ config: config('        max_risk: high'), github: new FakeGitHub() });
+    const autoAccept = async () =>
+      ((await call('GET', '/api/github')).json as GitHubStatus).repos[0]?.autoAccept;
+    expect(await autoAccept()).toEqual({
+      maxRisk: 'high',
+      maxSize: 'L',
+      maxPerDay: null,
+      usedToday: 0,
+    });
+
+    writeFile(
+      join(h.home, 'config.yaml'),
+      config('        max_risk: low\n        max_size: M\n        max_per_day: 2'),
+    );
+    h.master.configWatcher.reload();
+    expect(await autoAccept()).toEqual({
+      maxRisk: 'low',
+      maxSize: 'M',
+      maxPerDay: 2,
+      usedToday: 0,
+    });
   });
 });
 

@@ -8,8 +8,11 @@ import type { RunDetail } from '../src/api/types.js';
 import {
   acceptSplit,
   isAutoAcceptable,
+  PROPOSAL_SIZES,
   type ProposalKind,
+  type ProposalSize,
   REDO_BACKOFF_MAX_HOURS,
+  type Risk,
   scoutBackoff,
   scoutFailureStreak,
 } from '../src/config/flow.js';
@@ -76,6 +79,8 @@ interface ConfigOptions {
   /** scout.interval_minutes; omitted = 0 (no minimum). */
   intervalMinutes?: number;
   maxRisk?: 'none' | 'low' | 'mid' | 'high';
+  /** auto_accept.max_size; omitted = the default (L). */
+  maxSize?: 'S' | 'M' | 'L';
   /** null = no daily limit. */
   maxPerDay?: number | null;
   autoMerge?: boolean;
@@ -104,6 +109,7 @@ ${opts.pollMinutes === undefined ? '' : `  poll_minutes: ${opts.pollMinutes}`}
         max_proposals: 3
       auto_accept:
         max_risk: ${opts.maxRisk ?? 'low'}
+${opts.maxSize === undefined ? '' : `        max_size: ${opts.maxSize}`}
 ${maxPerDay === null ? '' : `        max_per_day: ${maxPerDay}`}
       auto_merge: ${opts.autoMerge ?? false}
       push: ${opts.push ?? false}
@@ -526,7 +532,12 @@ describe('issues: scout', () => {
     expect(run?.goal).not.toContain('侦察提出');
 
     const status = t.master.issues.status().repos[0];
-    expect(status?.autoAccept).toEqual({ maxRisk: 'low', maxPerDay: 1, usedToday: 1 });
+    expect(status?.autoAccept).toEqual({
+      maxRisk: 'low',
+      maxSize: 'L',
+      maxPerDay: 1,
+      usedToday: 1,
+    });
     expect(status?.budget.spentToday).toBeGreaterThanOrEqual(1.5);
   });
 
@@ -903,9 +914,12 @@ describe('issues: scout', () => {
     await scoutDone(t, scout?.id ?? '');
   });
 
-  /** Auto scouting files max_proposals (3) proposals of size L, then finds nothing more. */
+  /**
+   * Auto scouting files max_proposals (3) proposals of size L, then finds nothing more. With
+   * max_size M, so that auto-accept leaves them to a human whatever max_risk is.
+   */
   async function fileLargeProposals(maxRisk: 'none' | 'high') {
-    const t = await start(config({ auto: true, maxRisk, maxPerDay: null }));
+    const t = await start(config({ auto: true, maxRisk, maxSize: 'M', maxPerDay: null }));
     let n = 0;
     t.scripts.scout = () => ({
       structured: {
@@ -931,7 +945,7 @@ describe('issues: scout', () => {
     expect(scouts).toHaveLength(2);
     expect(scouts.every((s) => s.trigger === 'auto')).toBe(true);
     await scoutDone(t, scouts[0]?.id ?? '');
-    // The proposals of size L are left for a human, and the scout goes on.
+    // The proposals of size L are over max_size and left for a human, and the scout goes on.
     expect(gh.get(1).labels).toEqual([LABELS.proposal]);
     expect(t.master.store.listRuns()).toHaveLength(0);
     // The second scout found nothing: the next waits out the back-off, then goes on.
@@ -1690,7 +1704,7 @@ describe('issues: scout', () => {
   });
 
   it('accepts waiting proposals once the settings allow them', async () => {
-    const t = await start(config({ maxPerDay: null }));
+    const t = await start(config({ maxPerDay: null, maxSize: 'M' }));
     t.scripts.scout = () => ({
       structured: {
         gaps: [],
@@ -1706,13 +1720,16 @@ describe('issues: scout', () => {
     await t.master.issues.poll();
     expect(t.master.store.listRuns()).toHaveLength(0);
 
-    writeFile(join(t.home, 'config.yaml'), config({ maxPerDay: null, maxRisk: 'high' }));
+    writeFile(
+      join(t.home, 'config.yaml'),
+      config({ maxPerDay: null, maxRisk: 'high', maxSize: 'M' }),
+    );
     t.master.configWatcher.reload();
     await t.master.issues.poll();
     expect(gh.get(1).labels).toEqual([LABELS.proposal, LABELS.auto, LABELS.running]);
     expect(gh.get(1).comments[0]).toContain('已自动采纳');
     expect(gh.get(2).labels).toEqual([LABELS.proposal, LABELS.auto, LABELS.running]);
-    expect(gh.get(3).labels).toEqual([LABELS.proposal]); // size L always waits for a human
+    expect(gh.get(3).labels).toEqual([LABELS.proposal]); // size L is over max_size M
     expect(t.master.store.listRuns().map((r) => r.issue?.auto)).toEqual([true, true]);
     expect(t.master.store.getScout(scout.id).proposals.map((p) => p.issue?.auto)).toEqual([
       true,
@@ -1720,6 +1737,55 @@ describe('issues: scout', () => {
       false,
     ]);
     expect(t.master.issues.status().repos[0]?.autoAccept.usedToday).toBe(2);
+
+    // Back to the default max_size (L): the large one is accepted too.
+    writeFile(join(t.home, 'config.yaml'), config({ maxPerDay: null, maxRisk: 'high' }));
+    t.master.configWatcher.reload();
+    await t.master.issues.poll();
+    expect(gh.get(3).labels).toEqual([LABELS.proposal, LABELS.auto, LABELS.running]);
+    expect(t.master.store.getScout(scout.id).proposals.map((p) => p.issue?.auto)).toEqual([
+      true,
+      true,
+      true,
+    ]);
+    expect(t.master.issues.status().repos[0]?.autoAccept).toMatchObject({
+      maxSize: 'L',
+      usedToday: 3,
+    });
+  });
+
+  it('auto-accepts proposals of size L by default, and leaves them to a human under max_size M', async () => {
+    const t = await start(config({ maxPerDay: null, maxRisk: 'high' }));
+    let n = 0;
+    t.scripts.scout = () => ({
+      structured: { gaps: [], proposals: [proposal(`大需求 ${++n}`, 'low', 'L')] },
+    });
+    const first = await scoutDone(t, (await t.master.issues.startScout('demo', 'manual')).id);
+    expect(first.proposals.map((p) => p.issue?.auto)).toEqual([true]);
+    expect(gh.get(1).labels).toContain(LABELS.auto);
+
+    writeFile(
+      join(t.home, 'config.yaml'),
+      config({ maxPerDay: null, maxRisk: 'high', maxSize: 'M' }),
+    );
+    t.master.configWatcher.reload();
+    const second = await scoutDone(t, (await t.master.issues.startScout('demo', 'manual')).id);
+    expect(second.proposals.map((p) => p.issue?.auto)).toEqual([false]);
+    expect(gh.get(2).labels).toEqual([LABELS.proposal]);
+  });
+
+  it('auto-accepts nothing under max_risk none, whatever max_size', async () => {
+    const t = await start(config({ maxPerDay: null, maxRisk: 'none', maxSize: 'L' }));
+    t.scripts.scout = () => ({
+      structured: {
+        gaps: [],
+        proposals: [proposal('小需求', 'low', 'S'), proposal('大', 'low', 'L')],
+      },
+    });
+    const done = await scoutDone(t, (await t.master.issues.startScout('demo', 'manual')).id);
+    expect(done.proposals.map((p) => p.issue?.auto)).toEqual([false, false]);
+    await t.master.issues.poll();
+    expect(t.master.store.listRuns()).toHaveLength(0);
   });
 
   it('merges Runs from issues without approval when auto_merge is on', async () => {
@@ -3997,22 +4063,47 @@ describe('issues: texts', () => {
     );
   });
 
-  it('auto-accepts up to the configured risk, and only what fits one Run', () => {
-    expect(isAutoAcceptable({ risk: 'low', size: 'M' }, 'low')).toBe(true);
-    expect(isAutoAcceptable({ risk: 'mid', size: 'S' }, 'low')).toBe(false);
-    expect(isAutoAcceptable({ risk: 'high', size: 'S' }, 'high')).toBe(true);
-    expect(isAutoAcceptable({ risk: 'low', size: 'L' }, 'high')).toBe(false);
-    expect(isAutoAcceptable({ risk: 'low', size: 'S' }, 'none')).toBe(false);
+  it('auto-accepts up to the configured risk and size', () => {
+    const limits = (max_risk: Risk | 'none', max_size: ProposalSize = 'L') => ({
+      max_risk,
+      max_size,
+    });
+    expect(isAutoAcceptable({ risk: 'low', size: 'M' }, limits('low'))).toBe(true);
+    expect(isAutoAcceptable({ risk: 'mid', size: 'S' }, limits('low'))).toBe(false);
+    expect(isAutoAcceptable({ risk: 'high', size: 'S' }, limits('high'))).toBe(true);
+    // Size L is accepted under the default max_size, and waits under a smaller one.
+    expect(isAutoAcceptable({ risk: 'low', size: 'L' }, limits('high'))).toBe(true);
+    expect(isAutoAcceptable({ risk: 'high', size: 'L' }, limits('high'))).toBe(true);
+    expect(isAutoAcceptable({ risk: 'low', size: 'L' }, limits('high', 'M'))).toBe(false);
+    expect(isAutoAcceptable({ risk: 'low', size: 'M' }, limits('high', 'M'))).toBe(true);
+    expect(isAutoAcceptable({ risk: 'low', size: 'M' }, limits('high', 'S'))).toBe(false);
+    // Both limits apply.
+    expect(isAutoAcceptable({ risk: 'mid', size: 'S' }, limits('low', 'S'))).toBe(false);
+    // max_risk none accepts nothing, whatever the size.
+    for (const size of PROPOSAL_SIZES) {
+      expect(isAutoAcceptable({ risk: 'low', size }, limits('none'))).toBe(false);
+    }
   });
 
   it('splits every kind of proposal by the auto-accept rule', () => {
     const kinds = (list: ProposalKind[]) => list.map((k) => `${k.risk}/${k.size}`);
-    expect(kinds(acceptSplit('none').auto)).toEqual([]);
-    expect(acceptSplit('none').human).toHaveLength(9);
-    expect(kinds(acceptSplit('low').auto)).toEqual(['low/S', 'low/M']);
-    expect(kinds(acceptSplit('high').human)).toEqual(['low/L', 'mid/L', 'high/L']);
+    const none = { max_risk: 'none', max_size: 'L' } as const;
+    expect(kinds(acceptSplit(none).auto)).toEqual([]);
+    expect(acceptSplit(none).human).toHaveLength(9);
+    expect(kinds(acceptSplit({ max_risk: 'low', max_size: 'L' }).auto)).toEqual([
+      'low/S',
+      'low/M',
+      'low/L',
+    ]);
+    expect(acceptSplit({ max_risk: 'high', max_size: 'L' }).human).toEqual([]);
+    expect(kinds(acceptSplit({ max_risk: 'high', max_size: 'M' }).human)).toEqual([
+      'low/L',
+      'mid/L',
+      'high/L',
+    ]);
+    expect(kinds(acceptSplit({ max_risk: 'low', max_size: 'S' }).auto)).toEqual(['low/S']);
     // Another rule, e.g. one that accepts everything, leaves nothing to a human.
-    expect(acceptSplit('none', () => true).human).toEqual([]);
+    expect(acceptSplit(none, () => true).human).toEqual([]);
   });
 
   it('counts toward max_proposals only the proposals auto-accept would take, or all without it', () => {
@@ -4043,19 +4134,24 @@ describe('issues: texts', () => {
     ];
     const open = [
       issue(1), // low S: auto-accept takes it once the daily limit allows
-      issue(2), // size L: left for a human
+      issue(2), // low L: left for a human under max_size M
       issue(3), // mid: beyond max_risk low
       issue(4), // high
       issue(5, [LABELS.proposal, LABELS.ready]), // accepted already
       issue(6), // no scout record: counts, to stay safe
       issue(7, ['bug']), // not a proposal
     ];
-    const numbers = (maxRisk: 'none' | 'low' | 'mid' | 'high') =>
-      proposalsHoldingScout(open, scouts, maxRisk).map((i) => i.number);
+    const numbers = (max_risk: Risk | 'none', max_size: ProposalSize = 'M') =>
+      proposalsHoldingScout(open, scouts, { max_risk, max_size }).map((i) => i.number);
     expect(numbers('none')).toEqual([1, 2, 3, 4, 6]);
+    expect(numbers('none', 'L')).toEqual([1, 2, 3, 4, 6]);
     expect(numbers('low')).toEqual([1, 6]);
     expect(numbers('mid')).toEqual([1, 3, 6]);
     expect(numbers('high')).toEqual([1, 3, 4, 6]);
+    // Under the default max_size L, the large one would be accepted too, so it counts.
+    expect(numbers('low', 'L')).toEqual([1, 2, 6]);
+    expect(numbers('high', 'L')).toEqual([1, 2, 3, 4, 6]);
+    expect(numbers('high', 'S')).toEqual([1, 4, 6]);
     expect(filedProposal(scouts, 4)?.proposal).toBe(scouts[1]?.proposals[1]);
     expect(filedProposal(scouts, 6)).toBeNull();
   });

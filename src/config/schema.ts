@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { DEFAULT_LANG, LANGUAGES, t } from '../i18n.js';
 import { isEffortArg } from './effort.js';
-import { RISKS } from './flow.js';
+import { PROPOSAL_SIZES, RISKS } from './flow.js';
 
 export { agentEffort } from './effort.js';
 
@@ -41,6 +41,12 @@ export const GitHubRepoSchema = z.strictObject({
     .strictObject({
       /** Highest risk accepted automatically; none = every proposal waits for a human. */
       max_risk: z.enum(['none', ...RISKS]).default('none'),
+      /**
+       * Largest size accepted automatically, together with max_risk. L by default: a template
+       * whose coding stage plans (planning: auto or llm) splits an L requirement into steps, so
+       * one Run finishes it.
+       */
+      max_size: z.enum(PROPOSAL_SIZES).default('L'),
       /** Omitted = no daily limit. */
       max_per_day: z.number().int().min(1).optional(),
     })

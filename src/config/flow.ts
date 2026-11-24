@@ -59,28 +59,43 @@ export interface ProposalKind {
   size: ProposalSize;
 }
 
-/** Whether a kind of proposal is accepted without a human under `auto_accept.max_risk`. */
-export type AutoAcceptRule = (p: ProposalKind, maxRisk: Risk | 'none') => boolean;
+/**
+ * How far auto-accept goes: the keys of a repo's `auto_accept` setting, so its config is passed
+ * as it is.
+ */
+export interface AutoAcceptLimits {
+  max_risk: Risk | 'none';
+  max_size: ProposalSize;
+}
 
-/** Auto-accept up to the configured risk, and only what fits one Run. */
-export const isAutoAcceptable: AutoAcceptRule = (p, maxRisk) => {
-  if (maxRisk === 'none' || p.size === 'L') return false;
-  return RISKS.indexOf(p.risk) <= RISKS.indexOf(maxRisk);
+/** Whether a kind of proposal is accepted without a human under the `auto_accept` limits. */
+export type AutoAcceptRule = (p: ProposalKind, limits: AutoAcceptLimits) => boolean;
+
+/**
+ * Auto-accept what is within both limits: risk up to `max_risk` and size up to `max_size`.
+ * `max_risk: none` accepts nothing, whatever the size.
+ */
+export const isAutoAcceptable: AutoAcceptRule = (p, limits) => {
+  if (limits.max_risk === 'none') return false;
+  return (
+    RISKS.indexOf(p.risk) <= RISKS.indexOf(limits.max_risk) &&
+    PROPOSAL_SIZES.indexOf(p.size) <= PROPOSAL_SIZES.indexOf(limits.max_size)
+  );
 };
 
 /**
  * Every kind of proposal (risk × size), split into those the Master accepts by itself under
- * `maxRisk` and those left to a human. `rule` is the auto-accept rule; tests may pass another.
+ * `limits` and those left to a human. `rule` is the auto-accept rule; tests may pass another.
  */
 export function acceptSplit(
-  maxRisk: Risk | 'none',
+  limits: AutoAcceptLimits,
   rule: AutoAcceptRule = isAutoAcceptable,
 ): { auto: ProposalKind[]; human: ProposalKind[] } {
   const auto: ProposalKind[] = [];
   const human: ProposalKind[] = [];
   for (const risk of RISKS) {
     for (const size of PROPOSAL_SIZES) {
-      (rule({ risk, size }, maxRisk) ? auto : human).push({ risk, size });
+      (rule({ risk, size }, limits) ? auto : human).push({ risk, size });
     }
   }
   return { auto, human };

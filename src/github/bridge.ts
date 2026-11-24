@@ -759,7 +759,7 @@ export class IssueBridge {
       if (!this.mayAutoAccept(repo, cfg)) return;
       const filed = filedProposal(scouts, issue.number);
       const proposal = filed?.proposal;
-      if (!filed || !proposal?.issue || !isAutoAcceptable(proposal, cfg.auto_accept.max_risk)) {
+      if (!filed || !proposal?.issue || !isAutoAcceptable(proposal, cfg.auto_accept)) {
         continue;
       }
       const { scout } = filed;
@@ -1615,7 +1615,7 @@ export class IssueBridge {
       label: LABELS.proposal,
       limit: 100,
     });
-    const pending = proposalsHoldingScout(open, scouts, cfg.auto_accept.max_risk).length;
+    const pending = proposalsHoldingScout(open, scouts, cfg.auto_accept).length;
     const stuck = runs.stuck.length;
     if (pending + stuck >= scout.max_proposals) {
       return { reason: waitingForYouText(pending, stuck) };
@@ -1956,7 +1956,7 @@ export class IssueBridge {
     proposals: ScoutProposal[],
   ): Promise<ScoutProposal[]> {
     for (const p of proposals) {
-      const auto = isAutoAcceptable(p, cfg.auto_accept.max_risk) && this.mayAutoAccept(repo, cfg);
+      const auto = isAutoAcceptable(p, cfg.auto_accept) && this.mayAutoAccept(repo, cfg);
       const labels: string[] = [LABELS.proposal];
       if (auto) labels.push(LABELS.ready, LABELS.auto);
       try {
@@ -2012,6 +2012,7 @@ export class IssueBridge {
           : null,
         autoAccept: {
           maxRisk: cfg.auto_accept.max_risk,
+          maxSize: cfg.auto_accept.max_size,
           maxPerDay: cfg.auto_accept.max_per_day ?? null,
           usedToday: this.autoAcceptedToday(name),
         },

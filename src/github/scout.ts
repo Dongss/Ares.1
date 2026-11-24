@@ -3,10 +3,10 @@
 import { z } from 'zod';
 import { brandName } from '../brand.js';
 import {
+  type AutoAcceptLimits,
   isAutoAcceptable,
   PROPOSAL_SIZES,
   RISKS,
-  type Risk,
   sizeMeanings,
 } from '../config/flow.js';
 import {
@@ -913,20 +913,20 @@ export function filedProposal<S extends Pick<Scout, 'proposals'>>(
  * Untriaged proposals that hold the automatic scout back once there are `max_proposals` of them.
  * Without auto-accept, every one: a human decides them all. With it, only those auto-accept would
  * take but has not yet (today's count is used up), and those without a scout record, to stay
- * safe. Proposals beyond what auto-accept takes (size L, a higher risk) still wait for a human,
- * but would otherwise stop the system for good, so they do not count; the scout sees them among
- * the open issues and does not propose them again.
+ * safe. Proposals beyond what auto-accept takes (over `max_size` or `max_risk`) still wait for a
+ * human, but would otherwise stop the system for good, so they do not count; the scout sees them
+ * among the open issues and does not propose them again.
  */
 export function proposalsHoldingScout(
   open: GhIssue[],
   scouts: Pick<Scout, 'proposals'>[],
-  maxRisk: Risk | 'none',
+  limits: AutoAcceptLimits,
 ): GhIssue[] {
   const waiting = untriaged(open);
-  if (maxRisk === 'none') return waiting;
+  if (limits.max_risk === 'none') return waiting;
   return waiting.filter((issue) => {
     const filed = filedProposal(scouts, issue.number);
-    return !filed || isAutoAcceptable(filed.proposal, maxRisk);
+    return !filed || isAutoAcceptable(filed.proposal, limits);
   });
 }
 

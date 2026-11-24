@@ -218,6 +218,7 @@ function NotConfigured() {
         auto: true           # 没有在进行中的 Run 时自动侦察（只等人的 Run 不挡）；false = 只手动触发
       auto_accept:
         max_risk: none       # 自动采纳到哪个风险等级：none / low / mid / high
+        max_size: L          # 自动采纳到哪个大小：S / M / L
       auto_merge: false      # 从 issue 来的 Run 合并前不再等你审批
       push: false            # 合并后自动推送到 GitHub
       # daily_budget_usd: 20 # 每天自动花费的上限，不写 = 不限
@@ -232,6 +233,7 @@ function NotConfigured() {
         auto: true           # scout by itself when no Run is in progress (Runs waiting only for you do not hold it back); false = by hand only
       auto_accept:
         max_risk: none       # highest risk accepted automatically: none / low / mid / high
+        max_size: L          # largest size accepted automatically: S / M / L
       auto_merge: false      # Runs from issues merge without waiting for your approval
       push: false            # push to GitHub after merging
       # daily_budget_usd: 20 # daily limit of automatic spend; omitted = no limit

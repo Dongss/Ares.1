@@ -278,20 +278,24 @@ export function beforeChinese(text: string): string {
   return /[A-Za-z0-9]$/.test(text) ? `${text} ` : text;
 }
 
+/** The settings of `auto_accept` that decide which proposals it takes. */
+export type AcceptLimits = Pick<GitHubRepoStatus['autoAccept'], 'maxRisk' | 'maxSize'>;
+
 /**
- * The proposals the Master accepts by itself under `auto_accept.max_risk` and those left to you,
- * in words, by the auto-accept rule (`rule`; tests may pass another). null = none.
+ * The proposals the Master accepts by itself under `auto_accept` (`max_risk` and `max_size`) and
+ * those left to you, in words, by the auto-accept rule (`rule`; tests may pass another).
+ * null = none.
  */
 export function acceptRanges(
-  maxRisk: Risk | 'none',
+  accept: AcceptLimits,
   rule?: AutoAcceptRule,
 ): { auto: string | null; human: string | null } {
-  const { auto, human } = acceptSplit(maxRisk, rule);
+  const { auto, human } = acceptSplit({ max_risk: accept.maxRisk, max_size: accept.maxSize }, rule);
   return { auto: proposalKindsText(auto), human: proposalKindsText(human) };
 }
 
 export function autoAcceptText(auto: GitHubRepoStatus['autoAccept']): string {
-  const range = acceptRanges(auto.maxRisk).auto;
+  const range = acceptRanges(auto).auto;
   if (range === null) {
     return t({ zh: '关闭：提案都由你采纳', en: 'Off: you accept every proposal' });
   }

@@ -42,6 +42,7 @@ defaults:
 #         max_proposals: 5       # 一次最多提几条；未处理的提案加上只等人的 Run 达到这个数就不再自动侦察（开了自动采纳时提案只算在采纳范围内的）
 #       auto_accept:
 #         max_risk: none         # 自动采纳到哪个风险等级：none（都由人采纳）/ low / mid / high
+#         # max_size: L          # 自动采纳到哪个大小：S / M / L（默认）；风险和大小都不超过才自动采纳。编码阶段 planning: auto 的模板会把 L 拆成几步做完
 #         # max_per_day: 3       # 每天最多自动采纳几条；不写 = 不限
 #       auto_merge: false        # true = 从 issue 来的 Run 合并前不等人审批
 #       push: false              # true = 合并后把目标分支推送到 GitHub，每轮检查时也把 GitHub 上的新提交快进到本地目标分支
@@ -92,6 +93,7 @@ defaults:
 #         max_proposals: 5       # proposals per scout; no automatic scout while this many proposals and Runs stuck waiting for a human await you (with auto-accept on, only proposals within its range count)
 #       auto_accept:
 #         max_risk: none         # accept automatically up to this risk: none (a human accepts all) / low / mid / high
+#         # max_size: L          # accept automatically up to this size: S / M / L (default); both risk and size must be within. A template with planning: auto in its coding stage splits an L into steps
 #         # max_per_day: 3       # at most this many automatic accepts a day; omitted = no limit
 #       auto_merge: false        # true = Runs from issues merge without waiting for approval
 #       push: false              # true = push the target branch to GitHub after merging, and fast-forward it to new commits on GitHub at every check

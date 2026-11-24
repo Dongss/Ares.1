@@ -48,7 +48,8 @@ github:
         interval_minutes: 360  # 两次自动侦察至少间隔几分钟，默认 0（不限）。没找到需求或失败后另有退避，最长 6 小时
         max_proposals: 3       # 一次最多提几条，默认 5（1 到 20）；等你处理的提案加上卡住的 Run 达到这个数就不再自动侦察
       auto_accept:             # 不经过人，自动给提案加上 ares1:ready
-        max_risk: low          # 自动采纳到哪个风险等级：none（默认，都由人采纳）/ low / mid / high；大小为 L 的提案总是等人
+        max_risk: low          # 自动采纳到哪个风险等级：none（默认，都由人采纳）/ low / mid / high
+        # max_size: L          # 自动采纳到哪个大小：S / M / L（默认）；和 max_risk 一起决定，两项都不超过才自动采纳
         max_per_day: 3         # 每天最多自动采纳几条；不写 = 不限
       auto_merge: true         # true = 从 issue 来的 Run 合并前不等人审批（模板里其他阶段的审批照旧）；默认 false
       push: true               # true = 合并后把目标分支推送到 GitHub，每轮检查时也把 GitHub 上的新提交

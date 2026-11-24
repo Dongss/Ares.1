@@ -279,6 +279,8 @@ export interface GitHubRepoStatus {
   } | null;
   autoAccept: {
     maxRisk: 'none' | 'low' | 'mid' | 'high';
+    /** Largest size accepted automatically, together with maxRisk. */
+    maxSize: 'S' | 'M' | 'L';
     /** null = no daily limit. */
     maxPerDay: number | null;
     usedToday: number;

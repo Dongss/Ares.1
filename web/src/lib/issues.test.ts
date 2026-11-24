@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import type { ProposalSize, Risk } from '../../../src/config/flow.js';
 import { setLang } from '../../../src/i18n.js';
 import {
   acceptRanges,
@@ -75,29 +76,41 @@ describe('issues display', () => {
     expect(budgetText({ dailyUsd: null, spentToday: 21, reached: false })).toBe(
       '$21.00（不设上限）',
     );
-    expect(autoAcceptText({ maxRisk: 'none', maxPerDay: null, usedToday: 0 })).toBe(
+    expect(autoAcceptText({ maxRisk: 'none', maxSize: 'L', maxPerDay: null, usedToday: 0 })).toBe(
       '关闭：提案都由你采纳',
     );
-    expect(autoAcceptText({ maxRisk: 'high', maxPerDay: null, usedToday: 3 })).toBe(
+    expect(autoAcceptText({ maxRisk: 'high', maxSize: 'L', maxPerDay: null, usedToday: 3 })).toBe(
+      '所有提案；不限条数，今天 3 条',
+    );
+    expect(autoAcceptText({ maxRisk: 'high', maxSize: 'M', maxPerDay: null, usedToday: 3 })).toBe(
       'S、M 级提案；不限条数，今天 3 条',
     );
-    expect(autoAcceptText({ maxRisk: 'low', maxPerDay: 2, usedToday: 1 })).toBe(
-      '风险低的 S、M 级提案；每天最多 2 条，今天 1 条',
+    expect(autoAcceptText({ maxRisk: 'low', maxSize: 'L', maxPerDay: 2, usedToday: 1 })).toBe(
+      '风险低的提案；每天最多 2 条，今天 1 条',
     );
   });
 
   it('words which proposals auto-accept takes and which it leaves to you, by the rule', () => {
-    expect(acceptRanges('none')).toEqual({ auto: null, human: '所有提案' });
-    expect(acceptRanges('low')).toEqual({
+    const ranges = (maxRisk: Risk | 'none', maxSize: ProposalSize = 'L') =>
+      acceptRanges({ maxRisk, maxSize });
+    expect(ranges('none')).toEqual({ auto: null, human: '所有提案' });
+    expect(ranges('none', 'S')).toEqual({ auto: null, human: '所有提案' });
+    expect(ranges('low')).toEqual({ auto: '风险低的提案', human: '风险中、高的提案' });
+    expect(ranges('mid')).toEqual({ auto: '风险低、中的提案', human: '风险高的提案' });
+    expect(ranges('high')).toEqual({ auto: '所有提案', human: null });
+    expect(ranges('high', 'M')).toEqual({ auto: 'S、M 级提案', human: 'L 级提案' });
+    expect(ranges('low', 'M')).toEqual({
       auto: '风险低的 S、M 级提案',
       human: 'L 级提案和风险中、高的提案',
     });
-    expect(acceptRanges('mid')).toEqual({
-      auto: '风险低、中的 S、M 级提案',
-      human: 'L 级提案和风险高的提案',
+    expect(ranges('mid', 'S')).toEqual({
+      auto: '风险低、中的 S 级提案',
+      human: 'M、L 级提案和风险高的提案',
     });
-    expect(acceptRanges('high')).toEqual({ auto: 'S、M 级提案', human: 'L 级提案' });
-    expect(acceptRanges('none', () => true)).toEqual({ auto: '所有提案', human: null });
+    expect(acceptRanges({ maxRisk: 'none', maxSize: 'L' }, () => true)).toEqual({
+      auto: '所有提案',
+      human: null,
+    });
     // Whatever is left after whole sizes and risks is worded by risk.
     expect(
       proposalKindsText([
@@ -221,26 +234,47 @@ describe('issues display in English', () => {
       '$21.00 (no limit)',
     );
     expect(budgetText({ dailyUsd: 20, spentToday: 21, reached: true })).toContain('limit reached');
-    expect(autoAcceptText({ maxRisk: 'none', maxPerDay: null, usedToday: 0 })).toBe(
+    expect(autoAcceptText({ maxRisk: 'none', maxSize: 'L', maxPerDay: null, usedToday: 0 })).toBe(
       'Off: you accept every proposal',
     );
-    expect(autoAcceptText({ maxRisk: 'low', maxPerDay: 2, usedToday: 1 })).toBe(
+    expect(autoAcceptText({ maxRisk: 'low', maxSize: 'L', maxPerDay: 2, usedToday: 1 })).toBe(
+      'low-risk proposals; at most 2 a day, 1 today',
+    );
+    expect(autoAcceptText({ maxRisk: 'low', maxSize: 'M', maxPerDay: 2, usedToday: 1 })).toBe(
       'low-risk proposals of size S or M; at most 2 a day, 1 today',
     );
-    expect(acceptRanges('none')).toEqual({ auto: null, human: 'all proposals' });
-    expect(acceptRanges('low')).toEqual({
+    const ranges = (maxRisk: Risk | 'none', maxSize: ProposalSize = 'L') =>
+      acceptRanges({ maxRisk, maxSize });
+    expect(ranges('none')).toEqual({ auto: null, human: 'all proposals' });
+    expect(ranges('low')).toEqual({
+      auto: 'low-risk proposals',
+      human: 'medium- or high-risk proposals',
+    });
+    expect(ranges('mid')).toEqual({
+      auto: 'low- or medium-risk proposals',
+      human: 'high-risk proposals',
+    });
+    expect(ranges('high')).toEqual({ auto: 'all proposals', human: null });
+    expect(ranges('low', 'M')).toEqual({
       auto: 'low-risk proposals of size S or M',
       human: 'size L proposals and medium- or high-risk proposals',
     });
-    expect(acceptRanges('mid')).toEqual({
+    expect(ranges('mid', 'M')).toEqual({
       auto: 'low- or medium-risk proposals of size S or M',
       human: 'size L proposals and high-risk proposals',
     });
-    expect(acceptRanges('high')).toEqual({
+    expect(ranges('high', 'M')).toEqual({
       auto: 'size S or M proposals',
       human: 'size L proposals',
     });
-    expect(acceptRanges('none', () => true)).toEqual({ auto: 'all proposals', human: null });
+    expect(ranges('mid', 'S')).toEqual({
+      auto: 'low- or medium-risk proposals of size S',
+      human: 'size M or L proposals and high-risk proposals',
+    });
+    expect(acceptRanges({ maxRisk: 'none', maxSize: 'L' }, () => true)).toEqual({
+      auto: 'all proposals',
+      human: null,
+    });
     expect(
       upgradeText({
         auto: true,

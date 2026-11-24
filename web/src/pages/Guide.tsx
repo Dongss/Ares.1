@@ -760,7 +760,7 @@ function GuardsSection({ input, working }: { input: GuideInput; working: boolean
 function FaqSection(props: { input: GuideInput; home: string; idle: string[] }) {
   const { input, home } = props;
   const { github } = input;
-  const leftToYou = github && acceptRanges(github.autoAccept.maxRisk).human;
+  const leftToYou = github && acceptRanges(github.autoAccept).human;
   return (
     <div className="guide-items">
       <div>

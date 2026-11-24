@@ -71,28 +71,28 @@ const manualRepo: GitHubRepoStatus = {
   template: 'self-dev',
   problems: [],
   scout: null,
-  autoAccept: { maxRisk: 'none', maxPerDay: null, usedToday: 0 },
+  autoAccept: { maxRisk: 'none', maxSize: 'L', maxPerDay: null, usedToday: 0 },
   autoMerge: false,
   budget: { dailyUsd: null, spentToday: 0, reached: false },
   push: false,
   maxRunAttempts: 3,
 };
 
-/** Everything handed over: idle scouts, any risk accepted, merged, pushed, upgraded. */
+/** Everything handed over: idle scouts, any risk and size accepted, merged, pushed, upgraded. */
 const autoRepo: GitHubRepoStatus = {
   ...manualRepo,
   scout,
-  autoAccept: { maxRisk: 'high', maxPerDay: null, usedToday: 2 },
+  autoAccept: { maxRisk: 'high', maxSize: 'L', maxPerDay: null, usedToday: 2 },
   autoMerge: true,
   budget: { dailyUsd: 20, spentToday: 3.2, reached: false },
   push: true,
 };
 
-/** Some of it: low risk accepted, merge still approved, pushed, no upgrades. */
+/** Some of it: low risk up to size M accepted, merge still approved, pushed, no upgrades. */
 const partialRepo: GitHubRepoStatus = {
   ...manualRepo,
   scout: { ...scout, intervalMinutes: 360 },
-  autoAccept: { maxRisk: 'low', maxPerDay: 3, usedToday: 1 },
+  autoAccept: { maxRisk: 'low', maxSize: 'M', maxPerDay: 3, usedToday: 1 },
   push: true,
 };
 
@@ -157,10 +157,10 @@ describe('the cycle', () => {
       'claude-reviewer 只读地看代码、文档和最近的 Run 记录，找值得做的事',
     );
     expect(steps.propose?.text).toContain('一次最多 5 条');
-    // Size L proposals always wait for a human.
-    expect(steps.accept?.actors).toEqual(['master', 'human']);
+    // max_risk high with the default max_size L: no proposal waits for a human.
+    expect(steps.accept?.actors).toEqual(['master']);
     expect(steps.accept?.text).toBe(
-      'S、M 级提案自动采纳（加 ares1:ready 和 ares1:auto）；当天自动花费到 $20.00 后暂停，第二天自动继续采纳积压的提案；L 级提案由你来做：加 ares1:ready 或关闭',
+      '所有提案自动采纳（加 ares1:ready 和 ares1:auto）；当天自动花费到 $20.00 后暂停，第二天自动继续采纳积压的提案',
     );
     expect(steps.run?.actors).toEqual(['ai', 'master']);
     expect(steps.push?.actors).toEqual(['master']);
@@ -218,22 +218,27 @@ describe('the accept step', () => {
   afterEach(() => setLang('zh'));
 
   const CJK = /[一-鿿]/;
-  const withRisk = (maxRisk: GitHubRepoStatus['autoAccept']['maxRisk']): GitHubRepoStatus => ({
+  const withRisk = (
+    maxRisk: GitHubRepoStatus['autoAccept']['maxRisk'],
+    maxSize: GitHubRepoStatus['autoAccept']['maxSize'] = 'L',
+  ): GitHubRepoStatus => ({
     ...autoRepo,
-    autoAccept: { ...autoRepo.autoAccept, maxRisk },
+    autoAccept: { ...autoRepo.autoAccept, maxRisk, maxSize },
   });
-  /** A rule that accepts every proposal: no setting of the current rule leaves none to you. */
+  /** A rule that accepts every proposal, whatever the settings. */
   const all = () => true;
 
   it('leaves every proposal to you with max_risk: none', () => {
-    const step = acceptStep(withRisk('none'));
-    expect(step.actors).toEqual(['human']);
-    expect(step.text.startsWith('所有提案都由你来做：')).toBe(true);
-    expect(step.text).not.toContain('自动采纳');
+    for (const github of [withRisk('none'), withRisk('none', 'S')]) {
+      const step = acceptStep(github);
+      expect(step.actors).toEqual(['human']);
+      expect(step.text.startsWith('所有提案都由你来做：')).toBe(true);
+      expect(step.text).not.toContain('自动采纳');
+    }
   });
 
-  it('leaves only size L proposals to you with max_risk: high', () => {
-    const step = acceptStep(withRisk('high'));
+  it('leaves only size L proposals to you with max_risk: high and max_size: M', () => {
+    const step = acceptStep(withRisk('high', 'M'));
     expect(step.actors).toEqual(['master', 'human']);
     expect(step.text).toContain('S、M 级提案自动采纳');
     expect(step.text).toContain('；L 级提案由你来做：加 ares1:ready 或关闭');
@@ -241,7 +246,8 @@ describe('the accept step', () => {
   });
 
   it('is up to the Master alone when no proposal needs you', () => {
-    const step = acceptStep(withRisk('high'), all);
+    // max_risk high with the default max_size L accepts every proposal.
+    const step = acceptStep(withRisk('high'));
     expect(step.actors).toEqual(['master']);
     expect(step.text).toBe(
       '所有提案自动采纳（加 ares1:ready 和 ares1:auto）；当天自动花费到 $20.00 后暂停，第二天自动继续采纳积压的提案',
@@ -249,24 +255,29 @@ describe('the accept step', () => {
     expect(step.text).not.toContain('由你来做');
     // The cycle and the summary of what is left to you follow the same rule.
     const i = input(withRisk('high'));
-    expect(cycleSteps(i, all).find((s) => s.id === 'accept')).toEqual(step);
-    expect(autonomy(i, all).auto).toContain('采纳所有提案');
-    expect(autonomy(i, all).you.join()).not.toContain('采纳');
+    expect(cycleSteps(i).find((s) => s.id === 'accept')).toEqual(step);
+    expect(autonomy(i).auto).toContain('采纳所有提案');
+    expect(autonomy(i).you.join()).not.toContain('采纳');
+    // The rule is passed through: one that accepts everything does so even under max_risk none.
+    expect(acceptStep(withRisk('none'), all)).toEqual(step);
+    expect(autonomy(input(withRisk('none')), all).auto).toContain('采纳所有提案');
   });
 
   it('says the daily limits only pause it until the next day', () => {
     const both = {
       ...withRisk('low'),
-      autoAccept: { maxRisk: 'low' as const, maxPerDay: 3, usedToday: 0 },
+      autoAccept: { maxRisk: 'low' as const, maxSize: 'L' as const, maxPerDay: 3, usedToday: 0 },
     };
     expect(acceptStep(both).text).toContain(
       '；当天自动采纳满 3 条或自动花费到 $20.00 后暂停，第二天自动继续采纳积压的提案；',
     );
-    const noLimit = { ...withRisk('high'), budget: { ...autoRepo.budget, dailyUsd: null } };
+    const noLimit = { ...withRisk('high', 'M'), budget: { ...autoRepo.budget, dailyUsd: null } };
     expect(acceptStep(noLimit).text).toBe(
       'S、M 级提案自动采纳（加 ares1:ready 和 ares1:auto）；L 级提案由你来做：加 ares1:ready 或关闭',
     );
-    for (const github of [both, noLimit, withRisk('high')]) {
+    const noLimitAll = { ...withRisk('high'), budget: { ...autoRepo.budget, dailyUsd: null } };
+    expect(acceptStep(noLimitAll).text).toBe('所有提案自动采纳（加 ares1:ready 和 ares1:auto）');
+    for (const github of [both, noLimit, noLimitAll, withRisk('high')]) {
       expect(acceptStep(github).text).not.toContain('就停');
     }
   });
@@ -276,21 +287,31 @@ describe('the accept step', () => {
     expect(acceptStep(withRisk('none')).text).toBe(
       'All proposals are up to you: label the issues to do with ares1:ready; close the others as not planned with a one-line reason',
     );
-    expect(acceptStep(withRisk('high')).text).toBe(
+    expect(acceptStep(withRisk('high', 'M')).text).toBe(
       'Accepted automatically: size S or M proposals (labeled ares1:ready and ares1:auto); once automatic spending reaches $20.00 in a day, it pauses for the rest of the day and accepts the backlog by itself the next day. Up to you: size L proposals; add ares1:ready or close them',
     );
     const one = {
       ...withRisk('mid'),
-      autoAccept: { maxRisk: 'mid' as const, maxPerDay: 1, usedToday: 0 },
+      autoAccept: { maxRisk: 'mid' as const, maxSize: 'L' as const, maxPerDay: 1, usedToday: 0 },
     };
     expect(acceptStep(one).text).toContain(
       'once 1 proposal is accepted or automatic spending reaches $20.00 in a day,',
     );
-    expect(acceptStep(one).text).toContain('Up to you: size L proposals and high-risk proposals;');
-    const none = acceptStep(withRisk('high'), all);
+    expect(acceptStep(one).text).toContain('Up to you: high-risk proposals;');
+    const none = acceptStep(withRisk('high'));
     expect(none.actors).toEqual(['master']);
-    expect(none.text).not.toContain('Up to you');
-    for (const github of [null, withRisk('none'), withRisk('low'), withRisk('mid'), one]) {
+    expect(none.text).toBe(
+      'Accepted automatically: all proposals (labeled ares1:ready and ares1:auto); once automatic spending reaches $20.00 in a day, it pauses for the rest of the day and accepts the backlog by itself the next day',
+    );
+    for (const github of [
+      null,
+      withRisk('none'),
+      withRisk('low'),
+      withRisk('mid'),
+      withRisk('low', 'M'),
+      withRisk('mid', 'S'),
+      one,
+    ]) {
       expect(acceptStep(github).text).not.toMatch(CJK);
     }
     expect(none.text).not.toMatch(CJK);
@@ -425,14 +446,16 @@ describe('autonomy', () => {
         '编码',
         '评审',
         '找活（侦察）',
-        '采纳 S、M 级提案',
+        '采纳所有提案',
         '合并',
         '推送到 GitHub',
         '升级 Master',
       ],
-      // Size L proposals always wait for a human.
-      you: ['采纳 L 级提案'],
+      you: [],
     });
+    expect(
+      autonomy(input({ ...autoRepo, autoAccept: { ...autoRepo.autoAccept, maxSize: 'M' } }, on)),
+    ).toMatchObject({ you: ['采纳 L 级提案'] });
     expect(autonomy(input(partialRepo))).toEqual({
       auto: ['编码', '评审', '找活（侦察）', '采纳风险低的 S、M 级提案', '推送到 GitHub'],
       you: ['采纳 L 级提案和风险中、高的提案', '合并前审批', '升级 Master'],
@@ -466,8 +489,9 @@ describe('scoutGuide', () => {
     expect(g.conditions).toContain(
       '仓库没有会自己往下走的 Run（排队、执行中、等评估回复且设了超时，或等目标分支上的改动清掉后自动合并）：手上的活做完了才找新活；只等人的 Run 不用等，算进下面的上限',
     );
+    // Nothing is left to you, so nothing is said about proposals that do not hold it back.
     expect(g.conditions).toContain(
-      '在自动采纳范围内、还没采纳的提案加上卡住等人的 Run 少于 5 个（max_proposals）；L 级提案留给你处理，不挡侦察',
+      '在自动采纳范围内、还没采纳的提案加上卡住等人的 Run 少于 5 个（max_proposals）',
     );
     expect(g.now).toBe('条件都满足，下次检查（每 5 分钟）时就会侦察。');
     expect(g.waiting).toBe(false);
@@ -575,10 +599,12 @@ describe('notifications', () => {
   it('explains ares1:auto by the auto_accept setting', () => {
     const auto = (a: GitHubRepoStatus['autoAccept'] | null) =>
       labelHelp(a).find(([label]) => label === 'ares1:auto')?.[1];
-    expect(auto(partialRepo.autoAccept)).toContain('现在是风险低的 S、M 级提案（max_risk: low）');
-    expect(auto(autoRepo.autoAccept)).toContain('现在是 S、M 级提案（max_risk: high）');
+    expect(auto(partialRepo.autoAccept)).toContain(
+      '现在是风险低的 S、M 级提案（max_risk: low，max_size: M）',
+    );
+    expect(auto(autoRepo.autoAccept)).toContain('现在是所有提案（max_risk: high，max_size: L）');
     expect(auto(manualRepo.autoAccept)).toContain('现在自动采纳关闭');
-    expect(auto(null)).toContain('由 max_risk 决定');
+    expect(auto(null)).toContain('由 max_risk 和 max_size 决定');
     expect(labelHelp(null).map(([label]) => label)).toEqual([
       'ares1:proposal',
       'ares1:ready',
@@ -1021,6 +1047,12 @@ describe('in English', () => {
       'E2E (placeholder)',
     );
     expect(autonomy(inputEn(autoRepo, on))).toMatchObject({
+      auto: expect.arrayContaining(['Accepting all proposals']),
+      you: [],
+    });
+    expect(
+      autonomy(inputEn({ ...autoRepo, autoAccept: { ...autoRepo.autoAccept, maxSize: 'M' } }, on)),
+    ).toMatchObject({
       auto: expect.arrayContaining(['Accepting size S or M proposals']),
       you: ['Accepting size L proposals'],
     });
@@ -1063,9 +1095,23 @@ describe('in English', () => {
       'FAQ',
     ]);
     expect(Object.values(ACTOR).map((a) => a.label)).toEqual(['AI', 'Master (auto)', 'Up to you']);
-    for (const accept of [null, manualRepo.autoAccept, partialRepo.autoAccept]) {
+    for (const accept of [
+      null,
+      manualRepo.autoAccept,
+      partialRepo.autoAccept,
+      autoRepo.autoAccept,
+    ]) {
       for (const [, text] of labelHelp(accept)) expect(text).not.toMatch(CJK);
     }
+    const autoLabel = (a: GitHubRepoStatus['autoAccept'] | null) =>
+      labelHelp(a).find(([label]) => label === 'ares1:auto')?.[1];
+    expect(autoLabel(null)).toContain('max_risk and max_size decide');
+    expect(autoLabel(partialRepo.autoAccept)).toContain(
+      'now low-risk proposals of size S or M (max_risk: low, max_size: M)',
+    );
+    expect(autoLabel(autoRepo.autoAccept)).toContain(
+      'now all proposals (max_risk: high, max_size: L)',
+    );
     for (const row of noticeRows()) expect(row.handle).not.toMatch(CJK);
     expect(notifyChannel(true)).not.toMatch(CJK);
     expect(notifyChannel(false)).not.toMatch(CJK);
