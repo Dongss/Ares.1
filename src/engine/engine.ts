@@ -4438,7 +4438,10 @@ export class Engine {
    * that no more agents run and nothing is merged for it. Not once the Run merged by itself: its
    * merge stage passed, or its HEAD, with the commit, is in the target branch (a merge stage
    * stopped right after it fast-forwarded). Null too when the commit is not in the repo: the Run
-   * goes on to `MergeCommitMissing` as before.
+   * goes on to `MergeCommitMissing` as before. A worktree that started from a commit with it
+   * (`baseCommit`) is never the Run's own merge, though its HEAD has the commit and is in the
+   * target branch: the target got the commit between the check before the worktree was created
+   * and the creation (the Master merged it meanwhile), and the worktree was made from that.
    */
   private async mergedRemoteElsewhere(run: Run, signal: AbortSignal): Promise<MergedRemote | null> {
     if (!run.mergeRemote || this.mergeStagePassed(run)) return null;
@@ -4450,6 +4453,13 @@ export class Engine {
     const inTarget = await isAncestor(repo.path, remote, targetHead);
     this.checkAbort(signal);
     if (!inTarget) return null;
+    // Without this, each later check would take the untouched worktree for the Run's own merge
+    // and let its agents run for nothing.
+    if (run.baseCommit) {
+      const inBase = await isAncestor(repo.path, remote, run.baseCommit);
+      this.checkAbort(signal);
+      if (inBase) return { remote, targetHead };
+    }
     if (run.worktreePath) {
       const head = await revParse(run.worktreePath, 'HEAD').catch(() => null);
       const own =
@@ -4497,6 +4507,12 @@ export class Engine {
    * included: at most its own merge of the same commit and what its agents built on it to get it
    * through, of no more use. `locked` when the caller holds the repo's merge lock (the merge
    * stage); else it is waited for, after the Run completed, so nothing stops the wait.
+   *
+   * The stage round it stopped in is ended too, as passed: left executing without an end, the
+   * dashboard's flow chart and time split would show a completed Run as still in that stage.
+   * Stage rounds have no status for one cut short, and failed would show the completed Run as
+   * failing there; the event's `stageId` tells that the round was skipped. No `stage.passed` is
+   * recorded, so that nothing is notified or taken for the stage's own pass.
    */
   private async completeMergedRemote(
     run: Run,
@@ -4510,6 +4526,10 @@ export class Engine {
         if (task.status !== 'passed' && task.status !== 'failed') {
           this.store.updateTask(task.id, { status: 'cancelled' });
         }
+      }
+      const round = sr && this.store.getStageRun(sr.id);
+      if (round && (round.status === 'executing' || round.status === 'waiting_approval')) {
+        this.store.updateStageRun(round.id, { status: 'passed', endedAt: nowIso() });
       }
       this.store.event(run.id, 'run.merge_remote_obsolete', {
         remote: merged.remote,

@@ -4432,6 +4432,13 @@ describe('engine: a Run that merges a commit from GitHub', () => {
     expect(eventsOf(run.id, 'merge.done')).toEqual([]);
     expect(store.listChecks(run.id).filter((c) => c.kind === 'merge' && !c.attemptId)).toEqual([]);
     expect(coderCalls()).toHaveLength(1);
+    // The merge stage's round ended with the Run, with no stage.passed of its own.
+    const merge = store.listStageRuns(run.id).find((s) => s.stageId === 'merge');
+    expect([merge?.status, Boolean(merge?.endedAt)]).toEqual(['passed', true]);
+    expect(eventsOf(run.id, 'stage.passed').map((e) => e.data.stageId)).toEqual([
+      'implement',
+      'review',
+    ]);
     await waitFor(() => eventsOf(run.id, 'workspace.removed').length === 1, 'the removal');
     expect(existsSync(worktree)).toBe(false);
     expect(git(repoDir, 'branch', '--list', `ares1/${run.id}`)).toBe('');
@@ -4450,6 +4457,99 @@ describe('engine: a Run that merges a commit from GitHub', () => {
     expect(eventsOf(run.id, 'workspace.created')).toEqual([]);
     expect(h.fake.calls).toEqual([]);
     expect(h.master.store.getRun(run.id).worktreePath).toBeNull();
+  });
+
+  it('completes without an agent when its worktree started from a main that had the commit', async () => {
+    const { repoDir, remote } = diverged();
+    h = await harness({
+      repoDir,
+      scripts: { coder: () => done(), reviewer: () => review() },
+    });
+    // The Master merges GitHub's commit right after the check before the worktree is created,
+    // so the worktree starts from a main that has it: its HEAD has the commit and is in main.
+    const engine = h.master.engine as unknown as {
+      skipMergedRemote(run: unknown, sr: unknown, signal: unknown): Promise<boolean>;
+    };
+    const skip = engine.skipMergedRemote.bind(engine);
+    let mainHead = '';
+    vi.spyOn(engine, 'skipMergedRemote').mockImplementation(async (run, sr, signal) => {
+      const skipped = await skip(run, sr, signal);
+      if (sr === null && !skipped && !mainHead) {
+        git(repoDir, 'merge', '-q', '--no-edit', '-X', 'ours', remote);
+        mainHead = git(repoDir, 'rev-parse', 'main');
+      }
+      return skipped;
+    });
+    const run = mergeRun(remote);
+    await h.waitStatus(run.id, 'completed');
+    expect(eventsOf(run.id, 'workspace.created').map((e) => e.data.base)).toEqual([mainHead]);
+    expect(eventsOf(run.id, 'run.merge_remote_obsolete').map((e) => e.data)).toEqual([
+      { remote, target: 'main', targetHead: mainHead, stageId: 'implement' },
+    ]);
+    expect(h.fake.calls).toEqual([]);
+    const store = h.master.store;
+    expect(store.listRunAttempts(run.id)).toEqual([]);
+    expect(store.listRunTasks(run.id).map((t) => t.status)).toEqual(['cancelled']);
+    const rounds = store.listStageRuns(run.id);
+    expect(rounds.map((s) => [s.stageId, s.round, s.status])).toEqual([['implement', 1, 'passed']]);
+    expect(rounds[0]?.endedAt).toBeTruthy();
+    expect(eventsOf(run.id, 'stage.passed')).toEqual([]);
+    await waitFor(() => eventsOf(run.id, 'workspace.removed').length === 1, 'the removal');
+    expect(git(repoDir, 'rev-parse', 'main')).toBe(mainHead);
+  });
+
+  it('ends the round it stopped in when main got the commit between two tasks of it', async () => {
+    const { repoDir, remote } = diverged();
+    const workflow = TEST_WORKFLOW_YAML.replace(
+      '    agent: coder\n',
+      '    agent: coder\n    planning: llm\n',
+    );
+    let mainHead = '';
+    h = await harness({
+      repoDir,
+      workflow,
+      verifyCommands: BOTH_SIDES,
+      scripts: {
+        coder: (ctx) => {
+          if (ctx.input.readOnly) {
+            return {
+              finalMessage: `\`\`\`json\n${JSON.stringify({
+                tasks: [
+                  { title: 'a', instructions: '解决冲突' },
+                  { title: 'b', instructions: '写 b.txt' },
+                ],
+              })}\n\`\`\``,
+            };
+          }
+          resolve(ctx.input.workdir);
+          // Meanwhile main gets GitHub's commit without the Run (the Master merged it, say).
+          git(repoDir, 'merge', '-q', '--no-edit', '-X', 'ours', remote);
+          mainHead = git(repoDir, 'rev-parse', 'main');
+          return done();
+        },
+        reviewer: () => review(),
+      },
+    });
+    const run = mergeRun(remote);
+    await h.waitStatus(run.id, 'completed');
+    expect(eventsOf(run.id, 'run.merge_remote_obsolete').map((e) => e.data)).toEqual([
+      { remote, target: 'main', targetHead: mainHead, stageId: 'implement' },
+    ]);
+    // The plan and step a ran; step b did not start, nor did the review.
+    expect(coderCalls()).toHaveLength(2);
+    expect(h.fake.calls.filter((c) => c.model === 'reviewer')).toEqual([]);
+    const store = h.master.store;
+    expect(store.listRunTasks(run.id).map((t) => [t.title, t.status])).toEqual([
+      [expect.any(String), 'passed'],
+      ['a', 'passed'],
+      ['b', 'cancelled'],
+    ]);
+    // The round is over: not shown as still executing, and with its end.
+    const rounds = store.listStageRuns(run.id);
+    expect(rounds.map((s) => [s.stageId, s.round, s.status])).toEqual([['implement', 1, 'passed']]);
+    expect(rounds[0]?.endedAt).toBeTruthy();
+    expect(eventsOf(run.id, 'stage.passed')).toEqual([]);
+    expect(git(repoDir, 'rev-parse', 'main')).toBe(mainHead);
   });
 
   it('ends the Run with an error saying so when the commit is not in the repo', async () => {
