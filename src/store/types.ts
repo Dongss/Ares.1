@@ -336,12 +336,24 @@ export type DiscussionEntry = AssessmentEntry | ReplyEntry | ReplyTimeoutEntry;
  */
 export type ScoutStatus = 'running' | 'completed' | 'failed' | 'interrupted' | 'rate_limited';
 
+/**
+ * Which lead of the scout a proposal follows. problem: something that stops the system or makes
+ * it spin without progress (lead 1); gap: a capability the gap analysis found missing (lead 2);
+ * defect: an obvious bug, a gap in tests, documents and code that disagree (lead 3). Review
+ * suggestions and polish are no proposals of their own: an iteration's closing step gathers them.
+ * Part of the protocol (the scout's output), the same in every language.
+ */
+export const SCOUT_LEADS = ['problem', 'gap', 'defect'] as const;
+export type ScoutLead = (typeof SCOUT_LEADS)[number];
+
 /** One issue proposed by a scout. */
 export interface ScoutProposal {
   title: string;
   category: 'bug' | 'feature' | 'improvement' | 'docs' | 'test' | 'refactor';
   size: 'S' | 'M' | 'L';
   risk: 'low' | 'mid' | 'high';
+  /** The lead it follows; missing in proposals recorded before scouts gave one. */
+  lead?: ScoutLead;
   why: string;
   evidence: string[];
   what: string;

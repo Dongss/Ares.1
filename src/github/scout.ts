@@ -5,9 +5,12 @@ import { brandName } from '../brand.js';
 import {
   type AutoAcceptLimits,
   holdsScout,
+  iterationProgress,
+  MAX_ITERATION_CHILDREN,
   PROPOSAL_SIZES,
   RISKS,
   sizeMeanings,
+  unmetDependencies,
 } from '../config/flow.js';
 import {
   deniedOperations,
@@ -41,17 +44,22 @@ import {
 } from '../engine/times.js';
 import { join, t } from '../i18n.js';
 import type { Store } from '../store/store.js';
-import type {
-  Attempt,
-  CheckResult,
-  EventRow,
-  Proposal,
-  Run,
-  Scout,
-  ScoutGap,
-  ScoutProposal,
-  StageRun,
-  Task,
+import {
+  type Attempt,
+  type CheckResult,
+  type EventRow,
+  type Iteration,
+  type IterationChild,
+  type IterationChildStatus,
+  type IterationStatus,
+  type Proposal,
+  type Run,
+  SCOUT_LEADS,
+  type Scout,
+  type ScoutGap,
+  type ScoutProposal,
+  type StageRun,
+  type Task,
 } from '../store/types.js';
 import type { UpgradeFailure } from '../upgrade/upgrader.js';
 import { executionSlot } from '../util.js';
@@ -66,9 +74,12 @@ import {
 } from './issues.js';
 import { redactForGitHub } from './redact.js';
 
-export const ProposalSchema = z.object({
+const CATEGORIES = ['bug', 'feature', 'improvement', 'docs', 'test', 'refactor'] as const;
+
+/** What every requirement the scout writes is made of: a proposal, or a step of an iteration. */
+const RequirementSchema = z.object({
   title: z.string().trim().min(1).max(120),
-  category: z.enum(['bug', 'feature', 'improvement', 'docs', 'test', 'refactor']),
+  category: z.enum(CATEGORIES),
   size: z.enum(PROPOSAL_SIZES),
   risk: z.enum(RISKS),
   why: z.string().trim().min(1),
@@ -76,6 +87,179 @@ export const ProposalSchema = z.object({
   what: z.string().trim().min(1),
   acceptance: z.array(z.string().trim().min(1)).min(1),
 });
+
+/** A proposal of its own, outside any iteration, with the lead it follows. */
+export const ProposalSchema = RequirementSchema.extend({ lead: z.enum(SCOUT_LEADS) });
+
+/** A number in an iteration's plan or list of criteria, from 1. */
+const NumberSchema = z.number().int().min(1);
+
+/**
+ * One step of a planned iteration: a requirement like a proposal, the completion criteria it
+ * moves forward and the steps it depends on, by their numbers from 1 (a step's number is its
+ * place in the plan); `closeout` marks the closing step that gathers the review suggestions.
+ */
+const PlannedChildSchema = RequirementSchema.extend({
+  criteria: z.array(NumberSchema).default([]),
+  dependsOn: z.array(NumberSchema).default([]),
+  closeout: z.boolean().default(false),
+});
+
+/**
+ * A new iteration as the scout plans it, when the repo has none under way: one larger goal,
+ * what users can do once it is done, how to tell it is, what it leaves out, and its steps in the
+ * order of their dependencies (see planProblems for the rules they follow).
+ */
+const PlannedIterationSchema = z
+  .object({
+    title: z.string().trim().min(1).max(120),
+    goal: z.string().trim().min(1),
+    readmeGoal: z.string().trim().min(1),
+    criteria: z.array(z.string().trim().min(1)).min(1),
+    outOfScope: z.array(z.string().trim().min(1)).default([]),
+    children: z.array(PlannedChildSchema).min(1).max(MAX_ITERATION_CHILDREN),
+  })
+  .superRefine((plan, ctx) => {
+    for (const { path, message } of planProblems(plan)) {
+      ctx.addIssue({ code: 'custom', path, message });
+    }
+  });
+
+/**
+ * A step added to the plan of the iteration under way: numbered after the steps it has, it
+ * depends on steps by their numbers in the plan; `replaces` is the number of the failed step it
+ * takes over from, if any.
+ */
+const IterationAdditionSchema = RequirementSchema.extend({
+  criteria: z.array(NumberSchema).default([]),
+  dependsOn: z.array(NumberSchema).default([]),
+  replaces: NumberSchema.nullish(),
+});
+
+/** A change to the plan of the iteration under way, with why (`note`). */
+const IterationUpdateSchema = z.object({
+  note: z.string().trim().min(1),
+  add: z.array(IterationAdditionSchema).min(1).max(MAX_ITERATION_CHILDREN),
+});
+
+export type PlannedChild = z.infer<typeof PlannedChildSchema>;
+export type PlannedIteration = z.infer<typeof PlannedIterationSchema>;
+export interface IterationAddition
+  extends Omit<z.infer<typeof IterationAdditionSchema>, 'replaces'> {
+  /** The number of the failed or dropped step it replaces; missing when it replaces none. */
+  replaces?: number;
+}
+export interface IterationUpdate {
+  /** Why the plan changes; recorded on the iteration (a comment on its issue on GitHub). */
+  note: string;
+  /** The steps added, numbered after the plan's last one, in this order. */
+  add: IterationAddition[];
+}
+
+/** 「2、3」, numbers of steps or criteria as a list. */
+const numberList = (numbers: readonly number[]) => join(numbers.map(String));
+
+/** A rule of the plan a scout's iteration breaks: where, and what is wrong. */
+interface PlanProblem {
+  path: (string | number)[];
+  message: string;
+}
+
+/**
+ * What is wrong with a planned iteration, empty when nothing: a step may depend only on steps
+ * before it (so a plan never has a cycle) and name only criteria the iteration has; at most one
+ * step closes it out, and that one comes last, after every other step, and is not the only one.
+ * The number of steps is limited by the schema (MAX_ITERATION_CHILDREN).
+ */
+export function planProblems(
+  plan: Pick<PlannedIteration, 'criteria'> & {
+    children: readonly Pick<PlannedChild, 'criteria' | 'dependsOn' | 'closeout'>[];
+  },
+): PlanProblem[] {
+  const problems: PlanProblem[] = [];
+  const children = plan.children;
+  for (const [i, child] of children.entries()) {
+    const position = i + 1;
+    const later = child.dependsOn.filter((n) => n >= position);
+    if (later.length > 0) {
+      problems.push({
+        path: ['children', i, 'dependsOn'],
+        message:
+          position === 1
+            ? t({
+                zh: `第 1 个子项排在最前，不能依赖别的子项（写了 ${numberList(later)}）`,
+                en: `step 1 comes first and cannot depend on other steps (it names ${numberList(later)})`,
+              })
+            : t({
+                zh: `第 ${position} 个子项只能依赖排在它前面的子项（1 到 ${position - 1}），写了 ${numberList(later)}`,
+                en: `step ${position} may depend only on steps before it (1 to ${position - 1}); it names ${numberList(later)}`,
+              }),
+      });
+    }
+    const unknown = child.criteria.filter((n) => n > plan.criteria.length);
+    if (unknown.length > 0) {
+      problems.push({
+        path: ['children', i, 'criteria'],
+        message: t({
+          zh: `完成标准只有 ${plan.criteria.length} 条，第 ${position} 个子项写了 ${numberList(unknown)}`,
+          en: `there ${plan.criteria.length === 1 ? 'is 1 completion criterion' : `are ${plan.criteria.length} completion criteria`}; step ${position} names ${numberList(unknown)}`,
+        }),
+      });
+    }
+  }
+  const closeouts = children.flatMap((c, i) => (c.closeout ? [i] : []));
+  if (closeouts.length > 1) {
+    problems.push({
+      path: ['children'],
+      message: t({
+        zh: `只能有一个收尾子项（closeout 为 true），现在有 ${closeouts.length} 个：第 ${numberList(closeouts.map((i) => i + 1))} 个`,
+        en: `only one step may close the iteration out (closeout true); steps ${numberList(closeouts.map((i) => i + 1))} do`,
+      }),
+    });
+    return problems;
+  }
+  const at = closeouts[0];
+  if (at === undefined) return problems;
+  if (children.length === 1) {
+    problems.push({
+      path: ['children'],
+      message: t({
+        zh: '除了收尾子项，迭代至少还要有一个子项',
+        en: 'an iteration needs at least one step besides the closing one',
+      }),
+    });
+    return problems;
+  }
+  if (at !== children.length - 1) {
+    problems.push({
+      path: ['children', at, 'closeout'],
+      message: t({
+        zh: `收尾子项要排在最后，现在是第 ${at + 1} 个，共 ${children.length} 个`,
+        en: `the closing step must come last; it is step ${at + 1} of ${children.length}`,
+      }),
+    });
+    return problems;
+  }
+  // Reached through the steps it depends on, directly or not: either way it starts last.
+  const reached = new Set<number>();
+  const next = [...(children[at]?.dependsOn ?? [])];
+  for (let n = next.pop(); n !== undefined; n = next.pop()) {
+    if (reached.has(n) || n > at) continue;
+    reached.add(n);
+    next.push(...(children[n - 1]?.dependsOn ?? []));
+  }
+  const missing = children.slice(0, at).flatMap((_, i) => (reached.has(i + 1) ? [] : [i + 1]));
+  if (missing.length > 0) {
+    problems.push({
+      path: ['children', at, 'dependsOn'],
+      message: t({
+        zh: `收尾子项要依赖其余全部子项，还缺 ${numberList(missing)}`,
+        en: `the closing step must depend on every other step; it misses ${numberList(missing)}`,
+      }),
+    });
+  }
+  return problems;
+}
 
 /**
  * A capability the project lacks for one of its README's goals, from the scout's gap analysis.
@@ -92,7 +276,19 @@ export const GapSchema = z.object({
 export const ScoutReportSchema = z.object({
   gaps: z.array(GapSchema),
   proposals: z.array(ProposalSchema),
+  iteration: PlannedIterationSchema.nullish(),
+  iterationUpdate: IterationUpdateSchema.nullish(),
 });
+
+/** The scout's answer as the Master takes it. */
+export interface ScoutReport {
+  proposals: ScoutProposal[];
+  gaps: ScoutGap[];
+  /** A new iteration, planned while the repo has none under way; null for none. */
+  iteration: PlannedIteration | null;
+  /** A change to the plan of the iteration under way; null for none. */
+  iterationUpdate: IterationUpdate | null;
+}
 
 /**
  * 「S：…；M：…；L：…」: what a proposal's size means, the same meanings a requirement assessment
@@ -109,7 +305,7 @@ function sizeDescription(): string {
 export function scoutReportJsonSchema() {
   return {
     type: 'object',
-    required: ['gaps', 'proposals'],
+    required: ['gaps', 'proposals', 'iteration', 'iterationUpdate'],
     additionalProperties: false,
     properties: {
       gaps: {
@@ -150,72 +346,384 @@ export function scoutReportJsonSchema() {
       },
       proposals: {
         type: 'array',
+        description: t({
+          zh: '迭代之外的提案：只放第 1 类问题和第 3 类明显缺陷，有进行中的迭代时只放第 1 类；没有就是空列表',
+          en: 'Proposals outside any iteration: only problems of lead 1 and obvious bugs of lead 3, and only lead 1 while an iteration is under way; an empty list if there are none',
+        }),
         items: {
           type: 'object',
           additionalProperties: false,
-          required: ['title', 'category', 'size', 'risk', 'why', 'evidence', 'what', 'acceptance'],
+          required: [...REQUIREMENT_KEYS, 'lead'],
           properties: {
-            title: {
-              type: 'string',
+            ...requirementProperties(),
+            lead: {
+              enum: [...SCOUT_LEADS],
               description: t({
-                zh: '一句话标题，说清要做什么',
-                en: 'One-line title saying what to do',
+                zh: '它属于哪一类线索：problem 是第 1 类，让系统停转或空耗的问题；gap 是第 2 类，能力缺口（规划进迭代，不单独提）；defect 是第 3 类，明显的缺陷、测试缺口、文档和代码不一致的地方',
+                en: 'The lead it follows: problem is lead 1, something that stops the system or makes it spin without progress; gap is lead 2, a missing capability (planned as an iteration, not proposed on its own); defect is lead 3, an obvious bug, a gap in tests, documents and code that disagree',
               }),
-            },
-            category: { enum: ['bug', 'feature', 'improvement', 'docs', 'test', 'refactor'] },
-            size: {
-              enum: [...PROPOSAL_SIZES],
-              description: sizeDescription(),
-            },
-            risk: { enum: [...RISKS] },
-            why: {
-              type: 'string',
-              description: t({
-                zh: '为什么值得做：现在的问题和做了之后的好处',
-                en: 'Why it is worth doing: the problem now and the benefit once done',
-              }),
-            },
-            evidence: {
-              type: 'array',
-              items: { type: 'string' },
-              description: t({
-                zh: 'Run id、文件:行号、文档中的段落等可以核对的证据；补能力的提案可以是 README 的目标加上限制这个能力的代码位置',
-                en: 'Verifiable evidence: Run ids, file:line, passages of documents; for a proposal that adds a capability, a goal of README together with where the code limits the capability',
-              }),
-            },
-            what: {
-              type: 'string',
-              description: t({
-                zh: '要做什么，写到 Agent 能直接动手的程度；只是一个大能力的第一步时，末尾单独一行写「后续步骤：」，下面列出剩下的步骤',
-                en: 'What to do, detailed enough for an agent to start right away; when it is only the first step of a large capability, end it with a line reading "Next steps:" followed by the remaining steps',
-              }),
-            },
-            acceptance: {
-              type: 'array',
-              items: { type: 'string' },
-              description: t({ zh: '验收标准', en: 'Acceptance criteria' }),
             },
           },
         },
+      },
+      iteration: {
+        description: t({
+          zh: '新迭代：仓库没有进行中的迭代时，围绕差距分析里最重要的一个缺口一次规划好；有进行中的迭代，或者没有值得规划的缺口时为 null',
+          en: 'A new iteration, planned in one go around the most important gap of your gap analysis while the repo has none under way; null while one is under way, or when no gap is worth one',
+        }),
+        anyOf: [
+          {
+            type: 'object',
+            additionalProperties: false,
+            required: ['title', 'goal', 'readmeGoal', 'criteria', 'outOfScope', 'children'],
+            properties: {
+              title: {
+                type: 'string',
+                description: t({
+                  zh: '一句话标题，说清这个迭代做成什么',
+                  en: 'One-line title saying what the iteration achieves',
+                }),
+              },
+              goal: {
+                type: 'string',
+                description: t({
+                  zh: '目标：做完之后，用户能做到以前做不到的什么事，用用户能感知的话写',
+                  en: 'Goal: what users can do once it is done that they could not before, in words users would use',
+                }),
+              },
+              readmeGoal: {
+                type: 'string',
+                description: t({
+                  zh: '它推进的 README.md 目标，一字不差地照抄 README.md 的原文',
+                  en: 'The goal of README.md it advances, copied word for word as README.md writes it',
+                }),
+              },
+              criteria: {
+                type: 'array',
+                items: { type: 'string' },
+                description: t({
+                  zh: '完成标准：怎样算做成了，一条一条写，最好能演示；子项按序号（从 1 起）引用它们',
+                  en: 'Completion criteria: how to tell it is done, one per item, ideally something to demonstrate; steps refer to them by number, from 1',
+                }),
+              },
+              outOfScope: {
+                type: 'array',
+                items: { type: 'string' },
+                description: t({
+                  zh: '不做：有意留在这个迭代之外的事',
+                  en: 'Out of scope: what the iteration leaves out on purpose',
+                }),
+              },
+              children: {
+                type: 'array',
+                description: t({
+                  zh: `计划：按依赖排好的子项，最多 ${MAX_ITERATION_CHILDREN} 个，最后一个是收尾子项；子项按在这里的位置从 1 编号`,
+                  en: `The plan: its steps ordered by their dependencies, at most ${MAX_ITERATION_CHILDREN}, the closing step last; steps are numbered by their place here, from 1`,
+                }),
+                items: {
+                  type: 'object',
+                  additionalProperties: false,
+                  required: [...REQUIREMENT_KEYS, 'criteria', 'dependsOn', 'closeout'],
+                  properties: {
+                    ...requirementProperties(),
+                    criteria: criteriaProperty(),
+                    dependsOn: {
+                      type: 'array',
+                      items: { type: 'integer' },
+                      description: t({
+                        zh: '它依赖的子项的序号，只能是排在它前面的；没有依赖就是空列表',
+                        en: 'The numbers of the steps it depends on, only steps before it; an empty list if none',
+                      }),
+                    },
+                    closeout: {
+                      type: 'boolean',
+                      description: t({
+                        zh: '是不是收尾子项：整理本迭代各 Run 评审通过时留下的建议，排在最后，依赖其余全部子项；只有最后一个子项为 true',
+                        en: "Whether it is the closing step, which goes through the suggestions reviews left when the iteration's Runs passed: it comes last and depends on every other step; true only for the last step",
+                      }),
+                    },
+                  },
+                },
+              },
+            },
+          },
+          { type: 'null' },
+        ],
+      },
+      iterationUpdate: {
+        description: t({
+          zh: '调整进行中的迭代的计划：补上漏掉的子项，或者换个做法替换失败的子项；不用调整，或者没有进行中的迭代时为 null',
+          en: 'A change to the plan of the iteration under way: a step the plan missed, or another approach replacing a step that failed; null when nothing needs to change, or no iteration is under way',
+        }),
+        anyOf: [
+          {
+            type: 'object',
+            additionalProperties: false,
+            required: ['note', 'add'],
+            properties: {
+              note: {
+                type: 'string',
+                description: t({
+                  zh: '为什么这样调整，会记在迭代上',
+                  en: 'Why the plan changes; recorded on the iteration',
+                }),
+              },
+              add: {
+                type: 'array',
+                description: t({
+                  zh: '要追加的子项，序号接在计划里现有的最大序号后面',
+                  en: "The steps to add, numbered on from the plan's highest number",
+                }),
+                items: {
+                  type: 'object',
+                  additionalProperties: false,
+                  required: [...REQUIREMENT_KEYS, 'criteria', 'dependsOn', 'replaces'],
+                  properties: {
+                    ...requirementProperties(),
+                    criteria: criteriaProperty(),
+                    dependsOn: {
+                      type: 'array',
+                      items: { type: 'integer' },
+                      description: t({
+                        zh: '它依赖的子项在计划里的序号，只能是排在它前面的，不能是收尾子项；没有依赖就是空列表',
+                        en: 'The numbers in the plan of the steps it depends on, only steps before it and not the closing step; an empty list if none',
+                      }),
+                    },
+                    replaces: {
+                      description: t({
+                        zh: '它替换的失败（或被关成不做）的子项的序号；不是替换就是 null',
+                        en: 'The number of the step that failed (or was dropped) it replaces; null if it replaces none',
+                      }),
+                      anyOf: [{ type: 'integer' }, { type: 'null' }],
+                    },
+                  },
+                },
+              },
+            },
+          },
+          { type: 'null' },
+        ],
       },
     },
   } as const;
 }
 
-export function parseScoutReport(
-  structured: unknown,
-  finalMessage: string,
-): { proposals: ScoutProposal[]; gaps: ScoutGap[] } {
+/** The fields of every requirement the scout writes, a proposal or a step of an iteration. */
+const REQUIREMENT_KEYS = [
+  'title',
+  'category',
+  'size',
+  'risk',
+  'why',
+  'evidence',
+  'what',
+  'acceptance',
+] as const;
+
+/** JSON schema of the fields of every requirement the scout writes (`REQUIREMENT_KEYS`). */
+function requirementProperties() {
+  return {
+    title: {
+      type: 'string',
+      description: t({
+        zh: '一句话标题，说清要做什么',
+        en: 'One-line title saying what to do',
+      }),
+    },
+    category: { enum: [...CATEGORIES] },
+    size: {
+      enum: [...PROPOSAL_SIZES],
+      description: sizeDescription(),
+    },
+    risk: { enum: [...RISKS] },
+    why: {
+      type: 'string',
+      description: t({
+        zh: '为什么值得做：现在的问题和做了之后的好处',
+        en: 'Why it is worth doing: the problem now and the benefit once done',
+      }),
+    },
+    evidence: {
+      type: 'array',
+      items: { type: 'string' },
+      description: t({
+        zh: 'Run id、文件:行号、文档中的段落等可以核对的证据；补能力的可以是 README 的目标加上限制这个能力的代码位置',
+        en: 'Verifiable evidence: Run ids, file:line, passages of documents; for adding a capability, a goal of README together with where the code limits the capability',
+      }),
+    },
+    what: {
+      type: 'string',
+      description: t({
+        zh: '要做什么，写到 Agent 能直接动手的程度',
+        en: 'What to do, detailed enough for an agent to start right away',
+      }),
+    },
+    acceptance: {
+      type: 'array',
+      items: { type: 'string' },
+      description: t({ zh: '验收标准', en: 'Acceptance criteria' }),
+    },
+  } as const;
+}
+
+/** JSON schema of the completion criteria a step of an iteration moves forward. */
+function criteriaProperty() {
+  return {
+    type: 'array',
+    items: { type: 'integer' },
+    description: t({
+      zh: '它推进迭代的第几条完成标准（序号从 1 起）',
+      en: "Which of the iteration's completion criteria it moves forward, by number from 1",
+    }),
+  } as const;
+}
+
+/** The error of a scout whose result breaks the contract, for `detail`. */
+function contractError(detail: string): Error {
+  return new Error(
+    t({
+      zh: `侦察结果不符合约定：${detail}`,
+      en: `The scout's result does not follow the contract: ${detail}`,
+    }),
+  );
+}
+
+/**
+ * The scout's answer, checked against the contract, a planned iteration's rules included
+ * (`planProblems`); throws when it breaks them. An iteration or update left out counts as null.
+ */
+export function parseScoutReport(structured: unknown, finalMessage: string): ScoutReport {
   const parsed = parseReport(ScoutReportSchema, structured, finalMessage);
-  if (!parsed.ok) {
-    throw new Error(
+  if (!parsed.ok) throw contractError(parsed.error);
+  const { proposals, gaps, iteration, iterationUpdate } = parsed.value;
+  return {
+    proposals,
+    gaps,
+    iteration: iteration ?? null,
+    iterationUpdate: iterationUpdate
+      ? {
+          note: iterationUpdate.note,
+          add: iterationUpdate.add.map(({ replaces, ...step }) =>
+            replaces == null ? step : { ...step, replaces },
+          ),
+        }
+      : null,
+  };
+}
+
+/**
+ * What is wrong with a change to the plan of the iteration under way (`children`, its plan;
+ * `criteria`, how many completion criteria it has), empty when nothing. The steps added are
+ * numbered after the plan's last one, in order; each may depend only on steps before it that are
+ * not the closing one (which waits for the new steps instead), and name only criteria the
+ * iteration has. A step may replace only one of the plan that failed or was dropped and was not
+ * replaced yet, never the closing one, and only once. With the steps added and those replaced
+ * left out, the plan has at most MAX_ITERATION_CHILDREN steps.
+ */
+export function updateProblems(
+  update: IterationUpdate,
+  plan: { criteria: readonly string[]; children: readonly IterationChild[] },
+): string[] {
+  const problems: string[] = [];
+  const byPosition = new Map(plan.children.map((c) => [c.position, c]));
+  const last = Math.max(0, ...plan.children.map((c) => c.position));
+  const replaced = new Set<number>();
+  for (const [i, step] of update.add.entries()) {
+    const position = last + i + 1;
+    const head = t({
+      zh: `追加的第 ${i + 1} 个子项（序号 ${position}）`,
+      en: `added step ${i + 1} (number ${position})`,
+    });
+    const later = step.dependsOn.filter((n) => n >= position);
+    if (later.length > 0) {
+      problems.push(
+        t({
+          zh: `${head}只能依赖排在它前面的子项（1 到 ${position - 1}），写了 ${numberList(later)}`,
+          en: `${head} may depend only on steps before it (1 to ${position - 1}); it names ${numberList(later)}`,
+        }),
+      );
+    }
+    const closing = step.dependsOn.filter((n) => byPosition.get(n)?.closeout);
+    if (closing.length > 0) {
+      problems.push(
+        t({
+          zh: `${head}不能依赖收尾子项 ${numberList(closing)}：收尾子项会等新加的子项做完`,
+          en: `${head} cannot depend on the closing step ${numberList(closing)}: the closing step waits for the steps added`,
+        }),
+      );
+    }
+    const unknown = step.criteria.filter((n) => n > plan.criteria.length);
+    if (unknown.length > 0) {
+      problems.push(
+        t({
+          zh: `完成标准只有 ${plan.criteria.length} 条，${head}写了 ${numberList(unknown)}`,
+          en: `there ${plan.criteria.length === 1 ? 'is 1 completion criterion' : `are ${plan.criteria.length} completion criteria`}; ${head} names ${numberList(unknown)}`,
+        }),
+      );
+    }
+    if (step.replaces === undefined) continue;
+    const old = byPosition.get(step.replaces);
+    const why = !old
+      ? t({ zh: '计划里没有这个序号', en: 'the plan has no such step' })
+      : old.closeout
+        ? t({ zh: '它是收尾子项', en: 'it is the closing step' })
+        : old.replacedBy !== undefined || replaced.has(step.replaces)
+          ? t({ zh: '它已经被换掉了', en: 'it was replaced already' })
+          : old.status !== 'failed' && old.status !== 'dropped'
+            ? t({ zh: '它没有失败，也没有被关成不做', en: 'it neither failed nor was dropped' })
+            : null;
+    if (why) {
+      problems.push(
+        t({
+          zh: `${head}不能替换第 ${step.replaces} 个子项：${why}`,
+          en: `${head} cannot replace step ${step.replaces}: ${why}`,
+        }),
+      );
+    } else {
+      replaced.add(step.replaces);
+    }
+  }
+  const kept = plan.children.filter((c) => c.replacedBy === undefined && !replaced.has(c.position));
+  const total = kept.length + update.add.length;
+  if (total > MAX_ITERATION_CHILDREN) {
+    problems.push(
       t({
-        zh: `侦察结果不符合约定：${parsed.error}`,
-        en: `The scout's result does not follow the contract: ${parsed.error}`,
+        zh: `调整后计划里有 ${total} 个子项，最多 ${MAX_ITERATION_CHILDREN} 个`,
+        en: `the plan would have ${total} steps; at most ${MAX_ITERATION_CHILDREN} are allowed`,
       }),
     );
   }
-  return { proposals: parsed.value.proposals, gaps: parsed.value.gaps };
+  return problems;
+}
+
+/**
+ * The scout's report as the Master takes it, by whether the repo has an iteration under way
+ * (`open`: pending, active or blocked, see ITERATION_OPEN_STATUSES). While one is, no other is
+ * planned and only problems that stop the system are proposed (lead `problem`), so a new
+ * iteration and every other proposal are dropped; a change to its plan must fit the plan
+ * (`updateProblems`), or the report breaks the contract. Without one there is no plan to change,
+ * so a change is dropped. Either way at most `max` proposals are kept (`max_proposals`); the
+ * steps of an iteration do not count toward it.
+ */
+export function keptReport(
+  report: ScoutReport,
+  open: Pick<Iteration, 'criteria' | 'children'> | null,
+  max: number,
+): ScoutReport {
+  if (!open) {
+    return { ...report, proposals: report.proposals.slice(0, max), iterationUpdate: null };
+  }
+  if (report.iterationUpdate) {
+    const problems = updateProblems(report.iterationUpdate, open);
+    if (problems.length > 0) {
+      throw contractError(`iterationUpdate: ${problems.join(t({ zh: '；', en: '; ' }))}`);
+    }
+  }
+  return {
+    ...report,
+    proposals: report.proposals.filter((p) => p.lead === 'problem').slice(0, max),
+    iteration: null,
+  };
 }
 
 const oneLine = (text: string, max: number) => {
@@ -1151,6 +1659,179 @@ export function localProposalDigest(
   ].join('\n\n');
 }
 
+const iterationStatusText = (status: IterationStatus) =>
+  t<Record<IterationStatus, string>>({
+    zh: {
+      pending: '等人采纳',
+      active: '进行中',
+      blocked: '受阻：有子项失败或被关成不做，还没有子项替换它',
+      done: '已完成',
+      cancelled: '不做',
+    },
+    en: {
+      pending: 'waiting for a human to accept it',
+      active: 'under way',
+      blocked: 'blocked: a step failed or was dropped, and no step replaced it yet',
+      done: 'done',
+      cancelled: 'turned down',
+    },
+  })[status];
+
+const childStatusText = (status: IterationChildStatus) =>
+  t<Record<IterationChildStatus, string>>({
+    zh: {
+      planned: '等迭代被采纳',
+      waiting: '等依赖',
+      ready: '可以开工',
+      running: '进行中',
+      done: '已完成',
+      failed: '失败',
+      dropped: '不做',
+    },
+    en: {
+      planned: 'waiting for the iteration to be accepted',
+      waiting: 'waiting for its dependencies',
+      ready: 'ready to start',
+      running: 'in progress',
+      done: 'done',
+      failed: 'failed',
+      dropped: 'dropped',
+    },
+  })[status];
+
+/**
+ * Why a step of an iteration that failed or was dropped did not get done, from its last Run that
+ * says: the Run's error, or the assessment's reason for dropping the requirement. Empty when no
+ * Run says.
+ */
+function childFailureLines(
+  child: IterationChild,
+  runOf: (runId: string) => ProposalRun | undefined,
+) {
+  if (child.status !== 'failed' && child.status !== 'dropped') return [];
+  for (const runId of [...child.runIds].reverse()) {
+    const run = runOf(runId);
+    const dropped = run?.status === 'dropped' ? conclusionOf(run.discussion) : null;
+    if (dropped) {
+      const reason = oneLine(dropped.summary, 300);
+      return [
+        `     ${t({ zh: '需求评估结论为不做，理由', en: 'The assessment dropped it; reason' })}${colon()}${reason}`,
+      ];
+    }
+    if (run?.status === 'failed' && run.error) {
+      return [
+        `     ${t({ zh: '失败原因', en: 'Why it failed' })}${colon()}${oneLine(run.error, 300)}`,
+      ];
+    }
+  }
+  return [];
+}
+
+/**
+ * One step of an iteration in its digest: its number in the plan, its issue (or proposal of the
+ * local backlog) and title, then whether it closes the iteration out, where it stands (for one
+ * waiting, the steps it still waits for), the step that replaced it, the steps it depends on and
+ * the criteria it moves forward, and its Runs with how each stands; why it failed on a line of
+ * its own.
+ */
+function childLines(
+  child: IterationChild,
+  children: readonly IterationChild[],
+  runOf: (runId: string) => ProposalRun | undefined,
+): string[] {
+  const ref = child.issue
+    ? `#${child.issue.number} `
+    : child.proposalId
+      ? `${child.proposalId} `
+      : '';
+  const unmet = child.status === 'waiting' ? unmetDependencies(child, children) : [];
+  const parts = child.closeout ? [t({ zh: '收尾', en: 'closing step' })] : [];
+  parts.push(
+    unmet.length > 0
+      ? t({
+          zh: `还在等 ${numberList(unmet)}`,
+          en: `still waiting for ${numberList(unmet)}`,
+        })
+      : childStatusText(child.status),
+  );
+  if (child.replacedBy !== undefined) {
+    parts.push(t({ zh: `已被 ${child.replacedBy} 替换`, en: `replaced by ${child.replacedBy}` }));
+  }
+  if (child.dependsOn.length > 0) {
+    parts.push(
+      t({
+        zh: `依赖 ${numberList(child.dependsOn)}`,
+        en: `depends on ${numberList(child.dependsOn)}`,
+      }),
+    );
+  }
+  if (child.criteria.length > 0) {
+    parts.push(
+      t({
+        zh: `推进完成标准 ${numberList(child.criteria)}`,
+        en: `advances criteria ${numberList(child.criteria)}`,
+      }),
+    );
+  }
+  if (child.runIds.length > 0) {
+    const runs = child.runIds.map((id) => {
+      const run = runOf(id);
+      return run
+        ? t({ zh: `${id}（${statusText(run.status)}）`, en: `${id} (${statusText(run.status)})` })
+        : id;
+    });
+    parts.push(`Run ${join(runs)}`);
+  }
+  const about = t({ zh: `（${parts.join('；')}）`, en: ` (${parts.join('; ')})` });
+  return [
+    `  ${child.position}. ${ref}${oneLine(child.title, 120)}${about}`,
+    ...childFailureLines(child, runOf),
+  ];
+}
+
+/**
+ * The iteration under way, for the scout's prompt: its title, where it stands, its goal with the
+ * README goal it serves, its completion criteria, what it leaves out, how far it got, each step
+ * by its number in the plan (see childLines) and the changes scouts made to the plan so far.
+ * `runOf` gives what is known of a Run of its steps, undefined when nothing is. Every part of it
+ * was written by a scout of the Master, so all of it is trusted.
+ */
+export function iterationDigest(
+  iteration: Iteration,
+  runOf: (runId: string) => ProposalRun | undefined,
+): string {
+  const progress = iterationProgress(iteration.children);
+  const number = iteration.issue?.number;
+  const issue = number ? t({ zh: `（#${number}）`, en: ` (#${number})` }) : '';
+  const none = t({ zh: '（没有写）', en: '(none given)' });
+  const lines = [
+    `- ${t({ zh: '标题', en: 'Title' })}${colon()}${oneLine(iteration.title, 120)}${issue}`,
+    `- ${t({ zh: '状态', en: 'Status' })}${colon()}${iterationStatusText(iteration.status)}`,
+    `- ${t({ zh: '目标', en: 'Goal' })}${colon()}${oneLine(iteration.goal, 500)}`,
+    `- ${t({ zh: '对应 README 的目标', en: 'README goal it serves' })}${colon()}${oneLine(iteration.readmeGoal, 300)}`,
+    `- ${t({ zh: '完成标准：', en: 'Completion criteria:' })}`,
+    ...iteration.criteria.map((c, i) => `  ${i + 1}. ${oneLine(c, 300)}`),
+    `- ${t({ zh: '不做', en: 'Out of scope' })}${colon()}${
+      iteration.outOfScope.length > 0
+        ? join(iteration.outOfScope.map((o) => oneLine(o, 200)))
+        : none
+    }`,
+    `- ${t({
+      zh: `进度：完成 ${progress.done} 个子项，共 ${progress.total} 个`,
+      en: `Progress: ${progress.done} of ${progress.total} step${progress.total === 1 ? '' : 's'} done`,
+    })}`,
+    `- ${t({ zh: '子项（按计划里的序号）：', en: 'Steps (by their numbers in the plan):' })}`,
+    ...iteration.children.flatMap((child) => childLines(child, iteration.children, runOf)),
+  ];
+  if (iteration.notes.length > 0) {
+    lines.push(`- ${t({ zh: '计划的调整：', en: 'Changes to the plan:' })}`);
+    for (const note of iteration.notes) {
+      lines.push(`  - ${note.at.slice(0, 10)}${colon()}${oneLine(note.text, 300)}`);
+    }
+  }
+  return lines.join('\n');
+}
+
 /**
  * The goal of a Run created from a local proposal: its title, then why, the evidence, what to do
  * and the acceptance criteria, as the issue of a proposal reads (`proposalSections`).
@@ -1206,27 +1887,65 @@ interface ScoutPromptInput {
   repoName: string;
   /** Where proposals go and the requirements there are come from; github when omitted. */
   source?: ScoutSource;
+  /** At most this many proposals outside an iteration (`max_proposals`). */
   max: number;
   runs: string;
   /** The requirements there are: `issueDigest` on GitHub, `localProposalDigest` otherwise. */
   issues: string;
   /**
    * Whether the repo's template splits an L requirement into steps done in one Run
-   * (`templateSplits`). Then a capability one Run finishes that way is one proposal of size L,
-   * not several issues; without it, large capabilities are split into issues as before.
+   * (`templateSplits`). Then what one Run finishes that way is one step of an iteration of size
+   * L, not several; without it, steps are kept to S or M where they can be.
    */
   splits: boolean;
-  /** Whether size L proposals within `max_risk` are accepted without a human (`autoAcceptsL`). */
+  /**
+   * Whether an iteration with a step of size L is accepted without a human when its risk is
+   * within `max_risk` (`autoAcceptsL`): auto-accept judges an iteration as a whole.
+   */
   autoAcceptsL: boolean;
   /**
    * The Master's last failed upgrade, given only to the scout of the Master's own repo while no
    * upgrade has succeeded since.
    */
   upgrade?: UpgradeFailure | null;
+  /**
+   * The repo's iteration under way, pending, active or blocked (`iterationDigest`); null or
+   * missing while it has none. Without one, the scout's main output is a new iteration, besides
+   * proposals of problems and obvious bugs; with one, it plans no other, proposes only problems
+   * that stop the system, and judges whether the plan needs to change.
+   */
+  iteration?: string | null;
 }
 
+/**
+ * The scout's prompt, in the language in use. Both languages are built from the same sections in
+ * the same order, so they say the same; which sections there are depends on whether the repo has
+ * an iteration under way (`iteration`).
+ */
 export function scoutPrompt(input: ScoutPromptInput): string {
-  return t({ zh: scoutPromptZh, en: scoutPromptEn })(input, input.source ?? 'github');
+  const source = input.source ?? 'github';
+  const sections = input.iteration
+    ? [
+        followingIntro(input, source),
+        directionSection(),
+        gapSection(source),
+        openIterationSection(input.iteration),
+        followingLeads(input),
+        changingPlanSection(source),
+        followingProposals(input),
+        requirementsSection(source),
+      ]
+    : [
+        planningIntro(input, source),
+        directionSection(),
+        gapSection(source),
+        planningLeads(input),
+        planningSection(input, source),
+        planningProposals(input),
+        requirementsSection(source),
+      ];
+  const runs = t({ zh: '## 最近的 Run', en: '## Recent Runs' });
+  return `${sections.join('\n\n')}\n\n${upgradeSection(input.upgrade, source)}${runs}\n${input.runs}\n\n${existingHeading(source)}\n${input.issues}\n`;
 }
 
 /** `text` as a Markdown code block, fenced with more backticks than any run of them inside. */
@@ -1319,84 +2038,41 @@ function upgradeLead(failure: UpgradeFailure | null | undefined): string {
 /** A part of a Run's time, named as the dashboard and the Run summaries name it. */
 const part = (p: RunTimePart) => runTimePartLabels()[p];
 
-/** Whether size L proposals are accepted automatically or wait for a human, as one sentence. */
-function autoAcceptLNote(autoAcceptsL: boolean): string {
-  return autoAcceptsL
+/**
+ * How auto-accept judges an iteration, as a whole by the highest risk and the largest size of its
+ * steps, and whether a step of size L keeps it from being accepted automatically.
+ */
+function autoAcceptText(autoAcceptsL: boolean): string {
+  const whole = t({
+    zh: '迭代按整体自动采纳：取子项里最高的风险和最大的大小，和自动采纳的设置比较。',
+    en: 'Auto-accept judges an iteration as a whole, by the highest risk and the largest size among its steps.',
+  });
+  const l = autoAcceptsL
     ? t({
-        zh: '风险在自动采纳范围内的 L 提案也会被自动采纳。',
-        en: 'Proposals of size L are accepted automatically too when their risk is within what auto-accept takes.',
+        zh: '风险在自动采纳范围内时，有 L 子项的迭代也会被自动采纳。',
+        en: 'An iteration with steps of size L is accepted automatically too when its risk is within what auto-accept takes.',
       })
     : t({
-        zh: 'L 的提案不会被自动采纳，要等人处理。',
-        en: 'Proposals of size L are not accepted automatically: they wait for a human.',
+        zh: '有一个子项是 L，整个迭代就不会被自动采纳，要等人采纳。',
+        en: 'A single step of size L keeps the whole iteration from being accepted automatically: it waits for a human.',
       });
-}
-
-/** What makes a step of a large capability worth an issue of its own. */
-function stepRule(): string {
-  return t({
-    zh: '每一步都能单独合并，合并后系统照常可用，并且实际推进了这个能力，不能只是空壳（比如只加了配置项、类型或接口，却没有实际行为）。',
-    en: 'Each step must be mergeable on its own, leave the system working as usual once merged, and actually advance the capability, not be an empty shell (for example a config option, a type or an interface without any real behavior).',
-  });
+  return t({ zh: `${whole}${l}`, en: `${whole} ${l}` });
 }
 
 /**
- * The start of the section on splitting a large capability: whether the repo's template splits
- * an L requirement in one Run, whether L is accepted automatically, and when to split a capability
- * into several issues. A template that splits finishes in one Run what would otherwise take
- * several issues, each with its own assessment, review, merge and upgrade, so a capability is
- * split into issues only when one Run cannot finish it or its first steps are worth merging alone.
+ * How large a step of an iteration is, by whether the repo's template splits an L requirement in
+ * one Run: then what one Run finishes that way is one step of size L, since every extra step costs
+ * its own assessment, review, merge and upgrade; otherwise steps are kept to S or M.
  */
-function splitIntro(input: ScoutPromptInput): string {
-  const note = autoAcceptLNote(input.autoAcceptsL);
-  const source = input.source ?? 'github';
-  if (input.splits) {
-    const items = severalItems(source);
-    const extra = t({
-      zh: source === 'local' ? '每多一条提案' : '每多一个 issue',
-      en: source === 'local' ? 'every extra proposal' : 'every extra issue',
-    });
-    return t({
-      zh: `这个仓库用的模板能拆分大需求：size 为 L 的需求，在编码阶段会先拆成几步，再一步一步做、一步一步检查，一个 Run 就能做完。${note}
-- 一个能力一个 Run 拆成几步能做完的，作为一条提案，size 标 L，不要拆成${items}：${extra}，就多一轮评估、评审、合并和升级。
-- 只有一个 Run 拆了也做不完，或者前面几步单独合并就有价值时，才把它拆成有先后的${items}。${stepRule()}这次只提第一步，第一步也可以是 L。`,
-      en: `The template this repo uses can split large requirements: a requirement of size L is first split into steps in the coding stage, then done and checked step by step, all in one Run. ${note}
-- When one Run can finish a capability by splitting it into steps, make it one proposal of size L; do not split it into several ${items}: ${extra} costs another round of assessment, review, merge and upgrade.
-- Only when one Run cannot finish it even split up, or when its first steps are worth merging on their own, split it into several ${items} in order. ${stepRule()} Propose only the first step now; it may be of size L too.`,
-    });
-  }
-  return t({
-    zh: `这个仓库用的模板不拆分需求：每条需求都整个交给一个 Run 一次做完。${note}
-一个能力一个 Run 做不完时，把它拆成有先后的几步。${stepRule()}
-- 这次只提第一步，size 尽量是 S 或 M。`,
-    en: `The template this repo uses does not split requirements: each one goes to one Run as a whole, done in one go. ${note}
-When a capability is too much for one Run, split it into steps in order. ${stepRule()}
-- Propose only the first step now, preferably of size S or M.`,
-  });
-}
-
-/**
- * 「几个 issue」, what a large capability is split into when one Run cannot finish it: issues, or
- * proposals of the local backlog. In English the plural noun alone.
- */
-function severalItems(source: ScoutSource): string {
-  return t({
-    zh: source === 'local' ? '几条提案' : '几个 issue',
-    en: source === 'local' ? 'proposals' : 'issues',
-  });
-}
-
-/** The requirement on how large a proposal is, by whether the repo's template splits. */
-function sizeRequirement(splits: boolean, source: ScoutSource): string {
-  const items = severalItems(source);
+function stepSizeText(splits: boolean): string {
   return splits
     ? t({
-        zh: `每条要能独立完成、独立合并，一个 Run 能做完。一个 Run 拆成几步能做完的能力，作为一条提案、size 标 L，不要拆成${items}；什么时候才拆成${items}，见上面「拆一个大能力」。`,
-        en: `Each proposal must be doable and mergeable on its own, within one Run. A capability one Run can finish by splitting it into steps is one proposal of size L, not several ${items}; when to split it into ${items} anyway is described in "Splitting a large capability".`,
+        zh: '这个仓库用的模板能拆分大需求：size 为 L 的需求，在编码阶段会先拆成几步，再一步一步做、一步一步检查，一个 Run 就能做完。一个 Run 这样能做完的，作为一个子项，size 标 L，不要拆成几个子项：每多一个子项，就多一轮评估、评审、合并和升级。',
+        en: 'The template this repo uses can split large requirements: a requirement of size L is broken down in the coding stage, then done and checked piece by piece, all in one Run. What one Run can finish that way is one step of size L; do not make several steps of it: every extra step costs another round of assessment, review, merge and upgrade.',
       })
     : t({
-        zh: '每条要能独立完成、独立合并，一个 Run 能做完。太大的按上面「拆一个大能力」的做法拆开，只提第一步；那样也拆不开的，才把 size 标为 L。',
-        en: 'Each proposal must be doable and mergeable on its own, within one Run. Split anything too large as described in "Splitting a large capability" and propose only its first step; only if it cannot be split even that way, set its size to L.',
+        zh: '这个仓库用的模板不拆分需求：每个子项都整个交给一个 Run 一次做完，size 尽量是 S 或 M；一个 Run 做不完的，拆成有先后的几个子项。',
+        en: 'The template this repo uses does not split requirements: each step goes to one Run as a whole, done in one go, so keep steps to size S or M where you can; split what one Run cannot finish into several steps in order.',
       });
 }
 
@@ -1430,49 +2106,59 @@ function coveredGapsText(source: ScoutSource): string {
       });
 }
 
-/** What a review suggestion is checked against besides the code, within lead 4. */
-function coveredCheck(source: ScoutSource): string {
+/** What becomes of an iteration. */
+function iterationFate(source: ScoutSource): string {
   return source === 'local'
-    ? t({ zh: '是否已经有提案覆盖', en: 'that no existing proposal covers it' })
-    : t({ zh: '是否已经有 issue 覆盖', en: 'that no existing issue covers it' });
+    ? t({
+        zh: '迭代会存进 Master 的本地提案池，它的每个子项各成为一条提案；迭代在看板上整个一起采纳（或按自动采纳的设置采纳），子项按依赖顺序开工，全部完成后 Master 写一份总结。',
+        en: "An iteration goes into the Master's local backlog, each of its steps as a proposal of its own; it is accepted as a whole on the dashboard (or under the auto-accept setting), its steps start in the order of their dependencies, and once all of them are done the Master writes a summary.",
+      })
+    : t({
+        zh: '迭代会成为一个 GitHub issue，写明目标、完成标准、计划和不做的事，它的每个子项各成为一个 issue；迭代整个一起采纳，子项按依赖顺序开工，全部完成后 Master 发一份总结。',
+        en: 'An iteration becomes a GitHub issue stating its goal, completion criteria, plan and what it leaves out, and each of its steps becomes an issue of its own; the iteration is accepted as a whole, its steps start in the order of their dependencies, and once all of them are done the Master posts a summary.',
+      });
 }
 
-/** What to do about a gap some requirement already works on, in the mix of proposals. */
+/** Where the reason for a change to an iteration's plan ends up. */
+function noteFate(source: ScoutSource): string {
+  return source === 'local'
+    ? t({
+        zh: '会记在迭代上，在看板上能看到。',
+        en: 'it is recorded on the iteration, where the dashboard shows it.',
+      })
+    : t({
+        zh: '会作为评论发在迭代的 issue 上。',
+        en: "it is posted as a comment on the iteration's issue.",
+      });
+}
+
+/** What to do about a gap some requirement already works on, when choosing the iteration's. */
 function takenGapText(source: ScoutSource): string {
   return source === 'local'
     ? t({
-        zh: '缺口已经有提案在做（还在等人决定，或已采纳、Run 还没完成）时，换一个缺口；只有那条提案覆盖面很大、还在等人决定时，才提它能独立合并的第一步（见下面「拆一个大能力」里等人决定的大提案那一条）。',
-        en: 'When a proposal already works on a gap (still waiting for a human, or accepted with its Run not completed yet), take another gap; only when that proposal covers a lot and is still waiting for a human, propose a first step of it that can be merged on its own (see the point on large proposals waiting for a human in "Splitting a large capability" below).',
+        zh: '缺口已经有提案在做（还在等人决定，或已采纳、Run 还没完成）时，换一个缺口；那条提案覆盖面很大、没有拆过、还在等人决定时，可以围绕它规划迭代，在相关子项的 why 里注明对应哪条提案（写上它的 id），这不算重复。',
+        en: 'When a proposal already works on a gap (still waiting for a human, or accepted with its Run not completed yet), take another gap; when that proposal covers a lot, was never split and is still waiting for a human, you may plan the iteration around it, saying in the why of the steps concerned which proposal they stand for (with its id); that is not a duplicate.',
       })
     : t({
-        zh: '缺口已经有未关闭的 issue 在做时，换一个缺口；只有那个 issue 覆盖面很大、还在等人采纳时，才提它能独立合并的第一步（见下面「拆一个大能力」里等人采纳的大 issue 那一条）。',
-        en: 'When an open issue already works on a gap, take another gap; only when that issue covers a lot and is still waiting for a human to accept it, propose a first step of it that can be merged on its own (see the point on large issues waiting for a human in "Splitting a large capability" below).',
+        zh: '缺口已经有未关闭的 issue 在做时，换一个缺口；那个 issue 覆盖面很大、没有拆过、还在等人采纳时，可以围绕它规划迭代，在相关子项的 why 里注明对应哪条 issue，这不算重复。',
+        en: 'When an open issue already works on a gap, take another gap; when that issue covers a lot, was never split and is still waiting for a human to accept it, you may plan the iteration around it, saying in the why of the steps concerned which issue they stand for; that is not a duplicate.',
       });
 }
 
-/** Going on with the next step of a requirement whose step was merged, and not before. */
-function followUpText(source: ScoutSource): string {
+/**
+ * The next steps earlier scouts left when they split a large capability into a series of
+ * requirements: material for planning an iteration once the step before them was merged, no
+ * longer the next single proposal, and not to plan with before.
+ */
+function nextStepsText(source: ScoutSource): string {
   return source === 'local'
     ? t({
-        zh: '- 下面已有的本地提案里，列着「后续步骤」、而且已采纳、Run 已完成（前一步已经合并）的，优先考虑提它的下一步：在 why 里写明接着哪条提案（写上它的 id），what 末尾的「后续步骤」只列还剩下的步骤。列着「后续步骤」、但还在等人决定或 Run 还没完成的提案，说明这一步还没合并，不要提它后面的步骤。',
-        en: '- Among the existing local proposals below, when a proposal lists "Next steps", was accepted and its Run completed (its step was merged), consider its next step first: say in why which proposal it follows (with its id), and list only the steps still left under "Next steps" at the end of what. A proposal listing "Next steps" that still waits for a human, or whose Run has not completed, has its step not merged yet: do not propose the steps after it.',
+        zh: '- 下面已有的本地提案里列着「后续步骤」的，是以前把一个大能力拆成一串提案时留下的剩余步骤。已采纳、Run 已完成的提案的后续步骤，可以当作规划迭代的素材：把剩下的步骤作为一个迭代重新设计，不要再提接着某条提案往下做的单条提案。还在等人决定或 Run 还没完成的提案列着的后续步骤，要等它合并后才能做，不要拿来规划。',
+        en: '- Among the existing local proposals below, those listing "Next steps" hold what is left of a large capability once split into a series of proposals. The next steps of a proposal that was accepted and whose Run completed are material for planning an iteration: design what is left anew as one iteration, and no longer propose single proposals that follow on from one. The next steps of a proposal still waiting for a human, or whose Run has not completed, can only be done once it is merged: do not plan with them.',
       })
     : t({
-        zh: '- 下面已有的 issue 里，列着「后续步骤」、而且已完成（前一步已经合并）的，优先考虑提它的下一步：在 why 里写明接着哪条 issue，what 末尾的「后续步骤」只列还剩下的步骤。已经拆好、列着「后续步骤」但还没关闭的 issue，说明这一步正在做、还没合并，不要提它后面的步骤。',
-        en: '- Among the existing issues below, when an issue lists "Next steps" and is done (its step was merged), consider its next step first: say in why which issue it follows, and list only the steps still left under "Next steps" at the end of what. An issue already split up, listing "Next steps" and still open, has its step in progress and not merged yet: do not propose the steps after it.',
-      });
-}
-
-/** Proposing the first step of a large requirement still waiting for a human. */
-function largeWaitingText(source: ScoutSource): string {
-  return source === 'local'
-    ? t({
-        zh: '- 这和还在等人决定的大提案不同：已有的提案覆盖的能力太大、没有拆过、一直在等人决定的，可以提它能独立合并的第一步，在 why 里注明对应哪条提案（写上它的 id），这不算重复。',
-        en: '- A large proposal still waiting for a human is different: when an existing proposal covers a capability too large to have been taken up, was never split, and still waits for a human, you may propose a first step of it that can be merged on its own, saying in why which proposal it belongs to (with its id); that is not a duplicate.',
-      })
-    : t({
-        zh: '- 这和还在等人采纳的大 issue 不同：已有的 issue 覆盖的能力太大、没有拆过、一直没人做的（比如还在等人采纳的大提案），可以提它能独立合并的第一步，在 why 里注明对应哪条 issue，这不算重复。',
-        en: '- A large issue still waiting for a human is different: when an existing issue covers a capability too large to have been taken up, was never split, and nobody has worked on it (such as a large proposal still waiting for a human), you may propose a first step of it that can be merged on its own, saying in why which issue it belongs to; that is not a duplicate.',
+        zh: '- 下面已有的 issue 里列着「后续步骤」的，是以前把一个大能力拆成一串 issue 时留下的剩余步骤。已完成的 issue 的后续步骤，可以当作规划迭代的素材：把剩下的步骤作为一个迭代重新设计，不要再提「接着 #X」式的单条提案。还没关闭的 issue 列着的后续步骤，要等它合并后才能做，不要拿来规划。',
+        en: '- Among the existing issues below, those listing "Next steps" hold what is left of a large capability once split into a series of issues. The next steps of a done issue are material for planning an iteration: design what is left anew as one iteration, and no longer propose single "follows #X" proposals. The next steps of an issue still open can only be done once it is merged: do not plan with them.',
       });
 }
 
@@ -1509,100 +2195,204 @@ function existingHeading(source: ScoutSource): string {
     : t({ zh: '## 已有的 issue', en: '## Existing issues' });
 }
 
-const scoutPromptZh = (input: ScoutPromptInput, source: ScoutSource) =>
-  `你是${brandName()}的「侦察」：为仓库 ${input.repoName} 找出接下来最值得做的事，写成需求提案。${proposalFate(source)}你只能读代码和文档，不能修改任何文件。
+// The sections of the scout's prompt, each in the language in use. Without an iteration under
+// way: planning intro, direction, gap analysis, leads, planning an iteration, proposals outside
+// it, requirements. With one: following intro, direction, gap analysis, the iteration under way,
+// the lead left, changing the plan, proposals, requirements.
 
-## 先弄清方向
+/** The intro while the repo has no iteration under way: its main output is a new one. */
+function planningIntro(input: ScoutPromptInput, source: ScoutSource): string {
+  return t({
+    zh: `你是${brandName()}的「侦察」：为仓库 ${input.repoName} 找出接下来最值得做的事。这次的主要产出是一个「迭代」：围绕一个完整的大目标，一次规划好、成批交付的一组需求，做完之后人能看出这一轮做成了什么。${iterationFate(source)}另外，需要马上处理的问题写成单独的提案。${proposalFate(source)}你只能读代码和文档，不能修改任何文件。`,
+    en: `You are the scout of ${brandName()}: find what is most worth doing next in the repo ${input.repoName}. Your main output this time is an iteration: a set of requirements around one complete, larger goal, planned in one go and delivered together, so that once it is done people can see what the round achieved. ${iterationFate(source)} Besides, problems that need attention right away become proposals of their own. ${proposalFate(source)} You may only read code and documents; you must not change any file.`,
+  });
+}
+
+/** The intro while the repo has an iteration under way: no other, only problems and its plan. */
+function followingIntro(input: ScoutPromptInput, source: ScoutSource): string {
+  return t({
+    zh: `你是${brandName()}的「侦察」：为仓库 ${input.repoName} 找出接下来最值得做的事。这个仓库有一个进行中的迭代（见下面「进行中的迭代」），它结束之前不规划新的迭代，也不提迭代之外的能力需求。这次只做两件事：把让系统停转或空耗的问题写成提案；判断迭代的计划要不要调整。差距分析照常做，留给下一个迭代用。${proposalFate(source)}你只能读代码和文档，不能修改任何文件。`,
+    en: `You are the scout of ${brandName()}: find what is most worth doing next in the repo ${input.repoName}. The repo has an iteration under way (see "The iteration under way" below): until it is over, no other iteration is planned and no capability outside it is proposed. This time you do two things only: propose the problems that stop the system or make it spin without progress, and judge whether the iteration's plan needs to change. Do the gap analysis as usual, for the next iteration. ${proposalFate(source)} You may only read code and documents; you must not change any file.`,
+  });
+}
+
+function directionSection(): string {
+  return t({
+    zh: `## 先弄清方向
 - 读 README.md 和 AGENTS.md（有 CLAUDE.md 的也读）。README.md 写着项目的目标，是一切决定的依据；AGENTS.md 写着目录结构、命令和约定。
-- 提案要服务于 README.md 里的目标，不提和目标无关或背离目标的事。
+- 迭代和提案都要服务于 README.md 里的目标，不提和目标无关或背离目标的事。`,
+    en: `## First, get the direction
+- Read README.md and AGENTS.md (and CLAUDE.md if there is one). README.md states the project's goals and is the basis for every decision. AGENTS.md describes the layout, commands and conventions.
+- Iterations and proposals must serve the goals in README.md; do not propose anything unrelated to them or against them.`,
+  });
+}
 
-## 先做差距分析
-提案之前，先按 README.md 的原文列出它写的目标（只用来对照，不写进结果），再对照其中的每个目标，在能力层面列出这个项目现在还做不到什么，写进结果的 gaps。要看的是缺了哪些能力，不是零碎的缺陷：比如能对接哪些外部工具和服务、能做多大的任务、能不能并行、能服务什么样的用户、场景和需求来源、出了问题能不能自己恢复。代码里定义了却没有实现的选项、只支持一种情况的地方、写死的上限，往往就是缺口。
+function gapSection(source: ScoutSource): string {
+  return t({
+    zh: `## 先做差距分析
+规划和提案之前，先按 README.md 的原文列出它写的目标（只用来对照，不写进结果），再对照其中的每个目标，在能力层面列出这个项目现在还做不到什么，写进结果的 gaps。要看的是缺了哪些能力，不是零碎的缺陷：比如能对接哪些外部工具和服务、能做多大的任务、能不能并行、能服务什么样的用户、场景和需求来源、出了问题能不能自己恢复。代码里定义了却没有实现的选项、只支持一种情况的地方、写死的上限，往往就是缺口。
 - 每个缺口写明：goal 是上面列出的哪个目标，一字不差地照抄 README.md 里这个目标的原文，同一个目标在每个缺口里写法相同；gap 是缺什么能力，evidence 是限制这个能力的代码位置（文件:行号）或 README、文档里的段落。
 - 最重要的缺口放在最前：越是挡住目标、越多事情依赖它，越重要。${coveredGapsText(source)}
-- 认真对照每个目标后仍然找不到缺口，gaps 才是空列表。
+- 认真对照每个目标后仍然找不到缺口，gaps 才是空列表。`,
+    en: `## First, a gap analysis
+Before planning or proposing anything, list the goals README.md states, in its own words (only to go by, not part of your answer); then go through each of them and list, as capabilities, what the project cannot do yet; put them in the gaps of your answer. Look for missing capabilities, not scattered bugs: for example which outside tools and services it can work with, how large a task it can take on, whether it can do things in parallel, what users, situations and sources of requirements it can serve, and whether it can recover by itself when something goes wrong. Options defined in the code but never implemented, places that support only one case, and hard-coded limits are often gaps.
+- For each gap, give goal: one of the goals you listed, copied word for word as README.md writes it, and written the same way in every gap of that goal; gap: the missing capability; evidence: where the code limits this capability (file:line), or passages of README or other documents.
+- Put the most important gaps first: the more a gap stands in the way of a goal and the more depends on it, the more important it is. ${coveredGapsText(source)}
+- Leave gaps empty only if you find none after carefully going through every goal.`,
+  });
+}
 
-## 线索（按优先级从高到低）
-1. 让系统停转或空耗的问题：下面附的最近 Run 里卡住、失败、反复返工、评审反复提同类意见、费用或 Agent 执行用时异常的${upgradeLead(input.upgrade)}。用时里「${part('stoppedMs')}」「${part('approvalMs')}」「${part('blockedMs')}」「${part('pausedMs')}」的部分是在等人处理，「${part('queuedMs')}」的部分是在等别的 Run 做完（也包括等升级、Master 没运行的时候），「${part('conflictWaitMs')}」和排队一样是在等别的 Run（避开和它改同一处的 Run，免得合并时冲突），都不说明 Agent 慢。摘要开头写着当时的 concurrency.per_repo 和有几个 Run 并行执行过：per_repo 为 1、排队时间远多于 Agent 执行时间、并行带来的错开等待和「并行时合并冲突」又很少时，可以建议人调大 per_repo，并写明依据。per_repo 由用户在自己数据目录的 config.yaml 里设置，不在仓库里：侦察只提建议，不改用户的配置。需求评估提了疑问、需求在讨论后改过或结论为不做，说明这条需求没写清楚或方向有偏差：留意其中的疑问和理由，新提案不要再犯。
-2. 差距分析里最重要的能力缺口。
+/** Lead 1, the problems that stop the system or make it spin without progress. */
+function problemLead(input: ScoutPromptInput): string {
+  return t({
+    zh: `1. 让系统停转或空耗的问题：下面附的最近 Run 里卡住、失败、反复返工、评审反复提同类意见、费用或 Agent 执行用时异常的${upgradeLead(input.upgrade)}。用时里「${part('stoppedMs')}」「${part('approvalMs')}」「${part('blockedMs')}」「${part('pausedMs')}」的部分是在等人处理，「${part('queuedMs')}」的部分是在等别的 Run 做完（也包括等升级、Master 没运行的时候），「${part('conflictWaitMs')}」和排队一样是在等别的 Run（避开和它改同一处的 Run，免得合并时冲突），都不说明 Agent 慢。摘要开头写着当时的 concurrency.per_repo 和有几个 Run 并行执行过：per_repo 为 1、排队时间远多于 Agent 执行时间、并行带来的错开等待和「并行时合并冲突」又很少时，可以建议人调大 per_repo，并写明依据。per_repo 由用户在自己数据目录的 config.yaml 里设置，不在仓库里：侦察只提建议，不改用户的配置。需求评估提了疑问、需求在讨论后改过或结论为不做，说明这条需求没写清楚或方向有偏差：留意其中的疑问和理由，新提案不要再犯。`,
+    en: `1. Problems that stop the system or make it spin without progress: Runs below that got stuck, failed, needed rework again and again, drew the same kind of review comments again and again, or took unusual cost or agent time${upgradeLead(input.upgrade)}. In the times, "${part('stoppedMs')}", "${part('approvalMs')}", "${part('blockedMs')}" and "${part('pausedMs')}" are time spent waiting for a human; "${part('queuedMs')}" is time spent waiting for other Runs to finish (including while an upgrade is pending or the Master is not running), and "${part('conflictWaitMs')}" is waiting for another Run just like the queue (keeping clear of a Run that changes the same place, so that the two do not conflict at the merge): none of these mean the agents were slow. The digest of the Runs opens with concurrency.per_repo at the time and how many Runs executed side by side: when per_repo is 1, the Runs spent far more time queued than executing, and working side by side brought few waits for overlapping Runs and few merge conflicts, you may suggest that a human raise per_repo, giving your grounds. per_repo is set by the user in config.yaml in their own data directory, not in the repo: the scout only suggests it and does not change the user's configuration. When the requirement assessment asked questions, the requirement was revised in the discussion, or the conclusion was to drop it, the requirement was unclear or off course: note the questions and reasons, and do not repeat those mistakes in new proposals.`,
+  });
+}
+
+/** The leads while no iteration is under way: gaps become the iteration, polish no proposal. */
+function planningLeads(input: ScoutPromptInput): string {
+  return t({
+    zh: `## 线索（按优先级从高到低）
+${problemLead(input)}
+2. 差距分析里最重要的能力缺口：规划成迭代（见下面「规划迭代」），不单独提案。
 3. 明显的缺陷和测试缺口，README.md、AGENTS.md 和代码不一致的地方，代码里的 TODO。
-4. 评审建议和对最近改动的修饰：评审通过时给的建议是评审有意留到以后的改进（超出当时目标范围的缺陷、测试缺口、重复代码等），对最近合并的改动还能再修一修的地方也归在这一类。要先到代码里核对它是否仍然存在、${coveredCheck(source)}；相关的几条合成一条提案，不要一条建议提一条。
+4. 评审建议和对最近改动的修饰：不单独提案。评审通过时给的建议是评审有意留到以后的改进，由迭代最后的「收尾」子项统一整理，内容由 Master 在它开工前填入；迭代之外也不为它们单独提案。`,
+    en: `## Leads (highest priority first)
+${problemLead(input)}
+2. The most important capability gaps from your gap analysis: plan them as an iteration (see "Planning an iteration" below), not as proposals of their own.
+3. Obvious bugs and gaps in tests, places where README.md, AGENTS.md and the code disagree, TODOs in the code.
+4. Review suggestions and polish of recent changes: no proposals of their own. The suggestions given by a review that passed are improvements the reviewer left for later on purpose; the closing step at the end of an iteration goes through them all, its content filled in by the Master before it starts. Outside an iteration, do not propose them on their own either.`,
+  });
+}
 
-## 提案的配比
-- 第 1 类问题优先：有就先提；条数上限放不下时，以第 1 类为先。
-- 第 1 类之外，只要差距分析里有缺口，至少有一条提案是补能力的：category 为 feature，补上差距分析里的一个缺口，推进 README.md 的某个目标，而不是对最近改动的修补。${takenGapText(source)}
-- 第 4 类每次最多一条。
+/** The only lead while an iteration is under way: problems, a blocked iteration included. */
+function followingLeads(input: ScoutPromptInput): string {
+  return t({
+    zh: `## 线索
+${problemLead(input)}进行中的迭代受阻（有子项失败或被关成不做）也算这一类：在下面「调整计划」里换个做法重新安排这一步；失败暴露出系统本身的问题时，再为它提一条提案。
+能力缺口、明显的缺陷、评审建议和修饰这次都不提：能力缺口留给下一个迭代，评审建议由迭代的「收尾」子项整理。`,
+    en: `## Leads
+${problemLead(input)} An iteration under way that is blocked (a step failed or was dropped) belongs here too: plan that step again another way under "Changing the plan" below, and when the failure shows a problem of the system itself, propose a fix for that as well.
+Leave capability gaps, obvious bugs, review suggestions and polish alone this time: capability gaps wait for the next iteration, and the iteration's closing step goes through the review suggestions.`,
+  });
+}
 
-## 拆一个大能力
-${splitIntro(input)}
-- what 的末尾单独起一行写「后续步骤：」（不要写成标题），下面按顺序列出剩下的几步，每步一句话，以后的侦察从这里接着往下提。
-${followUpText(source)}
-${largeWaitingText(source)}
+/** How to plan a new iteration, the main output while the repo has none under way. */
+function planningSection(input: ScoutPromptInput, source: ScoutSource): string {
+  const max = MAX_ITERATION_CHILDREN;
+  return t({
+    zh: `## 规划迭代
+仓库现在没有进行中的迭代，这次的主要产出是一个新迭代，写进结果的 iteration：
+- 从差距分析里选最重要的一个缺口，一次把整个迭代设计好。${takenGapText(source)}
+- goal 用用户能感知的话写：做完之后，用户能做到以前做不到的什么事；readmeGoal 是它推进的 README.md 目标，一字不差地照抄原文。
+- criteria 写怎样算做成了，一条一条写，最好每条都能演示；outOfScope 写有意不做的事，划清范围。
+- children 是计划：按依赖排好的子项，数量按需要来，最多 ${max} 个；需要更多就缩小目标，剩下的留给下一个迭代。每个子项像一条提案那样写，另外写明 criteria（它推进第几条完成标准）和 dependsOn（它依赖的子项的序号，只能写排在它前面的）。子项按在 children 里的位置从 1 编号。没有依赖关系的子项会同时开工，所以只写真正的依赖。
+- 每个子项都能单独合并，合并后系统照常可用，并且实际推进了这个迭代，不能只是空壳（比如只加了配置项、类型或接口，却没有实际行为）。
+- ${stepSizeText(input.splits)}
+- 最后一个子项是「收尾」：closeout 为 true，dependsOn 写上其余全部子项，用来整理本迭代各 Run 评审通过时留下的建议。建议的具体内容由 Master 在它开工前填入，what 里说明这一点就行。其余子项的 closeout 都是 false。
+- ${autoAcceptText(input.autoAcceptsL)}
+${nextStepsText(source)}
+- 差距分析里没有值得规划成迭代的缺口时，iteration 写 null。`,
+    en: `## Planning an iteration
+The repo has no iteration under way, so your main output this time is a new one, in iteration of your answer:
+- Take the most important gap from your gap analysis and design the whole iteration in one go. ${takenGapText(source)}
+- Write goal in words users would use: what they can do once it is done that they could not before; readmeGoal is the goal of README.md it advances, copied word for word.
+- In criteria, write how to tell it is done, one per item, ideally each something to demonstrate; in outOfScope, what it leaves out on purpose, to draw its bounds.
+- children is the plan: its steps ordered by their dependencies, as many as it takes, at most ${max}; if it takes more, narrow the goal and leave the rest for the next iteration. Write each step like a proposal, and add criteria (which completion criteria it moves forward) and dependsOn (the numbers of the steps it depends on, only steps before it). Steps are numbered by their place in children, from 1. Steps that do not depend on each other start side by side, so list only real dependencies.
+- Each step must be mergeable on its own, leave the system working as usual once merged, and actually advance the iteration, not be an empty shell (for example a config option, a type or an interface without any real behavior).
+- ${stepSizeText(input.splits)}
+- The last step is the closing step: closeout true, and dependsOn listing every other step; it goes through the suggestions reviews left when the iteration's Runs passed. The Master fills in the suggestions before it starts, so what only needs to say so. Every other step has closeout false.
+- ${autoAcceptText(input.autoAcceptsL)}
+${nextStepsText(source)}
+- If your gap analysis found no gap worth an iteration, set iteration to null.`,
+  });
+}
 
-## 要求
-- 最多 ${input.max} 条，宁缺毋滥；没有值得做的就返回空列表。按上面的优先级和配比排列，同一类里价值高的在前。
-- 每条都要有能核对的证据：Run id、文件:行号、README 或 AGENTS.md 中的段落。补能力的提案不需要有出错的 Run：README.md 里的目标加上限制这个能力的代码位置就是证据。拿不出证据的不要提。
+/** The proposals besides a new iteration: problems and obvious bugs only. */
+function planningProposals(input: ScoutPromptInput): string {
+  return t({
+    zh: `## 迭代之外的提案
+需要马上处理、不能等进迭代的问题写进结果的 proposals，lead 写它属于哪一类线索：
+- 只提第 1 类问题（lead 为 problem）和第 3 类明显的缺陷（lead 为 defect）。第 1 类优先：有就先提；条数上限放不下时，以第 1 类为先。
+- 能力缺口规划进迭代，不单独提案；也不提评审建议和修饰。
+- 最多 ${input.max} 条，宁缺毋滥；没有值得提的就返回空列表。同一类里价值高的在前。
+- 每条要能独立完成、独立合并，一个 Run 能做完。`,
+    en: `## Proposals outside the iteration
+Problems that need attention right away and cannot wait for an iteration go in proposals of your answer, with lead saying which lead each follows:
+- Propose only problems of lead 1 (lead problem) and obvious bugs of lead 3 (lead defect). Lead 1 comes first: propose those before anything else, and when the limit leaves no room for more, they take it.
+- Capability gaps are planned as an iteration, not proposed on their own; do not propose review suggestions or polish either.
+- At most ${input.max}, and only ones that are worth it; return an empty list if nothing is. The more valuable first within each lead.
+- Each proposal must be doable and mergeable on its own, within one Run.`,
+  });
+}
+
+/** The iteration under way, its digest (`iterationDigest`) as the scout reads it. */
+function openIterationSection(digest: string): string {
+  return t({
+    zh: `## 进行中的迭代
+下面是这个仓库进行中的迭代：目标、完成标准、各子项的状态和它们的 Run。子项按计划里的序号列出，调整计划时用这些序号。
+${digest}`,
+    en: `## The iteration under way
+The repo's iteration under way: its goal, completion criteria, and where each step stands with its Runs. Steps are listed by their numbers in the plan; a change to the plan refers to them by these numbers.
+${digest}`,
+  });
+}
+
+/** How to judge whether the plan of the iteration under way changes, and how to change it. */
+function changingPlanSection(source: ScoutSource): string {
+  const max = MAX_ITERATION_CHILDREN;
+  return t({
+    zh: `## 调整计划
+根据已经做完的子项和它们的 Run，判断迭代的计划要不要调整。要调整就写进结果的 iterationUpdate；不用调整就写 null，不要为调整而调整：
+- 有子项失败或被关成不做、迭代因此受阻时，换个做法重新安排这一步：在 add 里写一个新子项，replaces 写被换掉的子项的序号。新做法要针对失败原因（比如拆小、先补上缺的能力、换一种做法），在 why 里说明和上次的不同。
+- 做完的子项暴露出计划漏掉的一步时，在 add 里补上它，replaces 写 null。
+- 新子项接在计划里现有的最大序号后面编号；dependsOn 用计划里的序号，只能写排在它前面的，不要写收尾子项：收尾子项会等新加的子项都做完再开工。criteria 写它推进第几条完成标准。
+- 加上新子项、去掉被换掉的之后，计划里最多 ${max} 个子项。
+- note 写为什么这样调整，${noteFate(source)}`,
+    en: `## Changing the plan
+Judge from the steps done so far and their Runs whether the iteration's plan needs to change. If it does, put the change in iterationUpdate of your answer; otherwise set it to null, and do not change the plan for the sake of it:
+- When a step failed or was dropped and the iteration is blocked by it, plan that step again another way: add a new step in add, with replaces set to the number of the step it replaces. The new approach must address why the old one failed (e.g. split it up, first add a missing capability, do it another way); say in why what is different this time.
+- When the steps done so far show a step the plan missed, add it in add, with replaces set to null.
+- New steps are numbered on from the plan's highest number; dependsOn uses numbers in the plan, only of steps before it, and never the closing step: the closing step waits until the steps added are done. criteria says which completion criteria it moves forward.
+- With the new steps added and the replaced ones left out, the plan has at most ${max} steps.
+- In note, say why the plan changes; ${noteFate(source)}`,
+  });
+}
+
+/** The proposals while an iteration is under way: problems only. */
+function followingProposals(input: ScoutPromptInput): string {
+  return t({
+    zh: `## 提案
+- 写进结果的 proposals 只放第 1 类问题，lead 都是 problem；最多 ${input.max} 条，宁缺毋滥，没有就返回空列表。
+- 迭代进行中不规划新的迭代（iteration 写 null），不提迭代之外的能力需求，也不单独提明显的缺陷、评审建议或修饰：这些都会被丢掉。
+- 每条要能独立完成、独立合并，一个 Run 能做完。`,
+    en: `## Proposals
+- Put only problems of lead 1 in proposals of your answer, each with lead problem; at most ${input.max}, and only ones that are worth it; return an empty list if nothing is.
+- While the iteration is under way, plan no new iteration (set iteration to null), propose no capability outside it, and propose no obvious bugs, review suggestions or polish on their own: all of these are dropped.
+- Each proposal must be doable and mergeable on its own, within one Run.`,
+  });
+}
+
+function requirementsSection(source: ScoutSource): string {
+  return t({
+    zh: `## 要求
+- 子项和提案都要有能核对的证据：Run id、文件:行号、README 或 AGENTS.md 中的段落。补能力的不需要有出错的 Run：README.md 里的目标加上限制这个能力的代码位置就是证据。拿不出证据的不要提。
 ${duplicatesText(source)}
 ${failedRequirementsText(source)}
-- ${sizeRequirement(input.splits, source)}
 - risk 的含义：
   - low：只涉及文档、测试、看板展示，或不改变行为的重构；
   - mid：改变行为，但影响范围清楚；
   - high：涉及数据库迁移、合并或回滚等 git 操作、Agent 权限、配置格式、对外发布，或者改动 .ares1/ 下的文件（仓库自己的开发流程）。
-- 用中文写。不要写本机的绝对路径，也不要写任何个人信息。
-
-${upgradeSection(input.upgrade, source)}## 最近的 Run
-${input.runs}
-
-${existingHeading(source)}
-${input.issues}
-`;
-
-const scoutPromptEn = (input: ScoutPromptInput, source: ScoutSource) =>
-  `You are the scout of ${brandName()}: find what is most worth doing next in the repo ${input.repoName} and write it up as proposals. ${proposalFate(source)} You may only read code and documents; you must not change any file.
-
-## First, get the direction
-- Read README.md and AGENTS.md (and CLAUDE.md if there is one). README.md states the project's goals and is the basis for every decision. AGENTS.md describes the layout, commands and conventions.
-- Proposals must serve the goals in README.md; do not propose anything unrelated to them or against them.
-
-## First, a gap analysis
-Before proposing anything, list the goals README.md states, in its own words (only to go by, not part of your answer); then go through each of them and list, as capabilities, what the project cannot do yet; put them in the gaps of your answer. Look for missing capabilities, not scattered bugs: for example which outside tools and services it can work with, how large a task it can take on, whether it can do things in parallel, what users, situations and sources of requirements it can serve, and whether it can recover by itself when something goes wrong. Options defined in the code but never implemented, places that support only one case, and hard-coded limits are often gaps.
-- For each gap, give goal: one of the goals you listed, copied word for word as README.md writes it, and written the same way in every gap of that goal; gap: the missing capability; evidence: where the code limits this capability (file:line), or passages of README or other documents.
-- Put the most important gaps first: the more a gap stands in the way of a goal and the more depends on it, the more important it is. ${coveredGapsText(source)}
-- Leave gaps empty only if you find none after carefully going through every goal.
-
-## Leads (highest priority first)
-1. Problems that stop the system or make it spin without progress: Runs below that got stuck, failed, needed rework again and again, drew the same kind of review comments again and again, or took unusual cost or agent time${upgradeLead(input.upgrade)}. In the times, "${part('stoppedMs')}", "${part('approvalMs')}", "${part('blockedMs')}" and "${part('pausedMs')}" are time spent waiting for a human; "${part('queuedMs')}" is time spent waiting for other Runs to finish (including while an upgrade is pending or the Master is not running), and "${part('conflictWaitMs')}" is waiting for another Run just like the queue (keeping clear of a Run that changes the same place, so that the two do not conflict at the merge): none of these mean the agents were slow. The digest of the Runs opens with concurrency.per_repo at the time and how many Runs executed side by side: when per_repo is 1, the Runs spent far more time queued than executing, and working side by side brought few waits for overlapping Runs and few merge conflicts, you may suggest that a human raise per_repo, giving your grounds. per_repo is set by the user in config.yaml in their own data directory, not in the repo: the scout only suggests it and does not change the user's configuration. When the requirement assessment asked questions, the requirement was revised in the discussion, or the conclusion was to drop it, the requirement was unclear or off course: note the questions and reasons, and do not repeat those mistakes in new proposals.
-2. The most important capability gaps from your gap analysis.
-3. Obvious bugs and gaps in tests, places where README.md, AGENTS.md and the code disagree, TODOs in the code.
-4. Review suggestions and polish of recent changes: the suggestions given by a review that passed are improvements the reviewer left for later on purpose (bugs beyond the goal of the time, gaps in tests, duplicated code and the like), and whatever could still be touched up in recently merged changes belongs here too. First check in the code that each one is still there and ${coveredCheck(source)}; merge related ones into one proposal rather than proposing each suggestion on its own.
-
-## Mix of proposals
-- Problems of lead 1 come first: propose them before anything else, and when the limit leaves no room for more, they take it.
-- Besides lead 1, as long as your gap analysis found a gap, at least one proposal must add a capability: category feature, closing a gap from your gap analysis and advancing a goal of README.md, not patching a recent change. ${takenGapText(source)}
-- At most one proposal from lead 4 per scout.
-
-## Splitting a large capability
-${splitIntro(input)}
-- End what with a line of its own reading "Next steps:" (not a heading), followed by the remaining steps in order, one sentence each, for later scouts to go on from.
-${followUpText(source)}
-${largeWaitingText(source)}
-
-## Requirements
-- At most ${input.max}, and only ones that are worth it; return an empty list if nothing is. Order them by the priorities and the mix above, the more valuable first within each lead.
-- Every proposal needs verifiable evidence: Run ids, file:line, passages of README or AGENTS.md. A proposal that adds a capability needs no failed Run: a goal in README.md together with where the code limits the capability is evidence. Do not propose anything you cannot back with evidence.
+- 用中文写。不要写本机的绝对路径，也不要写任何个人信息。`,
+    en: `## Requirements
+- Every step and proposal needs verifiable evidence: Run ids, file:line, passages of README or AGENTS.md. Adding a capability needs no failed Run: a goal in README.md together with where the code limits the capability is evidence. Do not propose anything you cannot back with evidence.
 ${duplicatesText(source)}
 ${failedRequirementsText(source)}
-- ${sizeRequirement(input.splits, source)}
 - What risk means:
   - low: only documentation, tests, how the dashboard shows things, or refactoring without behavior change;
   - mid: changes behavior, with a clear scope;
   - high: database migrations, git operations such as merging or rollback, agent permissions, the configuration format, publishing anything outside, or changes to files under .ares1/ (the repo's own development workflow).
-- Write in English. Do not write absolute paths of this machine or any personal information.
-
-${upgradeSection(input.upgrade, source)}## Recent Runs
-${input.runs}
-
-${existingHeading(source)}
-${input.issues}
-`;
+- Write in English. Do not write absolute paths of this machine or any personal information.`,
+  });
+}

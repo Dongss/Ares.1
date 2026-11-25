@@ -2,6 +2,7 @@ import { rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { strictOutputSchema } from '../src/adapters/codex.js';
 import { storedRunTimes } from '../src/engine/times.js';
 import type { GhIssue } from '../src/github/client.js';
 import {
@@ -12,16 +13,31 @@ import {
   RETRIES_EXHAUSTED_MARKER,
 } from '../src/github/issues.js';
 import {
+  type IterationUpdate,
   issueDigest,
+  iterationDigest,
+  keptReport,
   localProposalDigest,
   nextSteps,
   type ProposalRun,
+  parseScoutReport,
   proposalGoal,
   runDigest,
+  type ScoutReport,
   scoutPrompt,
+  scoutReportJsonSchema,
+  updateProblems,
 } from '../src/github/scout.js';
 import { setLang, t } from '../src/i18n.js';
-import type { AssessmentEntry, Proposal, Run, RunStatus } from '../src/store/types.js';
+import type {
+  AssessmentEntry,
+  Iteration,
+  IterationChild,
+  Proposal,
+  Run,
+  RunStatus,
+  ScoutLead,
+} from '../src/store/types.js';
 import type { UpgradeFailure } from '../src/upgrade/upgrader.js';
 import {
   ASSESS_AGENTS_YAML,
@@ -1258,7 +1274,7 @@ describe('scoutPrompt', () => {
   it("sends the scout to README.md's goals, the basis for every decision, and AGENTS.md", () => {
     expect(prompt).toContain('读 README.md 和 AGENTS.md');
     expect(prompt).toContain('README.md 写着项目的目标，是一切决定的依据');
-    expect(prompt).toContain('提案要服务于 README.md 里的目标');
+    expect(prompt).toContain('迭代和提案都要服务于 README.md 里的目标');
     expect(prompt).toContain(
       '先按 README.md 的原文列出它写的目标（只用来对照，不写进结果），再对照其中的每个目标，在能力层面列出这个项目现在还做不到什么',
     );
@@ -1280,13 +1296,16 @@ describe('scoutPrompt', () => {
     expect(prompt).toContain('## 已有的 issue\n（无）');
   });
 
-  it('takes the suggestions of passed reviews as the last leads, to be checked and merged', () => {
+  it('leaves the suggestions of passed reviews to the closing step of an iteration, never a proposal', () => {
     const clue = prompt.split('\n').find((l) => l.startsWith('4. '));
+    expect(clue).toContain('评审建议和对最近改动的修饰：不单独提案');
     expect(clue).toContain('评审通过时给的建议是评审有意留到以后的改进');
-    expect(clue).toContain('对最近合并的改动还能再修一修的地方也归在这一类');
-    expect(clue).toContain('要先到代码里核对它是否仍然存在、是否已经有 issue 覆盖');
-    expect(clue).toContain('相关的几条合成一条提案，不要一条建议提一条');
+    expect(clue).toContain('由迭代最后的「收尾」子项统一整理，内容由 Master 在它开工前填入');
+    expect(clue).toContain('迭代之外也不为它们单独提案');
     expect(prompt.split('\n').find((l) => l.startsWith('1. '))).not.toContain('评审通过时');
+    // No more one polish proposal per scout.
+    expect(prompt).not.toContain('第 4 类每次最多一条');
+    expect(section(prompt, '## 迭代之外的提案')).toContain('也不提评审建议和修饰');
   });
 
   it('counts the time with work switched off as waiting for a human, not the queue', () => {
@@ -1352,56 +1371,101 @@ describe('scoutPrompt', () => {
     );
     // No failed upgrade to fix: not mentioned.
     expect(leads[0]).not.toContain('升级失败');
-    expect(leads[1]).toBe('2. 差距分析里最重要的能力缺口。');
+    expect(leads[1]).toBe(
+      '2. 差距分析里最重要的能力缺口：规划成迭代（见下面「规划迭代」），不单独提案。',
+    );
     expect(leads[2]).toMatch(/^3\. 明显的缺陷和测试缺口/);
     expect(leads[3]).toMatch(/^4\. 评审建议和对最近改动的修饰/);
   });
 
-  it('asks for at least one capability and at most one polish, stopping the system first', () => {
-    const mix = section(prompt, '## 提案的配比');
-    expect(mix).toContain('第 1 类问题优先：有就先提；条数上限放不下时，以第 1 类为先');
-    expect(mix).toContain(
-      '第 1 类之外，只要差距分析里有缺口，至少有一条提案是补能力的：category 为 feature',
-    );
-    expect(mix).toContain('而不是对最近改动的修补');
-    expect(mix).toContain('第 4 类每次最多一条');
-  });
-
-  it('takes another gap when an open issue works on it, unless that issue waits for a human', () => {
-    const mix = section(prompt, '## 提案的配比');
-    expect(mix).toContain(
-      '缺口已经有未关闭的 issue 在做时，换一个缺口；只有那个 issue 覆盖面很大、还在等人采纳时，才提它能独立合并的第一步（见下面「拆一个大能力」里等人采纳的大 issue 那一条）',
-    );
-    // No longer reads as proposing any step of an open issue, against the split section.
-    expect(mix).not.toContain('还没人提的一步');
-    const split = section(prompt, '## 拆一个大能力');
-    expect(split).toContain(
-      '已经拆好、列着「后续步骤」但还没关闭的 issue，说明这一步正在做、还没合并，不要提它后面的步骤',
-    );
-    expect(split).toContain(
-      '这和还在等人采纳的大 issue 不同：已有的 issue 覆盖的能力太大、没有拆过、一直没人做的',
-    );
-  });
-
-  it('splits a large capability into steps, proposing the first and listing the rest', () => {
-    const split = section(prompt, '## 拆一个大能力');
-    expect(split).toContain('每一步都能单独合并，合并后系统照常可用，并且实际推进了这个能力');
-    expect(split).toContain('不能只是空壳');
-    expect(split).toContain('这次只提第一步，size 尽量是 S 或 M');
-    expect(split).toContain('what 的末尾单独起一行写「后续步骤：」');
-    expect(split).toContain(
-      '列着「后续步骤」、而且已完成（前一步已经合并）的，优先考虑提它的下一步',
-    );
-    expect(split).toContain('可以提它能独立合并的第一步，在 why 里注明对应哪条 issue，这不算重复');
-    // L only once splitting that way does not work.
+  it('makes a new iteration its main output while the repo has none under way', () => {
     expect(prompt).toContain(
-      '太大的按上面「拆一个大能力」的做法拆开，只提第一步；那样也拆不开的，才把 size 标为 L',
+      '这次的主要产出是一个「迭代」：围绕一个完整的大目标，一次规划好、成批交付的一组需求',
     );
+    expect(prompt).toContain(
+      '迭代会成为一个 GitHub issue，写明目标、完成标准、计划和不做的事，它的每个子项各成为一个 issue；迭代整个一起采纳，子项按依赖顺序开工，全部完成后 Master 发一份总结。',
+    );
+    const plan = section(prompt, '## 规划迭代');
+    expect(plan).toContain(
+      '仓库现在没有进行中的迭代，这次的主要产出是一个新迭代，写进结果的 iteration',
+    );
+    expect(plan).toContain('从差距分析里选最重要的一个缺口，一次把整个迭代设计好');
+    expect(plan).toContain('goal 用用户能感知的话写：做完之后，用户能做到以前做不到的什么事');
+    expect(plan).toContain('readmeGoal 是它推进的 README.md 目标，一字不差地照抄原文');
+    expect(plan).toContain('criteria 写怎样算做成了，一条一条写，最好每条都能演示');
+    expect(plan).toContain('outOfScope 写有意不做的事');
+    expect(plan).toContain('差距分析里没有值得规划成迭代的缺口时，iteration 写 null');
+    // The sections, in order; nothing of following an iteration under way.
+    const headings = prompt.split('\n').filter((l) => l.startsWith('## '));
+    expect(headings).toEqual([
+      '## 先弄清方向',
+      '## 先做差距分析',
+      '## 线索（按优先级从高到低）',
+      '## 规划迭代',
+      '## 迭代之外的提案',
+      '## 要求',
+      '## 最近的 Run',
+      '## 已有的 issue',
+    ]);
+    expect(prompt).not.toContain('iterationUpdate');
+  });
+
+  it('plans the steps in the order of their dependencies, at most 8, the closing step last', () => {
+    const plan = section(prompt, '## 规划迭代');
+    expect(plan).toContain(
+      'children 是计划：按依赖排好的子项，数量按需要来，最多 8 个；需要更多就缩小目标，剩下的留给下一个迭代',
+    );
+    expect(plan).toContain(
+      '另外写明 criteria（它推进第几条完成标准）和 dependsOn（它依赖的子项的序号，只能写排在它前面的）',
+    );
+    expect(plan).toContain('子项按在 children 里的位置从 1 编号');
+    expect(plan).toContain('没有依赖关系的子项会同时开工，所以只写真正的依赖');
+    expect(plan).toContain(
+      '每个子项都能单独合并，合并后系统照常可用，并且实际推进了这个迭代，不能只是空壳',
+    );
+    expect(plan).toContain(
+      '最后一个子项是「收尾」：closeout 为 true，dependsOn 写上其余全部子项，用来整理本迭代各 Run 评审通过时留下的建议',
+    );
+    expect(plan).toContain('建议的具体内容由 Master 在它开工前填入');
+    expect(plan).toContain(
+      '迭代按整体自动采纳：取子项里最高的风险和最大的大小，和自动采纳的设置比较。',
+    );
+  });
+
+  it('proposes only problems and obvious bugs outside the iteration, problems first', () => {
+    const outside = section(prompt, '## 迭代之外的提案');
+    expect(outside).toContain('lead 写它属于哪一类线索');
+    expect(outside).toContain(
+      '只提第 1 类问题（lead 为 problem）和第 3 类明显的缺陷（lead 为 defect）。第 1 类优先：有就先提；条数上限放不下时，以第 1 类为先',
+    );
+    expect(outside).toContain('能力缺口规划进迭代，不单独提案');
+    expect(outside).toContain('最多 3 条，宁缺毋滥');
+    // No proposal of its own for a capability any more.
+    expect(prompt).not.toContain('至少有一条提案是补能力的');
+  });
+
+  it('takes another gap when an open issue works on it, or plans around a large one waiting', () => {
+    const plan = section(prompt, '## 规划迭代');
+    expect(plan).toContain(
+      '缺口已经有未关闭的 issue 在做时，换一个缺口；那个 issue 覆盖面很大、没有拆过、还在等人采纳时，可以围绕它规划迭代，在相关子项的 why 里注明对应哪条 issue，这不算重复',
+    );
+  });
+
+  it('takes the next steps of done issues as material for an iteration, not «follows #X» proposals', () => {
+    const plan = section(prompt, '## 规划迭代');
+    expect(plan).toContain(
+      '已完成的 issue 的后续步骤，可以当作规划迭代的素材：把剩下的步骤作为一个迭代重新设计，不要再提「接着 #X」式的单条提案',
+    );
+    expect(plan).toContain('还没关闭的 issue 列着的后续步骤，要等它合并后才能做，不要拿来规划');
+    // Scouts no longer write next steps of their own, nor propose only a first step.
+    expect(prompt).not.toContain('what 的末尾单独起一行写「后续步骤：」');
+    expect(prompt).not.toContain('这次只提第一步');
+    expect(prompt).not.toContain('## 拆一个大能力');
   });
 
   it('takes a goal of README and the code that limits it as evidence of a gap', () => {
     expect(section(prompt, '## 要求')).toContain(
-      '补能力的提案不需要有出错的 Run：README.md 里的目标加上限制这个能力的代码位置就是证据',
+      '子项和提案都要有能核对的证据：Run id、文件:行号、README 或 AGENTS.md 中的段落。补能力的不需要有出错的 Run：README.md 里的目标加上限制这个能力的代码位置就是证据',
     );
   });
 });
@@ -1411,59 +1475,38 @@ describe('scoutPrompt: whether the template splits and L is accepted automatical
 
   const prompt = (splits: boolean, autoAcceptsL: boolean) =>
     scoutPrompt({ repoName: 'demo', max: 3, runs: '', issues: '', splits, autoAcceptsL });
-  const split = (text: string) =>
-    section(text, t({ zh: '## 拆一个大能力', en: '## Splitting a large capability' }));
-  const requirements = (text: string) => section(text, t({ zh: '## 要求', en: '## Requirements' }));
+  const plan = (text: string) =>
+    section(text, t({ zh: '## 规划迭代', en: '## Planning an iteration' }));
 
-  it('asks for one proposal of size L for what one Run finishes split up, when the template splits', () => {
+  it('asks for one step of size L for what one Run finishes split up, when the template splits', () => {
     const text = prompt(true, true);
-    expect(split(text)).toContain(
+    expect(plan(text)).toContain(
       '这个仓库用的模板能拆分大需求：size 为 L 的需求，在编码阶段会先拆成几步，再一步一步做、一步一步检查，一个 Run 就能做完。',
     );
-    expect(split(text)).toContain(
-      '一个能力一个 Run 拆成几步能做完的，作为一条提案，size 标 L，不要拆成几个 issue',
+    expect(plan(text)).toContain(
+      '一个 Run 这样能做完的，作为一个子项，size 标 L，不要拆成几个子项：每多一个子项，就多一轮评估、评审、合并和升级。',
     );
-    expect(split(text)).toContain(
-      '只有一个 Run 拆了也做不完，或者前面几步单独合并就有价值时，才把它拆成有先后的几个 issue',
-    );
-    expect(split(text)).toContain('每一步都能单独合并，合并后系统照常可用');
-    expect(split(text)).toContain('这次只提第一步，第一步也可以是 L');
     expect(text).not.toContain('尽量是 S 或 M');
-    expect(text).not.toContain('那样也拆不开的，才把 size 标为 L');
-    expect(requirements(text)).toContain(
-      '一个 Run 拆成几步能做完的能力，作为一条提案、size 标 L，不要拆成几个 issue',
-    );
-    // The steps of split issues stay as they were.
-    expect(split(text)).toContain('what 的末尾单独起一行写「后续步骤：」');
-    expect(split(text)).toContain(
-      '已经拆好、列着「后续步骤」但还没关闭的 issue，说明这一步正在做、还没合并，不要提它后面的步骤',
-    );
-    expect(split(text)).toContain('这和还在等人采纳的大 issue 不同');
   });
 
-  it('keeps proposing only a first step of S or M when the template does not split', () => {
+  it('keeps steps to S or M when the template does not split', () => {
     const text = prompt(false, true);
-    expect(split(text)).toContain(
-      '这个仓库用的模板不拆分需求：每条需求都整个交给一个 Run 一次做完。',
-    );
-    expect(split(text)).toContain('一个能力一个 Run 做不完时，把它拆成有先后的几步');
-    expect(split(text)).toContain('这次只提第一步，size 尽量是 S 或 M');
-    expect(requirements(text)).toContain(
-      '太大的按上面「拆一个大能力」的做法拆开，只提第一步；那样也拆不开的，才把 size 标为 L',
+    expect(plan(text)).toContain(
+      '这个仓库用的模板不拆分需求：每个子项都整个交给一个 Run 一次做完，size 尽量是 S 或 M；一个 Run 做不完的，拆成有先后的几个子项。',
     );
     expect(text).not.toContain('能拆分大需求');
     expect(text).not.toContain('size 标 L');
-    expect(split(text)).toContain('what 的末尾单独起一行写「后续步骤：」');
   });
 
-  it('says whether L is accepted automatically, apart from whether the template splits', () => {
-    const accepted = '风险在自动采纳范围内的 L 提案也会被自动采纳。';
-    const waits = 'L 的提案不会被自动采纳，要等人处理。';
+  it('says whether an iteration with a step of L is accepted automatically, apart from splitting', () => {
+    const whole = '迭代按整体自动采纳：取子项里最高的风险和最大的大小，和自动采纳的设置比较。';
+    const accepted = '风险在自动采纳范围内时，有 L 子项的迭代也会被自动采纳。';
+    const waits = '有一个子项是 L，整个迭代就不会被自动采纳，要等人采纳。';
     for (const splits of [true, false]) {
-      expect(split(prompt(splits, true))).toContain(accepted);
-      expect(split(prompt(splits, true))).not.toContain(waits);
-      expect(split(prompt(splits, false))).toContain(waits);
-      expect(split(prompt(splits, false))).not.toContain(accepted);
+      expect(plan(prompt(splits, true))).toContain(`${whole}${accepted}`);
+      expect(plan(prompt(splits, true))).not.toContain(waits);
+      expect(plan(prompt(splits, false))).toContain(`${whole}${waits}`);
+      expect(plan(prompt(splits, false))).not.toContain(accepted);
       // Only that sentence differs.
       expect(prompt(splits, false).replace(waits, accepted)).toBe(prompt(splits, true));
     }
@@ -1477,36 +1520,25 @@ describe('scoutPrompt: whether the template splits and L is accepted automatical
       }
     }
     const splitting = prompt(true, true);
-    expect(split(splitting)).toContain(
-      'The template this repo uses can split large requirements: a requirement of size L is first split into steps in the coding stage, then done and checked step by step, all in one Run.',
+    expect(plan(splitting)).toContain(
+      'The template this repo uses can split large requirements: a requirement of size L is broken down in the coding stage, then done and checked piece by piece, all in one Run.',
     );
-    expect(split(splitting)).toContain(
-      'When one Run can finish a capability by splitting it into steps, make it one proposal of size L; do not split it into several issues',
+    expect(plan(splitting)).toContain(
+      'What one Run can finish that way is one step of size L; do not make several steps of it: every extra step costs another round of assessment, review, merge and upgrade.',
     );
-    expect(split(splitting)).toContain(
-      'Only when one Run cannot finish it even split up, or when its first steps are worth merging on their own, split it into several issues in order.',
+    expect(plan(splitting)).toContain(
+      'Auto-accept judges an iteration as a whole, by the highest risk and the largest size among its steps. An iteration with steps of size L is accepted automatically too when its risk is within what auto-accept takes.',
     );
-    expect(split(splitting)).toContain('Propose only the first step now; it may be of size L too.');
-    expect(split(splitting)).toContain(
-      'Proposals of size L are accepted automatically too when their risk is within what auto-accept takes.',
-    );
-    expect(splitting).not.toContain('preferably of size S or M');
-    expect(requirements(splitting)).toContain(
-      'A capability one Run can finish by splitting it into steps is one proposal of size L, not several issues',
-    );
+    expect(splitting).not.toContain('S or M');
 
     const whole = prompt(false, false);
-    expect(split(whole)).toContain(
-      'The template this repo uses does not split requirements: each one goes to one Run as a whole, done in one go.',
+    expect(plan(whole)).toContain(
+      'The template this repo uses does not split requirements: each step goes to one Run as a whole, done in one go, so keep steps to size S or M where you can; split what one Run cannot finish into several steps in order.',
     );
-    expect(split(whole)).toContain('Propose only the first step now, preferably of size S or M.');
-    expect(split(whole)).toContain(
-      'Proposals of size L are not accepted automatically: they wait for a human.',
+    expect(plan(whole)).toContain(
+      'A single step of size L keeps the whole iteration from being accepted automatically: it waits for a human.',
     );
-    expect(whole).not.toContain('one proposal of size L');
-    expect(requirements(whole)).toContain(
-      'only if it cannot be split even that way, set its size to L',
-    );
+    expect(whole).not.toContain('one step of size L');
   });
 });
 
@@ -1686,7 +1718,7 @@ describe('scout in English', () => {
     });
     expect(prompt.startsWith('You are the scout of Ares.1: ')).toBe(true);
     expect(prompt).not.toMatch(/[\u4e00-\u9fff]/);
-    expect(prompt).toContain('Proposals must serve the goals in README.md');
+    expect(prompt).toContain('Iterations and proposals must serve the goals in README.md');
     expect(prompt).toContain('Write in English.');
     expect(prompt).toContain('At most 3,');
     expect(prompt).toContain('## Recent Runs\n(no Runs yet)');
@@ -1699,14 +1731,14 @@ describe('scout in English', () => {
     );
     const polish = prompt.split('\n').find((l) => l.startsWith('4. '));
     expect(polish).toContain(
-      'the suggestions given by a review that passed are improvements the reviewer left for later on purpose',
+      'Review suggestions and polish of recent changes: no proposals of their own.',
     );
     expect(polish).toContain(
-      'First check in the code that each one is still there and that no existing issue covers it',
+      'the closing step at the end of an iteration goes through them all, its content filled in by the Master before it starts',
     );
   });
 
-  it('has the gap analysis, the leads, the mix and the next steps in English too', () => {
+  it('has the gap analysis, the leads, the plan of an iteration and the proposals in English too', () => {
     setLang('en');
     const input = { repoName: 'demo', max: 3, splits: false, autoAcceptsL: false };
     const prompt = scoutPrompt({ ...input, runs: '(no Runs yet)', issues: '' });
@@ -1722,8 +1754,8 @@ describe('scout in English', () => {
       '## First, get the direction',
       '## First, a gap analysis',
       '## Leads (highest priority first)',
-      '## Mix of proposals',
-      '## Splitting a large capability',
+      '## Planning an iteration',
+      '## Proposals outside the iteration',
       '## Requirements',
       '## Recent Runs',
       '## Existing issues',
@@ -1751,50 +1783,62 @@ describe('scout in English', () => {
       /^1\. Problems that stop the system or make it spin without progress: Runs below that got stuck, failed, needed rework again and again/,
     );
     expect(leads[0]).not.toContain('failed upgrade');
-    expect(leads[1]).toBe('2. The most important capability gaps from your gap analysis.');
+    expect(leads[1]).toBe(
+      '2. The most important capability gaps from your gap analysis: plan them as an iteration (see "Planning an iteration" below), not as proposals of their own.',
+    );
     expect(leads[2]).toMatch(/^3\. Obvious bugs and gaps in tests/);
     expect(leads[3]).toMatch(/^4\. Review suggestions and polish of recent changes/);
-    expect(leads[3]).toContain(
-      'merge related ones into one proposal rather than proposing each suggestion on its own',
-    );
+    expect(leads[3]).toContain('Outside an iteration, do not propose them on their own either.');
 
-    const mix = section(prompt, '## Mix of proposals');
-    expect(mix).toContain(
-      'Problems of lead 1 come first: propose them before anything else, and when the limit leaves no room for more, they take it',
-    );
-    expect(mix).toContain(
-      'Besides lead 1, as long as your gap analysis found a gap, at least one proposal must add a capability: category feature',
-    );
-    expect(mix).toContain('not patching a recent change');
-    expect(mix).toContain('At most one proposal from lead 4 per scout');
-    expect(mix).toContain(
-      'When an open issue already works on a gap, take another gap; only when that issue covers a lot and is still waiting for a human to accept it, propose a first step of it that can be merged on its own (see the point on large issues waiting for a human in "Splitting a large capability" below)',
-    );
-    expect(mix).not.toContain('nobody has proposed yet');
-
-    const split = section(prompt, '## Splitting a large capability');
-    expect(split).toContain(
-      'Each step must be mergeable on its own, leave the system working as usual once merged, and actually advance the capability, not be an empty shell',
-    );
-    expect(split).toContain('Propose only the first step now, preferably of size S or M');
-    expect(split).toContain(
-      'End what with a line of its own reading "Next steps:" (not a heading)',
-    );
-    expect(split).toContain(
-      'when an issue lists "Next steps" and is done (its step was merged), consider its next step first',
-    );
-    expect(split).toContain('saying in why which issue it belongs to; that is not a duplicate');
-    expect(split).toContain(
-      'An issue already split up, listing "Next steps" and still open, has its step in progress and not merged yet: do not propose the steps after it',
-    );
-    expect(split).toContain(
-      'A large issue still waiting for a human is different: when an existing issue covers a capability too large to have been taken up, was never split, and nobody has worked on it',
+    expect(prompt).toContain(
+      'Your main output this time is an iteration: a set of requirements around one complete, larger goal, planned in one go and delivered together',
     );
     expect(prompt).toContain(
-      'Split anything too large as described in "Splitting a large capability" and propose only its first step; only if it cannot be split even that way, set its size to L',
+      'An iteration becomes a GitHub issue stating its goal, completion criteria, plan and what it leaves out, and each of its steps becomes an issue of its own',
     );
+    const plan = section(prompt, '## Planning an iteration');
+    expect(plan).toContain(
+      'The repo has no iteration under way, so your main output this time is a new one, in iteration of your answer',
+    );
+    expect(plan).toContain(
+      'Take the most important gap from your gap analysis and design the whole iteration in one go.',
+    );
+    expect(plan).toContain(
+      'Write goal in words users would use: what they can do once it is done that they could not before; readmeGoal is the goal of README.md it advances, copied word for word.',
+    );
+    expect(plan).toContain(
+      'children is the plan: its steps ordered by their dependencies, as many as it takes, at most 8; if it takes more, narrow the goal and leave the rest for the next iteration.',
+    );
+    expect(plan).toContain(
+      'dependsOn (the numbers of the steps it depends on, only steps before it). Steps are numbered by their place in children, from 1.',
+    );
+    expect(plan).toContain(
+      'Each step must be mergeable on its own, leave the system working as usual once merged, and actually advance the iteration, not be an empty shell',
+    );
+    expect(plan).toContain(
+      'The last step is the closing step: closeout true, and dependsOn listing every other step',
+    );
+    expect(plan).toContain(
+      'When an open issue already works on a gap, take another gap; when that issue covers a lot, was never split and is still waiting for a human to accept it, you may plan the iteration around it',
+    );
+    expect(plan).toContain(
+      'The next steps of a done issue are material for planning an iteration: design what is left anew as one iteration, and no longer propose single "follows #X" proposals.',
+    );
+    expect(plan).toContain(
+      'If your gap analysis found no gap worth an iteration, set iteration to null.',
+    );
+
+    const outside = section(prompt, '## Proposals outside the iteration');
+    expect(outside).toContain(
+      'Propose only problems of lead 1 (lead problem) and obvious bugs of lead 3 (lead defect). Lead 1 comes first: propose those before anything else, and when the limit leaves no room for more, they take it.',
+    );
+    expect(outside).toContain(
+      'Capability gaps are planned as an iteration, not proposed on their own; do not propose review suggestions or polish either.',
+    );
+    expect(prompt).not.toContain('Next steps:" (not a heading)');
+    expect(prompt).not.toContain('At most one proposal from lead 4');
     expect(section(prompt, '## Requirements')).toContain(
-      'A proposal that adds a capability needs no failed Run: a goal in README.md together with where the code limits the capability is evidence',
+      'Adding a capability needs no failed Run: a goal in README.md together with where the code limits the capability is evidence',
     );
   });
 
@@ -2341,8 +2385,15 @@ describe('scoutPrompt: the local backlog', () => {
       expect(prompt).not.toMatch(/issue|GitHub/i);
     }
     const [splitting] = prompts('local', issues);
-    expect(splitting).toContain('不要拆成几条提案：每多一条提案，就多一轮评估、评审、合并和升级。');
-    expect(splitting).toContain('在 why 里写明接着哪条提案（写上它的 id）');
+    expect(splitting).toContain(
+      '迭代会存进 Master 的本地提案池，它的每个子项各成为一条提案；迭代在看板上整个一起采纳（或按自动采纳的设置采纳）',
+    );
+    expect(splitting).toContain(
+      '已采纳、Run 已完成的提案的后续步骤，可以当作规划迭代的素材：把剩下的步骤作为一个迭代重新设计，不要再提接着某条提案往下做的单条提案',
+    );
+    expect(splitting).toContain(
+      '那条提案覆盖面很大、没有拆过、还在等人决定时，可以围绕它规划迭代，在相关子项的 why 里注明对应哪条提案（写上它的 id）',
+    );
     expect(splitting).toContain('已采纳、但 Run 失败了的提案不一样：它不是人拒绝的');
   });
 
@@ -2383,5 +2434,765 @@ describe('scoutPrompt: the local backlog', () => {
       expect(prompt).toContain('Each proposal becomes a GitHub issue;');
       expect(prompt).toContain('\n## Existing issues\n');
     }
+  });
+});
+
+/** A proposal outside any iteration as a scout writes it, following `lead`. */
+const leadProposal = (title: string, lead: ScoutLead) => ({
+  title,
+  category: 'bug',
+  size: 'S',
+  risk: 'low',
+  lead,
+  why: `${title}的原因`,
+  evidence: ['run_abc 返工了 3 轮'],
+  what: `${title}的做法`,
+  acceptance: ['测试通过'],
+});
+
+/** A step of a planned iteration as a scout writes it. */
+const plannedStep = (title: string, patch: Record<string, unknown> = {}) => ({
+  title,
+  category: 'feature',
+  size: 'M',
+  risk: 'low',
+  why: `${title}的原因`,
+  evidence: ['README.md:1'],
+  what: `${title}的做法`,
+  acceptance: ['能演示'],
+  criteria: [1],
+  dependsOn: [],
+  closeout: false,
+  ...patch,
+});
+
+/** The closing step of a planned iteration, depending on `dependsOn`. */
+const closingStep = (dependsOn: number[]) =>
+  plannedStep('整理本迭代的评审建议', { criteria: [], dependsOn, closeout: true });
+
+/** A planned iteration with two completion criteria and the given steps. */
+const plannedIteration = (children: unknown[]) => ({
+  title: '不接 GitHub 的仓库也能永动',
+  goal: '没有接 GitHub 的仓库，也能自己提需求、自己做完',
+  readmeGoal: '永动',
+  criteria: ['本地仓库能自己跑完一轮', '看板上能整批采纳'],
+  outOfScope: ['GitLab'],
+  children,
+});
+
+/** A step added to the plan of the iteration under way. */
+const addedStep = (title: string, patch: Record<string, unknown> = {}) => {
+  const { closeout: _closeout, ...step } = plannedStep(title, patch);
+  return { ...step, replaces: null, ...patch };
+};
+
+const parse = (structured: Record<string, unknown>) =>
+  parseScoutReport({ gaps: [], proposals: [], ...structured }, '');
+
+/** What a parse of `structured` throws. */
+const parseError = (structured: Record<string, unknown>) => {
+  try {
+    parse(structured);
+  } catch (err) {
+    return (err as Error).message;
+  }
+  throw new Error('parsed without an error');
+};
+
+describe('parseScoutReport', () => {
+  afterEach(() => setLang('zh'));
+
+  it('takes an iteration planned in the order of its dependencies, the closing step last', () => {
+    const report = parse({
+      proposals: [leadProposal('修好卡住的 Run', 'problem')],
+      iteration: plannedIteration([
+        plannedStep('本地提案池'),
+        plannedStep('看板上采纳', { dependsOn: [1], criteria: [2] }),
+        plannedStep('自动采纳', { dependsOn: [1] }),
+        closingStep([1, 2, 3]),
+      ]),
+      iterationUpdate: null,
+    });
+    expect(report.proposals.map((p) => p.lead)).toEqual(['problem']);
+    expect(report.iteration?.title).toBe('不接 GitHub 的仓库也能永动');
+    expect(report.iteration?.children.map((c) => [c.title, c.dependsOn, c.closeout])).toEqual([
+      ['本地提案池', [], false],
+      ['看板上采纳', [1], false],
+      ['自动采纳', [1], false],
+      ['整理本迭代的评审建议', [1, 2, 3], true],
+    ]);
+    expect(report.iterationUpdate).toBeNull();
+  });
+
+  it('counts an iteration or a change left out as none, and fills in what a step leaves out', () => {
+    expect(parse({})).toEqual({ gaps: [], proposals: [], iteration: null, iterationUpdate: null });
+    const { criteria: _c, dependsOn: _d, closeout: _o, ...bare } = plannedStep('只有一步');
+    const report = parse({ iteration: { ...plannedIteration([bare]), outOfScope: undefined } });
+    expect(report.iteration?.children[0]).toMatchObject({
+      criteria: [],
+      dependsOn: [],
+      closeout: false,
+    });
+    expect(report.iteration?.outOfScope).toEqual([]);
+  });
+
+  it('takes at most 8 steps: a larger goal is narrowed down', () => {
+    const steps = (n: number) =>
+      Array.from({ length: n }, (_, i) =>
+        plannedStep(`第 ${i + 1} 步`, { dependsOn: i ? [i] : [] }),
+      );
+    expect(parse({ iteration: plannedIteration(steps(8)) }).iteration?.children).toHaveLength(8);
+    expect(parseError({ iteration: plannedIteration(steps(9)) })).toMatch(
+      /^侦察结果不符合约定：JSON 结果不符合约定：iteration\.children: /,
+    );
+  });
+
+  it('lets a step depend only on steps before it, so a plan never has a cycle', () => {
+    expect(
+      parseError({
+        iteration: plannedIteration([plannedStep('A', { dependsOn: [2] }), plannedStep('B')]),
+      }),
+    ).toContain('iteration.children.0.dependsOn: 第 1 个子项排在最前，不能依赖别的子项（写了 2）');
+    expect(
+      parseError({
+        iteration: plannedIteration([
+          plannedStep('A'),
+          plannedStep('B', { dependsOn: [1, 2, 3] }),
+          plannedStep('C'),
+        ]),
+      }),
+    ).toContain(
+      'iteration.children.1.dependsOn: 第 2 个子项只能依赖排在它前面的子项（1 到 1），写了 2、3',
+    );
+  });
+
+  it('takes one closing step at most: the last, after every other step, and not the only one', () => {
+    expect(
+      parseError({
+        iteration: plannedIteration([plannedStep('A'), closingStep([1]), closingStep([1, 2])]),
+      }),
+    ).toContain('只能有一个收尾子项（closeout 为 true），现在有 2 个：第 2、3 个');
+    expect(
+      parseError({ iteration: plannedIteration([closingStep([]), plannedStep('A')]) }),
+    ).toContain('iteration.children.0.closeout: 收尾子项要排在最后，现在是第 1 个，共 2 个');
+    expect(parseError({ iteration: plannedIteration([closingStep([])]) })).toContain(
+      '除了收尾子项，迭代至少还要有一个子项',
+    );
+    expect(
+      parseError({
+        iteration: plannedIteration([plannedStep('A'), plannedStep('B'), closingStep([1])]),
+      }),
+    ).toContain('iteration.children.2.dependsOn: 收尾子项要依赖其余全部子项，还缺 2');
+    // Through the steps it depends on is enough: it still starts last.
+    const chained = parse({
+      iteration: plannedIteration([
+        plannedStep('A'),
+        plannedStep('B', { dependsOn: [1] }),
+        closingStep([2]),
+      ]),
+    });
+    expect(chained.iteration?.children).toHaveLength(3);
+    // No closing step at all is not wrong.
+    expect(parse({ iteration: plannedIteration([plannedStep('A')]) }).iteration).not.toBeNull();
+  });
+
+  it('lets a step name only the completion criteria the iteration has', () => {
+    expect(
+      parseError({ iteration: plannedIteration([plannedStep('A', { criteria: [1, 3] })]) }),
+    ).toContain('iteration.children.0.criteria: 完成标准只有 2 条，第 1 个子项写了 3');
+  });
+
+  it('wants the lead of every proposal', () => {
+    const { lead: _lead, ...noLead } = leadProposal('没写线索', 'problem');
+    expect(parseError({ proposals: [noLead] })).toContain('proposals.0.lead');
+    expect(parseError({ proposals: [leadProposal('第 4 类', 'polish' as ScoutLead)] })).toContain(
+      'proposals.0.lead',
+    );
+  });
+
+  it('takes a change to the plan, a replaced step by its number', () => {
+    const report = parse({
+      iterationUpdate: {
+        note: '第 2 步失败了两次，换个做法',
+        add: [addedStep('换个做法的第 2 步', { replaces: 2 }), addedStep('漏掉的一步')],
+      },
+    });
+    expect(report.iterationUpdate?.note).toBe('第 2 步失败了两次，换个做法');
+    expect(report.iterationUpdate?.add.map((a) => a.replaces)).toEqual([2, undefined]);
+    expect(report.iterationUpdate?.add[1]).not.toHaveProperty('replaces');
+    expect(parseError({ iterationUpdate: { note: '没有要加的', add: [] } })).toContain(
+      'iterationUpdate.add',
+    );
+  });
+
+  it('says what is wrong in English', () => {
+    setLang('en');
+    const message = parseError({
+      iteration: plannedIteration([
+        plannedStep('A', { dependsOn: [1], criteria: [5] }),
+        closingStep([]),
+        closingStep([1]),
+      ]),
+    });
+    expect(message).toMatch(/^The scout's result does not follow the contract: /);
+    expect(message).toContain('step 1 comes first and cannot depend on other steps (it names 1)');
+    expect(message).toContain('there are 2 completion criteria; step 1 names 5');
+    expect(message).toContain(
+      'only one step may close the iteration out (closeout true); steps 2, 3 do',
+    );
+    expect(
+      parseError({ iteration: plannedIteration([closingStep([]), plannedStep('A')]) }),
+    ).toContain('the closing step must come last; it is step 1 of 2');
+    expect(
+      parseError({
+        iteration: plannedIteration([plannedStep('A'), plannedStep('B'), closingStep([2])]),
+      }),
+    ).toContain('the closing step must depend on every other step; it misses 1');
+    expect(message).not.toMatch(/[一-鿿]/);
+  });
+});
+
+/** A step of an iteration under way, as the Master keeps it; waiting on the one before it. */
+const step = (position: number, patch: Partial<IterationChild> = {}): IterationChild => ({
+  position,
+  title: `第 ${position} 步`,
+  category: 'feature',
+  size: 'M',
+  risk: 'low',
+  why: '为什么',
+  evidence: ['README.md:1'],
+  what: '做什么',
+  acceptance: ['能演示'],
+  criteria: [1],
+  dependsOn: position > 1 ? [position - 1] : [],
+  closeout: false,
+  status: 'waiting',
+  runIds: [],
+  ...patch,
+});
+
+/**
+ * An iteration blocked on its second step: the first done, the second failed twice, the third
+ * waiting for it, then the closing step.
+ */
+const underWay = (patch: Partial<Iteration> = {}): Iteration => ({
+  id: 'iteration-1',
+  repoId: 'repo-1',
+  scoutId: 'scout-1',
+  source: 'github',
+  issuesRepo: 'me/demo',
+  issue: { number: 20, url: '' },
+  title: '不接 GitHub 的仓库也能永动',
+  goal: '没有接 GitHub 的仓库，也能自己提需求、自己做完',
+  readmeGoal: '永动',
+  criteria: ['本地仓库能自己跑完一轮', '看板上能整批采纳'],
+  outOfScope: ['GitLab', 'Gitea'],
+  children: [
+    step(1, { issue: { number: 21, url: '' }, status: 'done', runIds: ['run-a'] }),
+    step(2, {
+      issue: { number: 22, url: '' },
+      status: 'failed',
+      runIds: ['run-b', 'run-c'],
+      criteria: [1, 2],
+    }),
+    step(3, { issue: { number: 23, url: '' }, criteria: [2] }),
+    step(4, {
+      title: '整理评审建议',
+      issue: { number: 24, url: '' },
+      criteria: [],
+      dependsOn: [1, 2, 3],
+      closeout: true,
+    }),
+  ],
+  notes: [],
+  status: 'blocked',
+  auto: false,
+  summaryPosted: false,
+  summary: null,
+  createdAt: '2026-11-24T00:00:00.000Z',
+  decidedAt: '2026-11-24T01:00:00.000Z',
+  endedAt: null,
+  ...patch,
+});
+
+const iterationRuns: Record<string, ProposalRun> = {
+  'run-a': { status: 'completed', error: null, discussion: [] },
+  'run-b': { status: 'failed', error: '检查一直不通过', discussion: [] },
+  'run-c': { status: 'failed', error: 'npm test 失败：缺少本地提案池的表', discussion: [] },
+};
+const iterationRunOf = (id: string) => iterationRuns[id];
+
+/** A report as parsed, with the given parts. */
+const parsedReport = (patch: Partial<ScoutReport> = {}): ScoutReport => ({
+  gaps: [],
+  proposals: [],
+  iteration: null,
+  iterationUpdate: null,
+  ...patch,
+});
+
+/** A change to the plan adding `add`, as parsed. */
+const change = (...add: Record<string, unknown>[]): IterationUpdate =>
+  parse({ iterationUpdate: { note: '调整', add } }).iterationUpdate as IterationUpdate;
+
+describe('keptReport', () => {
+  const proposals = parse({
+    proposals: [
+      leadProposal('卡住的 Run', 'problem'),
+      leadProposal('能力缺口', 'gap'),
+      leadProposal('明显的缺陷', 'defect'),
+      leadProposal('又一个卡住的', 'problem'),
+    ],
+  }).proposals;
+  const iteration = parse({
+    iteration: plannedIteration([plannedStep('A'), closingStep([1])]),
+  }).iteration;
+
+  it('keeps only problems and the change to the plan while an iteration is under way', () => {
+    const update = change(addedStep('换个做法的第 2 步', { replaces: 2, dependsOn: [1] }));
+    const kept = keptReport(
+      parsedReport({ proposals, iteration, iterationUpdate: update }),
+      underWay(),
+      3,
+    );
+    expect(kept.proposals.map((p) => p.title)).toEqual(['卡住的 Run', '又一个卡住的']);
+    expect(kept.iteration).toBeNull();
+    expect(kept.iterationUpdate).toBe(update);
+    // max_proposals still holds.
+    const one = keptReport(parsedReport({ proposals }), underWay(), 1);
+    expect(one.proposals.map((p) => p.title)).toEqual(['卡住的 Run']);
+  });
+
+  it('drops a change to the plan without an iteration under way, keeping the new one and every lead', () => {
+    const kept = keptReport(
+      parsedReport({ proposals, iteration, iterationUpdate: change(addedStep('多余的')) }),
+      null,
+      3,
+    );
+    expect(kept.proposals.map((p) => p.lead)).toEqual(['problem', 'gap', 'defect']);
+    // The steps of an iteration do not count toward max_proposals.
+    expect(kept.iteration).toBe(iteration);
+    expect(kept.iterationUpdate).toBeNull();
+  });
+
+  it('breaks the contract with a change that does not fit the plan', () => {
+    expect(() =>
+      keptReport(
+        parsedReport({ iterationUpdate: change(addedStep('换掉做完的', { replaces: 1 })) }),
+        underWay(),
+        3,
+      ),
+    ).toThrow(
+      '侦察结果不符合约定：iterationUpdate: 追加的第 1 个子项（序号 5）不能替换第 1 个子项：它没有失败，也没有被关成不做',
+    );
+  });
+});
+
+describe('updateProblems', () => {
+  afterEach(() => setLang('zh'));
+
+  const problems = (...add: Record<string, unknown>[]) =>
+    updateProblems(change(...add), underWay());
+
+  it('takes steps numbered after the plan, depending on steps before them', () => {
+    expect(
+      problems(
+        addedStep('换个做法', { replaces: 2, dependsOn: [1] }),
+        addedStep('漏掉的', { dependsOn: [3, 5], criteria: [2] }),
+      ),
+    ).toEqual([]);
+  });
+
+  it('replaces only a step that failed or was dropped, once, and never the closing one', () => {
+    const dropped = underWay();
+    (dropped.children[2] as IterationChild).status = 'dropped';
+    expect(updateProblems(change(addedStep('换掉不做的', { replaces: 3 })), dropped)).toEqual([]);
+    expect(problems(addedStep('换掉做完的', { replaces: 1 }))).toEqual([
+      '追加的第 1 个子项（序号 5）不能替换第 1 个子项：它没有失败，也没有被关成不做',
+    ]);
+    expect(problems(addedStep('换掉收尾', { replaces: 4 }))).toEqual([
+      '追加的第 1 个子项（序号 5）不能替换第 4 个子项：它是收尾子项',
+    ]);
+    expect(problems(addedStep('换掉没有的', { replaces: 9 }))).toEqual([
+      '追加的第 1 个子项（序号 5）不能替换第 9 个子项：计划里没有这个序号',
+    ]);
+    expect(
+      problems(addedStep('换一次', { replaces: 2 }), addedStep('再换一次', { replaces: 2 })),
+    ).toEqual(['追加的第 2 个子项（序号 6）不能替换第 2 个子项：它已经被换掉了']);
+    const replaced = underWay();
+    (replaced.children[1] as IterationChild).replacedBy = 5;
+    replaced.children.push(step(5, { status: 'running', dependsOn: [1] }));
+    expect(updateProblems(change(addedStep('又换', { replaces: 2 })), replaced)).toEqual([
+      '追加的第 1 个子项（序号 6）不能替换第 2 个子项：它已经被换掉了',
+    ]);
+  });
+
+  it('refuses dependencies on later steps or on the closing step, and criteria it does not have', () => {
+    expect(problems(addedStep('靠后', { dependsOn: [5, 6] }))).toEqual([
+      '追加的第 1 个子项（序号 5）只能依赖排在它前面的子项（1 到 4），写了 5、6',
+    ]);
+    expect(problems(addedStep('等收尾', { dependsOn: [4] }))).toEqual([
+      '追加的第 1 个子项（序号 5）不能依赖收尾子项 4：收尾子项会等新加的子项做完',
+    ]);
+    expect(problems(addedStep('多一条标准', { criteria: [3] }))).toEqual([
+      '完成标准只有 2 条，追加的第 1 个子项（序号 5）写了 3',
+    ]);
+  });
+
+  it('keeps the plan within 8 steps, those replaced left out', () => {
+    const five = (replaces: number | null) =>
+      Array.from({ length: 5 }, (_, i) =>
+        addedStep(`第 ${i + 5} 步`, { replaces: i ? null : replaces }),
+      );
+    expect(problems(...five(null))).toEqual(['调整后计划里有 9 个子项，最多 8 个']);
+    expect(problems(...five(2))).toEqual([]);
+  });
+
+  it('says so in English', () => {
+    setLang('en');
+    const found = problems(
+      addedStep('Later', { dependsOn: [4, 6], criteria: [3], replaces: 1 }),
+      ...Array.from({ length: 4 }, () => addedStep('More')),
+    );
+    expect(found).toEqual([
+      'added step 1 (number 5) may depend only on steps before it (1 to 4); it names 6',
+      'added step 1 (number 5) cannot depend on the closing step 4: the closing step waits for the steps added',
+      'there are 2 completion criteria; added step 1 (number 5) names 3',
+      'added step 1 (number 5) cannot replace step 1: it neither failed nor was dropped',
+      'the plan would have 9 steps; at most 8 are allowed',
+    ]);
+  });
+});
+
+describe('iterationDigest', () => {
+  afterEach(() => setLang('zh'));
+
+  it('lists the goal, the criteria, how far it got and each step with its Runs and why it failed', () => {
+    const iteration = underWay({
+      notes: [{ at: '2026-11-24T08:00:00.000Z', scoutId: 'scout-2', text: '补上漏掉的一步' }],
+    });
+    expect(iterationDigest(iteration, iterationRunOf)).toBe(
+      [
+        '- 标题：不接 GitHub 的仓库也能永动（#20）',
+        '- 状态：受阻：有子项失败或被关成不做，还没有子项替换它',
+        '- 目标：没有接 GitHub 的仓库，也能自己提需求、自己做完',
+        '- 对应 README 的目标：永动',
+        '- 完成标准：',
+        '  1. 本地仓库能自己跑完一轮',
+        '  2. 看板上能整批采纳',
+        '- 不做：GitLab、Gitea',
+        '- 进度：完成 1 个子项，共 4 个',
+        '- 子项（按计划里的序号）：',
+        '  1. #21 第 1 步（已完成；推进完成标准 1；Run run-a（已完成））',
+        '  2. #22 第 2 步（失败；依赖 1；推进完成标准 1、2；Run run-b（失败）、run-c（失败））',
+        '     失败原因：npm test 失败：缺少本地提案池的表',
+        '  3. #23 第 3 步（还在等 2；依赖 2；推进完成标准 2）',
+        '  4. #24 整理评审建议（收尾；还在等 2、3；依赖 1、2、3）',
+        '- 计划的调整：',
+        '  - 2026-11-24：补上漏掉的一步',
+      ].join('\n'),
+    );
+  });
+
+  it('names the steps of the local backlog by their proposals, a replaced step and its stand-in', () => {
+    const iteration = underWay({ source: 'local', issuesRepo: '', issue: null, status: 'active' });
+    iteration.children = iteration.children.map((c) => ({
+      ...c,
+      issue: undefined,
+      proposalId: `proposal-${c.position}`,
+    }));
+    (iteration.children[1] as IterationChild).replacedBy = 5;
+    iteration.children.push(
+      step(5, { proposalId: 'proposal-5', status: 'running', runIds: ['run-d'], dependsOn: [1] }),
+    );
+    const digest = iterationDigest(iteration, iterationRunOf);
+    expect(digest).toContain('- 标题：不接 GitHub 的仓库也能永动\n- 状态：进行中\n');
+    expect(digest).toContain('- 进度：完成 1 个子项，共 4 个');
+    expect(digest).toContain('  2. proposal-2 第 2 步（失败；已被 5 替换；依赖 1；');
+    // Waiting for step 5 now, which stands for step 2; a Run not found shows by its id.
+    expect(digest).toContain('  3. proposal-3 第 3 步（还在等 5；依赖 2；推进完成标准 2）');
+    expect(digest).toContain(
+      '  5. proposal-5 第 5 步（进行中；依赖 1；推进完成标准 1；Run run-d）',
+    );
+    expect(digest).not.toMatch(/issue|#\d/i);
+  });
+
+  it('gives why the assessment dropped a step', () => {
+    const iteration = underWay();
+    (iteration.children[1] as IterationChild).status = 'dropped';
+    const run: ProposalRun = {
+      status: 'dropped',
+      error: null,
+      discussion: [dropped('和 README 的目标无关')],
+    };
+    const digest = iterationDigest(iteration, (id) => (id === 'run-c' ? run : iterationRunOf(id)));
+    expect(digest).toContain('  2. #22 第 2 步（不做；');
+    expect(digest).toContain('     需求评估结论为不做，理由：和 README 的目标无关');
+  });
+
+  it('says so in English', () => {
+    setLang('en');
+    const english = underWay({
+      title: 'Repos without GitHub keep going',
+      goal: 'A repo without GitHub proposes and finishes its own work',
+      readmeGoal: 'Perpetual motion',
+      criteria: ['A local repo finishes a round', 'Accepted as a whole on the dashboard'],
+      notes: [{ at: '2026-11-24T08:00:00.000Z', scoutId: 'scout-2', text: 'Added a missed step' }],
+    });
+    english.children = english.children.map((c) => ({ ...c, title: `Step ${c.position}` }));
+    const digest = iterationDigest(english, (id) =>
+      id === 'run-c'
+        ? { status: 'failed', error: 'npm test failed', discussion: [] }
+        : iterationRunOf(id),
+    );
+    expect(digest).toBe(
+      [
+        '- Title: Repos without GitHub keep going (#20)',
+        '- Status: blocked: a step failed or was dropped, and no step replaced it yet',
+        '- Goal: A repo without GitHub proposes and finishes its own work',
+        '- README goal it serves: Perpetual motion',
+        '- Completion criteria:',
+        '  1. A local repo finishes a round',
+        '  2. Accepted as a whole on the dashboard',
+        '- Out of scope: GitLab, Gitea',
+        '- Progress: 1 of 4 steps done',
+        '- Steps (by their numbers in the plan):',
+        '  1. #21 Step 1 (done; advances criteria 1; Run run-a (completed))',
+        '  2. #22 Step 2 (failed; depends on 1; advances criteria 1, 2; Run run-b (failed), run-c (failed))',
+        '     Why it failed: npm test failed',
+        '  3. #23 Step 3 (still waiting for 2; depends on 2; advances criteria 2)',
+        '  4. #24 Step 4 (closing step; still waiting for 2, 3; depends on 1, 2, 3)',
+        '- Changes to the plan:',
+        '  - 2026-11-24: Added a missed step',
+      ].join('\n'),
+    );
+  });
+});
+
+describe('scoutPrompt: an iteration under way', () => {
+  afterEach(() => setLang('zh'));
+
+  const prompt = (source: 'github' | 'local' = 'github', upgrade: UpgradeFailure | null = null) =>
+    scoutPrompt({
+      repoName: 'demo',
+      source,
+      max: 3,
+      runs: '',
+      issues: '',
+      splits: true,
+      autoAcceptsL: true,
+      upgrade,
+      iteration: iterationDigest(underWay(), iterationRunOf),
+    });
+
+  it('follows the iteration under way instead of planning another', () => {
+    const text = prompt();
+    expect(text).toContain(
+      '这个仓库有一个进行中的迭代（见下面「进行中的迭代」），它结束之前不规划新的迭代，也不提迭代之外的能力需求。这次只做两件事：把让系统停转或空耗的问题写成提案；判断迭代的计划要不要调整。差距分析照常做，留给下一个迭代用。',
+    );
+    expect(text.split('\n').filter((l) => l.startsWith('## '))).toEqual([
+      '## 先弄清方向',
+      '## 先做差距分析',
+      '## 进行中的迭代',
+      '## 线索',
+      '## 调整计划',
+      '## 提案',
+      '## 要求',
+      '## 最近的 Run',
+      '## 已有的 issue',
+    ]);
+    const open = section(text, '## 进行中的迭代');
+    expect(open).toContain('子项按计划里的序号列出，调整计划时用这些序号');
+    expect(open).toContain(iterationDigest(underWay(), iterationRunOf));
+    expect(text).not.toContain('## 规划迭代');
+    expect(text).not.toContain('这次的主要产出是一个「迭代」');
+  });
+
+  it('proposes only problems that stop the system, a blocked iteration among them', () => {
+    const text = prompt();
+    const leads = section(text, '## 线索');
+    expect(leads.split('\n').filter((l) => /^\d\. /.test(l))).toHaveLength(1);
+    expect(firstLead(text)).toMatch(/^1\. 让系统停转或空耗的问题：/);
+    expect(firstLead(text)).toContain(
+      '进行中的迭代受阻（有子项失败或被关成不做）也算这一类：在下面「调整计划」里换个做法重新安排这一步',
+    );
+    expect(leads).toContain(
+      '能力缺口、明显的缺陷、评审建议和修饰这次都不提：能力缺口留给下一个迭代，评审建议由迭代的「收尾」子项整理',
+    );
+    const proposals = section(text, '## 提案');
+    expect(proposals).toContain(
+      '写进结果的 proposals 只放第 1 类问题，lead 都是 problem；最多 3 条',
+    );
+    expect(proposals).toContain(
+      '迭代进行中不规划新的迭代（iteration 写 null），不提迭代之外的能力需求，也不单独提明显的缺陷、评审建议或修饰：这些都会被丢掉',
+    );
+    expect(text).not.toContain('第 4 类每次最多一条');
+  });
+
+  it('says how to change the plan: replace a failed step, add a missed one, or leave it', () => {
+    const change = section(prompt(), '## 调整计划');
+    expect(change).toContain(
+      '要调整就写进结果的 iterationUpdate；不用调整就写 null，不要为调整而调整',
+    );
+    expect(change).toContain(
+      '有子项失败或被关成不做、迭代因此受阻时，换个做法重新安排这一步：在 add 里写一个新子项，replaces 写被换掉的子项的序号',
+    );
+    expect(change).toContain('做完的子项暴露出计划漏掉的一步时，在 add 里补上它，replaces 写 null');
+    expect(change).toContain(
+      '新子项接在计划里现有的最大序号后面编号；dependsOn 用计划里的序号，只能写排在它前面的，不要写收尾子项：收尾子项会等新加的子项都做完再开工',
+    );
+    expect(change).toContain('计划里最多 8 个子项');
+    expect(change).toContain('note 写为什么这样调整，会作为评论发在迭代的 issue 上。');
+    expect(section(prompt('local'), '## 调整计划')).toContain(
+      'note 写为什么这样调整，会记在迭代上，在看板上能看到。',
+    );
+  });
+
+  it('keeps the failed upgrade of the Master among the problems', () => {
+    const failure: UpgradeFailure = {
+      at: '2026-11-20T00:00:00.000Z',
+      from: 'aaaaaaa1111',
+      to: 'bbbbbbb2222',
+      message: 'npm run build failed',
+      detail: null,
+      env: false,
+    };
+    const text = prompt('github', failure);
+    expect(firstLead(text)).toContain('，以及下面的「Master 自动升级失败」');
+    expect(text).toContain('## Master 自动升级失败');
+  });
+
+  it('never mentions issues in the local backlog, and says it all in English too', () => {
+    const local = prompt('local').replace(iterationDigest(underWay(), iterationRunOf), '');
+    expect(local).not.toMatch(/issue|GitHub/i);
+    setLang('en');
+    const english = underWay({
+      title: 'Repos without GitHub keep going',
+      goal: 'A repo without GitHub proposes and finishes its own work',
+      readmeGoal: 'Perpetual motion',
+      criteria: ['A local repo finishes a round'],
+      outOfScope: [],
+    });
+    english.children = english.children.map((c) => ({ ...c, title: `Step ${c.position}` }));
+    const runOf = (id: string): ProposalRun => ({
+      status: 'failed',
+      error: `${id} failed`,
+      discussion: [],
+    });
+    for (const source of ['github', 'local'] as const) {
+      const text = scoutPrompt({
+        repoName: 'demo',
+        source,
+        max: 3,
+        runs: '',
+        issues: '',
+        splits: false,
+        autoAcceptsL: false,
+        iteration: iterationDigest(english, runOf),
+      });
+      expect(text).not.toMatch(/[一-鿿]/);
+      expect(text).toContain(
+        'The repo has an iteration under way (see "The iteration under way" below)',
+      );
+      expect(text).toContain(
+        'An iteration under way that is blocked (a step failed or was dropped) belongs here too',
+      );
+      expect(section(text, '## Changing the plan')).toContain(
+        'add a new step in add, with replaces set to the number of the step it replaces',
+      );
+      expect(section(text, '## Proposals')).toContain(
+        'Put only problems of lead 1 in proposals of your answer, each with lead problem; at most 3',
+      );
+    }
+  });
+});
+
+describe('scoutPrompt: the same in both languages', () => {
+  afterEach(() => setLang('zh'));
+
+  /**
+   * The outline of a prompt: each heading's place, and how many list items and numbered lines
+   * its section has.
+   */
+  const outline = (text: string) =>
+    text
+      .split('\n## ')
+      .slice(1)
+      .map((s) => {
+        const lines = s.split('\n').slice(1);
+        return {
+          items: lines.filter((l) => /^ *- /.test(l)).length,
+          numbered: lines.filter((l) => /^ *\d+\. /.test(l)).length,
+        };
+      });
+
+  it('has the same sections and items in Chinese and English, with an iteration under way or not', () => {
+    for (const source of ['github', 'local'] as const) {
+      for (const open of [false, true]) {
+        const prompts = (['zh', 'en'] as const).map((lang) => {
+          setLang(lang);
+          return scoutPrompt({
+            repoName: 'demo',
+            source,
+            max: 3,
+            runs: '',
+            issues: '',
+            splits: true,
+            autoAcceptsL: false,
+            iteration: open ? iterationDigest(underWay(), iterationRunOf) : null,
+          });
+        });
+        setLang('zh');
+        const [zh, en] = prompts as [string, string];
+        expect(outline(en)).toEqual(outline(zh));
+      }
+    }
+  });
+});
+
+describe('scoutReportJsonSchema', () => {
+  afterEach(() => setLang('zh'));
+
+  /** Every object schema in it, nested ones included. */
+  function objects(schema: unknown): Record<string, unknown>[] {
+    if (Array.isArray(schema)) return schema.flatMap(objects);
+    if (!schema || typeof schema !== 'object') return [];
+    const s = schema as Record<string, unknown>;
+    const nested = Object.values(s).flatMap((v) => (v && typeof v === 'object' ? objects(v) : []));
+    return s.type === 'object' ? [s, ...nested] : nested;
+  }
+
+  it('is strict already: every object lists all its fields and allows no others', () => {
+    const schema = scoutReportJsonSchema();
+    const found = objects(schema);
+    // The report, gaps, proposals, the iteration, its steps, the change and its steps.
+    expect(found).toHaveLength(7);
+    for (const o of found) {
+      expect(o.additionalProperties).toBe(false);
+      expect([...(o.required as string[])].sort()).toEqual(
+        Object.keys(o.properties as object).sort(),
+      );
+    }
+    // A strict CLI keeps the iteration and the change nullable as they are.
+    const strict = strictOutputSchema(schema) as typeof schema;
+    expect(strict.required).toEqual(['gaps', 'proposals', 'iteration', 'iterationUpdate']);
+    expect(strict.properties.iteration.anyOf[1]).toEqual({ type: 'null' });
+    expect(strict.properties.iterationUpdate.anyOf[1]).toEqual({ type: 'null' });
+    expect(schema.properties.proposals.items.properties.lead.enum).toEqual([
+      'problem',
+      'gap',
+      'defect',
+    ]);
+  });
+
+  it('describes the fields in English too, with no Chinese left', () => {
+    setLang('en');
+    const schema = scoutReportJsonSchema();
+    expect(JSON.stringify(schema)).not.toMatch(/[一-鿿]/);
+    expect(schema.properties.iteration.description).toContain('A new iteration');
+    expect(
+      schema.properties.iteration.anyOf[0].properties.children.items.properties.closeout
+        .description,
+    ).toContain('true only for the last step');
   });
 });

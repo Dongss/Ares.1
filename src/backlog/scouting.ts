@@ -1,7 +1,8 @@
 // The AI scout of a repo, whatever source its requirements come from: starting and running the
-// scout's agent read-only, recording how it went, and when the automatic scout waits. Where the
-// proposals go, and what the prompt says of the requirements there are already, is up to the
-// source (`ProposalSource`): GitHub issues (IssueBridge) or the local backlog.
+// scout's agent read-only, recording how it went, and when the automatic scout waits. Without an
+// iteration under way the scout plans one; with one, it follows it (see keptReport). Where the
+// proposals and iterations go, and what the prompt says of the requirements there are already,
+// is up to the source (`ProposalSource`): GitHub issues (IssueBridge) or the local backlog.
 
 import { readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -15,6 +16,7 @@ import {
 import type { ProposalSourceStatus } from '../api/types.js';
 import {
   autoAcceptsL,
+  ITERATION_OPEN_STATUSES,
   limitedScout,
   scoutBackoff,
   scoutFailureStreak,
@@ -26,6 +28,11 @@ import { findTemplate, type HomePaths, type LoadedConfig } from '../config/load.
 import type { ProposalSourceConfig } from '../config/schema.js';
 import { type Engine, estimateCost, InvalidStateError } from '../engine/engine.js';
 import {
+  type IterationUpdate,
+  iterationDigest,
+  keptReport,
+  type PlannedIteration,
+  type ProposalRun,
   parseScoutReport,
   runDigest,
   type ScoutSource,
@@ -34,7 +41,7 @@ import {
 } from '../github/scout.js';
 import { join as joinList, t } from '../i18n.js';
 import { NotFoundError, type Store } from '../store/store.js';
-import type { Repo, Scout, ScoutProposal } from '../store/types.js';
+import type { Iteration, Repo, Scout, ScoutProposal } from '../store/types.js';
 import { isMasterSource, type MasterOrigin } from '../upgrade/source.js';
 import { lastUpgradeFailure, type UpgradeFailure } from '../upgrade/upgrader.js';
 import { errorMessage, nowIso } from '../util.js';
@@ -154,8 +161,21 @@ export interface FiledProposals {
   created: number;
   /** Of them, accepted without a human. */
   auto: number;
-  /** Of them, waiting for a human. */
+  /**
+   * Of them, waiting for a human; an iteration the scout planned that waits for a human counts
+   * as one more, accepted or turned down as a whole.
+   */
   pending: number;
+  /** The iteration the scout planned, once written out: `auto` when accepted without a human. */
+  iteration?: FiledIteration;
+}
+
+/** An iteration a scout planned, written out by its source. */
+export interface FiledIteration {
+  /** `Iteration.id`. */
+  id: string;
+  /** Accepted without a human, within the repo's auto_accept as a whole (`iterationKind`). */
+  auto: boolean;
 }
 
 /**
@@ -185,6 +205,30 @@ export interface ProposalSource<C extends ProposalSourceConfig> {
    * scout keeps them as they are once this returns.
    */
   file(scout: Scout, repo: Repo, cfg: C, proposals: ScoutProposal[]): Promise<FiledProposals>;
+  /**
+   * Write out the iteration the scout planned while the repo had none under way, with its steps,
+   * accepting it as a whole if the settings allow; null when nothing was written out. A source
+   * without it leaves planned iterations aside.
+   */
+  fileIteration?(
+    scout: Scout,
+    repo: Repo,
+    cfg: C,
+    iteration: PlannedIteration,
+  ): Promise<FiledIteration | null>;
+  /**
+   * Change the plan of the repo's iteration under way (`iteration`, as it is once the scout
+   * ended) as the scout says, the change checked against the plan the scout was shown
+   * (`updateProblems`). Called only while it is still under way. A source without it leaves the
+   * changes aside.
+   */
+  adjustIteration?(
+    scout: Scout,
+    repo: Repo,
+    cfg: C,
+    iteration: Iteration,
+    update: IterationUpdate,
+  ): Promise<void>;
   /** Called once the scout completed with its proposals filed. */
   completed?(repo: Repo, filed: FiledProposals): void;
   /**
@@ -569,6 +613,28 @@ export class Scouting {
   }
 
   /**
+   * The repo's iteration under way (pending, active or blocked), if any; a repo has at most one.
+   */
+  private openIteration(repoId: string): Iteration | null {
+    const open = this.deps.store.listIterations({
+      repoId,
+      status: ITERATION_OPEN_STATUSES,
+      limit: 1,
+    });
+    return open[0] ?? null;
+  }
+
+  /** What the iteration's digest reads of a Run of its steps; undefined once it is gone. */
+  private runOf(runId: string): ProposalRun | undefined {
+    try {
+      return this.deps.store.getRun(runId);
+    } catch (err) {
+      if (err instanceof NotFoundError) return undefined;
+      throw err;
+    }
+  }
+
+  /**
    * The Master's last failed upgrade if `repo` is the Master's own source, so that its scout
    * proposes fixing what the stable copy cannot build or start; null for every other repo.
    */
@@ -602,6 +668,8 @@ export class Scouting {
         );
       }
       const known = await source.known(scout, repo, cfg);
+      // With an iteration under way the scout follows it rather than planning another.
+      const open = this.openIteration(repo.id);
       // A repo whose template is gone gets no Runs anyway; such a scout is told nothing splits.
       const template = findTemplate(this.cfg, repo.name, cfg.template)?.template;
       const prompt = scoutPrompt({
@@ -613,6 +681,7 @@ export class Scouting {
         splits: template ? templateSplits(template) : false,
         autoAcceptsL: autoAcceptsL(cfg.auto_accept),
         upgrade: this.upgradeFailureFor(repo, known.github),
+        iteration: open ? iterationDigest(open, (id) => this.runOf(id)) : null,
       });
       // Read the target branch as committed, like a Run does, not whatever the main worktree has
       // checked out or left uncommitted. A detached worktree creates no branch.
@@ -661,11 +730,32 @@ export class Scouting {
             }),
         );
       }
-      const report = parseScoutReport(result.structured, result.finalMessage);
-      const proposals = report.proposals.slice(0, scoutCfg.max_proposals);
+      // Taken by the rules of what the scout was shown: with an iteration under way, only
+      // problems and a change to its plan; without one, a new iteration and no change.
+      const report = keptReport(
+        parseScoutReport(result.structured, result.finalMessage),
+        open,
+        scoutCfg.max_proposals,
+      );
+      const proposals = report.proposals;
       // Kept before the proposals are filed, so that a scout cut short there still shows them.
       store.updateScout(scout.id, { gaps: report.gaps });
-      const filed = await source.file(scout, repo, cfg, proposals);
+      let filed = await source.file(scout, repo, cfg, proposals);
+      if (report.iteration && source.fileIteration) {
+        const iteration = await source.fileIteration(scout, repo, cfg, report.iteration);
+        // Accepted or turned down as a whole: one more for a human to decide while it waits.
+        if (iteration) {
+          filed = { ...filed, iteration, pending: filed.pending + (iteration.auto ? 0 : 1) };
+        }
+      }
+      if (open && report.iterationUpdate && source.adjustIteration) {
+        // Changed only while it is still under way: it may have ended while the scout ran.
+        const current = this.openIteration(repo.id);
+        if (current?.id === open.id) {
+          await source.adjustIteration(scout, repo, cfg, current, report.iterationUpdate);
+        }
+      }
+      const iteration = filed.iteration;
       store.tx(() => {
         store.updateScout(scout.id, { status: 'completed', proposals, endedAt: nowIso() });
         store.event(null, 'scout.completed', {
@@ -673,8 +763,10 @@ export class Scouting {
           repo: repo.name,
           created: filed.created,
           auto: filed.auto,
-          /** Proposals that wait for a human. */
+          /** Proposals that wait for a human, an iteration waiting to be accepted included. */
           pending: filed.pending,
+          // The iteration the scout planned, once written out.
+          ...(iteration ? { iteration: { id: iteration.id, auto: iteration.auto } } : {}),
           // Decided on the dashboard rather than on GitHub (see noticeFor).
           ...(source.kind === 'local' ? { backlog: true } : {}),
         });

@@ -1,9 +1,12 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import type { ProposalSource } from '../src/backlog/scouting.js';
+import type { BacklogRepoConfig } from '../src/config/schema.js';
 import { InvalidStateError } from '../src/engine/engine.js';
+import type { IterationUpdate, PlannedIteration } from '../src/github/scout.js';
 import { setLang } from '../src/i18n.js';
 import { noticeFor } from '../src/notify/notice.js';
 import { NotFoundError } from '../src/store/store.js';
-import type { Proposal, Run } from '../src/store/types.js';
+import type { IterationChild, Proposal, Run } from '../src/store/types.js';
 import { FakeGitHub, type Harness, harness, TEST_AGENTS_YAML, waitFor } from './helpers.js';
 
 const AGENTS = `${TEST_AGENTS_YAML}
@@ -50,6 +53,7 @@ const proposal = (title: string, risk: 'low' | 'mid' | 'high', size: 'S' | 'M' |
   category: 'improvement',
   size,
   risk,
+  lead: 'problem',
   why: `${title}的原因`,
   evidence: ['run_abc 返工了 3 轮'],
   what: `${title}的做法`,
@@ -439,5 +443,205 @@ backlog:
 
     const text = [prompt, notice?.title, notice?.body, waiting, ...errors].join('\n');
     expect(text).not.toMatch(/[一-鿿]/);
+  });
+});
+
+describe('scouting with iterations', () => {
+  /** A step of a planned iteration as a scout writes it. */
+  const plannedStep = (title: string, patch: Record<string, unknown> = {}) => ({
+    ...proposal(title, 'low', 'M'),
+    category: 'feature',
+    criteria: [1],
+    dependsOn: [],
+    closeout: false,
+    ...patch,
+  });
+  const { lead: _lead, ...requirement } = proposal('补上的一步', 'low');
+  const ITERATION = {
+    title: '不接 GitHub 的仓库也能永动',
+    goal: '没有接 GitHub 的仓库，也能自己提需求、自己做完',
+    readmeGoal: '永动',
+    criteria: ['本地仓库能自己跑完一轮'],
+    outOfScope: [],
+    children: [
+      plannedStep('本地提案池'),
+      plannedStep('整理评审建议', { criteria: [], dependsOn: [1], closeout: true }),
+    ],
+  };
+  const UPDATE = {
+    note: '第 1 步失败了，换个做法',
+    add: [{ ...requirement, criteria: [1], dependsOn: [], replaces: 1 }],
+  };
+  const LEADS = [
+    proposal('卡住的 Run', 'low'),
+    { ...proposal('能力缺口', 'low'), lead: 'gap' },
+    { ...proposal('明显的缺陷', 'low'), lead: 'defect' },
+    proposal('又一个卡住的', 'low'),
+  ];
+
+  /**
+   * A source of the local backlog that records what the scout hands it: the proposals filed, the
+   * iterations planned (kept as pending iterations of the store) and the changes to plans.
+   */
+  function recordingSource(t: Harness) {
+    const filed: string[][] = [];
+    const planned: PlannedIteration[] = [];
+    const changes: { iteration: string; update: IterationUpdate }[] = [];
+    const source: ProposalSource<BacklogRepoConfig> = {
+      kind: 'local',
+      configPath: (name) => `backlog.repos.${name}`,
+      pollMinutes: () => 5,
+      prepareScout: async () => '',
+      known: async () => ({ issues: '（无）', github: null }),
+      file: async (_scout, _repo, _cfg, proposals) => {
+        filed.push(proposals.map((p) => p.title));
+        return { created: proposals.length, auto: 0, pending: proposals.length };
+      },
+      fileIteration: async (scout, repo, _cfg, iteration) => {
+        planned.push(iteration);
+        const row = t.master.store.createIteration({
+          repoId: repo.id,
+          scoutId: scout.id,
+          source: 'local',
+          issuesRepo: '',
+          title: iteration.title,
+          goal: iteration.goal,
+          readmeGoal: iteration.readmeGoal,
+          criteria: iteration.criteria,
+          outOfScope: iteration.outOfScope,
+          children: [],
+        });
+        return { id: row.id, auto: false };
+      },
+      adjustIteration: async (_scout, _repo, _cfg, iteration, update) => {
+        changes.push({ iteration: iteration.id, update });
+      },
+      holdingProposals: async () => 0,
+    };
+    return { source, filed, planned, changes };
+  }
+
+  /** A scout of demo through `source`, once it has ended. */
+  async function scoutWith(t: Harness, source: ProposalSource<BacklogRepoConfig>) {
+    const cfg = t.master.config.master.backlog?.repos.demo as BacklogRepoConfig;
+    const scout = await t.master.scouting.startScout(source, t.repo, cfg, 'manual');
+    return scoutDone(t, scout.id);
+  }
+
+  /** An iteration of demo under way, its first step failed. */
+  function underWay(t: Harness) {
+    const step = (position: number, patch: Partial<IterationChild>): IterationChild => ({
+      ...plannedStep(`第 ${position} 步`),
+      category: 'feature',
+      size: 'M',
+      risk: 'low',
+      position,
+      status: 'waiting',
+      runIds: [],
+      ...patch,
+    });
+    return t.master.store.createIteration({
+      repoId: t.repo.id,
+      scoutId: null,
+      source: 'local',
+      issuesRepo: '',
+      title: '进行中的迭代',
+      goal: '能做到一件新事',
+      readmeGoal: '永动',
+      criteria: ['能演示'],
+      outOfScope: [],
+      children: [
+        step(1, { status: 'failed', proposalId: 'proposal-1' }),
+        step(2, { dependsOn: [1], criteria: [], closeout: true, proposalId: 'proposal-2' }),
+      ],
+      status: 'blocked',
+    });
+  }
+
+  it('plans an iteration without one under way, counted once among those waiting for a human', async () => {
+    const t = await start();
+    const { source, filed, planned, changes } = recordingSource(t);
+    t.scripts.scout = () => ({
+      structured: { gaps: [], proposals: LEADS, iteration: ITERATION, iterationUpdate: UPDATE },
+    });
+    const scout = await scoutWith(t, source);
+    expect(scout.status).toBe('completed');
+    expect(lastScoutPrompt(t)).toContain('## 规划迭代');
+    expect(lastScoutPrompt(t)).not.toContain('## 进行中的迭代');
+    // Every lead, up to max_proposals; the steps of the iteration do not count toward it.
+    expect(filed).toEqual([['卡住的 Run', '能力缺口', '明显的缺陷']]);
+    expect(scout.proposals.map((p) => p.lead)).toEqual(['problem', 'gap', 'defect']);
+    expect(planned.map((p) => [p.title, p.children.length])).toEqual([
+      ['不接 GitHub 的仓库也能永动', 2],
+    ]);
+    // No plan to change.
+    expect(changes).toEqual([]);
+    const [iteration] = t.master.store.listIterations({ repoId: t.repo.id });
+    expect(eventData(t, 'scout.completed')).toEqual([
+      expect.objectContaining({
+        created: 3,
+        auto: 0,
+        pending: 4,
+        iteration: { id: iteration?.id, auto: false },
+      }),
+    ]);
+  });
+
+  it('follows the iteration under way: problems only, no other iteration, its plan changed', async () => {
+    const t = await start();
+    const open = underWay(t);
+    const { source, filed, planned, changes } = recordingSource(t);
+    t.scripts.scout = () => ({
+      structured: { gaps: [], proposals: LEADS, iteration: ITERATION, iterationUpdate: UPDATE },
+    });
+    const scout = await scoutWith(t, source);
+    expect(scout.status).toBe('completed');
+    const prompt = lastScoutPrompt(t);
+    expect(prompt).toContain('## 进行中的迭代');
+    expect(prompt).toContain('- 标题：进行中的迭代\n- 状态：受阻');
+    expect(prompt).toContain('  1. proposal-1 第 1 步（失败；推进完成标准 1）');
+    expect(prompt).not.toContain('## 规划迭代');
+    expect(filed).toEqual([['卡住的 Run', '又一个卡住的']]);
+    expect(planned).toEqual([]);
+    expect(changes).toEqual([
+      {
+        iteration: open.id,
+        update: {
+          note: '第 1 步失败了，换个做法',
+          add: [expect.objectContaining({ replaces: 1 })],
+        },
+      },
+    ]);
+    expect(eventData(t, 'scout.completed')).toEqual([
+      expect.not.objectContaining({ iteration: expect.anything() }),
+    ]);
+  });
+
+  it('fails a scout whose change does not fit the plan, filing nothing', async () => {
+    const t = await start();
+    underWay(t);
+    const { source, filed, changes } = recordingSource(t);
+    const update = { ...UPDATE, add: [{ ...UPDATE.add[0], replaces: 2 }] };
+    t.scripts.scout = () => ({
+      structured: { gaps: [], proposals: LEADS, iteration: null, iterationUpdate: update },
+    });
+    const scout = await scoutWith(t, source);
+    expect(scout.status).toBe('failed');
+    expect(scout.error).toBe(
+      '侦察结果不符合约定：iterationUpdate: 追加的第 1 个子项（序号 3）不能替换第 2 个子项：它是收尾子项',
+    );
+    expect(filed).toEqual([]);
+    expect(changes).toEqual([]);
+  });
+
+  it('leaves the iteration aside in a source that cannot file one yet', async () => {
+    const t = await start();
+    t.scripts.scout = () => ({
+      structured: { gaps: [], proposals: LEADS.slice(0, 1), iteration: ITERATION },
+    });
+    const scout = await scoutByHand(t);
+    expect(scout.status).toBe('completed');
+    expect(proposalsOf(t).map((p) => p.title)).toEqual(['卡住的 Run']);
+    expect(t.master.store.listIterations({ repoId: t.repo.id })).toEqual([]);
   });
 });

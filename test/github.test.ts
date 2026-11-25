@@ -151,6 +151,7 @@ const proposal = (title: string, risk: 'low' | 'mid' | 'high', size: 'S' | 'M' |
   category: 'improvement',
   size,
   risk,
+  lead: 'problem' as const,
   why: `${title}的原因`,
   evidence: ['run_abc 返工了 3 轮'],
   what: `${title}的做法`,
@@ -928,26 +929,26 @@ describe('issues: scout', () => {
     );
     expect(planning).toContain('planning: auto');
 
-    // The coding stage plans and L is within auto_accept: one proposal of size L.
+    // The coding stage plans and L is within auto_accept: one step of size L.
     const splits = await scoutPromptOf(await start(config({ maxRisk: 'high' }), planning));
     expect(splits).toContain('这个仓库用的模板能拆分大需求');
-    expect(splits).toContain('作为一条提案，size 标 L，不要拆成几个 issue');
-    expect(splits).toContain('风险在自动采纳范围内的 L 提案也会被自动采纳。');
+    expect(splits).toContain('作为一个子项，size 标 L，不要拆成几个子项');
+    expect(splits).toContain('风险在自动采纳范围内时，有 L 子项的迭代也会被自动采纳。');
     expect(splits).not.toContain('尽量是 S 或 M');
     await h?.close();
 
-    // No stage plans, and max_size keeps L for a human: the first step only, and L waits.
+    // No stage plans, and max_size keeps L for a human: steps of S or M, and L waits.
     const whole = await scoutPromptOf(await start(config({ maxRisk: 'high', maxSize: 'M' })));
     expect(whole).toContain('这个仓库用的模板不拆分需求');
-    expect(whole).toContain('这次只提第一步，size 尽量是 S 或 M');
-    expect(whole).toContain('L 的提案不会被自动采纳，要等人处理。');
+    expect(whole).toContain('每个子项都整个交给一个 Run 一次做完，size 尽量是 S 或 M');
+    expect(whole).toContain('有一个子项是 L，整个迭代就不会被自动采纳，要等人采纳。');
     expect(whole).not.toContain('size 标 L');
     await h?.close();
 
     // max_risk: none accepts nothing, L included.
     const none = await scoutPromptOf(await start(config({ maxRisk: 'none' }), planning));
     expect(none).toContain('这个仓库用的模板能拆分大需求');
-    expect(none).toContain('L 的提案不会被自动采纳，要等人处理。');
+    expect(none).toContain('有一个子项是 L，整个迭代就不会被自动采纳，要等人采纳。');
   });
 
   it('stops auto-accepting once the daily budget is spent', async () => {
