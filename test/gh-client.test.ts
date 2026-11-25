@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { GhCli, GhError } from '../src/github/client.js';
 import { isTrusted } from '../src/github/issues.js';
 import { setLang } from '../src/i18n.js';
-import { git, initRepo, tmpDir, writeFile } from './helpers.js';
+import { FakeGitHub, git, initRepo, tmpDir, writeFile } from './helpers.js';
 
 // A stand-in `gh` that records every call (arguments, stdin, GH_TOKEN, working directory) in
 // calls.jsonl next to it and answers from responses.json: the first response whose `when` is a
@@ -640,6 +640,185 @@ describe('GhCli writes', () => {
   });
 });
 
+const PR_FIELDS =
+  'number,url,state,mergeable,mergeCommit,headRefName,baseRefName,isCrossRepository';
+const PULL_9 = 'https://github.com/acme/widgets/pull/9';
+
+/** A pull request as `gh pr list/view --json` prints it. */
+function rawPull(fields: Record<string, unknown> = {}) {
+  return {
+    number: 9,
+    url: PULL_9,
+    state: 'OPEN',
+    mergeable: 'MERGEABLE',
+    mergeCommit: null,
+    headRefName: 'ares1/run-1',
+    baseRefName: 'main',
+    isCrossRepository: false,
+    ...fields,
+  };
+}
+
+describe('GhCli pull requests', () => {
+  it('createPullRequest passes head, base and title as arguments and the body through stdin', async () => {
+    const body = '改动摘要\n\nCloses #7\n';
+    const gh = fakeGh([
+      {
+        when: ['pr', 'create'],
+        stdout: `\nCreating pull request for ares1/run-1 into main in acme/widgets\n\n${PULL_9}\n`,
+      },
+    ]);
+    const created = await new GhCli(gh.bin).createPullRequest('acme/widgets', {
+      head: 'ares1/run-1',
+      base: 'main',
+      title: 'A title',
+      body,
+    });
+    expect(created).toEqual({ number: 9, url: PULL_9 });
+    expect(gh.calls()).toMatchObject([
+      {
+        args: [
+          'pr',
+          'create',
+          '-R',
+          'acme/widgets',
+          '--head',
+          'ares1/run-1',
+          '--base',
+          'main',
+          '--title',
+          'A title',
+          '--body-file',
+          '-',
+        ],
+        stdin: body,
+      },
+    ]);
+  });
+
+  it('createPullRequest fails when gh prints no pull request link', async () => {
+    const gh = fakeGh([
+      { when: ['pr', 'create'], stdout: 'https://github.com/acme/widgets/issues/9\n' },
+      {
+        when: ['pr', 'create'],
+        stderr: 'a pull request for branch "ares1/run-1" into branch "main" already exists\n',
+        code: 1,
+      },
+    ]);
+    const cli = new GhCli(gh.bin);
+    const pr = { head: 'ares1/run-1', base: 'main', title: 't', body: 'b' };
+    expect((await ghError(cli.createPullRequest('acme/widgets', pr))).message).toBe(
+      'gh pr create 没有返回 PR 链接：https://github.com/acme/widgets/issues/9',
+    );
+    expect((await ghError(cli.createPullRequest('acme/widgets', pr))).message).toBe(
+      'gh pr create 失败：a pull request for branch "ares1/run-1" into branch "main" already exists',
+    );
+  });
+
+  it("findOpenPullRequest finds the head branch's open pull request of the repo itself", async () => {
+    const gh = fakeGh([
+      { when: ['pr', 'list'], stdout: '[]\n' },
+      {
+        when: ['pr', 'list'],
+        // A fork's branch of the same name comes first: it is not the Run's.
+        stdout: JSON.stringify([
+          rawPull({ number: 3, isCrossRepository: true }),
+          rawPull({ mergeable: 'CONFLICTING' }),
+        ]),
+      },
+      { when: ['pr', 'list'], stdout: JSON.stringify([rawPull({ isCrossRepository: true })]) },
+    ]);
+    const cli = new GhCli(gh.bin);
+    expect(await cli.findOpenPullRequest('acme/widgets', 'ares1/run-1')).toBeNull();
+    expect(await cli.findOpenPullRequest('acme/widgets', 'ares1/run-1')).toEqual({
+      number: 9,
+      url: PULL_9,
+      state: 'open',
+      mergeable: false,
+      mergeCommit: null,
+      headRefName: 'ares1/run-1',
+      baseRefName: 'main',
+    });
+    expect(await cli.findOpenPullRequest('acme/widgets', 'ares1/run-1')).toBeNull();
+    const args = [
+      'pr',
+      'list',
+      '-R',
+      'acme/widgets',
+      '--head',
+      'ares1/run-1',
+      '--state',
+      'open',
+      '--json',
+      PR_FIELDS,
+      '--limit',
+      '100',
+    ];
+    expect(gh.calls().map((c) => c.args)).toEqual([args, args, args]);
+  });
+
+  it('getPullRequest reads open, merged and closed pull requests', async () => {
+    const merge = 'a'.repeat(40);
+    const gh = fakeGh([
+      { when: ['pr', 'view', '9'], stdout: JSON.stringify(rawPull({ mergeable: 'UNKNOWN' })) },
+      {
+        when: ['pr', 'view', '9'],
+        stdout: JSON.stringify(rawPull({ state: 'MERGED', mergeCommit: { oid: merge } })),
+      },
+      {
+        when: ['pr', 'view', '9'],
+        stdout: JSON.stringify(rawPull({ state: 'CLOSED', mergeable: 'MERGEABLE' })),
+      },
+    ]);
+    const cli = new GhCli(gh.bin);
+    const pull = {
+      number: 9,
+      url: PULL_9,
+      mergeCommit: null,
+      headRefName: 'ares1/run-1',
+      baseRefName: 'main',
+    };
+    expect(await cli.getPullRequest('acme/widgets', 9)).toEqual({
+      ...pull,
+      state: 'open',
+      mergeable: null,
+    });
+    expect(await cli.getPullRequest('acme/widgets', 9)).toEqual({
+      ...pull,
+      state: 'merged',
+      mergeable: true,
+      mergeCommit: merge,
+    });
+    expect(await cli.getPullRequest('acme/widgets', 9)).toEqual({
+      ...pull,
+      state: 'closed',
+      mergeable: true,
+    });
+    expect(gh.calls().map((c) => c.args)).toEqual(
+      Array(3).fill(['pr', 'view', '9', '-R', 'acme/widgets', '--json', PR_FIELDS]),
+    );
+  });
+
+  it('throws a GhError for what gh prints that it cannot read', async () => {
+    const gh = fakeGh([
+      { when: ['pr', 'view'], stdout: '<html>proxy</html>' },
+      { when: ['pr', 'view'], stdout: JSON.stringify(rawPull({ state: 'DRAFT', number: '9' })) },
+      { when: ['pr', 'list'], stdout: JSON.stringify(rawPull()) },
+    ]);
+    const cli = new GhCli(gh.bin);
+    expect((await ghError(cli.getPullRequest('acme/widgets', 9))).message).toBe(
+      'gh pr view 返回的不是 JSON：<html>proxy</html>',
+    );
+    expect((await ghError(cli.getPullRequest('acme/widgets', 9))).message).toMatch(
+      /^gh pr view 返回的数据无法识别（number, state）：/,
+    );
+    // A list is expected, not one pull request.
+    expect((await ghError(cli.findOpenPullRequest('acme/widgets', 'b'))).message).toMatch(
+      /^gh pr list 返回的数据无法识别（\$）：/,
+    );
+  });
+});
+
 describe('GhCli with an account', () => {
   it('acts as the account through GH_TOKEN and asks gh for the token every 10 minutes', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
@@ -791,6 +970,59 @@ describe('GhCli push', () => {
     expect(git(bare, 'rev-parse', 'refs/heads/ares1/run-2')).toBe(git(clone, 'rev-parse', 'HEAD'));
   });
 
+  it("force-pushes a Run's branch whose history was rewritten, and no other branch", async () => {
+    const clone = initRepo();
+    git(clone, 'checkout', '-q', '-b', 'ares1/run-3');
+    writeFile(join(clone, 'a.txt'), 'a\n');
+    git(clone, 'add', '-A');
+    git(clone, 'commit', '-q', '-m', 'a');
+    const remotes = localGitHub();
+    const bare = join(remotes, 'widgets.git');
+    mkdirSync(bare);
+    git(bare, 'init', '-q', '--bare');
+    const cli = new GhCli(fakeGh([]).bin);
+    await cli.push(clone, 'acme/widgets', 'ares1/run-3');
+
+    // Rolled back and done again: no longer a fast-forward of what GitHub has.
+    git(clone, 'reset', '-q', '--hard', 'HEAD~1');
+    writeFile(join(clone, 'b.txt'), 'b\n');
+    git(clone, 'add', '-A');
+    git(clone, 'commit', '-q', '-m', 'b');
+    const refused = await ghError(cli.push(clone, 'acme/widgets', 'ares1/run-3'));
+    expect(refused.message).toMatch(/^推送 ares1\/run-3 到 acme\/widgets 失败：/);
+    await cli.push(clone, 'acme/widgets', 'ares1/run-3', { force: true });
+    expect(git(bare, 'rev-parse', 'refs/heads/ares1/run-3')).toBe(git(clone, 'rev-parse', 'HEAD'));
+
+    // Never a target branch, nor any branch that is not a Run's: refused before git runs.
+    const calls = fakeGit();
+    for (const branch of ['main', 'feature/ares1/x', 'ares1']) {
+      const err = await ghError(cli.push(clone, 'acme/widgets', branch, { force: true }));
+      expect(err.message).toBe(`只能强制推送 ares1/ 开头的 Run 分支，不能强制推送 ${branch}`);
+    }
+    expect(calls()).toEqual([]);
+  });
+
+  it('adds + to the refspec of a force push', async () => {
+    const calls = fakeGit();
+    const cli = new GhCli(fakeGh([]).bin);
+    await ghError(cli.push(tmpDir(), 'acme/widgets', 'ares1/run-4', { force: true }));
+    await ghError(cli.push(tmpDir(), 'acme/widgets', 'ares1/run-4', { force: false }));
+    expect(calls().map((c) => c.args.slice(4))).toEqual([
+      [
+        'push',
+        '-q',
+        'https://github.com/acme/widgets.git',
+        '+refs/heads/ares1/run-4:refs/heads/ares1/run-4',
+      ],
+      [
+        'push',
+        '-q',
+        'https://github.com/acme/widgets.git',
+        'refs/heads/ares1/run-4:refs/heads/ares1/run-4',
+      ],
+    ]);
+  });
+
   it('reports what git wrote to stderr when the push fails', async () => {
     const clone = initRepo();
     const remotes = localGitHub();
@@ -901,11 +1133,15 @@ describe('GhCli in English', () => {
       gql({ repository: { issue: null } }),
       { when: ['issue', 'create'], stdout: 'oops\n' },
       { when: ['auth', 'token'], stdout: 'tok\n' },
+      { when: ['pr', 'create'], stdout: 'oops\n' },
+      { when: ['pr', 'view'], stdout: '<html>proxy</html>' },
+      { when: ['pr', 'list'], stdout: '{}' },
     ]);
     const cli = new GhCli(gh.bin);
     // One client for the push and the fetch: it asks gh for the token once.
     const bot = new GhCli(gh.bin, 'ares1-bot');
     fakeGit();
+    const pr = { head: 'ares1/run-1', base: 'main', title: 't', body: 'b' };
 
     const messages = [
       (await ghError(cli.viewer())).message,
@@ -917,6 +1153,10 @@ describe('GhCli in English', () => {
         .message,
       (await ghError(bot.push(tmpDir(), 'acme/widgets', 'b1'))).message,
       (await ghError(bot.fetch(tmpDir(), 'acme/widgets', 'b1'))).message,
+      (await ghError(cli.createPullRequest('acme/widgets', pr))).message,
+      (await ghError(cli.getPullRequest('acme/widgets', 9))).message,
+      (await ghError(cli.findOpenPullRequest('acme/widgets', 'ares1/run-1'))).message,
+      (await ghError(cli.push(tmpDir(), 'acme/widgets', 'main', { force: true }))).message,
     ];
     expect(messages).toEqual([
       'gh api user failed: HTTP 401: Bad credentials',
@@ -927,7 +1167,142 @@ describe('GhCli in English', () => {
       'gh issue create returned no issue link: oops',
       'Pushing b1 to acme/widgets failed: fatal: Authentication failed for https://github.com/acme/widgets.git/',
       'Fetching b1 from acme/widgets failed: fatal: Authentication failed for https://github.com/acme/widgets.git/',
+      'gh pr create returned no pull request link: oops',
+      'gh pr view returned no JSON: <html>proxy</html>',
+      'gh pr list returned data it cannot read ($): {}',
+      "Only a Run's branch (ares1/...) may be force-pushed, not main",
     ]);
     for (const message of messages) expect(message).not.toMatch(CJK);
+  });
+});
+
+// The stand-in the engine's and bridge's tests deliver through: it must refuse what GitHub does.
+describe('FakeGitHub pull requests', () => {
+  /** A commit on `branch` of the clone, which is checked out afterwards. */
+  function commit(clone: string, branch: string, file: string): string {
+    git(clone, 'checkout', '-q', '-B', branch);
+    writeFile(join(clone, file), `${file}\n`);
+    git(clone, 'add', '-A');
+    git(clone, 'commit', '-q', '-m', file);
+    return git(clone, 'rev-parse', 'HEAD');
+  }
+
+  it("keeps the Runs' branches apart from the target branch, and force-pushes only them", async () => {
+    const clone = initRepo();
+    const gh = new FakeGitHub();
+    const first = commit(clone, 'ares1/run-1', 'a.txt');
+    await gh.push(clone, 'me/demo', 'ares1/run-1');
+    expect(gh.remoteBranches).toEqual(new Map([['ares1/run-1', first]]));
+    // The target branch's record is untouched.
+    expect(gh.pushes).toEqual([]);
+    expect(gh.remoteHead).toBeNull();
+
+    // History rewritten: refused unless forced.
+    git(clone, 'reset', '-q', '--hard', 'main');
+    const second = commit(clone, 'ares1/run-1', 'b.txt');
+    await expect(gh.push(clone, 'me/demo', 'ares1/run-1')).rejects.toThrow(/not a fast-forward/);
+    await gh.push(clone, 'me/demo', 'ares1/run-1', { force: true });
+    expect(gh.remoteBranches.get('ares1/run-1')).toBe(second);
+    await expect(gh.push(clone, 'me/demo', 'main', { force: true })).rejects.toThrow();
+
+    await gh.push(clone, 'me/demo', 'main');
+    expect(gh.pushes).toEqual([git(clone, 'rev-parse', 'main')]);
+    expect(gh.calls).toEqual([
+      'push ares1/run-1',
+      'push ares1/run-1',
+      'push ares1/run-1',
+      'push main',
+      'push main',
+    ]);
+  });
+
+  it('numbers pull requests with the issues, and merges and closes them as GitHub does', async () => {
+    const clone = initRepo();
+    const gh = new FakeGitHub();
+    const issue = gh.add({ title: 'Add a' });
+    const other = gh.add({ title: 'Add b' });
+    const pr = (head: string, body: string) => ({ head, base: 'main', title: head, body });
+
+    // Only from a branch GitHub has, and one open pull request per branch.
+    await expect(
+      gh.createPullRequest('me/demo', pr('ares1/run-1', `Closes #${issue.number}`)),
+    ).rejects.toThrow(/no branch ares1\/run-1/);
+    const head = commit(clone, 'ares1/run-1', 'a.txt');
+    await gh.push(clone, 'me/demo', 'ares1/run-1');
+    expect(await gh.findOpenPullRequest('me/demo', 'ares1/run-1')).toBeNull();
+    const created = await gh.createPullRequest(
+      'me/demo',
+      pr('ares1/run-1', `摘要\n\nCloses #${issue.number}\n`),
+    );
+    expect(created).toEqual({ number: 3, url: 'https://github.com/me/demo/pull/3' });
+    await expect(gh.createPullRequest('me/demo', pr('ares1/run-1', 'again'))).rejects.toThrow(
+      /already exists/,
+    );
+    const open = {
+      number: 3,
+      url: 'https://github.com/me/demo/pull/3',
+      state: 'open',
+      mergeable: true,
+      mergeCommit: null,
+      headRefName: 'ares1/run-1',
+      baseRefName: 'main',
+    };
+    expect(await gh.findOpenPullRequest('me/demo', 'ares1/run-1')).toEqual(open);
+    expect(await gh.getPullRequest('me/demo', 3)).toEqual(open);
+    // The next issue comes after the pull request.
+    expect(gh.add({ title: 'later' }).number).toBe(4);
+
+    // Merged by a human: GitHub's main moves and the issue the body closes is completed.
+    gh.mergePull(3, head);
+    expect(await gh.getPullRequest('me/demo', 3)).toMatchObject({
+      state: 'merged',
+      mergeCommit: head,
+    });
+    expect(await gh.findOpenPullRequest('me/demo', 'ares1/run-1')).toBeNull();
+    expect(await gh.fetch(clone, 'me/demo', 'main')).toBe(head);
+    expect(gh.get(issue.number)).toMatchObject({ state: 'closed', stateReason: 'completed' });
+    expect(gh.get(other.number).state).toBe('open');
+
+    // Closed without merging: the issue it names stays open.
+    commit(clone, 'ares1/run-2', 'b.txt');
+    await gh.push(clone, 'me/demo', 'ares1/run-2');
+    const closed = await gh.createPullRequest(
+      'me/demo',
+      pr('ares1/run-2', `Closes #${other.number}`),
+    );
+    gh.closePull(closed.number);
+    expect(await gh.getPullRequest('me/demo', closed.number)).toMatchObject({
+      state: 'closed',
+      mergeCommit: null,
+    });
+    expect(gh.get(other.number).state).toBe('open');
+    // A new pull request from the same branch may be opened again.
+    await gh.createPullRequest('me/demo', pr('ares1/run-2', 'again'));
+
+    expect(gh.calls.filter((c) => !c.startsWith('push') && !c.startsWith('fetch'))).toEqual([
+      'createPull ares1/run-1',
+      'findPull ares1/run-1',
+      'createPull ares1/run-1',
+      'createPull ares1/run-1',
+      'findPull ares1/run-1',
+      'getPull #3',
+      'getPull #3',
+      'findPull ares1/run-1',
+      'createPull ares1/run-2',
+      `getPull #${closed.number}`,
+      'createPull ares1/run-2',
+    ]);
+  });
+
+  it('fails the calls a test asks it to', async () => {
+    const gh = new FakeGitHub();
+    gh.failing.set('getPull #1', 'boom');
+    await expect(gh.getPullRequest('me/demo', 1)).rejects.toThrow('boom');
+    gh.failWith = 'down';
+    await expect(gh.findOpenPullRequest('me/demo', 'ares1/run-1')).rejects.toThrow('down');
+    await expect(
+      gh.createPullRequest('me/demo', { head: 'ares1/run-1', base: 'main', title: 't', body: 'b' }),
+    ).rejects.toThrow('down');
+    expect(gh.calls).toEqual(['getPull #1', 'findPull ares1/run-1', 'createPull ares1/run-1']);
   });
 });

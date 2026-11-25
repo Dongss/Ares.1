@@ -47,6 +47,7 @@ defaults:
 #         # max_per_day: 3       # 每天最多自动采纳几条；不写 = 不限
 #       auto_merge: false        # true = 从 issue 来的 Run 合并前不等人审批
 #       push: false              # true = 合并后把目标分支推送到 GitHub，每轮检查时也把 GitHub 上的新提交快进到本地目标分支
+#       deliver: push            # push（默认）= 合并进本地目标分支后推送；pr = 推送 Run 分支并开 PR，PR 在 GitHub 上合并后 Run 才完成，适合目标分支受保护、要走 PR 或 CI 的仓库；pr 要求 push: true
 #       daily_budget_usd: 20     # 可选：当天侦察、自动采纳的 Run 和自动重做的 Run 花费达到后停止自动行为；不写 = 不限
 #       max_run_attempts: 3      # 一个 issue 最多跑几次 Run（含第一次）：失败后自动重做，带上失败原因；用完就关闭 issue 并写明每次的原因；1 = 不重做
 
@@ -99,6 +100,7 @@ defaults:
 #         # max_per_day: 3       # at most this many automatic accepts a day; omitted = no limit
 #       auto_merge: false        # true = Runs from issues merge without waiting for approval
 #       push: false              # true = push the target branch to GitHub after merging, and fast-forward it to new commits on GitHub at every check
+#       deliver: push            # push (default) = merge into the local target branch, then push it; pr = push the Run's branch and open a pull request, and the Run completes once it is merged on GitHub: for target branches that are protected or need a PR or CI; pr needs push: true
 #       daily_budget_usd: 20     # optional: stop automatic actions once the day's scouts, auto-accepted Runs and automatic redos cost this much; omitted = no limit
 #       max_run_attempts: 3      # Runs an issue gets at most, the first included: a failed Run is redone automatically with its reason; once they are used up, the issue is closed with every reason; 1 = never redone
 

@@ -3,7 +3,14 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { FakeAdapter, type FakeContext, type FakeOutcome } from '../src/adapters/fake.js';
-import type { GhComment, GhIssue, GitHub, LabelDef } from '../src/github/client.js';
+import {
+  forcePushable,
+  type GhComment,
+  type GhIssue,
+  type GhPullRequest,
+  type GitHub,
+  type LabelDef,
+} from '../src/github/client.js';
 import { Master, type MasterOptions } from '../src/master.js';
 import type { Repo, Run, RunStatus } from '../src/store/types.js';
 
@@ -311,6 +318,15 @@ export interface FakeIssue extends Omit<GhIssue, 'comments'> {
   commentAuthors: (FakeAuthor | undefined)[];
 }
 
+/** A pull request as FakeGitHub keeps it: what the client returns, with what it was opened with. */
+export interface FakePull extends GhPullRequest {
+  title: string;
+  body: string;
+}
+
+/** Issues a merged pull request's body closes on GitHub: "Closes #3", "fixes #4", ... */
+const CLOSING_REFS = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)\b/gi;
+
 /** GitHub in memory: issues of one repo, "me/demo". */
 export class FakeGitHub implements GitHub {
   readonly issues = new Map<number, FakeIssue>();
@@ -457,9 +473,28 @@ export class FakeGitHub implements GitHub {
   /** Branch heads pushed, in order. */
   readonly pushes: string[] = [];
 
-  async push(path: string, _repo: string, branch: string): Promise<void> {
+  /** The Runs' branches (ares1/...) on GitHub and the commits they point at, as pushed. */
+  readonly remoteBranches = new Map<string, string>();
+
+  async push(
+    path: string,
+    _repo: string,
+    branch: string,
+    opts: { force?: boolean } = {},
+  ): Promise<void> {
     this.call(`push ${branch}`);
+    if (opts.force && !forcePushable(branch)) throw new Error(`push ${branch}: no force allowed`);
     const head = execFileSync('git', ['rev-parse', branch], { cwd: path, encoding: 'utf8' }).trim();
+    if (branch.startsWith('ares1/')) {
+      // A Run's branch, kept apart from the target branch's remoteHead and pushes.
+      const before = this.remoteBranches.get(branch);
+      if (before !== undefined && !opts.force) {
+        const ff = spawnSync('git', ['merge-base', '--is-ancestor', before, head], { cwd: path });
+        if (ff.status !== 0) throw new Error(`push ${branch} rejected: not a fast-forward`);
+      }
+      this.remoteBranches.set(branch, head);
+      return;
+    }
     if (this.remoteMissing) {
       // The push creates the branch on GitHub.
       this.remoteMissing = false;
@@ -502,4 +537,90 @@ export class FakeGitHub implements GitHub {
     issue.state = 'closed';
     issue.stateReason = reason;
   }
+
+  /** Pull requests by number; numbered from the same counter as issues, as on GitHub. */
+  readonly pulls = new Map<number, FakePull>();
+
+  pull(number: number): FakePull {
+    const pull = this.pulls.get(number);
+    if (!pull) throw new Error(`no pull request #${number}`);
+    return pull;
+  }
+
+  async findOpenPullRequest(_repo: string, head: string): Promise<GhPullRequest | null> {
+    this.call(`findPull ${head}`);
+    const open = [...this.pulls.values()].find((p) => p.state === 'open' && p.headRefName === head);
+    return open ? pullView(open) : null;
+  }
+
+  async createPullRequest(
+    _repo: string,
+    pr: { head: string; base: string; title: string; body: string },
+  ): Promise<{ number: number; url: string }> {
+    this.call(`createPull ${pr.head}`);
+    // GitHub refuses a pull request from a branch it does not have, or a second open one.
+    if (!this.remoteBranches.has(pr.head)) throw new Error(`no branch ${pr.head} on GitHub`);
+    const open = [...this.pulls.values()].some(
+      (p) => p.state === 'open' && p.headRefName === pr.head && p.baseRefName === pr.base,
+    );
+    if (open) throw new Error(`a pull request for ${pr.head} already exists`);
+    const number = this.next++;
+    const url = `https://github.com/me/demo/pull/${number}`;
+    this.pulls.set(number, {
+      number,
+      url,
+      state: 'open',
+      mergeable: true,
+      mergeCommit: null,
+      headRefName: pr.head,
+      baseRefName: pr.base,
+      title: pr.title,
+      body: pr.body,
+    });
+    return { number, url };
+  }
+
+  async getPullRequest(_repo: string, number: number): Promise<GhPullRequest> {
+    this.call(`getPull #${number}`);
+    return pullView(this.pull(number));
+  }
+
+  /**
+   * A human merges the pull request on GitHub: its base branch there moves to `commit` (which
+   * must exist in the clone, as for `remoteHead`), and the issues its body closes ("Closes #N")
+   * are closed as completed.
+   */
+  mergePull(number: number, commit: string): void {
+    const pull = this.pull(number);
+    pull.state = 'merged';
+    pull.mergeable = null;
+    pull.mergeCommit = commit;
+    this.remoteMissing = false;
+    this.remoteHead = commit;
+    for (const [, ref] of pull.body.matchAll(CLOSING_REFS)) {
+      const issue = this.issues.get(Number(ref));
+      if (issue && issue.state === 'open') {
+        issue.state = 'closed';
+        issue.stateReason = 'completed';
+      }
+    }
+  }
+
+  /** A human closes the pull request on GitHub without merging it. */
+  closePull(number: number): void {
+    this.pull(number).state = 'closed';
+  }
+}
+
+/** A pull request as the GitHub client returns it: a copy, without what FakeGitHub adds. */
+function pullView(pull: FakePull): GhPullRequest {
+  return {
+    number: pull.number,
+    url: pull.url,
+    state: pull.state,
+    mergeable: pull.mergeable,
+    mergeCommit: pull.mergeCommit,
+    headRefName: pull.headRefName,
+    baseRefName: pull.baseRefName,
+  };
 }

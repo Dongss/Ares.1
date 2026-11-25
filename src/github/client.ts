@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { z } from 'zod';
 import { t } from '../i18n.js';
 
 /** Who wrote an issue or a comment, which decides whether the Master trusts what it says. */
@@ -36,6 +37,27 @@ export interface LabelDef {
   description: string;
 }
 
+/** A pull request as the Master needs it, to deliver a Run through one. */
+export interface GhPullRequest {
+  number: number;
+  url: string;
+  /** merged: GitHub merged it into its base, whether by a merge, a squash or a rebase. */
+  state: 'open' | 'merged' | 'closed';
+  /** Whether it merges without conflicts; null while GitHub has not worked that out yet. */
+  mergeable: boolean | null;
+  /** The commit the merge put on the base branch; null unless merged. */
+  mergeCommit: string | null;
+  /** The branch with the changes. */
+  headRefName: string;
+  /** The branch it merges into. */
+  baseRefName: string;
+}
+
+/** Only the Runs' own branches may be force-pushed: never a target branch or anybody else's. */
+export function forcePushable(branch: string): boolean {
+  return branch.startsWith('ares1/');
+}
+
 /** What the Master does on GitHub. `repo` is always "owner/name". */
 export interface GitHub {
   /** "owner/name" of the GitHub repo behind a local clone. */
@@ -68,8 +90,21 @@ export interface GitHub {
   listComments(repo: string, number: number): Promise<GhComment[]>;
   /** Close as completed (done) or as not planned. */
   close(repo: string, number: number, reason: 'completed' | 'not_planned'): Promise<void>;
-  /** Push `branch` of the local clone at `path` to the GitHub repo, as the same account. */
-  push(path: string, repo: string, branch: string): Promise<void>;
+  /**
+   * Push `branch` of the local clone at `path` to the GitHub repo, as the same account. `force`
+   * replaces what GitHub has even when it is not a fast-forward (a Run's branch whose history was
+   * rewritten, e.g. by a rollback); only for branches `forcePushable` allows, else a GhError.
+   */
+  push(path: string, repo: string, branch: string, opts?: { force?: boolean }): Promise<void>;
+  /** The open pull request from `head`, a branch of `repo` itself; null when there is none. */
+  findOpenPullRequest(repo: string, head: string): Promise<GhPullRequest | null>;
+  /** Open a pull request from `head` into `base`, both branches of `repo`. */
+  createPullRequest(
+    repo: string,
+    pr: { head: string; base: string; title: string; body: string },
+  ): Promise<{ number: number; url: string }>;
+  /** The pull request as it is now. */
+  getPullRequest(repo: string, number: number): Promise<GhPullRequest>;
   /**
    * Fetch `branch` of the GitHub repo into the local clone at `path`, as the same account, and
    * return the commit it points at. No ref of the clone moves; the commit's objects are in it.
@@ -154,6 +189,80 @@ function repoParts(repo: string): { owner: string; name: string } {
     );
   }
   return { owner, name };
+}
+
+/** The fields of a pull request asked of `gh pr list/view --json` (see RawPullRequest). */
+const PR_FIELDS =
+  'number,url,state,mergeable,mergeCommit,headRefName,baseRefName,isCrossRepository';
+
+/** A pull request as `gh pr list/view --json PR_FIELDS` prints it. */
+const RawPullRequest = z.object({
+  number: z.number().int().positive(),
+  url: z.string().min(1),
+  state: z.enum(['OPEN', 'CLOSED', 'MERGED']),
+  /** MERGEABLE, CONFLICTING or UNKNOWN (not worked out yet). */
+  mergeable: z.string().nullish(),
+  mergeCommit: z.object({ oid: z.string().min(1) }).nullish(),
+  headRefName: z.string(),
+  baseRefName: z.string(),
+  /** From a fork: a branch of the same name there is not the Run's. */
+  isCrossRepository: z.boolean().optional(),
+});
+type RawPullRequest = z.infer<typeof RawPullRequest>;
+
+function fromRawPull(raw: RawPullRequest): GhPullRequest {
+  return {
+    number: raw.number,
+    url: raw.url,
+    state: raw.state === 'OPEN' ? 'open' : raw.state === 'MERGED' ? 'merged' : 'closed',
+    mergeable:
+      raw.mergeable === 'MERGEABLE' ? true : raw.mergeable === 'CONFLICTING' ? false : null,
+    mergeCommit: raw.state === 'MERGED' ? (raw.mergeCommit?.oid ?? null) : null,
+    headRefName: raw.headRefName,
+    baseRefName: raw.baseRefName,
+  };
+}
+
+/**
+ * What `command` printed as JSON, read with `schema`. Anything else (a proxy's HTML page, a gh
+ * warning, fields of other types) is a GhError, naming the fields that did not fit, so callers
+ * that handle GhError keep working.
+ */
+function parseOutput<T>(out: string, schema: z.ZodType<T>, command: string): T {
+  let json: unknown;
+  try {
+    json = JSON.parse(out);
+  } catch {
+    throw new GhError(
+      t({
+        zh: `${command} 返回的不是 JSON：${out.slice(0, 300)}`,
+        en: `${command} returned no JSON: ${out.slice(0, 300)}`,
+      }),
+    );
+  }
+  const parsed = schema.safeParse(json);
+  if (!parsed.success) {
+    const fields = [
+      ...new Set(parsed.error.issues.map((i) => i.path.map(String).join('.') || '$')),
+    ].join(', ');
+    throw new GhError(
+      t({
+        zh: `${command} 返回的数据无法识别（${fields}）：${out.slice(0, 300)}`,
+        en: `${command} returned data it cannot read (${fields}): ${out.slice(0, 300)}`,
+      }),
+    );
+  }
+  return parsed.data;
+}
+
+/** A GhError for a force push of a branch `forcePushable` does not allow. */
+function forceRefused(branch: string): GhError {
+  return new GhError(
+    t({
+      zh: `只能强制推送 ares1/ 开头的 Run 分支，不能强制推送 ${branch}`,
+      en: `Only a Run's branch (ares1/...) may be force-pushed, not ${branch}`,
+    }),
+  );
 }
 
 const TOKEN_TTL_MS = 10 * 60_000;
@@ -393,6 +502,51 @@ export class GhCli implements GitHub {
     await this.gh(['issue', 'close', String(number), '-R', repo, '--reason', flag]);
   }
 
+  async findOpenPullRequest(repo: string, head: string): Promise<GhPullRequest | null> {
+    const out = await this.gh([
+      'pr',
+      'list',
+      '-R',
+      repo,
+      '--head',
+      head,
+      '--state',
+      'open',
+      '--json',
+      PR_FIELDS,
+      // --head matches the branch name only, so forks' branches of that name come too.
+      '--limit',
+      String(MAX_PAGE),
+    ]);
+    const pulls = parseOutput(out, z.array(RawPullRequest), 'gh pr list');
+    const own = pulls.find((p) => p.isCrossRepository !== true && p.headRefName === head);
+    return own ? fromRawPull(own) : null;
+  }
+
+  async createPullRequest(
+    repo: string,
+    pr: { head: string; base: string; title: string; body: string },
+  ): Promise<{ number: number; url: string }> {
+    const args = ['pr', 'create', '-R', repo, '--head', pr.head, '--base', pr.base];
+    args.push('--title', pr.title, '--body-file', '-');
+    const url = (await this.gh(args, { stdin: pr.body })).split('\n').pop() ?? '';
+    const number = Number(/\/pull\/(\d+)/.exec(url)?.[1]);
+    if (!Number.isInteger(number)) {
+      throw new GhError(
+        t({
+          zh: `gh pr create 没有返回 PR 链接：${url}`,
+          en: `gh pr create returned no pull request link: ${url}`,
+        }),
+      );
+    }
+    return { number, url };
+  }
+
+  async getPullRequest(repo: string, number: number): Promise<GhPullRequest> {
+    const out = await this.gh(['pr', 'view', String(number), '-R', repo, '--json', PR_FIELDS]);
+    return fromRawPull(parseOutput(out, RawPullRequest, 'gh pr view'));
+  }
+
   /**
    * git in the clone at `path`, talking to GitHub with gh as the credential helper, so it acts
    * as the same account as everything else and needs no SSH key; the token only travels through
@@ -420,10 +574,19 @@ export class GhCli implements GitHub {
     });
   }
 
-  async push(path: string, repo: string, branch: string): Promise<void> {
+  async push(
+    path: string,
+    repo: string,
+    branch: string,
+    opts: { force?: boolean } = {},
+  ): Promise<void> {
+    if (opts.force && !forcePushable(branch)) throw forceRefused(branch);
+    // A leading + lets this one ref replace what GitHub has; --force-with-lease would need a
+    // remote-tracking ref, which a push to a URL does not have.
+    const refspec = `${opts.force ? '+' : ''}refs/heads/${branch}:refs/heads/${branch}`;
     await this.gitWithGh(
       path,
-      ['push', '-q', `https://github.com/${repo}.git`, `refs/heads/${branch}:refs/heads/${branch}`],
+      ['push', '-q', `https://github.com/${repo}.git`, refspec],
       (detail) =>
         t({
           zh: `推送 ${branch} 到 ${repo} 失败：${detail}`,

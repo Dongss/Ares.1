@@ -332,6 +332,11 @@ export interface GitHubRepoStatus {
   budget: { dailyUsd: number | null; spentToday: number; reached: boolean };
   /** The target branch is pushed to GitHub after merges. */
   push: boolean;
+  /**
+   * How Runs deliver (`deliver`): push = merged into the local target branch, which is pushed;
+   * pr = the Run's branch is pushed and a pull request opened, the Run completes once it merges.
+   */
+  deliver: 'push' | 'pr';
   /** Runs an issue gets at most, the first included (`max_run_attempts`); 1 = never redone. */
   maxRunAttempts: number;
 }

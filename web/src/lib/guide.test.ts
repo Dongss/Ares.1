@@ -76,6 +76,7 @@ const manualRepo: GitHubRepoStatus = {
   autoMerge: false,
   budget: { dailyUsd: null, spentToday: 0, reached: false },
   push: false,
+  deliver: 'push',
   maxRunAttempts: 3,
 };
 

@@ -318,6 +318,16 @@ export function loadConfig(
         }),
       );
     }
+    // A pull request needs the Run's branch on GitHub and the target branch pulled back after
+    // the merge, which only repos with push do.
+    if (repo.deliver === 'pr' && !repo.push) {
+      problems.push(
+        t({
+          zh: 'deliver: pr 要求 push: true：开 PR 要先把 Run 的分支推送到 GitHub，PR 合并后还要从 GitHub 拉取目标分支',
+          en: "deliver: pr needs push: true: a pull request needs the Run's branch pushed to GitHub, and the target branch pulled from GitHub once it is merged",
+        }),
+      );
+    }
     if (problems.length > 0) errors[githubConfigKey(name)] = problems;
   }
   if (repoWarnings.length > 0) {

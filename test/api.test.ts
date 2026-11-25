@@ -17,7 +17,7 @@ import type {
   StatsView,
 } from '../src/api/types.js';
 import { SCOUT_FAILURE_NOTIFY_AFTER } from '../src/config/flow.js';
-import { findTemplate } from '../src/config/load.js';
+import { findTemplate, githubConfigKey } from '../src/config/load.js';
 import { storedRunTimes } from '../src/engine/times.js';
 import { setLang } from '../src/i18n.js';
 import { type ExecFile, noticeScript } from '../src/notify/system.js';
@@ -1288,6 +1288,33 @@ ${acceptLines}
       maxPerDay: 2,
       usedToday: 0,
     });
+  });
+
+  it("gives each repo's way of delivering, and why pr without push disables it", async () => {
+    const config = (lines: string) => `
+github:
+  repos:
+    demo:
+      template: dev
+${lines}`;
+    h = await harness({ config: config(''), github: new FakeGitHub() });
+    const repo = async () => ((await call('GET', '/api/github')).json as GitHubStatus).repos[0];
+    expect(await repo()).toMatchObject({ push: false, deliver: 'push', problems: [] });
+
+    const reload = (lines: string) => {
+      writeFile(join((h as Harness).home, 'config.yaml'), config(lines));
+      (h as Harness).master.configWatcher.reload();
+    };
+    reload('      push: true\n      deliver: pr\n');
+    expect(await repo()).toMatchObject({ push: true, deliver: 'pr', problems: [] });
+
+    // Without push the repo is disabled; the problem shows on the repo and the config page.
+    reload('      deliver: pr\n');
+    const problem =
+      'deliver: pr 要求 push: true：开 PR 要先把 Run 的分支推送到 GitHub，PR 合并后还要从 GitHub 拉取目标分支';
+    expect(await repo()).toMatchObject({ push: false, deliver: 'pr', problems: [problem] });
+    const { json } = (await call('GET', '/api/config')) as { json: ConfigView };
+    expect(json.errors[githubConfigKey('demo')]).toEqual([problem]);
   });
 });
 

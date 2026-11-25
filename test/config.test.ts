@@ -700,6 +700,67 @@ stages:
     }
   });
 
+  describe('deliver', () => {
+    function load(repo: string, extra = '') {
+      const paths = home();
+      writeFile(paths.configFile, `${extra}github:\n  repos:\n    app: ${repo}\n`);
+      return loadConfig(paths, ['claude-code'], ['claude-code']);
+    }
+    const PR_NEEDS_PUSH =
+      'deliver: pr 要求 push: true：开 PR 要先把 Run 的分支推送到 GitHub，PR 合并后还要从 GitHub 拉取目标分支';
+
+    it('delivers by push unless pr is written, and takes no other value', () => {
+      expect(GitHubRepoSchema.parse({ template: 'x' }).deliver).toBe('push');
+      expect(GitHubRepoSchema.parse({ template: 'x', deliver: 'pr' }).deliver).toBe('pr');
+      for (const bad of ['merge', 'PR', true, null]) {
+        expect(GitHubRepoSchema.safeParse({ template: 'x', deliver: bad }).success).toBe(false);
+      }
+      for (const repo of [
+        '{ template: self-dev }',
+        '{ template: self-dev, deliver: push }',
+        '{ template: self-dev, deliver: push, push: true }',
+        '{ template: self-dev, deliver: pr, push: true }',
+      ]) {
+        const cfg = load(repo);
+        expect(cfg.errors, repo).toEqual({});
+        expect(cfg.warnings, repo).toEqual({});
+      }
+      expect(load('{ template: self-dev }').master.github?.repos.app?.deliver).toBe('push');
+      expect(
+        load('{ template: self-dev, deliver: pr, push: true }').master.github?.repos.app,
+      ).toMatchObject({ deliver: 'pr', push: true });
+    });
+
+    it('disables a repo delivering by pull request without push, and says why', () => {
+      for (const repo of [
+        '{ template: self-dev, deliver: pr }',
+        '{ template: self-dev, deliver: pr, push: false }',
+      ]) {
+        const cfg = load(repo);
+        expect(cfg.errors, repo).toEqual({ [githubConfigKey('app')]: [PR_NEEDS_PUSH] });
+        expect(cfg.warnings, repo).toEqual({});
+      }
+      // Told together with the repo's other problems.
+      expect(load('{ template: nope, deliver: pr }').errors).toEqual({
+        [githubConfigKey('app')]: ['模板 nope 不存在或无效', PR_NEEDS_PUSH],
+      });
+    });
+
+    it('says so in English when config.yaml says so', () => {
+      try {
+        const cfg = load('{ template: self-dev, deliver: pr }', 'language: en\n');
+        const problems = cfg.errors[githubConfigKey('app')];
+        expect(problems).toEqual([
+          "deliver: pr needs push: true: a pull request needs the Run's branch pushed to GitHub, and the target branch pulled from GitHub once it is merged",
+        ]);
+        for (const problem of problems ?? []) expect(problem).not.toMatch(/[一-鿿]/);
+      } finally {
+        // Back to the default language, zod's messages included, for the other tests.
+        load('{ template: self-dev }');
+      }
+    });
+  });
+
   it('disables invalid agents and templates instead of failing', () => {
     const paths = home();
     writeFile(

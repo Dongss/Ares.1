@@ -60,6 +60,14 @@ export const GitHubRepoSchema = z.strictObject({
   /** Push the target branch to the GitHub repo after each merge. */
   push: z.boolean().default(false),
   /**
+   * How a Run's work reaches GitHub. push: the merge stage fast-forwards the local target branch
+   * and the target branch is pushed (with push: true). pr: for target branches that only take
+   * pull requests (protected, or guarded by CI and reviews): the merge stage pushes the Run's
+   * branch and opens a pull request to the target branch instead, and the Run completes once it
+   * is merged on GitHub; the target branch itself is never pushed. pr needs push: true.
+   */
+  deliver: z.enum(['push', 'pr']).default('push'),
+  /**
    * Spend of a day (scouts, auto-accepted Runs, automatic redos) after which automatic scouting,
    * auto-accepting and redoing stop until the next day; omitted = no limit.
    */

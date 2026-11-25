@@ -2290,6 +2290,7 @@ export class IssueBridge {
           reached: cfg.daily_budget_usd !== undefined && spent >= cfg.daily_budget_usd,
         },
         push: cfg.push,
+        deliver: cfg.deliver,
         maxRunAttempts: cfg.max_run_attempts,
       };
     });
