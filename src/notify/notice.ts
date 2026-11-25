@@ -391,6 +391,10 @@ export function noticeFor(event: EventRow, goal: string | undefined): Notice | n
     case 'github.diverged_run':
       // Told by the github.diverged recorded with it, which names the Run.
       return null;
+    case 'run.merge_remote_obsolete':
+      // A merge Run completed with nothing left to merge: the target branch had GitHub's commit
+      // already. Like any completed Run, nothing for a human to do.
+      return null;
     case 'github.pull_blocked': {
       const branch = text(event.data.branch) ?? t({ zh: '目标分支', en: 'The target branch' });
       const worktree = text(event.data.worktree);

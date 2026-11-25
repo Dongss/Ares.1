@@ -331,10 +331,15 @@ interface Divergence {
    */
   outcome?: 'failed' | 'environment';
   /**
-   * Why the merge of this pair failed, while a Run that merges `remote` goes on with it: once
-   * the Run ends without merging, a human is asked to merge, for this reason.
+   * Why the merge of this pair failed, while the Run `handedTo` goes on with it: once the Run
+   * ends without merging, a human is asked to merge, for this reason.
    */
   handed?: RemoteMergeFailure;
+  /**
+   * The Run the merge of this pair was handed to: the one created for `remote`, or the repo's
+   * merge Run that was going on already, created for an earlier commit of GitHub.
+   */
+  handedTo?: string;
   /**
    * The merge commit, checked, when fast-forwarding the target branch to it had to wait: the
    * next round tries the fast-forward again without merging and checking once more.
@@ -1295,15 +1300,20 @@ export class IssueBridge {
    * again after the checks; a fast-forward that has to wait is tried again next round with the
    * same merge commit. When the merge conflicts or a check fails on it, the branch stays as it
    * is and the merge is not tried again for the same pair of commits. It is handed to a Run that
-   * merges `remote` (`handToRun`), created for it (`github.diverged_run`) unless the repo had one
-   * already: the Run's coding agent finishes the merge, and once the Run is merged the target
-   * branch has `remote`, so the next round finds it ahead and pushes. Without such a Run going
-   * on (none could be created, or the one for `remote` was terminated or failed, at the time or
-   * later) a human merges. Either way it is recorded (`github.diverged`, with the conflicted files
-   * or the failed command, and `runId` while a Run has it). A check that cannot start for a
-   * missing program is recorded too, with no Run, but tried again each round, to go on once it is
-   * installed. Each kind of record notifies once while the divergence lasts (`repeated` on the
-   * others): handing it to a Run (once per Run), asking for a hand merge, a missing program.
+   * merges GitHub's commits (`handToRun`): the repo's one that goes on already, whichever commit
+   * it was created for, so that a repo has one merging at a time; else one created for `remote`
+   * (`github.diverged_run`). The Run's coding agent finishes the merge, and once the Run is merged
+   * the target branch has moved: the next round finds it ahead and pushes, or tries the new pair
+   * (GitHub's newer commit, when the Run merged an earlier one) like any. Without a Run going on
+   * (none could be created, or the one it was handed to, found by its id, was terminated or
+   * failed, at the time or later) a human merges. Either way it is recorded (`github.diverged`,
+   * with the conflicted files or the failed command, and `runId` while a Run has it). A check that
+   * cannot start for a missing program is recorded too, with no Run, but tried again each round,
+   * to go on once it is installed. Each kind of record notifies once while the divergence lasts
+   * (`repeated` on the others): handing it to a Run (once per Run), asking for a hand merge, a
+   * missing program. A merge Run going on when the Master's own merge goes through is left to the
+   * engine: once it finds the target branch has the Run's commit, it completes the Run without
+   * starting another agent (`run.merge_remote_obsolete`).
    */
   private async mergeDiverged(
     repo: Repo,
@@ -1315,9 +1325,10 @@ export class IssueBridge {
     const same = seen?.local === local && seen.remote === remote ? seen : undefined;
     if (same?.outcome === 'failed') {
       // The Run it was handed to ended without merging it: a human merges now.
-      if (same.handed && !this.mergeRunGoesOn(repo, remote)) {
+      if (same.handed && !this.mergeRunGoesOn(same.handedTo)) {
         const why = same.handed;
         same.handed = undefined;
+        same.handedTo = undefined;
         this.recordDiverged(repo, name, same, 'failed', why);
       }
       return;
@@ -1346,8 +1357,11 @@ export class IssueBridge {
           }
           return;
         }
-        const run = this.handToRun(repo, name, local, remote, result.data);
-        if (run) divergence.handed = result.data;
+        const run = await this.handToRun(repo, name, local, remote, result.data);
+        if (run) {
+          divergence.handed = result.data;
+          divergence.handedTo = run.id;
+        }
         this.recordDiverged(repo, name, divergence, 'failed', result.data, run ?? undefined);
         return;
       }
@@ -1369,25 +1383,35 @@ export class IssueBridge {
 
   /**
    * The Run that merges GitHub's commit `remote` into the repo's target branch, at `local`, after
-   * the Master's own merge failed (`why`): the one the repo has for `remote` while it goes on;
-   * else a new one, with `mergeRemoteGoal` and the repo's template, without approval before
-   * merging when `auto_merge` is on, like the Runs of its issues. One Run per commit, found again
-   * after a restart (`runMergingRemote`). Null when a human merges instead: the repo's Run for
-   * `remote` was terminated or failed, the repo no longer pushes, its template is missing or has
-   * no agent stage to merge in, or the Run could not be created.
+   * the Master's own merge failed (`why`). At most one such Run of a repo merges at a time, so
+   * that two agents never merge GitHub's commits side by side, the later one running into
+   * conflicts with the earlier: while the repo has one that has not finished
+   * (`unfinishedMergeRemoteRuns`), whichever commit it was created for, the pair is handed to it,
+   * and no Run is created. It merges its own commit; once it is merged the target branch has
+   * moved, so the next round tries the new pair, by the Master's merge first, and hands it to a
+   * new Run when that fails again. A Run whose commit the target branch has already does not
+   * count: it has nothing left to merge, and completes without an agent when it next goes on
+   * (`run.merge_remote_obsolete`), maybe only after a human, if it waits for one. Else a new one,
+   * with `mergeRemoteGoal` and the repo's template, without approval before merging when
+   * `auto_merge` is on, like the Runs of its issues. One Run per commit, found again after a
+   * restart (`runMergingRemote`). Null when a human merges instead: the repo's Run for `remote`
+   * was terminated or failed, the repo no longer pushes, its template is missing or has no agent
+   * stage to merge in, or the Run could not be created.
    */
-  private handToRun(
+  private async handToRun(
     repo: Repo,
     name: string,
     local: string,
     remote: string,
     why: RemoteMergeFailure,
-  ): { id: string; created: boolean } | null {
-    const existing = this.deps.store.runMergingRemote(repo.id, remote);
-    if (existing) {
-      if (FINISHED_RUN_STATUSES.includes(existing.status)) return null;
-      return { id: existing.id, created: false };
+  ): Promise<{ id: string; created: boolean } | null> {
+    const store = this.deps.store;
+    for (const going of store.unfinishedMergeRemoteRuns(repo.id)) {
+      const merged = going.mergeRemote && (await isAncestor(repo.path, going.mergeRemote, local));
+      if (!merged) return { id: going.id, created: false };
     }
+    // Only finished ones are left for `remote`: it ended without merging, a human merges now.
+    if (store.runMergingRemote(repo.id, remote)) return null;
     // Looked at again: the config may have changed while the merge was checked.
     const cfg = this.cfg.master.github?.repos[name];
     if (!cfg?.push) return null;
@@ -1408,10 +1432,13 @@ export class IssueBridge {
     }
   }
 
-  /** Whether the Run the repo has to merge GitHub's commit `remote` goes on. */
-  private mergeRunGoesOn(repo: Repo, remote: string): boolean {
-    const run = this.deps.store.runMergingRemote(repo.id, remote);
-    return run !== undefined && !FINISHED_RUN_STATUSES.includes(run.status);
+  /**
+   * Whether the Run a pair was handed to (`handedTo`) goes on: by its id, since it may have been
+   * created for another commit of GitHub than the pair's.
+   */
+  private mergeRunGoesOn(runId: string | undefined): boolean {
+    if (!runId) return false;
+    return !FINISHED_RUN_STATUSES.includes(this.deps.store.getRun(runId).status);
   }
 
   /**

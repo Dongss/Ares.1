@@ -4141,6 +4141,9 @@ describe('engine: a Run that merges a commit from GitHub', () => {
     expect(h.fake.calls.find((c) => c.model === 'reviewer')?.prompt).toContain(
       `git diff ${local}...HEAD`,
     );
+    // Merged by the Run itself: not taken for a merge done elsewhere.
+    expect(eventsOf(run.id, 'merge.done')).toHaveLength(1);
+    expect(eventsOf(run.id, 'run.merge_remote_obsolete')).toEqual([]);
   });
 
   it('reworks while conflict markers are left, going on with the same merge', async () => {
@@ -4351,6 +4354,66 @@ describe('engine: a Run that merges a commit from GitHub', () => {
     const started = eventsOf(run.id, 'merge.started');
     expect(started.map((e) => e.data.targetHead)).toEqual([remote, remote]);
     expect(contains(repoDir, remote, 'main')).toBe(true);
+  });
+
+  it('completes without merging when main got the commit while it waited for the approval to merge', async () => {
+    const { repoDir, remote } = diverged();
+    h = await harness({
+      repoDir,
+      verifyCommands: BOTH_SIDES,
+      scripts: {
+        coder: (ctx) => {
+          resolve(ctx.input.workdir);
+          return done('合并了 GitHub 上的提交');
+        },
+        reviewer: () => review(),
+      },
+    });
+    const store = h.master.store;
+    // The merge stage waits for its approval (the template's gate).
+    const run = h.master.engine.createRun({
+      repo: 'demo',
+      template: 'dev',
+      goal: '合并 GitHub 上的提交',
+      mergeRemote: remote,
+    });
+    await h.waitStatus(run.id, 'waiting_approval');
+    // Its coding task merged the commit on its own branch.
+    const worktree = store.getRun(run.id).worktreePath as string;
+    expect(contains(worktree, remote, 'HEAD')).toBe(true);
+
+    // Meanwhile main gets GitHub's commit without the Run (the Master merged it, say).
+    git(repoDir, 'merge', '-q', '--no-edit', '-X', 'ours', remote);
+    const mainHead = git(repoDir, 'rev-parse', 'main');
+    h.master.engine.approve(run.id);
+    const completed = await h.waitStatus(run.id, 'completed');
+    expect(completed.error).toBeNull();
+    expect(eventsOf(run.id, 'run.merge_remote_obsolete').map((e) => e.data)).toEqual([
+      { remote, target: 'main', targetHead: mainHead, stageId: 'merge' },
+    ]);
+    // Nothing merged: main is as it was, the Run's own merge of the commit is not in it.
+    expect(git(repoDir, 'rev-parse', 'main')).toBe(mainHead);
+    expect(eventsOf(run.id, 'merge.done')).toEqual([]);
+    expect(store.listChecks(run.id).filter((c) => c.kind === 'merge' && !c.attemptId)).toEqual([]);
+    expect(coderCalls()).toHaveLength(1);
+    await waitFor(() => eventsOf(run.id, 'workspace.removed').length === 1, 'the removal');
+    expect(existsSync(worktree)).toBe(false);
+    expect(git(repoDir, 'branch', '--list', `ares1/${run.id}`)).toBe('');
+  });
+
+  it('completes before its worktree is created when main has the commit already', async () => {
+    const { repoDir, remote } = diverged();
+    h = await harness({ repoDir });
+    git(repoDir, 'merge', '-q', '--no-edit', '-X', 'ours', remote);
+    const mainHead = git(repoDir, 'rev-parse', 'main');
+    const run = mergeRun(remote);
+    await h.waitStatus(run.id, 'completed');
+    expect(eventsOf(run.id, 'run.merge_remote_obsolete').map((e) => e.data)).toEqual([
+      { remote, target: 'main', targetHead: mainHead, stageId: null },
+    ]);
+    expect(eventsOf(run.id, 'workspace.created')).toEqual([]);
+    expect(h.fake.calls).toEqual([]);
+    expect(h.master.store.getRun(run.id).worktreePath).toBeNull();
   });
 
   it('ends the Run with an error saying so when the commit is not in the repo', async () => {

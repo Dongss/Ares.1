@@ -307,6 +307,17 @@ interface MergeToResolve {
 /** The commit from GitHub a Run merges (`mergeRemote`) is not in the repo. */
 class MergeCommitMissing extends Error {}
 
+/**
+ * The commit from GitHub a Run merges, found in the target branch without the Run
+ * (`mergedRemoteElsewhere`).
+ */
+interface MergedRemote {
+  /** The commit, in full. */
+  remote: string;
+  /** The target branch's commit, which has it. */
+  targetHead: string;
+}
+
 /** Why a Run's worktree no longer matches the records (`workspaceProblem`). */
 interface WorkspaceProblem {
   /** Deleted; on another branch or a detached HEAD; or without the last accepted commit. */
@@ -1723,6 +1734,8 @@ export class Engine {
    * lock (`withMergeLock`); the setup commands run in the Run's own worktree without it.
    */
   private async prepareWorkspace(run: Run, signal: AbortSignal): Promise<void> {
+    // No worktree or setup for a merge of GitHub's commit the target branch has by now.
+    if (await this.skipMergedRemote(run, null, signal)) return;
     const repo = this.store.getRepo(run.repoId);
     if (repo.setupCommands.length > 0 && this.blockOnMissingNode(run)) return;
     const { path, branch } = this.newWorkspace(run.id);
@@ -1912,6 +1925,9 @@ export class Engine {
       else this.passStage(run, sr);
       return;
     }
+    // Before any agent of the round starts (and before checks left over from one): a merge of
+    // GitHub's commit that the target branch has by now is not worth an agent.
+    if (await this.skipMergedRemote(run, sr, signal)) return;
     if (task.status === 'failed' || task.status === 'cancelled') {
       this.block(run.id, {
         kind: 'task_failed',
@@ -3539,6 +3555,11 @@ export class Engine {
     eff: EffectiveStage,
     signal: AbortSignal,
   ): Promise<void> {
+    // Nothing to merge, nor a pull request to open (deliver: pr), for GitHub's commit that the
+    // target branch has by now.
+    const elsewhere = run.mergeRemote ? await this.mergedRemoteElsewhere(run, signal) : null;
+    this.checkAbort(signal);
+    if (elsewhere) return this.completeMergedRemote(run, sr, elsewhere, true);
     const repo = this.store.getRepo(run.repoId);
     const workdir = this.workdir(run);
     const target = repo.targetBranch;
@@ -4021,6 +4042,112 @@ export class Engine {
         this.store.event(run.id, 'workspace.removed', {});
       }
     }
+  }
+
+  /**
+   * A Run the Master created to merge GitHub's commit `mergeRemote` has nothing left to do once
+   * the target branch has that commit without it: the Master's own merge of a later divergence
+   * went through (`github.merged_remote`), or another Run or a human brought it in, while this one
+   * waited (queued, for an approval, blocked) or worked. Looked at before its worktree is created,
+   * before each agent task of its rounds and when its merge stage starts (deliver: pr too), so
+   * that no more agents run and nothing is merged for it. Not once the Run merged by itself: its
+   * merge stage passed, or its HEAD, with the commit, is in the target branch (a merge stage
+   * stopped right after it fast-forwarded). Null too when the commit is not in the repo: the Run
+   * goes on to `MergeCommitMissing` as before.
+   */
+  private async mergedRemoteElsewhere(run: Run, signal: AbortSignal): Promise<MergedRemote | null> {
+    if (!run.mergeRemote || this.mergeStagePassed(run)) return null;
+    const repo = this.store.getRepo(run.repoId);
+    const remote = await revParse(repo.path, run.mergeRemote).catch(() => null);
+    this.checkAbort(signal);
+    if (!remote) return null;
+    const targetHead = await revParse(repo.path, repo.targetBranch);
+    const inTarget = await isAncestor(repo.path, remote, targetHead);
+    this.checkAbort(signal);
+    if (!inTarget) return null;
+    if (run.worktreePath) {
+      const head = await revParse(run.worktreePath, 'HEAD').catch(() => null);
+      const own =
+        head !== null &&
+        (await isAncestor(repo.path, remote, head)) &&
+        (await isAncestor(repo.path, head, targetHead));
+      this.checkAbort(signal);
+      if (own) return null;
+    }
+    return { remote, targetHead };
+  }
+
+  /** Whether a merge stage of the Run passed: its work is in the target branch. */
+  private mergeStagePassed(run: Run): boolean {
+    const merges = new Set(run.template.stages.filter((s) => s.kind === 'merge').map((s) => s.id));
+    return this.store
+      .listStageRuns(run.id)
+      .some((s) => s.status === 'passed' && merges.has(s.stageId));
+  }
+
+  /**
+   * `mergedRemoteElsewhere`, and when so `completeMergedRemote`, waiting for the repo's merge lock
+   * to remove the worktree. `sr` is the stage round about to start an agent, null before the
+   * worktree is created. Returns whether the Run completed.
+   */
+  private async skipMergedRemote(
+    run: Run,
+    sr: StageRun | null,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    if (!run.mergeRemote) return false;
+    const merged = await this.mergedRemoteElsewhere(run, signal);
+    this.checkAbort(signal);
+    if (!merged) return false;
+    await this.completeMergedRemote(run, sr, merged, false);
+    return true;
+  }
+
+  /**
+   * Complete the Run whose commit from GitHub the target branch has without it
+   * (`mergedRemoteElsewhere`): not a failure, the merge it was created for is done. Its unfinished
+   * tasks are cancelled, and `run.merge_remote_obsolete` records the commit, the target branch
+   * and its commit that has it, and the stage it stopped before (null: before its worktree was
+   * created). Then its worktree and branch are removed whatever they hold, the unfinished one
+   * included: at most its own merge of the same commit and what its agents built on it to get it
+   * through, of no more use. `locked` when the caller holds the repo's merge lock (the merge
+   * stage); else it is waited for, after the Run completed, so nothing stops the wait.
+   */
+  private async completeMergedRemote(
+    run: Run,
+    sr: StageRun | null,
+    merged: MergedRemote,
+    locked: boolean,
+  ): Promise<void> {
+    const target = this.store.getRepo(run.repoId).targetBranch;
+    this.store.tx(() => {
+      for (const task of this.store.listRunTasks(run.id)) {
+        if (task.status !== 'passed' && task.status !== 'failed') {
+          this.store.updateTask(task.id, { status: 'cancelled' });
+        }
+      }
+      this.store.event(run.id, 'run.merge_remote_obsolete', {
+        remote: merged.remote,
+        target,
+        targetHead: merged.targetHead,
+        stageId: sr?.stageId ?? null,
+      });
+      this.setStatus(run.id, 'completed', { queuePos: null, finishedAt: nowIso() });
+    });
+    const remove = () => this.removeObsoleteWorkspace(run);
+    await (locked ? remove() : this.withMergeLock(run, undefined, remove));
+  }
+
+  /**
+   * Remove the worktree and branch of a Run `completeMergedRemote` completed, also when its
+   * worktree is not recorded yet (an interrupted setup left it). Called holding the merge lock.
+   */
+  private async removeObsoleteWorkspace(run: Run): Promise<void> {
+    const state = await this.inspectWorkspace(run);
+    if (!state.worktreeExists && !state.branchExists) return;
+    const { path, branch } = state.workspace;
+    await removeWorktree(this.store.getRepo(run.repoId).path, path, branch);
+    this.store.event(run.id, 'workspace.removed', {});
   }
 
   // =========================================================================

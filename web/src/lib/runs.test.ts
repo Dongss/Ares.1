@@ -720,6 +720,36 @@ describe('a Run started over because its issue changed', () => {
   });
 });
 
+describe('a merge Run whose commit the target branch had already', () => {
+  afterEach(() => setLang('zh'));
+  const obsolete = {
+    remote: '0123456789abcdef0123456789abcdef01234567',
+    target: 'main',
+    targetHead: 'fedcba9876543210fedcba9876543210fedcba98',
+    stageId: 'implement',
+  };
+
+  it('words the event from its data', () => {
+    expect(eventText({ type: 'run.merge_remote_obsolete', data: obsolete })).toBe(
+      'main 已经有了这个 Run 要合并的 GitHub 提交 01234567（Master 自己合并了，或者别的 Run 合并了进去），没什么要合并的了：不再启动 Agent，Run 直接完成',
+    );
+    // Without the commit or the branch: only the data.
+    expect(eventText({ type: 'run.merge_remote_obsolete', data: { target: 'main' } })).toBeNull();
+    expect(
+      eventText({ type: 'run.merge_remote_obsolete', data: { remote: obsolete.remote } }),
+    ).toBeNull();
+  });
+
+  it('in English', () => {
+    setLang('en');
+    const text = eventText({ type: 'run.merge_remote_obsolete', data: obsolete });
+    expect(text).toBe(
+      'main has the commit 01234567 from GitHub this Run was to merge already (the Master merged it by itself, or another Run did), so nothing is left to merge: the Run completed without starting another agent',
+    );
+    expect(text).not.toMatch(/[一-鿿]/);
+  });
+});
+
 describe('the agent a stage with agent_candidates picked', () => {
   afterEach(() => setLang('zh'));
   const selected = (data: Record<string, unknown>) => ({

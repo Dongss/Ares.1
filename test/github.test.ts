@@ -2194,6 +2194,185 @@ describe('issues: pulling the target branch from GitHub', () => {
     expect(gh.calls).not.toContain('push main');
   });
 
+  it('hands a newer commit of GitHub that does not merge either to the merge Run going on, creating no second one', async () => {
+    const t = await start(config({ push: true }));
+    t.master.engine.setWorking(false);
+    const { local, remote } = conflicting(t, head(t));
+    gh.remoteHead = remote;
+    await t.master.issues.poll();
+    const [run] = t.master.store.listRuns();
+    if (!run) throw new Error('no run');
+    expect(run.mergeRemote).toBe(remote);
+
+    // Somebody pushes on top of it on GitHub, changing README.md once more: it conflicts too.
+    const remote2 = pushedByOthers(t, remote, 'README.md', '# theirs again\n');
+    gh.remoteHead = remote2;
+    for (let i = 0; i < 3; i++) await t.master.issues.poll();
+    // The Run going on takes it, though created for the earlier commit: no second Run, nothing
+    // new to tell, and no hand merge asked for in the rounds after.
+    expect(t.master.store.listRuns().map((r) => r.id)).toEqual([run.id]);
+    expect(events(t, 'github.diverged_run')).toHaveLength(1);
+    const diverged = events(t, 'github.diverged');
+    expect(
+      diverged.map((e) => [e.data.local, e.data.remote, e.data.runId, e.data.repeated]),
+    ).toEqual([
+      [local, remote, run.id, undefined],
+      [local, remote2, run.id, true],
+    ]);
+    expect(diverged[1] && noticeFor(diverged[1], undefined)).toBeNull();
+    expect(gh.calls).not.toContain('push main');
+
+    // Nor after a restart: the new Master finds the Run by the repo, not by the commit.
+    await t.close();
+    const again = await restart(t, config({ push: true }));
+    for (let i = 0; i < 2; i++) await again.master.issues.poll();
+    expect(again.master.store.listRuns().map((r) => r.id)).toEqual([run.id]);
+    expect(events(again, 'github.diverged_run')).toHaveLength(1);
+    const last = events(again, 'github.diverged');
+    expect(last).toHaveLength(3);
+    expect(last[2]?.data).toMatchObject({ local, remote: remote2, runId: run.id });
+
+    // Once it ends without merging, a human merges, as for the Run of the commit itself.
+    await again.master.engine.cancel(run.id);
+    await again.master.issues.poll();
+    const manual = events(again, 'github.diverged').at(-1);
+    expect(manual?.data).toMatchObject({ local, remote: remote2 });
+    expect(manual?.data.runId).toBeUndefined();
+    expect(manual && noticeFor(manual, undefined)?.body).toContain('手动合并');
+    expect(again.master.store.listRuns()).toHaveLength(1);
+  });
+
+  it('completes the merge Run without another agent once the Master merged its commit meanwhile', async () => {
+    const t = await start(config({ push: true }));
+    // No checks: the Master's merge of the newer pair below goes through as it is.
+    t.master.store.updateRepo(t.repo.id, { verifyCommands: [] });
+    let release = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let coding = 0;
+    t.scripts.coder = async (ctx) => {
+      coding++;
+      await held;
+      writeFile(join(ctx.input.workdir, 'README.md'), '# ours\n# theirs\n');
+      return done('两边的改动都保留了');
+    };
+    const { local, remote } = conflicting(t, head(t));
+    gh.remoteHead = remote;
+    await t.master.issues.poll();
+    const [run] = t.master.store.listRuns();
+    if (!run) throw new Error('no run');
+    await waitFor(() => coding === 1, 'the coding agent to start');
+
+    // Meanwhile somebody on GitHub settles README.md the local way: that pair merges by itself,
+    // and the merge, with the Run's commit in it, is pushed.
+    const remote2 = pushedByOthers(t, remote, 'README.md', '# ours\n');
+    gh.remoteHead = remote2;
+    await t.master.issues.poll();
+    const merged = head(t);
+    expect(git(t.repoDir, 'rev-list', '--parents', '-n', '1', merged).split(' ')).toEqual([
+      merged,
+      local,
+      remote2,
+    ]);
+    expect(events(t, 'github.merged_remote').map((e) => e.data.merge)).toEqual([merged]);
+    expect(gh.pushes).toEqual([merged]);
+
+    // The coding agent finishes; no other agent starts: main has the Run's commit already.
+    release();
+    const completed = await t.waitStatus(run.id, 'completed');
+    expect(completed.error).toBeNull();
+    expect(t.fake.calls.map((c) => c.model)).toEqual(['coder']);
+    const obsolete = t.master.store
+      .listEvents(run.id)
+      .filter((e) => e.type === 'run.merge_remote_obsolete');
+    expect(obsolete.map((e) => e.data)).toEqual([
+      { remote, target: 'main', targetHead: merged, stageId: 'review' },
+    ]);
+    expect(obsolete[0] && noticeFor(obsolete[0], run.goal)).toBeNull();
+    expect(t.master.store.listRunTasks(run.id).map((x) => [x.title, x.status])).toEqual([
+      ['编码', 'passed'],
+      ['评审', 'cancelled'],
+    ]);
+    // main stays as the Master merged it; the Run's worktree and branch, with its own merge of
+    // the same commit, are gone.
+    await waitFor(
+      () => t.master.store.listEvents(run.id).some((e) => e.type === 'workspace.removed'),
+      'the worktree to be removed',
+    );
+    expect(head(t)).toBe(merged);
+    expect(extraWorktrees(t)).toEqual([]);
+    expect(git(t.repoDir, 'branch', '--list', `ares1/${run.id}`)).toBe('');
+
+    // The next round has nothing left to do.
+    await t.master.issues.poll();
+    expect(gh.pushes).toEqual([merged]);
+    expect(events(t, 'github.diverged')).toHaveLength(1);
+    expect(t.master.store.listRuns()).toHaveLength(1);
+  });
+
+  it('opens no pull request for a merge Run whose commit the target branch got meanwhile (deliver: pr)', async () => {
+    const t = await start(config({ push: true, deliver: 'pr' }));
+    t.master.store.updateRepo(t.repo.id, { verifyCommands: [] });
+    t.scripts.coder = (ctx) => {
+      writeFile(join(ctx.input.workdir, 'README.md'), '# ours\n# theirs\n');
+      return done('两边的改动都保留了');
+    };
+    const { remote } = conflicting(t, head(t));
+    gh.remoteHead = remote;
+    await t.master.issues.poll();
+    const [run] = t.master.store.listRuns();
+    if (!run) throw new Error('no run');
+    // Coded and reviewed, it waits for the approval to merge, which would open the pull request.
+    await t.waitStatus(run.id, 'waiting_approval');
+    git(t.repoDir, 'merge', '-q', '-X', 'ours', '--no-edit', remote);
+    const merged = head(t);
+    t.master.engine.approve(run.id);
+    await t.waitStatus(run.id, 'completed');
+    const types = t.master.store.listEvents(run.id).map((e) => e.type);
+    expect(types).toContain('run.merge_remote_obsolete');
+    expect(types).not.toContain('merge.pr_pending');
+    expect(t.fake.calls.map((c) => c.model)).toEqual(['coder', 'reviewer']);
+
+    await t.master.issues.poll();
+    expect(gh.pulls.size).toBe(0);
+    expect(head(t)).toBe(merged);
+  });
+
+  it('does not hand a pair to a merge Run whose commit the target branch has already', async () => {
+    const t = await start(config({ push: true }));
+    t.master.engine.setWorking(false);
+    const { remote } = conflicting(t, head(t));
+    gh.remoteHead = remote;
+    await t.master.issues.poll();
+    const [first] = t.master.store.listRuns();
+    if (!first) throw new Error('no run');
+    // A human merges GitHub's commit while the Run waits, and GitHub gets a newer one that
+    // conflicts: the waiting Run has nothing left to merge, so the pair gets a Run of its own.
+    git(t.repoDir, 'merge', '-q', '-X', 'ours', '--no-edit', remote);
+    const local2 = head(t);
+    const remote2 = pushedByOthers(t, remote, 'README.md', '# theirs again\n');
+    gh.remoteHead = remote2;
+    await t.master.issues.poll();
+    const next = t.master.store.listRuns().find((r) => r.mergeRemote === remote2);
+    if (!next) throw new Error('no Run for the newer commit');
+    expect(t.master.store.listRuns()).toHaveLength(2);
+    const last = events(t, 'github.diverged').at(-1);
+    expect(last?.data).toMatchObject({ local: local2, remote: remote2, runId: next.id });
+    expect(last && noticeFor(last, undefined)).toMatchObject({ kind: 'pull', runId: next.id });
+
+    // The first one completes once it goes on, before it has a worktree, without an agent.
+    await t.master.engine.cancel(next.id);
+    t.master.engine.setWorking(true);
+    await t.waitStatus(first.id, 'completed');
+    const recorded = t.master.store.listEvents(first.id);
+    expect(
+      recorded.filter((e) => e.type === 'run.merge_remote_obsolete').map((e) => e.data),
+    ).toEqual([{ remote, target: 'main', targetHead: local2, stageId: null }]);
+    expect(recorded.filter((e) => e.type === 'workspace.created')).toEqual([]);
+    expect(t.fake.calls).toEqual([]);
+  });
+
   it.each([
     ['terminated', 'cancelled'],
     ['failed', 'failed'],

@@ -623,6 +623,15 @@ export function eventText(event: Pick<EventRow, 'type' | 'data'>, now = new Date
   }
   const pr = pullRequestEventText(event);
   if (pr !== null) return pr;
+  if (event.type === 'run.merge_remote_obsolete') {
+    const { remote, target } = event.data;
+    if (typeof remote === 'string' && typeof target === 'string') {
+      return t({
+        zh: `${target} 已经有了这个 Run 要合并的 GitHub 提交 ${shortSha(remote)}（Master 自己合并了，或者别的 Run 合并了进去），没什么要合并的了：不再启动 Agent，Run 直接完成`,
+        en: `${target} has the commit ${shortSha(remote)} from GitHub this Run was to merge already (the Master merged it by itself, or another Run did), so nothing is left to merge: the Run completed without starting another agent`,
+      });
+    }
+  }
   if (event.type === 'task.verify_resumed') {
     return t({
       zh: 'Agent 的改动还在工作目录里，只重新运行检查命令',

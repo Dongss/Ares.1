@@ -686,6 +686,21 @@ export class Store {
     );
   }
 
+  /**
+   * The Runs of the repo that the Master created to merge a commit of GitHub into the target
+   * branch (`mergeRemote`) and that have not finished, whichever commit they merge; newest first.
+   */
+  unfinishedMergeRemoteRuns(repoId: string): Run[] {
+    return this.many<Run>(
+      'runs',
+      `SELECT * FROM runs WHERE repo_id = ? AND merge_remote IS NOT NULL
+         AND status NOT IN (${FINISHED_RUN_STATUSES.map(() => '?').join(', ')})
+         ORDER BY created_at DESC, rowid DESC`,
+      repoId,
+      ...FINISHED_RUN_STATUSES,
+    );
+  }
+
   /** The newest Run created from this issue, finished or not. */
   latestRunForIssue(issuesRepo: string, number: number): Run | undefined {
     return this.one<Run>(
