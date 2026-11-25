@@ -571,6 +571,49 @@ describe('a scout that keeps failing', () => {
   });
 });
 
+describe('proposals waiting for a human', () => {
+  afterEach(() => setLang('zh'));
+  const completed = (data: Record<string, unknown>) => ({
+    id: 9,
+    runId: null,
+    ts: '2026-11-19T00:00:00.000Z',
+    type: 'scout.completed',
+    data: { scoutId: 'scout_1', repo: 'demo', created: 3, auto: 1, ...data },
+  });
+
+  it('says where to decide them: on GitHub, or on the dashboard for the local backlog', () => {
+    expect(noticeFor(completed({ pending: 2 }), undefined)).toEqual({
+      kind: 'proposals',
+      title: '有提案等你决定：2 条',
+      body: '这些提案不能自动采纳（太大或超出自动采纳的风险），去 GitHub 上采纳或关闭',
+      runId: null,
+      about: 'issues',
+    });
+    expect(noticeFor(completed({ pending: 2, backlog: true }), undefined)).toEqual({
+      kind: 'proposals',
+      title: '有提案等你决定：2 条',
+      body: '这些提案没有自动采纳（太大、超出自动采纳的风险，或今天的自动采纳额度用完了），去看板的需求页上采纳或拒绝',
+      runId: null,
+      about: 'issues',
+    });
+    // Only when some wait for a human, whatever the source.
+    expect(noticeFor(completed({ pending: 0, auto: 3, backlog: true }), undefined)).toBeNull();
+    expect(noticeFor(completed({ pending: 0, auto: 3 }), undefined)).toBeNull();
+  });
+
+  it('is told in English without Chinese', () => {
+    setLang('en');
+    const notice = noticeFor(completed({ pending: 1, backlog: true }), undefined);
+    expect(notice).toMatchObject({
+      kind: 'proposals',
+      title: 'Proposals waiting for your decision: 1',
+      about: 'issues',
+    });
+    expect(notice?.body).toContain("accept or reject them on the dashboard's Issues page");
+    expect(`${notice?.title}\n${notice?.body}`).not.toMatch(/[一-鿿]/);
+  });
+});
+
 describe('the target branch cannot take the commits on GitHub', () => {
   afterEach(() => setLang('zh'));
   const ev = (type: string, data: Record<string, unknown>) => ({

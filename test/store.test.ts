@@ -509,6 +509,42 @@ describe('proposals of the local backlog', () => {
     expect(store.listProposals({ status: 'accepted' })).toEqual([store.getProposal(a.id)]);
   });
 
+  it('finds the Runs of the proposals a repo accepted without a human since a time', () => {
+    const store = new Store(':memory:');
+    const { repo, mk } = seed(store);
+    const accepted = (title: string, auto: boolean, repoId = repo.id) => {
+      const p = store.createProposal({ ...proposed(title), repoId, scoutId: null });
+      const run = mk(title);
+      store.updateProposal(p.id, { status: 'accepted', auto, runId: run.id });
+      return run;
+    };
+    const old = accepted('old', true);
+    store.updateRun(old.id, { createdAt: '2026-11-24T08:00:00.000Z' });
+    const auto = accepted('auto', true);
+    accepted('by hand', false);
+    // Pending, and accepted for another repo.
+    store.createProposal({ ...proposed('pending'), repoId: repo.id, scoutId: null });
+    const other = store.createRepo({
+      name: 'o',
+      path: '/tmp/o',
+      targetBranch: 'main',
+      verifyCommands: [],
+      setupCommands: [],
+      mergeMode: 'direct',
+    });
+    accepted('elsewhere', true, other.id);
+    // A Run of no proposal.
+    mk('plain');
+
+    const since = '2026-11-25T00:00:00.000Z';
+    expect(store.autoProposalRunsSince(repo.id, since).map((r) => r.id)).toEqual([auto.id]);
+    expect(store.autoProposalRunsSince(repo.id, '1970-01-01T00:00:00.000Z')).toEqual([
+      store.getRun(old.id),
+      store.getRun(auto.id),
+    ]);
+    expect(store.autoProposalRunsSince('nope', since)).toEqual([]);
+  });
+
   it('tells a proposal that does not exist, in both languages', () => {
     const store = new Store(':memory:');
     expect(() => store.getProposal('nope')).toThrow(NotFoundError);

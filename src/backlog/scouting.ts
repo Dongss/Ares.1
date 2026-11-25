@@ -12,6 +12,7 @@ import {
   type AgentResult,
   readOnlyClis,
 } from '../adapters/types.js';
+import type { ProposalSourceStatus } from '../api/types.js';
 import {
   autoAcceptsL,
   limitedScout,
@@ -44,11 +45,18 @@ import {
   pruneWorktrees,
   revParse,
 } from '../workspace/git.js';
-import { overBudget } from './guard.js';
+import { autoAcceptedToday, overBudget, spentToday } from './guard.js';
 
 /** Error of a scout cut short by the Master stopping. */
 export const stoppedWhileScouting = () =>
   t({ zh: 'Master 在侦察过程中停止了', en: 'The Master stopped during the scout' });
+
+/** Why a repo of config.yaml gets no requirements worked on: it is not on the dashboard. */
+export const notRegistered = (name: string) =>
+  t({
+    zh: `仓库 ${name} 没有在看板上登记`,
+    en: `Repo ${name} is not registered on the dashboard`,
+  });
 
 const pad = (n: number) => String(n).padStart(2, '0');
 
@@ -301,6 +309,53 @@ export class Scouting {
   /** The repo is being scouted. */
   isScouting(repoId: string): boolean {
     return this.scouting.has(repoId);
+  }
+
+  /**
+   * What the dashboard shows of a repo alike whatever its source: the template and `problems`,
+   * the scout (`waiting`: why the automatic one did not start at the source's last poll), the
+   * auto-accept settings with today's count, and today's spend against the budget. `repo`:
+   * undefined when it is not registered on the dashboard.
+   */
+  sourceStatus(
+    name: string,
+    cfg: ProposalSourceConfig,
+    repo: Repo | undefined,
+    problems: string[],
+    waiting: ScoutWait | null | undefined,
+  ): ProposalSourceStatus {
+    const store = this.deps.store;
+    const last = repo ? store.listScouts({ repoId: repo.id, limit: 1 })[0] : undefined;
+    const spent = repo ? spentToday(store, repo.id) : 0;
+    const running = repo ? this.isScouting(repo.id) : false;
+    return {
+      name,
+      template: cfg.template,
+      problems,
+      scout: cfg.scout
+        ? {
+            agent: cfg.scout.agent,
+            auto: cfg.scout.auto,
+            intervalMinutes: cfg.scout.interval_minutes,
+            maxProposals: cfg.scout.max_proposals,
+            running,
+            lastAt: last?.startedAt ?? null,
+            waiting: running ? null : (waiting ?? null),
+          }
+        : null,
+      autoAccept: {
+        maxRisk: cfg.auto_accept.max_risk,
+        maxSize: cfg.auto_accept.max_size,
+        maxPerDay: cfg.auto_accept.max_per_day ?? null,
+        usedToday: autoAcceptedToday(store, name),
+      },
+      autoMerge: cfg.auto_merge,
+      budget: {
+        dailyUsd: cfg.daily_budget_usd ?? null,
+        spentToday: spent,
+        reached: cfg.daily_budget_usd !== undefined && spent >= cfg.daily_budget_usd,
+      },
+    };
   }
 
   // ---- the automatic scout -----------------------------------------------------
@@ -620,6 +675,8 @@ export class Scouting {
           auto: filed.auto,
           /** Proposals that wait for a human. */
           pending: filed.pending,
+          // Decided on the dashboard rather than on GitHub (see noticeFor).
+          ...(source.kind === 'local' ? { backlog: true } : {}),
         });
       });
       source.completed?.(repo, filed);

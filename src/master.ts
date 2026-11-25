@@ -10,6 +10,7 @@ import { CursorAgentAdapter } from './adapters/cursor-agent.js';
 import { type AgentAdapter, readOnlyClis as readOnlyClisOf } from './adapters/types.js';
 import { createApi } from './api/server.js';
 import { defaultWebDir } from './api/static.js';
+import { LocalBacklog } from './backlog/local.js';
 import { Scouting } from './backlog/scouting.js';
 import { brandName } from './brand.js';
 import type { Backoff, RateLimitWait } from './config/flow.js';
@@ -69,7 +70,10 @@ export interface MasterOptions {
   watchConfig?: boolean;
   /** Replace gh (tests use an in-memory GitHub). */
   github?: GitHub;
-  /** Poll GitHub on a timer (default true); tests call `issues.poll()` themselves. */
+  /**
+   * Poll GitHub and the local backlog on a timer (default true); tests call `issues.poll()` and
+   * `backlog.poll()` themselves.
+   */
   pollIssues?: boolean;
   /**
    * The git checkout this Master was built from, for upgrading itself; null/omitted =
@@ -219,6 +223,8 @@ export class Master {
     /** The scouts of every repo, whichever source their proposals go to. */
     readonly scouting: Scouting,
     readonly issues: IssueBridge,
+    /** The proposals of the repos without GitHub (backlog.repos). */
+    readonly backlog: LocalBacklog,
     readonly notifier: SystemNotifier,
     readonly webhook: WebhookNotifier,
     readonly upgrader: Upgrader,
@@ -305,6 +311,7 @@ export class Master {
       nodeMissing,
       refreshTemplates,
     });
+    const backlog = new LocalBacklog({ store, engine, config, scouting, refreshTemplates });
     const notifier = new SystemNotifier(store, config, opts.notice);
     const webhook = new WebhookNotifier(store, config, { fetch: opts.fetch });
     let master: Master | undefined;
@@ -365,6 +372,7 @@ export class Master {
       engine,
       scouting,
       issues,
+      backlog,
       notifier,
       webhook,
       upgrader,
@@ -383,6 +391,7 @@ export class Master {
     // Before the polls, which may start scouts: the scouts the last Master left are put to rest.
     await scouting.start();
     await issues.start({ poll: opts.pollIssues !== false });
+    backlog.start({ poll: opts.pollIssues !== false });
     upgrader.start({ timer: opts.upgradeTimer !== false });
     logPruner.start();
     if (opts.watchConfig !== false) watcher.start();
@@ -427,8 +436,8 @@ export class Master {
     // rejects.
     const drained = this.webhook.drain();
     // Together: the scouts record that they were cut short and delete their temporary worktrees
-    // while the bridge finishes its round.
-    await Promise.all([this.issues.stop(), this.scouting.stop()]);
+    // while the bridge and the local backlog finish their rounds.
+    await Promise.all([this.issues.stop(), this.backlog.stop(), this.scouting.stop()]);
     await this.engine.stop();
     await this.repoWorkflows.stop();
     const server = this.server;

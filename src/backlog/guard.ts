@@ -13,8 +13,14 @@ export function startOfToday(now = new Date()): string {
 }
 
 /**
- * Spend of today on what this repo did without a human: scouts, auto-accepted Runs and
- * automatic redos of failed Runs.
+ * Events of a proposal accepted without a human: an issue labeled ares1:ready by the Master, or
+ * a local proposal turned into a Run (backlog.repos).
+ */
+const AUTO_ACCEPTED_EVENTS = ['issue.auto_accepted', 'proposal.auto_accepted'] as const;
+
+/**
+ * Spend of today on what this repo did without a human: scouts, auto-accepted Runs (from issues
+ * or local proposals) and automatic redos of failed Runs.
  */
 export function spentToday(store: Store, repoId: string): number {
   const since = startOfToday();
@@ -25,14 +31,18 @@ export function spentToday(store: Store, repoId: string): number {
     .issueRunsSince(since)
     .filter((r) => r.repoId === repoId && (r.issue?.auto || (r.issue?.attempt ?? 1) > 1))
     .reduce((sum, r) => sum + r.costUsd, 0);
-  return scouts + runs;
+  const local = store.autoProposalRunsSince(repoId, since).reduce((sum, r) => sum + r.costUsd, 0);
+  return scouts + runs + local;
 }
 
 /** Proposals of the repo accepted without a human today. */
 export function autoAcceptedToday(store: Store, repoName: string): number {
-  return store
-    .listEventsOfType('issue.auto_accepted', startOfToday())
-    .filter((e) => e.data.repo === repoName).length;
+  const since = startOfToday();
+  return AUTO_ACCEPTED_EVENTS.reduce(
+    (n, type) =>
+      n + store.listEventsOfType(type, since).filter((e) => e.data.repo === repoName).length,
+    0,
+  );
 }
 
 /** Today's spend reached the configured limit (none = never). */

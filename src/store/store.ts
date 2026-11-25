@@ -786,6 +786,21 @@ export class Store {
     );
   }
 
+  /**
+   * Runs of the repo created since `since` (ISO time) from local proposals accepted without a
+   * human (backlog.repos).
+   */
+  autoProposalRunsSince(repoId: string, since: string): Run[] {
+    return this.many<Run>(
+      'runs',
+      `SELECT runs.* FROM runs JOIN proposals ON proposals.run_id = runs.id
+         WHERE proposals.repo_id = ? AND proposals.auto = 1 AND runs.created_at >= ?
+         ORDER BY runs.created_at`,
+      repoId,
+      since,
+    );
+  }
+
   /** The next Run to execute: queued, lowest queue position first. */
   nextQueuedRun(): Run | undefined {
     return this.one<Run>(

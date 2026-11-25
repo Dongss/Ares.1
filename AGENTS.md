@@ -63,6 +63,7 @@ src/
     plan.ts           which step of its round's plan a task is (shared with the dashboard)
   backlog/            where requirements come from, whatever the source (GitHub or local):
     scouting.ts       the AI scout's scheduling and runs, filing through a ProposalSource
+    local.ts          the local backlog of repos without GitHub: polling, proposals, accepting
     guard.ts          the day's budget and auto-accept limits
   github/
     client.ts         GitHub through the gh CLI (FakeGitHub in tests)

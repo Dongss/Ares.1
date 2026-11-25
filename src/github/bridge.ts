@@ -3,13 +3,14 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { prepareAgentEnv } from '../adapters/process.js';
 import type { GitHubRepoStatus, GitHubStatus } from '../api/types.js';
-import { autoAcceptedToday, mayAutoAccept, overBudget, spentToday } from '../backlog/guard.js';
-import type {
-  FiledProposals,
-  KnownRequirements,
-  ProposalSource,
-  Scouting,
-  ScoutWait,
+import { mayAutoAccept, overBudget } from '../backlog/guard.js';
+import {
+  type FiledProposals,
+  type KnownRequirements,
+  notRegistered,
+  type ProposalSource,
+  type Scouting,
+  type ScoutWait,
 } from '../backlog/scouting.js';
 import { brandName } from '../brand.js';
 import {
@@ -106,12 +107,6 @@ const SCOUT_NOT_PLANNED = 300;
  * keep growing the set and keep notifying. Past it, the streak records no new github.error.
  */
 const MAX_REPORTED_ERRORS = 20;
-
-const notRegistered = (name: string) =>
-  t({
-    zh: `仓库 ${name} 没有在看板上登记`,
-    en: `Repo ${name} is not registered on the dashboard`,
-  });
 
 /**
  * Start of the names of the temporary worktrees, in the system's temp directory, where GitHub's
@@ -2042,19 +2037,7 @@ export class IssueBridge {
     });
   }
 
-  // ---- guardrails --------------------------------------------------------
-
-  /**
-   * Spend of today on what this repo did without a human: scouts, auto-accepted Runs and
-   * automatic redos of failed Runs (see spentToday in src/backlog/guard.ts).
-   */
-  spentToday(repoId: string): number {
-    return spentToday(this.deps.store, repoId);
-  }
-
-  autoAcceptedToday(repoName: string): number {
-    return autoAcceptedToday(this.deps.store, repoName);
-  }
+  // ---- guardrails (src/backlog/guard.ts) ---------------------------------
 
   /** Today's spend reached the configured limit (none = never). */
   private overBudget(repo: Repo, cfg: GitHubRepoConfig): boolean {
@@ -2215,37 +2198,9 @@ export class IssueBridge {
       const repo = this.deps.store.findRepo(name);
       const problems = [...(this.cfg.errors[githubConfigKey(name)] ?? [])];
       if (!repo) problems.push(notRegistered(name));
-      const last = repo ? this.deps.store.listScouts({ repoId: repo.id, limit: 1 })[0] : undefined;
-      const spent = repo ? this.spentToday(repo.id) : 0;
-      const running = repo ? this.deps.scouting.isScouting(repo.id) : false;
       return {
-        name,
+        ...this.deps.scouting.sourceStatus(name, cfg, repo, problems, this.scoutWaiting.get(name)),
         issuesRepo: cfg.issues_repo ?? (repo ? (this.resolved.get(repo.path) ?? null) : null),
-        template: cfg.template,
-        problems,
-        scout: cfg.scout
-          ? {
-              agent: cfg.scout.agent,
-              auto: cfg.scout.auto,
-              intervalMinutes: cfg.scout.interval_minutes,
-              maxProposals: cfg.scout.max_proposals,
-              running,
-              lastAt: last?.startedAt ?? null,
-              waiting: running ? null : (this.scoutWaiting.get(name) ?? null),
-            }
-          : null,
-        autoAccept: {
-          maxRisk: cfg.auto_accept.max_risk,
-          maxSize: cfg.auto_accept.max_size,
-          maxPerDay: cfg.auto_accept.max_per_day ?? null,
-          usedToday: this.autoAcceptedToday(name),
-        },
-        autoMerge: cfg.auto_merge,
-        budget: {
-          dailyUsd: cfg.daily_budget_usd ?? null,
-          spentToday: spent,
-          reached: cfg.daily_budget_usd !== undefined && spent >= cfg.daily_budget_usd,
-        },
         push: cfg.push,
         deliver: cfg.deliver,
         maxRunAttempts: cfg.max_run_attempts,

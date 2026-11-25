@@ -326,14 +326,15 @@ export interface NotifyTestResult {
   };
 }
 
-/** One repo whose issues the Master works on. */
-export interface GitHubRepoStatus {
+/**
+ * What a repo whose requirements the Master works on shows alike, whichever source they come
+ * from: GitHub issues (`GitHubRepoStatus`) or the local backlog (`BacklogRepoStatus`).
+ */
+export interface ProposalSourceStatus {
   /** Repo name as registered on the dashboard. */
   name: string;
-  /** "owner/name" once known. */
-  issuesRepo: string | null;
   template: string;
-  /** Why the Master cannot work on this repo's issues; empty when fine. */
+  /** Why the Master cannot work on this repo's requirements; empty when fine. */
   problems: string[];
   scout: {
     agent: string;
@@ -358,12 +359,18 @@ export interface GitHubRepoStatus {
     maxPerDay: number | null;
     usedToday: number;
   };
-  /** Runs from issues merge without approval. */
+  /** Runs from the repo's requirements merge without approval. */
   autoMerge: boolean;
   /**
    * Today's spend on scouts, auto-accepted Runs and automatic redos; dailyUsd null = no limit.
    */
   budget: { dailyUsd: number | null; spentToday: number; reached: boolean };
+}
+
+/** One repo whose issues the Master works on. */
+export interface GitHubRepoStatus extends ProposalSourceStatus {
+  /** "owner/name" once known. */
+  issuesRepo: string | null;
   /** The target branch is pushed to GitHub after merges. */
   push: boolean;
   /**
@@ -385,6 +392,23 @@ export interface GitHubStatus {
   /** The last GitHub call that failed; cleared by a poll without errors. */
   lastError: { message: string; at: string } | null;
   repos: GitHubRepoStatus[];
+}
+
+/** One repo whose requirements come from the local backlog (backlog.repos). */
+export interface BacklogRepoStatus extends ProposalSourceStatus {
+  /** Proposals waiting for a human or for the automatic acceptance. */
+  pending: number;
+}
+
+/** The local backlog of the repos without GitHub. */
+export interface BacklogStatus {
+  /** config.yaml has a `backlog` section. */
+  enabled: boolean;
+  pollMinutes: number;
+  lastPollAt: string | null;
+  /** The last thing a poll could not do; cleared by a poll without errors. */
+  lastError: { message: string; at: string } | null;
+  repos: BacklogRepoStatus[];
 }
 
 /** GET /api/upgrade: the Master upgrading itself. */

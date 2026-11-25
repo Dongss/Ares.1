@@ -296,10 +296,17 @@ export function noticeFor(event: EventRow, goal: string | undefined): Notice | n
       return {
         kind: 'proposals',
         title: titleOf('proposals', t({ zh: `${pending} 条`, en: String(pending) })),
-        body: t({
-          zh: '这些提案不能自动采纳（太大或超出自动采纳的风险），去 GitHub 上采纳或关闭',
-          en: 'These proposals cannot be accepted automatically (too large or above the auto-accept risk); accept or close them on GitHub',
-        }),
+        // A repo of the local backlog has its proposals in the Master, not on GitHub.
+        body:
+          event.data.backlog === true
+            ? t({
+                zh: '这些提案没有自动采纳（太大、超出自动采纳的风险，或今天的自动采纳额度用完了），去看板的需求页上采纳或拒绝',
+                en: "These proposals were not accepted automatically (too large, above the auto-accept risk, or past today's auto-accept limit); accept or reject them on the dashboard's Issues page",
+              })
+            : t({
+                zh: '这些提案不能自动采纳（太大或超出自动采纳的风险），去 GitHub 上采纳或关闭',
+                en: 'These proposals cannot be accepted automatically (too large or above the auto-accept risk); accept or close them on GitHub',
+              }),
         runId: null,
         about: 'issues',
       };
