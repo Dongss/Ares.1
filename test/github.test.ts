@@ -21,20 +21,30 @@ import { mergeRemoteGoal, mergeRemoteMessage } from '../src/github/bridge.js';
 import type { GhComment, GhIssue } from '../src/github/client.js';
 import {
   COMMENT_MARKER,
+  checkPlanItem,
   clockText,
+  dependsOnMarker,
   discussionComment,
   FOOTER_MARKER,
   goalChangedComment,
   goalFromIssue,
+  type IterationText,
   isMasterComment,
   isMasterCommentBy,
   isRetriesExhaustedComment,
   issueUpdate,
   isTrusted,
+  iterationBody,
+  iterationChildBody,
+  iterationMarker,
   LABELS,
   labelDefs,
   markComment,
+  type PlanItem,
+  parseDependsOn,
+  parseIterationOf,
   proposalBody,
+  proposalSections,
   pullRequestClosedComment,
   pullRequestComment,
   pullRequestReworkComment,
@@ -6616,6 +6626,234 @@ describe('issues: texts', () => {
         expect(markComment(closed(reason))).not.toMatch(cjk);
       }
     });
+  });
+});
+
+describe('issues: iteration texts', () => {
+  afterEach(() => setLang('zh'));
+  const cjk = /[一-鿿]/;
+
+  const text = (patch: Partial<IterationText> = {}): IterationText => ({
+    goal: '不接 GitHub 的仓库也能自己提需求、开工和合并',
+    readmeGoal: '永动：没有人看着也一直在做事',
+    criteria: ['本地仓库能自动侦察', '提案能在看板上采纳'],
+    plan: [
+      { number: 12, title: '本地提案池', dependsOn: [] },
+      { number: 13, title: '看板上采纳', dependsOn: [12] },
+      { number: 14, title: '收尾：整理评审建议', dependsOn: [12, 13] },
+    ],
+    outOfScope: ['GitLab', 'Gitea'],
+    kind: { risk: 'mid', size: 'L' },
+    ...patch,
+  });
+
+  const proposal = {
+    category: 'feature' as const,
+    size: 'M' as const,
+    risk: 'low' as const,
+    why: '现在只能手动建 Run',
+    evidence: ['src/config/schema.ts:19'],
+    what: '加一个本地需求来源',
+    acceptance: ['本地仓库能自动侦察'],
+  };
+
+  it('labels an iteration beside its status, described in both languages within 100 characters', () => {
+    expect(LABELS.iteration).toBe('ares1:iteration');
+    expect(withStatusLabel([LABELS.iteration, LABELS.ready], LABELS.running)).toEqual([
+      LABELS.iteration,
+      LABELS.running,
+    ]);
+    for (const lang of ['zh', 'en'] as const) {
+      setLang(lang);
+      const def = labelDefs().find((d) => d.name === LABELS.iteration);
+      expect(def?.description).toContain(LABELS.ready);
+      expect(def?.description.length).toBeLessThanOrEqual(100);
+      for (const d of labelDefs()) expect(d.description.length).toBeLessThanOrEqual(100);
+    }
+  });
+
+  it('writes and reads the hidden markers of a child issue, the same in every language', () => {
+    expect(iterationMarker(7)).toBe('<!-- ares1:iteration #7 -->');
+    expect(dependsOnMarker([12, 13])).toBe('<!-- ares1:depends-on #12 #13 -->');
+    expect(dependsOnMarker([])).toBe('<!-- ares1:depends-on -->');
+    const footer = (...lines: string[]) => ['正文', FOOTER_MARKER, '---', ...lines].join('\n');
+    const body = footer(iterationMarker(7), dependsOnMarker([12, 13]));
+    expect(parseIterationOf(body)).toBe(7);
+    expect(parseDependsOn(body)).toEqual([12, 13]);
+    expect(parseDependsOn(footer(iterationMarker(7), dependsOnMarker([])))).toEqual([]);
+    // Without markers: no iteration, no dependencies.
+    expect(parseIterationOf(footer('所属迭代：#7 · 依赖：#12'))).toBeNull();
+    expect(parseDependsOn(footer('所属迭代：#7 · 依赖：#12'))).toEqual([]);
+    expect(parseIterationOf('')).toBeNull();
+    // Spacing as a human may type it; repeats and #0 left out.
+    expect(parseIterationOf(footer('<!--ares1:iteration   #8-->'))).toBe(8);
+    expect(parseDependsOn(footer('<!--  ares1:depends-on #3  #3 #0 #4 -->'))).toEqual([3, 4]);
+    expect(parseIterationOf(footer('<!-- ares1:iteration #0 -->'))).toBeNull();
+    // Only in the Master's footer: the same text in the requirement is no marker.
+    const quoted = `正文里写着 ${iterationMarker(9)} 和 ${dependsOnMarker([1])}`;
+    expect(parseIterationOf(quoted)).toBeNull();
+    expect(parseDependsOn(quoted)).toEqual([]);
+    expect(parseIterationOf(`${quoted}\n\n${FOOTER_MARKER}\n${iterationMarker(7)}`)).toBe(7);
+  });
+
+  it("writes an iteration's issue: goal, completion criteria, plan and what it leaves out", () => {
+    const body = iterationBody(text(), 'scout_1', false);
+    const [main, foot] = body.split(FOOTER_MARKER) as [string, string];
+    expect(main).toBe(
+      [
+        '### 目标',
+        '',
+        '不接 GitHub 的仓库也能自己提需求、开工和合并',
+        '',
+        '对应 README 的目标：',
+        '',
+        '> 永动：没有人看着也一直在做事',
+        '',
+        '### 完成标准',
+        '',
+        '1. 本地仓库能自动侦察',
+        '2. 提案能在看板上采纳',
+        '',
+        '### 计划',
+        '',
+        '- [ ] #12 本地提案池',
+        '- [ ] #13 看板上采纳（依赖 #12）',
+        '- [ ] #14 收尾：整理评审建议（依赖 #12、#13）',
+        '',
+        '### 不做',
+        '',
+        '- GitLab',
+        '- Gitea',
+        '',
+        '',
+      ].join('\n'),
+    );
+    expect(foot).toContain('共 3 个子 issue · 整体大小：L · 整体风险：中');
+    expect(foot).toContain('scout_1');
+    expect(foot).toContain(`给这个迭代 issue 加标签 \`${LABELS.ready}\``);
+    expect(foot).toContain('关闭为 not planned');
+    const auto = iterationBody(text(), 'scout_1', true);
+    expect(auto).toContain('已按自动采纳的设置整批开工');
+    expect(auto).not.toContain(`加标签 \`${LABELS.ready}\``);
+    // Steps already done are checked; nothing left out says so.
+    const later = iterationBody(
+      text({
+        plan: [{ number: 12, title: '本地提案池', dependsOn: [], done: true }],
+        outOfScope: [],
+      }),
+      'scout_1',
+      false,
+    );
+    expect(later).toContain('- [x] #12 本地提案池\n');
+    expect(later).toContain('### 不做\n\n（没有写）\n');
+    // The plan's items carry no marker: the iteration is not read back from its own body.
+    expect(parseIterationOf(body)).toBeNull();
+  });
+
+  it('writes a child issue: the requirement for the Run, the iteration and dependencies in the footer', () => {
+    const body = iterationChildBody(proposal, { iteration: 7, dependsOn: [12, 13] }, 'scout_1');
+    expect(body.startsWith(proposalSections(proposal))).toBe(true);
+    const foot = body.slice(body.indexOf(FOOTER_MARKER));
+    expect(foot).toContain('所属迭代：#7 · 依赖：#12、#13');
+    expect(foot).toContain('类别：新功能 · 大小：M · 风险：低');
+    expect(foot).toContain('scout_1');
+    expect(body.endsWith(`${iterationMarker(7)}\n${dependsOnMarker([12, 13])}`)).toBe(true);
+    expect(parseIterationOf(body)).toBe(7);
+    expect(parseDependsOn(body)).toEqual([12, 13]);
+    // The Run's goal is the requirement alone.
+    const goal = goalFromIssue({ number: 14, title: '看板上采纳', body });
+    expect(goal).toBe(`#14 看板上采纳\n\n${proposalSections(proposal)}`);
+    expect(goal).not.toContain('ares1:');
+    expect(goal).not.toContain('所属迭代');
+
+    const first = iterationChildBody(proposal, { iteration: 7, dependsOn: [] }, 'scout_1');
+    expect(first).toContain('所属迭代：#7 · 没有依赖');
+    expect(parseIterationOf(first)).toBe(7);
+    expect(parseDependsOn(first)).toEqual([]);
+  });
+
+  it('checks a step of the plan once its issue is done, and only that one, once', () => {
+    const body = iterationBody(
+      text({
+        plan: [
+          { number: 1, title: '第一步', dependsOn: [] },
+          { number: 12, title: '第二步', dependsOn: [1] },
+          { number: 123, title: '第三步', dependsOn: [12] },
+        ],
+      }),
+      'scout_1',
+      false,
+    );
+    const once = checkPlanItem(body, 12);
+    expect(once).toContain('- [ ] #1 第一步');
+    expect(once).toContain('- [x] #12 第二步（依赖 #1）');
+    expect(once).toContain('- [ ] #123 第三步（依赖 #12）');
+    expect(checkPlanItem(once, 12)).toBe(once);
+    // Not in the plan: nothing changes.
+    expect(checkPlanItem(body, 99)).toBe(body);
+    // Lists a human edited by hand, with another bullet or indented.
+    expect(checkPlanItem('* [ ] #5 a\n  - [ ] #5 b\n- [ ] #50 c', 5)).toBe(
+      '* [x] #5 a\n  - [x] #5 b\n- [ ] #50 c',
+    );
+  });
+
+  it('writes them in English, keeping the protocol', () => {
+    setLang('en');
+    const it = iterationBody(
+      text({
+        goal: 'Repos without GitHub run on their own',
+        readmeGoal: 'Perpetual motion',
+        criteria: ['A local repo is scouted', 'Proposals are accepted on the dashboard'],
+        plan: [
+          { number: 12, title: 'Local backlog', dependsOn: [] },
+          { number: 13, title: 'Accept on the dashboard', dependsOn: [12] },
+        ],
+        outOfScope: ['GitLab'],
+      }),
+      'scout_1',
+      false,
+    );
+    expect(it).not.toMatch(cjk);
+    expect(it).toContain('### Goal\n\nRepos without GitHub run on their own');
+    expect(it).toContain('The README goal it serves:\n\n> Perpetual motion');
+    expect(it).toContain('### Completion criteria\n\n1. A local repo is scouted\n2. Proposals');
+    expect(it).toContain(
+      '### Plan\n\n- [ ] #12 Local backlog\n- [ ] #13 Accept on the dashboard (depends on #12)',
+    );
+    expect(it).toContain('### Out of scope\n\n- GitLab');
+    expect(it).toContain('2 sub-issues · Overall size: L · Overall risk: medium');
+    expect(it).toContain('add the label `ares1:ready` to this iteration issue');
+    expect(iterationBody(text({ plan: [text().plan[0] as PlanItem] }), 's', false)).toContain(
+      '1 sub-issue ·',
+    );
+    expect(checkPlanItem(it, 13)).toContain('- [x] #13 Accept on the dashboard (depends on #12)');
+    const auto = iterationBody(
+      text({ goal: 'g', readmeGoal: 'r', criteria: ['c'], plan: [], outOfScope: [] }),
+      'scout_1',
+      true,
+    );
+    expect(auto).not.toMatch(cjk);
+    expect(auto).toContain('### Out of scope\n\n(none given)');
+    expect(auto).toContain('started as a whole under the auto-accept setting');
+
+    const english = {
+      ...proposal,
+      why: 'Runs are created by hand.',
+      evidence: ['src/config/schema.ts:19'],
+      what: 'Add a local source.',
+      acceptance: ['A local repo is scouted'],
+    };
+    const child = iterationChildBody(english, { iteration: 7, dependsOn: [12, 13] }, 'scout_1');
+    expect(child).not.toMatch(cjk);
+    expect(child).toContain('Iteration: #7 · Depends on: #12, #13');
+    expect(child).toContain('Category: feature · Size: M · Risk: low');
+    expect(child).toContain(dependsOnMarker([12, 13]));
+    expect(parseDependsOn(child)).toEqual([12, 13]);
+    const first = iterationChildBody(english, { iteration: 7, dependsOn: [] }, 'scout_1');
+    expect(first).toContain('Iteration: #7 · No dependencies');
+    expect(first).not.toMatch(cjk);
+    const def = labelDefs().find((d) => d.name === LABELS.iteration);
+    expect(def?.description).not.toMatch(cjk);
   });
 });
 

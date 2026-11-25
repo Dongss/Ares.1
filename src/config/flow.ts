@@ -8,8 +8,10 @@
 // it is redone, how long a Run or a scout waits for an agent that is out of quota or rate-limited,
 // how long the raw output of agents is kept, which worktrees of failed or cancelled Runs of
 // issues are left over for the Master to remove, where a repo's requirements come from (GitHub
-// or the local backlog), whether a repo delivers through pull requests, and how many Runs may
-// execute across every repo (`concurrency.max_runs`).
+// or the local backlog), whether a repo delivers through pull requests, how many Runs may
+// execute across every repo (`concurrency.max_runs`), and the rules of iterations: how many
+// children one plans at most, the kind auto-accept judges one by as a whole, which children a
+// child waits for, its progress and where it stands.
 // Pure logic (type imports, src/i18n.ts, src/store/types.ts and src/engine/discussion.ts only),
 // so the dashboard shows the same rules the engine applies.
 
@@ -20,6 +22,8 @@ import {
   type Difficulty,
   type EventRow,
   FINISHED_RUN_STATUSES,
+  type IterationChild,
+  type IterationStatus,
   REQUIREMENT_SIZES,
   type RequirementSize,
   type Run,
@@ -157,6 +161,117 @@ export function acceptSplit(
     }
   }
   return { auto, human };
+}
+
+/**
+ * The most children one iteration plans, whatever a repo's `max_proposals`: a goal that needs
+ * more is too large for one iteration and is narrowed down instead.
+ */
+export const MAX_ITERATION_CHILDREN = 8;
+
+/**
+ * The statuses of an iteration that is not over yet: waiting to be accepted, under way, or
+ * blocked. A repo has at most one such iteration at a time; while it has one, the scout plans no
+ * other.
+ */
+export const ITERATION_OPEN_STATUSES: readonly IterationStatus[] = ['pending', 'active', 'blocked'];
+
+/**
+ * An iteration as auto-accept judges it, as a whole: the highest risk and the largest size of its
+ * children, compared with `auto_accept` by `isAutoAcceptable` like a single proposal. A plan
+ * without children counts as the smallest kind.
+ */
+export function iterationKind(children: readonly ProposalKind[]): ProposalKind {
+  let risk = 0;
+  let size = 0;
+  for (const child of children) {
+    risk = Math.max(risk, RISKS.indexOf(child.risk));
+    size = Math.max(size, PROPOSAL_SIZES.indexOf(child.size));
+  }
+  return { risk: RISKS[risk] as Risk, size: PROPOSAL_SIZES[size] as ProposalSize };
+}
+
+/** What the dependency rules look at in a child of an iteration. */
+export type ChildDependency = Pick<IterationChild, 'position' | 'dependsOn'>;
+export type ChildPlace = Pick<IterationChild, 'position' | 'status' | 'replacedBy'>;
+
+/**
+ * The positions a child really waits for: a child it depends on that was replaced stands for the
+ * one that replaced it (followed as far as replacements go), so the plan goes on with the new
+ * approach. Positions not in the plan, the child itself and repeats are left out, so a slip in a
+ * plan cannot hold a child back for good.
+ */
+export function effectiveDependencies(
+  child: ChildDependency,
+  children: readonly Pick<IterationChild, 'position' | 'replacedBy'>[],
+): number[] {
+  const byPosition = new Map(children.map((c) => [c.position, c]));
+  const result: number[] = [];
+  for (const dep of child.dependsOn) {
+    let at = dep;
+    const seen = new Set<number>();
+    while (!seen.has(at)) {
+      seen.add(at);
+      const next = byPosition.get(at)?.replacedBy;
+      if (next === undefined) break;
+      at = next;
+    }
+    if (!byPosition.has(at) || at === child.position || result.includes(at)) continue;
+    result.push(at);
+  }
+  return result;
+}
+
+/** The positions a child still waits for: its effective dependencies that are not done. */
+export function unmetDependencies(
+  child: ChildDependency,
+  children: readonly ChildPlace[],
+): number[] {
+  const byPosition = new Map(children.map((c) => [c.position, c]));
+  return effectiveDependencies(child, children).filter((p) => byPosition.get(p)?.status !== 'done');
+}
+
+/**
+ * Whether a child of an accepted iteration may start now (a Run be created for it): it waits for
+ * nothing more (`waiting`, or already `ready`), was not replaced, and every child it depends on
+ * is done.
+ */
+export function childReady(
+  child: ChildDependency & ChildPlace,
+  children: readonly ChildPlace[],
+): boolean {
+  return (
+    (child.status === 'waiting' || child.status === 'ready') &&
+    child.replacedBy === undefined &&
+    unmetDependencies(child, children).length === 0
+  );
+}
+
+/**
+ * How far an iteration got: its children that are done, of all of them. Children that were
+ * replaced are not counted; the ones that replaced them are.
+ */
+export function iterationProgress(children: readonly ChildPlace[]): {
+  done: number;
+  total: number;
+} {
+  const counted = children.filter((c) => c.replacedBy === undefined);
+  return { done: counted.filter((c) => c.status === 'done').length, total: counted.length };
+}
+
+/**
+ * Where an accepted iteration stands by its children: done once every child is (those replaced
+ * aside), blocked while a child failed or was dropped and nothing replaced it, otherwise active.
+ * Whether it is accepted (pending) or turned down (cancelled) is a human's decision, not its
+ * children's. A plan without children is done: nothing is left to do, and the repo can go on.
+ */
+export function iterationStatusOf(
+  children: readonly ChildPlace[],
+): Extract<IterationStatus, 'active' | 'blocked' | 'done'> {
+  const counted = children.filter((c) => c.replacedBy === undefined);
+  if (counted.every((c) => c.status === 'done')) return 'done';
+  if (counted.some((c) => c.status === 'failed' || c.status === 'dropped')) return 'blocked';
+  return 'active';
 }
 
 export const SYSTEM_DEFAULTS = {

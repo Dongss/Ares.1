@@ -227,4 +227,35 @@ export const MIGRATIONS: readonly string[] = [
   );
   CREATE INDEX proposals_repo_status ON proposals(repo_id, status);
   `,
+  // v12: iterations, a larger goal planned as children ordered by their dependencies; and the
+  // iteration a local proposal belongs to, with the proposals it depends on.
+  `
+  CREATE TABLE iterations (
+    id TEXT PRIMARY KEY,
+    repo_id TEXT NOT NULL REFERENCES repos(id),
+    scout_id TEXT,
+    source TEXT NOT NULL,
+    issues_repo TEXT NOT NULL DEFAULT '',
+    issue_number INTEGER,
+    issue_url TEXT,
+    title TEXT NOT NULL,
+    goal TEXT NOT NULL,
+    readme_goal TEXT NOT NULL,
+    criteria TEXT NOT NULL DEFAULT '[]',
+    out_of_scope TEXT NOT NULL DEFAULT '[]',
+    children TEXT NOT NULL DEFAULT '[]',
+    notes TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'pending',
+    auto INTEGER NOT NULL DEFAULT 0,
+    summary_posted INTEGER NOT NULL DEFAULT 0,
+    summary TEXT,
+    created_at TEXT NOT NULL,
+    decided_at TEXT,
+    ended_at TEXT
+  );
+  CREATE INDEX iterations_repo_status ON iterations(repo_id, status);
+
+  ALTER TABLE proposals ADD COLUMN iteration_id TEXT;
+  ALTER TABLE proposals ADD COLUMN depends_on TEXT NOT NULL DEFAULT '[]';
+  `,
 ];

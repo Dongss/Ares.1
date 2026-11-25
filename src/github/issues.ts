@@ -1,7 +1,7 @@
 // Labels, issue texts and how a Run's status shows on its issue. Pure functions.
 
 import { brandName } from '../brand.js';
-import type { Risk } from '../config/flow.js';
+import type { ProposalKind, Risk } from '../config/flow.js';
 import { conclusionLabel, waitText } from '../engine/discussion.js';
 import { groupedTimeParts, minutes, type RunTimes, timeParts } from '../engine/times.js';
 import { join, t } from '../i18n.js';
@@ -34,6 +34,11 @@ export const LABELS = {
    * again to redo it. A failed Run that is redone keeps ares1:running.
    */
   failed: 'ares1:failed',
+  /**
+   * An iteration: one larger goal planned by a scout, whose plan lists its child issues. Says
+   * what the issue is, not where it stands: it keeps a status label beside it.
+   */
+  iteration: 'ares1:iteration',
 } as const;
 
 /** Labels that say where the issue stands; exactly one of them is on an issue at a time. */
@@ -91,6 +96,14 @@ export function labelDefs(): LabelDef[] {
       description: t({
         zh: 'Run 被终止，或多次失败后不再自动重做；重新加 ares1:ready 可重做',
         en: 'The Run was cancelled, or failed too often to be redone; add ares1:ready again to redo it',
+      }),
+    },
+    {
+      name: LABELS.iteration,
+      color: '5319e7',
+      description: t({
+        zh: 'AI 规划的迭代：一个大目标和按依赖排好的子 issue；加 ares1:ready 就整批采纳',
+        en: 'An iteration planned by AI: one goal and its ordered sub-issues; add ares1:ready to accept all',
       }),
     },
   ];
@@ -295,6 +308,188 @@ export function autoAcceptedComment(): string {
     zh: `按当前的自动采纳设置，已自动采纳（加上 \`${LABELS.ready}\`）。不想做就关闭为 not planned，并留一句理由。`,
     en: `Accepted automatically under the current auto-accept setting (\`${LABELS.ready}\` added). If you don't want it, close it as not planned with a one-line reason.`,
   });
+}
+
+/**
+ * In the footer of an iteration's child issue: the iteration's own issue. Part of the protocol,
+ * the same in every language; the Master goes by it, not by the visible line beside it, which
+ * follows the language and which people may edit.
+ */
+export function iterationMarker(iteration: number): string {
+  return `<!-- ares1:iteration #${iteration} -->`;
+}
+
+/**
+ * In the footer of an iteration's child issue: the child issues of the same iteration it depends
+ * on, which must all be closed as completed before a Run is created for it. Written even when it
+ * depends on none.
+ */
+export function dependsOnMarker(issues: readonly number[]): string {
+  return `<!-- ares1:depends-on${issues.map((n) => ` #${n}`).join('')} -->`;
+}
+
+const ITERATION_MARKER = /<!--\s*ares1:iteration\s+#(\d+)\s*-->/;
+const DEPENDS_ON_MARKER = /<!--\s*ares1:depends-on((?:\s+#\d+)*)\s*-->/;
+
+/**
+ * The Master's footer of an issue body: from FOOTER_MARKER on, the part `goalFromIssue` leaves
+ * out of a Run's goal; '' without one. Markers are read only there, so the text a human or an
+ * agent reads as the requirement cannot pass for one.
+ */
+const footerOf = (body: string): string => {
+  const cut = body.indexOf(FOOTER_MARKER);
+  return cut >= 0 ? body.slice(cut) : '';
+};
+
+/** The iteration's issue a child issue belongs to, by its hidden marker; null for none. */
+export function parseIterationOf(body: string): number | null {
+  const match = ITERATION_MARKER.exec(footerOf(body));
+  const n = match ? Number(match[1]) : 0;
+  return n > 0 ? n : null;
+}
+
+/** The issues a child issue depends on, by its hidden marker, without repeats; [] for none. */
+export function parseDependsOn(body: string): number[] {
+  const match = DEPENDS_ON_MARKER.exec(footerOf(body));
+  const numbers = (match?.[1]?.match(/\d+/g) ?? []).map(Number).filter((n) => n > 0);
+  return [...new Set(numbers)];
+}
+
+/** 「#12、#13」, issue numbers as a list in the language in use. */
+const issueList = (issues: readonly number[]) => join(issues.map((n) => `#${n}`));
+
+/** One step of an iteration's plan as the iteration's issue lists it. */
+export interface PlanItem {
+  /** The step's own issue. */
+  number: number;
+  title: string;
+  /** The issues of the plan it depends on. */
+  dependsOn: readonly number[];
+  /** Closed as completed: its task list item is checked. */
+  done?: boolean;
+}
+
+/** What the issue of an iteration says. */
+export interface IterationText {
+  goal: string;
+  /** The goal of the README it serves, copied word for word. */
+  readmeGoal: string;
+  criteria: readonly string[];
+  /** The plan in order, each step with its issue. */
+  plan: readonly PlanItem[];
+  outOfScope: readonly string[];
+  /** The iteration as a whole, as auto-accept judges it (`iterationKind`). */
+  kind: ProposalKind;
+}
+
+/**
+ * The body of an iteration's issue: its goal with the README goal it serves, the completion
+ * criteria (numbered: children name them by number), the plan as a task list of its child issues
+ * (`- [ ] #N title`, checked by `checkPlanItem` as they are done) and what it leaves out; the
+ * footer says how to accept it or turn it down. `auto`: accepted under the auto-accept setting.
+ */
+export function iterationBody(it: IterationText, scoutId: string, auto: boolean): string {
+  const plan = it.plan.map((item) => {
+    const deps =
+      item.dependsOn.length > 0
+        ? t({
+            zh: `（依赖 ${issueList(item.dependsOn)}）`,
+            en: ` (depends on ${issueList(item.dependsOn)})`,
+          })
+        : '';
+    return `- [${item.done ? 'x' : ' '}] #${item.number} ${item.title}${deps}`;
+  });
+  const outOfScope =
+    it.outOfScope.length > 0
+      ? it.outOfScope.map((o) => `- ${o}`).join('\n')
+      : t({ zh: '（没有写）', en: '(none given)' });
+  return [
+    t({ zh: '### 目标', en: '### Goal' }),
+    '',
+    it.goal,
+    '',
+    t({ zh: '对应 README 的目标：', en: 'The README goal it serves:' }),
+    '',
+    quote(it.readmeGoal, 2000),
+    '',
+    t({ zh: '### 完成标准', en: '### Completion criteria' }),
+    '',
+    numbered([...it.criteria]),
+    '',
+    t({ zh: '### 计划', en: '### Plan' }),
+    '',
+    plan.join('\n'),
+    '',
+    t({ zh: '### 不做', en: '### Out of scope' }),
+    '',
+    outOfScope,
+    '',
+    FOOTER_MARKER,
+    '---',
+    t({
+      zh: `共 ${it.plan.length} 个子 issue · 整体大小：${it.kind.size} · 整体风险：${riskText(it.kind.risk)}`,
+      en: `${it.plan.length} sub-issue${it.plan.length === 1 ? '' : 's'} · Overall size: ${it.kind.size} · Overall risk: ${riskText(it.kind.risk)}`,
+    }),
+    '',
+    auto
+      ? t({
+          zh: `_由${brandName()}侦察规划（${scoutId}），已按自动采纳的设置整批开工：子 issue 按依赖顺序建 Run。不想做就关闭为 not planned，并留一句理由，还没完成的子 issue 会一起终止并关成不做。_`,
+          en: `_Planned by the ${brandName()} scout (${scoutId}) and started as a whole under the auto-accept setting: Runs are created for the sub-issues in the order of their dependencies. If you don't want it, close it as not planned with a one-line reason; the sub-issues not yet done are then stopped and closed as not planned too._`,
+        })
+      : t({
+          zh: `_由${brandName()}侦察规划（${scoutId}）。采纳：给这个迭代 issue 加标签 \`${LABELS.ready}\`，全部子 issue 一起采纳，按依赖顺序建 Run；不做：关闭为 not planned，并留一句理由，子 issue 会一起关成不做。_`,
+          en: `_Planned by the ${brandName()} scout (${scoutId}). To accept it, add the label \`${LABELS.ready}\` to this iteration issue: all its sub-issues are accepted with it, and Runs are created for them in the order of their dependencies. To decline, close it as not planned with a one-line reason; its sub-issues are closed as not planned too._`,
+        }),
+  ].join('\n');
+}
+
+/**
+ * The body of one child issue of an iteration: what it asks for, like any proposal, then in the
+ * footer a line for people with the iteration and the issues it depends on, its kind, and the
+ * hidden markers the Master goes by (`parseIterationOf`, `parseDependsOn`). In the footer, so
+ * they stay out of the Run's goal.
+ */
+export function iterationChildBody(
+  p: Pick<ScoutProposal, 'category' | 'size' | 'risk' | 'why' | 'evidence' | 'what' | 'acceptance'>,
+  at: { iteration: number; dependsOn: readonly number[] },
+  scoutId: string,
+): string {
+  const deps =
+    at.dependsOn.length > 0
+      ? t({
+          zh: `依赖：${issueList(at.dependsOn)}`,
+          en: `Depends on: ${issueList(at.dependsOn)}`,
+        })
+      : t({ zh: '没有依赖', en: 'No dependencies' });
+  return [
+    proposalSections(p),
+    '',
+    FOOTER_MARKER,
+    '---',
+    `${t({ zh: `所属迭代：#${at.iteration}`, en: `Iteration: #${at.iteration}` })} · ${deps}`,
+    '',
+    t({
+      zh: `类别：${categoryText(p.category)} · 大小：${p.size} · 风险：${riskText(p.risk)}`,
+      en: `Category: ${categoryText(p.category)} · Size: ${p.size} · Risk: ${riskText(p.risk)}`,
+    }),
+    '',
+    t({
+      zh: `_由${brandName()}侦察规划（${scoutId}），是迭代 #${at.iteration} 的一步：随迭代一起采纳，依赖的子 issue 都以完成关闭后才开工。_`,
+      en: `_Planned by the ${brandName()} scout (${scoutId}) as a step of iteration #${at.iteration}: accepted with the iteration, and started once the sub-issues it depends on are closed as completed._`,
+    }),
+    '',
+    iterationMarker(at.iteration),
+    dependsOnMarker(at.dependsOn),
+  ].join('\n');
+}
+
+/**
+ * An iteration's body with the plan's item of child issue `number` checked (`- [ ] #N` becomes
+ * `- [x] #N`); checking it again changes nothing, nor does a number the plan does not list.
+ */
+export function checkPlanItem(body: string, number: number): string {
+  const item = new RegExp(`^([ \\t]*[-*+] )\\[ \\]( #${number})(?!\\d)`, 'gm');
+  return body.replace(item, '$1[x]$2');
 }
 
 /** The goal of a Run created from an issue. */

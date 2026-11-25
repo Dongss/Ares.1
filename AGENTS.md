@@ -145,7 +145,11 @@ test/
     delivers through pull requests (`deliversByPr`), the limit on Runs executing across repos
     and which queued Runs wait for it (`roomUnderMaxRuns` / `waitsForMaxRuns`), the paths a Run
     expects to change and whether two Runs' paths overlap (`normalizeTouches` /
-    `touchesOverlap` / `conflictBlocker`), and the like: `src/config/flow.ts`
+    `touchesOverlap` / `conflictBlocker`), the rules of iterations: how many children one plans
+    (`MAX_ITERATION_CHILDREN`), the kind auto-accept judges one by as a whole (`iterationKind`),
+    which children a child waits for (`effectiveDependencies` / `unmetDependencies` /
+    `childReady`), its progress and where it stands (`iterationProgress` / `iterationStatusOf`),
+    and the like: `src/config/flow.ts`
   - notification rules: `src/notify/notice.ts`
   - assessment conclusion rules: `src/engine/discussion.ts`
   - how a Run's time is split, and the names and groups of the parts: `src/engine/times.ts`

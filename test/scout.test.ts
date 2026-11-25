@@ -2071,6 +2071,8 @@ const localProposal = (id: string, title: string, extra: Partial<Proposal> = {})
   rejectReason: null,
   auto: false,
   runId: null,
+  iterationId: null,
+  dependsOn: [],
   createdAt: '2026-11-20T00:00:00.000Z',
   decidedAt: null,
   ...extra,

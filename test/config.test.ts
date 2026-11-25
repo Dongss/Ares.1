@@ -3,15 +3,23 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   budgetPauses,
+  childReady,
   chooseStageAgent,
   conflictBlocker,
   discussionReplyWait,
+  effectiveDependencies,
   holdsScout,
+  ITERATION_OPEN_STATUSES,
+  isAutoAcceptable,
   issueRunOverrides,
+  iterationKind,
+  iterationProgress,
+  iterationStatusOf,
   leftoverWorkspaces,
   levelRank,
   limitedScout,
   loopsExhausted,
+  MAX_ITERATION_CHILDREN,
   MAX_TOUCHES,
   normalizeTouches,
   plansStage,
@@ -31,6 +39,7 @@ import {
   stageAgentIds,
   templateSplits,
   touchesOverlap,
+  unmetDependencies,
   waitsForMaxRuns,
 } from '../src/config/flow.js';
 import {
@@ -66,6 +75,8 @@ import {
   DIFFICULTIES,
   type Difficulty,
   type DiscussionEntry,
+  type IterationChild,
+  type IterationChildStatus,
   type RedoState,
   type Run,
   type RunStatus,
@@ -2898,6 +2909,129 @@ describe('holdsScout', () => {
     expect(holding('high', 'L')).toEqual(kinds.map((k) => `${k.risk}/${k.size}`));
     // Without a scout record its kind is not known: it counts, to stay safe.
     expect(holdsScout(null, { max_risk: 'low', max_size: 'S' })).toBe(true);
+  });
+});
+
+describe('iterations', () => {
+  type Place = Pick<IterationChild, 'position' | 'dependsOn' | 'status' | 'replacedBy'>;
+  const step = (
+    position: number,
+    status: IterationChildStatus,
+    dependsOn: number[] = [],
+    replacedBy?: number,
+  ): Place => ({ position, status, dependsOn, ...(replacedBy ? { replacedBy } : {}) });
+
+  it('plans at most 8 children, and a repo has one open iteration while it waits, works or is stuck', () => {
+    expect(MAX_ITERATION_CHILDREN).toBe(8);
+    expect(ITERATION_OPEN_STATUSES).toEqual(['pending', 'active', 'blocked']);
+  });
+
+  it('is judged as a whole by auto-accept: the highest risk and the largest size of its children', () => {
+    expect(
+      iterationKind([
+        { risk: 'low', size: 'L' },
+        { risk: 'mid', size: 'S' },
+        { risk: 'low', size: 'M' },
+      ]),
+    ).toEqual({ risk: 'mid', size: 'L' });
+    expect(iterationKind([{ risk: 'high', size: 'S' }])).toEqual({ risk: 'high', size: 'S' });
+    expect(iterationKind([])).toEqual({ risk: 'low', size: 'S' });
+    // One child beyond the limits keeps the whole iteration for a human.
+    const limits = { max_risk: 'low', max_size: 'M' } as const;
+    const small = [
+      { risk: 'low', size: 'S' },
+      { risk: 'low', size: 'M' },
+    ] as const;
+    expect(isAutoAcceptable(iterationKind(small), limits)).toBe(true);
+    expect(isAutoAcceptable(iterationKind([...small, { risk: 'low', size: 'L' }]), limits)).toBe(
+      false,
+    );
+    expect(isAutoAcceptable(iterationKind([...small, { risk: 'mid', size: 'S' }]), limits)).toBe(
+      false,
+    );
+  });
+
+  it('waits for the children it depends on until each is done', () => {
+    const plan = [
+      step(1, 'done'),
+      step(2, 'running', [1]),
+      step(3, 'waiting', [1, 2]),
+      step(4, 'waiting', [1]),
+    ];
+    const [, second, third, fourth] = plan as [Place, Place, Place, Place];
+    expect(effectiveDependencies(third, plan)).toEqual([1, 2]);
+    expect(unmetDependencies(third, plan)).toEqual([2]);
+    expect(childReady(third, plan)).toBe(false);
+    expect(unmetDependencies(fourth, plan)).toEqual([]);
+    expect(childReady(fourth, plan)).toBe(true);
+    // Already started: nothing to start.
+    expect(unmetDependencies(second, plan)).toEqual([]);
+    expect(childReady(second, plan)).toBe(false);
+    // Once the second is done, the third may start; already marked ready, it still is.
+    const later = plan.map((c) => (c.position === 2 ? { ...c, status: 'done' as const } : c));
+    expect(childReady(third, later)).toBe(true);
+    expect(childReady({ ...third, status: 'ready' }, later)).toBe(true);
+    // Not before the iteration is accepted, nor once it ended.
+    for (const status of ['planned', 'done', 'failed', 'dropped'] as const) {
+      expect(childReady({ ...third, status }, later)).toBe(false);
+    }
+  });
+
+  it('waits for the child that replaced a dependency instead, as far as replacements go', () => {
+    const plan = [
+      step(1, 'done'),
+      step(2, 'failed', [1], 4),
+      step(3, 'waiting', [2]),
+      step(4, 'dropped', [1], 5),
+      step(5, 'running', [1]),
+    ];
+    const third = plan[2] as Place;
+    expect(effectiveDependencies(third, plan)).toEqual([5]);
+    expect(unmetDependencies(third, plan)).toEqual([5]);
+    expect(childReady(third, plan)).toBe(false);
+    const done = plan.map((c) => (c.position === 5 ? { ...c, status: 'done' as const } : c));
+    expect(childReady(third, done)).toBe(true);
+    // A replaced child does not start itself.
+    expect(childReady({ ...(plan[1] as Place), status: 'waiting' }, done)).toBe(false);
+  });
+
+  it('leaves out positions not in the plan, the child itself, repeats and loops of replacements', () => {
+    const plan = [step(1, 'done'), step(2, 'failed', [], 3), step(3, 'waiting', [2, 2, 9, 1, 3])];
+    // 2 is replaced by 3, which is the child itself.
+    expect(effectiveDependencies(plan[2] as Place, plan)).toEqual([1]);
+    expect(childReady(plan[2] as Place, plan)).toBe(true);
+    const loop = [step(1, 'failed', [], 2), step(2, 'failed', [], 1), step(3, 'waiting', [1])];
+    expect(effectiveDependencies(loop[2] as Place, loop)).toHaveLength(1);
+    expect(childReady(loop[2] as Place, loop)).toBe(false);
+  });
+
+  it('counts its progress without the children that were replaced', () => {
+    expect(iterationProgress([])).toEqual({ done: 0, total: 0 });
+    expect(
+      iterationProgress([
+        step(1, 'done'),
+        step(2, 'failed', [], 4),
+        step(3, 'running'),
+        step(4, 'done'),
+        step(5, 'waiting'),
+      ]),
+    ).toEqual({ done: 2, total: 4 });
+  });
+
+  it('is done once every child is, blocked by a failed or dropped child nothing replaced', () => {
+    expect(iterationStatusOf([step(1, 'done'), step(2, 'done')])).toBe('done');
+    expect(iterationStatusOf([step(1, 'done'), step(2, 'failed', [], 3), step(3, 'done')])).toBe(
+      'done',
+    );
+    expect(iterationStatusOf([step(1, 'done'), step(2, 'running'), step(3, 'waiting')])).toBe(
+      'active',
+    );
+    expect(iterationStatusOf([step(1, 'ready'), step(2, 'planned')])).toBe('active');
+    expect(iterationStatusOf([step(1, 'failed'), step(2, 'running')])).toBe('blocked');
+    expect(iterationStatusOf([step(1, 'done'), step(2, 'dropped')])).toBe('blocked');
+    // Replaced: goes on with the replacement.
+    expect(iterationStatusOf([step(1, 'failed', [], 2), step(2, 'running')])).toBe('active');
+    expect(iterationStatusOf([])).toBe('done');
   });
 });
 

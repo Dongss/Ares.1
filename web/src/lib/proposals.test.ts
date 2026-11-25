@@ -39,6 +39,8 @@ function proposal(over: Partial<ProposalView> & Pick<ProposalView, 'id'>): Propo
     rejectReason: null,
     auto: false,
     runId: null,
+    iterationId: null,
+    dependsOn: [],
     createdAt: '2026-11-25T08:00:00.000Z',
     decidedAt: null,
     runStatus: null,

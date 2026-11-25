@@ -388,9 +388,138 @@ export interface Proposal {
   auto: boolean;
   /** The Run created from it once accepted. */
   runId: string | null;
+  /**
+   * The iteration it is a child of (`Iteration.id`); null for a proposal of its own. Accepted or
+   * rejected with its iteration, as a whole.
+   */
+  iterationId: string | null;
+  /**
+   * The proposals of the same iteration it depends on, by `id`: no Run is created for it before
+   * each of them completed. Empty for a proposal of its own.
+   */
+  dependsOn: string[];
   createdAt: string;
   /** When it was accepted or rejected. */
   decidedAt: string | null;
+}
+
+/** A GitHub issue the Master created or follows. */
+export interface IssueRef {
+  number: number;
+  url: string;
+}
+
+/**
+ * Where an iteration stands. pending: waits for a human to accept it, or for the automatic
+ * acceptance; active: accepted, its children are worked through in the order of their
+ * dependencies; blocked: a child failed or was dropped and nothing replaced it yet; done: every
+ * child completed; cancelled: a human turned it down. One repo has at most one iteration that is
+ * pending, active or blocked (`ITERATION_OPEN_STATUSES` in src/config/flow.ts).
+ */
+export const ITERATION_STATUSES = ['pending', 'active', 'blocked', 'done', 'cancelled'] as const;
+export type IterationStatus = (typeof ITERATION_STATUSES)[number];
+
+/**
+ * Where one child of an iteration stands. planned: the iteration is not accepted yet; waiting:
+ * accepted, but a child it depends on has not completed; ready: accepted and nothing to wait
+ * for, so a Run is created for it; running: a Run works on it, a failed one being redone
+ * included; done: its Run completed (its issue closed as completed); failed: its Runs failed
+ * until no attempts were left; dropped: not done, turned down by a human or with its iteration.
+ */
+export const ITERATION_CHILD_STATUSES = [
+  'planned',
+  'waiting',
+  'ready',
+  'running',
+  'done',
+  'failed',
+  'dropped',
+] as const;
+export type IterationChildStatus = (typeof ITERATION_CHILD_STATUSES)[number];
+
+/**
+ * One step of an iteration's plan: a requirement like any proposal, which becomes an issue (or a
+ * proposal of the local backlog) of its own, and where it stands in the plan.
+ */
+export interface IterationChild
+  extends Pick<
+    ScoutProposal,
+    'title' | 'category' | 'size' | 'risk' | 'why' | 'evidence' | 'what' | 'acceptance'
+  > {
+  /** Its number in the plan, from 1; children are referred to by it. */
+  position: number;
+  /** Which of the iteration's completion criteria it moves forward, by their number from 1. */
+  criteria: number[];
+  /**
+   * The children it depends on, by position: it starts only once each of them is done. A child
+   * that was replaced stands for the one that replaced it (`effectiveDependencies`).
+   */
+  dependsOn: number[];
+  /**
+   * The closing step: the suggestions reviewers left on the iteration's other Runs, gathered by
+   * the scout before it starts, instead of issues of their own.
+   */
+  closeout: boolean;
+  /** Its issue once created (GitHub). */
+  issue?: IssueRef;
+  /** Its proposal once created (the local backlog). */
+  proposalId?: string;
+  status: IterationChildStatus;
+  /** The Runs that worked on it, oldest first. */
+  runIds: string[];
+  /** The position of the child that took over after this one failed or was dropped. */
+  replacedBy?: number;
+}
+
+/** A change a scout made to an iteration's plan, with why. */
+export interface IterationNote {
+  at: string;
+  scoutId: string | null;
+  text: string;
+}
+
+/**
+ * An iteration: one larger goal of a repo, planned by a scout in one go as a set of children
+ * ordered by their dependencies, accepted as a whole and summed up once every child is done. On
+ * GitHub it is an issue labelled `ares1:iteration` whose children are issues of their own; in the
+ * local backlog, its children are proposals.
+ */
+export interface Iteration {
+  id: string;
+  repoId: string;
+  /** The scout that planned it. */
+  scoutId: string | null;
+  /** Where its children are: GitHub issues, or the local backlog (backlog.repos). */
+  source: 'github' | 'local';
+  /** "owner/name" of its issues; '' for the local backlog. */
+  issuesRepo: string;
+  /** Its own issue on GitHub once created; null in the local backlog and until then. */
+  issue: IssueRef | null;
+  title: string;
+  /** What users can do once it is done that they could not before, in words they would use. */
+  goal: string;
+  /** The goal of the README it serves, copied word for word. */
+  readmeGoal: string;
+  /** How to tell it is done, ideally something to demonstrate; numbered from 1 by children. */
+  criteria: string[];
+  /** What it leaves out on purpose. */
+  outOfScope: string[];
+  /** The plan, in order of position. */
+  children: IterationChild[];
+  /** Changes scouts made to the plan, oldest first. */
+  notes: IterationNote[];
+  status: IterationStatus;
+  /** Accepted without a human, within the repo's auto_accept. */
+  auto: boolean;
+  /** The summary was posted once every child was done (on GitHub: a comment on its issue). */
+  summaryPosted: boolean;
+  /** The summary of what it achieved; null until it is done. */
+  summary: string | null;
+  createdAt: string;
+  /** When it was accepted or turned down. */
+  decidedAt: string | null;
+  /** When it was done or cancelled. */
+  endedAt: string | null;
 }
 
 /**

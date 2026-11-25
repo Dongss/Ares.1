@@ -20,7 +20,7 @@ import {
   NotFoundError,
   Store,
 } from '../src/store/store.js';
-import type { Attempt, Scout, ScoutProposal } from '../src/store/types.js';
+import type { Attempt, IterationChild, Scout, ScoutProposal } from '../src/store/types.js';
 import { type Harness, harness, tmpDir } from './helpers.js';
 
 const template = TemplateSchema.parse({ id: 't', stages: [{ id: 'a', agent: 'x' }] });
@@ -410,7 +410,7 @@ describe('proposals of the local backlog', () => {
     const store = new Store(file);
     expect(
       (store.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
-    ).toBe(11);
+    ).toBe(MIGRATIONS.length);
     expect(store.getScout('old')).toMatchObject({ issuesRepo: 'me/r', status: 'completed' });
     expect(store.listProposals()).toEqual([]);
     const scout = store.createScout({
@@ -472,6 +472,8 @@ describe('proposals of the local backlog', () => {
       rejectReason: null,
       auto: false,
       runId: null,
+      iterationId: null,
+      dependsOn: [],
       createdAt: a.createdAt,
       decidedAt: null,
     });
@@ -615,6 +617,263 @@ describe('proposals of the local backlog', () => {
     expect(store.listScouts({ repoId: repo.id })).toEqual([]);
     expect(store.listProposals({ repoId: repo.id })).toEqual([]);
     expect(store.listProposals()).toEqual([kept]);
+  });
+});
+
+describe('iterations', () => {
+  afterEach(() => setLang('zh'));
+
+  const child = (position: number, patch: Partial<IterationChild> = {}): IterationChild => ({
+    position,
+    title: `第 ${position} 步`,
+    category: 'feature',
+    size: 'M',
+    risk: 'low',
+    why: '为什么',
+    evidence: ['README.md:1'],
+    what: '做什么',
+    acceptance: ['能演示'],
+    criteria: [1],
+    dependsOn: position > 1 ? [position - 1] : [],
+    closeout: false,
+    status: 'planned',
+    runIds: [],
+    ...patch,
+  });
+
+  const planned = (repoId: string, scoutId: string | null, title = '本地仓库自己运转') => ({
+    repoId,
+    scoutId,
+    source: 'github' as const,
+    issuesRepo: 'me/r',
+    title,
+    goal: '不接 GitHub 的仓库也能自己提需求、开工和合并',
+    readmeGoal: '永动',
+    criteria: ['本地仓库能自动侦察', '提案能在看板上采纳'],
+    outOfScope: ['GitLab'],
+    children: [child(1), child(2), child(3, { closeout: true, dependsOn: [1, 2] })],
+  });
+
+  it('migrates a v11 database: its proposals belong to no iteration and depend on nothing', () => {
+    const dir = tmpDir('ares1-db-');
+    const file = join(dir, 'ares1.db');
+    const old = new DatabaseSync(file);
+    for (const m of MIGRATIONS.slice(0, 11)) old.exec(m);
+    old.exec('PRAGMA user_version = 11');
+    old.exec(`
+      INSERT INTO repos (id, name, path, target_branch, created_at) VALUES ('r', 'r', '/r', 'main', 't');
+      INSERT INTO proposals (id, repo_id, scout_id, title, category, size, risk, why, what, created_at)
+        VALUES ('old', 'r', 's', 'a', 'feature', 'M', 'low', 'w', 'x', 't');
+    `);
+    old.close();
+
+    const store = new Store(file);
+    expect(
+      (store.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+    ).toBe(MIGRATIONS.length);
+    expect(store.getProposal('old')).toMatchObject({
+      title: 'a',
+      status: 'pending',
+      iterationId: null,
+      dependsOn: [],
+    });
+    expect(store.listIterations()).toEqual([]);
+    expect(
+      store.db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'iterations'")
+        .all()
+        .map((r) => (r as { name: string }).name),
+    ).toContain('iterations_repo_status');
+    const it = store.createIteration(planned('r', 's'));
+    expect(store.getIteration(it.id)).toEqual(it);
+    store.close();
+    expect(readdirSync(dir).filter((f) => f.includes('.bak-v11-'))).toHaveLength(1);
+  });
+
+  it('creates, reads back, updates and lists them by repo, status and scout, newest first', () => {
+    const store = new Store(':memory:');
+    const { repo } = seed(store);
+    const other = store.createRepo({
+      name: 'o',
+      path: '/tmp/o',
+      targetBranch: 'main',
+      verifyCommands: [],
+      setupCommands: [],
+      mergeMode: 'direct',
+    });
+
+    const a = store.createIteration(planned(repo.id, 'scout-1', 'a'));
+    expect(a).toEqual({
+      id: a.id,
+      repoId: repo.id,
+      scoutId: 'scout-1',
+      source: 'github',
+      issuesRepo: 'me/r',
+      issue: null,
+      title: 'a',
+      goal: '不接 GitHub 的仓库也能自己提需求、开工和合并',
+      readmeGoal: '永动',
+      criteria: ['本地仓库能自动侦察', '提案能在看板上采纳'],
+      outOfScope: ['GitLab'],
+      children: planned(repo.id, 'scout-1').children,
+      notes: [],
+      status: 'pending',
+      auto: false,
+      summaryPosted: false,
+      summary: null,
+      createdAt: a.createdAt,
+      decidedAt: null,
+      endedAt: null,
+    });
+    expect(a.id).toMatch(/^iteration-/);
+    // JSON, boolean and split columns come back as they went in.
+    expect(store.getIteration(a.id)).toEqual(a);
+    expect(Object.keys(store.getIteration(a.id)).sort()).toEqual(Object.keys(a).sort());
+
+    // Accepted on creation, in the local backlog.
+    const b = store.createIteration({
+      ...planned(repo.id, null, 'b'),
+      source: 'local',
+      issuesRepo: '',
+      status: 'active',
+      auto: true,
+      decidedAt: '2026-11-25T08:00:00.000Z',
+    });
+    expect(store.getIteration(b.id)).toMatchObject({
+      scoutId: null,
+      source: 'local',
+      issuesRepo: '',
+      issue: null,
+      status: 'active',
+      auto: true,
+      decidedAt: '2026-11-25T08:00:00.000Z',
+    });
+    const c = store.createIteration({
+      ...planned(other.id, 'scout-1', 'c'),
+      issue: { number: 7, url: 'https://github.com/me/r/issues/7' },
+    });
+    expect(store.getIteration(c.id).issue).toEqual({
+      number: 7,
+      url: 'https://github.com/me/r/issues/7',
+    });
+    const d = store.createIteration(planned(repo.id, 'scout-2', 'd'));
+
+    // Children and notes change as the plan goes on.
+    const children: IterationChild[] = a.children.map((ch) =>
+      ch.position === 1
+        ? { ...ch, status: 'done', issue: { number: 8, url: 'u8' }, runIds: ['run-1'] }
+        : ch.position === 2
+          ? { ...ch, status: 'failed', replacedBy: 4, runIds: ['run-2', 'run-3'] }
+          : { ...ch, status: 'waiting' },
+    );
+    children.push(child(4, { status: 'ready', dependsOn: [1], proposalId: 'proposal-x' }));
+    const updated = store.updateIteration(a.id, {
+      issue: { number: 6, url: 'u6' },
+      status: 'blocked',
+      children,
+      notes: [{ at: '2026-11-25T09:00:00.000Z', scoutId: 'scout-3', text: '第 2 步换个做法' }],
+      decidedAt: '2026-11-25T08:30:00.000Z',
+    });
+    expect(updated).toMatchObject({
+      issue: { number: 6, url: 'u6' },
+      status: 'blocked',
+      children,
+      notes: [{ at: '2026-11-25T09:00:00.000Z', scoutId: 'scout-3', text: '第 2 步换个做法' }],
+      title: 'a',
+    });
+    expect(store.getIteration(a.id)).toEqual(updated);
+    const ended = store.updateIteration(a.id, {
+      status: 'done',
+      summaryPosted: true,
+      summary: '做成了',
+      endedAt: '2026-11-26T00:00:00.000Z',
+    });
+    expect(ended).toMatchObject({ status: 'done', summaryPosted: true, summary: '做成了' });
+    // Back to false, and the issue back to none.
+    expect(store.updateIteration(a.id, { summaryPosted: false, issue: null })).toMatchObject({
+      summaryPosted: false,
+      issue: null,
+    });
+    // Nothing to change is no change.
+    expect(store.updateIteration(d.id, {})).toEqual(d);
+
+    const ids = (list: { id: string }[]) => list.map((i) => i.id);
+    expect(ids(store.listIterations())).toEqual([d.id, c.id, b.id, a.id]);
+    expect(ids(store.listIterations({ repoId: repo.id }))).toEqual([d.id, b.id, a.id]);
+    expect(ids(store.listIterations({ status: 'pending' }))).toEqual([d.id, c.id]);
+    expect(ids(store.listIterations({ repoId: repo.id, status: ['active', 'done'] }))).toEqual([
+      b.id,
+      a.id,
+    ]);
+    expect(store.listIterations({ status: [] })).toEqual([]);
+    expect(ids(store.listIterations({ scoutId: 'scout-1' }))).toEqual([c.id, a.id]);
+    expect(ids(store.listIterations({ repoId: repo.id, scoutId: 'scout-1' }))).toEqual([a.id]);
+    expect(ids(store.listIterations({ repoId: repo.id, limit: 2 }))).toEqual([d.id, b.id]);
+    expect(store.listIterations({ repoId: 'nope' })).toEqual([]);
+    // Listed as they are read one by one.
+    expect(store.listIterations({ status: 'active' })).toEqual([store.getIteration(b.id)]);
+  });
+
+  it('keeps the iteration of a local proposal and the proposals it depends on', () => {
+    const store = new Store(':memory:');
+    const { repo } = seed(store);
+    const it = store.createIteration({
+      ...planned(repo.id, null),
+      source: 'local',
+      issuesRepo: '',
+    });
+    const fields = {
+      category: 'feature' as const,
+      size: 'M' as const,
+      risk: 'low' as const,
+      why: 'w',
+      evidence: [],
+      what: 'x',
+      acceptance: [],
+      repoId: repo.id,
+      scoutId: null,
+    };
+    const first = store.createProposal({ ...fields, title: '1', iterationId: it.id });
+    const second = store.createProposal({
+      ...fields,
+      title: '2',
+      iterationId: it.id,
+      dependsOn: [first.id],
+    });
+    expect(store.getProposal(first.id)).toMatchObject({ iterationId: it.id, dependsOn: [] });
+    expect(store.getProposal(second.id)).toMatchObject({
+      iterationId: it.id,
+      dependsOn: [first.id],
+    });
+    expect(store.updateProposal(second.id, { dependsOn: [] }).dependsOn).toEqual([]);
+  });
+
+  it('tells an iteration that does not exist, in both languages', () => {
+    const store = new Store(':memory:');
+    expect(() => store.getIteration('nope')).toThrow(NotFoundError);
+    expect(() => store.getIteration('nope')).toThrow('迭代 nope 不存在');
+    expect(() => store.updateIteration('nope', { status: 'done' })).toThrow(NotFoundError);
+    setLang('en');
+    expect(() => store.getIteration('nope')).toThrow('Iteration nope not found');
+    expect(() => store.updateIteration('nope', {})).toThrow('Iteration nope not found');
+  });
+
+  it('are deleted with their repo, and only theirs', () => {
+    const store = new Store(':memory:');
+    const { repo } = seed(store);
+    const other = store.createRepo({
+      name: 'o',
+      path: '/tmp/o',
+      targetBranch: 'main',
+      verifyCommands: [],
+      setupCommands: [],
+      mergeMode: 'direct',
+    });
+    store.createIteration(planned(repo.id, 's'));
+    const kept = store.createIteration(planned(other.id, 's'));
+    store.deleteRepo(repo.id);
+    expect(store.listIterations({ repoId: repo.id })).toEqual([]);
+    expect(store.listIterations()).toEqual([kept]);
   });
 });
 

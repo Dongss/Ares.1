@@ -15,6 +15,8 @@ import {
   type CheckResult,
   type EventRow,
   FINISHED_RUN_STATUSES,
+  type Iteration,
+  type IterationStatus,
   type Proposal,
   type ProposalStatus,
   type RedoState,
@@ -37,7 +39,8 @@ type Table =
   | 'approvals'
   | 'artifacts'
   | 'scouts'
-  | 'proposals';
+  | 'proposals'
+  | 'iterations';
 
 /** Columns stored as JSON text. */
 const JSON_COLUMNS: Partial<Record<Table, readonly string[]>> = {
@@ -45,11 +48,13 @@ const JSON_COLUMNS: Partial<Record<Table, readonly string[]>> = {
   runs: ['template', 'overrides', 'blocked', 'issue', 'discussion'],
   attempts: ['structured'],
   scouts: ['proposals', 'gaps'],
-  proposals: ['evidence', 'acceptance'],
+  proposals: ['evidence', 'acceptance', 'depends_on'],
+  iterations: ['criteria', 'out_of_scope', 'children', 'notes'],
 };
 const BOOL_COLUMNS: Partial<Record<Table, readonly string[]>> = {
   check_results: ['passed'],
   proposals: ['auto'],
+  iterations: ['auto', 'summary_posted'],
 };
 /**
  * Object fields kept one key per column, by field: key `number` of field `pr` in column
@@ -57,6 +62,7 @@ const BOOL_COLUMNS: Partial<Record<Table, readonly string[]>> = {
  */
 const SPLIT_COLUMNS: Partial<Record<Table, Record<string, readonly string[]>>> = {
   runs: { pr: ['number', 'url'] },
+  iterations: { issue: ['number', 'url'] },
 };
 
 const toSnake = (key: string) => key.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
@@ -594,6 +600,7 @@ export class Store {
       );
     }
     this.tx(() => {
+      this.db.prepare('DELETE FROM iterations WHERE repo_id = ?').run(id);
       this.db.prepare('DELETE FROM proposals WHERE repo_id = ?').run(id);
       this.db.prepare('DELETE FROM scouts WHERE repo_id = ?').run(id);
       this.db.prepare('DELETE FROM repos WHERE id = ?').run(id);
@@ -1270,9 +1277,12 @@ export class Store {
 
   /**
    * A new pending proposal. Takes only the proposal's own fields, so a ScoutProposal can be
-   * passed as it is: its `issue`, `local` and `error` are not columns.
+   * passed as it is: its `issue`, `local` and `error` are not columns. Without `iterationId` it
+   * belongs to no iteration, without `dependsOn` it depends on nothing.
    */
-  createProposal(input: Pick<Proposal, ProposalInputKey>): Proposal {
+  createProposal(
+    input: Pick<Proposal, ProposalInputKey> & Partial<Pick<Proposal, 'iterationId' | 'dependsOn'>>,
+  ): Proposal {
     const proposal: Proposal = {
       id: newId('proposal'),
       repoId: input.repoId,
@@ -1289,6 +1299,8 @@ export class Store {
       rejectReason: null,
       auto: false,
       runId: null,
+      iterationId: input.iterationId ?? null,
+      dependsOn: input.dependsOn ?? [],
       createdAt: nowIso(),
       decidedAt: null,
     };
@@ -1343,7 +1355,109 @@ export class Store {
       filter.limit ?? -1,
     );
   }
+
+  // ---- iterations ----------------------------------------------------------
+
+  /**
+   * A new iteration, pending unless `status` says otherwise, with no issue, notes, summary or
+   * decision yet unless given.
+   */
+  createIteration(
+    input: Pick<Iteration, IterationInputKey> &
+      Partial<Pick<Iteration, 'issue' | 'notes' | 'status' | 'auto' | 'decidedAt'>>,
+  ): Iteration {
+    const iteration: Iteration = {
+      id: newId('iteration'),
+      repoId: input.repoId,
+      scoutId: input.scoutId,
+      source: input.source,
+      issuesRepo: input.issuesRepo,
+      issue: input.issue ?? null,
+      title: input.title,
+      goal: input.goal,
+      readmeGoal: input.readmeGoal,
+      criteria: input.criteria,
+      outOfScope: input.outOfScope,
+      children: input.children,
+      notes: input.notes ?? [],
+      status: input.status ?? 'pending',
+      auto: input.auto ?? false,
+      summaryPosted: false,
+      summary: null,
+      createdAt: nowIso(),
+      decidedAt: input.decidedAt ?? null,
+      endedAt: null,
+    };
+    this.insert('iterations', iteration);
+    return iteration;
+  }
+
+  getIteration(id: string): Iteration {
+    return this.must(
+      this.one<Iteration>('iterations', 'SELECT * FROM iterations WHERE id = ?', id),
+      t({ zh: `迭代 ${id}`, en: `Iteration ${id}` }),
+    );
+  }
+
+  /** Throws NotFoundError when there is no such iteration. */
+  updateIteration(
+    id: string,
+    patch: Partial<Omit<Iteration, 'id' | 'repoId' | 'createdAt'>>,
+  ): Iteration {
+    this.getIteration(id);
+    this.patch('iterations', id, patch);
+    return this.getIteration(id);
+  }
+
+  /** Newest first. `status` may list several; no `limit` = all of them. */
+  listIterations(
+    filter: {
+      repoId?: string;
+      status?: IterationStatus | readonly IterationStatus[];
+      scoutId?: string;
+      limit?: number;
+    } = {},
+  ): Iteration[] {
+    const where: string[] = [];
+    const params: SQLInputValue[] = [];
+    if (filter.repoId) {
+      where.push('repo_id = ?');
+      params.push(filter.repoId);
+    }
+    if (filter.status !== undefined) {
+      const statuses: readonly IterationStatus[] =
+        typeof filter.status === 'string' ? [filter.status] : filter.status;
+      // No status at all matches nothing, rather than everything.
+      where.push(statuses.length === 0 ? '0' : `status IN (${statuses.map(() => '?').join(', ')})`);
+      params.push(...statuses);
+    }
+    if (filter.scoutId) {
+      where.push('scout_id = ?');
+      params.push(filter.scoutId);
+    }
+    const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    return this.many<Iteration>(
+      'iterations',
+      `SELECT * FROM iterations ${clause} ORDER BY created_at DESC, rowid DESC LIMIT ?`,
+      ...params,
+      // SQLite takes a negative limit as none.
+      filter.limit ?? -1,
+    );
+  }
 }
+
+/** What a new iteration is made of; the rest is set when it is created, decided or ends. */
+type IterationInputKey =
+  | 'repoId'
+  | 'scoutId'
+  | 'source'
+  | 'issuesRepo'
+  | 'title'
+  | 'goal'
+  | 'readmeGoal'
+  | 'criteria'
+  | 'outOfScope'
+  | 'children';
 
 /** What a new proposal is made of; the rest is set when it is created or decided. */
 type ProposalInputKey =
