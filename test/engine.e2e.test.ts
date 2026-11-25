@@ -6839,7 +6839,7 @@ stages:
     const run = h.run();
     await h.waitStatus(run.id, 'completed');
 
-    const text = runDigest(h.master.store, h.repo.id);
+    const text = runDigest(h.master.store, h.repo.id, 1);
     const lines = text.split('\n');
     const at = lines.indexOf('  编码第 1 轮：拆成 2 步');
     expect(at).toBeGreaterThan(0);
@@ -6863,7 +6863,7 @@ stages:
     const run = h.run();
     await h.waitStatus(run.id, 'failed');
 
-    const lines = runDigest(h.master.store, h.repo.id).split('\n');
+    const lines = runDigest(h.master.store, h.repo.id, 1).split('\n');
     const at = lines.indexOf('  编码第 1 轮：拆成 3 步');
     expect(at).toBeGreaterThan(0);
     expect(lines.slice(at + 1)).toEqual([
@@ -6901,7 +6901,7 @@ stages:
       ['work', 'b', 'cancelled'],
       ['work', 'c', 'cancelled'],
     ]);
-    const lines = runDigest(h.master.store, h.repo.id).split('\n');
+    const lines = runDigest(h.master.store, h.repo.id, 1).split('\n');
     const at = lines.indexOf('  编码第 1 轮：拆成 3 步');
     expect(at).toBeGreaterThan(0);
     expect(lines.slice(at + 1, at + 3)).toEqual([
@@ -6929,7 +6929,7 @@ stages:
       const run = h.run('Add feature.txt');
       await h.waitStatus(run.id, 'failed');
 
-      const text = runDigest(h.master.store, h.repo.id);
+      const text = runDigest(h.master.store, h.repo.id, 1);
       const lines = text.split('\n');
       const at = lines.indexOf('  Coding round 1: split into 3 steps');
       expect(at).toBeGreaterThan(0);

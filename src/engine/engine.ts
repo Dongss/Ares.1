@@ -1,12 +1,5 @@
 import { EventEmitter } from 'node:events';
-import {
-  appendFileSync,
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  realpathSync,
-  writeFileSync,
-} from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { isOurProcess, killProcessGroup, prepareAgentEnv } from '../adapters/process.js';
@@ -80,7 +73,6 @@ import {
   type Attempt,
   type BlockInfo,
   type DiscussionEntry,
-  type EventRow,
   FINISHED_RUN_STATUSES,
   type ReplyEntry,
   type ReplyTimeoutEntry,
@@ -91,7 +83,7 @@ import {
   type StageRun,
   type Task,
 } from '../store/types.js';
-import { errorMessage, newId, nowIso } from '../util.js';
+import { errorMessage, executionSlot, newId, nowIso } from '../util.js';
 import {
   type CommandResult,
   environmentProblem,
@@ -165,6 +157,7 @@ import {
   reworkPrompt,
   taskPrompt,
 } from './prompts.js';
+import { conflictWaitSpans } from './times.js';
 
 export interface EngineDeps {
   store: Store;
@@ -384,40 +377,6 @@ function mergeStageId(run: Pick<Run, 'template'>): string | undefined {
 }
 
 /**
- * A wait for another Run, as the waiting Run's events recorded it: the Run waited for, and the
- * ids of the events it lasted between (exclusive).
- */
-interface RecordedConflictWait {
-  runId: string;
-  from: number;
-  to: number;
-}
-
-/**
- * The waits for other Runs that a Run's `events` (oldest first) recorded: each begins with its
- * `run.waiting_conflict` event and lasts until the Run leaves the queue (its next `run.status`
- * event other than `queued`; a Run going back to the queue after its assessment records the
- * wait just before it is queued) or waits for another Run. A wait the Run is still in lasts to
- * the end (`to` is Infinity).
- */
-function recordedConflictWaits(events: readonly EventRow[]): RecordedConflictWait[] {
-  const waits: RecordedConflictWait[] = [];
-  let current: { runId: string; from: number } | null = null;
-  for (const e of events) {
-    if (e.type === 'run.waiting_conflict') {
-      if (current) waits.push({ ...current, to: e.id });
-      current =
-        typeof e.data.blockedBy === 'string' ? { runId: e.data.blockedBy, from: e.id } : null;
-    } else if (current && e.type === 'run.status' && e.data.status !== 'queued') {
-      waits.push({ ...current, to: e.id });
-      current = null;
-    }
-  }
-  if (current) waits.push({ ...current, to: Number.POSITIVE_INFINITY });
-  return waits;
-}
-
-/**
  * The workflow engine: a deterministic state machine that executes up to `concurrency.per_repo`
  * Runs at a time per repo, each in the Run's own worktree, one task and one commit at a time.
  * Runs of different repos execute side by side, up to `concurrency.max_runs` in all when that is
@@ -561,7 +520,7 @@ export class Engine {
    * The Runs each queued Run had outlasted (`outlasted`) when the last Master stopped, read back
    * from its events, so that a restart does not make it wait for them again. Each wait it
    * recorded (`run.waiting_conflict`) lasted until it left the queue or waited for another Run
-   * (`recordedConflictWaits`); it outlasted the Run it waited for when that one got past its
+   * (`conflictWaitSpans`); it outlasted the Run it waited for when that one got past its
    * merge stage within the wait (its `stage.passed` event for the merge stage comes in between),
    * or has ended since. Which Run each waits for now (`conflictWaits`) is not read back: `kick`
    * works it out again.
@@ -583,7 +542,7 @@ export class Engine {
     };
     for (const run of this.store.queuedRuns()) {
       const outlasted = new Set<string>();
-      for (const wait of recordedConflictWaits(this.store.listEvents(run.id))) {
+      for (const wait of conflictWaitSpans(this.store.listEvents(run.id))) {
         if (outlasted.has(wait.runId)) continue;
         let blocker: Run;
         try {
@@ -594,7 +553,7 @@ export class Engine {
         }
         if (
           FINISHED_RUN_STATUSES.includes(blocker.status) ||
-          mergesOf(blocker).some((id) => id > wait.from && id < wait.to)
+          mergesOf(blocker).some((id) => id > wait.fromId && id < wait.toId)
         ) {
           outlasted.add(blocker.id);
         }
@@ -799,18 +758,12 @@ export class Engine {
   }
 
   /**
-   * The execution slot of a Run: its repo's path with symlinks resolved, so that two repos
-   * registered on the same git repository (e.g. with different target branches) share one, and
-   * with it its merge lock, so that their git commands do not race. The registered path when it
-   * cannot be resolved (it is gone: the Run then fails on it as before).
+   * The execution slot of a Run (`executionSlot` of its repo's path): two repos registered on the
+   * same git repository share one, and with it its merge lock, so that their git commands do not
+   * race. A repo whose path is gone gets its registered path: the Run then fails on it as before.
    */
   private slotOf(run: Run): string {
-    const { path } = this.store.getRepo(run.repoId);
-    try {
-      return realpathSync(path);
-    } catch {
-      return path;
-    }
+    return executionSlot(this.store.getRepo(run.repoId).path);
   }
 
   /**

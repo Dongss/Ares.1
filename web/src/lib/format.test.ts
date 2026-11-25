@@ -91,6 +91,7 @@ describe('format helpers', () => {
     const none = {
       agentMs: 0,
       queuedMs: 0,
+      conflictWaitMs: 0,
       stoppedMs: 0,
       approvalMs: 0,
       blockedMs: 0,
@@ -113,6 +114,7 @@ describe('format helpers', () => {
         blockedMs: 40_000,
         approvalMs: 2 * MIN,
         stoppedMs: 5 * MIN,
+        conflictWaitMs: 0,
         queuedMs: 12,
         agentMs: 90 * MIN + 400,
       };
@@ -125,6 +127,41 @@ describe('format helpers', () => {
         '暂停 3 分 0 秒',
       ]);
       expect(runTimePartTexts({ ...times, queuedMs: 1_500 })[1]).toBe('排队 2 秒');
+    });
+
+    it('shows the wait for an overlapping Run on its own, after the queue', () => {
+      const times = {
+        ...none,
+        totalMs: 60 * MIN,
+        agentMs: 10 * MIN,
+        queuedMs: 5 * MIN,
+        conflictWaitMs: 45 * MIN,
+      };
+      expect(runTimePartTexts(times)).toEqual([
+        'Agent 执行 10 分 0 秒',
+        '排队 5 分 0 秒',
+        '错开等待 45 分 0 秒',
+      ]);
+      expect(formatRunTime({ createdAt, finishedAt: at(60) }, times)).toBe(
+        '1 小时 0 分（Agent 执行 10 分 0 秒、排队 5 分 0 秒、错开等待 45 分 0 秒）',
+      );
+      // Without such a wait the part is left out, as before.
+      expect(runTimePartTexts({ ...times, conflictWaitMs: 0 })).toEqual([
+        'Agent 执行 10 分 0 秒',
+        '排队 5 分 0 秒',
+      ]);
+    });
+
+    it('names the wait for an overlapping Run in English', () => {
+      setLang('en');
+      try {
+        const times = { ...none, totalMs: 30 * MIN, agentMs: 10 * MIN, conflictWaitMs: 20 * MIN };
+        const texts = runTimePartTexts(times);
+        expect(texts).toEqual(['Agent work 10m 0s', 'Waiting for an overlapping Run 20m 0s']);
+        for (const text of texts) expect(text).not.toMatch(/[一-鿿]/);
+      } finally {
+        setLang('zh');
+      }
     });
 
     it('shows only the total when nothing has ended yet', () => {

@@ -33,7 +33,11 @@ afterEach(async () => {
   h = undefined;
 });
 
-const digest = (hh: Harness) => runDigest(hh.master.store, hh.repo.id);
+/** The digest of the harness's repo, with `concurrency.per_repo` at `perRepo`. */
+const fullDigest = (hh: Harness, perRepo = 1) => runDigest(hh.master.store, hh.repo.id, perRepo);
+
+/** The digest's lines on the Runs: all but its first, on Runs side by side. */
+const digest = (hh: Harness) => fullDigest(hh).split('\n').slice(1).join('\n');
 
 /** The first lead of a prompt: the problems that stop the system. */
 const firstLead = (text: string) => text.split('\n').find((l) => l.startsWith('1. ')) ?? '';
@@ -93,7 +97,7 @@ stages:
 describe('runDigest', () => {
   it('says there are no Runs yet', async () => {
     h = await harness();
-    expect(digest(h)).toBe('（还没有 Run）');
+    expect(fullDigest(h)).toBe('（还没有 Run）');
   });
 
   it('shows stage rounds only when nothing had to be redone', async () => {
@@ -793,6 +797,198 @@ stages:
   });
 });
 
+describe('runDigest: Runs side by side', () => {
+  afterEach(() => setLang('zh'));
+
+  /** IMPLEMENT_ONLY with its stage named in English, for digests without any Chinese left. */
+  const IMPLEMENT_ONLY_EN = IMPLEMENT_ONLY.replace('name: 编码', 'name: Coding');
+
+  /** Moves the Run's executions to the given minutes after its creation. */
+  function retimeAttempts(hh: Harness, run: Run, from: number, to: number): void {
+    const store = hh.master.store;
+    for (const a of store.listRunAttempts(run.id)) {
+      store.updateAttempt(a.id, { startedAt: later(run, from), endedAt: later(run, to) });
+    }
+  }
+
+  it('opens with concurrency.per_repo and how many Runs executed side by side', async () => {
+    h = await harness({ workflow: IMPLEMENT_ONLY_EN });
+    const a = h.run('Add a');
+    await h.waitStatus(a.id, 'completed');
+    const b = h.run('Add b');
+    await h.waitStatus(b.id, 'completed');
+    const c = h.run('Add c');
+    await h.waitStatus(c.id, 'completed');
+    // One after another, as they executed.
+    retimeAttempts(h, a, 0, 10);
+    retimeAttempts(h, b, 20, 30);
+    retimeAttempts(h, c, 40, 50);
+    expect(fullDigest(h).split('\n')[0]).toBe(
+      'concurrency.per_repo（同一仓库最多同时执行几个 Run）：1；下面 3 个 Run 里，执行时间和别的 Run 有重叠的 0 个',
+    );
+    // The first two side by side for a while.
+    retimeAttempts(h, b, 5, 30);
+    expect(fullDigest(h, 2).split('\n')[0]).toBe(
+      'concurrency.per_repo（同一仓库最多同时执行几个 Run）：2；下面 3 个 Run 里，执行时间和别的 Run 有重叠的 2 个',
+    );
+
+    setLang('en');
+    const english = fullDigest(h, 2);
+    expect(english.split('\n')[0]).toBe(
+      'concurrency.per_repo (how many Runs of a repo may execute at a time): 2; 2 of the 3 Runs below executed at the same time as another',
+    );
+    expect(english).not.toMatch(/[一-鿿]/);
+  });
+
+  it('says how often and how long a Run waited for Runs it overlaps, for which, and where', async () => {
+    h = await harness({ workflow: IMPLEMENT_ONLY_EN });
+    const store = h.master.store;
+    // Recorded while it is queued, before it starts: passed by for run-x, then for run-y.
+    h.master.engine.setWorking(false);
+    const run = h.run('Add feature.txt');
+    store.event(run.id, 'run.waiting_conflict', {
+      stageId: 'implement',
+      blockedBy: 'run-x',
+      paths: ['src/engine', 'docs/running.md'],
+    });
+    store.event(run.id, 'run.waiting_conflict', {
+      stageId: 'implement',
+      blockedBy: 'run-y',
+      paths: ['src/engine', 'src/github', 'test', 'web'],
+    });
+    h.master.engine.setWorking(true);
+    await h.waitStatus(run.id, 'completed');
+    // Queued from creation, for run-x from 10 and run-y from 20, started at 40.
+    retimeStatuses(h, run, [
+      ['running', 40],
+      ['completed', 45],
+    ]);
+    const [x, y] = store.listEvents(run.id).filter((e) => e.type === 'run.waiting_conflict');
+    for (const [e, min] of [
+      [x, 10],
+      [y, 20],
+    ] as const) {
+      store.db.prepare('UPDATE events SET ts = ? WHERE id = ?').run(later(run, min), e?.id ?? 0);
+    }
+    // Work was switched off and on again before the Run was created.
+    const switches = store.listGlobalEventsOfType('master.working');
+    for (const e of switches) {
+      store.db.prepare('UPDATE events SET ts = ? WHERE id = ?').run(later(run, -10), e.id);
+    }
+    store.updateRun(run.id, { finishedAt: later(run, 45) });
+    retimeAttempts(h, run, 40, 45);
+
+    const text = digest(h);
+    expect(text).toContain('，用时 45 分钟（Agent 执行 5 分钟，排队 10 分钟，错开等待 30 分钟）');
+    expect(text).toContain(
+      '\n  为避开冲突等了 2 次，共 30 分钟（等 run-x、run-y，重叠路径 src/engine、docs/running.md、src/github…另有 2 条）',
+    );
+
+    setLang('en');
+    const english = digest(h);
+    expect(english).toContain(
+      ', took 45 min (Agent work 5 min, Queued 10 min, Waiting for an overlapping Run 30 min)',
+    );
+    expect(english).toContain(
+      '\n  Waited for an overlapping Run 2 times, 30 min in all (for run-x, run-y; overlapping paths src/engine, docs/running.md, src/github…and 2 more)',
+    );
+    expect(english).not.toMatch(/[一-鿿]/);
+  });
+
+  it('says a Run still waits for one it overlaps', async () => {
+    h = await harness({ workflow: IMPLEMENT_ONLY });
+    h.master.engine.setWorking(false);
+    const run = h.run();
+    h.master.store.event(run.id, 'run.waiting_conflict', {
+      stageId: 'implement',
+      blockedBy: 'run-x',
+      paths: ['src/engine'],
+    });
+
+    expect(digest(h)).toContain(
+      '\n  为避开冲突等了 1 次，现在还在等（等 run-x，重叠路径 src/engine）',
+    );
+    setLang('en');
+    expect(digest(h)).toContain(
+      '\n  Waited for an overlapping Run 1 time, still waiting (for run-x; overlapping paths src/engine)',
+    );
+  });
+
+  it('has no line on waits for a Run that waited for none', async () => {
+    h = await harness({ workflow: IMPLEMENT_ONLY });
+    const run = h.run();
+    await h.waitStatus(run.id, 'completed');
+    expect(digest(h)).not.toContain('为避开冲突');
+  });
+
+  /** Two Runs, one after the other; the merge of the second ran into a conflict. */
+  async function conflicted(hh: Harness): Promise<{ first: Run; second: Run }> {
+    const first = hh.run('甲');
+    await hh.waitStatus(first.id, 'waiting_approval');
+    hh.master.engine.approve(first.id);
+    await hh.waitStatus(first.id, 'completed');
+    const second = hh.run('乙');
+    await hh.waitStatus(second.id, 'waiting_approval');
+    hh.master.engine.approve(second.id);
+    await hh.waitStatus(second.id, 'completed');
+    const store = hh.master.store;
+    const merge = store.listStageRuns(second.id).find((sr) => sr.stageId === 'merge');
+    store.updateStageRun(merge?.id ?? '', {
+      status: 'failed',
+      failReason: 'conflict',
+      failFeedback: '合并 main 的最新代码时，这些文件有冲突：feature.txt',
+    });
+    return { first, second };
+  }
+
+  it('tells a merge conflict while another Run executed or merged meanwhile', async () => {
+    h = await harness();
+    const { first, second } = await conflicted(h);
+    const store = h.master.store;
+    // The first executed after the second had begun coding.
+    const coding = store.listStageRuns(second.id).find((sr) => sr.stageId === 'implement');
+    const [attempt] = store.listRunAttempts(first.id);
+    store.updateAttempt(attempt?.id ?? '', { startedAt: coding?.startedAt, endedAt: null });
+    store.updateRun(first.id, { finishedAt: null });
+
+    const line = `  合并第 1 轮并行时合并冲突（同一仓库里同时在执行或先合并了的有 ${first.id}）：合并 main 的最新代码时，这些文件有冲突：feature.txt`;
+    expect(digest(h).split('\n')).toContain(line);
+
+    // The template names its stages in Chinese; the rest is in English.
+    setLang('en');
+    expect(digest(h)).toContain(
+      `  合并 round 1: merge conflict while working side by side (${first.id} of the same repo executed or merged meanwhile): `,
+    );
+    setLang('zh');
+
+    // Or merged while the second was coding, without executing meanwhile.
+    store.updateAttempt(attempt?.id ?? '', {
+      startedAt: later(first, -60),
+      endedAt: later(first, -50),
+    });
+    expect(digest(h).split('\n')).not.toContain(line);
+    const merge = store.listStageRuns(first.id).find((sr) => sr.stageId === 'merge');
+    store.updateStageRun(merge?.id ?? '', { endedAt: coding?.startedAt });
+    expect(digest(h).split('\n')).toContain(line);
+  });
+
+  it('tells a merge conflict without other Runs side by side as before', async () => {
+    h = await harness();
+    const { first } = await conflicted(h);
+    // The first executed and merged well before the second began.
+    const store = h.master.store;
+    retimeAttempts(h, first, -60, -50);
+    const merge = store.listStageRuns(first.id).find((sr) => sr.stageId === 'merge');
+    store.updateStageRun(merge?.id ?? '', { endedAt: later(first, -45) });
+    store.updateRun(first.id, { finishedAt: later(first, -45) });
+    const text = digest(h);
+    expect(text).toContain(
+      '  合并第 1 轮合并冲突：合并 main 的最新代码时，这些文件有冲突：feature.txt',
+    );
+    expect(text).not.toContain('并行时');
+  });
+});
+
 describe('runDigest: terminated Runs', () => {
   afterEach(() => setLang('zh'));
 
@@ -1089,6 +1285,38 @@ describe('scoutPrompt', () => {
     expect(clue).toContain(
       '用时里「停工」「等审批」「卡住等人」「暂停」的部分是在等人处理，「排队」的部分是在等别的 Run 做完（也包括等升级、Master 没运行的时候）',
     );
+  });
+
+  it('counts waiting for an overlapping Run as the queue, and lets the scout suggest raising per_repo', () => {
+    const clue = prompt.split('\n').find((l) => l.startsWith('1. '));
+    expect(clue).toContain('「错开等待」和排队一样是在等别的 Run');
+    expect(clue).toContain('都不说明 Agent 慢');
+    expect(clue).toContain(
+      'per_repo 为 1、排队时间远多于 Agent 执行时间、并行带来的错开等待和「并行时合并冲突」又很少时，可以建议人调大 per_repo',
+    );
+    expect(clue).toContain('侦察只提建议，不改用户的配置');
+
+    setLang('en');
+    try {
+      const english = firstLead(
+        scoutPrompt({
+          repoName: 'demo',
+          max: 3,
+          runs: '',
+          issues: '',
+          splits: false,
+          autoAcceptsL: false,
+        }),
+      );
+      expect(english).toContain(
+        '"Waiting for an overlapping Run" is waiting for another Run just like the queue',
+      );
+      expect(english).toContain('you may suggest that a human raise per_repo');
+      expect(english).toContain("does not change the user's configuration");
+      expect(english).not.toMatch(/[一-鿿]/);
+    } finally {
+      setLang('zh');
+    }
   });
 
   it('asks for a gap analysis against the goals before the leads, into gaps', () => {
@@ -1458,7 +1686,7 @@ describe('scout in English', () => {
     );
     const clue = prompt.split('\n').find((l) => l.startsWith('1. '));
     expect(clue).toContain(
-      '"Work switched off", "Awaiting approval", "Stuck, waiting for a human" and "Paused" are time spent waiting for a human, and "Queued" is time spent waiting for other Runs to finish (including while an upgrade is pending or the Master is not running)',
+      '"Work switched off", "Awaiting approval", "Stuck, waiting for a human" and "Paused" are time spent waiting for a human; "Queued" is time spent waiting for other Runs to finish (including while an upgrade is pending or the Master is not running)',
     );
     const polish = prompt.split('\n').find((l) => l.startsWith('4. '));
     expect(polish).toContain(

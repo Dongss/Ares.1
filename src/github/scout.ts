@@ -26,11 +26,14 @@ import {
 } from '../engine/discussion.js';
 import { planSteps } from '../engine/plan.js';
 import {
+  type ConflictWaitSpan,
+  conflictWaitSpans,
   minutes,
   type RunTimePart,
   type RunTimes,
   runTimePartLabels,
   runTimeParts,
+  SHOWN_PART_MS,
   storedRunTimes,
   timeParts,
   type WorkSwitch,
@@ -50,6 +53,7 @@ import type {
   Task,
 } from '../store/types.js';
 import type { UpgradeFailure } from '../upgrade/upgrader.js';
+import { executionSlot } from '../util.js';
 import type { GhAuthored, GhIssue } from './client.js';
 import {
   FOOTER_MARKER,
@@ -450,10 +454,26 @@ function issueLine(issue: ReviewReport['issues'][number]): string {
 }
 
 /**
- * Why a stage round failed. A failed review lists each must-fix issue on its own line, so a long
- * review summary cannot crowd them out; suggestions are only counted.
+ * 「并行时合并冲突（同一仓库里同时在执行或先合并了的有 run-b）」, a merge conflict while other
+ * Runs of the execution slot worked side by side with the Run (`parallelRuns`).
  */
-function failLines(sr: StageRun, stageName: string, attempts: Attempt[]): string[] {
+const parallelConflictText = (runIds: string[]) =>
+  t({
+    zh: `并行时合并冲突（同一仓库里同时在执行或先合并了的有 ${join(runIds)}）`,
+    en: `merge conflict while working side by side (${join(runIds)} of the same repo executed or merged meanwhile)`,
+  });
+
+/**
+ * Why a stage round failed. A failed review lists each must-fix issue on its own line, so a long
+ * review summary cannot crowd them out; suggestions are only counted. A merge conflict says which
+ * Runs worked side by side with this one meanwhile (`parallel`), if any.
+ */
+function failLines(
+  sr: StageRun,
+  stageName: string,
+  attempts: Attempt[],
+  parallel: string[],
+): string[] {
   if (!sr.failReason) return [];
   const head = `  ${roundName(stageName, sr.round)}`;
   const review = sr.failReason === 'review' ? reviewOf(attempts) : null;
@@ -471,12 +491,17 @@ function failLines(sr: StageRun, stageName: string, attempts: Attempt[]): string
     if (must.length > MAX_MUST_ISSUES) lines.push(`    ${moreText(must.length - MAX_MUST_ISSUES)}`);
     return lines;
   }
-  if (!sr.failFeedback) return [];
+  const besideOthers = sr.failReason === 'conflict' && parallel.length > 0;
+  const reason = besideOthers ? parallelConflictText(parallel) : failText(sr.failReason);
+  if (!sr.failFeedback) {
+    // Without feedback only a merge conflict beside other Runs is worth a line.
+    return besideOthers ? [t({ zh: `${head}${reason}`, en: `${head}: ${reason}` })] : [];
+  }
   const feedback = oneLine(sr.failFeedback, 300);
   return [
     t({
-      zh: `${head}${failText(sr.failReason)}：${feedback}`,
-      en: `${head}: ${failText(sr.failReason)}: ${feedback}`,
+      zh: `${head}${reason}：${feedback}`,
+      en: `${head}: ${reason}: ${feedback}`,
     }),
   ];
 }
@@ -655,8 +680,146 @@ function terminationReason(events: EventRow[]): string {
     : t({ zh: '人在看板上终止', en: 'by a human on the dashboard' });
 }
 
-/** Recent Runs of the repo, with what went wrong in them: the scout's best evidence. */
-export function runDigest(store: Store, repoId: string, limit = 15): string {
+/** A stretch of time, in epoch milliseconds. */
+interface Span {
+  start: number;
+  end: number;
+}
+
+const overlaps = (a: Span, b: Span) => a.start < b.end && b.start < a.end;
+
+/**
+ * How many of the Runs, given by their executions, executed at the same time as another of them
+ * at least once.
+ */
+function overlappingRuns(executions: readonly Span[][]): number {
+  return executions.filter((own, i) =>
+    executions.some((other, j) => j !== i && own.some((a) => other.some((b) => overlaps(a, b)))),
+  ).length;
+}
+
+/** The digest's first line: the limit on Runs side by side, and how many of them were. */
+function parallelHead(perRepo: number, runs: number, overlapping: number): string {
+  return t({
+    zh: `concurrency.per_repo（同一仓库最多同时执行几个 Run）：${perRepo}；下面 ${runs} 个 Run 里，执行时间和别的 Run 有重叠的 ${overlapping} 个`,
+    en: `concurrency.per_repo (how many Runs of a repo may execute at a time): ${perRepo}; ${overlapping} of the ${runs} Run${runs === 1 ? '' : 's'} below executed at the same time as another`,
+  });
+}
+
+/** Overlapping paths listed on a Run's line of waits; more are only counted. */
+const MAX_CONFLICT_PATHS = 3;
+
+/**
+ * 「为避开冲突等了 2 次，共 35 分钟（等 run-a，重叠路径 src/a、docs）」: the Run's waits for Runs it
+ * overlaps (`waits`, from `conflictWaitSpans`), how long they took (`conflictWaitMs` of its times;
+ * a wait still going on counts once it is over), the Runs waited for and the overlapping paths.
+ * Empty without waits. `showPaths` says whether the paths may be shown: the assessment wrote them
+ * from the goal.
+ */
+function conflictWaitLines(
+  run: Run,
+  waits: readonly ConflictWaitSpan[],
+  waitedMs: number,
+  showPaths: boolean,
+): string[] {
+  const n = waits.length;
+  if (n === 0) return [];
+  const runIds = join([...new Set(waits.map((w) => w.runId))]);
+  const paths = showPaths ? [...new Set(waits.flatMap((w) => w.paths))] : [];
+  const shown = paths.slice(0, MAX_CONFLICT_PATHS).map((p) => oneLine(p, 120));
+  const more = paths.length > MAX_CONFLICT_PATHS ? moreText(paths.length - MAX_CONFLICT_PATHS) : '';
+  const mins = minutes(waitedMs);
+  const still = run.status === 'queued' && waits.at(-1)?.to === null;
+  const counted = waitedMs >= SHOWN_PART_MS;
+  return [
+    t({
+      zh: `  为避开冲突等了 ${n} 次${counted ? `，共 ${mins} 分钟` : ''}${still ? '，现在还在等' : ''}（等 ${runIds}${shown.length > 0 ? `，重叠路径 ${join(shown)}${more}` : ''}）`,
+      en: `  Waited for an overlapping Run ${n} time${n === 1 ? '' : 's'}${counted ? `, ${mins} min in all` : ''}${still ? ', still waiting' : ''} (for ${runIds}${shown.length > 0 ? `; overlapping paths ${join(shown)}${more}` : ''})`,
+    }),
+  ];
+}
+
+/**
+ * What the digest reads of the Runs of the repo's execution slot (`executionSlot`: the repo and
+ * any other registered on the same path), each read once: their executions, and when their merges
+ * passed.
+ */
+class SlotHistory {
+  private runs: Run[] | undefined;
+  private readonly executions = new Map<string, Span[]>();
+  private readonly now = Date.now();
+
+  constructor(
+    private readonly store: Store,
+    private readonly repoId: string,
+  ) {}
+
+  /** The Run's executions, each from start to end; one still going lasts until now. */
+  executionsOf(runId: string): Span[] {
+    let spans = this.executions.get(runId);
+    if (!spans) {
+      spans = this.store.listRunAttempts(runId).map((a) => ({
+        start: Date.parse(a.startedAt),
+        end: a.endedAt ? Date.parse(a.endedAt) : this.now,
+      }));
+      this.executions.set(runId, spans);
+    }
+    return spans;
+  }
+
+  /** When the Run's merge stage rounds passed, in epoch milliseconds. */
+  mergesOf(run: Run): number[] {
+    const merge = new Set(run.template.stages.filter((s) => s.kind === 'merge').map((s) => s.id));
+    return this.store
+      .listStageRuns(run.id)
+      .filter((sr) => merge.has(sr.stageId) && sr.status === 'passed' && sr.endedAt)
+      .map((sr) => Date.parse(sr.endedAt as string));
+  }
+
+  /** Every Run of the execution slot, across the repos registered on its path. */
+  slotRuns(): Run[] {
+    if (!this.runs) {
+      const slot = executionSlot(this.store.getRepo(this.repoId).path);
+      this.runs = this.store
+        .listRepos()
+        .filter((r) => r.id === this.repoId || executionSlot(r.path) === slot)
+        .flatMap((r) => this.store.listRuns({ repoId: r.id }));
+    }
+    return this.runs;
+  }
+
+  /**
+   * The other Runs of the slot that worked side by side with `run` between the start of its work
+   * past the assessment (its first round of another stage; its creation without one) and the
+   * merge conflict that failed the round `sr`: one executing within that time, or whose merge
+   * passed within it, may have changed what the Run then conflicted with. Their ids, oldest
+   * first.
+   */
+  parallelRuns(run: Run, stageRuns: readonly StageRun[], sr: StageRun): string[] {
+    const kind = (stageId: string) => run.template.stages.find((s) => s.id === stageId)?.kind;
+    const begun = stageRuns.find((r) => kind(r.stageId) !== 'assess')?.startedAt ?? run.createdAt;
+    const window = { start: Date.parse(begun), end: Date.parse(sr.endedAt ?? sr.startedAt) };
+    return this.slotRuns()
+      .filter((other) => {
+        if (other.id === run.id || Date.parse(other.createdAt) > window.end) return false;
+        if (other.finishedAt && Date.parse(other.finishedAt) < window.start) return false;
+        return (
+          this.executionsOf(other.id).some((e) => overlaps(e, window)) ||
+          this.mergesOf(other).some((at) => at >= window.start && at <= window.end)
+        );
+      })
+      .map((other) => other.id)
+      .reverse();
+  }
+}
+
+/**
+ * Recent Runs of the repo, with what went wrong in them: the scout's best evidence. It opens with
+ * the repo's `concurrency.per_repo` at the time (`perRepo`) and how many of the Runs executed side
+ * by side with another, so that the scout can weigh what working side by side costs in waits,
+ * merge conflicts and rework against the time Runs spend queued.
+ */
+export function runDigest(store: Store, repoId: string, perRepo: number, limit = 15): string {
   const runs = store.listRuns({ repoId }).slice(0, limit);
   if (runs.length === 0) return t({ zh: '（还没有 Run）', en: '(no Runs yet)' });
   // Every finished Run's times need the whole record of the work switch: read it once, at the
@@ -666,9 +829,14 @@ export function runDigest(store: Store, repoId: string, limit = 15): string {
     switches ??= workSwitchesOf(store);
     return switches;
   };
-  return runs
+  const slot = new SlotHistory(store, repoId);
+  const overlapping = overlappingRuns(runs.map((run) => slot.executionsOf(run.id)));
+  const head = parallelHead(perRepo, runs.length, overlapping);
+  const digests = runs
     .map((run) => {
       const stageRuns = store.listStageRuns(run.id);
+      const events = store.listEvents(run.id);
+      const conflictWaits = conflictWaitSpans(events);
       const failedChecks = new Map<string, CheckResult[]>();
       for (const c of store.listChecks(run.id)) {
         if (c.passed || !c.attemptId) continue;
@@ -679,7 +847,12 @@ export function runDigest(store: Store, repoId: string, limit = 15): string {
       const trusted = trustedGoal(run);
       const rounds = new Map<string, number>();
       for (const sr of stageRuns) rounds.set(sr.stageId, (rounds.get(sr.stageId) ?? 0) + 1);
-      const took = run.finishedAt ? tookText(storedRunTimes(store, run, workSwitches())) : '';
+      // A Run that waited for one it overlaps says how long, finished or not.
+      const times =
+        run.finishedAt || conflictWaits.length > 0
+          ? storedRunTimes(store, run, workSwitches())
+          : null;
+      const took = times ? tookText(times) : '';
       const status = statusText(run.status);
       const date = run.createdAt.slice(0, 10);
       const goal = trusted
@@ -722,17 +895,19 @@ export function runDigest(store: Store, repoId: string, limit = 15): string {
       // Terminated is a strong lead: a human changed course, turned the requirement down, or it
       // was done some other way.
       if (run.status === 'cancelled') {
-        const reason = terminationReason(store.listEvents(run.id));
+        const reason = terminationReason(events);
         lines.push(`  ${t({ zh: '终止', en: 'Terminated' })}${colon()}${reason}`);
       }
       lines.push(...discussionLines(run));
+      lines.push(...conflictWaitLines(run, conflictWaits, times?.conflictWaitMs ?? 0, trusted));
       for (const sr of stageRuns) {
         const tasks = store
           .listTasks(sr.id)
           .map((task) => ({ task, attempts: store.listAttempts(task.id) }));
         const attempts = tasks.flatMap((x) => x.attempts);
+        const parallel = sr.failReason === 'conflict' ? slot.parallelRuns(run, stageRuns, sr) : [];
         lines.push(...roundReworkLines(run, sr, name(sr.stageId), tasks, failedChecks, trusted));
-        lines.push(...failLines(sr, name(sr.stageId), attempts));
+        lines.push(...failLines(sr, name(sr.stageId), attempts, parallel));
         // Reviewers read the goal: from an untrusted one, their suggestions may carry its text.
         if (trusted && stage(sr.stageId)?.kind === 'review') {
           lines.push(...suggestionLines(sr, name(sr.stageId), attempts));
@@ -741,6 +916,7 @@ export function runDigest(store: Store, repoId: string, limit = 15): string {
       return lines.join('\n');
     })
     .join('\n');
+  return `${head}\n${digests}`;
 }
 
 /**
@@ -1113,7 +1289,7 @@ const scoutPromptZh = (input: ScoutPromptInput) =>
 - 认真对照每个目标后仍然找不到缺口，gaps 才是空列表。
 
 ## 线索（按优先级从高到低）
-1. 让系统停转或空耗的问题：下面附的最近 Run 里卡住、失败、反复返工、评审反复提同类意见、费用或 Agent 执行用时异常的${upgradeLead(input.upgrade)}。用时里「${part('stoppedMs')}」「${part('approvalMs')}」「${part('blockedMs')}」「${part('pausedMs')}」的部分是在等人处理，「${part('queuedMs')}」的部分是在等别的 Run 做完（也包括等升级、Master 没运行的时候），都不说明 Agent 慢。需求评估提了疑问、需求在讨论后改过或结论为不做，说明这条需求没写清楚或方向有偏差：留意其中的疑问和理由，新提案不要再犯。
+1. 让系统停转或空耗的问题：下面附的最近 Run 里卡住、失败、反复返工、评审反复提同类意见、费用或 Agent 执行用时异常的${upgradeLead(input.upgrade)}。用时里「${part('stoppedMs')}」「${part('approvalMs')}」「${part('blockedMs')}」「${part('pausedMs')}」的部分是在等人处理，「${part('queuedMs')}」的部分是在等别的 Run 做完（也包括等升级、Master 没运行的时候），「${part('conflictWaitMs')}」和排队一样是在等别的 Run（避开和它改同一处的 Run，免得合并时冲突），都不说明 Agent 慢。摘要开头写着当时的 concurrency.per_repo 和有几个 Run 并行执行过：per_repo 为 1、排队时间远多于 Agent 执行时间、并行带来的错开等待和「并行时合并冲突」又很少时，可以建议人调大 per_repo，并写明依据。per_repo 由用户在自己数据目录的 config.yaml 里设置，不在仓库里：侦察只提建议，不改用户的配置。需求评估提了疑问、需求在讨论后改过或结论为不做，说明这条需求没写清楚或方向有偏差：留意其中的疑问和理由，新提案不要再犯。
 2. 差距分析里最重要的能力缺口。
 3. 明显的缺陷和测试缺口，README.md、AGENTS.md 和代码不一致的地方，代码里的 TODO。
 4. 评审建议和对最近改动的修饰：评审通过时给的建议是评审有意留到以后的改进（超出当时目标范围的缺陷、测试缺口、重复代码等），对最近合并的改动还能再修一修的地方也归在这一类。要先到代码里核对它是否仍然存在、是否已经有 issue 覆盖；相关的几条合成一条提案，不要一条建议提一条。
@@ -1162,7 +1338,7 @@ Before proposing anything, list the goals README.md states, in its own words (on
 - Leave gaps empty only if you find none after carefully going through every goal.
 
 ## Leads (highest priority first)
-1. Problems that stop the system or make it spin without progress: Runs below that got stuck, failed, needed rework again and again, drew the same kind of review comments again and again, or took unusual cost or agent time${upgradeLead(input.upgrade)}. In the times, "${part('stoppedMs')}", "${part('approvalMs')}", "${part('blockedMs')}" and "${part('pausedMs')}" are time spent waiting for a human, and "${part('queuedMs')}" is time spent waiting for other Runs to finish (including while an upgrade is pending or the Master is not running): none of these mean the agents were slow. When the requirement assessment asked questions, the requirement was revised in the discussion, or the conclusion was to drop it, the requirement was unclear or off course: note the questions and reasons, and do not repeat those mistakes in new proposals.
+1. Problems that stop the system or make it spin without progress: Runs below that got stuck, failed, needed rework again and again, drew the same kind of review comments again and again, or took unusual cost or agent time${upgradeLead(input.upgrade)}. In the times, "${part('stoppedMs')}", "${part('approvalMs')}", "${part('blockedMs')}" and "${part('pausedMs')}" are time spent waiting for a human; "${part('queuedMs')}" is time spent waiting for other Runs to finish (including while an upgrade is pending or the Master is not running), and "${part('conflictWaitMs')}" is waiting for another Run just like the queue (keeping clear of a Run that changes the same place, so that the two do not conflict at the merge): none of these mean the agents were slow. The digest of the Runs opens with concurrency.per_repo at the time and how many Runs executed side by side: when per_repo is 1, the Runs spent far more time queued than executing, and working side by side brought few waits for overlapping Runs and few merge conflicts, you may suggest that a human raise per_repo, giving your grounds. per_repo is set by the user in config.yaml in their own data directory, not in the repo: the scout only suggests it and does not change the user's configuration. When the requirement assessment asked questions, the requirement was revised in the discussion, or the conclusion was to drop it, the requirement was unclear or off course: note the questions and reasons, and do not repeat those mistakes in new proposals.
 2. The most important capability gaps from your gap analysis.
 3. Obvious bugs and gaps in tests, places where README.md, AGENTS.md and the code disagree, TODOs in the code.
 4. Review suggestions and polish of recent changes: the suggestions given by a review that passed are improvements the reviewer left for later on purpose (bugs beyond the goal of the time, gaps in tests, duplicated code and the like), and whatever could still be touched up in recently merged changes belongs here too. First check in the code that each one is still there and that no existing issue covers it; merge related ones into one proposal rather than proposing each suggestion on its own.

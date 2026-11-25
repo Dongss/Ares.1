@@ -2525,7 +2525,7 @@ export class IssueBridge {
       const prompt = scoutPrompt({
         repoName: repo.name,
         max: scoutCfg.max_proposals,
-        runs: runDigest(store, repo.id),
+        runs: runDigest(store, repo.id, this.cfg.master.concurrency.per_repo),
         issues: issueDigest(open, closed, await this.masterLogin(), notPlanned),
         splits: template ? templateSplits(template) : false,
         autoAcceptsL: autoAcceptsL(cfg.auto_accept),

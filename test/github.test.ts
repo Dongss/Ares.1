@@ -5931,6 +5931,7 @@ describe('issues: texts', () => {
     const none = {
       agentMs: 0,
       queuedMs: 0,
+      conflictWaitMs: 0,
       stoppedMs: 0,
       approvalMs: 0,
       blockedMs: 0,
@@ -5982,6 +5983,13 @@ describe('issues: texts', () => {
     expect(both.comment).toContain(
       '用时 60 分钟（其中 Agent 执行 10 分钟、排队 20 分钟、等人 30 分钟）',
     );
+    // Waiting for a Run it overlaps is waiting in the queue too.
+    const overlapping = issueUpdate(completed, {
+      ...ctx,
+      times: { ...none, totalMs: 60 * min, agentMs: 10 * min, conflictWaitMs: 50 * min },
+    });
+    expect(overlapping.comment).toContain('用时 60 分钟（其中 Agent 执行 10 分钟、排队 50 分钟）');
+    expect(overlapping.comment).not.toContain('错开等待');
     // Queued with work switched off: waiting for a human to switch it on, not for the queue.
     const stopped = issueUpdate(completed, {
       ...ctx,
@@ -6065,6 +6073,7 @@ describe('issues: texts', () => {
       const none = {
         agentMs: 0,
         queuedMs: 0,
+        conflictWaitMs: 0,
         stoppedMs: 0,
         approvalMs: 0,
         blockedMs: 0,

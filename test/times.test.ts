@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  conflictWaitSpans,
   groupedTimeParts,
   minutes,
   RUN_TIME_PART_GROUP,
@@ -81,6 +82,7 @@ describe('runTimes', () => {
       totalMs: null,
       agentMs: 10 * MIN + 5 * MIN + 30_500 + 4 * MIN,
       queuedMs: (5 + 3 + 1 + 2) * MIN,
+      conflictWaitMs: 0,
       stoppedMs: 0,
       approvalMs: 60 * MIN,
       blockedMs: 20 * MIN + 3 * MIN,
@@ -152,6 +154,7 @@ describe('runTimes', () => {
       totalMs: MIN,
       agentMs: 0,
       queuedMs: 0,
+      conflictWaitMs: 0,
       stoppedMs: 0,
       approvalMs: 0,
       blockedMs: 0,
@@ -263,6 +266,150 @@ describe('runTimes', () => {
       expect(times).toMatchObject({ queuedMs: (30 - 14) * MIN + 10 * MIN, stoppedMs: 14 * MIN });
     });
   });
+
+  describe('waiting for an overlapping Run', () => {
+    const none = { attempts: [], approvals: [] };
+    const waiting = (min: number, blockedBy = 'run-a', paths = ['src/a.ts']) =>
+      event('run.waiting_conflict', min, { stageId: 'assess', blockedBy, paths });
+    const finished = { createdAt: at(0), finishedAt: at(50) };
+
+    it('tells the wait after the assessment apart from the queue, until the Run starts again', () => {
+      // Assessed from 0 to 5, then back in the queue for run-a (the wait is recorded just before
+      // the requeue), and for run-b from 20 on: one wait, until the Run starts again at 40.
+      const events = [
+        status('running', 0),
+        waiting(5),
+        status('queued', 5),
+        waiting(20, 'run-b'),
+        status('running', 40),
+        status('completed', 50),
+      ];
+      expect(runTimes(finished, { ...none, events })).toMatchObject({
+        queuedMs: 0,
+        conflictWaitMs: 35 * MIN,
+      });
+    });
+
+    it('divides the time as before without such a wait', () => {
+      const events = [
+        status('running', 0),
+        status('queued', 5),
+        status('running', 40),
+        status('completed', 50),
+      ];
+      expect(runTimes(finished, { ...none, events })).toMatchObject({
+        queuedMs: 35 * MIN,
+        conflictWaitMs: 0,
+      });
+    });
+
+    it('counts a wait that began in the queue from when it was recorded', () => {
+      // Passed by in the queue from 10 on; it waits on until it leaves the queue at 30.
+      const events = [waiting(10), status('running', 30), status('completed', 50)];
+      expect(runTimes(finished, { ...none, events })).toMatchObject({
+        queuedMs: 10 * MIN,
+        conflictWaitMs: 20 * MIN,
+      });
+    });
+
+    it('ends the wait when the Run leaves the queue, and does not count a wait not over', () => {
+      // Paused while waiting at 15, resumed into the queue at 25 waiting for nothing.
+      const events = [
+        status('running', 0),
+        waiting(5),
+        status('queued', 5),
+        status('paused', 15),
+        status('queued', 25),
+        status('running', 30),
+        status('completed', 50),
+      ];
+      expect(runTimes(finished, { ...none, events })).toMatchObject({
+        queuedMs: 5 * MIN,
+        conflictWaitMs: 10 * MIN,
+        pausedMs: 10 * MIN,
+      });
+      const still = [status('running', 0), waiting(5), status('queued', 5)];
+      expect(runTimes(created, { ...none, events: still })).toMatchObject({
+        queuedMs: 0,
+        conflictWaitMs: 0,
+      });
+    });
+
+    it('counts the time work was switched off as stopped, not as waiting', () => {
+      const events = [
+        status('running', 0),
+        waiting(5),
+        status('queued', 5),
+        status('running', 40),
+        status('completed', 50),
+      ];
+      const times = runTimes(finished, {
+        ...none,
+        events,
+        workSwitches: [
+          { ts: at(10), on: false },
+          { ts: at(20), on: true },
+        ],
+      });
+      expect(times).toMatchObject({ queuedMs: 0, stoppedMs: 10 * MIN, conflictWaitMs: 25 * MIN });
+      // Nothing is counted twice: the parts add up to the time not spent executing.
+      expect(times.queuedMs + times.stoppedMs + times.conflictWaitMs).toBe(35 * MIN);
+    });
+  });
+});
+
+describe('conflictWaitSpans', () => {
+  let id = 0;
+  const event = (type: string, min: number, data: Record<string, unknown> = {}) => ({
+    id: ++id,
+    type,
+    ts: at(min),
+    data,
+  });
+
+  it('gives each wait, its Run and paths, until the Run leaves the queue or waits for another', () => {
+    const first = event('run.waiting_conflict', 5, { blockedBy: 'run-a', paths: ['src/a', 3] });
+    const queued = event('run.status', 5, { status: 'queued' });
+    const second = event('run.waiting_conflict', 9, { blockedBy: 'run-b', paths: ['docs'] });
+    const running = event('run.status', 12, { status: 'running' });
+    const third = event('run.waiting_conflict', 20, { blockedBy: 'run-a' });
+    expect(conflictWaitSpans([third, running, second, queued, first])).toEqual([
+      {
+        runId: 'run-a',
+        paths: ['src/a'],
+        fromId: first.id,
+        from: at(5),
+        toId: second.id,
+        to: at(9),
+      },
+      {
+        runId: 'run-b',
+        paths: ['docs'],
+        fromId: second.id,
+        from: at(9),
+        toId: running.id,
+        to: at(12),
+      },
+      // Still waiting.
+      {
+        runId: 'run-a',
+        paths: [],
+        fromId: third.id,
+        from: at(20),
+        toId: Number.POSITIVE_INFINITY,
+        to: null,
+      },
+    ]);
+  });
+
+  it('starts no wait from an event without the Run waited for', () => {
+    const events = [
+      event('run.waiting_conflict', 1, { blockedBy: 'run-a' }),
+      event('run.waiting_conflict', 2, {}),
+      event('run.status', 3, { status: 'running' }),
+    ];
+    expect(conflictWaitSpans(events).map((w) => [w.runId, w.to])).toEqual([['run-a', at(2)]]);
+  });
 });
 
 describe('workSwitchesOf', () => {
@@ -313,6 +460,7 @@ describe('time texts', () => {
       blockedMs: 4,
       approvalMs: 3,
       stoppedMs: 6,
+      conflictWaitMs: 7,
       queuedMs: 2,
       agentMs: 1,
       totalMs: 100,
@@ -320,6 +468,7 @@ describe('time texts', () => {
     expect(runTimeParts(times)).toEqual([
       ['Agent 执行', 1],
       ['排队', 2],
+      ['错开等待', 7],
       ['停工', 6],
       ['等审批', 3],
       ['卡住等人', 4],
@@ -333,6 +482,7 @@ describe('grouped time parts', () => {
     totalMs: 1000,
     agentMs: 1,
     queuedMs: 20,
+    conflictWaitMs: 7000000,
     stoppedMs: 600000,
     approvalMs: 300,
     blockedMs: 4000,
@@ -348,9 +498,10 @@ describe('grouped time parts', () => {
   });
 
   it('lists the agents, the queue and the waiting for a human, in that order', () => {
+    // Waiting for an overlapping Run is waiting in the queue, for another Run.
     expect(groupedTimeParts(times)).toEqual([
       ['Agent 执行', 1],
-      ['排队', 20],
+      ['排队', 20 + 7000000],
       ['等人', 600000 + 300 + 4000 + 50000],
     ]);
   });
@@ -379,6 +530,7 @@ describe('time texts in English', () => {
       totalMs: 100 * MIN,
       agentMs: 40 * MIN,
       queuedMs: 3 * MIN,
+      conflictWaitMs: 4 * MIN,
       stoppedMs: 50 * MIN,
       approvalMs: 2 * MIN,
       blockedMs: 0,
@@ -387,12 +539,13 @@ describe('time texts in English', () => {
     expect(timeParts(runTimeParts(times))).toEqual([
       'Agent work 40 min',
       'Queued 3 min',
+      'Waiting for an overlapping Run 4 min',
       'Work switched off 50 min',
       'Awaiting approval 2 min',
     ]);
     expect(timeParts(groupedTimeParts(times))).toEqual([
       'Agent work 40 min',
-      'Queued 3 min',
+      'Queued 7 min',
       'Waiting for a human 52 min',
     ]);
     expect(groupedTimeParts(times).map(([label]) => label)).toEqual([
