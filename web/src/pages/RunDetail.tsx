@@ -51,6 +51,7 @@ import {
   discussionItems,
   eventText,
   ignoredCommentsText,
+  maxRunsWaitText,
   prSummary,
   prWaitText,
   prWaitTitle,
@@ -80,8 +81,16 @@ export function RunDetailPage(props: {
 }) {
   const { id, config } = props;
   const detail = useResource(() => api.run(id), id);
-  // A redo of this Run is an event of the new Run.
-  useReloadOn(detail.reload, (e) => e.runId === id || e.data.failedRunId === id);
+  // A redo of this Run is an event of the new Run. While it waits for room under
+  // concurrency.max_runs, other Runs ending and a reload of the limit change whether it still does.
+  const waitsForMaxRuns = detail.data?.waitingForMaxRuns === true;
+  useReloadOn(
+    detail.reload,
+    (e) =>
+      e.runId === id ||
+      e.data.failedRunId === id ||
+      (waitsForMaxRuns && (e.type === 'run.status' || e.type === 'config.reloaded')),
+  );
   const [tab, setTab] = useState<Tab>('progress');
   const [commit, setCommit] = useState<string>();
   /** A stage round to scroll to in the timeline; `n` makes a repeated click scroll again. */
@@ -386,6 +395,17 @@ function RunActions(props: {
             {t({
               zh: '这不算出错，不消耗重试次数，也不用人处理：等待期间它不算在正在执行的 Run 里，排队的其他 Run 照常执行，到时间后从同一个 Task 接着做。想马上再试，可以暂停后再恢复。',
               en: 'This is not an error: it uses up no retries and needs no human. Meanwhile it does not count among the executing Runs, so other queued Runs go ahead, and the same Task carries on at that time. To try again right away, pause and resume the Run.',
+            })}
+          </p>
+        </div>
+      )}
+      {run.status === 'queued' && props.detail.waitingForMaxRuns && (
+        <div className="panel">
+          <h2>{maxRunsWaitText(props.config?.maxRuns ?? null)}</h2>
+          <p>
+            {t({
+              zh: '不用人处理：每结束一个执行中的 Run，排队的 Run 就按先后开始下一个（它的仓库也要有空位，见 concurrency.per_repo）。等审批、卡住、暂停和等额度恢复的 Run 不占名额。想让更多 Run 同时执行，调高 config.yaml 的 concurrency.max_runs，保存后马上生效。',
+              en: "It needs no human: each time an executing Run ends, the next queued Run starts in queue order (its repo needs room too, see concurrency.per_repo). Runs waiting for approval, blocked, paused or waiting for their agent's quota take no place. For more Runs at a time, raise concurrency.max_runs in config.yaml; it takes effect once saved.",
             })}
           </p>
         </div>

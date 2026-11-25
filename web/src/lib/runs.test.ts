@@ -11,8 +11,10 @@ import {
   difficultyText,
   discussionItems,
   eventText,
+  executingOfMaxText,
   groupRuns,
   ignoredCommentsText,
+  maxRunsWaitText,
   pageTitle,
   patchLineClass,
   prSummary,
@@ -38,6 +40,7 @@ function run(id: string, status: RunSummary['status'], extra: Partial<RunSummary
     templateId: 'dev',
     templateName: 'dev',
     costUnknown: false,
+    waitingForMaxRuns: false,
     goal: id,
     overrides: {},
     status,
@@ -515,6 +518,25 @@ describe('rate limits', () => {
   const today = new Date(2026, 10, 20, 14, 5, 0).toISOString();
   const tomorrow = new Date(2026, 10, 21, 3, 30, 0).toISOString();
   const event = (data: Record<string, unknown>) => ({ type: 'task.rate_limited', data });
+
+  it('says a queued Run waits for the limit across repos (concurrency.max_runs)', () => {
+    expect(maxRunsWaitText(2)).toBe(
+      '所有仓库执行中的 Run 已达上限（concurrency.max_runs: 2），等其中一个结束再开始',
+    );
+    // Before the configuration has loaded.
+    expect(maxRunsWaitText(null)).toBe(
+      '所有仓库执行中的 Run 已达上限（concurrency.max_runs），等其中一个结束再开始',
+    );
+    expect(executingOfMaxText(1, 3)).toBe('执行中 1 / 上限 3（concurrency.max_runs）');
+    setLang('en');
+    expect(maxRunsWaitText(2)).toBe(
+      'The Runs executing across all repos are at the limit (concurrency.max_runs: 2); it starts once one of them ends',
+    );
+    expect(maxRunsWaitText(null)).not.toMatch(/[一-鿿]/);
+    expect(executingOfMaxText(1, 3, true)).toBe(
+      '1 of at most 3 executing across all repos (concurrency.max_runs)',
+    );
+  });
 
   it('says which agent hit the limit and when the Run goes on', () => {
     expect(rateLimitText({ agentId: 'coder', retryAt: today }, now)).toBe(

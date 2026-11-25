@@ -25,6 +25,7 @@ function run(
     templateId: 'dev',
     templateName: 'dev',
     costUnknown: false,
+    waitingForMaxRuns: false,
     goal: id,
     overrides: {},
     status,
@@ -236,6 +237,48 @@ describe('homeSections', () => {
 
   it('returns no sections when nothing matches', () => {
     expect(homeSections([run('c', 'completed')], { status: 'active', repoId: null })).toEqual([]);
+  });
+
+  describe('with concurrency.max_runs', () => {
+    afterEach(() => setLang('zh'));
+    const runs = [
+      run('a', 'running', 'repo-a'),
+      run('b', 'running', 'repo-b'),
+      run('q', 'queued', 'repo-a', { queuePos: 1, waitingForMaxRuns: true }),
+    ];
+    const runningNote = (filter: Parameters<typeof homeSections>[1], maxRuns: number | null) =>
+      homeSections(runs, filter, maxRuns).find((section) => section.id === 'running')?.note;
+
+    it('notes the Runs executing across all repos against the limit', () => {
+      expect(runningNote({ status: 'all', repoId: null }, 2)).toBe(
+        '执行中 2 / 上限 2（concurrency.max_runs）',
+      );
+      expect(runningNote({ status: 'active', repoId: null }, 3)).toBe(
+        '执行中 2 / 上限 3（concurrency.max_runs）',
+      );
+      // One repo's list still counts every repo's Runs, and says so.
+      expect(runningNote({ status: 'all', repoId: 'repo-a' }, 2)).toBe(
+        '所有仓库执行中 2 / 上限 2（concurrency.max_runs）',
+      );
+      // Also when none executes.
+      expect(
+        homeSections([run('q', 'queued')], { status: 'all', repoId: null }, 1).find(
+          (section) => section.id === 'running',
+        )?.note,
+      ).toBe('执行中 0 / 上限 1（concurrency.max_runs）');
+      // No limit: as before.
+      expect(runningNote({ status: 'all', repoId: null }, null)).toBeUndefined();
+    });
+
+    it('notes it in English', () => {
+      setLang('en');
+      expect(runningNote({ status: 'all', repoId: null }, 3)).toBe(
+        '2 of at most 3 executing (concurrency.max_runs)',
+      );
+      expect(runningNote({ status: 'all', repoId: 'repo-b' }, 3)).toBe(
+        '2 of at most 3 executing across all repos (concurrency.max_runs)',
+      );
+    });
   });
 
   it('groups only the selected repository', () => {

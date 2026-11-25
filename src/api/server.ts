@@ -216,6 +216,7 @@ export function createApi(deps: ApiDeps): Hono {
     return c.json({
       language: cfg.master.language,
       perRepo: cfg.master.concurrency.per_repo,
+      maxRuns: cfg.master.concurrency.max_runs ?? null,
       agents: [...cfg.agents.values()],
       templates: [...cfg.templates.values()],
       errors: cfg.errors,
@@ -306,7 +307,9 @@ export function createApi(deps: ApiDeps): Hono {
     const status = c.req.query('status') as RunStatus | undefined;
     const repo = c.req.query('repo');
     const repoId = repo ? store.getRepo(repo).id : undefined;
-    return c.json(store.listRuns({ status, repoId }).map((run) => summarizeRun(store, run)));
+    return c.json(
+      store.listRuns({ status, repoId }).map((run) => summarizeRun(store, engine, run)),
+    );
   });
 
   app.get('/api/runs/:id', async (c) => {
@@ -325,6 +328,7 @@ export function createApi(deps: ApiDeps): Hono {
       times: storedRunTimes(store, run),
       ...(await engine.inspectWorkspace(run)),
       rateLimited: engine.rateLimited(run),
+      waitingForMaxRuns: engine.waitingForMaxRuns(run),
       redoAt: redoAt === null ? null : new Date(redoAt).toISOString(),
     } satisfies RunDetail);
   });
@@ -511,7 +515,7 @@ export function createApi(deps: ApiDeps): Hono {
   return app;
 }
 
-function summarizeRun(store: Store, run: ReturnType<Store['getRun']>): RunSummary {
+function summarizeRun(store: Store, engine: Engine, run: ReturnType<Store['getRun']>): RunSummary {
   const { template, ...rest } = run;
   let currentStage: { id: string; name: string; round: number } | null = null;
   if (run.currentStageRunId) {
@@ -524,5 +528,6 @@ function summarizeRun(store: Store, run: ReturnType<Store['getRun']>): RunSummar
     templateName: template.name ?? template.id,
     currentStage,
     costUnknown: store.listRunAttempts(run.id).some(isCostUnknown),
+    waitingForMaxRuns: engine.waitingForMaxRuns(run),
   };
 }

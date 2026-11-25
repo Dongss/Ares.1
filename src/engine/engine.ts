@@ -35,7 +35,9 @@ import {
   type RunLimitWait,
   rateLimitDelayMs,
   recordedLimitWait,
+  roomUnderMaxRuns,
   stageAgentIds,
+  waitsForMaxRuns,
 } from '../config/flow.js';
 import {
   findTemplate,
@@ -351,7 +353,8 @@ const IN_FLIGHT_TASK = new Set<Task['status']>(['running', 'verifying']);
 /**
  * The workflow engine: a deterministic state machine that executes up to `concurrency.per_repo`
  * Runs at a time per repo, each in the Run's own worktree, one task and one commit at a time.
- * Runs of different repos execute side by side. A repo's Runs share its git repository (the
+ * Runs of different repos execute side by side, up to `concurrency.max_runs` in all when that is
+ * set. A repo's Runs share its git repository (the
  * target branch, worktrees, branches), so what they do there besides their own worktree goes one
  * Run at a time, under the repo's merge lock (`withMergeLock`): merging, creating and removing
  * worktrees.
@@ -361,7 +364,8 @@ export class Engine {
   readonly live = new EventEmitter<{ agent: [LiveAgentEvent] }>();
   /**
    * The executing Runs by Run id, in the order they started; each records its execution slot
-   * (`slotOf`), of which `kick` lets `concurrency.per_repo` Runs execute at a time.
+   * (`slotOf`), of which `kick` lets `concurrency.per_repo` Runs execute at a time, and
+   * `concurrency.max_runs` of all slots together.
    */
   private readonly active = new Map<string, Active>();
   /**
@@ -538,17 +542,22 @@ export class Engine {
 
   /**
    * While the work switch is on, start queued Runs in queue order: each one whose execution slot
-   * (`slotOf`) has fewer than `concurrency.per_repo` Runs executing, the ones started in this
-   * round included. Runs waiting for their agent's quota are passed by until their wait ends;
-   * `kick` is woken up when the first wait ends.
+   * (`slotOf`) has fewer than `concurrency.per_repo` Runs executing, while fewer than
+   * `concurrency.max_runs` execute in all slots together (`roomUnderMaxRuns`), the ones started
+   * in this round included. Both count the same Runs: every one in `active`, those waiting to
+   * retry after an agent error or for their slot's merge lock included. Runs waiting for their
+   * agent's quota are passed by until their wait ends; `kick` is woken up when the first wait
+   * ends. A Run whose slot is full is passed by too, so a later Run of another repo may start
+   * first; the queue order alone decides among the others, so no repo gets ahead of its turn.
    */
   kick(): void {
     clearTimeout(this.limitTimer);
     this.limitTimer = undefined;
     // Whatever ends the early returns (a Run finishing, the switch turned on, the hold lifted)
-    // kicks again; so does a Run finishing for the place it frees in its slot.
+    // kicks again; so does a Run finishing for the place it frees in its slot and in the total,
+    // and a reload of config.yaml for higher limits.
     if (this.stopping || this.holding || !this.store.working) return;
-    const perRepo = this.cfg.master.concurrency.per_repo;
+    const { per_repo: perRepo, max_runs: maxRuns } = this.cfg.master.concurrency;
     const queued = this.store.queuedRuns();
     // A Run that left the queue meanwhile (paused, cancelled) waits no more.
     const ids = new Set(queued.map((r) => r.id));
@@ -557,6 +566,9 @@ export class Engine {
     let wake: number | undefined;
     const slots = new Map<string, string>();
     for (const run of queued) {
+      // The total is reached: nothing more starts until an executing Run ends (or the limit is
+      // raised), which kicks again; a lower limit stops none of those executing.
+      if (!roomUnderMaxRuns(this.active.size, maxRuns)) break;
       // Started meanwhile by a kick from a listener of an earlier launch's status event.
       if (this.active.has(run.id)) continue;
       const until = this.limitWaits.get(run.id)?.until;
@@ -657,12 +669,26 @@ export class Engine {
   /**
    * A queued Run waiting for its agent's quota to come back: the agent and when the Run goes on
    * (then also waiting for room in its repo's execution slot if `concurrency.per_repo` other Runs
-   * of the repo execute). null when it does not wait (any more).
+   * of the repo execute, and in the total if `concurrency.max_runs` Runs execute). null when it
+   * does not wait (any more).
    */
   rateLimited(run: Run): RateLimitedWait | null {
     const wait = this.limitWaits.get(run.id);
     if (!wait || wait.until <= this.now() || run.status !== 'queued') return null;
     return { agentId: wait.agentId, retryAt: new Date(wait.until).toISOString() };
+  }
+
+  /**
+   * Whether the queued Run waits for room under `concurrency.max_runs` (`waitsForMaxRuns`): that
+   * many Runs execute across every repo, and it is not waiting for its agent's quota.
+   */
+  waitingForMaxRuns(run: Run): boolean {
+    return waitsForMaxRuns(
+      run,
+      this.rateLimited(run) !== null,
+      this.active.size,
+      this.cfg.master.concurrency.max_runs,
+    );
   }
 
   /** Stop an executing Run's drive loop and wait until it has left it. */
@@ -3134,8 +3160,8 @@ export class Engine {
           delayMs,
         });
       });
-      // Still counts as executing meanwhile, one of its repo's `concurrency.per_repo` Runs; a
-      // pause, cancel or shutdown ends the wait at once.
+      // Still counts as executing meanwhile, one of its repo's `concurrency.per_repo` Runs and of
+      // the `concurrency.max_runs` in all; a pause, cancel or shutdown ends the wait at once.
       if (delayMs > 0) await delay(delayMs, undefined, { signal }).catch(() => {});
       this.checkAbort(signal);
       return;

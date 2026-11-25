@@ -112,6 +112,7 @@ function input(github: GitHubRepoStatus | null, upgrade = off): GuideInput {
     github,
     pollMinutes: 5,
     perRepo: 1,
+    maxRuns: null,
     flow: github ? issueFlow(config, github, ['npm test']) : null,
     targetBranch: 'main',
     upgrade,
@@ -155,6 +156,13 @@ describe('the cycle', () => {
     // More Runs of a repo at a time with concurrency.per_repo; they still merge one by one.
     expect(byId({ ...input(manualRepo), perRepo: 2 }).run?.text).toContain(
       '每个仓库同一时间最多执行 2 个 Run（concurrency.per_repo），各在自己的工作目录里做，合并时一个一个来',
+    );
+    // A limit across repos with concurrency.max_runs.
+    expect(byId({ ...input(manualRepo), perRepo: 2, maxRuns: 3 }).run?.text).toContain(
+      '合并时一个一个来；不同仓库的 Run 也可以同时执行，所有仓库合计最多 3 个（concurrency.max_runs）',
+    );
+    expect(byId({ ...input(manualRepo), maxRuns: 1 }).run?.text).toContain(
+      '每个仓库同一时间只执行一个 Run（concurrency.per_repo: 1）；所有仓库合计同一时间只执行一个 Run（concurrency.max_runs: 1）',
     );
   });
 
@@ -1180,6 +1188,16 @@ describe('in English', () => {
       'each repo executes up to 3 Runs at a time (concurrency.per_repo), each in its own working directory, and they merge one at a time',
     );
     expect(parallel).not.toMatch(CJK);
+    const limited = byId({ ...inputEn(partialRepo), perRepo: 3, maxRuns: 4 }).run?.text;
+    expect(limited).toContain(
+      'they merge one at a time; Runs of different repos can execute side by side too, up to 4 in all (concurrency.max_runs)',
+    );
+    expect(limited).not.toMatch(CJK);
+    const one = byId({ ...inputEn(partialRepo), maxRuns: 1 }).run?.text;
+    expect(one).toContain(
+      'each repo executes one Run at a time (concurrency.per_repo: 1); only one Run executes at a time across all repos (concurrency.max_runs: 1)',
+    );
+    expect(one).not.toMatch(CJK);
     expect(runStages(inputEn(manualRepo))?.find((s) => s.id === 'e2e')?.name).toBe(
       'E2E (placeholder)',
     );

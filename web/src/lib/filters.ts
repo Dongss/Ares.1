@@ -2,7 +2,7 @@ import type { RunSummary } from '../../../src/api/types.js';
 import { t } from '../../../src/i18n.js';
 import { FINISHED_RUN_STATUSES, type RunStatus } from '../../../src/store/types.js';
 import { useLocationHash } from './router.js';
-import { FINISHED_PREVIEW_LIMIT, groupRuns } from './runs.js';
+import { executingOfMaxText, FINISHED_PREVIEW_LIMIT, groupRuns } from './runs.js';
 
 /**
  * Status groups for the home Run list. The "needs me" group includes paused runs;
@@ -140,7 +140,10 @@ export interface HomeSection {
   /** Shown when the section is visible but has no runs (the dashboard). */
   emptyText?: string;
   highlight?: boolean;
-  /** Set when the recently finished section hides older finished runs. */
+  /**
+   * Set when the recently finished section hides older finished runs, and on the running section
+   * when `concurrency.max_runs` is set (how many execute against it).
+   */
   note?: string;
 }
 
@@ -155,8 +158,14 @@ function finishedCapNote(): string {
  * Sections the home list shows for `filter`.
  * An empty array means nothing matches. "All" keeps the dashboard groups and the
  * default finished cap; one status shows only that group, with every finished run.
+ * With config.yaml's `concurrency.max_runs` set (`maxRuns`), the running section notes how many
+ * Runs execute across all repos against it: pass every run, as the limit is global.
  */
-export function homeSections(runs: readonly RunSummary[], filter: RunListFilter): HomeSection[] {
+export function homeSections(
+  runs: readonly RunSummary[],
+  filter: RunListFilter,
+  maxRuns: number | null = null,
+): HomeSection[] {
   const visible = filterRuns(runs, filter);
   if (visible.length === 0) return [];
   // "All" uses groupRuns' default cap; a status filter shows every finished run.
@@ -179,6 +188,14 @@ export function homeSections(runs: readonly RunSummary[], filter: RunListFilter)
       title: t({ zh: '正在执行', en: 'Running' }),
       runs: groups.running,
       emptyText: t({ zh: '没有正在执行的 Run。', en: 'No Run is running.' }),
+      note:
+        maxRuns === null
+          ? undefined
+          : executingOfMaxText(
+              runs.filter((run) => run.status === 'running').length,
+              maxRuns,
+              filter.repoId !== null,
+            ),
     });
   }
   if ((dashboard || filter.status === 'active') && groups.queued.length > 0) {

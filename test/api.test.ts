@@ -210,6 +210,46 @@ describe('HTTP API', () => {
     expect(busy).toMatchObject({ activeRun: runs[0]?.id, activeRuns: [runs[0]?.id, runs[1]?.id] });
     const config: ConfigView = (await call('GET', '/api/config')).json;
     expect(config.perRepo).toBe(2);
+    expect(config.maxRuns).toBeNull();
+    // Without max_runs, no queued Run waits for the total.
+    const list: RunSummary[] = (await call('GET', '/api/runs')).json;
+    expect(list.map((r) => r.waitingForMaxRuns)).toEqual([false, false, false]);
+  });
+
+  it('reports concurrency.max_runs and the Runs queued because of it', async () => {
+    h = await harness({ config: 'concurrency: { per_repo: 2, max_runs: 1 }\n' });
+    const t = h;
+    t.scripts.coder = (ctx) =>
+      new Promise((resolve) => ctx.signal.addEventListener('abort', () => resolve(done())));
+    const first = t.run('一');
+    const second = t.run('二');
+    await waitFor(() => t.fake.calls.length === 1, 'the first coder to start');
+    const config: ConfigView = (await call('GET', '/api/config')).json;
+    expect(config).toMatchObject({ perRepo: 2, maxRuns: 1 });
+    const health: HealthView = (await call('GET', '/api/health')).json;
+    expect(health.activeRuns).toEqual([first.id]);
+
+    // The repo has room for the second, the total does not.
+    const waiting = (id: string) =>
+      call('GET', `/api/runs/${id}`).then((r) => r.json.waitingForMaxRuns);
+    expect(await waiting(first.id)).toBe(false);
+    expect(await waiting(second.id)).toBe(true);
+    const list: RunSummary[] = (await call('GET', '/api/runs')).json;
+    expect(Object.fromEntries(list.map((r) => [r.id, r.waitingForMaxRuns]))).toEqual({
+      [first.id]: false,
+      [second.id]: true,
+    });
+
+    // Paused, it waits for the human, not for the total.
+    await t.master.engine.pause(second.id);
+    expect(await waiting(second.id)).toBe(false);
+    t.master.engine.resume(second.id);
+    expect(await waiting(second.id)).toBe(true);
+
+    // The first ending makes room: the second starts and waits no more.
+    await t.master.engine.cancel(first.id);
+    await waitFor(() => t.fake.calls.length === 2, 'the second coder to start');
+    expect(await waiting(second.id)).toBe(false);
   });
 
   it('tells a raw log deleted past retention from a missing one, and keeps the events', async () => {
@@ -909,8 +949,9 @@ agents:
     writeFile(join(home, 'workflows', 'broken.yaml'), 'id: dev2\nstages: []\n');
     h = await harness({ home, agents });
     const { json } = (await call('GET', '/api/config')) as { json: ConfigView };
-    // config.yaml leaves concurrency out: one Run of a repo at a time.
+    // config.yaml leaves concurrency out: one Run of a repo at a time, no limit across repos.
     expect(json.perRepo).toBe(1);
+    expect(json.maxRuns).toBeNull();
     // Existing fields are unchanged: only enabled agents and valid templates.
     expect(json.agents.map((a) => a.id)).toEqual(['coder', 'coder2', 'reviewer']);
     expect(json.templates.map((t) => t.id)).toEqual(['dev']);

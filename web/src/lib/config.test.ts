@@ -29,6 +29,7 @@ const agent = (id: string, raw: unknown) => ({ ...AgentSchema.parse(raw), id });
 const view: ConfigView = {
   language: 'zh',
   perRepo: 1,
+  maxRuns: null,
   agents: [
     agent('coder', { cli: 'claude-code', model: 'sonnet', effort: 'high', tags: ['coding'] }),
   ],

@@ -24,15 +24,31 @@ import {
 } from '../lib/format.js';
 import { useTick } from '../lib/hooks.js';
 import { href } from '../lib/router.js';
-import { prWaitHint, prWaitTitle, queueRanks, runStatusBadge, waitingForPr } from '../lib/runs.js';
+import {
+  maxRunsWaitText,
+  prWaitHint,
+  prWaitTitle,
+  queueRanks,
+  runStatusBadge,
+  waitingForPr,
+} from '../lib/runs.js';
 
-export function HomePage({ runs, repos }: { runs: RunSummary[]; repos: Repo[] }) {
+export function HomePage({
+  runs,
+  repos,
+  maxRuns,
+}: {
+  runs: RunSummary[];
+  repos: Repo[];
+  /** config.yaml's `concurrency.max_runs`; null = no limit, or the configuration is not loaded. */
+  maxRuns: number | null;
+}) {
   const filter = effectiveRunFilter(
     useRunListFilter(),
     repos.map((repo) => repo.id),
   );
   const counts = countRunFilters(filterRuns(runs, { status: 'all', repoId: filter.repoId }));
-  const sections = homeSections(runs, filter);
+  const sections = homeSections(runs, filter, maxRuns);
   // The queue is global. Ranks come from every run, not the filtered list.
   const ranks = queueRanks(runs);
   const repoName = (id: string) => repos.find((r) => r.id === id)?.name ?? id;
@@ -105,7 +121,7 @@ export function HomePage({ runs, repos }: { runs: RunSummary[]; repos: Repo[] })
                 card(
                   run,
                   section.id === 'queued'
-                    ? queueExtra(ranks.get(run.id))
+                    ? queueExtra(run, ranks.get(run.id), maxRuns)
                     : section.id === 'attention'
                       ? attentionExtra(run)
                       : undefined,
@@ -119,10 +135,15 @@ export function HomePage({ runs, repos }: { runs: RunSummary[]; repos: Repo[] })
   );
 }
 
-function queueExtra(rank: number | undefined): ReactNode {
+function queueExtra(run: RunSummary, rank: number | undefined, maxRuns: number | null): ReactNode {
   if (rank === undefined) return null;
+  const place = t({ zh: `第 ${rank} 个执行`, en: `#${rank} in line` });
+  if (!run.waitingForMaxRuns) return <div className="run-card-note">{place}</div>;
   return (
-    <div className="run-card-note">{t({ zh: `第 ${rank} 个执行`, en: `#${rank} in line` })}</div>
+    <div className="run-card-note">
+      <div className="run-card-note-title">{place}</div>
+      <div className="run-card-note-detail">{maxRunsWaitText(maxRuns)}</div>
+    </div>
   );
 }
 

@@ -7,8 +7,8 @@
 // many failed scouts in a row a human is notified, how long a failed Run of an issue waits before
 // it is redone, how long a Run or a scout waits for an agent that is out of quota or rate-limited,
 // how long the raw output of agents is kept, which worktrees of failed or cancelled Runs of
-// issues are left over for the Master to remove, and whether a repo delivers through pull
-// requests.
+// issues are left over for the Master to remove, whether a repo delivers through pull
+// requests, and how many Runs may execute across every repo (`concurrency.max_runs`).
 // Pure logic (type imports, src/i18n.ts, src/store/types.ts and src/engine/discussion.ts only),
 // so the dashboard shows the same rules the engine applies.
 
@@ -455,6 +455,33 @@ export function deliversByPr(
   repoName: string,
 ): boolean {
   return github?.repos[repoName]?.deliver === 'pr';
+}
+
+/**
+ * Whether one more Run may start while `executing` Runs execute across every repo, under
+ * config.yaml's `concurrency.max_runs` (undefined or null = no limit). Executing Runs count as
+ * for `concurrency.per_repo`: every Run the engine drives, those waiting to retry after an agent
+ * error and those waiting for their repo's merge lock included; queued Runs (also those waiting
+ * for their agent's quota), Runs waiting for approval, blocked and paused Runs do not. Lowering
+ * the limit stops no executing Run: no new one starts until fewer execute.
+ */
+export function roomUnderMaxRuns(executing: number, maxRuns: number | null | undefined): boolean {
+  return maxRuns === undefined || maxRuns === null || executing < maxRuns;
+}
+
+/**
+ * Whether a queued Run waits for room under `concurrency.max_runs`: that many Runs execute across
+ * every repo (`roomUnderMaxRuns`). A Run waiting for its agent's quota (`rateLimited`) waits for
+ * that first, so it is not said to wait for this. The Run may wait for room in its own repo
+ * (`concurrency.per_repo`) as well.
+ */
+export function waitsForMaxRuns(
+  run: Pick<Run, 'status'>,
+  rateLimited: boolean,
+  executing: number,
+  maxRuns: number | null | undefined,
+): boolean {
+  return run.status === 'queued' && !rateLimited && !roomUnderMaxRuns(executing, maxRuns);
 }
 
 /**

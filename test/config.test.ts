@@ -18,12 +18,14 @@ import {
   redoDelayMs,
   redoDueAt,
   resolveTemplate,
+  roomUnderMaxRuns,
   scoutBackoff,
   scoutFailureStreak,
   scoutLimitWait,
   splitUnfinishedRuns,
   stageAgentIds,
   templateSplits,
+  waitsForMaxRuns,
 } from '../src/config/flow.js';
 import {
   ConfigError,
@@ -236,6 +238,26 @@ upgrade: { auto: true }
     }
     writeFile(paths.configFile, 'concurrency: { per_rep: 2 }\n');
     expect(() => loadConfig(paths, ['claude-code'])).toThrow(/per_rep/);
+  });
+
+  it('limits Runs across repos only with concurrency.max_runs', () => {
+    const paths = home();
+    // Left out (also by the default config.yaml): no limit.
+    expect(loadConfig(paths, ['claude-code']).master.concurrency.max_runs).toBeUndefined();
+    writeFile(paths.configFile, 'concurrency: { max_runs: 3 }\n');
+    const cfg = loadConfig(paths, ['claude-code'], ['claude-code']);
+    expect(cfg.master.concurrency).toEqual({ per_repo: 1, max_runs: 3 });
+    expect(cfg.warnings).toEqual({});
+    writeFile(paths.configFile, 'concurrency: { per_repo: 2, max_runs: 1 }\n');
+    expect(loadConfig(paths, ['claude-code']).master.concurrency).toEqual({
+      per_repo: 2,
+      max_runs: 1,
+    });
+    // At least one, a whole number.
+    for (const bad of ['0', '-1', '1.5', '"2"', 'null']) {
+      writeFile(paths.configFile, `concurrency: { max_runs: ${bad} }\n`);
+      expect(() => loadConfig(paths, ['claude-code']), bad).toThrow(/concurrency\.max_runs/);
+    }
   });
 
   it('takes a webhook with an http or https address, JSON by default', () => {
@@ -2271,6 +2293,30 @@ describe('redo after a failure', () => {
     }
     expect(redoDueAt({ ...failed(1, 'pending'), status: 'cancelled' }, 5)).toBeNull();
     expect(redoDueAt({ ...failed(1, 'pending'), issue: null }, 5)).toBeNull();
+  });
+});
+
+describe('concurrency.max_runs', () => {
+  it('leaves room below the limit, always without one', () => {
+    expect(roomUnderMaxRuns(0, 1)).toBe(true);
+    expect(roomUnderMaxRuns(1, 1)).toBe(false);
+    expect(roomUnderMaxRuns(2, 3)).toBe(true);
+    // Over it after the limit was lowered: still no room.
+    expect(roomUnderMaxRuns(4, 2)).toBe(false);
+    for (const none of [undefined, null]) expect(roomUnderMaxRuns(100, none)).toBe(true);
+  });
+
+  it('says a queued Run waits for it only when the total is reached and no quota holds it', () => {
+    const queued = { status: 'queued' as const };
+    expect(waitsForMaxRuns(queued, false, 2, 2)).toBe(true);
+    expect(waitsForMaxRuns(queued, false, 1, 2)).toBe(false);
+    expect(waitsForMaxRuns(queued, false, 5, undefined)).toBe(false);
+    expect(waitsForMaxRuns(queued, false, 5, null)).toBe(false);
+    // Waiting for its agent's quota first.
+    expect(waitsForMaxRuns(queued, true, 2, 2)).toBe(false);
+    for (const status of ['running', 'paused', 'blocked', 'waiting_approval'] as const) {
+      expect(waitsForMaxRuns({ status }, false, 2, 2), status).toBe(false);
+    }
   });
 });
 

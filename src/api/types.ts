@@ -57,6 +57,8 @@ export type RunSummary = Omit<Run, 'template'> & {
   /** Some attempts have no known cost, so `costUsd` is a lower bound. */
   costUnknown: boolean;
   currentStage: { id: string; name: string; round: number } | null;
+  /** As on GET /api/runs/:id: the Run is queued because `concurrency.max_runs` Runs execute. */
+  waitingForMaxRuns: boolean;
 };
 
 /** GET /api/runs/:id */
@@ -90,10 +92,16 @@ export interface RunDetail {
   /**
    * The Run is queued because its agent was out of quota or rate-limited, and goes on at
    * `retryAt` (ISO; then also waiting for room if `concurrency.per_repo` other Runs of the repo
-   * execute). null when it is not waiting for a quota. The wait holds across a Master restart:
+   * execute, or `concurrency.max_runs` in all). null when it is not waiting for a quota. The wait holds across a Master restart:
    * the new Master restores it from the Run's recorded `task.rate_limited` event.
    */
   rateLimited: RateLimitedWait | null;
+  /**
+   * The Run is queued and waits for room under config.yaml's `concurrency.max_runs`: that many
+   * Runs execute across every repo (`waitsForMaxRuns` in src/config/flow.ts). false when no limit
+   * is set, the total is not reached, or the Run waits for its agent's quota (`rateLimited`).
+   */
+  waitingForMaxRuns: boolean;
   /**
    * The Run failed and its issue is redone as a new Run, at this time at the earliest (ISO;
    * `redoDueAt`): the wait after a failure doubles with each attempt. Later when today's
@@ -177,6 +185,11 @@ export interface ConfigView {
    * merges go one at a time).
    */
   perRepo: number;
+  /**
+   * config.yaml's `concurrency.max_runs`: how many Runs of all repos together execute at the same
+   * time; null = no limit beyond `perRepo`.
+   */
+  maxRuns: number | null;
   /** Valid and enabled agents. */
   agents: AgentConfig[];
   /** Valid templates of the home directory. */
@@ -251,7 +264,9 @@ export interface HealthView {
   /** The first of `activeRuns`, null when none executes; kept for older clients. */
   activeRun: string | null;
   /**
-   * The Runs executing now, at most `concurrency.per_repo` per repo, in the order they started.
+   * The Runs executing now, at most `concurrency.per_repo` per repo and `concurrency.max_runs` in
+   * all, in the order they started. Lowering a limit stops none of them, so there may be more for
+   * a while.
    */
   activeRuns: string[];
   /** The work switch: off = nothing new starts. */

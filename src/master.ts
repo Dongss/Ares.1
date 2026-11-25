@@ -254,7 +254,8 @@ export class Master {
           store.event(null, 'config.reloaded', {
             errors: Object.keys(change.config.errors).length,
           });
-          // A higher concurrency.per_repo starts queued Runs at once.
+          // A higher concurrency.per_repo or concurrency.max_runs starts queued Runs at once; a
+          // lower one stops no executing Run, only starts none until fewer execute.
           engine.kick();
         } else {
           store.event(null, 'config.reload_failed', { message: change.message });

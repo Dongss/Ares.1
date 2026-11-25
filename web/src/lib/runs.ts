@@ -421,6 +421,36 @@ export function rateLimitText(wait: RateLimitedWait, now = new Date()): string {
 }
 
 /**
+ * Why a queued Run waits when `waitingForMaxRuns`: the Runs executing across all repos reached
+ * config.yaml's `concurrency.max_runs` (`maxRuns`; null when the configuration is not loaded).
+ */
+export function maxRunsWaitText(maxRuns: number | null): string {
+  const limit =
+    maxRuns === null ? 'concurrency.max_runs' : `concurrency.max_runs: ${String(maxRuns)}`;
+  return t({
+    zh: `所有仓库执行中的 Run 已达上限（${limit}），等其中一个结束再开始`,
+    en: `The Runs executing across all repos are at the limit (${limit}); it starts once one of them ends`,
+  });
+}
+
+/**
+ * 「执行中 2 / 上限 3」: how many Runs execute across all repos (`executing`) against config.yaml's
+ * `concurrency.max_runs`; `allRepos` when the list shows one repo only, so the count is not
+ * taken for that repo's.
+ */
+export function executingOfMaxText(executing: number, maxRuns: number, allRepos = false): string {
+  return allRepos
+    ? t({
+        zh: `所有仓库执行中 ${executing} / 上限 ${maxRuns}（concurrency.max_runs）`,
+        en: `${executing} of at most ${maxRuns} executing across all repos (concurrency.max_runs)`,
+      })
+    : t({
+        zh: `执行中 ${executing} / 上限 ${maxRuns}（concurrency.max_runs）`,
+        en: `${executing} of at most ${maxRuns} executing (concurrency.max_runs)`,
+      });
+}
+
+/**
  * 「预计 14:05:00 自动重做，开始第 2 次尝试」: when the issue of a failed Run (its `attempt`) is
  * redone as a new Run (`RunDetail.redoAt`). Once that time has passed, the redo starts at the next
  * check, unless today's automatic spending is at its limit or the work switch is off.

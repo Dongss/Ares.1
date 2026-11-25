@@ -106,6 +106,7 @@ export function GuidePage(props: {
     github: github.data.enabled ? repoStatus : null,
     pollMinutes: github.data.pollMinutes,
     perRepo: props.config.perRepo,
+    maxRuns: props.config.maxRuns,
     flow: repoStatus ? issueFlow(props.config, repoStatus, repo?.verifyCommands ?? null) : null,
     targetBranch: repo?.targetBranch ?? null,
     upgrade: upgrade.data,

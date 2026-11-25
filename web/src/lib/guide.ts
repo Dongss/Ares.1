@@ -118,6 +118,8 @@ export interface GuideInput {
   pollMinutes: number;
   /** `concurrency.per_repo`: how many Runs of a repo execute at the same time. */
   perRepo: number;
+  /** `concurrency.max_runs`: how many Runs of all repos execute at the same time; null = no limit. */
+  maxRuns: number | null;
   /** The Runs created from its issues (`issueFlow`); null without GitHub or a valid template. */
   flow: IssueFlow | null;
   /** The registered repo's target branch; null when not known. */
@@ -297,16 +299,41 @@ function capitalize(s: string): string {
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
-/** How many Runs execute at the same time under `concurrency.per_repo`, lowercase. */
-export function concurrencyText(perRepo: number): string {
+/**
+ * How many Runs execute at the same time under `concurrency.per_repo` and, when set,
+ * `concurrency.max_runs` (null = no limit across repos), lowercase.
+ */
+export function concurrencyText(perRepo: number, maxRuns: number | null = null): string {
+  const each =
+    perRepo === 1
+      ? t({
+          zh: '每个仓库同一时间只执行一个 Run（concurrency.per_repo: 1）',
+          en: 'each repo executes one Run at a time (concurrency.per_repo: 1)',
+        })
+      : t({
+          zh: `每个仓库同一时间最多执行 ${perRepo} 个 Run（concurrency.per_repo），各在自己的工作目录里做，合并时一个一个来`,
+          en: `each repo executes up to ${perRepo} Runs at a time (concurrency.per_repo), each in its own working directory, and they merge one at a time`,
+        });
+  if (maxRuns === 1) {
+    return t({
+      zh: `${each}；所有仓库合计同一时间只执行一个 Run（concurrency.max_runs: 1）`,
+      en: `${each}; only one Run executes at a time across all repos (concurrency.max_runs: 1)`,
+    });
+  }
+  if (maxRuns !== null) {
+    return t({
+      zh: `${each}；不同仓库的 Run 也可以同时执行，所有仓库合计最多 ${maxRuns} 个（concurrency.max_runs）`,
+      en: `${each}; Runs of different repos can execute side by side too, up to ${maxRuns} in all (concurrency.max_runs)`,
+    });
+  }
   return perRepo === 1
     ? t({
-        zh: '每个仓库同一时间只执行一个 Run（concurrency.per_repo: 1），不同仓库的 Run 可以同时执行',
-        en: 'each repo executes one Run at a time (concurrency.per_repo: 1), while Runs of different repos can execute side by side',
+        zh: `${each}，不同仓库的 Run 可以同时执行`,
+        en: `${each}, while Runs of different repos can execute side by side`,
       })
     : t({
-        zh: `每个仓库同一时间最多执行 ${perRepo} 个 Run（concurrency.per_repo），各在自己的工作目录里做，合并时一个一个来；不同仓库的 Run 也可以同时执行`,
-        en: `each repo executes up to ${perRepo} Runs at a time (concurrency.per_repo), each in its own working directory, and they merge one at a time; Runs of different repos can execute side by side too`,
+        zh: `${each}；不同仓库的 Run 也可以同时执行`,
+        en: `${each}; Runs of different repos can execute side by side too`,
       });
 }
 
@@ -414,8 +441,8 @@ export function cycleSteps(input: GuideInput, rule?: AutoAcceptRule): CycleStep[
         runActors,
         input.flow
           ? t({
-              zh: `Master 每 ${pollMinutes} 分钟查一次带 ares1:ready 的 issue，按模板「${input.flow.templateName}」${input.flow.templateSource === 'repo' ? `（仓库自带的，在目标分支的 ${REPO_WORKFLOWS_DIR}/ 里）` : ''}建 Run，进展回写到 issue；${concurrencyText(input.perRepo)}`,
-              en: `Every ${pollMinutes} minutes the Master looks for issues labeled ares1:ready, creates Runs from them with the template "${input.flow.templateName}"${input.flow.templateSource === 'repo' ? ` (the repo's own, in ${REPO_WORKFLOWS_DIR}/ on the target branch)` : ''} and reports progress on the issue; ${concurrencyText(input.perRepo)}`,
+              zh: `Master 每 ${pollMinutes} 分钟查一次带 ares1:ready 的 issue，按模板「${input.flow.templateName}」${input.flow.templateSource === 'repo' ? `（仓库自带的，在目标分支的 ${REPO_WORKFLOWS_DIR}/ 里）` : ''}建 Run，进展回写到 issue；${concurrencyText(input.perRepo, input.maxRuns)}`,
+              en: `Every ${pollMinutes} minutes the Master looks for issues labeled ares1:ready, creates Runs from them with the template "${input.flow.templateName}"${input.flow.templateSource === 'repo' ? ` (the repo's own, in ${REPO_WORKFLOWS_DIR}/ on the target branch)` : ''} and reports progress on the issue; ${concurrencyText(input.perRepo, input.maxRuns)}`,
             })
           : t({
               zh: `模板「${github.template}」不存在或无效，issue 建不了 Run：先修好配置`,

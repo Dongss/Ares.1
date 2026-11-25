@@ -159,6 +159,11 @@ export const MasterConfigSchema = z.object({
        * execute at the same time, each in its own worktree. Their merges still go one at a time.
        */
       per_repo: z.number().int().min(1).default(1),
+      /**
+       * Runs of all repos together that execute at the same time, counted as `per_repo` counts
+       * them (`roomUnderMaxRuns`). Omitted = no limit beyond `per_repo`.
+       */
+      max_runs: z.number().int().min(1).optional(),
     })
     .prefault({}),
   /** Omitted = no GitHub integration. */

@@ -4681,6 +4681,95 @@ describe('engine: Runs of different repos', () => {
     expect(git(t.repoDir, 'show', 'main:feature.txt')).toBe('ok');
     expect(git(otherPath, 'show', 'main:feature.txt')).toBe('ok');
   });
+
+  describe('a limit across repos (concurrency.max_runs)', () => {
+    const waiting = (t: Harness, run: Run) =>
+      t.master.engine.waitingForMaxRuns(t.master.store.getRun(run.id));
+
+    it('executes one Run at a time with max_runs: 1, the next in queue order', async () => {
+      h = await harness({ config: 'concurrency: { per_repo: 1, max_runs: 1 }\n' });
+      const t = h;
+      const other = addRepo(t, 'other');
+      const log = statusLog(t);
+      const release = slowCoder(t);
+      const first = runIn(t, 'demo', '第一个');
+      const second = runIn(t, 'other', '第二个');
+      const third = runIn(t, 'demo', '第三个');
+      await waitFor(() => t.fake.calls.length === 1, 'the first coder to start');
+      // Kicking again starts nothing: the other repo has room, the total does not.
+      t.master.engine.kick();
+      expect(t.master.engine.activeRunIds).toEqual([first.id]);
+      expect([status(t, second), status(t, third)]).toEqual(['queued', 'queued']);
+      expect([waiting(t, first), waiting(t, second), waiting(t, third)]).toEqual([
+        false,
+        true,
+        true,
+      ]);
+
+      release();
+      for (const run of [first, second, third]) await t.waitStatus(run.id, 'completed');
+      // One after the other, in queue order: the demo repo's second Run did not get ahead of
+      // the other repo's, although its turn in the demo repo came at the same time.
+      const started = (run: Run) => log.indexOf(`${run.id}:running`);
+      const ended = (run: Run) => log.indexOf(`${run.id}:completed`);
+      expect(started(second)).toBeGreaterThan(ended(first));
+      expect(started(third)).toBeGreaterThan(ended(second));
+      expect(git(t.repoDir, 'show', `main:${third.id}.txt`)).toBe('ok');
+      expect(git(other.path, 'show', 'main:feature.txt')).toBe('ok');
+      expect(waiting(t, third)).toBe(false);
+    });
+
+    it('starts queued Runs at once when max_runs is raised', async () => {
+      h = await harness({ config: 'concurrency: { max_runs: 1 }\n' });
+      const t = h;
+      addRepo(t, 'other');
+      const release = slowCoder(t);
+      const first = runIn(t, 'demo');
+      const second = runIn(t, 'other');
+      await waitFor(() => t.fake.calls.length === 1, 'the first coder to start');
+      t.master.engine.kick();
+      expect(status(t, second)).toBe('queued');
+
+      writeFile(join(t.home, 'config.yaml'), 'concurrency: { max_runs: 2 }\n');
+      await waitFor(() => t.fake.calls.length === 2, 'the second coder to start on reload');
+      expect(t.master.engine.activeRunIds).toEqual([first.id, second.id]);
+      expect(waiting(t, second)).toBe(false);
+      release();
+      await t.waitStatus(first.id, 'completed');
+      await t.waitStatus(second.id, 'completed');
+    });
+
+    it('lowering max_runs stops no executing Run, and starts none until fewer execute', async () => {
+      h = await harness();
+      const t = h;
+      addRepo(t, 'other');
+      addRepo(t, 'third');
+      const log = statusLog(t);
+      const release = slowCoder(t);
+      const a = runIn(t, 'demo');
+      const b = runIn(t, 'other');
+      await waitFor(() => t.fake.calls.length === 2, 'both coders to start');
+
+      writeFile(join(t.home, 'config.yaml'), 'concurrency: { max_runs: 1 }\n');
+      await waitFor(
+        () => t.master.config.master.concurrency.max_runs === 1,
+        'the lower limit to load',
+      );
+      expect(t.master.engine.activeRunIds).toEqual([a.id, b.id]);
+      const c = runIn(t, 'third');
+      t.master.engine.kick();
+      expect(status(t, c)).toBe('queued');
+      expect(waiting(t, c)).toBe(true);
+      expect(t.fake.calls).toHaveLength(2);
+
+      release();
+      for (const run of [a, b, c]) await t.waitStatus(run.id, 'completed');
+      // Two executed, over the new limit: the third waited until both had ended.
+      const started = log.indexOf(`${c.id}:running`);
+      expect(started).toBeGreaterThan(log.indexOf(`${a.id}:completed`));
+      expect(started).toBeGreaterThan(log.indexOf(`${b.id}:completed`));
+    });
+  });
 });
 
 describe('engine: Runs of one repo side by side (concurrency.per_repo)', () => {
