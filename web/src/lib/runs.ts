@@ -1,4 +1,9 @@
-import type { RateLimitedWait, RunDetail, RunSummary } from '../../../src/api/types.js';
+import type {
+  ConflictWait,
+  RateLimitedWait,
+  RunDetail,
+  RunSummary,
+} from '../../../src/api/types.js';
 import { brandTitle } from '../../../src/brand.js';
 import {
   type AgentSelection,
@@ -584,6 +589,39 @@ export function maxRunsWaitText(maxRuns: number | null): string {
   });
 }
 
+/** How many of the paths a wait for an overlapping Run names; the rest are counted. */
+const CONFLICT_PATHS_SHOWN = 3;
+
+/**
+ * `conflictWaitText` around the id of the Run waited for, so that a page can make the id a link:
+ * the text is `${before}${wait.runId}${after}`.
+ */
+export function conflictWaitParts(wait: ConflictWait): { before: string; after: string } {
+  const shown = join(wait.paths.slice(0, CONFLICT_PATHS_SHOWN));
+  const more = wait.paths.length - CONFLICT_PATHS_SHOWN;
+  const paths =
+    more > 0
+      ? t({ zh: `${shown} 等 ${wait.paths.length} 处`, en: `${shown} and ${more} more` })
+      : shown;
+  return t({
+    zh: { before: '等 Run ', after: `：预计改同一处（${paths}）` },
+    en: {
+      before: 'Waiting for Run ',
+      after: `: expected to change the same ${wait.paths.length === 1 ? 'place' : 'places'} (${paths})`,
+    },
+  });
+}
+
+/**
+ * 「等 Run X：预计改同一处（src/engine、docs）」: why a queued Run waits when `waitingForConflict`
+ * (or its `run.waiting_conflict` event says): Run X of its repo executes and has not merged yet,
+ * and both assessments expect to change these paths. Names the first few paths, counts the rest.
+ */
+export function conflictWaitText(wait: ConflictWait): string {
+  const { before, after } = conflictWaitParts(wait);
+  return `${before}${wait.runId}${after}`;
+}
+
 /**
  * 「执行中 2 / 上限 3」: how many Runs execute across all repos (`executing`) against config.yaml's
  * `concurrency.max_runs`; `allRepos` when the list shows one repo only, so the count is not
@@ -786,6 +824,21 @@ export function eventText(event: Pick<EventRow, 'type' | 'data'>, now = new Date
     const { agentId, retryAt } = event.data;
     if (typeof agentId === 'string' && typeof retryAt === 'string') {
       return rateLimitText({ agentId, retryAt }, now);
+    }
+  }
+  if (event.type === 'run.waiting_conflict') {
+    const { blockedBy, paths } = event.data;
+    if (
+      typeof blockedBy === 'string' &&
+      Array.isArray(paths) &&
+      paths.length > 0 &&
+      paths.every((p) => typeof p === 'string')
+    ) {
+      const wait = conflictWaitText({ runId: blockedBy, paths });
+      return t({
+        zh: `${wait}。这个 Run 在队列里等，不占名额，等它合并或结束后接着做，不重新评估`,
+        en: `${wait}. This Run waits in the queue, taking no place, and goes on once that one has merged or ended, without being assessed again`,
+      });
     }
   }
   if (event.type === 'run.blocked' && event.data.kind === 'environment') {

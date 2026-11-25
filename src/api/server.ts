@@ -329,6 +329,7 @@ export function createApi(deps: ApiDeps): Hono {
       ...(await engine.inspectWorkspace(run)),
       rateLimited: engine.rateLimited(run),
       waitingForMaxRuns: engine.waitingForMaxRuns(run),
+      waitingForConflict: engine.waitingForConflict(run),
       redoAt: redoAt === null ? null : new Date(redoAt).toISOString(),
     } satisfies RunDetail);
   });
@@ -529,5 +530,6 @@ function summarizeRun(store: Store, engine: Engine, run: ReturnType<Store['getRu
     currentStage,
     costUnknown: store.listRunAttempts(run.id).some(isCostUnknown),
     waitingForMaxRuns: engine.waitingForMaxRuns(run),
+    waitingForConflict: engine.waitingForConflict(run),
   };
 }

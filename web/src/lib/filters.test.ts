@@ -26,6 +26,7 @@ function run(
     templateName: 'dev',
     costUnknown: false,
     waitingForMaxRuns: false,
+    waitingForConflict: null,
     goal: id,
     overrides: {},
     status,

@@ -25,6 +25,7 @@ import {
 import { useTick } from '../lib/hooks.js';
 import { href } from '../lib/router.js';
 import {
+  conflictWaitText,
   maxRunsWaitText,
   prWaitHint,
   prWaitTitle,
@@ -138,11 +139,19 @@ export function HomePage({
 function queueExtra(run: RunSummary, rank: number | undefined, maxRuns: number | null): ReactNode {
   if (rank === undefined) return null;
   const place = t({ zh: `第 ${rank} 个执行`, en: `#${rank} in line` });
-  if (!run.waitingForMaxRuns) return <div className="run-card-note">{place}</div>;
+  if (!run.waitingForMaxRuns && !run.waitingForConflict) {
+    return <div className="run-card-note">{place}</div>;
+  }
+  // Text only: the card is a link, and the Run waited for is linked from the Run's page.
   return (
     <div className="run-card-note">
       <div className="run-card-note-title">{place}</div>
-      <div className="run-card-note-detail">{maxRunsWaitText(maxRuns)}</div>
+      {run.waitingForConflict && (
+        <div className="run-card-note-detail">{conflictWaitText(run.waitingForConflict)}</div>
+      )}
+      {run.waitingForMaxRuns && (
+        <div className="run-card-note-detail">{maxRunsWaitText(maxRuns)}</div>
+      )}
     </div>
   );
 }

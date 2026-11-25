@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useState } from 'react';
 import { isCostUnknown } from '../../../src/api/cost.js';
-import type { ConfigView, RunDetail } from '../../../src/api/types.js';
+import type { ConfigView, ConflictWait, RunDetail } from '../../../src/api/types.js';
 import { effectiveBudget, REDO_BACKOFF_MAX_HOURS } from '../../../src/config/flow.js';
 import type { PlanStep } from '../../../src/engine/plan.js';
 import { t } from '../../../src/i18n.js';
@@ -42,11 +42,13 @@ import {
 } from '../lib/format.js';
 import { useAction, useReloadOn, useResource, useTick } from '../lib/hooks.js';
 import { autoPlanText, roundTasks, stepLabel, stepsDoneText, taskTitle } from '../lib/plan.js';
+import { href } from '../lib/router.js';
 import {
   assessmentDifficulty,
   assessmentHeadline,
   assessmentSize,
   canCleanUpWorkspace,
+  conflictWaitParts,
   difficultyText,
   discussionItems,
   eventText,
@@ -87,11 +89,15 @@ export function RunDetailPage(props: {
   // A redo of this Run is an event of the new Run. While it waits for room under
   // concurrency.max_runs, other Runs ending and a reload of the limit change whether it still does.
   const waitsForMaxRuns = detail.data?.waitingForMaxRuns === true;
+  // While it waits for a Run expected to change the same places, that Run merging or ending
+  // (an event of that Run) ends the wait, even when this one then waits for room.
+  const conflictWith = detail.data?.waitingForConflict?.runId ?? null;
   useReloadOn(
     detail.reload,
     (e) =>
       e.runId === id ||
       e.data.failedRunId === id ||
+      (conflictWith !== null && e.runId === conflictWith) ||
       (waitsForMaxRuns && (e.type === 'run.status' || e.type === 'config.reloaded')),
   );
   // A Run with a pull request: its events tell whether and why it went back for more work. Others
@@ -426,6 +432,9 @@ function RunActions(props: {
           </p>
         </div>
       )}
+      {run.status === 'queued' && props.detail.waitingForConflict && (
+        <ConflictWaitPanel wait={props.detail.waitingForConflict} />
+      )}
       {run.status === 'queued' && props.detail.waitingForMaxRuns && (
         <div className="panel">
           <h2>{maxRunsWaitText(props.config?.maxRuns ?? null)}</h2>
@@ -489,6 +498,29 @@ function RunActions(props: {
         </div>
       )}
       <ErrorBox>{action.error}</ErrorBox>
+    </div>
+  );
+}
+
+/**
+ * A queued Run held back by a Run of its repo expected to change the same places
+ * (`RunDetail.waitingForConflict`): 「等 Run X：预计改同一处（…）」 with X linking to that Run.
+ */
+function ConflictWaitPanel({ wait }: { wait: ConflictWait }) {
+  const { before, after } = conflictWaitParts(wait);
+  return (
+    <div className="panel">
+      <h2>
+        {before}
+        <a href={href.run(wait.runId)}>{wait.runId}</a>
+        {after}
+      </h2>
+      <p>
+        {t({
+          zh: '两个 Run 的需求评估预计会改同一处，同时做的话，后合并的那个很可能冲突、返工。所以评估过的这个 Run 在队列里等，不占名额，也不用人处理：那个 Run 合并或结束后它接着做，不重新评估；这期间排在后面、不冲突的 Run 先开始。只在 concurrency.per_repo 大于 1 时这样等。',
+          en: "Both Runs' assessments expect to change the same places, and working on them at once would most likely make the one that merges later conflict and rework. So this Run, already assessed, waits in the queue, taking no place and needing no human. It goes on once that Run has merged or ended, without being assessed again; meanwhile queued Runs behind it that conflict with nothing start first. Runs only wait like this with concurrency.per_repo above 1.",
+        })}
+      </p>
     </div>
   );
 }

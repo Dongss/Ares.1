@@ -7,6 +7,7 @@ import type {
   AgentEventRecord,
   AgentSummary,
   ConfigView,
+  ConflictWait,
   GitHubStatus,
   HealthView,
   KeptWorkspace,
@@ -250,6 +251,54 @@ describe('HTTP API', () => {
     await t.master.engine.cancel(first.id);
     await waitFor(() => t.fake.calls.length === 2, 'the second coder to start');
     expect(await waiting(second.id)).toBe(false);
+  });
+
+  it('reports the Run a queued Run waits for, expected to change the same paths', async () => {
+    h = await harness({
+      config: 'concurrency: { per_repo: 2 }\n',
+      agents: ASSESS_AGENTS_YAML,
+      workflow: ASSESS_WORKFLOW_YAML,
+    });
+    const t = h;
+    let coding = 0;
+    // The coders run until they are stopped.
+    t.scripts.coder = (ctx) => {
+      coding++;
+      return new Promise((resolve) => ctx.signal.addEventListener('abort', () => resolve(done())));
+    };
+    t.scripts.assessor = async (ctx) => {
+      if (ctx.input.prompt.includes('目标甲')) return assessment('go', { touches: ['src/engine'] });
+      // Assessed once the first codes, so that the first goes ahead.
+      await waitFor(() => coding === 1, 'the first coder');
+      return assessment('go', { touches: ['src', 'docs'] });
+    };
+    const first = t.run('目标甲');
+    const second = t.run('目标乙');
+    await waitFor(
+      () =>
+        t.master.store.getRun(second.id).status === 'queued' &&
+        t.master.store.listEvents(second.id).some((e) => e.type === 'run.waiting_conflict'),
+      'the second to wait for the first',
+    );
+
+    const waiting = (id: string): Promise<ConflictWait | null> =>
+      call('GET', `/api/runs/${id}`).then((r) => r.json.waitingForConflict);
+    expect(await waiting(first.id)).toBeNull();
+    expect(await waiting(second.id)).toEqual({ runId: first.id, paths: ['src/engine'] });
+    const list: RunSummary[] = (await call('GET', '/api/runs')).json;
+    expect(Object.fromEntries(list.map((r) => [r.id, r.waitingForConflict]))).toEqual({
+      [first.id]: null,
+      [second.id]: { runId: first.id, paths: ['src/engine'] },
+    });
+    // It waits for the Run it overlaps, not for room.
+    expect(list.map((r) => r.waitingForMaxRuns)).toEqual([false, false]);
+
+    // The first ending, the second goes on and waits no more.
+    await t.master.engine.cancel(first.id);
+    await waitFor(() => coding === 2, 'the second coder to start');
+    expect(await waiting(second.id)).toBeNull();
+    const after: RunSummary[] = (await call('GET', '/api/runs')).json;
+    expect(after.map((r) => r.waitingForConflict)).toEqual([null, null]);
   });
 
   it('tells a raw log deleted past retention from a missing one, and keeps the events', async () => {

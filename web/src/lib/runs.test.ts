@@ -8,6 +8,8 @@ import {
   assessmentSize,
   attentionCount,
   canCleanUpWorkspace,
+  conflictWaitParts,
+  conflictWaitText,
   difficultyText,
   discussionItems,
   eventText,
@@ -45,6 +47,7 @@ function run(id: string, status: RunSummary['status'], extra: Partial<RunSummary
     templateName: 'dev',
     costUnknown: false,
     waitingForMaxRuns: false,
+    waitingForConflict: null,
     goal: id,
     overrides: {},
     status,
@@ -578,6 +581,58 @@ describe('rate limits', () => {
       'Agent coder is out of quota or rate-limited; expected to continue at 14:05:00',
     );
     expect(text).not.toMatch(/[一-鿿]/);
+  });
+});
+
+describe('waiting for a Run expected to change the same places', () => {
+  afterEach(() => setLang('zh'));
+  const event = (data: Record<string, unknown>) => ({ type: 'run.waiting_conflict', data });
+  const many = ['src/a', 'src/b', 'src/c', 'docs', 'web'];
+
+  it('names the Run and the paths, counting those past the first few', () => {
+    expect(conflictWaitText({ runId: 'run-1', paths: ['src/engine', 'docs'] })).toBe(
+      '等 Run run-1：预计改同一处（src/engine、docs）',
+    );
+    expect(conflictWaitText({ runId: 'run-1', paths: many })).toBe(
+      '等 Run run-1：预计改同一处（src/a、src/b、src/c 等 5 处）',
+    );
+  });
+
+  it('splits the text around the Run id, so that the id can be a link', () => {
+    const wait = { runId: 'run-1', paths: ['src'] };
+    const { before, after } = conflictWaitParts(wait);
+    expect(`${before}run-1${after}`).toBe(conflictWaitText(wait));
+    expect(before).not.toContain('run-1');
+    expect(after).not.toContain('run-1');
+  });
+
+  it('words run.waiting_conflict events from their data, and no others', () => {
+    expect(eventText(event({ stageId: 'assess', blockedBy: 'run-1', paths: ['src'] }))).toBe(
+      '等 Run run-1：预计改同一处（src）。这个 Run 在队列里等，不占名额，等它合并或结束后接着做，不重新评估',
+    );
+    expect(eventText(event({ blockedBy: 'run-1' }))).toBeNull();
+    expect(eventText(event({ blockedBy: 'run-1', paths: [] }))).toBeNull();
+    expect(eventText(event({ blockedBy: 'run-1', paths: [1] }))).toBeNull();
+    expect(eventText(event({ paths: ['src'] }))).toBeNull();
+  });
+
+  it('in English', () => {
+    setLang('en');
+    expect(conflictWaitText({ runId: 'run-1', paths: ['src/engine'] })).toBe(
+      'Waiting for Run run-1: expected to change the same place (src/engine)',
+    );
+    expect(conflictWaitText({ runId: 'run-1', paths: many })).toBe(
+      'Waiting for Run run-1: expected to change the same places (src/a, src/b, src/c and 2 more)',
+    );
+    const text = eventText(
+      event({ stageId: 'assess', blockedBy: 'run-1', paths: ['src/engine', 'docs'] }),
+    );
+    expect(text).toBe(
+      'Waiting for Run run-1: expected to change the same places (src/engine, docs). This Run waits in the queue, taking no place, and goes on once that one has merged or ended, without being assessed again',
+    );
+    expect(text).not.toMatch(/[一-鿿]/);
+    const { before, after } = conflictWaitParts({ runId: 'run-1', paths: many });
+    expect(`${before}${after}`).not.toMatch(/[一-鿿]/);
   });
 });
 

@@ -59,6 +59,8 @@ export type RunSummary = Omit<Run, 'template'> & {
   currentStage: { id: string; name: string; round: number } | null;
   /** As on GET /api/runs/:id: the Run is queued because `concurrency.max_runs` Runs execute. */
   waitingForMaxRuns: boolean;
+  /** As on GET /api/runs/:id: the Run waits for a Run expected to change the same paths. */
+  waitingForConflict: ConflictWait | null;
 };
 
 /** GET /api/runs/:id */
@@ -103,6 +105,14 @@ export interface RunDetail {
    */
   waitingForMaxRuns: boolean;
   /**
+   * The Run is queued because another Run of its repo that executes (or waits for its pull
+   * request) and has not merged yet expects to change these paths too, by both assessments'
+   * touches: working on them at once would most likely conflict at the merge. It goes on once
+   * that Run has merged or ended (`conflictBlocker` in src/config/flow.ts). null when it does not
+   * wait for one.
+   */
+  waitingForConflict: ConflictWait | null;
+  /**
    * The Run failed and its issue is redone as a new Run, at this time at the earliest (ISO;
    * `redoDueAt`): the wait after a failure doubles with each attempt. Later when today's
    * automatic spending reached its limit or the work switch is off. null when the issue is not
@@ -115,6 +125,15 @@ export interface RunDetail {
 export interface RateLimitedWait {
   agentId: string;
   retryAt: string;
+}
+
+/**
+ * A queued Run waiting for another Run of its repo that expects to change the same places: that
+ * Run's id, and the paths both expect to change (the more specific of each overlapping pair).
+ */
+export interface ConflictWait {
+  runId: string;
+  paths: string[];
 }
 
 /** Where a Run's worktree and branch are and whether they are still there. */
