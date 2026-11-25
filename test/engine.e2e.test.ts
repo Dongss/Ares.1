@@ -29,6 +29,7 @@ import {
   FakeGitHub,
   git,
   type Harness,
+  type HarnessOptions,
   harness,
   initRepo,
   readEnvFile,
@@ -5139,6 +5140,239 @@ ${mergeCheck ? `    verify:\n      commands:\n        - ${JSON.stringify(mergeCh
     held.release();
     await t.waitStatus(a.id, 'completed');
     await t.waitStatus(b.id, 'completed');
+  });
+
+  describe('Runs whose assessments expect to change the same place (touches)', () => {
+    /** Assessment → coding → review → merge without approval. */
+    const start = (config = PER_REPO_2, more: HarnessOptions = {}) =>
+      harness({ config, agents: ASSESS_AGENTS_YAML, workflow: ASSESS_WORKFLOW_YAML, ...more });
+
+    /**
+     * An assessor that goes ahead with the touches of the Run's goal (found in its prompt), none
+     * for null, after `before` when given.
+     */
+    const assessor =
+      (
+        touchesByGoal: Record<string, string[] | null>,
+        before?: (goal: string) => Promise<void>,
+      ): Script =>
+      async (ctx) => {
+        const goal = Object.keys(touchesByGoal).find((g) => ctx.input.prompt.includes(g));
+        if (goal === undefined) throw new Error('the assessor does not know this goal');
+        await before?.(goal);
+        const touches = touchesByGoal[goal];
+        return assessment('go', touches ? { touches } : {});
+      };
+
+    /** The id of the Run's first event of `type` whose data has `data`. */
+    const firstEventId = (t: Harness, run: Run, type: string, data: Record<string, unknown> = {}) =>
+      t.master.store
+        .listEvents(run.id)
+        .find((e) => e.type === type && Object.entries(data).every(([k, v]) => e.data[k] === v))
+        ?.id ?? Number.NaN;
+    const codingStarted = (t: Harness, run: Run) =>
+      firstEventId(t, run, 'stage.started', { stageId: 'implement' });
+    const waits = (t: Harness, run: Run) =>
+      eventsOf(t, run, 'run.waiting_conflict').map((e) => e.data);
+    const assessments = (t: Harness, run: Run) =>
+      t.master.store.listRunAttempts(run.id).filter((a) => a.agentId === 'assessor');
+    const waitingFor = (t: Harness, run: Run) =>
+      t.master.engine.waitingForConflict(t.master.store.getRun(run.id));
+    const stages = (t: Harness, run: Run) =>
+      t.master.store.listStageRuns(run.id).map((s) => `${s.stageId}:${s.status}`);
+
+    it('holds the later of two overlapping Runs back after its assessment until the first merged', async () => {
+      h = await start();
+      const t = h;
+      const held = heldCoder(coder);
+      t.scripts.coder = held.script;
+      t.scripts.assessor = assessor(
+        { 目标甲: ['src/engine'], 目标乙: ['src', 'docs'] },
+        async (goal) => {
+          // Assessed once the first codes, so that the first goes ahead.
+          if (goal === '目标乙') await waitFor(() => held.started === 1, 'the first coder');
+        },
+      );
+      const a = t.run('目标甲');
+      const b = t.run('目标乙');
+      await waitFor(() => waits(t, b).length === 1, 'the second to wait for the first');
+      expect(waits(t, b)).toEqual([{ stageId: 'assess', blockedBy: a.id, paths: ['src/engine'] }]);
+      expect(status(t, b)).toBe('queued');
+      expect(waitingFor(t, b)).toEqual({ runId: a.id, paths: ['src/engine'] });
+      expect(waitingFor(t, a)).toBeNull();
+      // Its assessment stays passed and current: it goes on from there.
+      expect(stages(t, b)).toEqual(['assess:passed']);
+      await waitFor(() => t.master.engine.activeRunIds.length === 1, 'the second to leave');
+      expect(t.master.engine.activeRunIds).toEqual([a.id]);
+
+      // Further kicks pass it by, without recording the wait again.
+      t.master.engine.kick();
+      await sleep(100);
+      expect(status(t, b)).toBe('queued');
+      expect(held.started).toBe(1);
+      expect(waits(t, b)).toHaveLength(1);
+
+      held.release();
+      await t.waitStatus(a.id, 'completed');
+      await t.waitStatus(b.id, 'completed');
+      // Never both past their assessment and not yet merged: the second went on to code only
+      // after the first had merged.
+      expect(codingStarted(t, b)).toBeGreaterThan(firstEventId(t, a, 'merge.done'));
+      expect(codingSpan(t, b).start).toBeGreaterThanOrEqual(codingSpan(t, a).end);
+      // Assessed once, and merged without a conflict.
+      expect(assessments(t, b)).toHaveLength(1);
+      expect(stages(t, b)).toEqual([
+        'assess:passed',
+        'implement:passed',
+        'review:passed',
+        'merge:passed',
+      ]);
+      expect(waits(t, a)).toEqual([]);
+      expect(waitingFor(t, b)).toBeNull();
+      expect(git(t.repoDir, 'show', `main:${b.id}.txt`)).toBe('ok');
+    });
+
+    it('executes two Runs that overlap nowhere side by side', async () => {
+      h = await start();
+      const t = h;
+      const held = heldCoder(coder);
+      t.scripts.coder = held.script;
+      // Compared by path segments: src/engine is not part of src/engineering.
+      t.scripts.assessor = assessor({
+        目标甲: ['src/engine', 'docs/running.md'],
+        目标乙: ['src/engineering', 'docs/examples'],
+      });
+      const a = t.run('目标甲');
+      const b = t.run('目标乙');
+      await waitFor(() => held.started === 2, 'both coders to start');
+      expect([...t.master.engine.activeRunIds].sort()).toEqual([a.id, b.id].sort());
+      held.release();
+      await t.waitStatus(a.id, 'completed');
+      await t.waitStatus(b.id, 'completed');
+      const [spanA, spanB] = [codingSpan(t, a), codingSpan(t, b)];
+      expect(spanA.start).toBeLessThan(spanB.end);
+      expect(spanB.start).toBeLessThan(spanA.end);
+      expect([waits(t, a), waits(t, b)]).toEqual([[], []]);
+    });
+
+    // Without an assessment stage at all, two Runs code side by side as well: 'codes two Runs of
+    // a repo at the same time, and merges them one at a time'.
+    it('executes a Run whose assessment gave no touches beside any other, as before', async () => {
+      h = await start();
+      const t = h;
+      const held = heldCoder(coder);
+      t.scripts.coder = held.script;
+      t.scripts.assessor = assessor({ 目标甲: ['src'], 目标乙: null });
+      const a = t.run('目标甲');
+      const b = t.run('目标乙');
+      await waitFor(() => held.started === 2, 'both coders to start');
+      expect([...t.master.engine.activeRunIds].sort()).toEqual([a.id, b.id].sort());
+      expect(t.master.store.getRun(b.id).discussion[0]).not.toHaveProperty('touches');
+      held.release();
+      await t.waitStatus(a.id, 'completed');
+      await t.waitStatus(b.id, 'completed');
+      expect([waits(t, a), waits(t, b)]).toEqual([[], []]);
+    });
+
+    it('changes nothing with concurrency.per_repo: 1', async () => {
+      h = await start('concurrency: { per_repo: 1 }\n');
+      const t = h;
+      t.scripts.coder = coder;
+      t.scripts.assessor = assessor({ 目标甲: ['src'], 目标乙: ['src'] });
+      const a = t.run('目标甲');
+      const b = t.run('目标乙');
+      await t.waitStatus(a.id, 'completed');
+      await t.waitStatus(b.id, 'completed');
+      // One after the other in queue order: the second started once the first had completed.
+      expect(firstEventId(t, b, 'stage.started')).toBeGreaterThan(
+        firstEventId(t, a, 'run.status', { status: 'completed' }),
+      );
+      const statuses = (run: Run) => eventsOf(t, run, 'run.status').map((e) => e.data.status);
+      expect(statuses(b)).toEqual(statuses(a));
+      expect([waits(t, a), waits(t, b)]).toEqual([[], []]);
+      expect(assessments(t, b)).toHaveLength(1);
+    });
+
+    it('starts a later Run that overlaps nothing while an earlier one waits', async () => {
+      h = await start();
+      const t = h;
+      const held = heldCoder(coder);
+      t.scripts.coder = held.script;
+      t.scripts.assessor = assessor(
+        { 目标甲: ['src'], 目标乙: ['src/config/flow.ts'], 目标丙: ['docs'] },
+        async (goal) => {
+          if (goal === '目标乙') await waitFor(() => held.started === 1, 'the first coder');
+        },
+      );
+      const a = t.run('目标甲');
+      const b = t.run('目标乙');
+      const c = t.run('目标丙');
+      // The third takes the place the second gave up, and codes beside the first.
+      await waitFor(() => held.started === 2, 'the third coder to start');
+      expect(status(t, b)).toBe('queued');
+      expect(t.master.engine.activeRunIds).toEqual([a.id, c.id]);
+      expect(waits(t, b)).toEqual([
+        { stageId: 'assess', blockedBy: a.id, paths: ['src/config/flow.ts'] },
+      ]);
+      expect(waits(t, c)).toEqual([]);
+
+      held.release();
+      for (const run of [a, b, c]) await t.waitStatus(run.id, 'completed');
+      expect(codingStarted(t, b)).toBeGreaterThan(firstEventId(t, a, 'merge.done'));
+      expect(assessments(t, b)).toHaveLength(1);
+      expect(waits(t, b)).toHaveLength(1);
+    });
+
+    /** The event that ends the first Run's wait for its pull request, by how it ends. */
+    const prEnds = [
+      { end: 'merged', type: 'github.pr_merged', data: {} },
+      { end: 'closed', type: 'github.pr_closed', data: {} },
+      { end: 'cancelled', type: 'run.status', data: { status: 'cancelled' } },
+    ] as const;
+
+    it.each(prEnds)(
+      'holds an overlapping Run back while the first waits for its pull request, until it is $end',
+      async ({ end, type, data }) => {
+        const deliverPr =
+          'github:\n  repos:\n    demo:\n      template: dev\n      push: true\n      deliver: pr\n';
+        h = await start(PER_REPO_2 + deliverPr, { github: new FakeGitHub() });
+        const t = h;
+        t.scripts.coder = coder;
+        t.scripts.assessor = assessor({ 目标甲: ['src'], 目标乙: ['src'] });
+        const a = t.run('目标甲');
+        const pending = await t.waitStatus(a.id, 'blocked');
+        expect(pending.blocked?.kind).toBe('pr_open');
+        await waitFor(() => t.master.engine.activeRunIds.length === 0, 'the first to leave');
+
+        // Not executing, but its work is in no target branch yet: the second waits for it.
+        const b = t.run('目标乙');
+        await waitFor(() => waits(t, b).length === 1, 'the second to wait for the first');
+        expect(waits(t, b)).toEqual([{ stageId: 'assess', blockedBy: a.id, paths: ['src'] }]);
+        await waitFor(() => t.master.engine.activeRunIds.length === 0, 'the second to leave');
+        expect(status(t, b)).toBe('queued');
+        expect(waitingFor(t, b)).toEqual({ runId: a.id, paths: ['src'] });
+        t.master.engine.kick();
+        await sleep(100);
+        expect(stages(t, b)).toEqual(['assess:passed']);
+
+        const pr = { number: 7, url: 'https://github.com/me/demo/pull/7' };
+        if (end === 'merged') {
+          expect(t.master.engine.pullRequestMerged(pending, { ...pr, mergeCommit: null })).toBe(
+            true,
+          );
+        } else if (end === 'closed') {
+          expect(t.master.engine.pullRequestClosed(pending, pr)).toBe(true);
+        } else {
+          await t.master.engine.cancel(a.id);
+        }
+        // The second goes on from its assessment, and waits for a pull request of its own.
+        const after = await t.waitStatus(b.id, 'blocked');
+        expect(after.blocked?.kind).toBe('pr_open');
+        expect(codingStarted(t, b)).toBeGreaterThan(firstEventId(t, a, type, data));
+        expect(assessments(t, b)).toHaveLength(1);
+        expect(waits(t, b)).toHaveLength(1);
+      },
+    );
   });
 });
 

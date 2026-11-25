@@ -21,7 +21,9 @@ import {
   type AgentSelection,
   type Backoff,
   backoffMs,
+  type ConflictBlock,
   chooseStageAgent,
+  conflictBlocker,
   deliversByPr,
   discussionReplyWait,
   LEFTOVER_WORKSPACE_EVENTS,
@@ -33,6 +35,7 @@ import {
   type RateLimitWait,
   REPO_WORKFLOWS_DIR,
   type RunLimitWait,
+  type RunTouches,
   rateLimitDelayMs,
   recordedLimitWait,
   roomUnderMaxRuns,
@@ -140,6 +143,7 @@ import {
 import {
   assessedDifficulty,
   assessedSize,
+  assessedTouches,
   assessmentProblem,
   formatAssessment,
   takeAssessment,
@@ -371,7 +375,10 @@ const IN_FLIGHT_TASK = new Set<Task['status']>(['running', 'verifying']);
  * The workflow engine: a deterministic state machine that executes up to `concurrency.per_repo`
  * Runs at a time per repo, each in the Run's own worktree, one task and one commit at a time.
  * Runs of different repos execute side by side, up to `concurrency.max_runs` in all when that is
- * set. A repo's Runs share its git repository (the
+ * set. Side by side in one repo, two Runs whose assessments expect them to change the same place
+ * (`touches`) do not work at once (`conflictWith`): the later one waits in the queue after its
+ * assessment, progress kept, until the other has merged or ended, so that they do not conflict at
+ * the merge. A repo's Runs share its git repository (the
  * target branch, worktrees, branches), so what they do there besides their own worktree goes one
  * Run at a time, under the repo's merge lock (`withMergeLock`): merging, creating and removing
  * worktrees.
@@ -414,6 +421,12 @@ export class Engine {
   private readonly limitWaits = new Map<string, RunLimitWait>();
   /** Wakes `kick` when the first wait in `limitWaits` ends. */
   private limitTimer: ReturnType<typeof setTimeout> | undefined;
+  /**
+   * Queued Runs held back by a Run they overlap (`conflictWith`), by Run id: the Run each waits
+   * for and the overlapping paths, as its latest `run.waiting_conflict` event recorded them, so
+   * that the event is recorded once per Run waited for and not on every `kick`.
+   */
+  private readonly conflictWaits = new Map<string, ConflictBlock>();
   private readonly store: Store;
   private readonly now: () => number;
   private readonly backoff: Backoff;
@@ -495,6 +508,7 @@ export class Engine {
     clearTimeout(this.limitTimer);
     this.limitTimer = undefined;
     this.limitWaits.clear();
+    this.conflictWaits.clear();
     // A sweep ends after the removal in progress; the store must stay open until it has.
     await Promise.all([this.stopActive(), this.sweeping?.catch(() => {})]);
   }
@@ -566,6 +580,10 @@ export class Engine {
    * agent's quota are passed by until their wait ends; `kick` is woken up when the first wait
    * ends. A Run whose slot is full is passed by too, so a later Run of another repo may start
    * first; the queue order alone decides among the others, so no repo gets ahead of its turn.
+   * With `concurrency.per_repo` above 1, an assessed Run that overlaps a Run of its slot not yet
+   * past its merge (`conflictWith`) is passed by as well, so that later Runs that overlap nothing
+   * start first; it is recorded once per Run it waits for (`run.waiting_conflict`). The Run it
+   * waits for kicks again once past its merge stage, and when it ends.
    */
   kick(): void {
     clearTimeout(this.limitTimer);
@@ -579,6 +597,7 @@ export class Engine {
     // A Run that left the queue meanwhile (paused, cancelled) waits no more.
     const ids = new Set(queued.map((r) => r.id));
     for (const id of this.limitWaits.keys()) if (!ids.has(id)) this.limitWaits.delete(id);
+    for (const id of this.conflictWaits.keys()) if (!ids.has(id)) this.conflictWaits.delete(id);
     const now = this.now();
     let wake: number | undefined;
     const slots = new Map<string, string>();
@@ -598,6 +617,7 @@ export class Engine {
         slot = this.slotOf(run);
         slots.set(run.repoId, slot);
       }
+      if (this.waitsForConflict(run, slot)) continue;
       if (this.executingIn(slot) < perRepo) this.launch(run.id, slot);
     }
     if (wake !== undefined) {
@@ -610,6 +630,7 @@ export class Engine {
   /** Execute the queued Run `runId` in the execution slot `slot`, which has room for it. */
   private launch(runId: string, slot: string): void {
     this.limitWaits.delete(runId);
+    this.conflictWaits.delete(runId);
     const controller = new AbortController();
     const active: Active = { runId, slot, controller, done: Promise.resolve() };
     // Registered before its status changes: a listener of the status event may kick again, and
@@ -706,6 +727,117 @@ export class Engine {
       this.active.size,
       this.cfg.master.concurrency.max_runs,
     );
+  }
+
+  /**
+   * A queued Run held back by a Run of its repo it overlaps (`conflictWith`): the Run it waits for
+   * and the paths both expect to change. null when it does not wait for one (any more). The rule
+   * is `kick`'s: it goes on once the other has merged or ended (then also waiting for room in its
+   * execution slot and in the total, like any queued Run).
+   */
+  waitingForConflict(run: Run): ConflictBlock | null {
+    if (run.status !== 'queued') return null;
+    return this.conflictWith(run, this.slotOf(run));
+  }
+
+  /**
+   * The Run that keeps `run` from working past its assessment in the execution slot `slot`, and
+   * the paths both expect to change (`conflictBlocker`); null when none does. Two Runs that
+   * change the same place at once would most likely conflict when the second merges, and have
+   * to rework. Only with `concurrency.per_repo` above 1, where Runs of a repo work side by side,
+   * and only for a Run whose assessment gave touches (`assessedTouches`). The Runs that may hold
+   * it back are the other Runs of the slot with touches that are not yet past their merge stage
+   * (`pastMerge`): those executing, in the order they started, then those waiting for their pull
+   * request to be merged on GitHub (`pr_open`), whose work is in no target branch yet either.
+   * Other Runs that do not execute (queued, paused, waiting for a human) hold back none: they
+   * may wait for long, and whichever goes on first merges first.
+   */
+  private conflictWith(run: Run, slot: string): ConflictBlock | null {
+    if (this.cfg.master.concurrency.per_repo <= 1) return null;
+    const touches = assessedTouches(run.discussion);
+    if (!touches) return null;
+    const others: RunTouches[] = [];
+    const consider = (other: Run) => {
+      if (other.id === run.id || this.pastMerge(other)) return;
+      const otherTouches = assessedTouches(other.discussion);
+      if (otherTouches) others.push({ runId: other.id, touches: otherTouches });
+    };
+    for (const active of this.active.values()) {
+      if (active.slot !== slot) continue;
+      const other = this.store.getRun(active.runId);
+      // On its way out of `active`: queued again (e.g. after its own assessment), or blocked.
+      if (other.status === 'running') consider(other);
+    }
+    for (const other of this.store.listRuns({ status: 'blocked' })) {
+      if (other.blocked?.kind !== 'pr_open') continue;
+      if (other.repoId !== run.repoId && this.slotOf(other) !== slot) continue;
+      consider(other);
+    }
+    return conflictBlocker(touches, others, new Set());
+  }
+
+  /**
+   * Whether the Run is past its merge stage (the last one, when the template has several): its
+   * work is in the target branch, so Runs that go on after it build on it. A Run of a template
+   * without a merge stage never is.
+   */
+  private pastMerge(run: Run): boolean {
+    const stages = run.template.stages;
+    const merge = stages.findLastIndex((s) => s.kind === 'merge');
+    if (merge < 0 || !run.currentStageRunId) return false;
+    const sr = this.store.getStageRun(run.currentStageRunId);
+    const at = stages.findIndex((s) => s.id === sr.stageId);
+    return at > merge || (at === merge && sr.status === 'passed');
+  }
+
+  /**
+   * Whether `kick` passes the queued Run by for a Run it overlaps (`conflictWith`). The wait is
+   * recorded (`run.waiting_conflict`) when it begins and whenever the Run waited for changes, and
+   * forgotten once the Run no longer waits.
+   */
+  private waitsForConflict(run: Run, slot: string): boolean {
+    const block = this.conflictWith(run, slot);
+    if (!block) {
+      this.conflictWaits.delete(run.id);
+      return false;
+    }
+    const before = this.conflictWaits.get(run.id);
+    this.conflictWaits.set(run.id, block);
+    if (before?.runId !== block.runId) {
+      const stageId = run.currentStageRunId
+        ? this.store.getStageRun(run.currentStageRunId).stageId
+        : null;
+      this.store.event(run.id, 'run.waiting_conflict', {
+        stageId,
+        blockedBy: block.runId,
+        paths: block.paths,
+      });
+    }
+    return true;
+  }
+
+  /**
+   * The Run's assessment passed and it is about to go on to its next stage. When a Run of its
+   * slot not yet past its merge overlaps it (`conflictWith`), it gives up its place and goes back
+   * to the head of the queue instead (`run.waiting_conflict`), as when its agent is out of quota:
+   * the assessment stays passed and current, so that once `kick` finds it overlapping none it
+   * goes on from here (`advance`) without assessing again. Returns whether it went back.
+   */
+  private yieldToConflict(run: Run, sr: StageRun): boolean {
+    const block = this.conflictWith(run, this.activeOf(run.id)?.slot ?? this.slotOf(run));
+    if (!block) return false;
+    this.store.tx(() => {
+      // Before the status changes: a listener of its event may kick, which must not record the
+      // wait a second time.
+      this.conflictWaits.set(run.id, block);
+      this.store.event(run.id, 'run.waiting_conflict', {
+        stageId: sr.stageId,
+        blockedBy: block.runId,
+        paths: block.paths,
+      });
+      this.setStatus(run.id, 'queued', { queuePos: this.store.queueHead() });
+    });
+    return true;
   }
 
   /** Stop an executing Run's drive loop and wait until it has left it. */
@@ -1431,6 +1563,9 @@ export class Engine {
       this.setStatus(runId, 'cancelled', { queuePos: null, finishedAt: nowIso() });
     });
     this.limitWaits.delete(runId);
+    // Runs that overlap it wait for it no longer (`conflictWith`), also when it was not executing
+    // but waiting for its pull request.
+    if (run.blocked?.kind === 'pr_open') this.kick();
     return this.store.getRun(runId);
   }
 
@@ -1727,6 +1862,11 @@ export class Engine {
       case 'waiting_approval':
         return this.afterApproval(run, sr, eff);
       case 'passed':
+        if (eff.def.kind === 'assess' && this.yieldToConflict(run, sr)) return;
+        if (eff.def.kind === 'merge' && this.cfg.master.concurrency.per_repo > 1) {
+          // Past its merge, the Run holds back no Run that overlaps it any more (`conflictWith`).
+          setImmediate(() => this.kick());
+        }
         return this.advance(run, sr, signal);
       case 'failed':
         return this.rollback(run, sr);
@@ -3824,7 +3964,7 @@ export class Engine {
    * longer waits there.
    */
   pullRequestClosed(run: Pick<Run, 'id' | 'blocked'>, pr: RunPullRequest): boolean {
-    return this.store.tx(() => {
+    const closed = this.store.tx(() => {
       const found = this.pullRequestStage(run);
       if (!found) return false;
       const { run: current, sr } = found;
@@ -3857,6 +3997,9 @@ export class Engine {
       );
       return true;
     });
+    // Runs that overlap it wait for it no longer (`conflictWith`).
+    if (closed) this.kick();
+    return closed;
   }
 
   /**
