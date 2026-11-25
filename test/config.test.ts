@@ -4,12 +4,15 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   budgetPauses,
   chooseStageAgent,
+  conflictBlocker,
   discussionReplyWait,
   issueRunOverrides,
   leftoverWorkspaces,
   levelRank,
   limitedScout,
   loopsExhausted,
+  MAX_TOUCHES,
+  normalizeTouches,
   plansStage,
   RATE_LIMIT_WAIT,
   REDO_BACKOFF_MAX_HOURS,
@@ -25,6 +28,7 @@ import {
   splitUnfinishedRuns,
   stageAgentIds,
   templateSplits,
+  touchesOverlap,
   waitsForMaxRuns,
 } from '../src/config/flow.js';
 import {
@@ -2317,6 +2321,148 @@ describe('concurrency.max_runs', () => {
     for (const status of ['running', 'paused', 'blocked', 'waiting_approval'] as const) {
       expect(waitsForMaxRuns({ status }, false, 2, 2), status).toBe(false);
     }
+  });
+});
+
+describe('normalizeTouches', () => {
+  it('drops items that name nothing inside the repo', () => {
+    expect(
+      normalizeTouches([
+        '',
+        '   ',
+        '.',
+        './',
+        '/',
+        '/etc/passwd',
+        '\\abs\\path',
+        'C:',
+        'C:/Windows',
+        'c:\\Users',
+        'D:relative',
+        '..',
+        '../outside',
+        'src/../../outside',
+        'src/..',
+        'a\\..\\b',
+        'src/a',
+      ]),
+    ).toEqual(['src/a']);
+  });
+
+  it('tidies ./, \\, repeated and trailing slashes and surrounding blanks', () => {
+    expect(normalizeTouches(['./src/a.ts'])).toEqual(['src/a.ts']);
+    expect(normalizeTouches(['././src/'])).toEqual(['src']);
+    expect(normalizeTouches(['.//src'])).toEqual(['src']);
+    expect(normalizeTouches(['src\\engine\\engine.ts'])).toEqual(['src/engine/engine.ts']);
+    expect(normalizeTouches(['.\\web\\src\\'])).toEqual(['web/src']);
+    expect(normalizeTouches(['src//config///flow.ts'])).toEqual(['src/config/flow.ts']);
+    expect(normalizeTouches(['docs/'])).toEqual(['docs']);
+    expect(normalizeTouches(['  src/a  \n'])).toEqual(['src/a']);
+    expect(normalizeTouches(['src/./a'])).toEqual(['src/a']);
+    // Names that only look like the dropped ones stay.
+    expect(normalizeTouches(['.github/workflows', '..foo', 'a..b/c'])).toEqual([
+      '.github/workflows',
+      '..foo',
+      'a..b/c',
+    ]);
+  });
+
+  it('keeps the first place of duplicates', () => {
+    expect(normalizeTouches(['src/b', 'src/a', './src/b/', 'src\\a', 'docs'])).toEqual([
+      'src/b',
+      'src/a',
+      'docs',
+    ]);
+  });
+
+  it(`keeps the first ${MAX_TOUCHES} paths`, () => {
+    expect(MAX_TOUCHES).toBe(20);
+    const many = Array.from({ length: 30 }, (_, i) => `src/f${i}.ts`);
+    expect(normalizeTouches(many)).toEqual(many.slice(0, MAX_TOUCHES));
+    // Dropped items and duplicates do not count toward the limit.
+    const mixed = ['/abs', ...many.slice(0, 5), ...many.slice(0, 5), '../x', ...many.slice(5)];
+    expect(normalizeTouches(mixed)).toEqual(many.slice(0, MAX_TOUCHES));
+  });
+
+  it('gives undefined when nothing is left or there is no list', () => {
+    expect(normalizeTouches(undefined)).toBeUndefined();
+    expect(normalizeTouches([])).toBeUndefined();
+    expect(normalizeTouches(['', '/abs', '../up', 'C:/x', '.'])).toBeUndefined();
+  });
+});
+
+describe('touchesOverlap', () => {
+  it('overlaps on the same path', () => {
+    expect(touchesOverlap(['src/a.ts'], ['src/a.ts'])).toEqual(['src/a.ts']);
+    expect(touchesOverlap(['docs', 'src/a.ts'], ['web', 'src/a.ts'])).toEqual(['src/a.ts']);
+  });
+
+  it('overlaps a directory with what is inside it, giving the more specific path', () => {
+    expect(touchesOverlap(['src'], ['src/a'])).toEqual(['src/a']);
+    expect(touchesOverlap(['src/a'], ['src'])).toEqual(['src/a']);
+    expect(touchesOverlap(['src'], ['src/engine/engine.ts'])).toEqual(['src/engine/engine.ts']);
+    expect(touchesOverlap(['src/engine/engine.ts'], ['src/engine'])).toEqual([
+      'src/engine/engine.ts',
+    ]);
+  });
+
+  it('compares whole segments, not string prefixes', () => {
+    expect(touchesOverlap(['src/a'], ['src/ab'])).toEqual([]);
+    expect(touchesOverlap(['src/ab'], ['src/a'])).toEqual([]);
+    expect(touchesOverlap(['src'], ['srcs/a'])).toEqual([]);
+    expect(touchesOverlap(['docs', 'web/src'], ['src', 'web/srcs'])).toEqual([]);
+  });
+
+  it('overlaps nothing when either side has no touches', () => {
+    expect(touchesOverlap(undefined, ['src'])).toEqual([]);
+    expect(touchesOverlap(['src'], undefined)).toEqual([]);
+    expect(touchesOverlap(undefined, undefined)).toEqual([]);
+    expect(touchesOverlap([], ['src'])).toEqual([]);
+    expect(touchesOverlap(['src'], [])).toEqual([]);
+  });
+
+  it('gives each path once, in the order of the first side', () => {
+    expect(
+      touchesOverlap(['web', 'src', 'docs/running.md'], ['src/b', 'docs', 'src/a', 'web/x']),
+    ).toEqual(['web/x', 'src/b', 'src/a', 'docs/running.md']);
+    expect(touchesOverlap(['src/a', 'src'], ['src/a', 'src'])).toEqual(['src/a', 'src']);
+    expect(touchesOverlap(['src', 'src/a'], ['src/a'])).toEqual(['src/a']);
+  });
+});
+
+describe('conflictBlocker', () => {
+  const others = [
+    { runId: 'run-docs', touches: ['docs'] },
+    { runId: 'run-none', touches: undefined },
+    { runId: 'run-engine', touches: ['src/engine/engine.ts', 'test'] },
+    { runId: 'run-src', touches: ['src'] },
+  ];
+
+  it('gives the first Run that overlaps, with the overlapping paths', () => {
+    expect(conflictBlocker(['src/engine', 'web'], others, new Set())).toEqual({
+      runId: 'run-engine',
+      paths: ['src/engine/engine.ts'],
+    });
+    expect(conflictBlocker(['docs/running.md', 'src/a'], others, new Set())).toEqual({
+      runId: 'run-docs',
+      paths: ['docs/running.md'],
+    });
+  });
+
+  it('passes over the Runs it has outlasted', () => {
+    expect(conflictBlocker(['src/engine'], others, new Set(['run-engine']))).toEqual({
+      runId: 'run-src',
+      paths: ['src/engine'],
+    });
+    expect(conflictBlocker(['src/engine'], others, new Set(['run-engine', 'run-src']))).toBeNull();
+  });
+
+  it('gives null when nothing overlaps or the Run has no touches', () => {
+    expect(conflictBlocker(['web', 'README.md'], others, new Set())).toBeNull();
+    expect(conflictBlocker(['src/ab'], [{ runId: 'r', touches: ['src/a'] }], new Set())).toBeNull();
+    expect(conflictBlocker(undefined, others, new Set())).toBeNull();
+    expect(conflictBlocker([], others, new Set())).toBeNull();
+    expect(conflictBlocker(['src'], [], new Set())).toBeNull();
   });
 });
 

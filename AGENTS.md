@@ -138,8 +138,9 @@ test/
     `scoutRawLogExpired`), leftover worktrees (`leftoverWorkspaces`), which template a repo's
     Runs get by id, the home directory's or the repo's own (`resolveTemplate`), whether a repo
     delivers through pull requests (`deliversByPr`), the limit on Runs executing across repos
-    and which queued Runs wait for it (`roomUnderMaxRuns` / `waitsForMaxRuns`), and the like:
-    `src/config/flow.ts`
+    and which queued Runs wait for it (`roomUnderMaxRuns` / `waitsForMaxRuns`), the paths a Run
+    expects to change and whether two Runs' paths overlap (`normalizeTouches` /
+    `touchesOverlap` / `conflictBlocker`), and the like: `src/config/flow.ts`
   - notification rules: `src/notify/notice.ts`
   - assessment conclusion rules: `src/engine/discussion.ts`
   - how a Run's time is split, and the names and groups of the parts: `src/engine/times.ts`

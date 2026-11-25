@@ -485,6 +485,117 @@ export function waitsForMaxRuns(
 }
 
 /**
+ * The most paths an assessment may name as the ones a Run expects to change (its `touches`).
+ * More are cut off rather than rejected: a long list is still useful, and an assessment should
+ * not fail over it. Twenty is enough to name the directories of a change that spans the repo.
+ */
+export const MAX_TOUCHES = 20;
+
+/**
+ * Normalizes the paths an assessment says a Run expects to change into repo-relative paths that
+ * `touchesOverlap` can compare segment by segment. Each item is trimmed, `\` becomes `/`, empty
+ * and `.` segments go (so leading `./`, repeated `/` and a trailing `/` do too); an item that is
+ * then empty, absolute (`/…`, or a drive such as `C:` / `C:/`) or has a `..` segment is dropped,
+ * since it names nothing inside the repo, or something outside it. Duplicates keep their first
+ * place, and the first `MAX_TOUCHES` stay. Agents write these by hand, so the list is cleaned
+ * rather than failing the assessment. Nothing left (or no list) gives undefined: the Run then has
+ * no touches and never counts as conflicting with another, as before touches existed.
+ */
+export function normalizeTouches(raw: readonly string[] | undefined): string[] | undefined {
+  if (!raw) return undefined;
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    const path = normalizeTouch(item);
+    if (path === null || seen.has(path)) continue;
+    seen.add(path);
+    out.push(path);
+    if (out.length === MAX_TOUCHES) break;
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+/** One item of `normalizeTouches`, or null when it is dropped. */
+function normalizeTouch(item: string): string | null {
+  const path = item.trim().replace(/\\/g, '/');
+  if (path.startsWith('/') || /^[A-Za-z]:/.test(path)) return null;
+  const segments = path.split('/').filter((s) => s !== '' && s !== '.');
+  if (segments.length === 0 || segments.includes('..')) return null;
+  return segments.join('/');
+}
+
+/** Whether every segment of `dir` begins `path`: the same path, or one of its directories. */
+function containsPath(dir: readonly string[], path: readonly string[]): boolean {
+  return dir.length <= path.length && dir.every((segment, i) => segment === path[i]);
+}
+
+/**
+ * The paths where two Runs' touches (as `normalizeTouches` leaves them) overlap; empty when they
+ * do not. Two paths overlap when they are the same or one is a directory of the other, compared
+ * by `/` segments, so `src/a` and `src/ab` do not overlap while `src` and `src/a` do. Of an
+ * overlapping pair the more specific path is given (`src/a` there), as it says best where the two
+ * Runs meet. The result has no duplicates and follows the order of `a`. A side without touches
+ * (no assessment stage, or the assessment named none) overlaps nothing: such a Run is scheduled
+ * as before touches existed.
+ */
+export function touchesOverlap(
+  a: readonly string[] | undefined,
+  b: readonly string[] | undefined,
+): string[] {
+  if (!a?.length || !b?.length) return [];
+  const others = b.map((path) => ({ path, segments: path.split('/') }));
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const path of a) {
+    const segments = path.split('/');
+    for (const other of others) {
+      let deeper: string | null = null;
+      if (containsPath(segments, other.segments)) deeper = other.path;
+      else if (containsPath(other.segments, segments)) deeper = path;
+      if (deeper === null || seen.has(deeper)) continue;
+      seen.add(deeper);
+      out.push(deeper);
+    }
+  }
+  return out;
+}
+
+/** A Run's id and the paths it expects to change (`normalizeTouches`), if its assessment said. */
+export interface RunTouches {
+  runId: string;
+  touches: readonly string[] | undefined;
+}
+
+/** The Run another one waits for, and the paths both expect to change (`touchesOverlap`). */
+export interface ConflictBlock {
+  runId: string;
+  paths: string[];
+}
+
+/**
+ * Which of `others` (Runs executing in the same slot that are past their assessment and not yet
+ * past their merge) keeps a Run with these `touches` from going on, so that two Runs expected to
+ * change the same place do not work at once and then conflict at the merge: the first in order
+ * that overlaps it (`touchesOverlap`), with the overlapping paths. Runs in `outlasted` are passed
+ * over: the Run has already waited for one of their merges, and waiting on the same Run again
+ * could starve it. A Run without touches is held back by none (null), and so is one that overlaps
+ * nothing.
+ */
+export function conflictBlocker(
+  touches: readonly string[] | undefined,
+  others: readonly RunTouches[],
+  outlasted: ReadonlySet<string>,
+): ConflictBlock | null {
+  if (!touches?.length) return null;
+  for (const other of others) {
+    if (outlasted.has(other.runId)) continue;
+    const paths = touchesOverlap(touches, other.touches);
+    if (paths.length > 0) return { runId: other.runId, paths };
+  }
+  return null;
+}
+
+/**
  * Overrides of a Run created from a GitHub issue: with `auto_merge` the approvals
  * of the merge stages are off; other approval points of the template stay. The dashboard's guide
  * shows the same rule.
