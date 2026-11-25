@@ -396,6 +396,11 @@ export function noticeFor(event: EventRow, goal: string | undefined): Notice | n
         }),
       );
     }
+    case 'github.pr_closed_by_master':
+    case 'github.pr_found_closed':
+      // The pull request of a Run that ended unfinished, closed or left as GitHub had it: the
+      // Run's end was told already (a failed Run notifies), and nobody has to act on this.
+      return null;
     case 'github.pulled':
     case 'github.merged_remote':
       // GitHub's new commits were taken in by themselves (the merge passed the repo's checks):

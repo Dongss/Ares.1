@@ -324,10 +324,15 @@ export interface FakeIssue extends Omit<GhIssue, 'comments'> {
   commentAuthors: (FakeAuthor | undefined)[];
 }
 
-/** A pull request as FakeGitHub keeps it: what the client returns, with what it was opened with. */
+/**
+ * A pull request as FakeGitHub keeps it: what the client returns, with what it was opened with
+ * and the comments posted on it.
+ */
 export interface FakePull extends GhPullRequestStatus {
   title: string;
   body: string;
+  /** Comment bodies, oldest first: those `closePullRequest` posted. */
+  comments: string[];
 }
 
 /** A review a human submits on FakeGitHub (`reviewPull`). */
@@ -624,6 +629,7 @@ export class FakeGitHub implements GitHub {
       checks: [],
       title: pr.title,
       body: pr.body,
+      comments: [],
     });
     return { number, url };
   }
@@ -631,6 +637,16 @@ export class FakeGitHub implements GitHub {
   async getPullRequest(_repo: string, number: number): Promise<GhPullRequestStatus> {
     this.call(`getPull #${number}`);
     return pullStatusView(this.pull(number));
+  }
+
+  /** As gh does: refused once merged, nothing done once closed, else commented on and closed. */
+  async closePullRequest(_repo: string, number: number, comment: string): Promise<void> {
+    this.call(`closePull #${number}`);
+    const pull = this.pull(number);
+    if (pull.state === 'merged') throw new Error(`pull request #${number} was already merged`);
+    if (pull.state === 'closed') return;
+    pull.comments.push(comment);
+    pull.state = 'closed';
   }
 
   /**

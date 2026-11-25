@@ -31,7 +31,9 @@ import {
   type DiscussionEntry,
   type EventRow,
   FINISHED_RUN_STATUSES,
+  PR_CLOSE_REASONS,
   PR_REWORK_KINDS,
+  type PrCloseReason,
   type PrReworkKind,
   type RequirementSize,
   type Run,
@@ -239,8 +241,8 @@ export function prWaitText(run: Pick<Run, 'pr' | 'issue'>, target: string): stri
         en: 'If the pull request is closed unmerged, the Run ends as failed.',
       });
   const meanwhile = t({
-    zh: '等待期间不占执行名额，排队的 Run 照常执行；Master 重启后也接着等。这里没有可以重试的；终止 Run 不会关闭 GitHub 上的 PR。',
-    en: 'Meanwhile it takes no execution slot, so queued Runs go ahead, and it keeps waiting across Master restarts. There is nothing to retry here; cancelling the Run does not close the pull request on GitHub.',
+    zh: '等待期间不占执行名额，排队的 Run 照常执行；Master 重启后也接着等。这里没有可以重试的；终止 Run 后，Master 下次检查 GitHub 时会关掉这个 PR（已经合并的不动）。',
+    en: 'Meanwhile it takes no execution slot, so queued Runs go ahead, and it keeps waiting across Master restarts. There is nothing to retry here; once the Run is cancelled, the Master closes the pull request at its next GitHub check (unless it was merged).',
   });
   return [opened, merged, rework, closed, meanwhile];
 }
@@ -732,11 +734,31 @@ function agentSelectedText(data: EventRow['data']): string | null {
   }
 }
 
+/** 「失败」: how a Run ended, as the reason the Master closed its pull request gives it. */
+function prCloseReasonText(reason: PrCloseReason): string {
+  switch (reason) {
+    case 'failed':
+      return t({ zh: '失败', en: 'it failed' });
+    case 'cancelled':
+      return t({ zh: '被终止', en: 'it was cancelled' });
+    case 'issue_closed':
+      return t({ zh: 'issue 被关掉，Run 随之终止', en: 'its issue was closed' });
+    case 'restarted':
+      return t({
+        zh: 'issue 的内容改了，按新内容重新开始',
+        en: "its issue's text changed, so it was started over",
+      });
+    case 'dropped':
+      return t({ zh: '需求评估决定不做', en: 'the requirement assessment dropped it' });
+  }
+}
+
 /**
  * The events of delivering through a pull request (deliver: pr) in words: the merge stage waits
  * for it (`merge.pr_pending`), it was opened, merged or closed on GitHub, sent back for more work,
- * updated with the reworked commits, or a review on it ignored (`github.pr_*`); null for other
- * events and data not of that shape.
+ * updated with the reworked commits, a review on it ignored, or, once the Run ended without
+ * completing, closed by the Master or found merged or closed already (`github.pr_*`); null for
+ * other events and data not of that shape.
  */
 function pullRequestEventText(event: Pick<EventRow, 'type' | 'data'>): string | null {
   const { target, number, base, mergeCommit, head } = event.data;
@@ -771,6 +793,28 @@ function pullRequestEventText(event: Pick<EventRow, 'type' | 'data'>): string | 
         zh: `PR #${number} 没合并就被关掉了，Run 结束为失败`,
         en: `PR #${number} was closed without being merged, so the Run ended as failed`,
       });
+    case 'github.pr_closed_by_master': {
+      const reason = PR_CLOSE_REASONS.find((r) => r === event.data.reason);
+      if (!reason) return null;
+      return t({
+        zh: `Run 没做完就结束了（${prCloseReasonText(reason)}），PR #${number} 不会再更新：Master 关掉了它，并在 PR 上说明了原因`,
+        en: `The Run ended unfinished (${prCloseReasonText(reason)}), so PR #${number} gets no more updates: the Master closed it and said why on it`,
+      });
+    }
+    case 'github.pr_found_closed':
+      if (event.data.state === 'merged') {
+        return t({
+          zh: `Run 没做完就结束了，它的 PR #${number} 在 GitHub 上已经合并，Master 没有动它`,
+          en: `The Run ended unfinished, and its PR #${number} was already merged on GitHub; the Master left it as it is`,
+        });
+      }
+      if (event.data.state === 'closed') {
+        return t({
+          zh: `Run 没做完就结束了，它的 PR #${number} 在 GitHub 上已经关掉，不用 Master 再关`,
+          en: `The Run ended unfinished, and its PR #${number} was already closed on GitHub; nothing for the Master to close`,
+        });
+      }
+      return null;
     case 'github.pr_rework': {
       const rework = pullRequestRework(event.data);
       if (!rework) return null;

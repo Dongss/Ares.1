@@ -819,8 +819,8 @@ function PullRequestFaq({ github }: { github: GitHubRepoStatus | null }) {
         </li>
         <li>
           {t({
-            zh: 'PR 没合并就被关掉时，Run 结束为失败并通知你；还有重做次数（max_run_attempts）时 issue 自动重做，重做的 Run 开新的 PR。终止 Run 不会关闭 GitHub 上的 PR。',
-            en: 'If the pull request is closed unmerged, the Run ends as failed and you are notified; while attempts remain (max_run_attempts) the issue is redone, and the new Run opens a new pull request. Cancelling a Run does not close its pull request on GitHub.',
+            zh: 'PR 没合并就被关掉时，Run 结束为失败并通知你；还有重做次数（max_run_attempts）时 issue 自动重做，重做的 Run 开新的 PR。Run 没做完就结束（失败、被终止，或因 issue 被关掉、内容改了而终止）时，Master 下次检查 GitHub 时关掉它还开着的 PR，并在 PR 上说明原因，所以一个 issue 同时只有一个开着的 PR；已经合并的 PR 不动。',
+            en: 'If the pull request is closed unmerged, the Run ends as failed and you are notified; while attempts remain (max_run_attempts) the issue is redone, and the new Run opens a new pull request. When a Run ends unfinished (it failed, was cancelled, or was terminated because its issue was closed or changed), the Master closes the pull request it left open at its next GitHub check and says why on it, so an issue has one open pull request at a time; one already merged is left alone.',
           })}
         </li>
         <li>

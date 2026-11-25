@@ -748,6 +748,25 @@ export class Store {
     );
   }
 
+  /**
+   * Runs of the repo that ended without completing (failed, cancelled or dropped) with a pull
+   * request recorded, and that have no event of the types `settled`; oldest first.
+   */
+  endedRunsWithPullRequest(repoId: string, settled: readonly string[]): Run[] {
+    const ended: RunStatus[] = FINISHED_RUN_STATUSES.filter((s) => s !== 'completed');
+    return this.many<Run>(
+      'runs',
+      `SELECT * FROM runs WHERE repo_id = ? AND pr_number IS NOT NULL
+         AND status IN (${ended.map(() => '?').join(', ')})
+         AND NOT EXISTS (SELECT 1 FROM events WHERE events.run_id = runs.id
+           AND events.type IN (${settled.map(() => '?').join(', ')}))
+         ORDER BY created_at, rowid`,
+      repoId,
+      ...ended,
+      ...settled,
+    );
+  }
+
   /** Record what became of the issue after the Run failed (leaves updated_at alone). */
   setIssueRedo(id: string, redo: RedoState): void {
     this.db

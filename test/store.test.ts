@@ -180,6 +180,37 @@ describe('store', () => {
     store.close();
   });
 
+  it('finds the Runs that ended unfinished with a pull request not settled yet', () => {
+    const store = new Store(':memory:');
+    const { repo, mk } = seed(store);
+    const ended = (goal: string, status: 'failed' | 'cancelled' | 'dropped' | 'completed') => {
+      const run = mk(goal);
+      const pr = { number: goal.length, url: `https://github.com/me/r/pull/${goal.length}` };
+      store.updateRun(run.id, { status, pr });
+      return run;
+    };
+    const failed = ended('f', 'failed');
+    const cancelled = ended('cc', 'cancelled');
+    const dropped = ended('ddd', 'dropped');
+    ended('done', 'completed');
+    // Unfinished, or without a pull request: none of its business.
+    store.updateRun(mk('waiting').id, {
+      status: 'blocked',
+      pr: { number: 9, url: 'https://github.com/me/r/pull/9' },
+    });
+    store.updateRun(mk('nopr').id, { status: 'failed' });
+    const settled = ['github.pr_closed_by_master', 'github.pr_found_closed'];
+    const ids = () => store.endedRunsWithPullRequest(repo.id, settled).map((r) => r.id);
+    expect(ids()).toEqual([failed.id, cancelled.id, dropped.id]);
+
+    store.event(cancelled.id, 'github.pr_found_closed', { state: 'merged' });
+    store.event(failed.id, 'github.pr_rework', {});
+    expect(ids()).toEqual([failed.id, dropped.id]);
+    store.event(failed.id, 'github.pr_closed_by_master', { reason: 'failed' });
+    expect(ids()).toEqual([dropped.id]);
+    expect(store.endedRunsWithPullRequest('other', settled)).toEqual([]);
+  });
+
   it('orders the queue; queueHead puts a run in front', () => {
     const store = new Store(':memory:');
     const { mk } = seed(store);

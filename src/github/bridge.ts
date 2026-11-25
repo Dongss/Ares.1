@@ -35,6 +35,7 @@ import {
   type EventRow,
   type FailedAttempt,
   FINISHED_RUN_STATUSES,
+  type PrCloseReason,
   type Repo,
   type Run,
   type RunIssue,
@@ -78,6 +79,7 @@ import {
   labelDefs,
   markComment,
   proposalBody,
+  pullRequestClosedComment,
   pullRequestComment,
   pullRequestReworkComment,
   pullRequestText,
@@ -314,6 +316,31 @@ function mergedPullRequestOf(store: Store, runId: string): MergedPullRequestReco
   return { number: data.number, url: data.url, mergeCommit };
 }
 
+/**
+ * The events after which the pull request of a Run that ended without completing needs nothing
+ * more of the Master: merged or closed on GitHub while the Run waited for it, closed by the
+ * Master (`closeLeftPullRequest`), or found merged or closed by then.
+ */
+const PR_SETTLED_EVENTS: readonly string[] = [
+  'github.pr_merged',
+  'github.pr_closed',
+  'github.pr_closed_by_master',
+  'github.pr_found_closed',
+];
+
+/**
+ * Why the Run ended without completing, for the comment the Master closes its pull request with:
+ * failed, dropped by the requirement assessment, or terminated, as the bridge does it when its
+ * issue was changed (`run.goal_changed`) or closed (`run.issue_closed`), else by a human.
+ */
+function prCloseReason(run: Run, events: readonly EventRow[]): PrCloseReason {
+  if (run.status === 'failed') return 'failed';
+  if (run.status === 'dropped') return 'dropped';
+  if (events.some((e) => e.type === 'run.goal_changed')) return 'restarted';
+  if (events.some((e) => e.type === 'run.issue_closed')) return 'issue_closed';
+  return 'cancelled';
+}
+
 export interface BridgeDeps {
   store: Store;
   engine: Engine;
@@ -349,7 +376,8 @@ export interface BridgeDeps {
  *   and a human's replies there go back to the Run;
  * - pull requests (deliver: pr): a Run whose checks passed pushes its branch and opens a pull
  *   request into the target branch; once it is merged on GitHub the target branch is pulled and
- *   the Run completes, once it is closed unmerged the Run fails;
+ *   the Run completes, once it is closed unmerged the Run fails; a Run that ends without
+ *   completing has the pull request it left open closed, so that its redo's is the only one;
  * - scout: an AI reads the repo and its Run history and proposes issues, on demand or by itself
  *   whenever no Run of the repo goes on by itself (backing off while scouts find nothing or
  *   fail, waiting for the quota when its agent ran out of it, and capping the proposals and
@@ -560,8 +588,9 @@ export class IssueBridge {
   // ---- poll: intake, sync, scheduled scouts ----------------------------------
 
   /**
-   * One round: catch the target branches up with GitHub (`syncTarget`), open the pull requests
-   * of Runs done but for one (deliver: pr) and follow those opened, accept proposals the
+   * One round: catch the target branches up with GitHub (`syncTarget`), close the pull requests
+   * Runs left open when they ended without completing, open the pull requests of Runs done but
+   * for one (deliver: pr) and follow those opened, accept proposals the
    * settings allow, start Runs for ready issues, terminate Runs whose issue a human closed and
    * start over those whose issue a human changed, catch issues up, pass on replies to the
    * assessments' questions, start a scout where the repo is idle. With the work switch off only
@@ -593,6 +622,11 @@ export class IssueBridge {
       });
       // And of GitHub's commits just pulled, for the Runs taken this round.
       await this.deps.refreshTemplates?.();
+      // Before openPullRequests: an issue whose Run ended has that Run's pull request closed
+      // before the Run redoing it opens its own.
+      await each(async (name) => {
+        if (!(await this.closeLeftPullRequests(name))) failed = true;
+      });
       await each(async (name) => {
         if (!(await this.openPullRequests(name))) failed = true;
       });
@@ -632,17 +666,23 @@ export class IssueBridge {
   }
 
   /**
-   * Open the pull requests of Runs that just got to wait for one (deliver: pr) and follow those
-   * opened, catch issues up with their Runs now, and redo the failed Runs whose wait before the
-   * redo is over (see redoDueAt): a Run that just failed is not redone right away.
+   * Close the pull requests of Runs that just ended without completing, open those of Runs that
+   * just got to wait for one (deliver: pr) and follow those opened, catch issues up with their
+   * Runs now, and redo the failed Runs whose wait before the redo is over (see redoDueAt): a Run
+   * that just failed is not redone right away.
    */
   sync(): Promise<void> {
     return this.serial(async () => {
       const github = this.cfg.master.github;
       if (!github || this.stopping) return;
       // Before the issues are caught up, so the pull request's link is posted before the label
-      // says the issue waits for a human.
+      // says the issue waits for a human; the left ones closed first, as in a poll.
       for (const name of Object.keys(github.repos)) {
+        try {
+          await this.closeLeftPullRequests(name);
+        } catch (err) {
+          this.report(err);
+        }
         try {
           await this.openPullRequests(name);
         } catch (err) {
@@ -845,6 +885,72 @@ export class IssueBridge {
     this.deps.store.event(null, 'github.pushed', { repo: name, branch: repo.targetBranch, head });
     await this.trackOrigin(repo, full, head);
     return true;
+  }
+
+  /**
+   * Close the pull requests the repo's Runs left open when they ended without completing:
+   * failed (as when their pull request's reworks ran out), terminated by a human or because their
+   * issue was closed or changed, or dropped. Nobody follows such a pull request any more: a redo
+   * of the issue opens one of its own, so the issue would gather one more each time, and one a
+   * human merged later would bring in work no Run stands behind. Each Run is looked at until its
+   * pull request is settled (`PR_SETTLED_EVENTS`), and its pull request asked about first, so that
+   * one merged or closed on GitHub meanwhile is left as it is (`closeLeftPullRequest`). Pull
+   * requests merged or closed while their Run waited for them were settled then. Called before
+   * `openPullRequests`, so that a redone issue has one pull request open at a time. A GitHub call
+   * that fails is reported and tried again the next round; the other Runs go on. Returns false
+   * when some call failed.
+   */
+  private async closeLeftPullRequests(name: string): Promise<boolean> {
+    const store = this.deps.store;
+    const repo = store.findRepo(name);
+    if (!repo) return true;
+    const left = store.endedRunsWithPullRequest(repo.id, PR_SETTLED_EVENTS);
+    if (left.length === 0) return true;
+    // Throws while the repo is misconfigured: the pull requests wait.
+    const { cfg } = this.repoSetup(name);
+    // Opened where the Run's branch was pushed, as followPullRequests asks about it.
+    const full = await this.issuesRepo(repo, cfg);
+    let ok = true;
+    for (const run of left) {
+      if (this.stopping) break;
+      try {
+        await this.closeLeftPullRequest(full, run);
+      } catch (err) {
+        ok = false;
+        this.report(err);
+      }
+    }
+    return ok;
+  }
+
+  /**
+   * The pull request `run` left open on `full` when it ended without completing, as GitHub has it
+   * now: still open, it is closed with a comment saying why, which carries the Master's marker
+   * and no home directory (`github.pr_closed_by_master`, with a structured reason); merged or
+   * closed on GitHub, it is left as it is, never closed by the Master, and the Run stays as it
+   * ended (`github.pr_found_closed`). Either is recorded once, so that the Run is not asked about
+   * again, also after a restart.
+   */
+  private async closeLeftPullRequest(full: string, run: Run): Promise<void> {
+    const pr = run.pr;
+    if (!pr) return;
+    const gh = this.gh();
+    const store = this.deps.store;
+    const ref = { number: pr.number, url: pr.url };
+    const latest = await gh.getPullRequest(full, pr.number);
+    if (latest.state !== 'open') {
+      store.event(run.id, 'github.pr_found_closed', { ...ref, state: latest.state });
+      return;
+    }
+    const reason = prCloseReason(run, store.listEvents(run.id));
+    const comment = pullRequestClosedComment({
+      reason,
+      runId: run.id,
+      issue: run.issue !== null,
+      dashboardUrl: this.dashboardUrl(),
+    });
+    await gh.closePullRequest(full, pr.number, markComment(redactForGitHub(comment)));
+    store.event(run.id, 'github.pr_closed_by_master', { ...ref, reason });
   }
 
   /**

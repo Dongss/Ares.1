@@ -8,6 +8,7 @@ import { join, t } from '../i18n.js';
 import type {
   DiscussionEntry,
   FailedAttempt,
+  PrCloseReason,
   Run,
   RunStatus,
   ScoutProposal,
@@ -527,6 +528,51 @@ export function pullRequestReworkComment(input: {
     zh: `PR #${input.number} 需要返工：${input.reason}\n\nRun 带着这些反馈回去修改（计入回退上限），改好后推送到同一个 PR：${input.url}\n\n${link}`,
     en: `Pull request #${input.number} needs more work: ${input.reason}\n\nThe Run goes back to work on it with this feedback (counted toward its rollback limit) and pushes the changes to the same pull request: ${input.url}\n\n${link}`,
   });
+}
+
+/**
+ * The comment the Master closes a Run's open pull request with (deliver: pr) once the Run ended
+ * without completing, for `reason`: nobody follows the pull request any more. `issue`: the Run
+ * came from an issue, which a new Run may take up with a pull request of its own.
+ */
+export function pullRequestClosedComment(input: {
+  reason: PrCloseReason;
+  runId: string;
+  issue: boolean;
+  dashboardUrl: string;
+}): string {
+  const run = `Run \`${input.runId}\``;
+  const brand = brandName();
+  const why = (() => {
+    switch (input.reason) {
+      case 'failed':
+        return t({
+          zh: `${run} 失败了，这个 PR 不会再更新，${brand}把它关掉了。${input.issue ? 'issue 重做时，新的 Run 会开新的 PR。' : ''}`,
+          en: `${run} failed, so this pull request gets no more updates and ${brand} closed it.${input.issue ? ' If the issue is redone, the new Run opens a new pull request.' : ''}`,
+        });
+      case 'issue_closed':
+        return t({
+          zh: `issue 被关掉了，${run} 随之终止，这个 PR 不会再更新，${brand}把它关掉了。`,
+          en: `The issue was closed, so ${run} was terminated; this pull request gets no more updates, and ${brand} closed it.`,
+        });
+      case 'restarted':
+        return t({
+          zh: `issue 的标题或正文改了，${brand}终止了按旧内容做的 ${run}，关掉了这个 PR。新的 Run 按新内容做，做完会开新的 PR。`,
+          en: `The issue's title or body changed: ${brand} terminated ${run}, which worked from the old text, and closed this pull request. A new Run works from the new text and opens a new pull request once it is done.`,
+        });
+      case 'dropped':
+        return t({
+          zh: `需求评估决定不做了，${run} 结束，这个 PR 不会再更新，${brand}把它关掉了。`,
+          en: `The requirement assessment decided not to do it, so ${run} ended; this pull request gets no more updates, and ${brand} closed it.`,
+        });
+      case 'cancelled':
+        return t({
+          zh: `${run} 被终止了，这个 PR 不会再更新，${brand}把它关掉了。`,
+          en: `${run} was terminated, so this pull request gets no more updates and ${brand} closed it.`,
+        });
+    }
+  })();
+  return `${why}\n\n${dashboardLink(input.dashboardUrl, input.runId)}`;
 }
 
 const oneLine = (text: string, max: number) => {

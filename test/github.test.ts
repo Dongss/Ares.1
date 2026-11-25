@@ -35,6 +35,7 @@ import {
   labelDefs,
   markComment,
   proposalBody,
+  pullRequestClosedComment,
   pullRequestComment,
   pullRequestReworkComment,
   pullRequestText,
@@ -50,7 +51,15 @@ import { type PrReworkKind, reworkReason } from '../src/github/pr-rework.js';
 import { filedProposal, issueDigest, proposalsHoldingScout } from '../src/github/scout.js';
 import { setLang } from '../src/i18n.js';
 import { noticeFor } from '../src/notify/notice.js';
-import type { AssessmentEntry, BlockKind, Run, Scout, ScoutProposal } from '../src/store/types.js';
+import {
+  type AssessmentEntry,
+  type BlockKind,
+  PR_CLOSE_REASONS,
+  type PrCloseReason,
+  type Run,
+  type Scout,
+  type ScoutProposal,
+} from '../src/store/types.js';
 import {
   ASSESS_AGENTS_YAML,
   ASSESS_WORKFLOW_YAML,
@@ -3528,6 +3537,9 @@ describe('issues: delivering through pull requests (deliver: pr)', () => {
       expect(head(t)).toBe(squash);
       expect(eventData(t, run.id, 'github.pr_merged')).toHaveLength(1);
       expect(eventData(t, run.id, 'run.issue_closed')).toEqual([]);
+      // Merged: never closed, nor found left open.
+      expect(gh.calls.filter((c) => c.startsWith('closePull'))).toEqual([]);
+      expect(eventData(t, run.id, 'github.pr_found_closed')).toEqual([]);
     });
 
     it('terminates the Run as before when a human closes the issue of an open pull request', async () => {
@@ -3621,6 +3633,9 @@ describe('issues: delivering through pull requests (deliver: pr)', () => {
       expect(store.getRun(redo.id).pr).toEqual({ number: next?.number, url: next?.url });
       expect(store.getRun(run.id).pr).toEqual(ref);
       expect(gh.pull(pull.number).state).toBe('closed');
+      // Closed by a human already: the Master neither closes it nor asks about it again.
+      expect(gh.calls.filter((c) => c.startsWith('closePull'))).toEqual([]);
+      expect(gh.pull(pull.number).comments).toEqual([]);
     });
 
     it('follows the pull request after the Master restarts', async () => {
@@ -3637,6 +3652,172 @@ describe('issues: delivering through pull requests (deliver: pr)', () => {
       expect(head(t)).toBe(squash);
       expect(eventData(t, run.id, 'github.pr_merged')).toHaveLength(1);
       expect(eventData(t, run.id, 'merge.done')).toHaveLength(1);
+    });
+
+    describe('once the Run ended without completing', () => {
+      const closes = () => gh.calls.filter((c) => c.startsWith('closePull'));
+
+      it('closes the pull request of a Run terminated while it waited, the next round, saying why', async () => {
+        const t = await start(PR);
+        const store = t.master.store;
+        const { run, pull } = await prOpened(t);
+        const pr = { number: pull.number, url: pull.url };
+        await t.master.engine.cancel(run.id);
+        await t.master.issues.poll();
+
+        expect(gh.pull(pull.number).state).toBe('closed');
+        const said = gh.pull(pull.number).comments;
+        expect(said).toEqual([
+          markComment(
+            `Run \`${run.id}\` 被终止了，这个 PR 不会再更新，战神一号把它关掉了。\n\n看板：http://127.0.0.1:4870/#/runs/${run.id}`,
+          ),
+        ]);
+        expect(isMasterComment(said[0] ?? '')).toBe(true);
+        expect(eventData(t, run.id, 'github.pr_closed_by_master')).toEqual([
+          { ...pr, reason: 'cancelled' },
+        ]);
+        // Nobody is notified: the Run's end was told as it is.
+        const closed = store
+          .listEvents(run.id)
+          .find((e) => e.type === 'github.pr_closed_by_master');
+        expect(closed && noticeFor(closed, run.goal)).toBeNull();
+        expect(store.getRun(run.id)).toMatchObject({ status: 'cancelled', pr });
+        // The issue gets nothing about it: the pull request says it.
+        expect(gh.get(1).comments.join('\n')).not.toContain('战神一号把它关掉了');
+
+        // Later rounds leave it be, and never ask about it again.
+        const calls = gh.calls.length;
+        await t.master.issues.poll();
+        await t.master.issues.sync();
+        expect(gh.calls.slice(calls).filter((c) => c.endsWith(`#${pull.number}`))).toEqual([]);
+        expect(closes()).toEqual([`closePull #${pull.number}`]);
+        expect(t.master.issues.status().lastError).toBeNull();
+      });
+
+      it('closes it after a restart when the Master stopped before it did', async () => {
+        const first = await start(PR);
+        const { run, pull } = await prOpened(first);
+        await first.master.engine.cancel(run.id);
+        await first.close();
+        expect(gh.pull(pull.number).state).toBe('open');
+
+        const t = await restart(first, PR);
+        await t.master.issues.poll();
+        expect(gh.pull(pull.number).state).toBe('closed');
+        expect(eventData(t, run.id, 'github.pr_closed_by_master')).toEqual([
+          { number: pull.number, url: pull.url, reason: 'cancelled' },
+        ]);
+      });
+
+      it('closes it once a human closed the issue, and leaves the issue as they left it', async () => {
+        const t = await start(PR);
+        const { run, pull } = await prOpened(t);
+        await gh.close('me/demo', 1, 'not_planned');
+        gh.commentAs(1, OWNER, '不做了');
+        await t.master.issues.poll();
+        expect(t.master.store.getRun(run.id).status).toBe('cancelled');
+        await t.master.issues.poll();
+
+        expect(gh.pull(pull.number).state).toBe('closed');
+        expect(eventData(t, run.id, 'github.pr_closed_by_master')).toEqual([
+          { number: pull.number, url: pull.url, reason: 'issue_closed' },
+        ]);
+        expect(gh.pull(pull.number).comments[0]).toContain(
+          `issue 被关掉了，Run \`${run.id}\` 随之终止`,
+        );
+        // The human's closing comment is still the last on the issue.
+        expect(gh.get(1)).toMatchObject({ state: 'closed', stateReason: 'not_planned' });
+        expect(gh.get(1).comments.at(-1)).toBe('不做了');
+      });
+
+      it('never closes a pull request that was merged: the Run completes as usual', async () => {
+        const t = await start(PR);
+        const { run, pull } = await prOpened(t);
+        gh.mergePull(pull.number, squashed(t, run));
+        await t.master.issues.poll();
+        await t.waitStatus(run.id, 'completed');
+        await t.master.issues.sync();
+        await t.master.issues.poll();
+        expect(gh.pull(pull.number).state).toBe('merged');
+        expect(closes()).toEqual([]);
+        expect(eventData(t, run.id, 'github.pr_closed_by_master')).toEqual([]);
+        expect(eventData(t, run.id, 'github.pr_found_closed')).toEqual([]);
+      });
+
+      it('leaves alone one merged or closed on GitHub by the time it looks, once', async () => {
+        const t = await start(PR);
+        const store = t.master.store;
+        const { run, pull } = await prOpened(t);
+        await t.master.engine.cancel(run.id);
+        // Merged by a human before the next round: the Run stays terminated.
+        gh.mergePull(pull.number, squashed(t, run));
+        await t.master.issues.poll();
+        expect(gh.pull(pull.number).state).toBe('merged');
+        expect(closes()).toEqual([]);
+        expect(eventData(t, run.id, 'github.pr_found_closed')).toEqual([
+          { number: pull.number, url: pull.url, state: 'merged' },
+        ]);
+        expect(eventData(t, run.id, 'github.pr_closed_by_master')).toEqual([]);
+        expect(store.getRun(run.id).status).toBe('cancelled');
+        const calls = gh.calls.length;
+        await t.master.issues.poll();
+        expect(gh.calls.slice(calls)).not.toContain(`getPull #${pull.number}`);
+        expect(eventData(t, run.id, 'github.pr_found_closed')).toHaveLength(1);
+        expect(t.master.issues.status().lastError).toBeNull();
+      });
+
+      it('leaves alone one a human closed by the time it looks', async () => {
+        const t = await start(PR);
+        const { run, pull } = await prOpened(t);
+        await t.master.engine.cancel(run.id);
+        gh.closePull(pull.number);
+        await t.master.issues.poll();
+        expect(closes()).toEqual([]);
+        expect(eventData(t, run.id, 'github.pr_found_closed')).toEqual([
+          { number: pull.number, url: pull.url, state: 'closed' },
+        ]);
+        expect(eventData(t, run.id, 'github.pr_closed_by_master')).toEqual([]);
+        expect(t.master.issues.status().lastError).toBeNull();
+      });
+
+      it('tries again the next round when closing fails, reporting the error once', async () => {
+        const t = await start(PR);
+        const store = t.master.store;
+        const { run, pull } = await prOpened(t);
+        gh.failing.set(`closePull #${pull.number}`, 'GitHub 502');
+        await t.master.engine.cancel(run.id);
+        await t.master.issues.poll();
+        await t.master.issues.sync();
+        await t.master.issues.poll();
+
+        expect(gh.pull(pull.number).state).toBe('open');
+        expect(closes().length).toBeGreaterThan(2);
+        expect(eventData(t, run.id, 'github.pr_closed_by_master')).toEqual([]);
+        expect(t.master.issues.status().lastError?.message).toBe('GitHub 502');
+        // Told once for the whole streak.
+        const errors = store
+          .listGlobalEventsOfType('github.error')
+          .filter((e) => e.data.message === 'GitHub 502');
+        expect(errors).toHaveLength(1);
+        expect(errors[0] && noticeFor(errors[0], undefined)?.kind).toBe('github');
+
+        gh.failing.delete(`closePull #${pull.number}`);
+        await t.master.issues.poll();
+        expect(gh.pull(pull.number).state).toBe('closed');
+        expect(gh.pull(pull.number).comments).toHaveLength(1);
+        expect(eventData(t, run.id, 'github.pr_closed_by_master')).toHaveLength(1);
+        expect(t.master.issues.status().lastError).toBeNull();
+      });
+
+      it('does not close the pull request of a Run waiting for it', async () => {
+        const t = await start(PR);
+        const { run, pull } = await prOpened(t);
+        await t.master.issues.poll();
+        await t.master.issues.sync();
+        expect(t.master.store.getRun(run.id).status).toBe('blocked');
+        expect(gh.pull(pull.number).state).toBe('open');
+        expect(closes()).toEqual([]);
+      });
     });
 
     describe('after a rework sent the Run back', () => {
@@ -4098,7 +4279,7 @@ describe('issues: delivering through pull requests (deliver: pr)', () => {
         await t.waitStatus(run.id, 'completed');
       });
 
-      it('counts reworks toward max_loops, then ends the Run by on_exhausted', async () => {
+      it('counts reworks toward max_loops, then ends the Run by on_exhausted; its redo has the only open pull request', async () => {
         const oneLoop = TEST_WORKFLOW_YAML.replace(
           '  max_loops: 3\n',
           '    on_exhausted: fail\n  max_loops: 1\n',
@@ -4127,6 +4308,72 @@ describe('issues: delivering through pull requests (deliver: pr)', () => {
         await t.master.issues.sync();
         expect(gh.get(1).comments.some((c) => c.includes('超过回退上限 1'))).toBe(true);
         expect(gh.pulls.size).toBe(1);
+
+        // Nobody follows the failed Run's pull request any more: closed, saying why.
+        const pr = { number: pull.number, url: pull.url };
+        expect(gh.pull(pull.number).state).toBe('closed');
+        expect(eventData(t, run.id, 'github.pr_closed_by_master')).toEqual([
+          { ...pr, reason: 'failed' },
+        ]);
+        expect(gh.pull(pull.number).comments).toEqual([
+          markComment(
+            `Run \`${run.id}\` 失败了，这个 PR 不会再更新，战神一号把它关掉了。issue 重做时，新的 Run 会开新的 PR。\n\n看板：http://127.0.0.1:4870/#/runs/${run.id}`,
+          ),
+        ]);
+        // The Run stays as it ended, as does its record of the pull request.
+        expect(store.getRun(run.id)).toMatchObject({ status: 'failed', pr });
+
+        // The redo opens its own, the only one open for the issue.
+        elapseRedoWait(t);
+        await t.master.issues.sync();
+        const created = store.listRuns().find((r) => r.id !== run.id);
+        if (!created) throw new Error('not redone');
+        const redo = await approveMerge(t, await t.waitStatus(created.id, 'waiting_approval'));
+        await t.master.issues.sync();
+        await t.master.issues.poll();
+        expect(gh.pulls.size).toBe(2);
+        const open = pulls().filter((p) => p.state === 'open');
+        expect(open.map((p) => p.headRefName)).toEqual([redo.branch]);
+        expect(open[0]?.body).toContain('Closes #1');
+        expect(store.getRun(redo.id).pr).toEqual({ number: open[0]?.number, url: open[0]?.url });
+        // Settled for good: the failed Run's pull request is not asked about or closed again.
+        expect(gh.calls.filter((c) => c === `closePull #${pull.number}`)).toHaveLength(1);
+        const calls = gh.calls.length;
+        await t.master.issues.poll();
+        expect(gh.calls.slice(calls)).not.toContain(`getPull #${pull.number}`);
+        expect(eventData(t, run.id, 'github.pr_closed_by_master')).toHaveLength(1);
+        expect(t.master.issues.status().lastError).toBeNull();
+      });
+
+      it('closes the pull request of a Run started over because its issue changed during a rework', async () => {
+        const t = await start(PR);
+        const store = t.master.store;
+        let release = () => {};
+        const hold = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        const prompts = coderPrompts(t, { hold });
+        const { run, pull } = await prOpened(t);
+        gh.reviewPull(pull.number, changesBy('alice', 'COLLABORATOR', '把函数名改成 addFeature'));
+        await t.master.issues.poll();
+        // Back to coding, where a changed issue starts the Run over.
+        await waitFor(() => prompts.length === 2, 'the second round of coding');
+        gh.get(1).body = '写 feature.txt，两行';
+        await t.master.issues.poll();
+        expect(store.getRun(run.id).status).toBe('cancelled');
+        expect(eventData(t, run.id, 'run.goal_changed')).toHaveLength(1);
+        release();
+
+        await t.master.issues.poll();
+        expect(gh.pull(pull.number).state).toBe('closed');
+        expect(eventData(t, run.id, 'github.pr_closed_by_master')).toEqual([
+          { number: pull.number, url: pull.url, reason: 'restarted' },
+        ]);
+        const said = gh.pull(pull.number).comments;
+        expect(said).toHaveLength(1);
+        expect(said[0]).toContain(`终止了按旧内容做的 Run \`${run.id}\``);
+        expect(said[0]).toContain('做完会开新的 PR');
+        expect(isMasterComment(said[0] ?? '')).toBe(true);
       });
     });
   });
@@ -5758,6 +6005,33 @@ describe('issues: texts', () => {
       );
     });
 
+    it('says why the Master closed the pull request of a Run that ended unfinished', () => {
+      const closed = (reason: PrCloseReason, issue = true) =>
+        pullRequestClosedComment({ reason, runId: 'run_1', issue, dashboardUrl: ctx.dashboardUrl });
+      const link = '\n\n看板：http://127.0.0.1:4870/#/runs/run_1';
+      expect(closed('failed')).toBe(
+        `Run \`run_1\` 失败了，这个 PR 不会再更新，战神一号把它关掉了。issue 重做时，新的 Run 会开新的 PR。${link}`,
+      );
+      // A Run of no issue is not redone.
+      expect(closed('failed', false)).toBe(
+        `Run \`run_1\` 失败了，这个 PR 不会再更新，战神一号把它关掉了。${link}`,
+      );
+      expect(closed('cancelled')).toBe(
+        `Run \`run_1\` 被终止了，这个 PR 不会再更新，战神一号把它关掉了。${link}`,
+      );
+      expect(closed('issue_closed')).toBe(
+        `issue 被关掉了，Run \`run_1\` 随之终止，这个 PR 不会再更新，战神一号把它关掉了。${link}`,
+      );
+      expect(closed('restarted')).toBe(
+        `issue 的标题或正文改了，战神一号终止了按旧内容做的 Run \`run_1\`，关掉了这个 PR。新的 Run 按新内容做，做完会开新的 PR。${link}`,
+      );
+      expect(closed('dropped')).toBe(
+        `需求评估决定不做了，Run \`run_1\` 结束，这个 PR 不会再更新，战神一号把它关掉了。${link}`,
+      );
+      // The bridge adds the marker.
+      expect(isMasterComment(closed('failed'))).toBe(false);
+    });
+
     it('says the commits made after a rework were pushed to the same pull request', () => {
       const comment = pullRequestUpdatedComment({
         number: 13,
@@ -6326,6 +6600,21 @@ describe('issues: texts', () => {
         'Pull request #13 was merged into `main` (`1234567`): https://github.com/me/demo/pull/13' +
           '\n\ncost $1.23\n\nDashboard: http://127.0.0.1:4870/#/runs/run_1',
       );
+      const link = '\n\nDashboard: http://127.0.0.1:4870/#/runs/run_1';
+      const closed = (reason: PrCloseReason, issue = true) =>
+        pullRequestClosedComment({ reason, runId: 'run_1', issue, dashboardUrl: ctx.dashboardUrl });
+      expect(closed('failed')).toBe(
+        'Run `run_1` failed, so this pull request gets no more updates and Ares.1 closed it. If the issue is redone, the new Run opens a new pull request.' +
+          link,
+      );
+      expect(closed('failed', false)).toBe(
+        `Run \`run_1\` failed, so this pull request gets no more updates and Ares.1 closed it.${link}`,
+      );
+      for (const reason of PR_CLOSE_REASONS) {
+        expect(closed(reason)).toContain('Run `run_1`');
+        expect(closed(reason).endsWith(link)).toBe(true);
+        expect(markComment(closed(reason))).not.toMatch(cjk);
+      }
     });
   });
 });

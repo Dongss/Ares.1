@@ -170,6 +170,21 @@ export interface RunPullRequest {
 export const PR_REWORK_KINDS = ['conflict', 'ci', 'review'] as const;
 export type PrReworkKind = (typeof PR_REWORK_KINDS)[number];
 
+/**
+ * Why the Master closed the pull request a Run left open when it ended without completing, as
+ * its `github.pr_closed_by_master` event records it: the Run failed, was terminated (by a human,
+ * because its issue was closed, or to start over on its changed issue), or the requirement
+ * assessment dropped it.
+ */
+export const PR_CLOSE_REASONS = [
+  'failed',
+  'cancelled',
+  'issue_closed',
+  'restarted',
+  'dropped',
+] as const;
+export type PrCloseReason = (typeof PR_CLOSE_REASONS)[number];
+
 export interface RunIssue {
   /** "owner/name". */
   repo: string;

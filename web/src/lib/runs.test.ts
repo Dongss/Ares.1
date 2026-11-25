@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import type { RunSummary } from '../../../src/api/types.js';
 import { setLang } from '../../../src/i18n.js';
-import type { AssessmentEntry, DiscussionEntry } from '../../../src/store/types.js';
+import {
+  type AssessmentEntry,
+  type DiscussionEntry,
+  PR_CLOSE_REASONS,
+} from '../../../src/store/types.js';
 import {
   assessmentDifficulty,
   assessmentHeadline,
@@ -961,7 +965,9 @@ describe('waiting for a pull request', () => {
     );
     expect(lines[3]).toContain('Run 结束为失败；还有重做次数（max_run_attempts）时 issue 自动重做');
     expect(lines[4]).toContain('等待期间不占执行名额');
-    expect(lines[4]).toContain('终止 Run 不会关闭 GitHub 上的 PR');
+    expect(lines[4]).toContain(
+      '终止 Run 后，Master 下次检查 GitHub 时会关掉这个 PR（已经合并的不动）',
+    );
     // Before the PR is opened, and for a Run without an issue.
     const early = prWaitText(waiting(), 'main');
     expect(early[0]).toContain('Master 下次检查 GitHub 时推送 Run 的分支，开一个合并到 main 的 PR');
@@ -1028,6 +1034,33 @@ describe('waiting for a pull request', () => {
     expect(eventText({ type: 'github.pr_closed', data: {} })).toBeNull();
     expect(eventText({ type: 'github.pr_opened', data: pr })).toBeNull();
     expect(eventText({ type: 'merge.pr_pending', data: {} })).toBeNull();
+  });
+
+  it('words what became of the pull request of a Run that ended unfinished', () => {
+    const closed = (reason: unknown) =>
+      eventText({ type: 'github.pr_closed_by_master', data: { ...pr, reason } });
+    expect(closed('failed')).toBe(
+      'Run 没做完就结束了（失败），PR #12 不会再更新：Master 关掉了它，并在 PR 上说明了原因',
+    );
+    expect(closed('cancelled')).toContain('（被终止）');
+    expect(closed('issue_closed')).toContain('（issue 被关掉，Run 随之终止）');
+    expect(closed('restarted')).toContain('（issue 的内容改了，按新内容重新开始）');
+    expect(closed('dropped')).toContain('（需求评估决定不做）');
+    expect(eventText({ type: 'github.pr_found_closed', data: { ...pr, state: 'merged' } })).toBe(
+      'Run 没做完就结束了，它的 PR #12 在 GitHub 上已经合并，Master 没有动它',
+    );
+    expect(eventText({ type: 'github.pr_found_closed', data: { ...pr, state: 'closed' } })).toBe(
+      'Run 没做完就结束了，它的 PR #12 在 GitHub 上已经关掉，不用 Master 再关',
+    );
+    // Data not of that shape only shows itself.
+    expect(closed('lost')).toBeNull();
+    expect(
+      eventText({ type: 'github.pr_closed_by_master', data: { reason: 'failed' } }),
+    ).toBeNull();
+    expect(
+      eventText({ type: 'github.pr_found_closed', data: { ...pr, state: 'open' } }),
+    ).toBeNull();
+    expect(eventText({ type: 'github.pr_found_closed', data: pr })).toBeNull();
   });
 
   const HEAD = '0123456789abcdef0123456789abcdef01234567';
@@ -1198,6 +1231,11 @@ describe('waiting for a pull request', () => {
       eventText({ type: 'github.pr_merged', data: { ...pr, mergeCommit: 'abcdef1234' } }),
       eventText({ type: 'github.pr_merged', data: pr }),
       eventText({ type: 'github.pr_closed', data: pr }),
+      ...PR_CLOSE_REASONS.map((reason) =>
+        eventText({ type: 'github.pr_closed_by_master', data: { ...pr, reason } }),
+      ),
+      eventText({ type: 'github.pr_found_closed', data: { ...pr, state: 'merged' } }),
+      eventText({ type: 'github.pr_found_closed', data: { ...pr, state: 'closed' } }),
     ];
     expect(texts[1]).toBe(
       'Merging it on GitHub completes the Run; closing it unmerged fails the Run',

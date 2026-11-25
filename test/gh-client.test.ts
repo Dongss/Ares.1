@@ -4,6 +4,7 @@ import { delimiter, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { GhCli, GhError } from '../src/github/client.js';
 import { isTrusted } from '../src/github/issues.js';
+import { judgePullRequest } from '../src/github/pr-rework.js';
 import { setLang } from '../src/i18n.js';
 import { FakeGitHub, git, initRepo, tmpDir, writeFile } from './helpers.js';
 
@@ -885,6 +886,74 @@ describe('GhCli pull requests', () => {
     ]);
   });
 
+  it('getPullRequest skips checks of kinds it does not know, and reads the rest', async () => {
+    const merge = 'a'.repeat(40);
+    const failed = {
+      __typename: 'CheckRun',
+      name: 'build',
+      status: 'COMPLETED',
+      conclusion: 'FAILURE',
+      detailsUrl: 'https://ci/build',
+    };
+    // Kinds GitHub may add, and what is no check at all: neither done nor not done.
+    const unknown = [
+      { __typename: 'CheckSuite', name: 'suite', status: 'IN_PROGRESS' },
+      { __typename: 'Deployment', state: 'PENDING' },
+      { name: 'untyped', status: 'QUEUED' },
+      null,
+      'text',
+    ];
+    const gh = fakeGh([
+      {
+        when: ['pr', 'view', '9'],
+        stdout: JSON.stringify(
+          rawPullStatus({
+            state: 'MERGED',
+            mergeCommit: { oid: merge },
+            statusCheckRollup: [unknown[0], failed, ...unknown.slice(1)],
+          }),
+        ),
+      },
+      {
+        when: ['pr', 'view', '9'],
+        stdout: JSON.stringify(rawPullStatus({ statusCheckRollup: [failed, ...unknown] })),
+      },
+      comments9([]),
+    ]);
+    const cli = new GhCli(gh.bin);
+    const build = { name: 'build', done: true, conclusion: 'FAILURE', url: 'https://ci/build' };
+
+    // Merged is told as merged, whatever else came with the checks.
+    const merged = await cli.getPullRequest('acme/widgets', 9);
+    expect(merged).toMatchObject({ state: 'merged', mergeCommit: merge, checks: [build] });
+
+    // Open, the failed check sends the Run back: the unknown ones keep nothing waiting.
+    const open = await cli.getPullRequest('acme/widgets', 9);
+    expect(open).toMatchObject({ state: 'open', checks: [build] });
+    const { rework } = judgePullRequest(open, { head: HEAD, master: 'me', done: [] });
+    expect(rework).toMatchObject({ kinds: ['ci'], checks: [{ name: 'build' }] });
+  });
+
+  it('closePullRequest closes it with the comment as gh takes it', async () => {
+    const gh = fakeGh([
+      { when: ['pr', 'close'] },
+      {
+        when: ['pr', 'close'],
+        stderr: "X Pull request acme/widgets#9 (t) can't be closed because it was already merged\n",
+        code: 1,
+      },
+    ]);
+    const cli = new GhCli(gh.bin);
+    const comment = 'Run `run-1` 失败了。\n\n看板：http://127.0.0.1:4870/#/runs/run-1';
+    await cli.closePullRequest('acme/widgets', 9, comment);
+    expect(gh.calls().map((c) => c.args)).toEqual([
+      ['pr', 'close', '9', '-R', 'acme/widgets', '--comment', comment],
+    ]);
+    expect((await ghError(cli.closePullRequest('acme/widgets', 9, comment))).message).toBe(
+      "gh pr close 失败：X Pull request acme/widgets#9 (t) can't be closed because it was already merged",
+    );
+  });
+
   it('getPullRequest reads the reviews and, oldest first, the review comments', async () => {
     const gh = fakeGh([
       {
@@ -1049,7 +1118,11 @@ describe('GhCli pull requests', () => {
         stdout: JSON.stringify(
           rawPullStatus({
             reviews: [{ author: { login: 'bob' }, body: 'x' }],
-            statusCheckRollup: [{ __typename: 'Commit', name: 'x' }],
+            // A kind it does not know is skipped; one it knows has to fit.
+            statusCheckRollup: [
+              { __typename: 'Commit', name: 'x' },
+              { __typename: 'CheckRun', status: 'COMPLETED' },
+            ],
           }),
         ),
       },
@@ -1070,7 +1143,7 @@ describe('GhCli pull requests', () => {
       /^gh pr view 返回的数据无法识别（headRefOid）：/,
     );
     expect((await ghError(cli.getPullRequest('acme/widgets', 9))).message).toMatch(
-      /^gh pr view 返回的数据无法识别（reviews\.0\.state, statusCheckRollup\.0\.__typename）：/,
+      /^gh pr view 返回的数据无法识别（reviews\.0\.state, statusCheckRollup\.1\.name）：/,
     );
     expect((await ghError(cli.getPullRequest('acme/widgets', 9))).message).toMatch(
       /^gh api repos\/acme\/widgets\/pulls\/9\/comments 返回的数据无法识别（\$）：/,
@@ -1564,6 +1637,45 @@ describe('FakeGitHub pull requests', () => {
       'createPull ares1/run-2',
       `getPull #${closed.number}`,
       'createPull ares1/run-2',
+    ]);
+  });
+
+  it('closes a pull request for the Master as gh does, with its comment', async () => {
+    const clone = initRepo();
+    const gh = new FakeGitHub();
+    commit(clone, 'ares1/run-1', 'a.txt');
+    await gh.push(clone, 'me/demo', 'ares1/run-1');
+    const open = await gh.createPullRequest('me/demo', {
+      head: 'ares1/run-1',
+      base: 'main',
+      title: 't',
+      body: '',
+    });
+    await gh.closePullRequest('me/demo', open.number, 'why');
+    expect(gh.pull(open.number)).toMatchObject({ state: 'closed', comments: ['why'] });
+    expect(await gh.findOpenPullRequest('me/demo', 'ares1/run-1')).toBeNull();
+    // Closed already: nothing more, no comment.
+    await gh.closePullRequest('me/demo', open.number, 'again');
+    expect(gh.pull(open.number).comments).toEqual(['why']);
+
+    // Merged: refused.
+    const head = commit(clone, 'ares1/run-2', 'b.txt');
+    await gh.push(clone, 'me/demo', 'ares1/run-2');
+    const merged = await gh.createPullRequest('me/demo', {
+      head: 'ares1/run-2',
+      base: 'main',
+      title: 't',
+      body: '',
+    });
+    gh.mergePull(merged.number, head);
+    await expect(gh.closePullRequest('me/demo', merged.number, 'why')).rejects.toThrow(
+      /already merged/,
+    );
+    expect(gh.pull(merged.number)).toMatchObject({ state: 'merged', comments: [] });
+    expect(gh.calls.filter((c) => c.startsWith('closePull'))).toEqual([
+      `closePull #${open.number}`,
+      `closePull #${open.number}`,
+      `closePull #${merged.number}`,
     ]);
   });
 

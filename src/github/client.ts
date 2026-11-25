@@ -159,6 +159,12 @@ export interface GitHub {
   /** The pull request as it is now, with its reviews and the checks of its head commit. */
   getPullRequest(repo: string, number: number): Promise<GhPullRequestStatus>;
   /**
+   * Close the open pull request without merging it, with `comment` posted on it first, as it is:
+   * the caller marks and redacts it. One already closed stays as it is, with no comment; one
+   * already merged is a GhError.
+   */
+  closePullRequest(repo: string, number: number, comment: string): Promise<void>;
+  /**
    * Fetch `branch` of the GitHub repo into the local clone at `path`, as the same account, and
    * return the commit it points at. No ref of the clone moves; the commit's objects are in it.
    * null: the GitHub repo has no such branch yet (e.g. a new, empty repo).
@@ -315,6 +321,27 @@ const RawCheck = z.discriminatedUnion('__typename', [
 ]);
 type RawCheck = z.infer<typeof RawCheck>;
 
+/** The kinds of entry of `statusCheckRollup` that RawCheck reads. */
+const CHECK_TYPES: readonly unknown[] = ['CheckRun', 'StatusContext'];
+
+/**
+ * An entry of `statusCheckRollup`, or null for one of a kind RawCheck does not know. GitHub may
+ * add kinds at any time, and one it adds must not make the whole pull request unreadable: its Run
+ * would wait for it for good, even once it is merged. Such an entry is skipped rather than taken
+ * for a check not done yet, which would keep a failed check from ever sending the Run back
+ * (`judgePullRequest` waits for every check to finish). An entry of a known kind that does not
+ * fit still fails the read.
+ */
+const RawRollupEntry = z.preprocess(
+  (entry) =>
+    typeof entry === 'object' &&
+    entry !== null &&
+    CHECK_TYPES.includes((entry as { __typename?: unknown }).__typename)
+      ? entry
+      : null,
+  RawCheck.nullable(),
+);
+
 /** The fields `getPullRequest` asks of `gh pr view --json` besides PR_FIELDS. */
 const PR_STATUS_FIELDS = 'headRefOid,reviewDecision,reviews,statusCheckRollup';
 
@@ -324,7 +351,7 @@ const RawPullRequestStatus = RawPullRequest.extend({
   /** Empty when there is none. */
   reviewDecision: z.string().nullish(),
   reviews: z.array(RawReview).nullish(),
-  statusCheckRollup: z.array(RawCheck).nullish(),
+  statusCheckRollup: z.array(RawRollupEntry).nullish(),
 });
 
 /** Review comments as the REST API lists them (`GET /repos/{repo}/pulls/{n}/comments`). */
@@ -705,8 +732,14 @@ export class GhCli implements GitHub {
       })),
       // What was said on the lines matters only while the work may still change.
       reviewComments: pr.state === 'open' ? await this.reviewComments(repo, number) : [],
-      checks: (raw.statusCheckRollup ?? []).map(fromRawCheck),
+      checks: (raw.statusCheckRollup ?? []).flatMap((c) => (c ? [fromRawCheck(c)] : [])),
     };
+  }
+
+  async closePullRequest(repo: string, number: number, comment: string): Promise<void> {
+    // gh posts the comment, then closes; it refuses a merged pull request, and leaves one
+    // already closed as it is, without the comment.
+    await this.gh(['pr', 'close', String(number), '-R', repo, '--comment', comment]);
   }
 
   /**
