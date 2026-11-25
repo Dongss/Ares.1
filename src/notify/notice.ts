@@ -101,11 +101,11 @@ export const NOTICE_KINDS: Record<NoticeKind, { label: string; when: string }> =
   failed: {
     zh: {
       label: 'Run 失败了',
-      when: 'Run 没做完就结束了，例如返工次数用完仍未通过、阶段回退次数用完（on_exhausted: fail），Agent 出错且重试、换 Agent 都用完，或超出预算（on_budget_exceeded: abort，默认）；你自己终止的不通知',
+      when: 'Run 没做完就结束了，例如返工次数用完仍未通过、阶段回退次数用完（on_exhausted: fail），Agent 出错且重试、换 Agent 都用完，超出预算（on_budget_exceeded: abort，默认），或通过 PR 交付（deliver: pr）时 PR 没合并就被关掉；你自己终止的不通知',
     },
     en: {
       label: 'Run failed',
-      when: 'A Run ended unfinished, e.g. still failing after all retries or past the stage loop limit (on_exhausted: fail), an agent error with every retry and agent used up, or over budget (on_budget_exceeded: abort, the default); Runs you cancel yourself are not notified',
+      when: 'A Run ended unfinished, e.g. still failing after all retries or past the stage loop limit (on_exhausted: fail), an agent error with every retry and agent used up, over budget (on_budget_exceeded: abort, the default), or its pull request closed unmerged when the repo delivers through pull requests (deliver: pr); Runs you cancel yourself are not notified',
     },
   },
   proposals: {

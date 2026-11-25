@@ -21,11 +21,10 @@ import {
   formatTime,
   goalTitle,
   messageExcerpt,
-  RUN_STATUS,
 } from '../lib/format.js';
 import { useTick } from '../lib/hooks.js';
 import { href } from '../lib/router.js';
-import { queueRanks } from '../lib/runs.js';
+import { prWaitHint, prWaitTitle, queueRanks, runStatusBadge, waitingForPr } from '../lib/runs.js';
 
 export function HomePage({ runs, repos }: { runs: RunSummary[]; repos: Repo[] }) {
   const filter = effectiveRunFilter(
@@ -76,7 +75,13 @@ export function HomePage({ runs, repos }: { runs: RunSummary[]; repos: Repo[] })
   }
 
   const card = (run: RunSummary, extra?: ReactNode) => (
-    <RunCard key={run.id} run={run} repo={repoName(run.repoId)} extra={extra} />
+    <RunCard
+      key={run.id}
+      run={run}
+      repo={repoName(run.repoId)}
+      extra={extra}
+      after={waitingForPr(run) ? <PrWaitNote run={run} /> : undefined}
+    />
   );
 
   return (
@@ -121,7 +126,30 @@ function queueExtra(rank: number | undefined): ReactNode {
   );
 }
 
+/**
+ * A Run waiting for its pull request: 「等 PR 合并 #N」 linking to it on GitHub. Rendered after the
+ * card's link to the Run, since a link cannot sit inside another.
+ */
+function PrWaitNote({ run }: { run: RunSummary }) {
+  return (
+    <div className="run-card-note run-card-after">
+      <div className="run-card-note-title">
+        {run.pr ? (
+          <a href={run.pr.url} target="_blank" rel="noreferrer">
+            {prWaitTitle(run)}
+          </a>
+        ) : (
+          prWaitTitle(run)
+        )}
+      </div>
+      <div className="run-card-note-detail">{prWaitHint()}</div>
+    </div>
+  );
+}
+
 function attentionExtra(run: RunSummary): ReactNode {
+  // Said after the card's link (PrWaitNote), with the link to the pull request.
+  if (waitingForPr(run)) return null;
   if (run.status === 'waiting_approval') {
     return (
       <div className="run-card-note">
@@ -218,39 +246,50 @@ function Section(props: {
   );
 }
 
-function RunCard({ run, repo, extra }: { run: RunSummary; repo: string; extra?: ReactNode }) {
-  const status = RUN_STATUS[run.status];
+function RunCard(props: {
+  run: RunSummary;
+  repo: string;
+  /** Inside the link to the Run. */
+  extra?: ReactNode;
+  /** Below it, outside the link: for content with links of its own. */
+  after?: ReactNode;
+}) {
+  const { run, repo, extra, after } = props;
+  const status = runStatusBadge(run);
   const finished = run.finishedAt !== null;
   return (
-    <a className="run-card" href={href.run(run.id)}>
-      <div className="run-card-top">
-        <Badge tone={status.tone}>{status.label}</Badge>
-        <span className="run-card-goal">{goalTitle(run.goal)}</span>
-      </div>
-      <div className="run-card-meta">
-        <span>{repo}</span>
-        {run.issue && <span>issue #{run.issue.number}</span>}
-        <span>{run.templateName}</span>
-        {run.currentStage && !finished && (
-          <span>
-            {run.currentStage.name}
-            {run.currentStage.round > 1
-              ? t({
-                  zh: `（第 ${run.currentStage.round} 轮）`,
-                  en: ` (round ${run.currentStage.round})`,
-                })
+    <div className="run-card">
+      <a className="run-card-link" href={href.run(run.id)}>
+        <div className="run-card-top">
+          <Badge tone={status.tone}>{status.label}</Badge>
+          <span className="run-card-goal">{goalTitle(run.goal)}</span>
+        </div>
+        <div className="run-card-meta">
+          <span>{repo}</span>
+          {run.issue && <span>issue #{run.issue.number}</span>}
+          <span>{run.templateName}</span>
+          {run.currentStage && !finished && (
+            <span>
+              {run.currentStage.name}
+              {run.currentStage.round > 1
+                ? t({
+                    zh: `（第 ${run.currentStage.round} 轮）`,
+                    en: ` (round ${run.currentStage.round})`,
+                  })
+                : ''}
+            </span>
+          )}
+          <span>{formatRunCost(run.costUsd, run.costUnknown)}</span>
+          <span title={run.createdAt}>
+            {formatTime(run.createdAt)}
+            {run.status === 'running' || finished
+              ? ` · ${formatSpan(run.createdAt, run.finishedAt)}`
               : ''}
           </span>
-        )}
-        <span>{formatRunCost(run.costUsd, run.costUnknown)}</span>
-        <span title={run.createdAt}>
-          {formatTime(run.createdAt)}
-          {run.status === 'running' || finished
-            ? ` · ${formatSpan(run.createdAt, run.finishedAt)}`
-            : ''}
-        </span>
-      </div>
-      {extra}
-    </a>
+        </div>
+        {extra}
+      </a>
+      {after}
+    </div>
   );
 }

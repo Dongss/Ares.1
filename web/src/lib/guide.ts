@@ -20,7 +20,8 @@ import {
 } from '../../../src/config/flow.js';
 import { waitText } from '../../../src/engine/discussion.js';
 import { join, t } from '../../../src/i18n.js';
-import { NOTICE_KINDS, type NoticeKind } from '../../../src/notify/notice.js';
+import { BLOCK_KIND, NOTICE_KINDS, type NoticeKind } from '../../../src/notify/notice.js';
+import type { BlockKind } from '../../../src/store/types.js';
 import { findRepoTemplate } from './config.js';
 import { buildFlow, type FlowStage } from './flow.js';
 import { formatCost, formatMinutes, type Tone } from './format.js';
@@ -178,6 +179,36 @@ export interface CycleStage {
   /** Empty for placeholder stages: nobody does anything yet. */
   actors: Actor[];
   note: string;
+}
+
+/**
+ * The push step of a repo delivering through pull requests (deliver: pr), `target` the target
+ * branch in words: the Master pushes the Run's branch and opens the pull request, a human (or
+ * GitHub) merges it. Without push: true the repo is disabled, which the step says.
+ */
+export function prDeliveryStep(github: Pick<GitHubRepoStatus, 'push'>, target: string): CycleStep {
+  const id = 'push';
+  const name = t({ zh: '推送并开 PR', en: 'Push and open a PR' });
+  if (!github.push) {
+    return {
+      id,
+      name,
+      actors: ['human'],
+      text: t({
+        zh: 'deliver: pr 要配 push: true：现在没开 push，这个仓库停用，先修好配置',
+        en: 'deliver: pr needs push: true: push is off, so the repo is disabled; fix the configuration first',
+      }),
+    };
+  }
+  return {
+    id,
+    name,
+    actors: ['master', 'human'],
+    text: t({
+      zh: `检查通过后 Master 推送 Run 的分支、开一个合并到${target}的 PR，正文用 Closes 关联 issue；你在 GitHub 上合并它之后，Master 把本地的${target}快进，Run 完成、issue 关闭；PR 没合并就被关掉时 Run 失败。${target}本身 Master 从不推送`,
+      en: `Once the checks pass, the Master pushes the Run's branch and opens a pull request into ${target}, linked to the issue with Closes; once you merge it on GitHub, the Master fast-forwards the local ${target}, the Run completes and the issue is closed; if it is closed unmerged, the Run fails. The Master never pushes ${target} itself`,
+    }),
+  };
 }
 
 /** Whether the merge of a Run from an issue waits for an approval. */
@@ -398,27 +429,30 @@ export function cycleSteps(input: GuideInput, rule?: AutoAcceptRule): CycleStep[
         en: `the target branch (${input.targetBranch})`,
       })
     : t({ zh: '目标分支', en: 'the target branch' });
-  const push = github?.push
-    ? step(
-        'push',
-        pushName,
-        ['master'],
-        t({
-          zh: `合并后 Master 把${target}推送到 GitHub，再在 issue 上留言并关闭它；推送失败会通知你，从不强推`,
-          en: `After a merge the Master pushes ${target} to GitHub, then comments on the issue and closes it; a failed push notifies you, and it never force-pushes`,
-        }),
-      )
-    : step(
-        'push',
-        pushName,
-        ['human'],
-        t({
-          zh: `由你来做：合并只到本地的${target}${github ? '，issue 照样关闭并注明' : ''}，需要时自己 git push`,
-          en: `Up to you: merges only go to the local ${target}${
-            github ? ' (the issue is still closed, with a note)' : ''
-          }; git push yourself when needed`,
-        }),
-      );
+  const push =
+    github?.deliver === 'pr'
+      ? prDeliveryStep(github, target)
+      : github?.push
+        ? step(
+            'push',
+            pushName,
+            ['master'],
+            t({
+              zh: `合并后 Master 把${target}推送到 GitHub，再在 issue 上留言并关闭它；推送失败会通知你，从不强推`,
+              en: `After a merge the Master pushes ${target} to GitHub, then comments on the issue and closes it; a failed push notifies you, and it never force-pushes`,
+            }),
+          )
+        : step(
+            'push',
+            pushName,
+            ['human'],
+            t({
+              zh: `由你来做：合并只到本地的${target}${github ? '，issue 照样关闭并注明' : ''}，需要时自己 git push`,
+              en: `Up to you: merges only go to the local ${target}${
+                github ? ' (the issue is still closed, with a note)' : ''
+              }; git push yourself when needed`,
+            }),
+          );
 
   const { upgrade } = input;
   const upgradeStep = canUpgradeItself(upgrade)
@@ -671,6 +705,9 @@ export function autonomy(
     t({ zh: '合并前审批', en: 'Approving merges' }),
   );
   add(github?.push === true, t({ zh: '推送到 GitHub', en: 'Pushing to GitHub' }));
+  if (github?.deliver === 'pr') {
+    you.push(t({ zh: '在 GitHub 上合并 PR', en: 'Merging pull requests on GitHub' }));
+  }
   add(canUpgradeItself(input.upgrade), t({ zh: '升级 Master', en: 'Upgrading the Master' }));
   return { auto, you };
 }
@@ -1029,6 +1066,19 @@ export function labelHelp(autoAccept: GitHubRepoStatus['autoAccept'] | null): [s
   ];
 }
 
+// ---- blocked Runs ----------------------------------------------------------------------
+
+/**
+ * Why a Run can be blocked, as the guide's answer to "What if a Run is blocked?" lists them: every
+ * kind but waiting for its pull request (`pr_open`), which is how deliver: pr goes, with nothing
+ * stuck and nothing to retry.
+ */
+export function blockReasons(): string[] {
+  return (Object.keys(BLOCK_KIND) as BlockKind[])
+    .filter((kind) => kind !== 'pr_open')
+    .map((kind) => BLOCK_KIND[kind]);
+}
+
 // ---- guardrails ----------------------------------------------------------------------
 
 export interface Guardrail {
@@ -1254,10 +1304,16 @@ export function guardrails(input: GuideInput, working: boolean | undefined): Gua
   items.push({
     title: t({ zh: 'git 历史可回退', en: 'Revertible git history' }),
     on: true,
-    text: t({
-      zh: 'Run 在单独的 worktree 和分支上做，每个 Task 一个 commit；合并后的任何改动都能用 git revert 回退，推送从不强推',
-      en: 'Each Run works in its own worktree and branch, one commit per Task; any merged change can be undone with git revert, and pushes are never forced',
-    }),
+    text:
+      github?.deliver === 'pr'
+        ? t({
+            zh: 'Run 在单独的 worktree 和分支上做，每个 Task 一个 commit；合并后的任何改动都能用 git revert 回退。目标分支从不强推；只有 ares1/ 开头的 Run 分支会强制推送，让它的 PR 跟上它',
+            en: 'Each Run works in its own worktree and branch, one commit per Task; any merged change can be undone with git revert. The target branch is never force-pushed; only the Runs’ own branches (ares1/…) are, to keep their pull requests up to date',
+          })
+        : t({
+            zh: 'Run 在单独的 worktree 和分支上做，每个 Task 一个 commit；合并后的任何改动都能用 git revert 回退，推送从不强推',
+            en: 'Each Run works in its own worktree and branch, one commit per Task; any merged change can be undone with git revert, and pushes are never forced',
+          }),
   });
 
   return items;

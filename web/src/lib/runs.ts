@@ -29,7 +29,14 @@ import {
   type RequirementSize,
   type Run,
 } from '../../../src/store/types.js';
-import { formatTime, missingCommandText, type Tone } from './format.js';
+import {
+  BLOCK_KIND,
+  formatTime,
+  missingCommandText,
+  RUN_STATUS,
+  shortSha,
+  type Tone,
+} from './format.js';
 
 export interface HomeGroups {
   /** Waiting for a human: approvals and blocked Runs, oldest first. */
@@ -140,6 +147,104 @@ export function workspaceLines(
       detail.worktreeExists,
     ),
   ];
+}
+
+// ---- delivery through a pull request -----------------------------------------------------
+
+/**
+ * Whether the Run waits for its pull request on GitHub to be merged (deliver: pr): blocked on
+ * `pr_open` with the merge stage's checks passed. Not stuck: it takes no execution slot, has
+ * nothing to retry, and goes on by itself once the pull request is merged or closed on GitHub.
+ */
+export function waitingForPr(run: Pick<Run, 'status' | 'blocked'>): boolean {
+  return run.status === 'blocked' && run.blocked?.kind === 'pr_open';
+}
+
+/** The Run's status badge: a Run waiting for its pull request says so instead of "blocked". */
+export function runStatusBadge(run: Pick<Run, 'status' | 'blocked'>): {
+  label: string;
+  tone: Tone;
+} {
+  if (waitingForPr(run)) return { label: BLOCK_KIND.pr_open, tone: 'attention' };
+  return RUN_STATUS[run.status];
+}
+
+/**
+ * 「等 PR 合并 #12」: the headline of a Run waiting for its pull request, on the home page and the
+ * Run detail. Before the bridge has opened it (`pr` still null), says that it is about to.
+ */
+export function prWaitTitle(run: Pick<Run, 'pr'>): string {
+  if (!run.pr) {
+    return t({
+      zh: '等 PR 合并：下次检查 GitHub 时推送分支、开 PR',
+      en: 'Waiting for the PR to merge: the branch is pushed and the PR opened at the next GitHub check',
+    });
+  }
+  return t({
+    zh: `等 PR 合并 #${run.pr.number}`,
+    en: `Waiting for PR #${run.pr.number} to merge`,
+  });
+}
+
+/** The short line under `prWaitTitle` on the home page: what merging or closing it does. */
+export function prWaitHint(): string {
+  return t({
+    zh: '在 GitHub 上合并后 Run 自动完成；没合并就关掉，Run 失败',
+    en: 'Merging it on GitHub completes the Run; closing it unmerged fails the Run',
+  });
+}
+
+/**
+ * What the Run detail says about a Run waiting for its pull request into `target`: where it
+ * stands, what merging or closing it on GitHub does, and that there is nothing to retry here.
+ */
+export function prWaitText(run: Pick<Run, 'pr' | 'issue'>, target: string): string[] {
+  const opened = run.pr
+    ? t({
+        zh: `检查已通过，Run 的分支已推送到 GitHub，PR #${run.pr.number} 等着合并到 ${target}。`,
+        en: `The checks passed and the Run's branch is pushed to GitHub, where PR #${run.pr.number} waits to be merged into ${target}.`,
+      })
+    : t({
+        zh: `检查已通过。Master 下次检查 GitHub 时推送 Run 的分支，开一个合并到 ${target} 的 PR（已经有开着的就接着用）；推送或开 PR 失败时，在「需求」页能看到原因，之后每次检查都会再试。`,
+        en: `The checks passed. At its next GitHub check the Master pushes the Run's branch and opens a pull request into ${target} (or keeps using one already open); if the push or the pull request fails, the Issues page shows why, and every later check tries again.`,
+      });
+  const merged = run.issue
+    ? t({
+        zh: `在 GitHub 上合并它（merge、squash 或 rebase 都行）后，Master 下次检查 GitHub 时把本地的 ${target} 快进到合并后的提交，Run 完成，issue 关闭。`,
+        en: `Once it is merged on GitHub (by a merge, a squash or a rebase), the Master fast-forwards the local ${target} to the merged commit at its next GitHub check, the Run completes and the issue is closed.`,
+      })
+    : t({
+        zh: `在 GitHub 上合并它（merge、squash 或 rebase 都行）后，Master 下次检查 GitHub 时把本地的 ${target} 快进到合并后的提交，Run 完成。`,
+        en: `Once it is merged on GitHub (by a merge, a squash or a rebase), the Master fast-forwards the local ${target} to the merged commit at its next GitHub check, and the Run completes.`,
+      });
+  const closed = run.issue
+    ? t({
+        zh: 'PR 没合并就被关掉时，Run 结束为失败；还有重做次数（max_run_attempts）时 issue 自动重做，重做的 Run 开新的 PR。',
+        en: 'If the pull request is closed unmerged, the Run ends as failed; while attempts remain (max_run_attempts) the issue is redone, and the new Run opens a new pull request.',
+      })
+    : t({
+        zh: 'PR 没合并就被关掉时，Run 结束为失败。',
+        en: 'If the pull request is closed unmerged, the Run ends as failed.',
+      });
+  const meanwhile = t({
+    zh: '等待期间不占执行名额，排队的 Run 照常执行；Master 重启后也接着等。这里没有可以重试的；终止 Run 不会关闭 GitHub 上的 PR。',
+    en: 'Meanwhile it takes no execution slot, so queued Runs go ahead, and it keeps waiting across Master restarts. There is nothing to retry here; cancelling the Run does not close the pull request on GitHub.',
+  });
+  return [opened, merged, closed, meanwhile];
+}
+
+/**
+ * The PR line of the Run detail's summary, for any Run that has one: 「#12」 (the link) and how it
+ * stands when the Run tells: waiting for it, or completed, which only a merge of it gets to.
+ */
+export function prSummary(
+  run: Pick<Run, 'pr' | 'status' | 'blocked'>,
+): { label: string; note: string | null } | null {
+  if (!run.pr) return null;
+  const label = `#${run.pr.number}`;
+  if (waitingForPr(run)) return { label, note: t({ zh: '（等合并）', en: ' (awaiting merge)' }) };
+  if (run.status === 'completed') return { label, note: t({ zh: '（已合并）', en: ' (merged)' }) };
+  return { label, note: null };
 }
 
 /** Number of Runs waiting for a human, shown in the tab title. */
@@ -409,6 +514,49 @@ function agentSelectedText(data: EventRow['data']): string | null {
 }
 
 /**
+ * The events of delivering through a pull request (deliver: pr) in words: the merge stage waits
+ * for it (`merge.pr_pending`), it was opened, merged or closed on GitHub (`github.pr_*`); null for
+ * other events and data not of that shape.
+ */
+function pullRequestEventText(event: Pick<EventRow, 'type' | 'data'>): string | null {
+  const { target, number, base, mergeCommit } = event.data;
+  if (event.type === 'merge.pr_pending') {
+    if (typeof target !== 'string') return null;
+    return t({
+      zh: `检查已通过，这个仓库通过 PR 交付（deliver: pr）：不合并进本地的 ${target}，等推送 Run 的分支、开 PR`,
+      en: `The checks passed and this repo delivers through pull requests (deliver: pr): nothing is merged into the local ${target}; the Run's branch is to be pushed and a pull request opened`,
+    });
+  }
+  if (typeof number !== 'number') return null;
+  switch (event.type) {
+    case 'github.pr_opened':
+      return typeof base === 'string'
+        ? t({
+            zh: `推送了 Run 的分支，PR #${number} 等着合并到 ${base}`,
+            en: `The Run's branch was pushed; PR #${number} waits to be merged into ${base}`,
+          })
+        : null;
+    case 'github.pr_merged':
+      return typeof mergeCommit === 'string'
+        ? t({
+            zh: `PR #${number} 在 GitHub 上合并了（合并提交 ${shortSha(mergeCommit)}），本地目标分支已快进`,
+            en: `PR #${number} was merged on GitHub (merge commit ${shortSha(mergeCommit)}), and the local target branch fast-forwarded`,
+          })
+        : t({
+            zh: `PR #${number} 在 GitHub 上合并了，本地目标分支已快进`,
+            en: `PR #${number} was merged on GitHub, and the local target branch fast-forwarded`,
+          });
+    case 'github.pr_closed':
+      return t({
+        zh: `PR #${number} 没合并就被关掉了，Run 结束为失败`,
+        en: `PR #${number} was closed without being merged, so the Run ended as failed`,
+      });
+    default:
+      return null;
+  }
+}
+
+/**
  * The event in words, for the events list, from its structured data; null for events that only
  * show their data.
  */
@@ -443,6 +591,8 @@ export function eventText(event: Pick<EventRow, 'type' | 'data'>, now = new Date
           en: `${what} is found in the environment again, so the Run goes on by itself`,
         });
   }
+  const pr = pullRequestEventText(event);
+  if (pr !== null) return pr;
   if (event.type === 'task.verify_resumed') {
     return t({
       zh: 'Agent 的改动还在工作目录里，只重新运行检查命令',

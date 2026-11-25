@@ -35,7 +35,6 @@ import {
   formatTokens,
   goalTitle,
   missingCommandText,
-  RUN_STATUS,
   runTimePartTexts,
   STAGE_STATUS,
   shortSha,
@@ -52,12 +51,17 @@ import {
   discussionItems,
   eventText,
   ignoredCommentsText,
+  prSummary,
+  prWaitText,
+  prWaitTitle,
   rateLimitText,
   rawLogPrunedText,
   redoText,
   replyDeadlineOf,
+  runStatusBadge,
   sizeText,
   untrustedIssueText,
+  waitingForPr,
   workspaceLines,
 } from '../lib/runs.js';
 
@@ -153,8 +157,9 @@ function stageName(detail: RunDetail, stageId: string): string {
 
 function RunHeader({ detail, onChanged }: { detail: RunDetail; onChanged: () => void }) {
   const { run, repo, stageRuns } = detail;
-  const status = RUN_STATUS[run.status];
+  const status = runStatusBadge(run);
   const current = stageRuns.find((s) => s.id === run.currentStageRunId);
+  const pr = prSummary(run);
   const multiLine = run.goal.trim().includes('\n');
   const budget = effectiveBudget(run.template, run.overrides);
   const untrusted = untrustedIssueText(run.issue);
@@ -191,6 +196,17 @@ function RunHeader({ detail, onChanged }: { detail: RunDetail; onChanged: () => 
                     en: `, attempt ${run.issue.attempt}: redone after earlier Runs failed`,
                   })
                 : ''}
+            </dd>
+          </div>
+        )}
+        {run.pr && pr && (
+          <div>
+            <dt>PR</dt>
+            <dd>
+              <a href={run.pr.url} target="_blank" rel="noreferrer">
+                {pr.label}
+              </a>
+              {pr.note && <span className="muted">{pr.note}</span>}
             </dd>
           </div>
         )}
@@ -343,10 +359,12 @@ function RunActions(props: {
       {run.status === 'blocked' && run.blocked?.kind === 'untrusted_issue' && (
         <ConfirmGoalPanel detail={props.detail} onChanged={props.onChanged} />
       )}
+      {waitingForPr(run) && <PullRequestPanel detail={props.detail} />}
       {run.status === 'blocked' &&
         run.blocked &&
         run.blocked.kind !== 'discussion' &&
-        run.blocked.kind !== 'untrusted_issue' && (
+        run.blocked.kind !== 'untrusted_issue' &&
+        run.blocked.kind !== 'pr_open' && (
           <BlockedPanel detail={props.detail} config={props.config} onChanged={props.onChanged} />
         )}
       {run.status === 'failed' && run.error && <ErrorBox>{run.error}</ErrorBox>}
@@ -414,6 +432,12 @@ function RunActions(props: {
               zh: '终止后保留工作目录和分支，可再手动清理。',
               en: 'Cancelling keeps the worktree and branch, which you can clean up afterwards.',
             })}
+            {waitingForPr(run) &&
+              run.pr &&
+              t({
+                zh: 'GitHub 上的 PR 不会被关闭，不要了请到 GitHub 上关掉。',
+                en: ' The pull request on GitHub stays open; close it there if you no longer want it.',
+              })}
           </span>
         </div>
       )}
@@ -652,6 +676,39 @@ function ConfirmGoalPanel({ detail, onChanged }: { detail: RunDetail; onChanged:
         />
       </div>
       <ErrorBox>{action.error}</ErrorBox>
+    </div>
+  );
+}
+
+/**
+ * The Run waits for its pull request on GitHub (deliver: pr): where it is, and what merging or
+ * closing it does. No retry: the Master moves the Run on from what happens to it on GitHub.
+ */
+function PullRequestPanel({ detail }: { detail: RunDetail }) {
+  const { run, repo } = detail;
+  return (
+    <div className="panel panel-attention">
+      <h2>
+        {run.pr ? (
+          <a href={run.pr.url} target="_blank" rel="noreferrer">
+            {prWaitTitle(run)}
+          </a>
+        ) : (
+          prWaitTitle(run)
+        )}
+      </h2>
+      {run.pr && (
+        <p>
+          <a href={run.pr.url} target="_blank" rel="noreferrer" className="pr-url">
+            {run.pr.url}
+          </a>
+        </p>
+      )}
+      {prWaitText(run, repo.targetBranch).map((line) => (
+        <p key={line} className="hint">
+          {line}
+        </p>
+      ))}
     </div>
   );
 }

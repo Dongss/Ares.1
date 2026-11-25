@@ -16,6 +16,7 @@ import {
   type Actor,
   autonomy,
   autonomyLevel,
+  blockReasons,
   type CycleStage,
   type CycleStep,
   cycleSteps,
@@ -38,7 +39,7 @@ import {
   stopCommand,
 } from '../lib/guide.js';
 import { useAction, useReloadOn, useResource } from '../lib/hooks.js';
-import { acceptRanges, issuesUrl, newIssueUrl } from '../lib/issues.js';
+import { acceptRanges, deliveryText, issuesUrl, newIssueUrl } from '../lib/issues.js';
 import { href } from '../lib/router.js';
 import { attentionCount } from '../lib/runs.js';
 
@@ -757,6 +758,77 @@ function GuardsSection({ input, working }: { input: GuideInput; working: boolean
   );
 }
 
+/** Delivering through pull requests (deliver: pr), for repos whose target branch is protected. */
+function PullRequestFaq({ github }: { github: GitHubRepoStatus | null }) {
+  return (
+    <div>
+      <h3>
+        {t({
+          zh: '目标分支受保护、只能走 PR 怎么办？',
+          en: 'What if the target branch is protected and only takes pull requests?',
+        })}
+      </h3>
+      {github && (
+        <p className="guide-now">
+          {t({ zh: '现在：', en: 'Now: ' })}
+          {deliveryText(github)}
+        </p>
+      )}
+      <p>
+        {t({
+          zh: (
+            <>
+              在 <code>config.yaml</code> 的 <code>github.repos.&lt;仓库名&gt;</code> 里写{' '}
+              <code>deliver: pr</code>（要同时配 <code>push: true</code>
+              ，不然这个仓库停用），保存后生效。 GitHub 上的 CI 和评审照常起作用：
+            </>
+          ),
+          en: (
+            <>
+              Set <code>deliver: pr</code> under <code>github.repos.&lt;repo name&gt;</code> in{' '}
+              <code>config.yaml</code> (with <code>push: true</code>, or the repo is disabled); it
+              takes effect when saved. CI and reviews on GitHub work as usual:
+            </>
+          ),
+        })}
+      </p>
+      <Pre>{'github:\n  repos:\n    my-repo:\n      push: true\n      deliver: pr'}</Pre>
+      <ul className="guide-list">
+        <li>
+          {t({
+            zh: '合并阶段照常把目标分支的新提交合进 Run 的分支、跑检查，但不动本地的目标分支；Master 下次检查 GitHub 时推送 Run 的分支（ares1/ 开头，会强制推送），开一个合并到目标分支的 PR（已经有开着的就接着用），正文用 Closes 关联 issue。',
+            en: "The merge stage still merges the target branch's new commits into the Run's branch and runs the checks, but leaves the local target branch alone; at its next GitHub check the Master pushes the Run's branch (ares1/…, force-pushed) and opens a pull request into the target branch (or keeps using one already open), linked to the issue with Closes.",
+          })}
+        </li>
+        <li>
+          {t({
+            zh: `Run 随后进入「${BLOCK_KIND.pr_open}」：不占执行名额，没有可以重试的，不算卡住，Master 重启后由每轮检查接着等。`,
+            en: `The Run then shows "${BLOCK_KIND.pr_open}": it takes no execution slot, has nothing to retry and is not stuck; after a Master restart each check goes on waiting.`,
+          })}
+        </li>
+        <li>
+          {t({
+            zh: 'PR 在 GitHub 上合并后（merge、squash、rebase 都行），Master 把本地的目标分支快进到 GitHub 上的提交，Run 完成、issue 关闭。',
+            en: 'Once the pull request is merged on GitHub (by a merge, a squash or a rebase), the Master fast-forwards the local target branch to GitHub’s, the Run completes and the issue is closed.',
+          })}
+        </li>
+        <li>
+          {t({
+            zh: 'PR 没合并就被关掉时，Run 结束为失败并通知你；还有重做次数（max_run_attempts）时 issue 自动重做，重做的 Run 开新的 PR。终止 Run 不会关闭 GitHub 上的 PR。',
+            en: 'If the pull request is closed unmerged, the Run ends as failed and you are notified; while attempts remain (max_run_attempts) the issue is redone, and the new Run opens a new pull request. Cancelling a Run does not close its pull request on GitHub.',
+          })}
+        </li>
+        <li>
+          {t({
+            zh: '这样的仓库，Master 从不推送目标分支。',
+            en: 'For such a repo the Master never pushes the target branch.',
+          })}
+        </li>
+      </ul>
+    </div>
+  );
+}
+
 function FaqSection(props: { input: GuideInput; home: string; idle: string[] }) {
   const { input, home } = props;
   const { github } = input;
@@ -829,8 +901,8 @@ function FaqSection(props: { input: GuideInput; home: string; idle: string[] }) 
         <h3>{t({ zh: 'Run 卡住了怎么办？', en: 'What if a Run is blocked?' })}</h3>
         <p>
           {t({
-            zh: `打开 Run 详情看原因和具体问题，可能是：${join(Object.values(BLOCK_KIND))}。`,
-            en: `Open the Run to see the reason and the details; it can be: ${join(Object.values(BLOCK_KIND))}.`,
+            zh: `打开 Run 详情看原因和具体问题，可能是：${join(blockReasons())}。`,
+            en: `Open the Run to see the reason and the details; it can be: ${join(blockReasons())}.`,
           })}
         </p>
         <p>
@@ -870,6 +942,7 @@ function FaqSection(props: { input: GuideInput; home: string; idle: string[] }) 
           </li>
         </ul>
       </div>
+      <PullRequestFaq github={github} />
       <div>
         <h3>{t({ zh: '怎么让它完全停下来？', en: 'How do I stop it completely?' })}</h3>
         <ul className="guide-list">

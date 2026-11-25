@@ -6,6 +6,7 @@ import {
   autoAcceptText,
   budgetText,
   CATEGORY,
+  deliveryText,
   gapsByGoal,
   gapsHeading,
   issuesUrl,
@@ -303,5 +304,32 @@ describe('issues display in English', () => {
     });
     expect(RISK.mid).toMatchObject({ label: 'Medium risk', tone: 'attention' });
     expect(CATEGORY.bug).toBe('Bug');
+  });
+});
+
+describe('how a repo delivers', () => {
+  afterEach(() => setLang('zh'));
+
+  it('tells pushing the target branch from pull requests', () => {
+    expect(deliveryText({ deliver: 'push', push: true })).toBe(
+      '推送：合并到本地目标分支后自动推送',
+    );
+    expect(deliveryText({ deliver: 'push', push: false })).toBe(
+      '推送：只合并到本地目标分支，由你推送',
+    );
+    expect(deliveryText({ deliver: 'pr', push: true })).toBe(
+      'PR：推送 Run 的分支、开合并到目标分支的 PR，在 GitHub 上合并后 Run 完成；目标分支不由 Master 推送',
+    );
+    // deliver: pr without push disables the repo.
+    expect(deliveryText({ deliver: 'pr', push: false })).toContain('这个仓库现在停用');
+  });
+
+  it('in English', () => {
+    setLang('en');
+    const texts = (['push', 'pr'] as const).flatMap((deliver) =>
+      [true, false].map((push) => deliveryText({ deliver, push })),
+    );
+    expect(texts[2]).toContain('the Master never pushes the target branch');
+    for (const text of texts) expect(text).not.toMatch(/[一-鿿]/);
   });
 });

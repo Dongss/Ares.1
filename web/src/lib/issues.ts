@@ -165,6 +165,33 @@ export function budgetText(budget: GitHubRepoStatus['budget']): string {
   });
 }
 
+/**
+ * How the repo's Runs reach GitHub (`deliver` and `push`): 「推送：合并后自动推送」 or 「PR：……」.
+ * deliver: pr without push: true disables the repo, which its configuration problems say too.
+ */
+export function deliveryText(repo: Pick<GitHubRepoStatus, 'deliver' | 'push'>): string {
+  if (repo.deliver === 'pr') {
+    return repo.push
+      ? t({
+          zh: 'PR：推送 Run 的分支、开合并到目标分支的 PR，在 GitHub 上合并后 Run 完成；目标分支不由 Master 推送',
+          en: "Pull request: the Run's branch is pushed with a pull request into the target branch, and the Run completes once it is merged on GitHub; the Master never pushes the target branch",
+        })
+      : t({
+          zh: 'PR，但没开 push：deliver: pr 要配 push: true，这个仓库现在停用',
+          en: 'Pull request, but push is off: deliver: pr needs push: true, so the repo is disabled now',
+        });
+  }
+  return repo.push
+    ? t({
+        zh: '推送：合并到本地目标分支后自动推送',
+        en: 'Push: the target branch is pushed after each local merge',
+      })
+    : t({
+        zh: '推送：只合并到本地目标分支，由你推送',
+        en: 'Push: merges stay in the local target branch, and you push',
+      });
+}
+
 function upgradeState(state: UpgradeStatus['state']): string {
   switch (state) {
     case 'idle':

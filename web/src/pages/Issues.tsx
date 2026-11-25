@@ -15,6 +15,7 @@ import {
   autoAcceptText,
   budgetText,
   CATEGORY,
+  deliveryText,
   gapsByGoal,
   gapsHeading,
   issuesUrl,
@@ -230,6 +231,7 @@ function NotConfigured() {
         max_size: L          # 自动采纳到哪个大小：S / M / L
       auto_merge: false      # 从 issue 来的 Run 合并前不再等你审批
       push: false            # 合并后自动推送到 GitHub
+      # deliver: pr          # 目标分支受保护时：推送 Run 的分支、开 PR，合并后 Run 完成（要配 push: true）
       # daily_budget_usd: 20 # 每天自动花费的上限，不写 = 不限
       max_run_attempts: 3    # 一个 issue 最多跑几次 Run（含第一次），失败后自动重做`,
           en: `github:
@@ -245,6 +247,7 @@ function NotConfigured() {
         max_size: L          # largest size accepted automatically: S / M / L
       auto_merge: false      # Runs from issues merge without waiting for your approval
       push: false            # push to GitHub after merging
+      # deliver: pr          # protected target branch: push the Run's branch, open a PR, done once merged (needs push: true)
       # daily_budget_usd: 20 # daily limit of automatic spend; omitted = no limit
       max_run_attempts: 3    # Runs an issue gets at most, the first included; failed ones are redone`,
         })}
@@ -342,13 +345,9 @@ function RepoIssues(props: {
               : t({ zh: '需要你审批', en: 'You approve' })}
           </dd>
         </div>
-        <div>
-          <dt>{t({ zh: '推送到 GitHub', en: 'Push to GitHub' })}</dt>
-          <dd>
-            {repo.push
-              ? t({ zh: '合并后自动推送', en: 'Pushed after each merge' })
-              : t({ zh: '由你推送', en: 'You push' })}
-          </dd>
+        <div className="wide">
+          <dt>{t({ zh: '交付方式', en: 'Delivery' })}</dt>
+          <dd>{deliveryText(repo)}</dd>
         </div>
         <div>
           <dt>{t({ zh: '今日自动花费', en: 'Automatic spend today' })}</dt>

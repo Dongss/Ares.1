@@ -15,13 +15,19 @@ import {
   ignoredCommentsText,
   pageTitle,
   patchLineClass,
+  prSummary,
+  prWaitHint,
+  prWaitText,
+  prWaitTitle,
   rateLimitText,
   rawLogPrunedText,
   redoText,
   replyDeadlineOf,
+  runStatusBadge,
   sizeText,
   splitPatch,
   untrustedIssueText,
+  waitingForPr,
   workspaceLines,
 } from './runs.js';
 
@@ -789,5 +795,125 @@ describe('raw logs past retention', () => {
     const text = rawLogPrunedText(run('old', 'cancelled', { finishedAt: daysAgo(40) }), now);
     expect(text).toBe('The raw log was deleted once past retention (30 days after the Run ended)');
     expect(text).not.toMatch(/[一-鿿]/);
+  });
+});
+
+describe('waiting for a pull request', () => {
+  afterEach(() => setLang('zh'));
+  const pr = { number: 12, url: 'https://github.com/me/demo/pull/12' };
+  const issue = {
+    repo: 'me/demo',
+    number: 7,
+    url: 'https://github.com/me/demo/issues/7',
+    auto: false,
+  } satisfies RunSummary['issue'];
+  const waiting = (extra: Partial<RunSummary> = {}) =>
+    run('w', 'blocked', {
+      blocked: { kind: 'pr_open', message: 'checks passed', stageRunId: 'sr' },
+      ...extra,
+    });
+
+  it('tells a Run waiting for its pull request from a stuck one', () => {
+    expect(waitingForPr(waiting())).toBe(true);
+    expect(waitingForPr(waiting({ pr }))).toBe(true);
+    expect(
+      waitingForPr(run('b', 'blocked', { blocked: { kind: 'merge_conflict', message: 'x' } })),
+    ).toBe(false);
+    // A pull request alone is not a wait: merged and completed, or closed and failed.
+    expect(waitingForPr(run('c', 'completed', { pr }))).toBe(false);
+    expect(waitingForPr(run('f', 'failed', { pr }))).toBe(false);
+  });
+
+  it('badges it as waiting for the PR rather than blocked', () => {
+    expect(runStatusBadge(waiting({ pr }))).toEqual({ label: '等 PR 合并', tone: 'attention' });
+    expect(
+      runStatusBadge(run('b', 'blocked', { blocked: { kind: 'budget', message: 'x' } })),
+    ).toEqual({ label: '卡住', tone: 'danger' });
+    expect(runStatusBadge(run('c', 'completed', { pr }))).toEqual({
+      label: '已完成',
+      tone: 'success',
+    });
+  });
+
+  it('heads it with the PR number, or says the PR is about to be opened', () => {
+    expect(prWaitTitle(waiting({ pr }))).toBe('等 PR 合并 #12');
+    expect(prWaitTitle(waiting())).toBe('等 PR 合并：下次检查 GitHub 时推送分支、开 PR');
+    expect(prWaitHint()).toBe('在 GitHub 上合并后 Run 自动完成；没合并就关掉，Run 失败');
+  });
+
+  it('explains what merging or closing it does', () => {
+    const lines = prWaitText(waiting({ pr, issue }), 'main');
+    expect(lines[0]).toBe('检查已通过，Run 的分支已推送到 GitHub，PR #12 等着合并到 main。');
+    expect(lines[1]).toContain('本地的 main 快进到合并后的提交，Run 完成，issue 关闭');
+    expect(lines[2]).toContain('Run 结束为失败；还有重做次数（max_run_attempts）时 issue 自动重做');
+    expect(lines[3]).toContain('等待期间不占执行名额');
+    expect(lines[3]).toContain('终止 Run 不会关闭 GitHub 上的 PR');
+    // Before the PR is opened, and for a Run without an issue.
+    const early = prWaitText(waiting(), 'main');
+    expect(early[0]).toContain('Master 下次检查 GitHub 时推送 Run 的分支，开一个合并到 main 的 PR');
+    expect(early[1]).not.toContain('issue');
+    expect(early[2]).toBe('PR 没合并就被关掉时，Run 结束为失败。');
+  });
+
+  it('sums up the PR of any Run that has one', () => {
+    expect(prSummary(waiting({ pr }))).toEqual({ label: '#12', note: '（等合并）' });
+    expect(prSummary(run('c', 'completed', { pr }))).toEqual({ label: '#12', note: '（已合并）' });
+    expect(prSummary(run('f', 'failed', { pr }))).toEqual({ label: '#12', note: null });
+    expect(prSummary(waiting())).toBeNull();
+    expect(prSummary(run('c', 'completed'))).toBeNull();
+  });
+
+  it('words the events of a pull request from their data', () => {
+    expect(eventText({ type: 'merge.pr_pending', data: { target: 'main', head: 'abc' } })).toBe(
+      '检查已通过，这个仓库通过 PR 交付（deliver: pr）：不合并进本地的 main，等推送 Run 的分支、开 PR',
+    );
+    expect(
+      eventText({
+        type: 'github.pr_opened',
+        data: { ...pr, head: 'ares1/run-1', base: 'main' },
+      }),
+    ).toBe('推送了 Run 的分支，PR #12 等着合并到 main');
+    expect(
+      eventText({
+        type: 'github.pr_merged',
+        data: { ...pr, mergeCommit: '0123456789abcdef0123456789abcdef01234567' },
+      }),
+    ).toBe('PR #12 在 GitHub 上合并了（合并提交 01234567），本地目标分支已快进');
+    expect(eventText({ type: 'github.pr_merged', data: { ...pr, mergeCommit: null } })).toBe(
+      'PR #12 在 GitHub 上合并了，本地目标分支已快进',
+    );
+    expect(eventText({ type: 'github.pr_closed', data: pr })).toBe(
+      'PR #12 没合并就被关掉了，Run 结束为失败',
+    );
+    // Data not of that shape only shows itself.
+    expect(eventText({ type: 'github.pr_closed', data: {} })).toBeNull();
+    expect(eventText({ type: 'github.pr_opened', data: pr })).toBeNull();
+    expect(eventText({ type: 'merge.pr_pending', data: {} })).toBeNull();
+  });
+
+  it('in English', () => {
+    setLang('en');
+    expect(runStatusBadge(waiting({ pr })).label).toBe('Waiting for the PR to merge');
+    expect(prWaitTitle(waiting({ pr }))).toBe('Waiting for PR #12 to merge');
+    expect(prSummary(waiting({ pr }))?.note).toBe(' (awaiting merge)');
+    const texts = [
+      prWaitTitle(waiting()),
+      prWaitHint(),
+      ...prWaitText(waiting({ pr, issue }), 'main'),
+      ...prWaitText(waiting(), 'main'),
+      prSummary(run('c', 'completed', { pr }))?.note,
+      eventText({ type: 'merge.pr_pending', data: { target: 'main' } }),
+      eventText({ type: 'github.pr_opened', data: { ...pr, base: 'main' } }),
+      eventText({ type: 'github.pr_merged', data: { ...pr, mergeCommit: 'abcdef1234' } }),
+      eventText({ type: 'github.pr_merged', data: pr }),
+      eventText({ type: 'github.pr_closed', data: pr }),
+    ];
+    expect(texts[1]).toBe(
+      'Merging it on GitHub completes the Run; closing it unmerged fails the Run',
+    );
+    for (const text of texts) {
+      expect(text).toBeTruthy();
+      expect(text).not.toMatch(/[一-鿿]/);
+    }
   });
 });

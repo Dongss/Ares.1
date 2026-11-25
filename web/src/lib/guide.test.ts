@@ -2,13 +2,19 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { GitHubRepoStatus, NotifyTestResult } from '../../../src/api/types.js';
 import { TemplateSchema } from '../../../src/config/schema.js';
 import { setLang } from '../../../src/i18n.js';
-import { NOTICE_KINDS, type NoticeKind, noticeFor } from '../../../src/notify/notice.js';
+import {
+  BLOCK_KIND,
+  NOTICE_KINDS,
+  type NoticeKind,
+  noticeFor,
+} from '../../../src/notify/notice.js';
 import type { EventRow } from '../../../src/store/types.js';
 import {
   ACTOR,
   acceptStep,
   autonomy,
   autonomyLevel,
+  blockReasons,
   cycleSteps,
   dataPaths,
   GUIDE_SECTIONS,
@@ -213,6 +219,55 @@ describe('the cycle', () => {
     const i = input(broken);
     expect(i.flow).toBeNull();
     expect(byId(i).run?.text).toContain('模板「gone」不存在或无效');
+  });
+});
+
+describe('delivering through pull requests', () => {
+  afterEach(() => setLang('zh'));
+  const prRepo: GitHubRepoStatus = { ...partialRepo, deliver: 'pr' };
+
+  it('pushes the Run branch and opens a PR that a human merges', () => {
+    const push = byId(input(prRepo)).push;
+    expect(push?.name).toBe('推送并开 PR');
+    expect(push?.actors).toEqual(['master', 'human']);
+    expect(push?.text).toContain('Master 推送 Run 的分支、开一个合并到目标分支（main）的 PR');
+    expect(push?.text).toContain('目标分支（main）本身 Master 从不推送');
+    // Without push the repo is disabled.
+    const off = byId(input({ ...prRepo, push: false })).push;
+    expect(off?.actors).toEqual(['human']);
+    expect(off?.text).toContain('deliver: pr 要配 push: true');
+  });
+
+  it('leaves merging the PR to you', () => {
+    expect(autonomy(input(prRepo)).auto).toContain('推送到 GitHub');
+    expect(autonomy(input(prRepo)).you).toContain('在 GitHub 上合并 PR');
+    expect(autonomy(input(partialRepo)).you).not.toContain('在 GitHub 上合并 PR');
+  });
+
+  it('says which branches are force-pushed', () => {
+    const history = (repo: GitHubRepoStatus) =>
+      guardrails(input(repo), true).find((g) => g.title === 'git 历史可回退')?.text;
+    expect(history(prRepo)).toContain('目标分支从不强推；只有 ares1/ 开头的 Run 分支会强制推送');
+    expect(history(partialRepo)).toContain('推送从不强推');
+  });
+
+  it('does not list waiting for a PR among the reasons a Run is stuck', () => {
+    const reasons = blockReasons();
+    expect(reasons).not.toContain('等 PR 合并');
+    expect(reasons).toContain('合并冲突');
+    expect(reasons).toHaveLength(Object.keys(BLOCK_KIND).length - 1);
+  });
+
+  it('in English', () => {
+    setLang('en');
+    const push = byId(input(prRepo)).push;
+    expect(push?.name).toBe('Push and open a PR');
+    expect(push?.text).toContain(
+      "the Master pushes the Run's branch and opens a pull request into the target branch (main)",
+    );
+    expect(autonomy(input(prRepo)).you).toContain('Merging pull requests on GitHub');
+    expect(blockReasons()).not.toContain('Waiting for the PR to merge');
+    for (const text of blockReasons()) expect(text).not.toMatch(/[一-鿿]/);
   });
 });
 
@@ -1085,7 +1140,14 @@ describe('in English', () => {
     ...input(github, upgrade),
     flow: github ? issueFlow(enConfig, github, ['npm test']) : null,
   });
-  const repos = [null, manualRepo, partialRepo, autoRepo];
+  const repos = [
+    null,
+    manualRepo,
+    partialRepo,
+    autoRepo,
+    { ...autoRepo, deliver: 'pr' as const },
+    { ...manualRepo, deliver: 'pr' as const },
+  ];
 
   it('words the loop, its stages and what is left to you without Chinese', () => {
     setLang('en');

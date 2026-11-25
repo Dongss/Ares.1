@@ -451,8 +451,6 @@ textarea:focus {
   gap: 8px;
 }
 .run-card {
-  display: block;
-  padding: 12px 16px;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -460,6 +458,13 @@ textarea:focus {
 }
 .run-card:hover {
   border-color: var(--accent);
+}
+.run-card-link {
+  display: block;
+  padding: 12px 16px;
+  color: inherit;
+}
+.run-card-link:hover {
   text-decoration: none;
 }
 .section-highlight .run-card {
@@ -497,6 +502,11 @@ textarea:focus {
   margin-top: 2px;
   color: var(--text-2);
   overflow-wrap: anywhere;
+}
+/* Below the link to the Run, whose bottom padding already spaces it from the meta line. */
+.run-card-after {
+  margin-top: -6px;
+  padding: 0 16px 12px;
 }
 
 /* ---- workspaces ------------------------------------------------------------ */
@@ -604,6 +614,9 @@ textarea:focus {
 }
 .panel-danger h2 {
   color: var(--danger);
+}
+.pr-url {
+  overflow-wrap: anywhere;
 }
 .panel textarea,
 .panel select,
