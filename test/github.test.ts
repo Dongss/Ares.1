@@ -6,6 +6,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AGENT_GH_TOKEN } from '../src/adapters/process.js';
 import type { RunDetail } from '../src/api/types.js';
 import {
+  closeoutSuggestions,
+  durationText,
+  iterationSummaryText,
+} from '../src/backlog/iterations.js';
+import {
   acceptSplit,
   isAutoAcceptable,
   PROPOSAL_SIZES,
@@ -28,7 +33,10 @@ import {
   FOOTER_MARKER,
   goalChangedComment,
   goalFromIssue,
+  hasReviewSuggestions,
+  ITERATION_SUMMARY_MARKER,
   type IterationText,
+  isIterationSummaryComment,
   isMasterComment,
   isMasterCommentBy,
   isRetriesExhaustedComment,
@@ -38,6 +46,7 @@ import {
   iterationBody,
   iterationChildBody,
   iterationMarker,
+  iterationSummaryComment,
   LABELS,
   labelDefs,
   markComment,
@@ -53,10 +62,12 @@ import {
   pullRequestText,
   pullRequestUpdatedComment,
   RETRIES_EXHAUSTED_MARKER,
+  REVIEW_SUGGESTIONS_MARKER,
   redoStartedComment,
   repliesAfterMaster,
   stripMarker,
   untrustedGoalMessage,
+  withReviewSuggestions,
   withStatusLabel,
 } from '../src/github/issues.js';
 import { type PrReworkKind, reworkReason } from '../src/github/pr-rework.js';
@@ -2186,10 +2197,12 @@ describe('issues: iterations', () => {
     await planIteration(t, planned([{ size: 'M' }, { risk: 'mid' }]));
     // Taken at once: the first step, which depends on nothing.
     await waitFor(() => gh.get(2).labels.includes(LABELS.running), 'Run of the first step');
+    // Once the round that took it is over, its Run is followed.
+    await t.master.issues.poll();
     const iteration = iterationOf(t);
     expect(iteration).toMatchObject({ status: 'active', auto: true });
     expect(iteration.decidedAt).not.toBeNull();
-    expect(iteration.children.map((c) => c.status)).toEqual(['ready', 'waiting', 'waiting']);
+    expect(iteration.children.map((c) => c.status)).toEqual(['running', 'waiting', 'waiting']);
     expect(gh.get(1).body).toContain('已按自动采纳的设置整批开工');
     expect(gh.get(1).labels).toEqual([
       LABELS.iteration,
@@ -2246,7 +2259,8 @@ describe('issues: iterations', () => {
     const iteration = iterationOf(t);
     expect(iteration).toMatchObject({ status: 'active', auto: false });
     expect(iteration.decidedAt).not.toBeNull();
-    expect(iteration.children.map((c) => c.status)).toEqual(['ready', 'waiting', 'waiting']);
+    // The first step, taken in the same round, is followed at its end.
+    expect(iteration.children.map((c) => c.status)).toEqual(['running', 'waiting', 'waiting']);
     expect(eventData(t, 'iteration.accepted')).toEqual([
       { repo: 'demo', iterationId: iteration.id, issue: 1 },
     ]);
@@ -2335,6 +2349,406 @@ describe('issues: iterations', () => {
     expect(scouts).toHaveLength(2);
     expect(scouts[0]?.trigger).toBe('auto');
     await scoutDone(t, scouts[0]?.id ?? '');
+  });
+
+  /**
+   * Coders that write one more file each time, at $0.50 an execution, so that every Run has
+   * work to merge and the iteration a known cost.
+   */
+  const payingCoder = (t: Harness) => {
+    let n = 0;
+    t.scripts.coder = (ctx) => {
+      n++;
+      writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+      writeFile(join(ctx.input.workdir, `step-${n}.txt`), `${n}\n`);
+      return { ...done(`写了 step-${n}.txt`), costUsd: 0.5 };
+    };
+  };
+
+  /** Approve the Run waiting to merge and wait until its issue is closed as completed. */
+  const completeStep = async (t: Harness, runId: string, issue: number) => {
+    await t.waitStatus(runId, 'waiting_approval');
+    t.master.engine.approve(runId);
+    await t.waitStatus(runId, 'completed');
+    await waitFor(() => gh.get(issue).state === 'closed', `#${issue} to close`);
+    expect(gh.get(issue).stateReason).toBe('completed');
+  };
+
+  const runOfIssue = (t: Harness, issue: number) => {
+    const run = t.master.store.latestRunForIssue('me/demo', issue);
+    if (!run) throw new Error(`no Run of #${issue}`);
+    return run;
+  };
+
+  it('follows its steps, checks each done one in the plan, and gives the closing step the review suggestions', async () => {
+    const t = await start(config({ maxRisk: 'none' }));
+    payingCoder(t);
+    await planIteration(t);
+    gh.get(1).labels.push(LABELS.ready);
+    t.scripts.reviewer = () =>
+      review([{ severity: 'suggestion', description: '把解析抽成一个函数' }]);
+    await t.master.issues.poll();
+    const first = runOfIssue(t, 2);
+    // Its Run is followed from the round it was created in.
+    let iteration = iterationOf(t);
+    expect(iteration.children.map((c) => [c.status, c.runIds])).toEqual([
+      ['running', [first.id]],
+      ['waiting', []],
+      ['waiting', []],
+    ]);
+    expect(eventData(t, 'iteration.child_status')).toEqual([
+      {
+        repo: 'demo',
+        iterationId: iteration.id,
+        issue: 1,
+        position: 1,
+        child: 2,
+        status: 'running',
+        previous: 'ready',
+      },
+    ]);
+    // Nothing done yet: the plan stays as it is.
+    expect(gh.calls.filter((c) => c === 'editIssue #1')).toHaveLength(1);
+
+    // Reviewed: the next Run's reviewer suggests something else.
+    await t.waitStatus(first.id, 'waiting_approval');
+    t.scripts.reviewer = () =>
+      review([{ severity: 'suggestion', description: '给看板的按钮加个确认' }]);
+    await completeStep(t, first.id, 2);
+    await t.master.issues.poll();
+    const second = runOfIssue(t, 3);
+    iteration = iterationOf(t);
+    expect(iteration.children.map((c) => c.status)).toEqual(['done', 'running', 'waiting']);
+    expect(gh.get(1).body).toContain('- [x] #2 甲：本地提案池\n- [ ] #3 乙：看板上采纳（依赖 #2）');
+    // Checked once: the next round leaves the plan alone.
+    const edits = gh.calls.filter((c) => c === 'editIssue #1').length;
+    await t.master.issues.poll();
+    expect(gh.calls.filter((c) => c === 'editIssue #1')).toHaveLength(edits);
+
+    await t.waitStatus(second.id, 'waiting_approval');
+    t.scripts.reviewer = () => review();
+    await completeStep(t, second.id, 3);
+    await t.master.issues.poll();
+    // The closing step got the suggestions of both Runs before its Run was created, from what
+    // its issue says now.
+    const closing = runOfIssue(t, 4);
+    const body = gh.get(4).body;
+    expect(hasReviewSuggestions(body)).toBe(true);
+    expect(body.indexOf('### 本迭代评审留下的建议')).toBeLessThan(body.indexOf(FOOTER_MARKER));
+    expect(body.indexOf(REVIEW_SUGGESTIONS_MARKER)).toBeGreaterThan(body.indexOf(FOOTER_MARKER));
+    expect(closing.goal).toBe(goalFromIssue(gh.get(4)));
+    expect(closing.goal).toContain(
+      [
+        '### 本迭代评审留下的建议',
+        '',
+        '本迭代其他子项的 Run 评审通过时留下了下面这些建议。逐条判断：值得做的就做；不值得做或已经不适用的，在结果里说明理由。',
+        '',
+        `- #2 甲：本地提案池（${first.id}，评审第 1 轮）`,
+        '  - 把解析抽成一个函数',
+        `- #3 乙：看板上采纳（${second.id}，评审第 1 轮）`,
+        '  - 给看板的按钮加个确认',
+      ].join('\n'),
+    );
+    expect(closing.goal).not.toContain('ares1:');
+    // Parsed from the footer as before.
+    expect(parseDependsOn(body)).toEqual([2, 3]);
+    expect(gh.calls.filter((c) => c === 'editIssue #4')).toHaveLength(1);
+    // Not taken for a human's change of the issue: the Run goes on.
+    await t.master.issues.poll();
+    expect(eventData(t, 'run.goal_changed')).toEqual([]);
+    expect(runOfIssue(t, 4).id).toBe(closing.id);
+    expect(gh.calls.filter((c) => c === 'editIssue #4')).toHaveLength(1);
+    expect(iterationOf(t).children.map((c) => c.status)).toEqual(['done', 'done', 'running']);
+  });
+
+  it('sums an iteration up on its issue once every step is done, closes it as completed, and does so once', async () => {
+    const t = await start(config({ maxRisk: 'none' }));
+    payingCoder(t);
+    await planIteration(t);
+    gh.get(1).labels.push(LABELS.ready);
+    await t.master.issues.poll();
+    const runs: Run[] = [];
+    for (const issue of [2, 3, 4]) {
+      const run = runOfIssue(t, issue);
+      runs.push(run);
+      await completeStep(t, run.id, issue);
+      // GitHub fails to close the iteration the first time: the round after goes on from there.
+      if (issue === 4) gh.failing.set('close #1 completed', 'GitHub 502');
+      await t.master.issues.poll();
+    }
+    const [a, b, c] = runs.map((r) => r.id);
+    let iteration = iterationOf(t);
+    expect(iteration.children.map((child) => child.status)).toEqual(['done', 'done', 'done']);
+    expect(iteration).toMatchObject({ status: 'active', summaryPosted: true });
+    expect(gh.get(1).state).toBe('open');
+    const comments = () => gh.get(1).comments.filter(isMasterComment);
+    expect(comments()).toHaveLength(1);
+
+    gh.failing.clear();
+    await t.master.issues.poll();
+    expect(gh.get(1).state).toBe('closed');
+    expect(gh.get(1).stateReason).toBe('completed');
+    expect(gh.get(1).labels).toEqual([LABELS.iteration, LABELS.proposal]);
+    expect(gh.get(1).body).toContain(
+      [
+        '- [x] #2 甲：本地提案池',
+        '- [x] #3 乙：看板上采纳（依赖 #2）',
+        '- [x] #4 丙：整理评审建议（依赖 #2、#3）',
+      ].join('\n'),
+    );
+    iteration = iterationOf(t);
+    expect(iteration.status).toBe('done');
+    expect(iteration.endedAt).not.toBeNull();
+    expect(iteration.children.map((child) => child.runIds)).toEqual([[a], [b], [c]]);
+    expect(eventData(t, 'iteration.completed')).toEqual([
+      { repo: 'demo', iterationId: iteration.id, issue: 1, costUsd: 1.5, runs: 3 },
+    ]);
+
+    // Posted once, as recorded.
+    const [posted, ...more] = comments();
+    expect(more).toEqual([]);
+    expect(posted).toContain(COMMENT_MARKER);
+    expect(posted).toContain(ITERATION_SUMMARY_MARKER);
+    expect(iteration.summary).not.toBeNull();
+    expect(posted).toContain(iteration.summary ?? '');
+    expect(posted).toContain(
+      [
+        '## 迭代完成',
+        '',
+        '### 做成了什么',
+        '',
+        '没接 GitHub 的仓库也能自己提需求、自己做完',
+        '',
+        '完成了全部 3 个子项：',
+        '',
+        '- #2 甲：本地提案池',
+        '- #3 乙：看板上采纳',
+        '- #4 丙：整理评审建议',
+        '',
+        '### 对照完成标准',
+        '',
+        '1. 本地仓库能自己跑完一轮',
+        `   - #2 甲：本地提案池：${a}，评审结论：没问题`,
+        '2. 看板上能整批采纳',
+        `   - #3 乙：看板上采纳：${b}，评审结论：没问题`,
+        '',
+        '### 用到的 Run',
+        '',
+        `- #2 甲：本地提案池：${a}（已完成，$0.50）`,
+        `- #3 乙：看板上采纳：${b}（已完成，$0.50）`,
+        `- #4 丙：整理评审建议：${c}（已完成，$0.50）`,
+        '',
+        '### 费用和用时',
+        '',
+        '- 总费用：$1.50，共 3 个 Run（失败的尝试也算在内）',
+        '- 用时：从采纳到完成 1 分钟，其中 Agent 执行 1 分钟',
+      ].join('\n'),
+    );
+
+    // Done: later rounds neither post nor close it again.
+    const calls = gh.calls.length;
+    await t.master.issues.poll();
+    expect(comments()).toHaveLength(1);
+    expect(gh.calls.slice(calls).filter((call) => /#1\b/.test(call))).toEqual([]);
+    expect(eventData(t, 'iteration.completed')).toHaveLength(1);
+  });
+
+  it('does not post the summary again when the Master stopped right after posting it', async () => {
+    const t = await start(config({ maxRisk: 'none' }));
+    payingCoder(t);
+    await planIteration(t);
+    gh.get(1).labels.push(LABELS.ready);
+    await t.master.issues.poll();
+    for (const issue of [2, 3]) {
+      await completeStep(t, runOfIssue(t, issue).id, issue);
+      await t.master.issues.poll();
+    }
+    await completeStep(t, runOfIssue(t, 4).id, 4);
+    // Posted, but not recorded; a stranger's copy of the marker does not count.
+    gh.commentAs(1, STRANGER, `抄来的总结\n\n${ITERATION_SUMMARY_MARKER}\n\n${COMMENT_MARKER}`);
+    await gh.comment('me/demo', 1, markComment(iterationSummaryComment('早先发过的总结')));
+    await t.master.issues.poll();
+    expect(gh.get(1).comments.filter((body) => body.includes('## 迭代完成'))).toEqual([]);
+    expect(iterationOf(t)).toMatchObject({ status: 'done', summaryPosted: true });
+    expect(gh.get(1).state).toBe('closed');
+  });
+});
+
+describe('iterations: summary and closing step texts', () => {
+  afterEach(() => setLang('zh'));
+
+  const hasChinese = (text: string) => /[　-〿一-鿿＀-￯]/.test(text);
+
+  /** An iteration of two steps whose children are all done, in English. */
+  const input = (): Parameters<typeof iterationSummaryText>[0] => ({
+    goal: 'Repos without GitHub run on their own',
+    criteria: [
+      'A local repo finishes a round by itself',
+      'Accept a whole iteration on the dashboard',
+      'Nobody waits',
+    ],
+    children: [
+      {
+        child: {
+          position: 1,
+          title: 'Local backlog',
+          issue: { number: 2, url: '' },
+          criteria: [1],
+        },
+        runs: [
+          { id: 'run-a', status: 'failed', costUsd: 0.25 },
+          { id: 'run-b', status: 'completed', costUsd: 0.5 },
+        ],
+        doneBy: { runId: 'run-b', reviews: [{ stageName: 'Review', summary: 'Looks good' }] },
+      },
+      {
+        child: { position: 2, title: 'Accept on the dashboard', criteria: [1, 2] },
+        runs: [{ id: 'run-c', status: 'completed', costUsd: 1 }],
+        doneBy: {
+          runId: 'run-c',
+          reviews: [
+            { stageName: 'Review', summary: 'Fine' },
+            { stageName: 'Security', summary: 'No issues' },
+          ],
+        },
+      },
+      {
+        child: { position: 3, title: 'Old approach', criteria: [2], replacedBy: 2 },
+        runs: [],
+        doneBy: null,
+      },
+    ],
+    totals: { runs: 3, costUsd: 1.75, elapsedMs: 3 * 3_600_000 + 5 * 60_000, agentMs: 80 * 60_000 },
+  });
+
+  it('writes the summary in English without Chinese characters', () => {
+    setLang('en');
+    const text = iterationSummaryText(input());
+    expect(hasChinese(text)).toBe(false);
+    expect(text).toContain(
+      [
+        '### Against the completion criteria',
+        '',
+        '1. A local repo finishes a round by itself',
+        '   - #2 Local backlog: run-b, review: Looks good',
+        '   - Accept on the dashboard: run-c, review: Review: Fine; Security: No issues',
+        '2. Accept a whole iteration on the dashboard',
+        '   - Accept on the dashboard: run-c, review: Review: Fine; Security: No issues',
+        '3. Nobody waits',
+        '   - No step was planned to advance it',
+      ].join('\n'),
+    );
+    expect(text).toContain('All 2 steps done:');
+    expect(text).toContain('- #2 Local backlog: run-a (failed, $0.25), run-b (completed, $0.50)');
+    expect(text).toContain('- Old approach (replaced by step 2): none');
+    expect(text).toContain('- Total cost: $1.75 over 3 Runs (failed attempts included)');
+    expect(text).toContain(
+      '- Time: 3 h 5 min from acceptance to done, of which agents worked 1 h 20 min',
+    );
+  });
+
+  it('writes the summary in Chinese with the same parts', () => {
+    const text = iterationSummaryText(input());
+    expect(text).toContain('- #2 Local backlog：run-a（失败，$0.25）、run-b（已完成，$0.50）');
+    expect(text).toContain('- 用时：从采纳到完成 3 小时 5 分钟，其中 Agent 执行 1 小时 20 分钟');
+    expect(text.split('\n').filter((l) => l.startsWith('### '))).toHaveLength(4);
+    setLang('en');
+    expect(
+      iterationSummaryText(input())
+        .split('\n')
+        .filter((l) => l.startsWith('### ')),
+    ).toHaveLength(4);
+  });
+
+  it('tells durations in days, hours and minutes, at least one minute', () => {
+    expect(durationText(0)).toBe('1 分钟');
+    expect(durationText(2 * 86_400_000 + 3_600_000)).toBe('2 天 1 小时');
+    setLang('en');
+    expect(durationText(90 * 60_000)).toBe('1 h 30 min');
+  });
+
+  it('adds the review suggestions to a closing step once, before its footer', () => {
+    const body = iterationChildBody(
+      {
+        category: 'refactor',
+        size: 'S',
+        risk: 'low',
+        why: '收尾',
+        evidence: [],
+        what: '整理评审建议',
+        acceptance: ['都处理了'],
+      },
+      { iteration: 1, dependsOn: [2, 3] },
+      'scout-1',
+    );
+    expect(hasReviewSuggestions(body)).toBe(false);
+    const added = withReviewSuggestions(body, '### 本迭代评审留下的建议\n\n- 一条建议\n');
+    expect(hasReviewSuggestions(added)).toBe(true);
+    expect(added.startsWith(body.slice(0, body.indexOf(FOOTER_MARKER)).trimEnd())).toBe(true);
+    expect(goalFromIssue({ number: 4, title: '收尾', body: added }).endsWith('- 一条建议')).toBe(
+      true,
+    );
+    expect(parseDependsOn(added)).toEqual([2, 3]);
+    expect(parseIterationOf(added)).toBe(1);
+    // The marker counts only in the footer: a requirement quoting it is not taken for one.
+    expect(hasReviewSuggestions(`${REVIEW_SUGGESTIONS_MARKER}\n\n${FOOTER_MARKER}`)).toBe(false);
+    // A body whose footer is gone gets one.
+    const bare = withReviewSuggestions('只有正文', '### 建议');
+    expect(bare).toBe(`只有正文\n\n### 建议\n\n${FOOTER_MARKER}\n${REVIEW_SUGGESTIONS_MARKER}`);
+    expect(hasReviewSuggestions(bare)).toBe(true);
+  });
+
+  it("takes the Master's summary comment by its marker only from the Master", () => {
+    const body = markComment(iterationSummaryComment('总结'));
+    const master = { body, author: OWNER.login, authorAssociation: OWNER.association };
+    expect(isIterationSummaryComment(master, OWNER.login)).toBe(true);
+    const stranger = { ...master, author: STRANGER.login, authorAssociation: STRANGER.association };
+    expect(isIterationSummaryComment(stranger, OWNER.login)).toBe(false);
+    expect(isIterationSummaryComment({ ...master, body: markComment('别的') }, OWNER.login)).toBe(
+      false,
+    );
+  });
+
+  it('says in both languages when the closing step has no suggestions to go through', async () => {
+    const t = await start();
+    const iteration = t.master.store.createIteration({
+      repoId: t.repo.id,
+      scoutId: null,
+      source: 'github',
+      issuesRepo: 'me/demo',
+      title: 'An iteration',
+      goal: 'A goal',
+      readmeGoal: 'perpetual motion',
+      criteria: ['It works'],
+      outOfScope: [],
+      children: [1, 2].map((position) => ({
+        position,
+        title: `Step ${position}`,
+        category: 'feature' as const,
+        size: 'S' as const,
+        risk: 'low' as const,
+        why: '',
+        evidence: [],
+        what: '',
+        acceptance: [],
+        criteria: [1],
+        dependsOn: position === 2 ? [1] : [],
+        closeout: position === 2,
+        issue: { number: position + 1, url: '' },
+        status: 'waiting' as const,
+        runIds: [],
+      })),
+    });
+    const closeout = { position: 2 };
+    expect(closeoutSuggestions(t.master.store, iteration, closeout)).toBe(
+      '### 本迭代评审留下的建议\n\n本迭代其他子项的 Run 评审通过时没有留下建议。',
+    );
+    setLang('en');
+    const text = closeoutSuggestions(t.master.store, iteration, closeout);
+    expect(text).toBe(
+      "### Review suggestions of this iteration\n\nThe reviews of this iteration's other steps left no suggestions when they passed.",
+    );
+    expect(hasChinese(text)).toBe(false);
   });
 });
 

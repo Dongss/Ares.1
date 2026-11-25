@@ -5,6 +5,12 @@ import { prepareAgentEnv } from '../adapters/process.js';
 import type { GitHubRepoStatus, GitHubStatus } from '../api/types.js';
 import { mayAutoAccept, overBudget } from '../backlog/guard.js';
 import {
+  closeoutSuggestions,
+  followChildren,
+  iterationSummary,
+  iterationTotals,
+} from '../backlog/iterations.js';
+import {
   type FiledIteration,
   type FiledProposals,
   type KnownRequirements,
@@ -19,6 +25,7 @@ import {
   isAutoAcceptable,
   issueRunOverrides,
   iterationKind,
+  iterationStatusOf,
   redoDueAt,
   replyTimeoutHours,
   unmetDependencies,
@@ -75,18 +82,22 @@ import {
 } from './client.js';
 import {
   autoAcceptedComment,
+  checkPlanItem,
   discussionComment,
   type FailureOutcome,
   failedAttempt,
   goalChangedComment,
   goalFromIssue,
+  hasReviewSuggestions,
   hasStatusLabel,
   type IterationText,
+  isIterationSummaryComment,
   issueUpdate,
   isTrusted,
   iterationAutoAcceptedComment,
   iterationBody,
   iterationChildBody,
+  iterationSummaryComment,
   LABELS,
   labelDefs,
   markComment,
@@ -102,6 +113,7 @@ import {
   repliesAfterMaster,
   untrustedAuthor,
   untrustedGoalMessage,
+  withReviewSuggestions,
   withStatusLabel,
 } from './issues.js';
 import {
@@ -656,10 +668,10 @@ export class IssueBridge {
    * for one (deliver: pr) and follow those opened, finish writing out the iterations scouts left
    * halfway, accept proposals the settings allow, start Runs for ready issues (the steps of an
    * iteration once their dependencies are done), terminate Runs whose issue a human closed and
-   * start over those whose issue a human changed, catch issues up, pass on replies to the
-   * assessments' questions, start a scout where the repo is idle. With the work switch off only
-   * the pulling, the pull requests, the terminating and the catching up happen: none of them
-   * starts new work.
+   * start over those whose issue a human changed, catch issues up, follow the iterations under
+   * way (and sum up those done), pass on replies to the assessments' questions, start a scout
+   * where the repo is idle. With the work switch off only the pulling, the pull requests, the
+   * terminating and the catching up happen: none of them starts new work.
    */
   poll(): Promise<void> {
     return this.serial(async () => {
@@ -706,6 +718,9 @@ export class IssueBridge {
       }
       if (!(await this.followIssues())) failed = true;
       if (!(await this.syncRuns())) failed = true;
+      // After the issues are caught up with their Runs: a step whose Run just completed was
+      // closed by syncRuns, and counts as done this round.
+      await each((name) => this.followIterations(name));
       if (working) {
         await each((name) => this.collectReplies(name));
         await each((name) => this.redoFailedRuns(name));
@@ -818,6 +833,8 @@ export class IssueBridge {
    * iteration's issue never becomes a Run: accepting it passes ares1:ready on to its steps
    * (takeIteration), which are taken in the same round. A step whose dependencies are not all
    * closed as completed yet keeps ares1:ready and waits (dependenciesMet); a later round takes it.
+   * An iteration's closing step gets the iteration's review suggestions added to its issue first
+   * (withIterationSuggestions), and its Run the goal with them.
    */
   private async intake(name: string): Promise<void> {
     const { repo, cfg } = this.repoSetup(name);
@@ -835,18 +852,22 @@ export class IssueBridge {
     if (accepted) ready = await listReady();
     // Whether each issue a step depends on is closed as completed, as looked up this round.
     const completed = new Map<number, boolean>();
-    // A dependency that cannot be read holds its step back while the other issues are taken;
-    // the error fails the round afterwards, so that it is reported once per streak.
+    // A dependency that cannot be read, or a closing step whose suggestions cannot be added, holds
+    // that step back while the other issues are taken; the error fails the round afterwards, so
+    // that it is reported once per streak.
     let unreadable: { err: unknown } | undefined;
-    for (const issue of ready.sort((a, b) => a.number - b.number)) {
+    for (const listed of ready.sort((a, b) => a.number - b.number)) {
       if (this.stopping) return;
-      if (issue.labels.includes(LABELS.iteration)) continue;
+      if (listed.labels.includes(LABELS.iteration)) continue;
+      let issue = listed;
       let run = this.deps.store.unfinishedRunForIssue(full, issue.number);
       if (!run) {
         let met = false;
         try {
           met = await this.dependenciesMet(full, issue, ready, completed);
+          if (met) issue = await this.withIterationSuggestions(repo, full, issue);
         } catch (err) {
+          met = false;
           unreadable ??= { err };
         }
         if (!met) continue;
@@ -935,6 +956,34 @@ export class IssueBridge {
       if (!done) return false;
     }
     return true;
+  }
+
+  /**
+   * The issue of an iteration's closing step about to get its first Run, with the iteration's
+   * review suggestions (`closeoutSuggestions`) added to its requirement on GitHub, so that the
+   * Run's goal has them and the issue says what the Run was given: the body the Run is created
+   * from is the one GitHub has, so restartForChangedIssue does not take the edit for a human's.
+   * Added once: the marker in its footer says so (`hasReviewSuggestions`), even when a later Run
+   * of it is created. Any other issue is returned as it is. Rejects when the edit fails.
+   */
+  private async withIterationSuggestions(
+    repo: Repo,
+    full: string,
+    issue: GhIssue,
+  ): Promise<GhIssue> {
+    if (hasReviewSuggestions(issue.body)) return issue;
+    const store = this.deps.store;
+    if (store.latestRunForIssue(full, issue.number)) return issue;
+    const iteration = this.githubIterations(repo, full).find((it) =>
+      it.children.some((c) => c.closeout && c.issue?.number === issue.number),
+    );
+    const child = iteration?.children.find((c) => c.issue?.number === issue.number);
+    if (!iteration || !child) return issue;
+    const section = closeoutSuggestions(store, iteration, child);
+    // The suggestions quote what reviewers wrote, with local paths in it.
+    const body = redactForGitHub(withReviewSuggestions(issue.body, section));
+    await this.gh().editIssue(full, issue.number, { body });
+    return { ...issue, body };
   }
 
   /**
@@ -2659,6 +2708,104 @@ export class IssueBridge {
         repo: repo.name,
         iterationId: iteration.id,
         issue: own.number,
+      });
+    });
+  }
+
+  /**
+   * Follow the repo's iterations under way (`followIteration`). Runs whatever the work switch:
+   * it starts no work. A failure of one iteration leaves the others to go on and fails the round
+   * afterwards; it is tried again the next round.
+   */
+  private async followIterations(name: string): Promise<void> {
+    const repo = this.deps.store.findRepo(name);
+    if (!repo) return;
+    const active = this.deps.store
+      .listIterations({ repoId: repo.id, status: 'active' })
+      .filter((it) => it.source === 'github' && it.issue !== null);
+    let failure: { err: unknown } | undefined;
+    for (const iteration of active) {
+      if (this.stopping) break;
+      try {
+        await this.followIteration(repo, iteration);
+      } catch (err) {
+        failure ??= { err };
+      }
+    }
+    if (failure) throw failure.err;
+  }
+
+  /**
+   * Where each step of an iteration under way stands by its issue and its Runs (`followChildren`):
+   * done once its issue is closed as completed, running while a Run works on it, waiting while a
+   * step it depends on is not done, otherwise ready. A step whose issue was closed some other way
+   * keeps its status, and one done is not read again. Then each step done is checked in the plan
+   * on the iteration's issue (`checkPlanItem`), which is edited only when that changes it. Once
+   * every step is done the iteration is summed up and closed (completeIteration).
+   */
+  private async followIteration(repo: Repo, iteration: Iteration): Promise<void> {
+    const own = iteration.issue;
+    if (!own) return;
+    const gh = this.gh();
+    const full = iteration.issuesRepo;
+    const done = new Map<number, boolean>();
+    for (const child of iteration.children) {
+      if (!child.issue || child.status === 'done') continue;
+      const issue = await gh.getIssue(full, child.issue.number);
+      if (issue.state === 'open') done.set(child.position, false);
+      else if (issue.stateReason === 'completed') done.set(child.position, true);
+    }
+    const followed = followChildren(this.deps.store, iteration.id, repo.name, done);
+    const issue = await gh.getIssue(full, own.number);
+    let body = issue.body;
+    for (const child of followed.children) {
+      if (child.status === 'done' && child.issue) body = checkPlanItem(body, child.issue.number);
+    }
+    if (body !== issue.body) {
+      await gh.editIssue(full, own.number, { body: redactForGitHub(body) });
+    }
+    if (iterationStatusOf(followed.children) === 'done') {
+      await this.completeIteration(repo, followed, issue);
+    }
+  }
+
+  /**
+   * Sum up an iteration whose steps are all done: its summary (`iterationSummary`, put together
+   * from the Runs' records) posted on its issue through comment(), so marked and redacted, and
+   * recorded; then its issue closed as completed, its status label removed; then the iteration
+   * done, with an `iteration.completed` event. The summary is posted once: a later round, after
+   * GitHub failed or the Master stopped halfway, goes on from where it got (`summaryPosted`, and
+   * the summary's marker among the issue's comments for a stop right after posting it).
+   */
+  private async completeIteration(repo: Repo, iteration: Iteration, issue: GhIssue): Promise<void> {
+    const store = this.deps.store;
+    const gh = this.gh();
+    const full = iteration.issuesRepo;
+    if (!iteration.summaryPosted) {
+      const summary = iterationSummary(store, iteration);
+      const master = await this.masterLogin();
+      const comments = await gh.listComments(full, issue.number);
+      if (!comments.some((c) => isIterationSummaryComment(c, master))) {
+        await this.comment(full, issue.number, iterationSummaryComment(summary));
+      }
+      store.updateIteration(iteration.id, { summaryPosted: true, summary });
+    }
+    if (issue.state === 'open') {
+      const labels = withStatusLabel(issue.labels, null);
+      if (labels.length !== issue.labels.length) await gh.setLabels(full, issue.number, labels);
+      await gh.close(full, issue.number, 'completed');
+    }
+    store.tx(() => {
+      const latest = store.getIteration(iteration.id);
+      if (latest.status !== 'active') return;
+      const ended = store.updateIteration(iteration.id, { status: 'done', endedAt: nowIso() });
+      const totals = iterationTotals(store, ended);
+      store.event(null, 'iteration.completed', {
+        repo: repo.name,
+        iterationId: iteration.id,
+        issue: issue.number,
+        costUsd: totals.costUsd,
+        runs: totals.runs,
       });
     });
   }

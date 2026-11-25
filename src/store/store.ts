@@ -737,6 +737,17 @@ export class Store {
     );
   }
 
+  /** Every Run created from this issue, finished or not, oldest first. */
+  runsForIssue(issuesRepo: string, number: number): Run[] {
+    return this.many<Run>(
+      'runs',
+      `SELECT * FROM runs WHERE json_extract(issue, '$.repo') = ? AND json_extract(issue, '$.number') = ?
+         ORDER BY created_at, rowid`,
+      issuesRepo,
+      number,
+    );
+  }
+
   /** Every Run created from an issue, oldest first. */
   issueRuns(): Run[] {
     return this.many<Run>(

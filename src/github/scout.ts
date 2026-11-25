@@ -751,12 +751,14 @@ export function keptReport(
   };
 }
 
-const oneLine = (text: string, max: number) => {
+/** `text` on one line, its whitespace collapsed, cut at `max` characters with an ellipsis. */
+export const oneLine = (text: string, max: number) => {
   const line = text.replace(/\s+/g, ' ').trim();
   return line.length > max ? `${line.slice(0, max)}…` : line;
 };
 
-const statusText = (status: Run['status']) =>
+/** A Run's status in words, lower case: 「已完成」, "completed". */
+export const statusText = (status: Run['status']) =>
   t<Record<Run['status'], string>>({
     zh: {
       queued: '排队中',
@@ -1041,6 +1043,46 @@ function failLines(
   ];
 }
 
+/** The suggestions a review left, as opposed to what it said must be fixed. */
+const suggestionsOf = (review: ReviewReport | null) =>
+  review?.issues.filter((i) => i.severity === 'suggestion') ?? [];
+
+/** A review round of a Run that passed, as its last reviewer that finished gave it. */
+export interface PassedReview {
+  /** The review stage, by its id. */
+  stageId: string;
+  stageName: string;
+  round: number;
+  /** The reviewer's summary: its conclusion. */
+  summary: string;
+  /** What it left as suggestions: improvements beyond the goal and polish, left for later. */
+  suggestions: ReviewReport['issues'];
+}
+
+/**
+ * The review rounds of the Run that passed, in the order they ran; those whose report cannot be
+ * read are left out. A round still executing or waiting for approval has not passed, even when
+ * its reviewer already reported: it may yet fail, or the Run may end there.
+ */
+export function passedReviews(store: Store, run: Run): PassedReview[] {
+  const reviews: PassedReview[] = [];
+  for (const sr of store.listStageRuns(run.id)) {
+    const stage = run.template.stages.find((s) => s.id === sr.stageId);
+    if (stage?.kind !== 'review' || sr.status !== 'passed') continue;
+    const attempts = store.listTasks(sr.id).flatMap((task) => store.listAttempts(task.id));
+    const review = reviewOf(attempts);
+    if (!review) continue;
+    reviews.push({
+      stageId: sr.stageId,
+      stageName: stage.name ?? sr.stageId,
+      round: sr.round,
+      summary: review.summary,
+      suggestions: suggestionsOf(review),
+    });
+  }
+  return reviews;
+}
+
 /**
  * The suggestions of a review round that passed. Reviewers leave improvements beyond the goal and
  * polish of edge cases as suggestions on purpose, for later; they reach no issue, so unless the
@@ -1050,7 +1092,7 @@ function failLines(
  */
 function suggestionLines(sr: StageRun, stageName: string, attempts: Attempt[]): string[] {
   if (sr.status !== 'passed') return [];
-  const suggestions = reviewOf(attempts)?.issues.filter((i) => i.severity === 'suggestion') ?? [];
+  const suggestions = suggestionsOf(reviewOf(attempts));
   const n = suggestions.length;
   if (n === 0) return [];
   const head = `  ${roundName(stageName, sr.round)}`;
@@ -1172,7 +1214,7 @@ function tookText(times: RunTimes): string {
  * Whether the Run's goal may go into a prompt: anything but the goal of an issue written by
  * someone the Master does not trust, before a human confirmed it.
  */
-function trustedGoal(run: Run): boolean {
+export function trustedGoal(run: Run): boolean {
   const untrusted = run.issue?.untrusted;
   return !untrusted || untrusted.confirmedAt !== null;
 }

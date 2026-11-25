@@ -514,6 +514,52 @@ export function checkPlanItem(body: string, number: number): string {
 }
 
 /**
+ * In the footer of an iteration's closing step once the review suggestions of the iteration were
+ * added to its requirement (`withReviewSuggestions`), so that they are added once. Part of the
+ * protocol, the same in every language.
+ */
+export const REVIEW_SUGGESTIONS_MARKER = '<!-- ares1:review-suggestions -->';
+
+const REVIEW_SUGGESTIONS = /<!--\s*ares1:review-suggestions\s*-->/;
+
+/** Whether the review suggestions were added to the body already, by the marker in its footer. */
+export function hasReviewSuggestions(body: string): boolean {
+  return REVIEW_SUGGESTIONS.test(footerOf(body));
+}
+
+/**
+ * The body of an iteration's closing step with `section` (the review suggestions, see
+ * `closeoutSuggestions` in src/backlog/iterations.ts) added at the end of its requirement, before
+ * the footer, so that the goal of its Run has them (`goalFromIssue`); REVIEW_SUGGESTIONS_MARKER
+ * ends the footer. A body whose footer is gone gets one with the marker alone.
+ */
+export function withReviewSuggestions(body: string, section: string): string {
+  const cut = body.indexOf(FOOTER_MARKER);
+  const head = (cut >= 0 ? body.slice(0, cut) : body).trimEnd();
+  const footer = cut >= 0 ? body.slice(cut).trimEnd() : FOOTER_MARKER;
+  return [head, '', section.trim(), '', footer, REVIEW_SUGGESTIONS_MARKER].join('\n');
+}
+
+/**
+ * In the summary the Master posts on an iteration's issue once every child is done, so that it
+ * is posted once even if the Master stopped before recording it. Part of the protocol.
+ */
+export const ITERATION_SUMMARY_MARKER = '<!-- ares1:iteration-summary -->';
+
+/** The comment with an iteration's summary, as posted (before `markComment`). */
+export function iterationSummaryComment(summary: string): string {
+  return `${summary.trimEnd()}\n\n${ITERATION_SUMMARY_MARKER}`;
+}
+
+/**
+ * Whether a comment is the Master's summary of an iteration: its marker in a comment the Master
+ * posted (`isMasterCommentBy`), so that nobody keeps the summary from being posted by copying it.
+ */
+export function isIterationSummaryComment(comment: GhComment, master: string | null): boolean {
+  return isMasterCommentBy(comment, master) && comment.body.includes(ITERATION_SUMMARY_MARKER);
+}
+
+/**
  * Whether an iteration's body lists every one of the child issues `numbers` as an item of its
  * plan's task list, checked or not: once it does, the plan was written out with them.
  */

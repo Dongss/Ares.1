@@ -96,6 +96,22 @@ const SAMPLES: [string, Record<string, unknown>][] = [
   ['issue.auto_accepted', { repo: 'demo', issue: 12 }],
   ['iteration.auto_accepted', { repo: 'demo', iterationId: 'iteration-1', issue: 20 }],
   ['iteration.accepted', { repo: 'demo', iterationId: 'iteration-1', issue: 20 }],
+  [
+    'iteration.child_status',
+    {
+      repo: 'demo',
+      iterationId: 'iteration-1',
+      issue: 20,
+      position: 2,
+      child: 22,
+      status: 'running',
+      previous: 'ready',
+    },
+  ],
+  [
+    'iteration.completed',
+    { repo: 'demo', iterationId: 'iteration-1', issue: 20, costUsd: 1.5, runs: 4 },
+  ],
   ['proposal.auto_accepted', { repo: 'demo', proposalId: 'proposal-1', runId: 'run-1' }],
   ['proposal.accepted', { repo: 'demo', proposalId: 'proposal-1', runId: 'run-1' }],
   // The reason is a human's own words, kept as written: English here, so the check below holds.
@@ -472,6 +488,33 @@ describe('globalEventText', () => {
     );
     expect(text('iteration.accepted', { repo: 'demo' })).toBe(
       'Iteration of demo was accepted as a whole; its sub-issues start in the order of their dependencies',
+    );
+  });
+
+  it('says where a step of an iteration stands now, and that an iteration is done and what it used', () => {
+    const step = { repo: 'demo', iterationId: 'iteration-1', issue: 20, position: 2, child: 22 };
+    expect(text('iteration.child_status', { ...step, status: 'running' })).toBe(
+      'demo 的迭代 #20：第 2 步（#22）开工了',
+    );
+    expect(text('iteration.child_status', { ...step, status: 'waiting' })).toBe(
+      'demo 的迭代 #20：第 2 步（#22）在等它依赖的步骤完成',
+    );
+    const done = { repo: 'demo', iterationId: 'iteration-1', issue: 20, costUsd: 1.5, runs: 4 };
+    expect(text('iteration.completed', done)).toBe(
+      'demo 的迭代 #20 全部完成：用了 4 个 Run，共 $1.50；总结发在了迭代 issue 上',
+    );
+    setLang('en');
+    expect(text('iteration.child_status', { ...step, status: 'done' })).toBe(
+      'Iteration #20 of demo: step 2 (#22) is done',
+    );
+    expect(text('iteration.child_status', { repo: 'demo', status: 'mystery' })).toBe(
+      'Iteration of demo: a step changed',
+    );
+    expect(text('iteration.completed', done)).toBe(
+      'Iteration #20 of demo is done: 4 Runs, $1.50 in all; its summary is posted on the iteration issue',
+    );
+    expect(text('iteration.completed', { repo: 'demo', runs: 1 })).toBe(
+      'An iteration of demo is done: 1 Run',
     );
   });
 

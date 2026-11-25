@@ -336,6 +336,63 @@ export function globalEventText(event: GlobalEvent, now = new Date()): string | 
             en: `Iteration${which} of ${repoOf(event)} was accepted as a whole; its sub-issues start in the order of their dependencies`,
           });
     }
+    case 'iteration.child_status': {
+      const issue = num(d.issue);
+      const position = num(d.position);
+      const child = num(d.child);
+      const iteration = t({
+        zh: `${repoOf(event)} 的迭代${issue === null ? '' : ` #${issue}`}`,
+        en: `Iteration${issue === null ? '' : ` #${issue}`} of ${repoOf(event)}`,
+      });
+      const step =
+        position === null
+          ? t({ zh: '一步', en: 'a step' })
+          : t({
+              zh: `第 ${position} 步${child === null ? '' : `（#${child}）`}`,
+              en: `step ${position}${child === null ? '' : ` (#${child})`}`,
+            });
+      const what = t<Record<string, string>>({
+        zh: {
+          waiting: '在等它依赖的步骤完成',
+          ready: '可以开工了',
+          running: '开工了',
+          done: '完成了',
+          failed: '失败了',
+          dropped: '不做了',
+        },
+        en: {
+          waiting: 'waits for the steps it depends on',
+          ready: 'can start',
+          running: 'started',
+          done: 'is done',
+          failed: 'failed',
+          dropped: 'was dropped',
+        },
+      })[str(d.status) ?? ''];
+      const changed = what ?? t({ zh: '状态变了', en: 'changed' });
+      return t({ zh: `${iteration}：${step}${changed}`, en: `${iteration}: ${step} ${changed}` });
+    }
+    case 'iteration.completed': {
+      const issue = num(d.issue);
+      const runs = num(d.runs);
+      const cost = num(d.costUsd);
+      const used =
+        runs === null
+          ? ''
+          : t({
+              zh: `：用了 ${runs} 个 Run${cost === null ? '' : `，共 $${cost.toFixed(2)}`}`,
+              en: `: ${runs} ${runs === 1 ? 'Run' : 'Runs'}${cost === null ? '' : `, $${cost.toFixed(2)} in all`}`,
+            });
+      return issue === null
+        ? t({
+            zh: `${repoOf(event)} 的迭代全部完成${used}`,
+            en: `An iteration of ${repoOf(event)} is done${used}`,
+          })
+        : t({
+            zh: `${repoOf(event)} 的迭代 #${issue} 全部完成${used}；总结发在了迭代 issue 上`,
+            en: `Iteration #${issue} of ${repoOf(event)} is done${used}; its summary is posted on the iteration issue`,
+          });
+    }
     case 'proposal.auto_accepted':
     case 'proposal.accepted': {
       const runId = str(d.runId);
