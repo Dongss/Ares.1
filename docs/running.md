@@ -324,6 +324,19 @@ github:
 
 错误输出和 Agent 写的总结常带着本机的绝对路径，比如 `/Users/<用户名>/.ares1/worktrees/run-…`，发到公开仓库就会把系统用户名和目录结构公开出去。所以 Master 发到 GitHub 的文字（issue 评论、侦察提案 issue 的标题和正文、Master 提交的提交信息）里，以用户目录开头的路径都换成 `~`，比如 `~/.ares1/worktrees/run-…`；不在用户目录下的路径保持原样。看板和本地日志照旧显示完整路径，方便排查。提交信息是提交时就替换好的，所以看板上看到的提交信息也是 `~`。
 
+## 不用 GitHub 时
+
+没有 GitHub 的仓库（本地仓库、托管在别处的项目）写在 `config.yaml` 的 `backlog.repos` 里，需求来自 Master 自己保存的本地提案池：侦察的提案存在 Master 里，在自动采纳范围内的直接建成 Run，其余的等人在看板上采纳或填理由拒绝。这一切都不调用 GitHub。
+
+### 本地提案池的 API
+
+- `GET /api/backlog`：本地提案池的状态。`enabled` 表示 `config.yaml` 有 `backlog` 一节，`pollMinutes` 是 `backlog.poll_minutes`，`lastPollAt` 是上一轮检查的时间（还没检查过时为 `null`），`lastError` 是上一轮没做成的事（下一轮全部做成后清空）。`repos` 按 `backlog.repos` 的顺序列出每个仓库，字段和 `GET /api/github` 里每个仓库共有的部分相同：`name`、`template`、`problems`（Master 为什么不能处理这个仓库，比如配置有误、没在看板上登记）、`scout`（`agent`、`auto`、`intervalMinutes`、`maxProposals`、`running`、`lastAt`，以及 `waiting`：上一轮检查时自动侦察为什么没开始；没配侦察时为 `null`）、`autoAccept`（`maxRisk`、`maxSize`、`maxPerDay`、当天已自动采纳的 `usedToday`）、`autoMerge`、`budget`（`dailyUsd`、`spentToday`、`reached`），另外 `pendingProposals` 是等人或等自动采纳的提案数。
+- `POST /api/backlog/poll`：马上检查一轮（自动采纳范围内的待处理提案、能开始的自动侦察），不等下一轮；返回检查后的状态，格式同上。
+- `GET /api/proposals`：本地提案，新的在前。参数 `repo`（仓库名或 id）只列这个仓库的，`status`（`pending`、`accepted`、`rejected`）只列这个状态的，`limit`（1–500 的整数）最多返回几条，不写时全部返回。每一项除了提案本身的字段（`id`、`repoId`、`scoutId`、`title`、`category`、`size`、`risk`、`why`、`evidence`、`what`、`acceptance`、`status`、`rejectReason`、`auto`、`runId`、`createdAt`、`decidedAt`），还有仓库名 `repo` 和建出的 Run 的状态 `runStatus`（还没采纳时为 `null`）。参数不合法时返回 400，仓库不存在时返回 404。
+- `POST /api/proposals/:id/accept`：采纳一条待处理的提案，用提案正文作为目标建 Run（模板和 `auto_merge` 按这个仓库在 `backlog.repos` 里的设置），返回 `{ proposal, run }`：采纳后的提案（格式同上）和建出的 Run（格式同 `GET /api/runs` 的各项）。提案不存在时返回 404；已经采纳或拒绝过，或者仓库已经不在 `backlog.repos` 里、配置有误时返回 409。
+- `POST /api/proposals/:id/reject`：拒绝一条待处理的提案，请求体是 `{ "reason": "…" }`，理由必填，去掉首尾空白后为空时返回 400。理由会和提案一起出现在这个仓库之后的侦察提示词里，作为不要再提的反例。返回拒绝后的提案；不存在时返回 404，已经采纳或拒绝过时返回 409。
+- `POST /api/scouts`：手动侦察，请求体是 `{ "repo": "<仓库名>" }`。仓库在 `backlog.repos` 里时交给本地提案池，提案写进本地提案池；在 `github.repos` 里时照旧建 issue。同一个仓库同时写在两处属于配置错误，这时 `backlog.repos` 里的设置不生效，按 GitHub 侦察。两处都没有时返回 404。
+
 ## Agent 用的 CLI
 
 `agents.yaml` 里每个 Agent 的 `cli` 决定用哪个 CLI 运行它。可执行文件默认从 PATH 里找，不在 PATH 上时在 `config.yaml` 的 `bins` 里写路径（键就是 `cli` 的值，改了要重启 Master）。看板「配置」页的 Agent 一节列出了 Master 支持的 CLI 和其中能以只读方式运行的（API `GET /api/config` 的 `clis`：每项是 `{ cli, readOnly }`）；某个 Agent 的设置它的 CLI 做不到时（比如下面 Codex 的 `permission: safe`），「配置」页和「Agent」页在这个 Agent 的状态下面写明，API 里是 `agentEntries` 各项的 `warnings`，键为 `agents.yaml#<id>` 的 `warnings` 里也有一份。

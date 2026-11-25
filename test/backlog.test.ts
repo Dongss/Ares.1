@@ -173,7 +173,7 @@ describe('local backlog', () => {
     expect(demoStatus(t)).toMatchObject({
       template: 'dev',
       problems: [],
-      pending: 1,
+      pendingProposals: 1,
       autoAccept: { maxRisk: 'low', maxSize: 'L', maxPerDay: null, usedToday: 1 },
       autoMerge: true,
       budget: { dailyUsd: null, spentToday: 0.5, reached: false },
@@ -203,7 +203,7 @@ describe('local backlog', () => {
     // Polls leave them to a human.
     await t.master.backlog.poll();
     expect(t.master.store.listRuns()).toHaveLength(0);
-    expect(demoStatus(t)?.pending).toBe(2);
+    expect(demoStatus(t)?.pendingProposals).toBe(2);
     expect(demoStatus(t)?.scout?.waiting?.reason).toBe('只在看板上手动触发');
 
     const accepted = t.master.backlog.accept(wanted.id);
@@ -243,7 +243,7 @@ describe('local backlog', () => {
     expect(() => t.master.backlog.reject(unwanted.id, '再拒一次')).toThrow(InvalidStateError);
     expect(() => t.master.backlog.accept('proposal_none')).toThrow(NotFoundError);
     expect(() => t.master.backlog.reject('proposal_none', '没有')).toThrow(NotFoundError);
-    expect(demoStatus(t)?.pending).toBe(0);
+    expect(demoStatus(t)?.pendingProposals).toBe(0);
 
     // The next scout is shown the accepted one with its Run, and the rejected one with the reason.
     t.scripts.scout = () => ({ structured: { gaps: [], proposals: [] } });

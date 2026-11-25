@@ -19,6 +19,7 @@ import type {
   Attempt,
   BlockKind,
   CheckResult,
+  Proposal,
   Repo,
   Run,
   RunStatus,
@@ -397,10 +398,10 @@ export interface GitHubStatus {
 /** One repo whose requirements come from the local backlog (backlog.repos). */
 export interface BacklogRepoStatus extends ProposalSourceStatus {
   /** Proposals waiting for a human or for the automatic acceptance. */
-  pending: number;
+  pendingProposals: number;
 }
 
-/** The local backlog of the repos without GitHub. */
+/** GET /api/backlog: the local backlog of the repos without GitHub. */
 export interface BacklogStatus {
   /** config.yaml has a `backlog` section. */
   enabled: boolean;
@@ -409,6 +410,20 @@ export interface BacklogStatus {
   /** The last thing a poll could not do; cleared by a poll without errors. */
   lastError: { message: string; at: string } | null;
   repos: BacklogRepoStatus[];
+}
+
+/** GET /api/proposals: a proposal of the local backlog, newest first. */
+export interface ProposalView extends Proposal {
+  /** Name of its repo as registered on the dashboard. */
+  repo: string;
+  /** Status of the Run it became once accepted; null before, or when there is no such Run. */
+  runStatus: RunStatus | null;
+}
+
+/** POST /api/proposals/:id/accept: the proposal, accepted, and the Run created from it. */
+export interface ProposalAccepted {
+  proposal: ProposalView;
+  run: RunSummary;
 }
 
 /** GET /api/upgrade: the Master upgrading itself. */

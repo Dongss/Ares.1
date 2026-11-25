@@ -21,6 +21,7 @@ import {
   recordedLimitWait,
   redoDelayMs,
   redoDueAt,
+  requirementSource,
   resolveTemplate,
   roomUnderMaxRuns,
   scoutBackoff,
@@ -2897,6 +2898,31 @@ describe('holdsScout', () => {
     expect(holding('high', 'L')).toEqual(kinds.map((k) => `${k.risk}/${k.size}`));
     // Without a scout record its kind is not known: it counts, to stay safe.
     expect(holdsScout(null, { max_risk: 'low', max_size: 'S' })).toBe(true);
+  });
+});
+
+describe('requirementSource', () => {
+  const source = (github: string[] | null, backlog: string[] | null, name: string) => {
+    const repos = (names: string[]) => Object.fromEntries(names.map((n) => [n, {}]));
+    return requirementSource(
+      {
+        github: github ? ({ repos: repos(github) } as never) : undefined,
+        backlog: backlog ? ({ repos: repos(backlog) } as never) : undefined,
+      },
+      name,
+    );
+  };
+
+  it('tells GitHub issues from the local backlog, GitHub keeping a repo in both', () => {
+    expect(source(['a'], ['b'], 'a')).toBe('github');
+    expect(source(['a'], ['b'], 'b')).toBe('backlog');
+    expect(source(null, ['b'], 'b')).toBe('backlog');
+    // In both: a configuration error that disables only the backlog entry.
+    expect(source(['a'], ['a'], 'a')).toBe('github');
+    expect(source(['a'], ['b'], 'c')).toBeNull();
+    expect(source(null, null, 'a')).toBeNull();
+    // Names of the object's prototype are no repos.
+    expect(source([], [], 'constructor')).toBeNull();
   });
 });
 

@@ -140,7 +140,8 @@ test/
     `src/engine/discussion.ts`), rate-limit waits of Runs and scouts,
     the redo wait (`redoDelayMs` / `redoDueAt`), raw log retention (`runRawLogsExpired` /
     `scoutRawLogExpired`), leftover worktrees (`leftoverWorkspaces`), which template a repo's
-    Runs get by id, the home directory's or the repo's own (`resolveTemplate`), whether a repo
+    Runs get by id, the home directory's or the repo's own (`resolveTemplate`), where a repo's
+    requirements come from, GitHub or the local backlog (`requirementSource`), whether a repo
     delivers through pull requests (`deliversByPr`), the limit on Runs executing across repos
     and which queued Runs wait for it (`roomUnderMaxRuns` / `waitsForMaxRuns`), the paths a Run
     expects to change and whether two Runs' paths overlap (`normalizeTouches` /

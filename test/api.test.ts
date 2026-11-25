@@ -6,6 +6,8 @@ import { statsSince } from '../src/api/stats.js';
 import type {
   AgentEventRecord,
   AgentSummary,
+  BacklogRepoStatus,
+  BacklogStatus,
   ConfigView,
   ConflictWait,
   GitHubStatus,
@@ -13,6 +15,8 @@ import type {
   KeptWorkspace,
   LiveAgentEvent,
   NotifyTestResult,
+  ProposalAccepted,
+  ProposalView,
   RawLogMissing,
   RunSummary,
   StatsView,
@@ -24,7 +28,7 @@ import { setLang } from '../src/i18n.js';
 import { type ExecFile, noticeScript } from '../src/notify/system.js';
 import { testNoticeText } from '../src/notify/test-notice.js';
 import type { Fetch } from '../src/notify/webhook.js';
-import type { Attempt, EventRow, Run, RunStatus, Scout } from '../src/store/types.js';
+import type { Attempt, EventRow, Proposal, Run, RunStatus, Scout } from '../src/store/types.js';
 import {
   ASSESS_AGENTS_YAML,
   ASSESS_WORKFLOW_YAML,
@@ -1428,6 +1432,357 @@ ${lines}`;
     expect(await repo()).toMatchObject({ push: false, deliver: 'pr', problems: [problem] });
     const { json } = (await call('GET', '/api/config')) as { json: ConfigView };
     expect(json.errors[githubConfigKey('demo')]).toEqual([problem]);
+  });
+});
+
+describe('local backlog API', () => {
+  const AGENTS = `${TEST_AGENTS_YAML}
+  scout:
+    cli: fake
+    model: scout
+`;
+  /** Only backlog.repos; `other` is not registered on the dashboard. */
+  const CONFIG = `
+backlog:
+  poll_minutes: 7
+  repos:
+    demo:
+      template: dev
+      scout:
+        agent: scout
+        auto: false
+        max_proposals: 3
+      auto_accept:
+        max_risk: low
+        max_size: M
+        max_per_day: 2
+      auto_merge: true
+      daily_budget_usd: 5
+    other:
+      template: dev
+`;
+  let gh: FakeGitHub;
+
+  /** A Master whose GitHub is fake, so that any call to it shows in `gh.calls`. */
+  async function start(config = CONFIG): Promise<Harness> {
+    gh = new FakeGitHub();
+    h = await harness({ agents: AGENTS, config, github: gh });
+    return h;
+  }
+
+  /** A pending proposal of the repo, as a scout files it. */
+  const propose = (repoId: string, title: string, risk: Proposal['risk'] = 'high') =>
+    (h as Harness).master.store.createProposal({
+      repoId,
+      scoutId: null,
+      title,
+      category: 'improvement',
+      size: 'M',
+      risk,
+      why: `${title}的原因`,
+      evidence: ['run_abc 返工了 3 轮'],
+      what: `${title}的做法`,
+      acceptance: ['测试通过'],
+    });
+
+  const titles = async (path: string) =>
+    ((await call('GET', path)).json as ProposalView[]).map((p) => p.title);
+
+  /** Wait until the scout has ended, its temporary worktree deleted. */
+  async function scoutDone(t: Harness, id: string): Promise<Scout> {
+    await waitFor(
+      () => t.master.store.getScout(id).status !== 'running' && !t.master.scouting.running,
+      'scout to finish',
+    );
+    return t.master.store.getScout(id);
+  }
+
+  it("gives each repo's settings, scout, auto-accept and pending proposals", async () => {
+    const t = await start();
+    propose(t.repo.id, '要人定的');
+    const rejected = propose(t.repo.id, '不想要的');
+    t.master.store.updateProposal(rejected.id, { status: 'rejected', rejectReason: '不划算' });
+
+    const res = await call('GET', '/api/backlog');
+    expect(res.status).toBe(200);
+    expect(res.json as BacklogStatus).toEqual({
+      enabled: true,
+      pollMinutes: 7,
+      lastPollAt: null,
+      lastError: null,
+      repos: [
+        {
+          name: 'demo',
+          template: 'dev',
+          problems: [],
+          scout: {
+            agent: 'scout',
+            auto: false,
+            intervalMinutes: 0,
+            maxProposals: 3,
+            running: false,
+            lastAt: null,
+            waiting: null,
+          },
+          autoAccept: { maxRisk: 'low', maxSize: 'M', maxPerDay: 2, usedToday: 0 },
+          autoMerge: true,
+          budget: { dailyUsd: 5, spentToday: 0, reached: false },
+          pendingProposals: 1,
+        },
+        {
+          name: 'other',
+          template: 'dev',
+          problems: ['仓库 other 没有在看板上登记'],
+          scout: null,
+          autoAccept: { maxRisk: 'none', maxSize: 'L', maxPerDay: null, usedToday: 0 },
+          autoMerge: false,
+          budget: { dailyUsd: null, spentToday: 0, reached: false },
+          pendingProposals: 0,
+        },
+      ] satisfies BacklogRepoStatus[],
+    });
+
+    // A poll now: the proposal beyond auto-accept stays for a human, the scout only by hand.
+    const polled = await call('POST', '/api/backlog/poll');
+    expect(polled.status).toBe(200);
+    const status = polled.json as BacklogStatus;
+    expect(status.lastPollAt).toEqual(expect.any(String));
+    expect(status.repos[0]).toMatchObject({
+      pendingProposals: 1,
+      scout: { waiting: { reason: '只在看板上手动触发' } },
+    });
+    expect(t.master.store.listRuns()).toHaveLength(0);
+    expect(gh.calls).toEqual([]);
+  });
+
+  it('is disabled without a backlog section', async () => {
+    // The config.yaml written on first start.
+    h = await harness();
+    expect((await call('GET', '/api/backlog')).json).toEqual({
+      enabled: false,
+      pollMinutes: 5,
+      lastPollAt: null,
+      lastError: null,
+      repos: [],
+    } satisfies BacklogStatus);
+    expect((await call('GET', '/api/proposals')).json).toEqual([]);
+  });
+
+  it('lists proposals newest first, filtered by repo and status', async () => {
+    const t = await start();
+    const other = t.master.store.createRepo({
+      name: 'other',
+      path: initRepo(),
+      targetBranch: 'main',
+      verifyCommands: [],
+      setupCommands: [],
+      mergeMode: 'direct',
+    });
+    propose(t.repo.id, 'A');
+    const b = propose(t.repo.id, 'B');
+    t.master.store.updateProposal(b.id, { status: 'rejected', rejectReason: '不划算' });
+    propose(other.id, 'C');
+
+    const all = await call('GET', '/api/proposals');
+    expect(all.status).toBe(200);
+    expect((all.json as ProposalView[]).map((p) => [p.title, p.repo, p.status])).toEqual([
+      ['C', 'other', 'pending'],
+      ['B', 'demo', 'rejected'],
+      ['A', 'demo', 'pending'],
+    ]);
+    expect(all.json[1]).toMatchObject({
+      id: b.id,
+      repoId: t.repo.id,
+      rejectReason: '不划算',
+      runId: null,
+      runStatus: null,
+      evidence: ['run_abc 返工了 3 轮'],
+      acceptance: ['测试通过'],
+    });
+    expect(await titles('/api/proposals?repo=demo')).toEqual(['B', 'A']);
+    expect(await titles(`/api/proposals?repo=${other.id}`)).toEqual(['C']);
+    expect(await titles('/api/proposals?status=pending')).toEqual(['C', 'A']);
+    expect(await titles('/api/proposals?repo=demo&status=rejected')).toEqual(['B']);
+    expect(await titles('/api/proposals?repo=demo&status=accepted')).toEqual([]);
+    expect(await titles('/api/proposals?limit=2')).toEqual(['C', 'B']);
+
+    expect((await call('GET', '/api/proposals?status=done')).status).toBe(400);
+    expect((await call('GET', '/api/proposals?limit=0')).status).toBe(400);
+    expect((await call('GET', '/api/proposals?limit=501')).status).toBe(400);
+    expect((await call('GET', '/api/proposals?state=pending')).status).toBe(400);
+    expect((await call('GET', '/api/proposals?repo=nowhere')).status).toBe(404);
+  });
+
+  it('accepts a proposal into a Run, and rejects one only with a reason', async () => {
+    const t = await start();
+    const wanted = propose(t.repo.id, '要人定的');
+    const unwanted = propose(t.repo.id, '不想要的', 'mid');
+
+    const accepted = await call('POST', `/api/proposals/${wanted.id}/accept`);
+    expect(accepted.status).toBe(200);
+    const { proposal, run } = accepted.json as ProposalAccepted;
+    expect(run).toMatchObject({ repoId: t.repo.id, templateName: '测试流程' });
+    expect(run.goal.startsWith('要人定的\n\n')).toBe(true);
+    expect(proposal).toMatchObject({
+      id: wanted.id,
+      repo: 'demo',
+      status: 'accepted',
+      auto: false,
+      runId: run.id,
+      runStatus: run.status,
+      decidedAt: expect.any(String),
+    });
+    expect(t.master.store.getProposal(wanted.id).status).toBe('accepted');
+    await t.waitStatus(run.id, 'completed');
+    expect((await call('GET', '/api/proposals?status=accepted')).json).toMatchObject([
+      { id: wanted.id, runId: run.id, runStatus: 'completed' },
+    ]);
+
+    // Decided already.
+    const again = await call('POST', `/api/proposals/${wanted.id}/accept`);
+    expect(again).toMatchObject({
+      status: 409,
+      json: { error: `提案 ${wanted.id} 已经采纳过了` },
+    });
+    expect(
+      (await call('POST', `/api/proposals/${wanted.id}/reject`, { reason: '不要了' })).status,
+    ).toBe(409);
+
+    // A reason is required.
+    for (const input of [{ reason: ' \n ' }, { reason: '' }, {}, undefined]) {
+      const res = await call('POST', `/api/proposals/${unwanted.id}/reject`, input);
+      expect(res.status).toBe(400);
+      expect(res.json.error).toContain('拒绝提案时必须填写理由');
+    }
+    expect(
+      (await call('POST', `/api/proposals/${unwanted.id}/reject`, { reason: 'x', why: 'y' }))
+        .status,
+    ).toBe(400);
+    expect(t.master.store.getProposal(unwanted.id).status).toBe('pending');
+
+    const rejected = await call('POST', `/api/proposals/${unwanted.id}/reject`, {
+      reason: ' 太复杂，不划算 \n',
+    });
+    expect(rejected.status).toBe(200);
+    expect(rejected.json as ProposalView).toMatchObject({
+      id: unwanted.id,
+      repo: 'demo',
+      status: 'rejected',
+      rejectReason: '太复杂，不划算',
+      runId: null,
+      runStatus: null,
+    });
+    expect(await call('POST', `/api/proposals/${unwanted.id}/accept`)).toMatchObject({
+      status: 409,
+      json: { error: `提案 ${unwanted.id} 已经被拒绝了` },
+    });
+    expect(
+      (await call('POST', `/api/proposals/${unwanted.id}/reject`, { reason: '再拒' })).status,
+    ).toBe(409);
+
+    expect((await call('POST', '/api/proposals/proposal_none/accept')).status).toBe(404);
+    expect(
+      (await call('POST', '/api/proposals/proposal_none/reject', { reason: '没有' })).status,
+    ).toBe(404);
+    expect(t.master.store.listRuns()).toHaveLength(1);
+    expect(gh.calls).toEqual([]);
+  });
+
+  it('scouts a repo of backlog.repos by hand without GitHub, showing it the rejected reasons', async () => {
+    const t = await start();
+    const unwanted = propose(t.repo.id, '不想要的');
+    await call('POST', `/api/proposals/${unwanted.id}/reject`, { reason: '和目标无关' });
+    t.scripts.scout = () => ({
+      structured: {
+        gaps: [],
+        proposals: [
+          {
+            title: '要人定的',
+            category: 'improvement',
+            size: 'M',
+            risk: 'high',
+            why: '原因',
+            evidence: ['run_abc 返工了 3 轮'],
+            what: '做法',
+            acceptance: ['测试通过'],
+          },
+        ],
+      },
+    });
+
+    const res = await call('POST', '/api/scouts', { repo: 'demo' });
+    expect(res.status).toBe(201);
+    expect(res.json as Scout).toMatchObject({
+      repoId: t.repo.id,
+      trigger: 'manual',
+      agentId: 'scout',
+      issuesRepo: '',
+    });
+    const done = await scoutDone(t, res.json.id);
+    expect(done.status).toBe('completed');
+    const prompt = t.fake.calls.filter((c) => c.model === 'scout').at(-1)?.prompt ?? '';
+    expect(prompt).toContain('不想要的');
+    expect(prompt).toContain('和目标无关');
+    expect(await titles('/api/proposals?repo=demo&status=pending')).toEqual(['要人定的']);
+
+    // A repo not registered on the dashboard, and one of neither source.
+    expect(await call('POST', '/api/scouts', { repo: 'other' })).toMatchObject({
+      status: 404,
+      json: { error: '仓库 other 没有在看板上登记' },
+    });
+    expect(await call('POST', '/api/scouts', { repo: 'nowhere' })).toMatchObject({
+      status: 404,
+      json: { error: 'config.yaml 的 github.repos 和 backlog.repos 里都没有 nowhere' },
+    });
+    expect(gh.calls).toEqual([]);
+  });
+
+  it('scouts a repo in both github.repos and backlog.repos through GitHub', async () => {
+    const t = await start(`
+github:
+  repos:
+    demo:
+      template: dev
+      scout: { agent: scout, auto: false }
+backlog:
+  repos:
+    demo:
+      template: dev
+      scout: { agent: scout, auto: false }
+`);
+    t.scripts.scout = () => ({ structured: { gaps: [], proposals: [] } });
+    const res = await call('POST', '/api/scouts', { repo: 'demo' });
+    expect(res.status).toBe(201);
+    expect((res.json as Scout).issuesRepo).not.toBe('');
+    await scoutDone(t, res.json.id);
+    expect(gh.calls.length).toBeGreaterThan(0);
+    // The backlog entry is the one disabled, with the reason.
+    const status = (await call('GET', '/api/backlog')).json as BacklogStatus;
+    expect(status.repos[0]?.problems[0]).toContain('同时写在 github.repos 和 backlog.repos 里');
+  });
+
+  it('answers in English', async () => {
+    const t = await start();
+    // After the Master took config.yaml's language.
+    setLang('en');
+    const p = propose(t.repo.id, 'Wanted');
+    const res = await call('POST', `/api/proposals/${p.id}/reject`, { reason: ' ' });
+    expect(res).toMatchObject({
+      status: 400,
+      json: { error: 'reason: Rejecting a proposal needs a reason' },
+    });
+    expect((await call('POST', `/api/proposals/${p.id}/accept`)).status).toBe(200);
+    const again = await call('POST', `/api/proposals/${p.id}/accept`);
+    expect(again.json.error).toBe(`Proposal ${p.id} was accepted already`);
+    const scout = await call('POST', '/api/scouts', { repo: 'nowhere' });
+    expect(scout.json.error).toBe(
+      'nowhere is in neither github.repos nor backlog.repos of config.yaml',
+    );
+    const status = (await call('GET', '/api/backlog')).json as BacklogStatus;
+    expect(status.repos[1]?.problems).toEqual(['Repo other is not registered on the dashboard']);
+    for (const text of [res.text, again.text, scout.text, JSON.stringify(status)]) {
+      expect(text).not.toMatch(/[一-鿿]/);
+    }
   });
 });
 

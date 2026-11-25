@@ -337,6 +337,7 @@ export class Master {
       store,
       engine,
       issues,
+      backlog,
       upgrader,
       version,
       config,

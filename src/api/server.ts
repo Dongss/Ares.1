@@ -3,7 +3,13 @@ import { isAbsolute, resolve } from 'node:path';
 import { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
 import { z } from 'zod';
-import { RAW_LOG_KEEP_DAYS, redoDueAt, runRawLogsExpired } from '../config/flow.js';
+import type { LocalBacklog } from '../backlog/local.js';
+import {
+  RAW_LOG_KEEP_DAYS,
+  redoDueAt,
+  requirementSource,
+  runRawLogsExpired,
+} from '../config/flow.js';
 import type { LoadedConfig } from '../config/load.js';
 import type { ConfigStatus } from '../config/watch.js';
 import { type Engine, InvalidStateError, readAttemptEvents } from '../engine/engine.js';
@@ -14,7 +20,7 @@ import { type ExecFile, systemNoticeSupported } from '../notify/system.js';
 import { sendTestNotice } from '../notify/test-notice.js';
 import type { WebhookNotifier } from '../notify/webhook.js';
 import { ConflictError, NotFoundError, type Store } from '../store/store.js';
-import type { EventRow, RunStatus } from '../store/types.js';
+import { type EventRow, PROPOSAL_STATUSES, type Proposal, type RunStatus } from '../store/types.js';
 import type { Upgrader } from '../upgrade/upgrader.js';
 import { branchExists, currentBranch, isGitRepo } from '../workspace/git.js';
 import { agentSummaries } from './agents.js';
@@ -24,6 +30,7 @@ import { mountDashboard } from './static.js';
 import { collectStats, STATS_RANGES } from './stats.js';
 import type {
   AgentSummary,
+  BacklogStatus,
   CliInfo,
   ConfigView,
   GitHubStatus,
@@ -31,6 +38,8 @@ import type {
   KeptWorkspace,
   LiveAgentEvent,
   NotifyTestResult,
+  ProposalAccepted,
+  ProposalView,
   RawLogMissing,
   RunDetail,
   RunSummary,
@@ -44,6 +53,8 @@ export interface ApiDeps {
   engine: Engine;
   /** GitHub Issues as the backlog. */
   issues: IssueBridge;
+  /** The local backlog of the repos without GitHub (backlog.repos). */
+  backlog: LocalBacklog;
   /** The Master upgrading itself. */
   upgrader: Upgrader;
   /** Commit of the running Master's install directory. */
@@ -98,6 +109,18 @@ const RepoPatch = z.strictObject({
 
 const CommentInput = z.strictObject({ comment: z.string().optional() });
 const ScoutInput = z.strictObject({ repo: z.string().min(1) });
+/** Most proposals one request returns. */
+const PROPOSALS_MAX = 500;
+const ProposalsQuery = z.strictObject({
+  repo: z.string().min(1).optional(),
+  status: z.enum(PROPOSAL_STATUSES).optional(),
+  limit: z.coerce.number().int().min(1).max(PROPOSALS_MAX).optional(),
+});
+const reasonNeeded = () =>
+  t({ zh: '拒绝提案时必须填写理由', en: 'Rejecting a proposal needs a reason' });
+const RejectProposalInput = z.strictObject({
+  reason: z.string({ error: reasonNeeded }).trim().min(1, { error: reasonNeeded }),
+});
 const WorkingInput = z.strictObject({ on: z.boolean() });
 const StatsQuery = z.strictObject({
   range: z.enum(STATS_RANGES).default('7d'),
@@ -154,7 +177,7 @@ function query<T>(c: { req: { query: () => Record<string, string> } }, schema: z
  * Listens on 127.0.0.1 only: there is no login.
  */
 export function createApi(deps: ApiDeps): Hono {
-  const { store, engine, issues, upgrader, version, config, configStatus, webDir } = deps;
+  const { store, engine, issues, backlog, upgrader, version, config, configStatus, webDir } = deps;
   const platform = deps.platform ?? process.platform;
   const now = deps.now ?? Date.now;
   const startedAt = new Date().toISOString();
@@ -302,7 +325,10 @@ export function createApi(deps: ApiDeps): Hono {
   });
 
   // ---- runs ----------------------------------------------------------------
-  // There is no endpoint for creating Runs: they only come from GitHub issues (IssueBridge).
+  // There is no endpoint for creating a Run from an arbitrary goal: Runs come from requirements,
+  // either GitHub issues (IssueBridge) or proposals of the local backlog accepted on the dashboard
+  // (POST /api/proposals/:id/accept) or by auto-accept (LocalBacklog); besides those, the Master
+  // only creates the Runs that merge GitHub's commits it could not merge itself.
   app.get('/api/runs', (c) => {
     const status = c.req.query('status') as RunStatus | undefined;
     const repo = c.req.query('repo');
@@ -435,9 +461,62 @@ export function createApi(deps: ApiDeps): Hono {
     return c.json(store.listScouts({ repoId, limit: 30 }));
   });
 
+  // A scout started by hand, by whichever source the repo's requirements come from.
   app.post('/api/scouts', async (c) => {
     const { repo } = await body(c, ScoutInput);
-    return c.json(await issues.startScout(repo, 'manual'), 201);
+    switch (requirementSource(config().master, repo)) {
+      case 'github':
+        return c.json(await issues.startScout(repo, 'manual'), 201);
+      case 'backlog':
+        return c.json(await backlog.startScout(repo, 'manual'), 201);
+      default:
+        throw new NotFoundError(
+          t({
+            zh: `config.yaml 的 github.repos 和 backlog.repos 里都没有 ${repo}`,
+            en: `${repo} is in neither github.repos nor backlog.repos of config.yaml`,
+          }),
+        );
+    }
+  });
+
+  // ---- the local backlog of the repos without GitHub -----------------------
+  app.get('/api/backlog', (c) => c.json(backlog.status() satisfies BacklogStatus));
+
+  // Accept the proposals auto-accept takes and start the scouts that may start, now instead of
+  // at the next poll.
+  app.post('/api/backlog/poll', async (c) => {
+    await backlog.poll();
+    return c.json(backlog.status() satisfies BacklogStatus);
+  });
+
+  // Proposals of the local backlog, newest first; ?repo= and ?status= filter, ?limit= caps.
+  app.get('/api/proposals', (c) => {
+    const { repo, status, limit } = query(c, ProposalsQuery);
+    const repoId = repo ? store.getRepo(repo).id : undefined;
+    const names = new Map(store.listRepos().map((r) => [r.id, r.name]));
+    return c.json(
+      store
+        .listProposals({ repoId, status, limit })
+        .map((p) => proposalView(store, p, names)) satisfies ProposalView[],
+    );
+  });
+
+  // Accepting creates a Run whose goal is the proposal's text.
+  app.post('/api/proposals/:id/accept', (c) => {
+    const proposal = backlog.accept(c.req.param('id'));
+    const run = store.getRun(proposal.runId ?? '');
+    return c.json({
+      proposal: proposalView(store, proposal),
+      run: summarizeRun(store, engine, run),
+    } satisfies ProposalAccepted);
+  });
+
+  // Rejecting needs a reason, which the repo's next scouts are shown.
+  app.post('/api/proposals/:id/reject', async (c) => {
+    const { reason } = await body(c, RejectProposalInput);
+    return c.json(
+      proposalView(store, backlog.reject(c.req.param('id'), reason)) satisfies ProposalView,
+    );
   });
 
   // ---- logs ----------------------------------------------------------------
@@ -514,6 +593,23 @@ export function createApi(deps: ApiDeps): Hono {
 
   mountDashboard(app, webDir);
   return app;
+}
+
+/**
+ * A proposal with its repo's name and the status of the Run it became. `names`: repo names by id,
+ * for listing many; omitted = looked up.
+ */
+function proposalView(store: Store, p: Proposal, names?: Map<string, string>): ProposalView {
+  let runStatus: RunStatus | null = null;
+  if (p.runId) {
+    try {
+      runStatus = store.getRun(p.runId).status;
+    } catch (err) {
+      if (!(err instanceof NotFoundError)) throw err;
+    }
+  }
+  const repo = names ? names.get(p.repoId) : store.findRepo(p.repoId)?.name;
+  return { ...p, repo: repo ?? p.repoId, runStatus };
 }
 
 function summarizeRun(store: Store, engine: Engine, run: ReturnType<Store['getRun']>): RunSummary {

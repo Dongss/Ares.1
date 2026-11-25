@@ -7,8 +7,9 @@
 // many failed scouts in a row a human is notified, how long a failed Run of an issue waits before
 // it is redone, how long a Run or a scout waits for an agent that is out of quota or rate-limited,
 // how long the raw output of agents is kept, which worktrees of failed or cancelled Runs of
-// issues are left over for the Master to remove, whether a repo delivers through pull
-// requests, and how many Runs may execute across every repo (`concurrency.max_runs`).
+// issues are left over for the Master to remove, where a repo's requirements come from (GitHub
+// or the local backlog), whether a repo delivers through pull requests, and how many Runs may
+// execute across every repo (`concurrency.max_runs`).
 // Pure logic (type imports, src/i18n.ts, src/store/types.ts and src/engine/discussion.ts only),
 // so the dashboard shows the same rules the engine applies.
 
@@ -26,6 +27,7 @@ import {
 } from '../store/types.js';
 import type {
   AgentConfig,
+  BacklogConfig,
   Escalate,
   GitHubConfig,
   RunOverrides,
@@ -470,6 +472,23 @@ export function deliversByPr(
   repoName: string,
 ): boolean {
   return github?.repos[repoName]?.deliver === 'pr';
+}
+
+/**
+ * Where a repo's requirements come from: GitHub issues (`github.repos`), the local backlog
+ * (`backlog.repos`), or neither (null). A repo in both is a configuration error that disables
+ * only its backlog entry, so GitHub keeps it.
+ */
+export function requirementSource(
+  master: {
+    github?: Pick<GitHubConfig, 'repos'> | undefined;
+    backlog?: Pick<BacklogConfig, 'repos'> | undefined;
+  },
+  repoName: string,
+): 'github' | 'backlog' | null {
+  if (master.github && Object.hasOwn(master.github.repos, repoName)) return 'github';
+  if (master.backlog && Object.hasOwn(master.backlog.repos, repoName)) return 'backlog';
+  return null;
 }
 
 /**

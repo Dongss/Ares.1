@@ -346,7 +346,8 @@ export interface ScoutProposal {
  * pending: waits for a human, or for the automatic acceptance; accepted: a Run was created from
  * it; rejected: a human turned it down, with a reason the next scouts are shown.
  */
-export type ProposalStatus = 'pending' | 'accepted' | 'rejected';
+export const PROPOSAL_STATUSES = ['pending', 'accepted', 'rejected'] as const;
+export type ProposalStatus = (typeof PROPOSAL_STATUSES)[number];
 
 /**
  * A proposal in the local backlog of a repo without GitHub (backlog.repos): what a scout

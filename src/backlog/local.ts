@@ -394,7 +394,9 @@ export class LocalBacklog {
       if (!repo) problems.push(notRegistered(name));
       return {
         ...this.deps.scouting.sourceStatus(name, cfg, repo, problems, this.scoutWaiting.get(name)),
-        pending: repo ? store.listProposals({ repoId: repo.id, status: 'pending' }).length : 0,
+        pendingProposals: repo
+          ? store.listProposals({ repoId: repo.id, status: 'pending' }).length
+          : 0,
       };
     });
     return {
