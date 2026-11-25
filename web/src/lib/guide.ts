@@ -186,7 +186,8 @@ export interface CycleStage {
 /**
  * The push step of a repo delivering through pull requests (deliver: pr), `target` the target
  * branch in words: the Master pushes the Run's branch and opens the pull request, a human (or
- * GitHub) merges it. Without push: true the repo is disabled, which the step says.
+ * GitHub) merges it, and changes asked for on it, failed checks or a conflict send the Run back
+ * for more work. Without push: true the repo is disabled, which the step says.
  */
 export function prDeliveryStep(github: Pick<GitHubRepoStatus, 'push'>, target: string): CycleStep {
   const id = 'push';
@@ -207,8 +208,8 @@ export function prDeliveryStep(github: Pick<GitHubRepoStatus, 'push'>, target: s
     name,
     actors: ['master', 'human'],
     text: t({
-      zh: `检查通过后 Master 推送 Run 的分支、开一个合并到${target}的 PR，正文用 Closes 关联 issue；你在 GitHub 上合并它之后，Master 把本地的${target}快进，Run 完成、issue 关闭；PR 没合并就被关掉时 Run 失败。${target}本身 Master 从不推送`,
-      en: `Once the checks pass, the Master pushes the Run's branch and opens a pull request into ${target}, linked to the issue with Closes; once you merge it on GitHub, the Master fast-forwards the local ${target}, the Run completes and the issue is closed; if it is closed unmerged, the Run fails. The Master never pushes ${target} itself`,
+      zh: `检查通过后 Master 推送 Run 的分支、开一个合并到${target}的 PR，正文用 Closes 关联 issue；你在 GitHub 上合并它之后，Master 把本地的${target}快进，Run 完成、issue 关闭；仓库成员在 PR 上要求修改、CI 没过或和${target}冲突时，Run 自动回去返工（计入回退上限），改好后推送到同一个 PR；PR 没合并就被关掉时 Run 失败。${target}本身 Master 从不推送`,
+      en: `Once the checks pass, the Master pushes the Run's branch and opens a pull request into ${target}, linked to the issue with Closes; once you merge it on GitHub, the Master fast-forwards the local ${target}, the Run completes and the issue is closed; if a member of the repo asks for changes on it, its checks fail or it conflicts with ${target}, the Run goes back to work on it (counted toward the rollback limit) and pushes the changes to the same pull request; if it is closed unmerged, the Run fails. The Master never pushes ${target} itself`,
     }),
   };
 }

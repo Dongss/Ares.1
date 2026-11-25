@@ -14,13 +14,17 @@ import {
   executingOfMaxText,
   groupRuns,
   ignoredCommentsText,
+  latestPrRework,
   maxRunsWaitText,
   pageTitle,
   patchLineClass,
+  prReworkNote,
+  prReworkReasonText,
   prSummary,
   prWaitHint,
   prWaitText,
   prWaitTitle,
+  pullRequestRework,
   rateLimitText,
   rawLogPrunedText,
   redoText,
@@ -893,26 +897,54 @@ describe('waiting for a pull request', () => {
     expect(prWaitHint()).toBe('在 GitHub 上合并后 Run 自动完成；没合并就关掉，Run 失败');
   });
 
-  it('explains what merging or closing it does', () => {
+  it('explains what merging, asking for changes on or closing it does', () => {
     const lines = prWaitText(waiting({ pr, issue }), 'main');
     expect(lines[0]).toBe('检查已通过，Run 的分支已推送到 GitHub，PR #12 等着合并到 main。');
     expect(lines[1]).toContain('本地的 main 快进到合并后的提交，Run 完成，issue 关闭');
-    expect(lines[2]).toContain('Run 结束为失败；还有重做次数（max_run_attempts）时 issue 自动重做');
-    expect(lines[3]).toContain('等待期间不占执行名额');
-    expect(lines[3]).toContain('终止 Run 不会关闭 GitHub 上的 PR');
+    expect(lines[2]).toBe(
+      'PR 上受信任的人（仓库所有者、成员和协作者）要求修改、CI 检查全部结束且有失败的，或者和 main 冲突时，Master 下次检查 GitHub 时让 Run 带着这些反馈自动回去返工（回到合并阶段的 on_fail 指向的阶段，计入回退上限 max_loops），改好后推送到同一个 PR。其他人的评审不触发返工，也不交给 Agent。',
+    );
+    expect(lines[3]).toContain('Run 结束为失败；还有重做次数（max_run_attempts）时 issue 自动重做');
+    expect(lines[4]).toContain('等待期间不占执行名额');
+    expect(lines[4]).toContain('终止 Run 不会关闭 GitHub 上的 PR');
     // Before the PR is opened, and for a Run without an issue.
     const early = prWaitText(waiting(), 'main');
     expect(early[0]).toContain('Master 下次检查 GitHub 时推送 Run 的分支，开一个合并到 main 的 PR');
     expect(early[1]).not.toContain('issue');
-    expect(early[2]).toBe('PR 没合并就被关掉时，Run 结束为失败。');
+    expect(early[2]).toContain('改好后推送到同一个 PR');
+    expect(early[3]).toBe('PR 没合并就被关掉时，Run 结束为失败。');
   });
 
   it('sums up the PR of any Run that has one', () => {
     expect(prSummary(waiting({ pr }))).toEqual({ label: '#12', note: '（等合并）' });
     expect(prSummary(run('c', 'completed', { pr }))).toEqual({ label: '#12', note: '（已合并）' });
     expect(prSummary(run('f', 'failed', { pr }))).toEqual({ label: '#12', note: null });
+    expect(prSummary(run('x', 'cancelled', { pr }))).toEqual({ label: '#12', note: null });
     expect(prSummary(waiting())).toBeNull();
     expect(prSummary(run('c', 'completed'))).toBeNull();
+  });
+
+  it('says a Run with a PR that neither waits for it nor finished is reworking, and why', () => {
+    for (const status of ['queued', 'running', 'paused', 'waiting_approval'] as const) {
+      expect(prSummary(run('r', status, { pr }))).toEqual({ label: '#12', note: '（返工中）' });
+    }
+    // Stopped at max_loops after reworks (on_exhausted: human): still in the rework.
+    const stuck = run('b', 'blocked', { pr, blocked: { kind: 'max_loops', message: 'x' } });
+    expect(prSummary(stuck)?.note).toBe('（返工中）');
+    const rework = {
+      number: 12,
+      kinds: ['ci', 'review'] as const,
+      reviewers: ['alice'],
+      checks: [{ name: 'build', url: null }],
+    };
+    expect(prSummary(run('r', 'running', { pr }), { ...rework, kinds: [...rework.kinds] })).toEqual(
+      { label: '#12', note: '（返工中：CI 检查没通过：build；@alice 要求修改）' },
+    );
+    // A rework of another pull request, or a Run waiting again, says nothing of it.
+    expect(prSummary(run('r', 'running', { pr }), { ...rework, number: 3, kinds: ['ci'] })).toEqual(
+      { label: '#12', note: '（返工中）' },
+    );
+    expect(prSummary(waiting({ pr }), { ...rework, kinds: ['ci'] })?.note).toBe('（等合并）');
   });
 
   it('words the events of a pull request from their data', () => {
@@ -943,6 +975,158 @@ describe('waiting for a pull request', () => {
     expect(eventText({ type: 'merge.pr_pending', data: {} })).toBeNull();
   });
 
+  const HEAD = '0123456789abcdef0123456789abcdef01234567';
+  const BUILD = { name: 'build', url: 'https://github.com/me/demo/actions/runs/1' };
+  /** The data of a github.pr_rework event, as the engine records it. */
+  const reworkData = (extra: Record<string, unknown> = {}) => ({
+    ...pr,
+    head: HEAD,
+    kinds: ['review'],
+    reviewers: ['alice'],
+    checks: [],
+    ...extra,
+  });
+
+  it('words a rework of the pull request by its kinds, reviewers and failed checks', () => {
+    const AFTER =
+      '。Run 带着这些反馈回到合并阶段的 on_fail 指向的阶段（计入回退上限 max_loops，用完后按 on_exhausted 处理）';
+    const SAME = '，改好后推送到同一个 PR';
+    expect(eventText({ type: 'github.pr_rework', data: reworkData() })).toBe(
+      `PR #12（提交 01234567）需要返工：@alice 要求修改${AFTER}${SAME}`,
+    );
+    expect(
+      eventText({
+        type: 'github.pr_rework',
+        data: reworkData({ kinds: ['ci'], reviewers: [], checks: [BUILD, { name: 'lint' }] }),
+      }),
+    ).toBe(`PR #12（提交 01234567）需要返工：CI 检查没通过：build、lint${AFTER}${SAME}`);
+    // Every kind at once, listed conflict first; the round gone back to merges the target first.
+    expect(
+      eventText({
+        type: 'github.pr_rework',
+        data: reworkData({
+          kinds: ['review', 'ci', 'conflict'],
+          reviewers: ['alice', null],
+          checks: [BUILD],
+        }),
+      }),
+    ).toBe(
+      `PR #12（提交 01234567）需要返工：和目标分支冲突；CI 检查没通过：build；@alice、已删除的账号 要求修改${AFTER}；回到的是 Agent 阶段时，那一轮先合并目标分支、解决冲突${SAME}`,
+    );
+    // Without the head it says no commit.
+    expect(eventText({ type: 'github.pr_rework', data: reworkData({ head: null }) })).toBe(
+      `PR #12 需要返工：@alice 要求修改${AFTER}${SAME}`,
+    );
+    // Data not of that shape only shows itself.
+    for (const bad of [
+      {},
+      reworkData({ number: '12' }),
+      reworkData({ url: undefined }),
+      reworkData({ kinds: [] }),
+      reworkData({ kinds: ['review', 'lint'] }),
+      reworkData({ kinds: 'review' }),
+      reworkData({ reviewers: [1] }),
+      reworkData({ reviewers: undefined }),
+      reworkData({ checks: ['build'] }),
+      reworkData({ checks: [{ url: BUILD.url }] }),
+      reworkData({ checks: null }),
+    ]) {
+      expect(eventText({ type: 'github.pr_rework', data: bad })).toBeNull();
+    }
+  });
+
+  it('names a few failed checks and counts the rest', () => {
+    const checks = ['a', 'b', 'c', 'd', 'e', 'f', 'g'].map((name) => ({ name, url: null }));
+    expect(prReworkReasonText({ kinds: ['ci'], reviewers: [], checks })).toBe(
+      'CI 检查没通过：a、b、c、d、e 等 7 个',
+    );
+    expect(prReworkReasonText({ kinds: ['ci'], reviewers: [], checks: [] })).toBe('CI 检查没通过');
+    expect(prReworkReasonText({ kinds: ['review'], reviewers: [], checks: [] })).toBe(
+      '评审要求修改',
+    );
+  });
+
+  it('reads the rework of the data of its event', () => {
+    expect(
+      pullRequestRework(reworkData({ kinds: ['review', 'conflict'], checks: [BUILD] })),
+    ).toEqual({
+      ...pr,
+      head: HEAD,
+      kinds: ['conflict', 'review'],
+      reviewers: ['alice'],
+      checks: [BUILD],
+    });
+    expect(pullRequestRework(reworkData({ checks: [{ name: 'lint', url: 3 }] }))?.checks).toEqual([
+      { name: 'lint', url: null },
+    ]);
+    expect(pullRequestRework({})).toBeNull();
+  });
+
+  it('words the reworked commits pushed to the same pull request', () => {
+    expect(eventText({ type: 'github.pr_updated', data: { ...pr, head: HEAD } })).toBe(
+      '返工后的提交已推送到 PR #12（head 01234567），PR 接着等合并',
+    );
+    expect(eventText({ type: 'github.pr_updated', data: { ...pr, head: null } })).toBe(
+      '返工后的提交已推送到 PR #12，PR 接着等合并',
+    );
+    expect(eventText({ type: 'github.pr_updated', data: { head: HEAD } })).toBeNull();
+  });
+
+  it('words a review by someone the Master does not trust, which changed nothing', () => {
+    const ignored = { ...pr, head: HEAD, reviewer: 'mallory', association: 'NONE' };
+    expect(eventText({ type: 'github.pr_review_ignored', data: ignored })).toBe(
+      'PR #12 上 @mallory（NONE）要求修改，但不是仓库成员：评审已忽略，不触发返工，内容也不交给 Agent',
+    );
+    expect(
+      eventText({
+        type: 'github.pr_review_ignored',
+        data: { ...ignored, reviewer: null, association: 'CONTRIBUTOR' },
+      }),
+    ).toBe(
+      'PR #12 上 已删除的账号（CONTRIBUTOR）要求修改，但不是仓库成员：评审已忽略，不触发返工，内容也不交给 Agent',
+    );
+    for (const bad of [
+      { ...ignored, reviewer: 3 },
+      { ...ignored, reviewer: undefined },
+      { ...ignored, association: undefined },
+      { ...ignored, number: undefined },
+    ]) {
+      expect(eventText({ type: 'github.pr_review_ignored', data: bad })).toBeNull();
+    }
+  });
+
+  it('finds the latest rework among the events, and words it for the pull request panel', () => {
+    const now = new Date('2026-11-25T12:00:00');
+    const at = (time: string) => new Date(`2026-11-25T${time}`).toISOString();
+    expect(latestPrRework([])).toBeNull();
+    const events = [
+      { type: 'github.pr_opened', data: { ...pr, base: 'main' }, ts: at('09:00:00') },
+      { type: 'github.pr_rework', data: reworkData(), ts: at('10:00:00') },
+      { type: 'github.pr_updated', data: { ...pr, head: HEAD }, ts: at('10:30:00') },
+      // Not of the shape: not counted.
+      { type: 'github.pr_rework', data: reworkData({ kinds: [] }), ts: at('10:45:00') },
+      {
+        type: 'github.pr_rework',
+        data: reworkData({ kinds: ['ci'], reviewers: [], checks: [BUILD] }),
+        ts: at('11:00:00'),
+      },
+    ];
+    const first = latestPrRework(events.slice(0, 3));
+    expect(first).toEqual({ ...pullRequestRework(reworkData()), at: at('10:00:00'), count: 1 });
+    const latest = latestPrRework(events);
+    expect(latest).toMatchObject({ kinds: ['ci'], at: at('11:00:00'), count: 2 });
+
+    expect(prReworkNote({ pr }, first, now)).toBe(
+      '这个 PR 返工过 1 次（10:00:00）：@alice 要求修改。',
+    );
+    expect(prReworkNote({ pr }, latest, now)).toBe(
+      '这个 PR 返工过 2 次，最近一次（11:00:00）：CI 检查没通过：build。',
+    );
+    expect(prReworkNote({ pr }, null, now)).toBeNull();
+    expect(prReworkNote({ pr: null }, latest, now)).toBeNull();
+    expect(prReworkNote({ pr: { ...pr, number: 13 } }, latest, now)).toBeNull();
+  });
+
   it('in English', () => {
     setLang('en');
     expect(runStatusBadge(waiting({ pr })).label).toBe('Waiting for the PR to merge');
@@ -963,6 +1147,67 @@ describe('waiting for a pull request', () => {
     expect(texts[1]).toBe(
       'Merging it on GitHub completes the Run; closing it unmerged fails the Run',
     );
+    for (const text of texts) {
+      expect(text).toBeTruthy();
+      expect(text).not.toMatch(/[一-鿿]/);
+    }
+  });
+
+  it('words reworks in English', () => {
+    setLang('en');
+    const now = new Date('2026-11-25T12:00:00');
+    const at = new Date('2026-11-25T11:00:00').toISOString();
+    const every = reworkData({
+      kinds: ['conflict', 'ci', 'review'],
+      reviewers: ['alice', null],
+      checks: [BUILD, { name: 'lint', url: null }],
+    });
+    expect(eventText({ type: 'github.pr_rework', data: every })).toBe(
+      "PR #12 (commit 01234567) needs more work: a conflict with the target branch; failed checks: build, lint; changes requested by @alice, a deleted account. The Run goes back with this feedback to the stage the merge stage's on_fail names (counted toward max_loops; past them, on_exhausted decides); when that is an agent stage, its round starts by merging the target branch to resolve the conflict, and the changes are pushed to the same pull request",
+    );
+    expect(
+      prReworkReasonText({ kinds: ['ci'], reviewers: [], checks: [{ name: 'build', url: null }] }),
+    ).toBe('a failed check: build');
+    expect(prSummary(run('r', 'running', { pr }))?.note).toBe(' (reworking)');
+    const latest = latestPrRework([{ type: 'github.pr_rework', data: reworkData(), ts: at }]);
+    expect(prSummary(run('r', 'running', { pr }), latest)?.note).toBe(
+      ' (reworking: changes requested by @alice)',
+    );
+    expect(prReworkNote({ pr }, latest, now)).toBe(
+      'This pull request was reworked once (11:00:00), for changes requested by @alice.',
+    );
+    expect(prReworkNote({ pr }, latest && { ...latest, count: 3 }, now)).toBe(
+      'This pull request was reworked 3 times, most recently (11:00:00) for changes requested by @alice.',
+    );
+    const texts = [
+      prWaitText(waiting({ pr, issue }), 'main')[2],
+      eventText({ type: 'github.pr_rework', data: every }),
+      eventText({ type: 'github.pr_rework', data: reworkData({ head: null }) }),
+      prReworkReasonText({ kinds: ['ci'], reviewers: [], checks: [] }),
+      prReworkReasonText({
+        kinds: ['ci'],
+        reviewers: [],
+        checks: ['a', 'b', 'c', 'd', 'e', 'f'].map((name) => ({ name, url: null })),
+      }),
+      prReworkReasonText({ kinds: ['review'], reviewers: [], checks: [] }),
+      eventText({ type: 'github.pr_updated', data: { ...pr, head: HEAD } }),
+      eventText({ type: 'github.pr_updated', data: pr }),
+      eventText({
+        type: 'github.pr_review_ignored',
+        data: { ...pr, head: HEAD, reviewer: 'mallory', association: 'NONE' },
+      }),
+      eventText({
+        type: 'github.pr_review_ignored',
+        data: { ...pr, head: HEAD, reviewer: null, association: 'NONE' },
+      }),
+    ];
+    expect(texts[7]).toBe(
+      'The reworked commits were pushed to PR #12, which waits to be merged again',
+    );
+    expect(texts[8]).toBe(
+      'The review by @mallory (NONE) asking for changes on PR #12 was ignored, as they are not a member of the repo: it triggers no rework, and its text goes to no agent',
+    );
+    expect(texts[4]).toBe('failed checks: a, b, c, d, e and 1 more');
     for (const text of texts) {
       expect(text).toBeTruthy();
       expect(text).not.toMatch(/[一-鿿]/);

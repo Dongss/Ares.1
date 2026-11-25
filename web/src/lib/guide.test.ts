@@ -240,6 +240,9 @@ describe('delivering through pull requests', () => {
     expect(push?.actors).toEqual(['master', 'human']);
     expect(push?.text).toContain('Master 推送 Run 的分支、开一个合并到目标分支（main）的 PR');
     expect(push?.text).toContain('目标分支（main）本身 Master 从不推送');
+    expect(push?.text).toContain(
+      '仓库成员在 PR 上要求修改、CI 没过或和目标分支（main）冲突时，Run 自动回去返工（计入回退上限），改好后推送到同一个 PR',
+    );
     // Without push the repo is disabled.
     const off = byId(input({ ...prRepo, push: false })).push;
     expect(off?.actors).toEqual(['human']);

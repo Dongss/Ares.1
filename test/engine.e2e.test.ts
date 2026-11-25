@@ -7244,6 +7244,12 @@ ${repo}`;
     expect(engine.pullRequestNeedsRework(again, pr, reworkOf(run))).toBe(false);
     expect(eventData(t, run.id, 'github.pr_rework')).toHaveLength(1);
     expect(git(t.repoDir, 'rev-parse', 'main')).toBe(main);
+    // How deliver: pr goes, not a breakdown: neither the rework, the Run leaving its wait for
+    // the queue and waiting again, nor the update of the pull request notifies anybody.
+    const statuses = eventData(t, run.id, 'run.status').map((d) => d.status);
+    expect(statuses.slice(statuses.indexOf('blocked'))).toContain('queued');
+    const events = store.listEvents(run.id);
+    expect(events.map((e) => noticeFor(e, run.goal)).filter((n) => n !== null)).toEqual([]);
   });
 
   it('reworks each kind once per head commit, also after a restart', async () => {
@@ -7326,6 +7332,9 @@ ${repo}`;
       expect(rounds).toHaveLength(2);
       expect(eventData(t, run.id, 'stage.rollback')).toHaveLength(1);
       expect(store.getRun(run.id).pr).toEqual(pr);
+      // Only stopping past max_loops notifies, as with any rollback; the reworks before do not.
+      const notices = store.listEvents(run.id).flatMap((e) => noticeFor(e, run.goal) ?? []);
+      expect(notices.map((n) => n.kind)).toEqual([onExhausted === 'fail' ? 'failed' : 'blocked']);
       await t.close();
       h = undefined;
     }

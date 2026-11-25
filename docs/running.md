@@ -120,18 +120,26 @@ AI 侦察、自动采纳、自动合并、推送和每日预算的设置写在 `
 
 - `push`（默认）：合并阶段把 Run 合并进本地目标分支，`push: true` 时之后推送目标分支。不写时就是这样。
 - `pr`：给目标分支受保护、只能走 PR 或要过 CI 的仓库用。合并阶段照常先把目标分支的新提交合进 Run 分支、跑检查，但不动本地目标分支，而是推送 Run 分支、开一个以目标分支为 base 的 PR，PR 在 GitHub 上合并后 Run 才完成；Master 不直接推送这个仓库的目标分支。`pr` 要求 `push: true`（推送 Run 分支、PR 合并后拉取目标分支都靠它），不满足时这个仓库停用，看板「配置」页在 `config.yaml#github.repos.<name>` 下写明原因；这期间它的 Run 检查通过后也不在本地合并，停在合并阶段等配置改好。`GET /api/github` 里每个仓库的 `deliver` 是这个设置。
-  - 检查通过后记 `merge.pr_pending` 事件（数据是 `{ target, head }`：目标分支和 Run 分支上检查通过的提交），Run 进入「等 PR 合并」：状态是 `blocked`，`blocked.kind` 为 `pr_open`，合并阶段保持执行中，不占执行名额，也不发通知；Master 重启后仍然等着，不会重跑合并，由每轮检查接着开 PR、跟踪 PR。这种卡住不能在看板上重试（`POST /api/runs/:id/retry` 返回 409），只看 GitHub 上的 PR：合并了（merge、squash、rebase 都算），合并阶段通过、记 `merge.done` 事件，Run 完成；没合并就被关掉，Run 结束为失败（工作目录和分支保留），记 `github.pr_closed` 事件并按失败的 Run 通知，从 issue 来的按重做规则处理。
+  - 检查通过后记 `merge.pr_pending` 事件（数据是 `{ target, head }`：目标分支和 Run 分支上检查通过的提交），Run 进入「等 PR 合并」：状态是 `blocked`，`blocked.kind` 为 `pr_open`，合并阶段保持执行中，不占执行名额，也不发通知；Master 重启后仍然等着，不会重跑合并，由每轮检查接着开 PR、跟踪 PR。这种卡住不能在看板上重试（`POST /api/runs/:id/retry` 返回 409），只看 GitHub 上的 PR：合并了（merge、squash、rebase 都算），合并阶段通过、记 `merge.done` 事件，Run 完成；没合并就被关掉，Run 结束为失败（工作目录和分支保留），记 `github.pr_closed` 事件并按失败的 Run 通知，从 issue 来的按重做规则处理；受信任的人要求修改、CI 检查没过或和目标分支冲突时，Run 带着这些反馈回去返工，改好后推送到同一个 PR（见下面的「跟踪 PR」）。
   - 开 PR：Run 一进入「等 PR 合并」，大约 1 秒后（之后每轮检查也会看一遍）Master 把 Run 分支推送到目标分支推送去的那个 GitHub 仓库（强制推送，只用于 `ares1/` 开头的 Run 分支，因为回滚可能改写过它的历史），再开一个从 Run 分支到目标分支的 PR。这个分支上已经有开着、合并到目标分支的 PR 时（比如开完 PR 还没记下 Master 就重启了）直接用它，不会开第二个。PR 标题是目标的第一行，正文是 Run 摘要（目标的前几行、Run id、费用、看板链接）；从 issue 来的 Run 在正文末尾写 `Closes #N`（issue 在别的仓库时写 `Closes owner/name#N`），PR 合并后 GitHub 会关闭 issue；Master 自己建的 Run（合并远端提交）不关联 issue。标题和正文里用户主目录的路径换成 `~`，正文不带 Master 评论的隐藏标记。开好后 Run 记下 PR、记 `github.pr_opened` 事件，issue 上发一条带 PR 链接的评论，标签换成 `ares1:needs-you`（不发「Run 卡住了」的评论）。推送或开 PR 失败时记 `github.error`，Run 保持原样，下一轮再试。仓库从 `pr` 改回 `push` 后，之前已经在等的 Run 只要还是 `push: true` 也照样开 PR，否则没有别的办法交付它们。
   - 跟踪 PR：每轮检查（Run 状态变化后的同步也会）Master 向 GitHub 查一遍已经开了 PR 的 Run，以 GitHub 返回的状态为准：
     - 已合并（merge、squash、rebase 都算）：先把本地目标分支快进到 GitHub 上的提交（和平时拉取一样，记 `github.pulled`），再记 `github.pr_merged` 事件（带合并提交）和 `merge.done`，合并阶段通过，Run 完成，工作目录和分支随之删除。本地目标分支暂时快进不了时（检出的地方有未提交的改动，记 `github.pull_blocked` 并通知；或者这个仓库另一个 Run 正在合并），Run 接着等，下一轮再试。issue 上发一条「PR #N 已合并到 `<目标分支>`（合并提交）」的评论，带费用和用时；issue 多半已经被 PR 里的 `Closes` 关掉，Master 不再重复关闭，还开着时由 Master 按 completed 关闭。
     - 没合并就被关掉：Run 结束为失败（见上），从 issue 来的按「Run 失败后自动重做」处理：还没用完 `max_run_attempts` 时等一会儿重做，用完了 issue 关闭为 not planned。重做是一个新的 Run，用它自己的分支开新的 PR，新 Run 的 `pr` 是新 PR；被关掉的 PR 保持关闭。
-    - 还开着：不动。
+    - 还开着：看它要不要返工。只看 PR 当前的 head 提交上的结果，而且这个提交要等于 Run 记下的 `headCommit`（也就是 Run 推送上去的那个）：旧提交上的评审和检查已经由之后的提交回应过，不再算；head 不是 Run 推送的，也不归 Run 判断。下面三种情况任何一种出现都要返工，一轮里出现几种时只返工一次，反馈里每种都写上：
+      - 评审要求修改：每个评审人只看他最新的一条表明态度的评审（APPROVED、CHANGES_REQUESTED、DISMISSED；只写评论的 COMMENTED 不改变态度），这一条是 CHANGES_REQUESTED，并且落在当前 head 上。GitHub 的 `reviewDecision` 已经是 APPROVED 或 REVIEW_REQUIRED（有人批准了，或者要求修改的评审被 dismiss 了）时不触发。评审人要受信任（见下面的「只信任仓库成员写的内容」）。反馈里有每条这样的评审的正文，以及受信任的人在当前 head 上写的行内评论（`文件:行`）。
+      - CI 没过：PR 的检查（GitHub Actions 的 check run 和 commit status 都算）全部结束，并且至少一个的结论是 FAILURE、TIMED_OUT、CANCELLED、ACTION_REQUIRED、STARTUP_FAILURE 或 ERROR。还有检查在跑时等下一轮再看；一个检查都没有时不触发。反馈里有每个失败检查的名称、结论和链接，打不开日志时让 Agent 在工作目录里运行相应的命令复现。
+      - 和目标分支冲突：以 GitHub 的 `mergeable` 为准，是 CONFLICTING 才算；GitHub 还没算出来（UNKNOWN）时等下一轮再看。
+    - 信任：要求修改的评审只认受信任的人写的（仓库所有者、成员、协作者和 Master 用的账号）。其他人的评审不触发返工，正文和行内评论都不进任何提示词，只记一条 `github.pr_review_ignored` 事件，写明是谁、和仓库是什么关系（不含正文）；同一个 head 上同一个人只记一次。
+    - 返工：在同一个事务里把合并阶段这一轮记为没通过（加一条 `merge` 检查，写明「PR #N 需要返工」和原因），记 `github.pr_rework` 事件，Run 放回队首，和合并阶段检查没通过一样回到合并阶段 `on_fail` 指向的阶段（默认是编码），反馈里写明 PR 链接、评审正文和行内评论、失败检查的名称和链接。有冲突、而回到的又是 Agent 阶段时，那一轮先合并目标分支、解决冲突（和合并时冲突一样，见下面的「合并冲突」），其他几种的反馈一起交给它。每次返工都和别的回退一样计入 `max_loops`，用完后按 `on_exhausted` 处理（见下面的「返工或回退用完时」）。
+    - 去重：同一个 head 提交上的同一类问题（评审、CI、冲突各算一类）只返工一次，依据是 `github.pr_rework` 事件里记下的 head 和 `kinds`，存在数据库里，所以 Master 重启后也不会重复返工。人在 GitHub 上把评审改成 APPROVED 或 dismiss 之后不再触发。
+    - 推送到同一个 PR：返工期间 Run 的 `pr` 不变。Run 改完、再次走到合并阶段并等 PR 合并时，Master 把 Run 分支强制推送上去，同一个 PR 随之更新，不开第二个 PR；记 `github.pr_updated` 事件，issue 上评论「返工后的提交已推送到 PR #N」。推送之前 GitHub 上还是返工前的提交，这期间不判断返工。返工期间 PR 在 GitHub 上被关掉或合并了的，Run 再次等 PR 合并时不推送，也不开新的 PR，按 PR 的状态处理：被关掉的 Run 结束为失败（见上）；已合并的 Run 完成，返工后的提交不在合进去的内容里。
+    - issue：返工时 issue 上评论「PR #N 需要返工：原因」（原因写冲突、失败检查的名称和要求修改的人），说明 Run 带着这些反馈回去修改、计入回退上限、改好后推送到同一个 PR；Run 回到队列后，issue 的标签由 `ares1:needs-you` 换回 `ares1:running`。评论和 Master 别的评论一样带隐藏标记，用户主目录的路径换成 `~`。返工不发通知；回退用完后停下来等人或失败时，照常按「Run 卡住了」或「Run 失败了」通知。
     - 等 PR 合并的 Run，issue 被关掉时，Master 先查 PR：已经合并的（多半就是 PR 里的 `Closes` 关的）照常完成，不会因为 issue 关了被终止；PR 没合并的，和别的 Run 一样被终止，PR 留在 GitHub 上，Master 不去关它。
     - 查 PR 失败时记 `github.error`，Run 保持原样（issue 被关掉也不终止），下一轮再试；Master 重启后照常跟踪。没有 `push: true` 时拉取不了目标分支，这些 Run 一直等到配置改好。
   - 在看板上终止等 PR 合并的 Run，不会关闭 GitHub 上的 PR：Master 不再跟踪它，之后它在 GitHub 上被合并的话，代码照样随拉取进入本地目标分支，但 Run 仍是已终止。不要了请到 GitHub 上关掉。
-  - 事件：`merge.pr_pending`（检查通过，等开 PR）、`github.pr_opened`（数据是 `{ number, url, head, base }`）、`github.pr_merged`（`{ number, url, mergeCommit }`，GitHub 没给合并提交时为 `null`）、`github.pr_closed`（`{ number, url }`），都是结构化数据，看板按自己的语言显示成文字。
-  - Run 数据里的 `pr` 是它的 PR（`{ number, url }`），开 PR 之前和 `deliver: push` 的仓库都是 `null`。
-  - 看板：首页把等 PR 合并的 Run 列在「待我处理」里，标成「等 PR 合并」而不是「卡住」，写「等 PR 合并 #N」并链接到 PR（还没开时写明下次检查 GitHub 时开）；Run 详情页给它一个面板，写明 PR 链接、在 GitHub 上合并或关掉后会怎样，不显示重试；有 PR 的 Run（包括已经完成的）在概要里显示 PR 链接。「需求」页每个仓库的「交付方式」写明是推送还是 PR。
+  - 事件：`merge.pr_pending`（检查通过，等开 PR）、`github.pr_opened`（数据是 `{ number, url, head, base }`）、`github.pr_merged`（`{ number, url, mergeCommit }`，GitHub 没给合并提交时为 `null`）、`github.pr_closed`（`{ number, url }`）、`github.pr_rework`（`{ number, url, head, kinds, reviewers, checks }`：`head` 是判断时的 head 提交，`kinds` 是这次返工的种类，由 `conflict`、`ci`、`review` 按这个顺序组成，`reviewers` 是要求修改的受信任评审人的账号，`checks` 是失败的检查 `{ name, url }`，`url` 没有时为 `null`）、`github.pr_updated`（`{ number, url, head }`：返工后推送到同一个 PR 的提交）、`github.pr_review_ignored`（`{ number, url, head, reviewer, association }`：不受信任的人要求修改的评审，`reviewer` 是账号，已删除的账号为 `null`，`association` 是 GitHub 给的和仓库的关系，比如 `NONE`），都是结构化数据，看板按自己的语言显示成文字。
+  - Run 数据里的 `pr` 是它的 PR（`{ number, url }`），开 PR 之前和 `deliver: push` 的仓库都是 `null`；返工期间不变。
+  - 看板：首页把等 PR 合并的 Run 列在「待我处理」里，标成「等 PR 合并」而不是「卡住」，写「等 PR 合并 #N」并链接到 PR（还没开时写明下次检查 GitHub 时开）；Run 详情页给它一个面板，写明 PR 链接、在 GitHub 上合并、要求修改（或 CI 没过、冲突）、关掉后会怎样，不显示重试，返工过的 PR 还写明返工过几次、最近一次的原因和时间；有 PR 的 Run（包括已经完成的）在概要里显示 PR 链接，返工期间（Run 有 PR，既不在等 PR 合并，也没结束）后面写「（返工中：原因）」，原因取自最近一次 `github.pr_rework` 事件。事件列表把 `github.pr_rework`、`github.pr_updated` 和 `github.pr_review_ignored` 按看板的语言显示成文字：返工的种类、要求修改的人、失败的检查，以及 Run 回到合并阶段 `on_fail` 指向的阶段。「需求」页每个仓库的「交付方式」写明是推送还是 PR。
 
 自动采纳（`auto_accept`）按侦察给提案标的风险和大小决定采纳哪些：风险不超过 `max_risk`（`none` / `low` / `mid` / `high`，默认 `none`）、大小也不超过 `max_size`（`S` / `M` / `L`，默认 `L`）的提案，Master 不等人，直接加上 `ares1:ready` 和 `ares1:auto`。`max_risk` 为 `none` 时不自动采纳任何提案，不管 `max_size` 是什么。`max_size` 默认是 `L`，因为编码阶段设了 `planning: auto` 或 `llm` 的模板（默认的 self-dev 就是）会先把 L 的需求拆成几步，在一个 Run 里一步一步做完；想让大需求先经过人，就设成 `M`。开了自动采纳、`max_size` 是 `L`（包括不写），而仓库用的模板里没有一个 Agent 阶段是 `planning: auto` 或 `llm` 时，L 的需求会整个交给一个 Run 一次做完，容易超时或返工，看板「配置」页会在 `config.yaml` 的警告里写明是哪个仓库、哪个模板，建议给编码阶段设 `planning: auto`，或把 `max_size` 调成 `M`。这只是提醒，仓库照常工作；模板不存在时那里已经报错，不再另外提醒。`max_per_day` 限制每天最多自动采纳几条，不写就不限。每轮检查时，还在等人的提案落在采纳范围内的（比如刚放宽了设置），也会被自动采纳。
 
@@ -545,7 +553,7 @@ Run 卡住（`blocked`）、已暂停或等审批时不算在正在执行的 Run
 - 审批：模板里设了 `gate` 的阶段（从 issue 来的 Run 和分叉时交给 Run 合并的 Run，在仓库打开 `auto_merge` 时，合并不等审批）。
 - 需求评估有疑问，等你回复，最多等 `reply_timeout_hours`（到时间评估自己决定，所以这种 Run 算作会自己往下走；设为 `null` 时一直等，算作只等人）；issue 作者不是仓库成员，等你确认需求。
 - 配置为等人时：`on_agent_error: human`（包括 Agent 不可用时）、`on_exhausted: human`、`on_budget_exceeded: pause`（超出预算）。
-- 仓库通过 PR 交付（`deliver: pr`）时，合并阶段检查通过后等 PR 在 GitHub 上合并（`pr_open`，看板上显示「等 PR 合并」）。这不是出了问题：不发「Run 卡住了」的通知，也没有可以重试的，PR 合并或被关掉后 Master 自己往下走（见上面的「接入 GitHub」）。要人在 GitHub 上审 PR、合并，所以算作只等人，计入 `scout.max_proposals`。
+- 仓库通过 PR 交付（`deliver: pr`）时，合并阶段检查通过后等 PR 在 GitHub 上合并（`pr_open`，看板上显示「等 PR 合并」）。这不是出了问题：不发「Run 卡住了」的通知，也没有可以重试的，PR 合并、被关掉或者需要返工时 Master 自己往下走（见上面的「接入 GitHub」）。要人在 GitHub 上审 PR、合并，所以算作只等人，计入 `scout.max_proposals`。
 
 目标分支有未提交的改动时，Run 也会卡住（`target_dirty`），但不用你做任何决定：合并阶段要快进目标分支，而目标分支在某个目录里检出、且有已跟踪文件的改动没提交（未跟踪的文件不算），快进会动到这些改动，所以先停下，并照常发「Run 卡住了」的通知。之后 Master 大约每分钟复查一次，你提交或丢弃这些改动后，Run 会自己回到队首接着合并：重新同步目标分支，有新提交时重跑检查，再快进。不用去看板点重试（点了也行，会立刻继续）。改动还在时复查什么都不改，也不会重复通知；工作开关关着时不会自动继续，打开时马上查一次。自举时 Master 正是往开发仓库的 `main` 合并，在那里随手改了文件，处理掉就行。这种 Run 算作会自己往下走，不计入 `scout.max_proposals`。
 
@@ -572,7 +580,7 @@ Agent 出错且重试、换 Agent 都用完，Agent 不可用且没有可换的 
 
 ## 通知
 
-只在需要你做点什么时通知：Run 卡住或失败、等审批、提案等人决定、侦察连续失败、推送或升级失败、目标分支没能拉取 GitHub 上的新提交；Run 完成、侦察完成、拉取成功都不通知。通过 PR 交付（`deliver: pr`）时，等 PR 合并不通知（GitHub 会通知 PR 的评审者），PR 没合并就被关掉按「Run 失败了」通知。
+只在需要你做点什么时通知：Run 卡住或失败、等审批、提案等人决定、侦察连续失败、推送或升级失败、目标分支没能拉取 GitHub 上的新提交；Run 完成、侦察完成、拉取成功都不通知。通过 PR 交付（`deliver: pr`）时，等 PR 合并不通知（GitHub 会通知 PR 的评审者），PR 要求修改、CI 没过或冲突时 Run 回去返工也不通知（issue 上有评论），返工用完 `max_loops` 后按 `on_exhausted` 停下来或失败时照常通知，PR 没合并就被关掉按「Run 失败了」通知。
 
 侦察失败（Agent 出错或超时、输出不符合约定、建临时工作目录失败等）时，事件列表里记一条 `scout.failed`（看板「事件」页能看到，标成红色），数据里有 `scoutId`、`repo`、`message`（错误信息）和 `streak`：这个仓库从最近一次侦察往回数连续失败的次数（包括这一次；自动和手动触发的都算）。额度用尽或被限流的、被 Master 停止打断的、还在进行的侦察既不计数，也不打断计数；正常结束的侦察（哪怕没找到需求）让计数从头开始。`streak` 正好到 3 时通知一次「侦察连续失败：<仓库名>」，正文是错误信息的第一行，点开是「需求」页；之后接着失败不再通知，直到有侦察正常结束、又连续失败 3 次。被 Master 停止打断的侦察也记 `scout.failed`，但不带 `streak`，不通知。
 

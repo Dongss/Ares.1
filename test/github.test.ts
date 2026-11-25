@@ -3998,6 +3998,11 @@ describe('issues: delivering through pull requests (deliver: pr)', () => {
           { ...pr, head: run.headCommit, reviewer: 'stranger', association: 'NONE' },
         ];
         expect(eventData(t, run.id, 'github.pr_review_ignored')).toEqual(ignored);
+        // Nothing for a human to act on: nobody is notified of it.
+        const ignoredEvent = store
+          .listEvents(run.id)
+          .find((e) => e.type === 'github.pr_review_ignored');
+        expect(ignoredEvent && noticeFor(ignoredEvent, run.goal)).toBeNull();
 
         // A check failing alongside sends the Run back, with none of the stranger's words.
         gh.setChecks(pull.number, [failedBuild]);

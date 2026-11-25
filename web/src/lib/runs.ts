@@ -26,6 +26,8 @@ import {
   type DiscussionEntry,
   type EventRow,
   FINISHED_RUN_STATUSES,
+  PR_REWORK_KINDS,
+  type PrReworkKind,
   type RequirementSize,
   type Run,
 } from '../../../src/store/types.js';
@@ -196,7 +198,8 @@ export function prWaitHint(): string {
 
 /**
  * What the Run detail says about a Run waiting for its pull request into `target`: where it
- * stands, what merging or closing it on GitHub does, and that there is nothing to retry here.
+ * stands, what merging it on GitHub, asking for changes on it (or failed checks, or a conflict)
+ * and closing it do, and that there is nothing to retry here.
  */
 export function prWaitText(run: Pick<Run, 'pr' | 'issue'>, target: string): string[] {
   const opened = run.pr
@@ -217,6 +220,10 @@ export function prWaitText(run: Pick<Run, 'pr' | 'issue'>, target: string): stri
         zh: `在 GitHub 上合并它（merge、squash 或 rebase 都行）后，Master 下次检查 GitHub 时把本地的 ${target} 快进到合并后的提交，Run 完成。`,
         en: `Once it is merged on GitHub (by a merge, a squash or a rebase), the Master fast-forwards the local ${target} to the merged commit at its next GitHub check, and the Run completes.`,
       });
+  const rework = t({
+    zh: `PR 上受信任的人（仓库所有者、成员和协作者）要求修改、CI 检查全部结束且有失败的，或者和 ${target} 冲突时，Master 下次检查 GitHub 时让 Run 带着这些反馈自动回去返工（回到合并阶段的 on_fail 指向的阶段，计入回退上限 max_loops），改好后推送到同一个 PR。其他人的评审不触发返工，也不交给 Agent。`,
+    en: `If someone the Master trusts (the repo's owner, a member or a collaborator) asks for changes on it, its checks all finish with some failed, or it conflicts with ${target}, the Master sends the Run back to work on it with that feedback at its next GitHub check (to the stage the merge stage's on_fail names, counted toward max_loops), and the changes are pushed to the same pull request. Reviews by anyone else trigger no rework and go to no agent.`,
+  });
   const closed = run.issue
     ? t({
         zh: 'PR 没合并就被关掉时，Run 结束为失败；还有重做次数（max_run_attempts）时 issue 自动重做，重做的 Run 开新的 PR。',
@@ -230,21 +237,165 @@ export function prWaitText(run: Pick<Run, 'pr' | 'issue'>, target: string): stri
     zh: '等待期间不占执行名额，排队的 Run 照常执行；Master 重启后也接着等。这里没有可以重试的；终止 Run 不会关闭 GitHub 上的 PR。',
     en: 'Meanwhile it takes no execution slot, so queued Runs go ahead, and it keeps waiting across Master restarts. There is nothing to retry here; cancelling the Run does not close the pull request on GitHub.',
   });
-  return [opened, merged, closed, meanwhile];
+  return [opened, merged, rework, closed, meanwhile];
 }
 
 /**
  * The PR line of the Run detail's summary, for any Run that has one: 「#12」 (the link) and how it
- * stands when the Run tells: waiting for it, or completed, which only a merge of it gets to.
+ * stands when the Run tells: waiting for it; completed, which only a merge of it gets to; or
+ * reworking. The merge stage is the last, and its pull request merged completes the Run, so a
+ * Run with one that neither waits for it nor finished went back for more work: a reviewer asked
+ * for changes, a check failed or it conflicts with the target branch. `rework`, the latest of the
+ * Run's reworks (`latestPrRework`), says which, when it was of this pull request.
  */
 export function prSummary(
   run: Pick<Run, 'pr' | 'status' | 'blocked'>,
+  rework: Pick<PullRequestRework, 'number' | 'kinds' | 'reviewers' | 'checks'> | null = null,
 ): { label: string; note: string | null } | null {
   if (!run.pr) return null;
   const label = `#${run.pr.number}`;
   if (waitingForPr(run)) return { label, note: t({ zh: '（等合并）', en: ' (awaiting merge)' }) };
   if (run.status === 'completed') return { label, note: t({ zh: '（已合并）', en: ' (merged)' }) };
-  return { label, note: null };
+  if (FINISHED_RUN_STATUSES.includes(run.status)) return { label, note: null };
+  if (rework?.number === run.pr.number) {
+    const why = prReworkReasonText(rework);
+    return { label, note: t({ zh: `（返工中：${why}）`, en: ` (reworking: ${why})` }) };
+  }
+  return { label, note: t({ zh: '（返工中）', en: ' (reworking)' }) };
+}
+
+/** A rework of a Run's pull request, as its `github.pr_rework` event records it. */
+export interface PullRequestRework {
+  number: number;
+  url: string;
+  /** The commit of the Run's it was judged on; null when not recorded. */
+  head: string | null;
+  /** Not empty; conflict, ci, review in that order. */
+  kinds: PrReworkKind[];
+  /** Who asked for changes (people the Master trusts), null for a deleted account. */
+  reviewers: (string | null)[];
+  /** The failed checks, and where to see each when GitHub gives a link. */
+  checks: { name: string; url: string | null }[];
+}
+
+const isReworkKind = (value: unknown): value is PrReworkKind =>
+  typeof value === 'string' && (PR_REWORK_KINDS as readonly string[]).includes(value);
+
+/**
+ * The rework recorded in the data of a `github.pr_rework` event; null for data not of that shape:
+ * no number or link, a kind it does not know, none at all, or reviewers and checks that are not
+ * lists of logins and of named checks.
+ */
+export function pullRequestRework(data: Record<string, unknown>): PullRequestRework | null {
+  const { number, url, head, kinds, reviewers, checks } = data;
+  if (typeof number !== 'number' || typeof url !== 'string') return null;
+  if (!Array.isArray(kinds) || kinds.length === 0 || !kinds.every(isReworkKind)) return null;
+  if (!Array.isArray(reviewers) || !reviewers.every((r) => r === null || typeof r === 'string')) {
+    return null;
+  }
+  if (!Array.isArray(checks)) return null;
+  const named: PullRequestRework['checks'] = [];
+  for (const check of checks) {
+    if (typeof check !== 'object' || check === null) return null;
+    const { name, url: link } = check as Record<string, unknown>;
+    if (typeof name !== 'string') return null;
+    named.push({ name, url: typeof link === 'string' ? link : null });
+  }
+  return {
+    number,
+    url,
+    head: typeof head === 'string' ? head : null,
+    kinds: PR_REWORK_KINDS.filter((kind) => kinds.includes(kind)),
+    reviewers: reviewers as (string | null)[],
+    checks: named,
+  };
+}
+
+/** How many failed checks a rework's reason names; the rest are counted. */
+const CHECKS_SHOWN = 5;
+
+/**
+ * Why a pull request was sent back for more work, in one line: 「和目标分支冲突；CI 检查没通过：
+ * build；@alice 要求修改」.
+ */
+export function prReworkReasonText(
+  rework: Pick<PullRequestRework, 'kinds' | 'reviewers' | 'checks'>,
+): string {
+  const parts = rework.kinds.map((kind) => {
+    if (kind === 'conflict') {
+      return t({ zh: '和目标分支冲突', en: 'a conflict with the target branch' });
+    }
+    if (kind === 'ci') {
+      const all = rework.checks.map((c) => c.name);
+      if (all.length === 0) return t({ zh: 'CI 检查没通过', en: 'failed checks' });
+      const shown = join(all.slice(0, CHECKS_SHOWN));
+      const more = all.length - CHECKS_SHOWN;
+      const list =
+        more > 0
+          ? t({ zh: `${shown} 等 ${all.length} 个`, en: `${shown} and ${more} more` })
+          : shown;
+      return t({
+        zh: `CI 检查没通过：${list}`,
+        en: `${all.length === 1 ? 'a failed check' : 'failed checks'}: ${list}`,
+      });
+    }
+    if (rework.reviewers.length === 0) {
+      return t({ zh: '评审要求修改', en: 'changes requested in a review' });
+    }
+    const who = join(
+      rework.reviewers.map((r) =>
+        r ? `@${r}` : t({ zh: '已删除的账号', en: 'a deleted account' }),
+      ),
+    );
+    return t({ zh: `${who} 要求修改`, en: `changes requested by ${who}` });
+  });
+  return parts.join(t({ zh: '；', en: '; ' }));
+}
+
+/** The latest rework of a Run's pull request, when it was recorded, and how many it had in all. */
+export type LatestPrRework = PullRequestRework & { at: string; count: number };
+
+/**
+ * The latest rework of the Run's pull request, from the Run's events (oldest first); null before
+ * the first.
+ */
+export function latestPrRework(
+  events: readonly Pick<EventRow, 'type' | 'data' | 'ts'>[],
+): LatestPrRework | null {
+  let latest: LatestPrRework | null = null;
+  let count = 0;
+  for (const e of events) {
+    if (e.type !== 'github.pr_rework') continue;
+    const rework = pullRequestRework(e.data);
+    if (!rework) continue;
+    count++;
+    latest = { ...rework, at: e.ts, count };
+  }
+  return latest;
+}
+
+/**
+ * What the pull request panel says of the reworks a Run waiting for its pull request had: how
+ * many, and the latest one's reason and time. null without any of this pull request's.
+ */
+export function prReworkNote(
+  run: Pick<Run, 'pr'>,
+  rework: LatestPrRework | null,
+  now = new Date(),
+): string | null {
+  if (!run.pr || !rework || rework.number !== run.pr.number) return null;
+  const why = prReworkReasonText(rework);
+  const at = formatTime(rework.at, now);
+  if (rework.count === 1) {
+    return t({
+      zh: `这个 PR 返工过 1 次（${at}）：${why}。`,
+      en: `This pull request was reworked once (${at}), for ${why}.`,
+    });
+  }
+  return t({
+    zh: `这个 PR 返工过 ${rework.count} 次，最近一次（${at}）：${why}。`,
+    en: `This pull request was reworked ${rework.count} times, most recently (${at}) for ${why}.`,
+  });
 }
 
 /** Number of Runs waiting for a human, shown in the tab title. */
@@ -545,11 +696,12 @@ function agentSelectedText(data: EventRow['data']): string | null {
 
 /**
  * The events of delivering through a pull request (deliver: pr) in words: the merge stage waits
- * for it (`merge.pr_pending`), it was opened, merged or closed on GitHub (`github.pr_*`); null for
- * other events and data not of that shape.
+ * for it (`merge.pr_pending`), it was opened, merged or closed on GitHub, sent back for more work,
+ * updated with the reworked commits, or a review on it ignored (`github.pr_*`); null for other
+ * events and data not of that shape.
  */
 function pullRequestEventText(event: Pick<EventRow, 'type' | 'data'>): string | null {
-  const { target, number, base, mergeCommit } = event.data;
+  const { target, number, base, mergeCommit, head } = event.data;
   if (event.type === 'merge.pr_pending') {
     if (typeof target !== 'string') return null;
     return t({
@@ -581,6 +733,44 @@ function pullRequestEventText(event: Pick<EventRow, 'type' | 'data'>): string | 
         zh: `PR #${number} 没合并就被关掉了，Run 结束为失败`,
         en: `PR #${number} was closed without being merged, so the Run ended as failed`,
       });
+    case 'github.pr_rework': {
+      const rework = pullRequestRework(event.data);
+      if (!rework) return null;
+      const why = prReworkReasonText(rework);
+      const at = rework.head
+        ? t({ zh: `（提交 ${shortSha(rework.head)}）`, en: ` (commit ${shortSha(rework.head)})` })
+        : t({ zh: ' ', en: '' });
+      const merge = rework.kinds.includes('conflict')
+        ? t({
+            zh: '；回到的是 Agent 阶段时，那一轮先合并目标分支、解决冲突',
+            en: '; when that is an agent stage, its round starts by merging the target branch to resolve the conflict',
+          })
+        : '';
+      return t({
+        zh: `PR #${number}${at}需要返工：${why}。Run 带着这些反馈回到合并阶段的 on_fail 指向的阶段（计入回退上限 max_loops，用完后按 on_exhausted 处理）${merge}，改好后推送到同一个 PR`,
+        en: `PR #${number}${at} needs more work: ${why}. The Run goes back with this feedback to the stage the merge stage's on_fail names (counted toward max_loops; past them, on_exhausted decides)${merge}, and the changes are pushed to the same pull request`,
+      });
+    }
+    case 'github.pr_updated':
+      return typeof head === 'string'
+        ? t({
+            zh: `返工后的提交已推送到 PR #${number}（head ${shortSha(head)}），PR 接着等合并`,
+            en: `The reworked commits were pushed to PR #${number} (head ${shortSha(head)}), which waits to be merged again`,
+          })
+        : t({
+            zh: `返工后的提交已推送到 PR #${number}，PR 接着等合并`,
+            en: `The reworked commits were pushed to PR #${number}, which waits to be merged again`,
+          });
+    case 'github.pr_review_ignored': {
+      const { reviewer, association } = event.data;
+      if (reviewer !== null && typeof reviewer !== 'string') return null;
+      if (typeof association !== 'string') return null;
+      const who = reviewer ? `@${reviewer}` : t({ zh: '已删除的账号', en: 'a deleted account' });
+      return t({
+        zh: `PR #${number} 上 ${who}（${association}）要求修改，但不是仓库成员：评审已忽略，不触发返工，内容也不交给 Agent`,
+        en: `The review by ${who} (${association}) asking for changes on PR #${number} was ignored, as they are not a member of the repo: it triggers no rework, and its text goes to no agent`,
+      });
+    }
     default:
       return null;
   }

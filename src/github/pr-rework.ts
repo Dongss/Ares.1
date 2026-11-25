@@ -3,21 +3,18 @@
 // has already reworked go in, the judgement comes out.
 
 import { join, t } from '../i18n.js';
-import type { EventRow } from '../store/types.js';
+import { type EventRow, PR_REWORK_KINDS, type PrReworkKind } from '../store/types.js';
 import type { GhCheck, GhPullRequestStatus, GhReview, GhReviewComment } from './client.js';
 import { isTrusted, quote } from './issues.js';
 
-/**
- * Why a pull request needs more work: a reviewer asked for changes, a check failed, or it
- * conflicts with its base branch.
- */
-export type PrReworkKind = 'review' | 'ci' | 'conflict';
+// Declared with the store's types, so that the dashboard reads the events by the same kinds.
+export type { PrReworkKind };
 
 /**
  * The order the kinds are listed in. A conflict comes first: the merge stage resolves it by
  * merging the target branch, which can change what the checks and the reviewers saw.
  */
-const KIND_ORDER: readonly PrReworkKind[] = ['conflict', 'ci', 'review'];
+const KIND_ORDER: readonly PrReworkKind[] = PR_REWORK_KINDS;
 
 /**
  * Conclusions of a finished check that mean it failed; the others (SUCCESS, NEUTRAL, SKIPPED, ...)

@@ -161,6 +161,15 @@ export interface RunPullRequest {
   url: string;
 }
 
+/**
+ * Why a Run's open pull request was sent back for more work, as its `github.pr_rework` events
+ * record them: it conflicts with the target branch, a check failed, or a reviewer asked for
+ * changes. In the order they are listed: a conflict first, since merging the target branch can
+ * change what the checks and the reviewers saw.
+ */
+export const PR_REWORK_KINDS = ['conflict', 'ci', 'review'] as const;
+export type PrReworkKind = (typeof PR_REWORK_KINDS)[number];
+
 export interface RunIssue {
   /** "owner/name". */
   repo: string;

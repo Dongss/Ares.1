@@ -51,7 +51,10 @@ import {
   discussionItems,
   eventText,
   ignoredCommentsText,
+  type LatestPrRework,
+  latestPrRework,
   maxRunsWaitText,
+  prReworkNote,
   prSummary,
   prWaitText,
   prWaitTitle,
@@ -91,6 +94,19 @@ export function RunDetailPage(props: {
       e.data.failedRunId === id ||
       (waitsForMaxRuns && (e.type === 'run.status' || e.type === 'config.reloaded')),
   );
+  // A Run with a pull request: its events tell whether and why it went back for more work. Others
+  // load none.
+  const hasPr = detail.data?.run.pr != null;
+  const prEvents = useResource(
+    () => (hasPr ? api.runEvents(id) : Promise.resolve([])),
+    `${id}:${hasPr}`,
+  );
+  useReloadOn(
+    prEvents.reload,
+    (e) => hasPr && e.runId === id && e.type.startsWith('github.pr_'),
+    500,
+  );
+  const prRework = prEvents.data ? latestPrRework(prEvents.data) : null;
   const [tab, setTab] = useState<Tab>('progress');
   const [commit, setCommit] = useState<string>();
   /** A stage round to scroll to in the timeline; `n` makes a repeated click scroll again. */
@@ -114,7 +130,7 @@ export function RunDetailPage(props: {
 
   return (
     <div className="run-detail">
-      <RunHeader detail={d} onChanged={detail.reload} />
+      <RunHeader detail={d} prRework={prRework} onChanged={detail.reload} />
       <RunFlow
         detail={d}
         config={config}
@@ -125,7 +141,7 @@ export function RunDetailPage(props: {
         }}
       />
       <AssessmentCard detail={d} />
-      <RunActions detail={d} config={config} onChanged={detail.reload} />
+      <RunActions detail={d} config={config} prRework={prRework} onChanged={detail.reload} />
       <nav className="tabs">
         {tabs().map((item) => (
           <button
@@ -164,11 +180,20 @@ function stageName(detail: RunDetail, stageId: string): string {
   return detail.run.template.stages.find((s) => s.id === stageId)?.name ?? stageId;
 }
 
-function RunHeader({ detail, onChanged }: { detail: RunDetail; onChanged: () => void }) {
+function RunHeader({
+  detail,
+  prRework,
+  onChanged,
+}: {
+  detail: RunDetail;
+  /** The latest rework of the Run's pull request, if it had any. */
+  prRework: LatestPrRework | null;
+  onChanged: () => void;
+}) {
   const { run, repo, stageRuns } = detail;
   const status = runStatusBadge(run);
   const current = stageRuns.find((s) => s.id === run.currentStageRunId);
-  const pr = prSummary(run);
+  const pr = prSummary(run, prRework);
   const multiLine = run.goal.trim().includes('\n');
   const budget = effectiveBudget(run.template, run.overrides);
   const untrusted = untrustedIssueText(run.issue);
@@ -346,6 +371,8 @@ function RunFlow(props: {
 function RunActions(props: {
   detail: RunDetail;
   config: ConfigView | undefined;
+  /** The latest rework of the Run's pull request, if it had any. */
+  prRework: LatestPrRework | null;
   onChanged: () => void;
 }) {
   const { run } = props.detail;
@@ -368,7 +395,7 @@ function RunActions(props: {
       {run.status === 'blocked' && run.blocked?.kind === 'untrusted_issue' && (
         <ConfirmGoalPanel detail={props.detail} onChanged={props.onChanged} />
       )}
-      {waitingForPr(run) && <PullRequestPanel detail={props.detail} />}
+      {waitingForPr(run) && <PullRequestPanel detail={props.detail} rework={props.prRework} />}
       {run.status === 'blocked' &&
         run.blocked &&
         run.blocked.kind !== 'discussion' &&
@@ -701,11 +728,19 @@ function ConfirmGoalPanel({ detail, onChanged }: { detail: RunDetail; onChanged:
 }
 
 /**
- * The Run waits for its pull request on GitHub (deliver: pr): where it is, and what merging or
- * closing it does. No retry: the Master moves the Run on from what happens to it on GitHub.
+ * The Run waits for its pull request on GitHub (deliver: pr): where it is, the reworks it had,
+ * and what merging it, asking for changes on it or closing it does. No retry: the Master moves
+ * the Run on from what happens to it on GitHub.
  */
-function PullRequestPanel({ detail }: { detail: RunDetail }) {
+function PullRequestPanel({
+  detail,
+  rework,
+}: {
+  detail: RunDetail;
+  rework: LatestPrRework | null;
+}) {
   const { run, repo } = detail;
+  const reworked = prReworkNote(run, rework);
   return (
     <div className="panel panel-attention">
       <h2>
@@ -724,6 +759,7 @@ function PullRequestPanel({ detail }: { detail: RunDetail }) {
           </a>
         </p>
       )}
+      {reworked && <p>{reworked}</p>}
       {prWaitText(run, repo.targetBranch).map((line) => (
         <p key={line} className="hint">
           {line}
