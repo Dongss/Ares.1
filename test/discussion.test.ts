@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   assessedDifficulty,
   assessedSize,
+  assessedTouches,
   assessmentProblem,
   assessmentRounds,
   conclusionLabel,
@@ -160,6 +161,55 @@ describe('takeAssessment', () => {
         where,
       );
       expect(alone).toMatchObject({ verdict: 'go', decidedAlone: true, difficulty: 'high' });
+    });
+
+    it('records the touches of a go, cleaned up', () => {
+      const entry = takeAssessment(
+        report('go', {
+          touches: [' ./src/engine/ ', 'docs\\running.md', '../outside', '/etc', 'src/engine', ''],
+        }),
+        [],
+        where,
+      );
+      expect(entry.touches).toEqual(['src/engine', 'docs/running.md']);
+      // A long list keeps its first 20.
+      const many = Array.from({ length: 25 }, (_, i) => `src/f${i}.ts`);
+      expect(takeAssessment(report('go', { touches: many }), [], where).touches).toEqual(
+        many.slice(0, 20),
+      );
+      // After a human reply and after a timeout alike.
+      const replied = takeAssessment(
+        report('go', { touches: ['web/'] }),
+        [assessor('ask'), human()],
+        where,
+      );
+      expect(replied).toMatchObject({ verdict: 'go', touches: ['web'] });
+      const alone = takeAssessment(
+        report('go', { touches: ['web/'] }),
+        [assessor('ask'), timeout()],
+        where,
+      );
+      expect(alone).toMatchObject({ verdict: 'go', decidedAlone: true, touches: ['web'] });
+    });
+
+    it('records no touches with ask or drop, or when none names a path in the repo', () => {
+      expect(takeAssessment(report('ask', { touches: ['src'] }), [], where)).not.toHaveProperty(
+        'touches',
+      );
+      const proposedDrop = takeAssessment(report('drop', { touches: ['src'] }), [], where);
+      expect(proposedDrop).toMatchObject({ verdict: 'ask', proposedDrop: true });
+      expect(proposedDrop).not.toHaveProperty('touches');
+      const dropped = takeAssessment(
+        report('drop', { touches: ['src'] }),
+        [assessor('ask'), human()],
+        where,
+      );
+      expect(dropped.verdict).toBe('drop');
+      expect(dropped).not.toHaveProperty('touches');
+      for (const touches of [[], ['', '  ', './', '/abs', 'C:/x', 'a/../b']]) {
+        expect(takeAssessment(report('go', { touches }), [], where)).not.toHaveProperty('touches');
+      }
+      expect(takeAssessment(report('go'), [], where)).not.toHaveProperty('touches');
     });
   });
 
@@ -383,6 +433,24 @@ describe('the discussion so far', () => {
     expect(assessedDifficulty([goHigh, reply2, ask2])).toBe('high');
   });
 
+  it('assessedTouches: the touches of the latest go round', () => {
+    expect(assessedTouches([])).toBeUndefined();
+    // Touches of rounds that did not go ahead decide nothing (they are not recorded either).
+    const askSrc = assessor('ask', { touches: ['src'] });
+    expect(assessedTouches([askSrc, reply1])).toBeUndefined();
+    expect(assessedTouches([assessor('drop', { touches: ['src'] })])).toBeUndefined();
+    // A go without touches (left out, or recorded before touches) has none.
+    expect(assessedTouches([askSrc, reply1, go])).toBeUndefined();
+    const goSrc = assessor('go', { touches: ['src', 'docs/running.md'], at: at(4) });
+    const goWeb = assessor('go', { touches: ['web'], at: at(6) });
+    expect(assessedTouches([askSrc, reply1, goSrc])).toEqual(['src', 'docs/running.md']);
+    expect(assessedTouches([goSrc, reply2])).toEqual(['src', 'docs/running.md']);
+    expect(assessedTouches([goSrc, reply2, goWeb])).toEqual(['web']);
+    expect(assessedTouches([goWeb, reply2, go])).toBeUndefined();
+    // The latest go counts even when a later round asks again.
+    expect(assessedTouches([goWeb, reply2, ask2])).toEqual(['web']);
+  });
+
   it('pendingTimeout: only when the discussion ends with a timeout', () => {
     expect(pendingTimeout([])).toBeUndefined();
     expect(pendingTimeout([ask1])).toBeUndefined();
@@ -565,6 +633,23 @@ describe('formatAssessment', () => {
     ).toBe('Hmm.\n\n建议：\n- Split');
   });
 
+  it('adds the paths the Run is expected to change last, when there are any', () => {
+    const touches = ['src/engine', 'docs/running.md'];
+    expect(formatAssessment({ ...full, touches })).toBe(
+      [
+        'Looks fine.',
+        '疑问和顾虑：\n1. Which page?\n2. Which language?',
+        '建议：\n- Start small\n- Add tests',
+        '修改后的需求：\n\nDo the home page first.',
+        '预计会改：src/engine、docs/running.md',
+      ].join('\n\n'),
+    );
+    expect(formatAssessment(assessor('go', { summary: 'Fine.', touches }))).toBe(
+      'Fine.\n\n预计会改：src/engine、docs/running.md',
+    );
+    expect(formatAssessment(assessor('go', { summary: 'Fine.', touches: [] }))).toBe('Fine.');
+  });
+
   it('in English', () => {
     setLang('en');
     const text = formatAssessment(full);
@@ -577,5 +662,10 @@ describe('formatAssessment', () => {
       ].join('\n\n'),
     );
     expect(text).not.toMatch(CJK);
+    const withTouches = formatAssessment(
+      assessor('go', { summary: 'Fine.', touches: ['src/engine', 'docs/running.md'] }),
+    );
+    expect(withTouches).toBe('Fine.\n\nExpected to change: src/engine, docs/running.md');
+    expect(withTouches).not.toMatch(CJK);
   });
 });

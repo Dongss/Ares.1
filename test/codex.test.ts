@@ -465,6 +465,7 @@ describe('strictOutputSchema', () => {
           suggestions: [],
           revisedGoal: null,
           size: null,
+          touches: null,
         },
         ASSESS_REPORT_JSON_SCHEMA,
       ),

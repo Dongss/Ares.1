@@ -246,7 +246,33 @@ describe('prompts', () => {
       expect(prompt).toContain(
         '- L：要改多个模块、一次做完容易超时或返工的需求，可能先拆成几步，再一步一步做。',
       );
-      expect(prompt).toContain('{"verdict": "go", "size": "M", "difficulty": "mid", "summary": ');
+      expect(prompt).toContain(
+        '{"verdict": "go", "size": "M", "difficulty": "mid", "touches": ["src/engine/", "docs/running.md"], "summary": ',
+      );
+    }
+  });
+
+  it('asks a go for the paths it expects to change, at most 20, in every round', () => {
+    const replied: DiscussionEntry[] = [
+      asked,
+      { role: 'human', text: '只改首页', source: 'issue', at: '2026-11-20T01:00:00Z' },
+    ];
+    const prompts = {
+      first: assessPrompt(ctx({ id: 'assess', kind: 'assess' }), [], null),
+      afterReply: assessPrompt(ctx({ id: 'assess', kind: 'assess' }), replied, null),
+      alone: assessPrompt(ctx({ id: 'assess', kind: 'assess' }), [asked, timeout], null),
+    };
+    for (const [name, prompt] of Object.entries(prompts)) {
+      expect(prompt, name).toContain(
+        'verdict 为 go 时还要给出 touches：预计会改的文件或目录，写仓库内的相对路径（例如 src/engine/、docs/running.md），最多 20 条。',
+      );
+      expect(prompt, name).toContain('同一仓库同时执行的 Run 按它避开同时改同一处');
+      expect(prompt, name).toContain('宁可写到目录这一层，也不要漏');
+      // Right after the difficulty rule.
+      expect(prompt.indexOf('verdict 为 go 时还要给出 touches'), name).toBeGreaterThan(
+        prompt.indexOf('- high：'),
+      );
+      expect(prompt, name).toContain('"touches": ["src/engine/", "docs/running.md"]');
     }
   });
 
@@ -611,9 +637,15 @@ describe('prompts in English', () => {
         'With verdict go, also give size, how big you judge the requirement, as one of the letters S, M and L:',
       );
       expect(prompt).toContain('- L: changes across several modules');
-      expect(prompt).toContain('{"verdict": "go", "size": "M", "difficulty": "mid", "summary": ');
+      expect(prompt).toContain(
+        '{"verdict": "go", "size": "M", "difficulty": "mid", "touches": ["src/engine/", "docs/running.md"], "summary": ',
+      );
     }
     for (const prompt of [prompts.assess, prompts.assessAfterReply, prompts.assessAlone]) {
+      expect(prompt).toContain(
+        'With verdict go, also give touches: the files or directories you expect the Run to change, as paths relative to the repo (such as src/engine/ or docs/running.md), at most 20.',
+      );
+      expect(prompt).toContain('name their directory rather than leave anything out');
       expect(prompt).toContain(
         'With verdict go, also give difficulty, how hard you judge the requirement, as one of low, mid and high.',
       );

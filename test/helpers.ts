@@ -185,6 +185,8 @@ export const assessment = (
     revisedGoal?: string;
     size?: 'S' | 'M' | 'L';
     difficulty?: 'low' | 'mid' | 'high';
+    /** As the agent writes them: the Master cleans them up. */
+    touches?: string[];
   } = {},
 ): FakeOutcome => ({
   finalMessage: `\`\`\`json\n${JSON.stringify({
@@ -195,6 +197,7 @@ export const assessment = (
     ...(extra.revisedGoal ? { revisedGoal: extra.revisedGoal } : {}),
     ...(extra.size ? { size: extra.size } : {}),
     ...(extra.difficulty ? { difficulty: extra.difficulty } : {}),
+    ...(extra.touches ? { touches: extra.touches } : {}),
   })}\n\`\`\``,
 });
 

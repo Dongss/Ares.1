@@ -268,6 +268,14 @@ export interface AssessmentEntry {
    * in entries recorded before assessments gave difficulties.
    */
   difficulty?: Difficulty;
+  /**
+   * The files and directories the agent expects the Run to change, as repo-relative paths cleaned
+   * up by `normalizeTouches` (src/config/flow.ts); recorded only with go, which is when they are
+   * asked for. Runs of the same repo whose paths overlap do not work at once. Missing when the
+   * agent gave none (or none that names a path inside the repo), with ask and drop, and in entries
+   * recorded before assessments gave them.
+   */
+  touches?: string[];
   /** The agent said drop before any human reply; a human is asked to confirm instead. */
   proposedDrop: boolean;
   /**

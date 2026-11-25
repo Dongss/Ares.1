@@ -173,6 +173,32 @@ describe('agent output contracts', () => {
       'difficulty',
     );
   });
+
+  it('takes optional touches in an assessment as written, any number of them', () => {
+    const base = { verdict: 'go', summary: 'fine' };
+    // Paths are taken as written: cleaning them up is normalizeTouches' job, not the contract's.
+    const touches = ['src/engine/', './docs/running.md', '../outside', '/etc/passwd', ''];
+    const parsed = parseReport(AssessReportSchema, { ...base, touches }, '');
+    expect(parsed.ok && parsed.value.touches).toEqual(touches);
+    // More than the 20 that are kept do not fail the report.
+    const many = Array.from({ length: 30 }, (_, i) => `src/f${i}.ts`);
+    const long = parseReport(AssessReportSchema, { ...base, touches: many }, '');
+    expect(long.ok && long.value.touches).toHaveLength(30);
+    const without = parseReport(AssessReportSchema, base, '');
+    expect(without.ok).toBe(true);
+    expect(without.ok && without.value.touches).toBeUndefined();
+    // Also with ask and drop (only a go's are taken).
+    expect(
+      parseReport(AssessReportSchema, { verdict: 'drop', summary: 's', touches: ['src'] }, '').ok,
+    ).toBe(true);
+    for (const bad of ['src', [1], [null], { a: 'src' }]) {
+      expect(parseReport(AssessReportSchema, { ...base, touches: bad }, '').ok).toBe(false);
+    }
+    expect(ASSESS_REPORT_JSON_SCHEMA).toMatchObject({
+      properties: { touches: { type: 'array', items: { type: 'string' } } },
+    });
+    expect((ASSESS_REPORT_JSON_SCHEMA as { required: string[] }).required).not.toContain('touches');
+  });
 });
 
 describe('agent output contracts in English', () => {

@@ -3029,6 +3029,40 @@ describe('engine: requirement assessment', () => {
     }
   });
 
+  it('records the touches of a go cleaned up, dropping paths outside the repo', async () => {
+    h = await start();
+    h.scripts.assessor = () =>
+      assessment('go', {
+        summary: '改引擎和文档',
+        touches: [
+          './src/engine/',
+          'docs\\running.md',
+          '../other-repo',
+          '/etc/hosts',
+          '',
+          'src/engine',
+        ],
+      });
+    const run = h.run();
+    const completed = await h.waitStatus(run.id, 'completed');
+    expect(completed.discussion).toMatchObject([
+      { role: 'assessor', verdict: 'go', touches: ['src/engine', 'docs/running.md'] },
+    ]);
+    // The check shows them with the rest of the assessment.
+    expect(h.master.store.listChecks(run.id)[0]?.detail).toBe(
+      '改引擎和文档\n\n预计会改：src/engine、docs/running.md',
+    );
+  });
+
+  it('records no touches when none names a path in the repo', async () => {
+    h = await start();
+    h.scripts.assessor = () => assessment('go', { touches: ['..', '/', 'C:\\x'] });
+    const run = h.run();
+    const completed = await h.waitStatus(run.id, 'completed');
+    expect(completed.discussion).toHaveLength(1);
+    expect(completed.discussion[0]).not.toHaveProperty('touches');
+  });
+
   it('blocks on ask, and a reply sends it back to assess; go with a revised goal', async () => {
     h = await start();
     let n = 0;

@@ -1,8 +1,9 @@
 // The requirement assessment and its discussion: how a reported verdict is taken, what the
-// conclusion is and how it is called. Pure (type imports and src/i18n.ts only): the engine, the
-// GitHub bridge and the dashboard share these rules.
+// conclusion is and how it is called. Pure (type imports, src/i18n.ts and the pure
+// src/config/flow.ts only): the engine, the GitHub bridge and the dashboard share these rules.
 
-import { t } from '../i18n.js';
+import { normalizeTouches } from '../config/flow.js';
+import { join, t } from '../i18n.js';
 import type {
   AssessmentEntry,
   AssessVerdict,
@@ -63,6 +64,17 @@ export function assessedSize(discussion: readonly DiscussionEntry[]): Requiremen
  */
 export function assessedDifficulty(discussion: readonly DiscussionEntry[]): Difficulty | undefined {
   return assessmentRounds(discussion).findLast((e) => e.verdict === 'go')?.difficulty;
+}
+
+/**
+ * The files and directories the Run is expected to change as the latest go round gave them
+ * (`normalizeTouches`), which keep Runs of the same repo that overlap from working at once.
+ * Undefined without a go round, or when that round gave none (it left them out, named nothing
+ * inside the repo, or was recorded before assessments gave them): the Run then conflicts with
+ * no other.
+ */
+export function assessedTouches(discussion: readonly DiscussionEntry[]): string[] | undefined {
+  return assessmentRounds(discussion).findLast((e) => e.verdict === 'go')?.touches;
 }
 
 /**
@@ -147,8 +159,9 @@ export function conclusionLabel(
 }
 
 /**
- * One assessment round in words: its summary, questions, suggestions and changed requirement.
- * The engine's check detail and the dashboard's discussion show it alike.
+ * One assessment round in words: its summary, questions, suggestions, changed requirement and the
+ * paths it expects the Run to change. The engine's check detail and the dashboard's discussion
+ * show it alike.
  */
 export function formatAssessment(entry: AssessmentEntry): string {
   const parts = [entry.summary];
@@ -170,6 +183,10 @@ export function formatAssessment(entry: AssessmentEntry): string {
       }),
     );
   }
+  if (entry.touches?.length) {
+    const paths = join(entry.touches);
+    parts.push(t({ zh: `预计会改：${paths}`, en: `Expected to change: ${paths}` }));
+  }
   return parts.join('\n\n');
 }
 
@@ -182,6 +199,8 @@ export interface ReportedAssessment {
   revisedGoal?: string;
   size?: RequirementSize;
   difficulty?: Difficulty;
+  /** As the agent wrote them: `takeAssessment` cleans them up (`normalizeTouches`). */
+  touches?: string[];
 }
 
 /**
@@ -214,7 +233,9 @@ export function assessmentProblem(
  * decides alone: a drop stands, and a changed goal is still ignored (its assumptions are in the
  * summary, which the later stages read). An ask then is refused before (`assessmentProblem`).
  * A size and a difficulty are recorded with any verdict; only those of a go decide anything
- * (`assessedSize`, `assessedDifficulty`).
+ * (`assessedSize`, `assessedDifficulty`). The paths the Run is expected to change are recorded
+ * only with go, cleaned up (`normalizeTouches`), and left out when none is left
+ * (`assessedTouches`).
  */
 export function takeAssessment(
   report: ReportedAssessment,
@@ -225,6 +246,7 @@ export function takeAssessment(
   const replied = hasHumanReply(discussion);
   const proposedDrop = report.verdict === 'drop' && !replied && !alone;
   const revised = report.revisedGoal?.trim();
+  const touches = report.verdict === 'go' ? normalizeTouches(report.touches) : undefined;
   return {
     role: 'assessor',
     verdict: proposedDrop ? 'ask' : report.verdict,
@@ -234,6 +256,7 @@ export function takeAssessment(
     revisedGoal: report.verdict === 'go' && replied && !alone && revised ? revised : null,
     ...(report.size ? { size: report.size } : {}),
     ...(report.difficulty ? { difficulty: report.difficulty } : {}),
+    ...(touches ? { touches } : {}),
     proposedDrop,
     ...(alone && report.verdict !== 'ask' ? { decidedAlone: true } : {}),
     stageRunId: where.stageRunId,

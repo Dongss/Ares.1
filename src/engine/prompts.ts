@@ -1,5 +1,5 @@
 import { brandName } from '../brand.js';
-import { difficultyMeanings, PROPOSAL_SIZES, sizeMeanings } from '../config/flow.js';
+import { difficultyMeanings, MAX_TOUCHES, PROPOSAL_SIZES, sizeMeanings } from '../config/flow.js';
 import type { AgentConfig, StageDef } from '../config/schema.js';
 import { join, t } from '../i18n.js';
 import {
@@ -801,6 +801,19 @@ function difficultyRule(): string {
 }
 
 /**
+ * How an assessment that goes ahead names the files and directories the Run is expected to change
+ * (`touches`, cleaned up by `normalizeTouches`): Runs of the same repo whose paths overlap do not
+ * work at once, so a path left out risks a conflict at the merge, while a directory only costs
+ * some waiting.
+ */
+function touchesRule(): string {
+  return t({
+    zh: `verdict 为 go 时还要给出 touches：预计会改的文件或目录，写仓库内的相对路径（例如 src/engine/、docs/running.md），最多 ${MAX_TOUCHES} 条。同一仓库同时执行的 Run 按它避开同时改同一处，免得合并时冲突。拿不准具体文件时，宁可写到目录这一层，也不要漏。`,
+    en: `With verdict go, also give touches: the files or directories you expect the Run to change, as paths relative to the repo (such as src/engine/ or docs/running.md), at most ${MAX_TOUCHES}. Runs of the same repo executing at the same time go by it to avoid changing the same place at once, which would conflict at the merge. When unsure of the exact files, name their directory rather than leave anything out.`,
+  });
+}
+
+/**
  * The conclusion and output format of the round after nobody replied in time: go with the
  * assumptions written down, or drop; asking again is not accepted (`assessmentProblem`).
  */
@@ -823,6 +836,8 @@ ${sizeRule()}
 
 ${difficultyRule()}
 
+${touchesRule()}
+
 summary 用中文书写。
 
 ## 输出格式
@@ -830,7 +845,7 @@ summary 用中文书写。
 最后一条回复以一个 JSON 代码块结束：
 
 \`\`\`json
-{"verdict": "go", "size": "M", "difficulty": "mid", "summary": "评估意见，以及对每个疑问做了什么假设"}
+{"verdict": "go", "size": "M", "difficulty": "mid", "touches": ["src/engine/", "docs/running.md"], "summary": "评估意见，以及对每个疑问做了什么假设"}
 \`\`\`
 `,
     en: `## Conclusion
@@ -843,6 +858,8 @@ ${sizeRule()}
 
 ${difficultyRule()}
 
+${touchesRule()}
+
 Write summary in English.
 
 ## Output format
@@ -850,7 +867,7 @@ Write summary in English.
 End your last reply with a JSON code block:
 
 \`\`\`json
-{"verdict": "go", "size": "M", "difficulty": "mid", "summary": "your assessment, and the assumption made for each question"}
+{"verdict": "go", "size": "M", "difficulty": "mid", "touches": ["src/engine/", "docs/running.md"], "summary": "your assessment, and the assumption made for each question"}
 \`\`\`
 `,
   });
@@ -946,6 +963,8 @@ ${sizeRule()}
 
 ${difficultyRule()}
 
+${touchesRule()}
+
 summary、questions、suggestions 和 revisedGoal 都用中文书写。
 
 ## 输出格式
@@ -956,7 +975,7 @@ summary、questions、suggestions 和 revisedGoal 都用中文书写。
 {"verdict": "ask", "summary": "评估意见", "questions": ["疑问或顾虑"], "suggestions": ["建议怎么改"]}
 \`\`\`
 
-go 时写成 \`{"verdict": "go", "size": "M", "difficulty": "mid", "summary": "评估意见"}\` 这样。
+go 时写成 \`{"verdict": "go", "size": "M", "difficulty": "mid", "touches": ["src/engine/", "docs/running.md"], "summary": "评估意见"}\` 这样。
 `,
     en: `## Conclusion
 
@@ -969,6 +988,8 @@ ${sizeRule()}
 
 ${difficultyRule()}
 
+${touchesRule()}
+
 Write summary, questions, suggestions and revisedGoal in English.
 
 ## Output format
@@ -979,7 +1000,7 @@ End your last reply with a JSON code block, for example:
 {"verdict": "ask", "summary": "your assessment", "questions": ["a question or concern"], "suggestions": ["how to change it"]}
 \`\`\`
 
-With go, it looks like \`{"verdict": "go", "size": "M", "difficulty": "mid", "summary": "your assessment"}\`.
+With go, it looks like \`{"verdict": "go", "size": "M", "difficulty": "mid", "touches": ["src/engine/", "docs/running.md"], "summary": "your assessment"}\`.
 `,
   })}`;
 }

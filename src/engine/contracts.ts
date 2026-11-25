@@ -41,6 +41,16 @@ export const AssessReportSchema = z
      * stages with `agent_candidates` take their first usable candidate.
      */
     difficulty: z.enum(DIFFICULTIES).optional(),
+    /**
+     * The files and directories the Run is expected to change, as repo-relative paths; asked for
+     * with go and only taken from a go. Runs of the same repo whose paths overlap do not work at
+     * once, so they do not conflict at the merge. Optional: without them the Run is scheduled as
+     * before. Taken as written here and cleaned up by `normalizeTouches` (src/config/flow.ts),
+     * which drops what names nothing inside the repo and cuts off a long list: a transform would
+     * keep `z.toJSONSchema` from writing the CLI schema, and a limit would fail the whole report
+     * over a few paths too many.
+     */
+    touches: z.array(z.string()).optional(),
   })
   .superRefine((report, ctx) => {
     if (report.verdict === 'ask' && report.questions.length === 0) {
