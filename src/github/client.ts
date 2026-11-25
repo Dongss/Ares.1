@@ -53,6 +53,59 @@ export interface GhPullRequest {
   baseRefName: string;
 }
 
+/** A review of a pull request. */
+export interface GhReview extends GhAuthored {
+  /** As GitHub gives it: APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED or PENDING. */
+  state: string;
+  body: string;
+  /** The commit it reviewed; null when GitHub gives none. */
+  commit: string | null;
+  /** When it was submitted (ISO 8601); null while pending. */
+  submittedAt: string | null;
+}
+
+/** A review comment on a line of a pull request's changes. */
+export interface GhReviewComment extends GhAuthored {
+  body: string;
+  /** The file it is on. */
+  path: string;
+  /** The line it is on; null when the line is gone from the changes (outdated). */
+  line: number | null;
+  /** The commit it applies to; null when GitHub gives none. */
+  commit: string | null;
+}
+
+/** A check of a pull request's head commit: a check run (e.g. CI) or a commit status. */
+export interface GhCheck {
+  name: string;
+  /** Whether it has finished. */
+  done: boolean;
+  /**
+   * How it finished, as GitHub gives it: SUCCESS, FAILURE, TIMED_OUT, CANCELLED,
+   * ACTION_REQUIRED, STARTUP_FAILURE, ERROR, NEUTRAL, SKIPPED, ...; null while not done.
+   */
+  conclusion: string | null;
+  /** Where to see it; null when GitHub gives no link. */
+  url: string | null;
+}
+
+/** Where a pull request stands with the reviews its base branch requires. */
+export type GhReviewDecision = 'CHANGES_REQUESTED' | 'APPROVED' | 'REVIEW_REQUIRED';
+
+/** A pull request with what was said and checked on it: whether it needs more work. */
+export interface GhPullRequestStatus extends GhPullRequest {
+  /** The commit its head branch points at. */
+  headRefOid: string;
+  /** null when GitHub gives none, as when the base branch requires no reviews. */
+  reviewDecision: GhReviewDecision | null;
+  /** Oldest first. */
+  reviews: GhReview[];
+  /** The latest (up to 100), oldest first; always empty once merged or closed. */
+  reviewComments: GhReviewComment[];
+  /** The checks of its head commit. */
+  checks: GhCheck[];
+}
+
 /** Only the Runs' own branches may be force-pushed: never a target branch or anybody else's. */
 export function forcePushable(branch: string): boolean {
   return branch.startsWith('ares1/');
@@ -103,8 +156,8 @@ export interface GitHub {
     repo: string,
     pr: { head: string; base: string; title: string; body: string },
   ): Promise<{ number: number; url: string }>;
-  /** The pull request as it is now. */
-  getPullRequest(repo: string, number: number): Promise<GhPullRequest>;
+  /** The pull request as it is now, with its reviews and the checks of its head commit. */
+  getPullRequest(repo: string, number: number): Promise<GhPullRequestStatus>;
   /**
    * Fetch `branch` of the GitHub repo into the local clone at `path`, as the same account, and
    * return the commit it points at. No ref of the clone moves; the commit's objects are in it.
@@ -159,12 +212,7 @@ interface SearchPage {
 const MAX_PAGE = 100;
 
 function fromRawComment(c: RawComment): GhComment {
-  return {
-    body: c.body ?? '',
-    author: c.author?.login ?? null,
-    // Unknown counts as unrelated to the repo: never trusted.
-    authorAssociation: c.authorAssociation ?? 'NONE',
-  };
+  return { body: c.body ?? '', ...authored(c.author?.login, c.authorAssociation) };
 }
 
 function fromRaw(i: RawIssue): GhIssue {
@@ -221,6 +269,103 @@ function fromRawPull(raw: RawPullRequest): GhPullRequest {
     headRefName: raw.headRefName,
     baseRefName: raw.baseRefName,
   };
+}
+
+/** Who wrote something, from the login and the relation to the repo GitHub gave. */
+function authored(login: string | null | undefined, association: string | null | undefined) {
+  return {
+    // gh prints a deleted account as an empty login.
+    author: login || null,
+    // Unknown counts as unrelated to the repo: never trusted.
+    authorAssociation: association || 'NONE',
+  } satisfies GhAuthored;
+}
+
+/** What gh prints for a commit or an author that GitHub gave none of: null or empty fields. */
+const RawCommit = z.object({ oid: z.string() }).nullish();
+const RawAuthor = z.object({ login: z.string() }).nullish();
+
+/** A review as `gh pr view --json reviews` prints it. */
+const RawReview = z.object({
+  author: RawAuthor,
+  authorAssociation: z.string().nullish(),
+  state: z.string().min(1),
+  body: z.string().nullish(),
+  commit: RawCommit,
+  submittedAt: z.string().nullish(),
+});
+
+/** An entry of `gh pr view --json statusCheckRollup`: a check run or a commit status. */
+const RawCheck = z.discriminatedUnion('__typename', [
+  z.object({
+    __typename: z.literal('CheckRun'),
+    name: z.string(),
+    /** QUEUED, IN_PROGRESS, COMPLETED, ... */
+    status: z.string(),
+    conclusion: z.string().nullish(),
+    detailsUrl: z.string().nullish(),
+  }),
+  z.object({
+    __typename: z.literal('StatusContext'),
+    context: z.string(),
+    /** EXPECTED, PENDING, SUCCESS, FAILURE or ERROR. */
+    state: z.string(),
+    targetUrl: z.string().nullish(),
+  }),
+]);
+type RawCheck = z.infer<typeof RawCheck>;
+
+/** The fields `getPullRequest` asks of `gh pr view --json` besides PR_FIELDS. */
+const PR_STATUS_FIELDS = 'headRefOid,reviewDecision,reviews,statusCheckRollup';
+
+/** A pull request as `gh pr view --json PR_FIELDS,PR_STATUS_FIELDS` prints it. */
+const RawPullRequestStatus = RawPullRequest.extend({
+  headRefOid: z.string().min(1),
+  /** Empty when there is none. */
+  reviewDecision: z.string().nullish(),
+  reviews: z.array(RawReview).nullish(),
+  statusCheckRollup: z.array(RawCheck).nullish(),
+});
+
+/** Review comments as the REST API lists them (`GET /repos/{repo}/pulls/{n}/comments`). */
+const RawReviewComments = z.array(
+  z.object({
+    user: RawAuthor,
+    author_association: z.string().nullish(),
+    path: z.string(),
+    line: z.number().int().nullish(),
+    body: z.string().nullish(),
+    commit_id: z.string().nullish(),
+  }),
+);
+
+function fromRawCheck(raw: RawCheck): GhCheck {
+  if (raw.__typename === 'CheckRun') {
+    const done = raw.status === 'COMPLETED';
+    return {
+      name: raw.name,
+      done,
+      conclusion: done ? raw.conclusion || null : null,
+      url: raw.detailsUrl || null,
+    };
+  }
+  const done = raw.state !== 'PENDING' && raw.state !== 'EXPECTED';
+  return {
+    name: raw.context,
+    done,
+    conclusion: done ? raw.state : null,
+    url: raw.targetUrl || null,
+  };
+}
+
+const REVIEW_DECISIONS: readonly string[] = [
+  'CHANGES_REQUESTED',
+  'APPROVED',
+  'REVIEW_REQUIRED',
+] satisfies GhReviewDecision[];
+
+function isReviewDecision(value: string | null | undefined): value is GhReviewDecision {
+  return typeof value === 'string' && REVIEW_DECISIONS.includes(value);
 }
 
 /**
@@ -542,9 +687,44 @@ export class GhCli implements GitHub {
     return { number, url };
   }
 
-  async getPullRequest(repo: string, number: number): Promise<GhPullRequest> {
-    const out = await this.gh(['pr', 'view', String(number), '-R', repo, '--json', PR_FIELDS]);
-    return fromRawPull(parseOutput(out, RawPullRequest, 'gh pr view'));
+  async getPullRequest(repo: string, number: number): Promise<GhPullRequestStatus> {
+    const fields = `${PR_FIELDS},${PR_STATUS_FIELDS}`;
+    const out = await this.gh(['pr', 'view', String(number), '-R', repo, '--json', fields]);
+    const raw = parseOutput(out, RawPullRequestStatus, 'gh pr view');
+    const pr = fromRawPull(raw);
+    return {
+      ...pr,
+      headRefOid: raw.headRefOid,
+      reviewDecision: isReviewDecision(raw.reviewDecision) ? raw.reviewDecision : null,
+      reviews: (raw.reviews ?? []).map((r) => ({
+        ...authored(r.author?.login, r.authorAssociation),
+        state: r.state,
+        body: r.body ?? '',
+        commit: r.commit?.oid || null,
+        submittedAt: r.submittedAt || null,
+      })),
+      // What was said on the lines matters only while the work may still change.
+      reviewComments: pr.state === 'open' ? await this.reviewComments(repo, number) : [],
+      checks: (raw.statusCheckRollup ?? []).map(fromRawCheck),
+    };
+  }
+
+  /**
+   * The latest review comments (up to 100) of a pull request, oldest first. Through the REST
+   * API: `gh pr view --json` has none of them.
+   */
+  private async reviewComments(repo: string, number: number): Promise<GhReviewComment[]> {
+    const path = `repos/${repo}/pulls/${number}/comments`;
+    const out = await this.gh(['api', `${path}?per_page=100&sort=created&direction=desc`]);
+    return parseOutput(out, RawReviewComments, `gh api ${path}`)
+      .map((c) => ({
+        ...authored(c.user?.login, c.author_association),
+        body: c.body ?? '',
+        path: c.path,
+        line: c.line ?? null,
+        commit: c.commit_id || null,
+      }))
+      .reverse();
   }
 
   /**

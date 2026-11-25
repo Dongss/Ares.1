@@ -5,9 +5,12 @@ import { dirname, join } from 'node:path';
 import { FakeAdapter, type FakeContext, type FakeOutcome } from '../src/adapters/fake.js';
 import {
   forcePushable,
+  type GhCheck,
   type GhComment,
   type GhIssue,
   type GhPullRequest,
+  type GhPullRequestStatus,
+  type GhReviewDecision,
   type GitHub,
   type LabelDef,
 } from '../src/github/client.js';
@@ -319,9 +322,35 @@ export interface FakeIssue extends Omit<GhIssue, 'comments'> {
 }
 
 /** A pull request as FakeGitHub keeps it: what the client returns, with what it was opened with. */
-export interface FakePull extends GhPullRequest {
+export interface FakePull extends GhPullRequestStatus {
   title: string;
   body: string;
+}
+
+/** A review a human submits on FakeGitHub (`reviewPull`). */
+export interface FakeReview {
+  /** Login; null for a deleted account. */
+  author: string | null;
+  /** GitHub's authorAssociation, e.g. OWNER or NONE. */
+  association: string;
+  /** APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED or PENDING. */
+  state: string;
+  body: string;
+  /** The commit reviewed; defaults to the pull request's head. */
+  commit?: string | null;
+  /** The pull request's reviewDecision afterwards; left as it is when omitted. */
+  reviewDecision?: GhReviewDecision | null;
+}
+
+/** A review comment a human writes on a line of FakeGitHub's pull request (`commentPull`). */
+export interface FakeReviewComment {
+  author: string | null;
+  association: string;
+  path: string;
+  line: number | null;
+  body: string;
+  /** The commit it applies to; defaults to the pull request's head. */
+  commit?: string | null;
 }
 
 /** Issues a merged pull request's body closes on GitHub: "Closes #3", "fixes #4", ... */
@@ -493,6 +522,14 @@ export class FakeGitHub implements GitHub {
         if (ff.status !== 0) throw new Error(`push ${branch} rejected: not a fast-forward`);
       }
       this.remoteBranches.set(branch, head);
+      // An open pull request from the branch follows it, as on GitHub. Its checks are those of
+      // the head commit: a new head has none until a test sets them.
+      for (const pull of this.pulls.values()) {
+        if (pull.state === 'open' && pull.headRefName === branch && pull.headRefOid !== head) {
+          pull.headRefOid = head;
+          pull.checks = [];
+        }
+      }
       return;
     }
     if (this.remoteMissing) {
@@ -559,7 +596,8 @@ export class FakeGitHub implements GitHub {
   ): Promise<{ number: number; url: string }> {
     this.call(`createPull ${pr.head}`);
     // GitHub refuses a pull request from a branch it does not have, or a second open one.
-    if (!this.remoteBranches.has(pr.head)) throw new Error(`no branch ${pr.head} on GitHub`);
+    const headRefOid = this.remoteBranches.get(pr.head);
+    if (headRefOid === undefined) throw new Error(`no branch ${pr.head} on GitHub`);
     const open = [...this.pulls.values()].some(
       (p) => p.state === 'open' && p.headRefName === pr.head && p.baseRefName === pr.base,
     );
@@ -574,15 +612,60 @@ export class FakeGitHub implements GitHub {
       mergeCommit: null,
       headRefName: pr.head,
       baseRefName: pr.base,
+      headRefOid,
+      reviewDecision: null,
+      reviews: [],
+      reviewComments: [],
+      checks: [],
       title: pr.title,
       body: pr.body,
     });
     return { number, url };
   }
 
-  async getPullRequest(_repo: string, number: number): Promise<GhPullRequest> {
+  async getPullRequest(_repo: string, number: number): Promise<GhPullRequestStatus> {
     this.call(`getPull #${number}`);
-    return pullView(this.pull(number));
+    return pullStatusView(this.pull(number));
+  }
+
+  /**
+   * A human submits a review on the pull request, on its head commit unless `commit` says
+   * otherwise; `reviewDecision`, when given, is what GitHub makes of the reviews afterwards.
+   */
+  reviewPull(number: number, review: FakeReview): void {
+    const pull = this.pull(number);
+    pull.reviews.push({
+      author: review.author,
+      authorAssociation: review.association,
+      state: review.state,
+      body: review.body,
+      commit: review.commit === undefined ? pull.headRefOid : review.commit,
+      submittedAt: review.state === 'PENDING' ? null : new Date().toISOString(),
+    });
+    if (review.reviewDecision !== undefined) pull.reviewDecision = review.reviewDecision;
+  }
+
+  /** A human comments on a line of the pull request's changes, of its head unless told. */
+  commentPull(number: number, comment: FakeReviewComment): void {
+    const pull = this.pull(number);
+    pull.reviewComments.push({
+      author: comment.author,
+      authorAssociation: comment.association,
+      path: comment.path,
+      line: comment.line,
+      body: comment.body,
+      commit: comment.commit === undefined ? pull.headRefOid : comment.commit,
+    });
+  }
+
+  /** The checks of the pull request's head commit, as CI reports them. */
+  setChecks(number: number, checks: readonly GhCheck[]): void {
+    this.pull(number).checks = checks.map((c) => ({ ...c }));
+  }
+
+  /** What GitHub makes of the reviews, e.g. after a human dismissed one. */
+  setReviewDecision(number: number, value: GhReviewDecision | null): void {
+    this.pull(number).reviewDecision = value;
   }
 
   /**
@@ -622,5 +705,20 @@ function pullView(pull: FakePull): GhPullRequest {
     mergeCommit: pull.mergeCommit,
     headRefName: pull.headRefName,
     baseRefName: pull.baseRefName,
+  };
+}
+
+/**
+ * A pull request as `getPullRequest` returns it: a deep copy, without what FakeGitHub adds. Its
+ * review comments are read only while it is open, as GhCli does.
+ */
+function pullStatusView(pull: FakePull): GhPullRequestStatus {
+  return {
+    ...pullView(pull),
+    headRefOid: pull.headRefOid,
+    reviewDecision: pull.reviewDecision,
+    reviews: pull.reviews.map((r) => ({ ...r })),
+    reviewComments: pull.state === 'open' ? pull.reviewComments.map((c) => ({ ...c })) : [],
+    checks: pull.checks.map((c) => ({ ...c })),
   };
 }
