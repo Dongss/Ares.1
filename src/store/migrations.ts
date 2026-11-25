@@ -203,4 +203,28 @@ export const MIGRATIONS: readonly string[] = [
   ALTER TABLE runs ADD COLUMN pr_number INTEGER;
   ALTER TABLE runs ADD COLUMN pr_url TEXT;
   `,
+  // v11: the local backlog of the repos without GitHub (backlog.repos): what scouts proposed,
+  // and what became of it. scouts.issues_repo stays NOT NULL; their scouts store ''.
+  `
+  CREATE TABLE proposals (
+    id TEXT PRIMARY KEY,
+    repo_id TEXT NOT NULL REFERENCES repos(id),
+    scout_id TEXT,
+    title TEXT NOT NULL,
+    category TEXT NOT NULL,
+    size TEXT NOT NULL,
+    risk TEXT NOT NULL,
+    why TEXT NOT NULL,
+    evidence TEXT NOT NULL DEFAULT '[]',
+    what TEXT NOT NULL,
+    acceptance TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'pending',
+    reject_reason TEXT,
+    auto INTEGER NOT NULL DEFAULT 0,
+    run_id TEXT,
+    created_at TEXT NOT NULL,
+    decided_at TEXT
+  );
+  CREATE INDEX proposals_repo_status ON proposals(repo_id, status);
+  `,
 ];

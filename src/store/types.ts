@@ -333,8 +333,48 @@ export interface ScoutProposal {
   acceptance: string[];
   /** Set once the issue is created. */
   issue?: { number: number; url: string; auto: boolean };
+  /**
+   * Set once it is in the repo's local backlog (backlog.repos), the counterpart of `issue`:
+   * `id` of the Proposal, `auto` when it was accepted without a human.
+   */
+  local?: { id: string; auto: boolean };
   /** Why the issue could not be created. */
   error?: string;
+}
+
+/**
+ * pending: waits for a human, or for the automatic acceptance; accepted: a Run was created from
+ * it; rejected: a human turned it down, with a reason the next scouts are shown.
+ */
+export type ProposalStatus = 'pending' | 'accepted' | 'rejected';
+
+/**
+ * A proposal in the local backlog of a repo without GitHub (backlog.repos): what a scout
+ * proposed, kept in the Master instead of as an issue, and what became of it.
+ */
+export interface Proposal {
+  id: string;
+  repoId: string;
+  /** The scout that proposed it. */
+  scoutId: string | null;
+  title: string;
+  category: ScoutProposal['category'];
+  size: ScoutProposal['size'];
+  risk: ScoutProposal['risk'];
+  why: string;
+  evidence: string[];
+  what: string;
+  acceptance: string[];
+  status: ProposalStatus;
+  /** Why a human rejected it; null unless rejected. */
+  rejectReason: string | null;
+  /** Accepted without a human, within the repo's auto_accept. */
+  auto: boolean;
+  /** The Run created from it once accepted. */
+  runId: string | null;
+  createdAt: string;
+  /** When it was accepted or rejected. */
+  decidedAt: string | null;
 }
 
 /**
@@ -352,7 +392,10 @@ export interface ScoutGap {
 export interface Scout {
   id: string;
   repoId: string;
-  /** "owner/name" of the issues. */
+  /**
+   * "owner/name" of the issues; '' for a repo of the local backlog (backlog.repos), which has
+   * none: the column is NOT NULL, and allowing null would mean rebuilding the table.
+   */
   issuesRepo: string;
   /** auto: started by the Master when the repo was idle. */
   trigger: 'manual' | 'auto';

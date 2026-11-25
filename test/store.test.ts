@@ -17,9 +17,10 @@ import {
   type BackupRestore,
   backupRestoredNotice,
   KEEP_BACKUPS,
+  NotFoundError,
   Store,
 } from '../src/store/store.js';
-import type { Attempt, Scout } from '../src/store/types.js';
+import type { Attempt, Scout, ScoutProposal } from '../src/store/types.js';
 import { type Harness, harness, tmpDir } from './helpers.js';
 
 const template = TemplateSchema.parse({ id: 't', stages: [{ id: 'a', agent: 'x' }] });
@@ -344,6 +345,209 @@ describe('store', () => {
     expect(store.agentScoutTotals()).toEqual([
       { agentId: 's', scouts: 4, costUsd: 0.4, costUnknown: 1, lastAt: last.startedAt },
     ]);
+  });
+});
+
+describe('proposals of the local backlog', () => {
+  afterEach(() => setLang('zh'));
+
+  const proposed = (title: string, patch: Partial<ScoutProposal> = {}): ScoutProposal => ({
+    title,
+    category: 'feature',
+    size: 'M',
+    risk: 'low',
+    why: `为什么要 ${title}`,
+    evidence: ['README.md:1', 'src/a.ts:2'],
+    what: `做 ${title}`,
+    acceptance: ['能用', '有测试'],
+    ...patch,
+  });
+
+  it('migrates a v10 database, keeping its scouts, and the scouts of local repos have no issues repo', () => {
+    const dir = tmpDir('ares1-db-');
+    const file = join(dir, 'ares1.db');
+    const old = new DatabaseSync(file);
+    for (const m of MIGRATIONS.slice(0, 10)) old.exec(m);
+    old.exec('PRAGMA user_version = 10');
+    old.exec(`
+      INSERT INTO repos (id, name, path, target_branch, created_at) VALUES ('r', 'r', '/r', 'main', 't');
+      INSERT INTO scouts (id, repo_id, issues_repo, trigger, status, agent_id, log_path, started_at)
+        VALUES ('old', 'r', 'me/r', 'manual', 'completed', 's', '/l', 't');
+    `);
+    old.close();
+
+    const store = new Store(file);
+    expect(
+      (store.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+    ).toBe(11);
+    expect(store.getScout('old')).toMatchObject({ issuesRepo: 'me/r', status: 'completed' });
+    expect(store.listProposals()).toEqual([]);
+    const scout = store.createScout({
+      repoId: 'r',
+      issuesRepo: '',
+      trigger: 'auto',
+      agentId: 's',
+      model: null,
+      logPath: '/l',
+    });
+    expect(store.getScout(scout.id).issuesRepo).toBe('');
+    const p = store.createProposal({ ...proposed('a'), repoId: 'r', scoutId: scout.id });
+    expect(store.getProposal(p.id)).toEqual(p);
+    expect(
+      store.db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'proposals'")
+        .all()
+        .map((r) => (r as { name: string }).name),
+    ).toContain('proposals_repo_status');
+    store.close();
+    expect(readdirSync(dir).filter((f) => f.includes('.bak-v10-'))).toHaveLength(1);
+  });
+
+  it('creates, reads back, decides and lists them by repo and status, newest first', () => {
+    const store = new Store(':memory:');
+    const { repo, mk } = seed(store);
+    const other = store.createRepo({
+      name: 'o',
+      path: '/tmp/o',
+      targetBranch: 'main',
+      verifyCommands: [],
+      setupCommands: [],
+      mergeMode: 'direct',
+    });
+
+    // A ScoutProposal as it is: its issue, local and error are not columns.
+    const a = store.createProposal({
+      ...proposed('a', {
+        issue: { number: 1, url: 'u', auto: false },
+        local: { id: 'nope', auto: true },
+        error: 'x',
+      }),
+      repoId: repo.id,
+      scoutId: 'scout-1',
+    });
+    expect(a).toEqual({
+      id: a.id,
+      repoId: repo.id,
+      scoutId: 'scout-1',
+      title: 'a',
+      category: 'feature',
+      size: 'M',
+      risk: 'low',
+      why: '为什么要 a',
+      evidence: ['README.md:1', 'src/a.ts:2'],
+      what: '做 a',
+      acceptance: ['能用', '有测试'],
+      status: 'pending',
+      rejectReason: null,
+      auto: false,
+      runId: null,
+      createdAt: a.createdAt,
+      decidedAt: null,
+    });
+    expect(Object.keys(store.getProposal(a.id)).sort()).toEqual(Object.keys(a).sort());
+    // JSON and boolean columns come back as they went in.
+    expect(store.getProposal(a.id)).toEqual(a);
+
+    const b = store.createProposal({
+      ...proposed('b', { category: 'bug', size: 'L', risk: 'high', evidence: [], acceptance: [] }),
+      repoId: repo.id,
+      scoutId: null,
+    });
+    expect(store.getProposal(b.id)).toMatchObject({
+      scoutId: null,
+      category: 'bug',
+      size: 'L',
+      risk: 'high',
+      evidence: [],
+      acceptance: [],
+    });
+    const c = store.createProposal({ ...proposed('c'), repoId: other.id, scoutId: null });
+    const d = store.createProposal({ ...proposed('d'), repoId: repo.id, scoutId: 'scout-2' });
+
+    const run = mk('做 a');
+    const accepted = store.updateProposal(a.id, {
+      status: 'accepted',
+      auto: true,
+      runId: run.id,
+      decidedAt: '2026-11-25T08:00:00.000Z',
+    });
+    expect(accepted).toMatchObject({
+      status: 'accepted',
+      auto: true,
+      runId: run.id,
+      decidedAt: '2026-11-25T08:00:00.000Z',
+      rejectReason: null,
+      title: 'a',
+    });
+    expect(store.getProposal(a.id)).toEqual(accepted);
+    const rejected = store.updateProposal(b.id, {
+      status: 'rejected',
+      rejectReason: '不做：和 README 的目标无关',
+      decidedAt: '2026-11-25T09:00:00.000Z',
+    });
+    expect(rejected).toMatchObject({ status: 'rejected', auto: false, runId: null });
+    expect(store.getProposal(b.id).rejectReason).toBe('不做：和 README 的目标无关');
+    // Back to false.
+    expect(store.updateProposal(a.id, { auto: false }).auto).toBe(false);
+    // Nothing to change is no change.
+    expect(store.updateProposal(c.id, {})).toEqual(c);
+
+    const ids = (list: { id: string }[]) => list.map((p) => p.id);
+    expect(ids(store.listProposals())).toEqual([d.id, c.id, b.id, a.id]);
+    expect(ids(store.listProposals({ repoId: repo.id }))).toEqual([d.id, b.id, a.id]);
+    expect(ids(store.listProposals({ repoId: repo.id, status: 'pending' }))).toEqual([d.id]);
+    expect(ids(store.listProposals({ status: 'pending' }))).toEqual([d.id, c.id]);
+    expect(ids(store.listProposals({ status: 'rejected' }))).toEqual([b.id]);
+    expect(ids(store.listProposals({ repoId: repo.id, status: ['pending', 'accepted'] }))).toEqual([
+      d.id,
+      a.id,
+    ]);
+    expect(store.listProposals({ status: [] })).toEqual([]);
+    expect(ids(store.listProposals({ repoId: repo.id, limit: 2 }))).toEqual([d.id, b.id]);
+    expect(store.listProposals({ repoId: 'nope' })).toEqual([]);
+    // Listed as they are read one by one.
+    expect(store.listProposals({ status: 'accepted' })).toEqual([store.getProposal(a.id)]);
+  });
+
+  it('tells a proposal that does not exist, in both languages', () => {
+    const store = new Store(':memory:');
+    expect(() => store.getProposal('nope')).toThrow(NotFoundError);
+    expect(() => store.getProposal('nope')).toThrow('提案 nope 不存在');
+    expect(() => store.updateProposal('nope', { status: 'accepted' })).toThrow(NotFoundError);
+    setLang('en');
+    expect(() => store.getProposal('nope')).toThrow('Proposal nope not found');
+    expect(() => store.updateProposal('nope', {})).toThrow('Proposal nope not found');
+  });
+
+  it('are deleted with their repo, and only theirs', () => {
+    const store = new Store(':memory:');
+    const { repo } = seed(store);
+    const other = store.createRepo({
+      name: 'o',
+      path: '/tmp/o',
+      targetBranch: 'main',
+      verifyCommands: [],
+      setupCommands: [],
+      mergeMode: 'direct',
+    });
+    const scout = store.createScout({
+      repoId: repo.id,
+      issuesRepo: '',
+      trigger: 'manual',
+      agentId: 's',
+      model: null,
+      logPath: '/l',
+    });
+    store.createProposal({ ...proposed('a'), repoId: repo.id, scoutId: scout.id });
+    const b = store.createProposal({ ...proposed('b'), repoId: repo.id, scoutId: scout.id });
+    store.updateProposal(b.id, { status: 'rejected', rejectReason: 'no' });
+    const kept = store.createProposal({ ...proposed('c'), repoId: other.id, scoutId: null });
+
+    store.deleteRepo(repo.id);
+    expect(store.findRepo(repo.id)).toBeUndefined();
+    expect(store.listScouts({ repoId: repo.id })).toEqual([]);
+    expect(store.listProposals({ repoId: repo.id })).toEqual([]);
+    expect(store.listProposals()).toEqual([kept]);
   });
 });
 

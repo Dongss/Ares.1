@@ -15,6 +15,8 @@ import {
   type CheckResult,
   type EventRow,
   FINISHED_RUN_STATUSES,
+  type Proposal,
+  type ProposalStatus,
   type RedoState,
   type Repo,
   type Run,
@@ -34,7 +36,8 @@ type Table =
   | 'check_results'
   | 'approvals'
   | 'artifacts'
-  | 'scouts';
+  | 'scouts'
+  | 'proposals';
 
 /** Columns stored as JSON text. */
 const JSON_COLUMNS: Partial<Record<Table, readonly string[]>> = {
@@ -42,9 +45,11 @@ const JSON_COLUMNS: Partial<Record<Table, readonly string[]>> = {
   runs: ['template', 'overrides', 'blocked', 'issue', 'discussion'],
   attempts: ['structured'],
   scouts: ['proposals', 'gaps'],
+  proposals: ['evidence', 'acceptance'],
 };
 const BOOL_COLUMNS: Partial<Record<Table, readonly string[]>> = {
   check_results: ['passed'],
+  proposals: ['auto'],
 };
 /**
  * Object fields kept one key per column, by field: key `number` of field `pr` in column
@@ -589,6 +594,7 @@ export class Store {
       );
     }
     this.tx(() => {
+      this.db.prepare('DELETE FROM proposals WHERE repo_id = ?').run(id);
       this.db.prepare('DELETE FROM scouts WHERE repo_id = ?').run(id);
       this.db.prepare('DELETE FROM repos WHERE id = ?').run(id);
     });
@@ -1225,7 +1231,98 @@ export class Store {
       lastAt: r.last_at,
     }));
   }
+
+  // ---- proposals of the local backlog ----------------------------------
+
+  /**
+   * A new pending proposal. Takes only the proposal's own fields, so a ScoutProposal can be
+   * passed as it is: its `issue`, `local` and `error` are not columns.
+   */
+  createProposal(input: Pick<Proposal, ProposalInputKey>): Proposal {
+    const proposal: Proposal = {
+      id: newId('proposal'),
+      repoId: input.repoId,
+      scoutId: input.scoutId,
+      title: input.title,
+      category: input.category,
+      size: input.size,
+      risk: input.risk,
+      why: input.why,
+      evidence: input.evidence,
+      what: input.what,
+      acceptance: input.acceptance,
+      status: 'pending',
+      rejectReason: null,
+      auto: false,
+      runId: null,
+      createdAt: nowIso(),
+      decidedAt: null,
+    };
+    this.insert('proposals', proposal);
+    return proposal;
+  }
+
+  getProposal(id: string): Proposal {
+    return this.must(
+      this.one<Proposal>('proposals', 'SELECT * FROM proposals WHERE id = ?', id),
+      t({ zh: `提案 ${id}`, en: `Proposal ${id}` }),
+    );
+  }
+
+  /** Throws NotFoundError when there is no such proposal. */
+  updateProposal(
+    id: string,
+    patch: Partial<Omit<Proposal, 'id' | 'repoId' | 'createdAt'>>,
+  ): Proposal {
+    this.getProposal(id);
+    this.patch('proposals', id, patch);
+    return this.getProposal(id);
+  }
+
+  /** Newest first. `status` may list several; no `limit` = all of them. */
+  listProposals(
+    filter: {
+      repoId?: string;
+      status?: ProposalStatus | readonly ProposalStatus[];
+      limit?: number;
+    } = {},
+  ): Proposal[] {
+    const where: string[] = [];
+    const params: SQLInputValue[] = [];
+    if (filter.repoId) {
+      where.push('repo_id = ?');
+      params.push(filter.repoId);
+    }
+    if (filter.status !== undefined) {
+      const statuses: readonly ProposalStatus[] =
+        typeof filter.status === 'string' ? [filter.status] : filter.status;
+      // No status at all matches nothing, rather than everything.
+      where.push(statuses.length === 0 ? '0' : `status IN (${statuses.map(() => '?').join(', ')})`);
+      params.push(...statuses);
+    }
+    const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    return this.many<Proposal>(
+      'proposals',
+      `SELECT * FROM proposals ${clause} ORDER BY created_at DESC, rowid DESC LIMIT ?`,
+      ...params,
+      // SQLite takes a negative limit as none.
+      filter.limit ?? -1,
+    );
+  }
 }
+
+/** What a new proposal is made of; the rest is set when it is created or decided. */
+type ProposalInputKey =
+  | 'repoId'
+  | 'scoutId'
+  | 'title'
+  | 'category'
+  | 'size'
+  | 'risk'
+  | 'why'
+  | 'evidence'
+  | 'what'
+  | 'acceptance';
 
 /** How much of an agent's latest error `agentAttemptTotals()` keeps. */
 const LAST_ERROR_CHARS = 200;
