@@ -812,6 +812,13 @@ describe('iterations', () => {
     expect(store.listIterations({ repoId: 'nope' })).toEqual([]);
     // Listed as they are read one by one.
     expect(store.listIterations({ status: 'active' })).toEqual([store.getIteration(b.id)]);
+
+    // An iteration never written out is forgotten, and only that one.
+    store.deleteIteration(d.id);
+    expect(ids(store.listIterations())).toEqual([c.id, b.id, a.id]);
+    expect(() => store.getIteration(d.id)).toThrow(NotFoundError);
+    store.deleteIteration('nope');
+    expect(ids(store.listIterations())).toEqual([c.id, b.id, a.id]);
   });
 
   it('keeps the iteration of a local proposal and the proposals it depends on', () => {

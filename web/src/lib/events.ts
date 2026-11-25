@@ -322,6 +322,20 @@ export function globalEventText(event: GlobalEvent, now = new Date()): string | 
         en: `Accepted proposal${which} of ${repoOf(event)} automatically; it waits to be worked on`,
       });
     }
+    case 'iteration.auto_accepted':
+    case 'iteration.accepted': {
+      const issue = num(d.issue);
+      const which = issue === null ? '' : ` #${issue}`;
+      return event.type === 'iteration.auto_accepted'
+        ? t({
+            zh: `整批自动采纳了 ${repoOf(event)} 的迭代${which}，子 issue 按依赖顺序开工`,
+            en: `Accepted iteration${which} of ${repoOf(event)} automatically as a whole; its sub-issues start in the order of their dependencies`,
+          })
+        : t({
+            zh: `${repoOf(event)} 的迭代${which} 已整批采纳，子 issue 按依赖顺序开工`,
+            en: `Iteration${which} of ${repoOf(event)} was accepted as a whole; its sub-issues start in the order of their dependencies`,
+          });
+    }
     case 'proposal.auto_accepted':
     case 'proposal.accepted': {
       const runId = str(d.runId);
@@ -520,9 +534,9 @@ export interface EventLink {
 }
 
 /**
- * Where to see more about the event: scouts, the issues they propose and the local proposals live
- * on the Issues page; a divergence handed to a Run, and an accepted local proposal, on that Run's
- * page.
+ * Where to see more about the event: scouts, the issues and iterations they propose and the local
+ * proposals live on the Issues page; a divergence handed to a Run, and an accepted local proposal,
+ * on that Run's page.
  */
 export function globalEventLink(event: GlobalEvent): EventLink | null {
   const runId = str(event.data.runId);
@@ -537,6 +551,7 @@ export function globalEventLink(event: GlobalEvent): EventLink | null {
   if (
     event.type.startsWith('scout.') ||
     event.type.startsWith('proposal.') ||
+    event.type.startsWith('iteration.') ||
     event.type === 'issue.auto_accepted'
   ) {
     return { href: href.issues, label: t({ zh: '查看需求', en: 'See issues' }) };

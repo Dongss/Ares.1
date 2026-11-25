@@ -115,6 +115,11 @@ export function withStatusLabel(labels: readonly string[], status: string | null
   return status ? [...kept, status] : kept;
 }
 
+/** Whether the labels say where the issue stands: it was decided, by a human or the Master. */
+export function hasStatusLabel(labels: readonly string[]): boolean {
+  return labels.some((l) => STATUS_LABELS.includes(l));
+}
+
 /** Marks where the Master's footer starts; the Run goal leaves it out. */
 export const FOOTER_MARKER = '<!-- ares1:footer -->';
 
@@ -311,6 +316,17 @@ export function autoAcceptedComment(): string {
 }
 
 /**
+ * Posted on an iteration's issue accepted as a whole once the auto-accept settings allowed it,
+ * after it waited for a human.
+ */
+export function iterationAutoAcceptedComment(): string {
+  return t({
+    zh: `按当前的自动采纳设置，已整批自动采纳：这个迭代和全部子 issue 都加上了 \`${LABELS.ready}\`，子 issue 按依赖顺序开工。不想做就关闭为 not planned，并留一句理由，还没完成的子 issue 会一起终止并关成不做。`,
+    en: `Accepted automatically as a whole under the current auto-accept setting: \`${LABELS.ready}\` was added to this iteration and all its sub-issues, which are started in the order of their dependencies. If you don't want it, close it as not planned with a one-line reason; the sub-issues not yet done are then stopped and closed as not planned too.`,
+  });
+}
+
+/**
  * In the footer of an iteration's child issue: the iteration's own issue. Part of the protocol,
  * the same in every language; the Master goes by it, not by the visible line beside it, which
  * follows the language and which people may edit.
@@ -360,8 +376,11 @@ const issueList = (issues: readonly number[]) => join(issues.map((n) => `#${n}`)
 
 /** One step of an iteration's plan as the iteration's issue lists it. */
 export interface PlanItem {
-  /** The step's own issue. */
-  number: number;
+  /**
+   * The step's own issue; null while it is not created yet: the iteration's issue is written
+   * before its children, which name it, and lists the steps by title until they have issues.
+   */
+  number: number | null;
   title: string;
   /** The issues of the plan it depends on. */
   dependsOn: readonly number[];
@@ -385,11 +404,13 @@ export interface IterationText {
 /**
  * The body of an iteration's issue: its goal with the README goal it serves, the completion
  * criteria (numbered: children name them by number), the plan as a task list of its child issues
- * (`- [ ] #N title`, checked by `checkPlanItem` as they are done) and what it leaves out; the
- * footer says how to accept it or turn it down. `auto`: accepted under the auto-accept setting.
+ * (`- [ ] #N title`, checked by `checkPlanItem` as they are done; a step without its issue yet is
+ * a plain item with its title) and what it leaves out; the footer says how to accept it or turn
+ * it down. `auto`: accepted under the auto-accept setting.
  */
 export function iterationBody(it: IterationText, scoutId: string, auto: boolean): string {
   const plan = it.plan.map((item) => {
+    if (item.number === null) return `- ${item.title}`;
     const deps =
       item.dependsOn.length > 0
         ? t({
@@ -490,6 +511,14 @@ export function iterationChildBody(
 export function checkPlanItem(body: string, number: number): string {
   const item = new RegExp(`^([ \\t]*[-*+] )\\[ \\]( #${number})(?!\\d)`, 'gm');
   return body.replace(item, '$1[x]$2');
+}
+
+/**
+ * Whether an iteration's body lists every one of the child issues `numbers` as an item of its
+ * plan's task list, checked or not: once it does, the plan was written out with them.
+ */
+export function planLists(body: string, numbers: readonly number[]): boolean {
+  return numbers.every((n) => new RegExp(`^[ \\t]*[-*+] \\[[ xX]\\] #${n}(?!\\d)`, 'm').test(body));
 }
 
 /** The goal of a Run created from an issue. */

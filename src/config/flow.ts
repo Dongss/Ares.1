@@ -944,6 +944,7 @@ export interface ScoutBackoff {
  * may start poll_minutes × 2^(k-1) after the newest of them ended, at most
  * MAX_SCOUT_BACKOFF_HOURS.
  * - A scout that filed a proposal ends the streak: as an issue, or into the local backlog.
+ * - So does a scout that wrote out an iteration, its id among `iterationScouts`.
  * - So does a scout started before `changedAt` (the target branch's latest commit): it did not
  *   see the repo as it is now.
  * - A scout cut short by the Master stopping, or still running, neither counts nor ends it.
@@ -952,9 +953,11 @@ export interface ScoutBackoff {
  * `scouts` are newest first. null: no streak, no back-off.
  */
 export function scoutBackoff(
-  scouts: Pick<Scout, 'status' | 'proposals' | 'startedAt' | 'endedAt'>[],
+  scouts: (Pick<Scout, 'status' | 'proposals' | 'startedAt' | 'endedAt'> &
+    Partial<Pick<Scout, 'id'>>)[],
   pollMinutes: number,
   changedAt = Number.NEGATIVE_INFINITY,
+  iterationScouts: ReadonlySet<string> = new Set(),
 ): ScoutBackoff | null {
   let count = 0;
   let newest: (typeof scouts)[number] | undefined;
@@ -964,6 +967,7 @@ export function scoutBackoff(
     }
     if (Date.parse(s.startedAt) < changedAt) break;
     if (s.status === 'completed' && s.proposals.some((p) => p.issue || p.local)) break;
+    if (s.status === 'completed' && s.id !== undefined && iterationScouts.has(s.id)) break;
     count++;
     newest ??= s;
   }

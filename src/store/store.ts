@@ -1409,6 +1409,14 @@ export class Store {
     return this.getIteration(id);
   }
 
+  /**
+   * Forget an iteration that was never written out (its issue could not be created), so that it
+   * does not hold the repo as the iteration under way. Nothing else refers to it then.
+   */
+  deleteIteration(id: string): void {
+    this.db.prepare('DELETE FROM iterations WHERE id = ?').run(id);
+  }
+
   /** Newest first. `status` may list several; no `limit` = all of them. */
   listIterations(
     filter: {

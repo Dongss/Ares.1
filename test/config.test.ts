@@ -2830,6 +2830,19 @@ describe('scoutBackoff', () => {
     expect(scoutBackoff([scout(10, 'completed', auto)], 5)).toBeNull();
   });
 
+  it('ends the streak at a scout that wrote out an iteration, though it filed no proposal', () => {
+    const planned = new Set(['scout-planned']);
+    const iteration = { ...scout(10, 'completed'), id: 'scout-planned' };
+    expect(scoutBackoff([iteration, scout(0, 'failed')], 5, undefined, planned)).toBeNull();
+    const scouts = [scout(30, 'failed'), scout(20, 'completed'), iteration, scout(0, 'failed')];
+    expect(scoutBackoff(scouts, 5, undefined, planned)).toEqual({ count: 2, until: at(31 + 10) });
+    // Without its iteration written out, it found nothing.
+    expect(scoutBackoff(scouts, 5)).toEqual({ count: 4, until: at(31 + 40) });
+    // A failed scout counts whatever its id.
+    const failed = { ...scout(10, 'failed'), id: 'scout-planned' };
+    expect(scoutBackoff([failed], 5, undefined, planned)).toEqual({ count: 1, until: at(16) });
+  });
+
   it('doubles poll_minutes with every scout in a row that found nothing or failed', () => {
     const one = [scout(20, 'completed')];
     expect(scoutBackoff(one, 5)).toEqual({ count: 1, until: at(21 + 5) });

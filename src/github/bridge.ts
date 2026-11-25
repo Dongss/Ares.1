@@ -5,6 +5,7 @@ import { prepareAgentEnv } from '../adapters/process.js';
 import type { GitHubRepoStatus, GitHubStatus } from '../api/types.js';
 import { mayAutoAccept, overBudget } from '../backlog/guard.js';
 import {
+  type FiledIteration,
   type FiledProposals,
   type KnownRequirements,
   notRegistered,
@@ -14,10 +15,13 @@ import {
 } from '../backlog/scouting.js';
 import { brandName } from '../brand.js';
 import {
+  effectiveDependencies,
   isAutoAcceptable,
   issueRunOverrides,
+  iterationKind,
   redoDueAt,
   replyTimeoutHours,
+  unmetDependencies,
 } from '../config/flow.js';
 import {
   findTemplate,
@@ -35,6 +39,9 @@ import {
   type EventRow,
   type FailedAttempt,
   FINISHED_RUN_STATUSES,
+  type Iteration,
+  type IterationChild,
+  type IterationStatus,
   type PrCloseReason,
   type Repo,
   type Run,
@@ -73,11 +80,18 @@ import {
   failedAttempt,
   goalChangedComment,
   goalFromIssue,
+  hasStatusLabel,
+  type IterationText,
   issueUpdate,
   isTrusted,
+  iterationAutoAcceptedComment,
+  iterationBody,
+  iterationChildBody,
   LABELS,
   labelDefs,
   markComment,
+  parseDependsOn,
+  planLists,
   proposalBody,
   pullRequestClosedComment,
   pullRequestComment,
@@ -97,7 +111,14 @@ import {
   reworksDone,
 } from './pr-rework.js';
 import { redactForGitHub } from './redact.js';
-import { filedProposal, issueDigest, proposalsHoldingScout, untriaged } from './scout.js';
+import {
+  filedProposal,
+  issueDigest,
+  type PlannedIteration,
+  plannedChildren,
+  proposalsHoldingScout,
+  untriaged,
+} from './scout.js';
 
 /** How many of the latest closed issues the scout sees, done or not. */
 const SCOUT_RECENT_CLOSED = 30;
@@ -341,6 +362,39 @@ function prCloseReason(run: Run, events: readonly EventRow[]): PrCloseReason {
   return 'cancelled';
 }
 
+/** Whether every step of the iteration has its issue (its plan may still have to be written). */
+function writtenOut(iteration: Pick<Iteration, 'children'>): boolean {
+  return iteration.children.every((c) => c.issue !== undefined);
+}
+
+/**
+ * The issues of the steps `child` depends on, in the order it names them: the dependencies it
+ * really waits for (`effectiveDependencies`) that have their issue.
+ */
+function dependencyIssues(child: IterationChild, children: readonly IterationChild[]): number[] {
+  return effectiveDependencies(child, children).flatMap((position) => {
+    const issue = children.find((c) => c.position === position)?.issue;
+    return issue ? [issue.number] : [];
+  });
+}
+
+/** What the issue of an iteration says, as recorded: a step without its issue yet by title. */
+function iterationText(iteration: Iteration): IterationText {
+  return {
+    goal: iteration.goal,
+    readmeGoal: iteration.readmeGoal,
+    criteria: iteration.criteria,
+    outOfScope: iteration.outOfScope,
+    kind: iterationKind(iteration.children),
+    plan: iteration.children.map((c) => ({
+      number: c.issue?.number ?? null,
+      title: c.title,
+      dependsOn: dependencyIssues(c, iteration.children),
+      done: c.status === 'done',
+    })),
+  };
+}
+
 export interface BridgeDeps {
   store: Store;
   engine: Engine;
@@ -382,7 +436,11 @@ export interface BridgeDeps {
  *   whenever no Run of the repo goes on by itself (backing off while scouts find nothing or
  *   fail, waiting for the quota when its agent ran out of it, and capping the proposals and
  *   stuck Runs left for a human); proposals up to the configured risk are accepted without a
- *   human.
+ *   human;
+ * - iterations: a larger goal a scout planned becomes an issue labeled ares1:iteration whose
+ *   plan lists its steps' issues; it is accepted as a whole (ares1:ready on it passes on to every
+ *   step, auto-accept judges it by its riskiest and largest step), never becomes a Run itself,
+ *   and a step gets its Run only once the issues it depends on are closed as completed.
  * Intake, auto-accept and automatic scouts only happen while the work switch is on.
  * GitHub is only a mirror: failures are reported and retried on the next poll, never block Runs.
  */
@@ -422,6 +480,11 @@ export class IssueBridge {
    * another 502) take turns: comparing with the last error only would record and notify each turn.
    */
   private readonly reportedErrors = new Set<string>();
+  /**
+   * Iterations (by id) whose issues a scout is writing out right now: a poll leaves them to it
+   * rather than finishing them too (finishIterations), which would create their issues twice.
+   */
+  private readonly writing = new Set<string>();
   private stopping = false;
   private readonly onEvent = (e: EventRow) => {
     // An assessment's result changes the discussion, not always the Run status (go keeps running).
@@ -590,8 +653,9 @@ export class IssueBridge {
   /**
    * One round: catch the target branches up with GitHub (`syncTarget`), close the pull requests
    * Runs left open when they ended without completing, open the pull requests of Runs done but
-   * for one (deliver: pr) and follow those opened, accept proposals the
-   * settings allow, start Runs for ready issues, terminate Runs whose issue a human closed and
+   * for one (deliver: pr) and follow those opened, finish writing out the iterations scouts left
+   * halfway, accept proposals the settings allow, start Runs for ready issues (the steps of an
+   * iteration once their dependencies are done), terminate Runs whose issue a human closed and
    * start over those whose issue a human changed, catch issues up, pass on replies to the
    * assessments' questions, start a scout where the repo is idle. With the work switch off only
    * the pulling, the pull requests, the terminating and the catching up happen: none of them
@@ -636,6 +700,7 @@ export class IssueBridge {
         if (!(await this.followPullRequests(name))) failed = true;
       });
       if (working) {
+        await each((name) => this.finishIterations(name));
         await each((name) => this.acceptBacklog(name));
         await each((name) => this.intake(name));
       }
@@ -748,16 +813,43 @@ export class IssueBridge {
     this.labelsReady.add(full);
   }
 
+  /**
+   * Create Runs for the open issues labeled ares1:ready, in the order of their numbers. An
+   * iteration's issue never becomes a Run: accepting it passes ares1:ready on to its steps
+   * (takeIteration), which are taken in the same round. A step whose dependencies are not all
+   * closed as completed yet keeps ares1:ready and waits (dependenciesMet); a later round takes it.
+   */
   private async intake(name: string): Promise<void> {
     const { repo, cfg } = this.repoSetup(name);
     const full = await this.issuesRepo(repo, cfg);
     await this.ensureLabels(full);
     const gh = this.gh();
-    const ready = await gh.listIssues(full, { state: 'open', label: LABELS.ready, limit: 50 });
+    const listReady = () => gh.listIssues(full, { state: 'open', label: LABELS.ready, limit: 50 });
+    let ready = await listReady();
+    let accepted = false;
+    for (const issue of ready.filter((i) => i.labels.includes(LABELS.iteration))) {
+      if (this.stopping) return;
+      if (await this.takeIteration(repo, full, issue)) accepted = true;
+    }
+    // The steps just labeled ares1:ready.
+    if (accepted) ready = await listReady();
+    // Whether each issue a step depends on is closed as completed, as looked up this round.
+    const completed = new Map<number, boolean>();
+    // A dependency that cannot be read holds its step back while the other issues are taken;
+    // the error fails the round afterwards, so that it is reported once per streak.
+    let unreadable: { err: unknown } | undefined;
     for (const issue of ready.sort((a, b) => a.number - b.number)) {
       if (this.stopping) return;
+      if (issue.labels.includes(LABELS.iteration)) continue;
       let run = this.deps.store.unfinishedRunForIssue(full, issue.number);
       if (!run) {
+        let met = false;
+        try {
+          met = await this.dependenciesMet(full, issue, ready, completed);
+        } catch (err) {
+          unreadable ??= { err };
+        }
+        if (!met) continue;
         // Only people allowed to triage can add ares1:ready, but anybody may have written the
         // issue, and may edit it after the label was added.
         const untrusted = isTrusted(issue, await this.masterLogin())
@@ -793,6 +885,56 @@ export class IssueBridge {
       await gh.setLabels(full, issue.number, withStatusLabel(issue.labels, LABELS.running));
       this.deps.store.setIssueSynced(run.id, 'queued');
     }
+    if (unreadable) throw unreadable.err;
+  }
+
+  /**
+   * An iteration's issue labeled ares1:ready. Pending, a human accepted it: as a whole, its steps
+   * get ares1:ready with it (acceptIteration); once accepted, by a human or auto-accept, its own
+   * label becomes ares1:running while it is under way. One a scout is still writing out is
+   * accepted once it is written out, at a later round; one the Master did not plan, or that is
+   * over, is left as it is. Returns whether its steps were accepted now.
+   */
+  private async takeIteration(repo: Repo, full: string, issue: GhIssue): Promise<boolean> {
+    const iteration = this.iterationOfIssue(repo, full, issue.number);
+    if (!iteration || iteration.status === 'done' || iteration.status === 'cancelled') {
+      return false;
+    }
+    const pending = iteration.status === 'pending';
+    if (pending) {
+      if (!writtenOut(iteration) || this.writing.has(iteration.id)) return false;
+      await this.acceptIteration(repo, iteration, false);
+    }
+    await this.gh().setLabels(full, issue.number, withStatusLabel(issue.labels, LABELS.running));
+    return pending;
+  }
+
+  /**
+   * Whether every issue that `issue` depends on (the hidden marker of an iteration's step,
+   * `parseDependsOn`) is closed as completed, so that a Run may be created for it. Issues among
+   * `ready` are open; the others are looked up once per round, in `known`. Rejects when one
+   * cannot be read.
+   */
+  private async dependenciesMet(
+    full: string,
+    issue: GhIssue,
+    ready: readonly GhIssue[],
+    known: Map<number, boolean>,
+  ): Promise<boolean> {
+    for (const number of parseDependsOn(issue.body)) {
+      if (number === issue.number) continue;
+      let done = known.get(number);
+      if (done === undefined) {
+        if (ready.some((i) => i.number === number)) done = false;
+        else {
+          const dep = await this.gh().getIssue(full, number);
+          done = dep.state === 'closed' && dep.stateReason === 'completed';
+        }
+        known.set(number, done);
+      }
+      if (!done) return false;
+    }
+    return true;
   }
 
   /**
@@ -832,7 +974,8 @@ export class IssueBridge {
 
   /**
    * Accept proposals still waiting for a human that the auto-accept settings now allow, e.g. after
-   * the settings were loosened. Uses the risk and size the scout gave them.
+   * the settings were loosened. Uses the risk and size the scout gave them; an iteration is
+   * accepted as a whole, by its riskiest and largest step (`iterationKind`), and counts once.
    */
   private async acceptBacklog(name: string): Promise<void> {
     const { repo, cfg } = this.repoSetup(name);
@@ -844,8 +987,22 @@ export class IssueBridge {
       limit: 100,
     });
     const scouts = this.deps.store.listScouts({ repoId: repo.id, limit: 200 });
+    const iterations = this.githubIterations(repo, full, 'pending');
     for (const issue of untriaged(open).sort((a, b) => a.number - b.number)) {
       if (!this.mayAutoAccept(repo, cfg)) return;
+      const iteration = iterations.find((it) => it.issue?.number === issue.number);
+      if (iteration) {
+        if (
+          this.writing.has(iteration.id) ||
+          !writtenOut(iteration) ||
+          !isAutoAcceptable(iterationKind(iteration.children), cfg.auto_accept)
+        ) {
+          continue;
+        }
+        await this.acceptIteration(repo, iteration, true);
+        await this.comment(full, issue.number, iterationAutoAcceptedComment());
+        continue;
+      }
       const filed = filedProposal(scouts, issue.number);
       const proposal = filed?.proposal;
       if (!filed || !proposal?.issue || !isAutoAcceptable(proposal, cfg.auto_accept)) {
@@ -2195,9 +2352,10 @@ export class IssueBridge {
     },
     known: (scout, repo) => this.knownIssues(scout, repo),
     file: (scout, repo, cfg, proposals) => this.fileProposals(scout, repo, cfg, proposals),
+    fileIteration: (scout, repo, cfg, plan) => this.fileIteration(scout, repo, cfg, plan),
     // The auto-accepted issues are labeled ares1:ready: take them at once.
     completed: (_repo, filed) => {
-      if (filed.auto > 0) void this.poll();
+      if (filed.auto > 0 || filed.iteration?.auto) void this.poll();
     },
     holdingProposals: async (repo, cfg, scouts) => {
       const full = await this.issuesRepo(repo, cfg);
@@ -2206,7 +2364,8 @@ export class IssueBridge {
         label: LABELS.proposal,
         limit: 100,
       });
-      return proposalsHoldingScout(open, scouts, cfg.auto_accept).length;
+      const iterations = this.githubIterations(repo, full);
+      return proposalsHoldingScout(open, scouts, cfg.auto_accept, iterations).length;
     },
   };
 
@@ -2294,6 +2453,214 @@ export class IssueBridge {
       /** Issues that wait for a human. */
       pending: proposals.filter((p) => p.issue && !p.issue.auto).length,
     };
+  }
+
+  // ---- iterations ------------------------------------------------------------
+
+  /** The repo's iterations whose issues are in `full`, newest first; of `status` if given. */
+  private githubIterations(
+    repo: Repo,
+    full: string,
+    status?: IterationStatus | readonly IterationStatus[],
+  ): Iteration[] {
+    return this.deps.store
+      .listIterations({ repoId: repo.id, ...(status === undefined ? {} : { status }) })
+      .filter((it) => it.source === 'github' && it.issuesRepo === full);
+  }
+
+  /** The iteration whose own issue is #`number` of `full`; null when the Master planned none. */
+  private iterationOfIssue(repo: Repo, full: string, number: number): Iteration | null {
+    return this.githubIterations(repo, full).find((it) => it.issue?.number === number) ?? null;
+  }
+
+  /**
+   * Write out the iteration a scout planned: its record first, so that nothing created is lost
+   * if the Master stops or GitHub fails halfway (a later poll finishes it, finishIterations), then
+   * its issues (writeOutIteration). Accepted as a whole when its riskiest and largest step is
+   * within auto_accept (`iterationKind`) and today's limits allow; it counts once. null when not
+   * even its own issue could be created: the record is dropped then, so that it does not hold the
+   * repo as the iteration under way, and the error is reported.
+   */
+  private async fileIteration(
+    scout: Scout,
+    repo: Repo,
+    cfg: GitHubRepoConfig,
+    plan: PlannedIteration,
+  ): Promise<FiledIteration | null> {
+    const store = this.deps.store;
+    const created = store.createIteration({
+      repoId: repo.id,
+      scoutId: scout.id,
+      source: 'github',
+      issuesRepo: scout.issuesRepo,
+      title: plan.title,
+      goal: plan.goal,
+      readmeGoal: plan.readmeGoal,
+      criteria: plan.criteria,
+      outOfScope: plan.outOfScope,
+      children: plannedChildren(plan),
+    });
+    const auto =
+      isAutoAcceptable(iterationKind(created.children), cfg.auto_accept) &&
+      this.mayAutoAccept(repo, cfg);
+    this.writing.add(created.id);
+    try {
+      const written = await this.writeOutIteration(created, auto);
+      if (auto) await this.acceptIteration(repo, written, true);
+    } catch (err) {
+      this.report(err);
+    } finally {
+      this.writing.delete(created.id);
+    }
+    const iteration = store.getIteration(created.id);
+    if (!iteration.issue) {
+      store.deleteIteration(iteration.id);
+      return null;
+    }
+    return { id: iteration.id, auto: iteration.auto };
+  }
+
+  /**
+   * Finish the repo's pending iterations a scout left half written out: the Master stopped, or
+   * GitHub failed, before every issue was created and the plan written with them. Written out,
+   * an iteration's issue lists each step's issue in its plan (`planLists`); one whose issue is not
+   * open with ares1:proposal (a human closed or relabeled it) is left as it is. One whose own
+   * issue was never created is dropped, as fileIteration does. A failure fails the round and is
+   * tried again at the next one.
+   */
+  private async finishIterations(name: string): Promise<void> {
+    const { repo, cfg } = this.repoSetup(name);
+    const full = await this.issuesRepo(repo, cfg);
+    const pending = this.githubIterations(repo, full, 'pending').filter(
+      (it) => !this.writing.has(it.id),
+    );
+    if (pending.length === 0) return;
+    const open = await this.gh().listIssues(full, {
+      state: 'open',
+      label: LABELS.proposal,
+      limit: 100,
+    });
+    for (const iteration of pending) {
+      if (this.stopping) return;
+      const own = iteration.issue;
+      if (!own) {
+        this.deps.store.deleteIteration(iteration.id);
+        continue;
+      }
+      const issue = open.find((i) => i.number === own.number);
+      if (!issue) continue;
+      const numbers = iteration.children.flatMap((c) => (c.issue ? [c.issue.number] : []));
+      if (writtenOut(iteration) && planLists(issue.body, numbers)) continue;
+      this.writing.add(iteration.id);
+      try {
+        await this.writeOutIteration(iteration, false);
+      } finally {
+        this.writing.delete(iteration.id);
+      }
+    }
+  }
+
+  /**
+   * Create the issues of the iteration not created yet, recording each at once, then write its
+   * plan with them. Its own issue first (labeled ares1:iteration and ares1:proposal, the plan
+   * listing its steps by title), so that its steps can name it; then one issue per step in the
+   * order of the plan (labeled ares1:proposal), naming the issues of the steps it depends on,
+   * which come before it; last, the plan as the task list of their issues. `auto`: its body says
+   * it was accepted without a human. Titles and bodies leave out the user's home directory: the
+   * scout wrote them in a worktree under it. Returns the iteration as recorded then.
+   */
+  private async writeOutIteration(iteration: Iteration, auto: boolean): Promise<Iteration> {
+    const store = this.deps.store;
+    const gh = this.gh();
+    const full = iteration.issuesRepo;
+    const scoutId = iteration.scoutId ?? '';
+    let own = iteration.issue;
+    if (!own) {
+      own = await gh.createIssue(full, {
+        title: redactForGitHub(iteration.title),
+        body: redactForGitHub(iterationBody(iterationText(iteration), scoutId, auto)),
+        labels: [LABELS.iteration, LABELS.proposal],
+      });
+      store.updateIteration(iteration.id, { issue: own });
+    }
+    for (const position of iteration.children.map((c) => c.position)) {
+      // As recorded now: each step created before this one has its issue.
+      const children = store.getIteration(iteration.id).children;
+      const child = children.find((c) => c.position === position);
+      if (!child || child.issue) continue;
+      const issue = await gh.createIssue(full, {
+        title: redactForGitHub(child.title),
+        body: redactForGitHub(
+          iterationChildBody(
+            child,
+            { iteration: own.number, dependsOn: dependencyIssues(child, children) },
+            scoutId,
+          ),
+        ),
+        labels: [LABELS.proposal],
+      });
+      // Read again: the record may have changed while the issue was created.
+      const latest = store.getIteration(iteration.id).children;
+      store.updateIteration(iteration.id, {
+        children: latest.map((c) => (c.position === position ? { ...c, issue } : c)),
+      });
+    }
+    const written = store.getIteration(iteration.id);
+    await gh.editIssue(full, own.number, {
+      body: redactForGitHub(iterationBody(iterationText(written), scoutId, auto)),
+    });
+    return written;
+  }
+
+  /**
+   * Accept a pending iteration as a whole, by a human (who labeled its issue ares1:ready) or
+   * without one (`auto`: its issue gets ares1:ready and ares1:auto here, and the acceptance counts
+   * once toward today's limit). Each of its steps' issues still open and undecided gets
+   * ares1:ready (and ares1:auto) with it; intake creates their Runs in the order of their
+   * dependencies. Its steps wait for the ones they depend on (`waiting`), or are `ready`.
+   */
+  private async acceptIteration(repo: Repo, iteration: Iteration, auto: boolean): Promise<void> {
+    const own = iteration.issue;
+    if (iteration.status !== 'pending' || !own) return;
+    const gh = this.gh();
+    const full = iteration.issuesRepo;
+    const accepted = (labels: readonly string[]) => [
+      ...new Set([...withStatusLabel(labels, LABELS.ready), ...(auto ? [LABELS.auto] : [])]),
+    ];
+    for (const child of iteration.children) {
+      if (!child.issue) continue;
+      const issue = await gh.getIssue(full, child.issue.number);
+      // Closed meanwhile, or decided on its own already: left as it is.
+      if (issue.state !== 'open' || hasStatusLabel(issue.labels)) continue;
+      await gh.setLabels(full, issue.number, accepted(issue.labels));
+    }
+    if (auto) {
+      const issue = await gh.getIssue(full, own.number);
+      await gh.setLabels(full, own.number, accepted(issue.labels));
+    }
+    const store = this.deps.store;
+    store.tx(() => {
+      const latest = store.getIteration(iteration.id);
+      if (latest.status !== 'pending') return;
+      store.updateIteration(iteration.id, {
+        status: 'active',
+        auto,
+        decidedAt: nowIso(),
+        children: latest.children.map((c) =>
+          c.status === 'planned'
+            ? {
+                ...c,
+                status: unmetDependencies(c, latest.children).length > 0 ? 'waiting' : 'ready',
+              }
+            : c,
+        ),
+      });
+      store.event(null, auto ? 'iteration.auto_accepted' : 'iteration.accepted', {
+        repo: repo.name,
+        iterationId: iteration.id,
+        issue: own.number,
+      });
+    });
   }
 
   // ---- status ----------------------------------------------------------------------

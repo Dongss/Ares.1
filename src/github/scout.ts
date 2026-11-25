@@ -5,6 +5,7 @@ import { brandName } from '../brand.js';
 import {
   type AutoAcceptLimits,
   holdsScout,
+  iterationKind,
   iterationProgress,
   MAX_ITERATION_CHILDREN,
   PROPOSAL_SIZES,
@@ -154,6 +155,30 @@ export interface IterationUpdate {
   note: string;
   /** The steps added, numbered after the plan's last one, in this order. */
   add: IterationAddition[];
+}
+
+/**
+ * The children of a new iteration's record, as its scout planned them: each step numbered by its
+ * place in the plan, not accepted yet (`planned`), with no Run and, until its source writes it
+ * out, no issue or proposal.
+ */
+export function plannedChildren(plan: Pick<PlannedIteration, 'children'>): IterationChild[] {
+  return plan.children.map((c, i) => ({
+    title: c.title,
+    category: c.category,
+    size: c.size,
+    risk: c.risk,
+    why: c.why,
+    evidence: [...c.evidence],
+    what: c.what,
+    acceptance: [...c.acceptance],
+    position: i + 1,
+    criteria: [...c.criteria],
+    dependsOn: [...c.dependsOn],
+    closeout: c.closeout,
+    status: 'planned',
+    runIds: [],
+  }));
 }
 
 /** 「2、3」, numbers of steps or criteria as a list. */
@@ -1864,16 +1889,29 @@ export function filedProposal<S extends Pick<Scout, 'proposals'>>(
 
 /**
  * Untriaged proposals that hold the automatic scout back once there are `max_proposals` of them,
- * by `holdsScout`: an issue without a scout record is of an unknown kind.
+ * by `holdsScout`: an issue without a scout record is of an unknown kind. An iteration waits for
+ * a human as a whole: its issue counts once, as the kind auto-accept judges it by
+ * (`iterationKind`), and the issues of its children, which it accepts with it, do not count.
+ * `iterations`: the repo's, with their issues and their children's.
  */
 export function proposalsHoldingScout(
   open: GhIssue[],
   scouts: Pick<Scout, 'proposals'>[],
   limits: AutoAcceptLimits,
+  iterations: readonly Pick<Iteration, 'issue' | 'children'>[] = [],
 ): GhIssue[] {
-  return untriaged(open).filter((issue) =>
-    holdsScout(filedProposal(scouts, issue.number)?.proposal ?? null, limits),
+  const byIssue = new Map(
+    iterations.flatMap((it) => (it.issue ? [[it.issue.number, it] as const] : [])),
   );
+  const children = new Set(
+    iterations.flatMap((it) => it.children.flatMap((c) => (c.issue ? [c.issue.number] : []))),
+  );
+  return untriaged(open).filter((issue) => {
+    if (children.has(issue.number)) return false;
+    const iteration = byIssue.get(issue.number);
+    if (iteration) return holdsScout(iterationKind(iteration.children), limits);
+    return holdsScout(filedProposal(scouts, issue.number)?.proposal ?? null, limits);
+  });
 }
 
 /**

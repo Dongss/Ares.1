@@ -487,6 +487,11 @@ export class FakeGitHub implements GitHub {
     return { number: created.number, url: created.url };
   }
 
+  async editIssue(_repo: string, number: number, edit: { body: string }): Promise<void> {
+    this.call(`editIssue #${number}`);
+    this.get(number).body = edit.body;
+  }
+
   async getIssue(_repo: string, number: number): Promise<GhIssue> {
     this.call(`getIssue #${number}`);
     return this.view(this.get(number), false);

@@ -34,6 +34,7 @@ import {
   isRetriesExhaustedComment,
   issueUpdate,
   isTrusted,
+  iterationAutoAcceptedComment,
   iterationBody,
   iterationChildBody,
   iterationMarker,
@@ -43,6 +44,7 @@ import {
   type PlanItem,
   parseDependsOn,
   parseIterationOf,
+  planLists,
   proposalBody,
   proposalSections,
   pullRequestClosedComment,
@@ -1970,6 +1972,369 @@ describe('issues: scout', () => {
     };
     expect(status.enabled).toBe(true);
     expect(status.repos.map((r) => r.name)).toEqual(['demo']);
+  });
+});
+
+describe('issues: iterations', () => {
+  /** A step of a planned iteration as a scout writes it: low risk and size S unless patched. */
+  const step = (title: string, patch: Record<string, unknown> = {}) => {
+    const { lead: _lead, ...requirement } = proposal(title, 'low', 'S');
+    return {
+      ...requirement,
+      category: 'feature',
+      criteria: [1],
+      dependsOn: [],
+      closeout: false,
+      ...patch,
+    };
+  };
+
+  /** Changes to the three steps of `planned`, in order. */
+  type StepPatches = [Record<string, unknown>?, Record<string, unknown>?, Record<string, unknown>?];
+
+  const TITLE = '本地仓库也能永动';
+
+  /**
+   * An iteration of three steps as a scout plans it: 乙 depends on 甲, and the closing step 丙 on
+   * both of them.
+   */
+  const planned = (patches: StepPatches = []) => ({
+    title: TITLE,
+    goal: '没接 GitHub 的仓库也能自己提需求、自己做完',
+    readmeGoal: '永动',
+    criteria: ['本地仓库能自己跑完一轮', '看板上能整批采纳'],
+    outOfScope: ['GitLab'],
+    children: [
+      step('甲：本地提案池', patches[0]),
+      step('乙：看板上采纳', { criteria: [2], dependsOn: [1], ...patches[1] }),
+      step('丙：整理评审建议', { criteria: [], dependsOn: [1, 2], closeout: true, ...patches[2] }),
+    ],
+  });
+
+  /** A scout of demo, once it has ended, that plans `plan`; the scouts after it find nothing. */
+  async function planIteration(t: Harness, plan: unknown = planned()) {
+    let first = true;
+    t.scripts.scout = () => {
+      const iteration = first ? plan : null;
+      first = false;
+      return { structured: { gaps: GAPS, proposals: [], iteration } };
+    };
+    return scoutDone(t, (await t.master.issues.startScout('demo', 'manual')).id);
+  }
+
+  /** The repo's only iteration. */
+  function iterationOf(t: Harness) {
+    const [iteration, ...others] = t.master.store.listIterations({ repoId: t.repo.id });
+    if (!iteration || others.length > 0) throw new Error('not one iteration');
+    return iteration;
+  }
+
+  const eventData = (t: Harness, type: string) =>
+    t.master.store.listEventsOfType(type, '1970-01-01T00:00:00.000Z').map((e) => e.data);
+
+  /** The calls that create or edit issues. */
+  const writes = () => gh.calls.filter((c) => c.startsWith('create ') || c.startsWith('editIssue'));
+
+  it('files its issue, then one issue per step, then writes the plan with their numbers', async () => {
+    const t = await start(config({ maxRisk: 'none' }));
+    const dir = join(homedir(), 'code', 'demo');
+    const plan = planned([{ evidence: [`${dir}/src/backlog/local.ts:12`] }]);
+    plan.goal = `在 ${dir} 之外也能用`;
+    const scout = await planIteration(t, plan);
+    expect(scout.status).toBe('completed');
+
+    // Its issue first, so that the steps can name it; each step after the ones it depends on;
+    // then the plan, with the steps' issues.
+    expect(writes()).toEqual([
+      `create ${TITLE}`,
+      'create 甲：本地提案池',
+      'create 乙：看板上采纳',
+      'create 丙：整理评审建议',
+      'editIssue #1',
+    ]);
+    const iteration = iterationOf(t);
+    expect(iteration).toMatchObject({
+      source: 'github',
+      issuesRepo: 'me/demo',
+      scoutId: scout.id,
+      status: 'pending',
+      auto: false,
+      decidedAt: null,
+      issue: { number: 1, url: 'https://github.com/me/demo/issues/1' },
+    });
+    expect(iteration.children.map((c) => [c.position, c.issue?.number, c.status])).toEqual([
+      [1, 2, 'planned'],
+      [2, 3, 'planned'],
+      [3, 4, 'planned'],
+    ]);
+
+    const own = gh.get(1);
+    expect(own.title).toBe(TITLE);
+    expect(own.labels).toEqual([LABELS.iteration, LABELS.proposal]);
+    expect(own.body).toContain('### 目标\n\n在 ~/code/demo 之外也能用');
+    expect(own.body).toContain('### 完成标准\n\n1. 本地仓库能自己跑完一轮\n2. 看板上能整批采纳');
+    expect(own.body).toContain(
+      [
+        '### 计划',
+        '',
+        '- [ ] #2 甲：本地提案池',
+        '- [ ] #3 乙：看板上采纳（依赖 #2）',
+        '- [ ] #4 丙：整理评审建议（依赖 #2、#3）',
+        '',
+        '### 不做',
+        '',
+        '- GitLab',
+      ].join('\n'),
+    );
+    expect(own.body).toContain('共 3 个子 issue · 整体大小：S · 整体风险：低');
+    expect(own.body).toContain(`给这个迭代 issue 加标签 \`${LABELS.ready}\``);
+    expect(own.body).not.toContain(homedir());
+
+    expect([2, 3, 4].map((n) => gh.get(n).labels)).toEqual([
+      [LABELS.proposal],
+      [LABELS.proposal],
+      [LABELS.proposal],
+    ]);
+    expect([2, 3, 4].map((n) => parseIterationOf(gh.get(n).body))).toEqual([1, 1, 1]);
+    expect([2, 3, 4].map((n) => parseDependsOn(gh.get(n).body))).toEqual([[], [2], [2, 3]]);
+    expect(gh.get(2).body).toContain('所属迭代：#1 · 没有依赖');
+    expect(gh.get(3).body).toContain('所属迭代：#1 · 依赖：#2');
+    expect(gh.get(4).body).toContain('所属迭代：#1 · 依赖：#2、#3');
+    expect(gh.get(2).body).toContain('~/code/demo/src/backlog/local.ts:12');
+    expect(gh.get(2).body).not.toContain(homedir());
+    // A step's Run gets the requirement alone.
+    const goal = goalFromIssue(gh.get(3));
+    expect(goal.startsWith('#3 乙：看板上采纳\n\n### 为什么')).toBe(true);
+    expect(goal).not.toContain('ares1:');
+
+    // It waits for a human as one, its steps with it.
+    expect(eventData(t, 'scout.completed')).toEqual([
+      expect.objectContaining({
+        created: 0,
+        auto: 0,
+        pending: 1,
+        iteration: { id: iteration.id, auto: false },
+      }),
+    ]);
+    // Neither it nor its steps become Runs before it is accepted, and nothing is written twice.
+    await t.master.issues.poll();
+    expect(t.master.store.listRuns()).toEqual([]);
+    expect(writes()).toHaveLength(5);
+  });
+
+  it('finishes writing out an iteration where GitHub failed, at the next poll', async () => {
+    const t = await start(config({ maxRisk: 'none' }));
+    gh.failing.set('create 乙：看板上采纳', 'GitHub 502');
+    await planIteration(t);
+    // Kept as far as it got: its issue and the first step's.
+    const half = iterationOf(t);
+    expect(half.issue?.number).toBe(1);
+    expect(half.children.map((c) => c.issue?.number)).toEqual([2, undefined, undefined]);
+    expect(gh.get(1).body).toContain(
+      '### 计划\n\n- 甲：本地提案池\n- 乙：看板上采纳\n- 丙：整理评审建议',
+    );
+    expect(eventData(t, 'github.error').map((d) => d.message)).toEqual(['GitHub 502']);
+
+    gh.failing.clear();
+    await t.master.issues.poll();
+    const whole = iterationOf(t);
+    expect(whole.children.map((c) => c.issue?.number)).toEqual([2, 3, 4]);
+    expect(parseDependsOn(gh.get(4).body)).toEqual([2, 3]);
+    expect(gh.get(1).body).toContain('- [ ] #4 丙：整理评审建议（依赖 #2、#3）');
+    // Once written out, it is left as it is.
+    const written = writes().length;
+    await t.master.issues.poll();
+    expect(writes()).toHaveLength(written);
+  });
+
+  it('drops an iteration whose own issue could not be created', async () => {
+    const t = await start(config({ maxRisk: 'none' }));
+    gh.failing.set(`create ${TITLE}`, 'GitHub 502');
+    const scout = await planIteration(t);
+    expect(scout.status).toBe('completed');
+    expect(t.master.store.listIterations({ repoId: t.repo.id })).toEqual([]);
+    expect(eventData(t, 'scout.completed')).toEqual([
+      expect.not.objectContaining({ iteration: expect.anything() }),
+    ]);
+  });
+
+  it('auto-accepts an iteration as a whole by its riskiest and largest step, counting it once', async () => {
+    // One step beyond max_risk, or one beyond max_size: all of it waits for a human.
+    const beyond: [string, StepPatches][] = [
+      [config({ maxRisk: 'low', maxPerDay: null }), [{}, { risk: 'mid' }]],
+      [config({ maxRisk: 'high', maxSize: 'M', maxPerDay: null }), [{}, {}, { size: 'L' }]],
+    ];
+    for (const [cfg, patches] of beyond) {
+      const t = await start(cfg);
+      await planIteration(t, planned(patches));
+      expect(iterationOf(t)).toMatchObject({ status: 'pending', auto: false });
+      expect([1, 2, 3, 4].map((n) => gh.get(n).labels.includes(LABELS.ready))).toEqual([
+        false,
+        false,
+        false,
+        false,
+      ]);
+      await t.master.issues.poll();
+      expect(t.master.store.listRuns()).toEqual([]);
+      expect(eventData(t, 'iteration.auto_accepted')).toEqual([]);
+      await h?.close();
+      h = undefined;
+    }
+
+    // Every step within auto_accept: accepted as a whole, which max_per_day 1 allows.
+    const t = await start(config({ maxRisk: 'mid', maxSize: 'M', maxPerDay: 1 }));
+    await planIteration(t, planned([{ size: 'M' }, { risk: 'mid' }]));
+    // Taken at once: the first step, which depends on nothing.
+    await waitFor(() => gh.get(2).labels.includes(LABELS.running), 'Run of the first step');
+    const iteration = iterationOf(t);
+    expect(iteration).toMatchObject({ status: 'active', auto: true });
+    expect(iteration.decidedAt).not.toBeNull();
+    expect(iteration.children.map((c) => c.status)).toEqual(['ready', 'waiting', 'waiting']);
+    expect(gh.get(1).body).toContain('已按自动采纳的设置整批开工');
+    expect(gh.get(1).labels).toEqual([
+      LABELS.iteration,
+      LABELS.proposal,
+      LABELS.auto,
+      LABELS.running,
+    ]);
+    expect(gh.get(2).labels).toEqual([LABELS.proposal, LABELS.auto, LABELS.running]);
+    expect(gh.get(3).labels).toEqual([LABELS.proposal, LABELS.ready, LABELS.auto]);
+    expect(gh.get(4).labels).toEqual([LABELS.proposal, LABELS.ready, LABELS.auto]);
+    expect(eventData(t, 'iteration.auto_accepted')).toEqual([
+      { repo: 'demo', iterationId: iteration.id, issue: 1 },
+    ]);
+    expect(eventData(t, 'issue.auto_accepted')).toEqual([]);
+    expect(eventData(t, 'scout.completed')).toEqual([
+      expect.objectContaining({ pending: 0, iteration: { id: iteration.id, auto: true } }),
+    ]);
+    expect(t.master.issues.status().repos[0]?.autoAccept.usedToday).toBe(1);
+    // A Run of the first step only, accepted without a human; none of the iteration itself.
+    const runs = t.master.store.listRuns();
+    expect(runs.map((r) => r.issue && [r.issue.number, r.issue.auto])).toEqual([[2, true]]);
+    await t.master.issues.poll();
+    expect(t.master.store.listRuns()).toHaveLength(1);
+  });
+
+  it('auto-accepts a waiting iteration as a whole once the settings allow it', async () => {
+    const t = await start(config({ maxRisk: 'low', maxPerDay: null }));
+    await planIteration(t, planned([{}, { risk: 'mid' }]));
+    await t.master.issues.poll();
+    expect(iterationOf(t).status).toBe('pending');
+
+    writeFile(join(t.home, 'config.yaml'), config({ maxRisk: 'mid', maxPerDay: null }));
+    t.master.configWatcher.reload();
+    await t.master.issues.poll();
+    const iteration = iterationOf(t);
+    expect(iteration).toMatchObject({ status: 'active', auto: true });
+    expect(gh.get(1).comments.at(-1)).toContain('已整批自动采纳');
+    expect(gh.get(1).labels).toEqual([
+      LABELS.iteration,
+      LABELS.proposal,
+      LABELS.auto,
+      LABELS.running,
+    ]);
+    expect(eventData(t, 'iteration.auto_accepted')).toHaveLength(1);
+    expect(t.master.store.listRuns().map((r) => r.issue?.number)).toEqual([2]);
+  });
+
+  it('passes ares1:ready on an iteration to its steps, and starts each once those it depends on are done', async () => {
+    const t = await start(config({ maxRisk: 'none' }));
+    await planIteration(t);
+    // A human accepts the iteration.
+    gh.get(1).labels.push(LABELS.ready);
+    await t.master.issues.poll();
+    const iteration = iterationOf(t);
+    expect(iteration).toMatchObject({ status: 'active', auto: false });
+    expect(iteration.decidedAt).not.toBeNull();
+    expect(iteration.children.map((c) => c.status)).toEqual(['ready', 'waiting', 'waiting']);
+    expect(eventData(t, 'iteration.accepted')).toEqual([
+      { repo: 'demo', iterationId: iteration.id, issue: 1 },
+    ]);
+    expect(eventData(t, 'iteration.auto_accepted')).toEqual([]);
+    expect(gh.get(1).labels).toEqual([LABELS.iteration, LABELS.proposal, LABELS.running]);
+    expect(gh.get(3).labels).toEqual([LABELS.proposal, LABELS.ready]);
+    expect(gh.get(4).labels).toEqual([LABELS.proposal, LABELS.ready]);
+    // Taken in the same round: the first step only, which depends on nothing. The iteration
+    // itself is no Run.
+    const [first, ...others] = t.master.store.listRuns();
+    if (!first) throw new Error('no Run of the first step');
+    expect(others).toEqual([]);
+    expect(first.issue).toMatchObject({ number: 2, auto: false });
+    expect(gh.get(2).labels).toEqual([LABELS.proposal, LABELS.running]);
+
+    // Its Run not done yet: the steps after it keep waiting, ares1:ready on them.
+    await t.waitStatus(first.id, 'waiting_approval');
+    await t.master.issues.poll();
+    expect(t.master.store.listRuns()).toHaveLength(1);
+    expect(gh.get(3).labels).toEqual([LABELS.proposal, LABELS.ready]);
+
+    // Done, its issue closed as completed: the next round starts the step that waited for it
+    // alone. The closing step still waits for that one.
+    t.master.engine.approve(first.id);
+    await t.waitStatus(first.id, 'completed');
+    await waitFor(() => gh.get(2).state === 'closed', 'the first step to close');
+    expect(gh.get(2).stateReason).toBe('completed');
+    await t.master.issues.poll();
+    expect(t.master.store.listRuns().map((r) => r.issue?.number)).toEqual([3, 2]);
+    expect(gh.get(4).labels).toEqual([LABELS.proposal, LABELS.ready]);
+
+    // Closed as not planned is not done: the closing step keeps waiting.
+    gh.get(3).state = 'closed';
+    gh.get(3).stateReason = 'not_planned';
+    await t.master.issues.poll();
+    expect(t.master.store.listRuns().map((r) => r.issue?.number)).toEqual([3, 2]);
+    expect(gh.get(4).labels).toEqual([LABELS.proposal, LABELS.ready]);
+  });
+
+  it('holds a step back while an issue it depends on cannot be read, reporting that once', async () => {
+    const t = await start();
+    const dep = gh.add({ title: '做完了的' });
+    dep.state = 'closed';
+    dep.stateReason = 'completed';
+    gh.add({
+      title: '依赖它的',
+      body: `做点事\n\n${FOOTER_MARKER}\n${dependsOnMarker([dep.number])}`,
+      labels: [LABELS.ready],
+    });
+    gh.add({ title: '不依赖什么的', labels: [LABELS.ready] });
+    gh.failing.set(`getIssue #${dep.number}`, 'GitHub 502');
+
+    // The other issues are taken all the same.
+    await t.master.issues.poll();
+    expect(t.master.store.listRuns().map((r) => r.issue?.number)).toEqual([3]);
+    expect(gh.get(2).labels).toEqual([LABELS.ready]);
+    await t.master.issues.poll();
+    expect(t.master.store.listRuns()).toHaveLength(1);
+    expect(eventData(t, 'github.error').map((d) => d.message)).toEqual(['GitHub 502']);
+    expect(t.master.issues.status().lastError?.message).toBe('GitHub 502');
+
+    gh.failing.clear();
+    await t.master.issues.poll();
+    expect(t.master.store.listRuns().map((r) => r.issue?.number)).toEqual([2, 3]);
+    expect(t.master.issues.status().lastError).toBeNull();
+  });
+
+  it('counts an iteration waiting for a human once, its steps not at all, and scouts on after it', async () => {
+    const t = await start(config({ auto: true, maxRisk: 'none' }));
+    oldTargetBranch(t);
+    gh.add({ title: '一条提案', labels: [LABELS.proposal] });
+    gh.add({ title: '又一条提案', labels: [LABELS.proposal] });
+    await planIteration(t);
+    expect(gh.get(3).labels).toContain(LABELS.iteration);
+
+    // Two proposals and the iteration: max_proposals (3) wait for a human.
+    await t.master.issues.poll();
+    expect(t.master.store.listScouts()).toHaveLength(1);
+    expect(t.master.issues.status().repos[0]?.scout?.waiting?.reason).toBe('有 3 条提案等你处理');
+
+    // A human turns one down: the scout goes on at once. The one before planned an iteration,
+    // though it filed no proposal: it did not come back empty, and nothing backs off.
+    gh.get(1).state = 'closed';
+    await t.master.issues.poll();
+    const scouts = t.master.store.listScouts();
+    expect(scouts).toHaveLength(2);
+    expect(scouts[0]?.trigger).toBe('auto');
+    await scoutDone(t, scouts[0]?.id ?? '');
   });
 });
 
@@ -6197,6 +6562,46 @@ describe('issues: texts', () => {
     expect(numbers('high', 'S')).toEqual([1, 4, 6]);
     expect(filedProposal(scouts, 4)?.proposal).toBe(scouts[1]?.proposals[1]);
     expect(filedProposal(scouts, 6)).toBeNull();
+
+    // An iteration waits as a whole: its issue once, by its riskiest and largest step; its steps'
+    // issues not at all, whatever their kind, nor the steps of an iteration accepted already.
+    const step = (number: number | null, risk: Risk, size: ProposalSize) => ({
+      ...proposal(`#${number}`, risk, size),
+      category: 'feature' as const,
+      position: 1,
+      criteria: [],
+      dependsOn: [],
+      closeout: false,
+      status: 'planned' as const,
+      runIds: [],
+      ...(number === null ? {} : { issue: { number, url: '' } }),
+    });
+    const iterations = [
+      { issue: { number: 10, url: '' }, children: [step(11, 'low', 'S'), step(12, 'mid', 'S')] },
+      { issue: { number: 20, url: '' }, children: [step(21, 'low', 'S'), step(null, 'low', 'S')] },
+    ];
+    const withIterations = [
+      ...open,
+      issue(10, [LABELS.iteration, LABELS.proposal]),
+      issue(11),
+      issue(12),
+      issue(20, [LABELS.iteration, LABELS.proposal, LABELS.running]),
+      issue(21),
+    ];
+    const held = (max_risk: Risk | 'none') =>
+      proposalsHoldingScout(withIterations, scouts, { max_risk, max_size: 'M' }, iterations).map(
+        (i) => i.number,
+      );
+    expect(held('none')).toEqual([1, 2, 3, 4, 6, 10]);
+    // Its riskiest step is mid: beyond max_risk low, auto-accept leaves the whole of it to a human.
+    expect(held('low')).toEqual([1, 6]);
+    expect(held('mid')).toEqual([1, 3, 6, 10]);
+    // Unknown to the Master without the iterations: every issue counts as its own.
+    expect(
+      proposalsHoldingScout(withIterations, scouts, { max_risk: 'none', max_size: 'M' }).map(
+        (i) => i.number,
+      ),
+    ).toEqual([1, 2, 3, 4, 6, 10, 11, 12, 21]);
   });
 
   it('says on the issue what happened to the Run', () => {
@@ -6798,6 +7203,40 @@ describe('issues: iteration texts', () => {
     );
   });
 
+  it('lists steps without their issue yet by title, and tells when the plan lists them all', () => {
+    const before = iterationBody(
+      text({
+        plan: [
+          { number: null, title: '第一步', dependsOn: [] },
+          { number: null, title: '第二步', dependsOn: [] },
+        ],
+      }),
+      'scout_1',
+      false,
+    );
+    expect(before).toContain('### 计划\n\n- 第一步\n- 第二步\n\n### 不做');
+    expect(before).toContain('共 2 个子 issue');
+    expect(planLists(before, [12, 13])).toBe(false);
+    // Nothing to list is listed already.
+    expect(planLists(before, [])).toBe(true);
+
+    const after = iterationBody(
+      text({
+        plan: [
+          { number: 12, title: '第一步', dependsOn: [], done: true },
+          { number: 13, title: '第二步', dependsOn: [12] },
+        ],
+      }),
+      'scout_1',
+      false,
+    );
+    expect(planLists(after, [12, 13])).toBe(true);
+    expect(planLists(after, [12, 13, 14])).toBe(false);
+    // Only as an item of the task list, not mentioned elsewhere nor as a longer number.
+    expect(planLists('依赖 #12\n- [ ] #123 别的', [12])).toBe(false);
+    expect(planLists('* [X] #12 a', [12])).toBe(true);
+  });
+
   it('writes them in English, keeping the protocol', () => {
     setLang('en');
     const it = iterationBody(
@@ -6855,6 +7294,12 @@ describe('issues: iteration texts', () => {
     expect(first).not.toMatch(cjk);
     const def = labelDefs().find((d) => d.name === LABELS.iteration);
     expect(def?.description).not.toMatch(cjk);
+
+    const accepted = iterationAutoAcceptedComment();
+    expect(accepted).not.toMatch(cjk);
+    expect(accepted).toContain('`ares1:ready` was added to this iteration and all its sub-issues');
+    setLang('zh');
+    expect(iterationAutoAcceptedComment()).toContain('已整批自动采纳');
   });
 });
 

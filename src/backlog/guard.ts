@@ -13,10 +13,15 @@ export function startOfToday(now = new Date()): string {
 }
 
 /**
- * Events of a proposal accepted without a human: an issue labeled ares1:ready by the Master, or
- * a local proposal turned into a Run (backlog.repos).
+ * Events of a proposal accepted without a human: an issue labeled ares1:ready by the Master, a
+ * local proposal turned into a Run (backlog.repos), or an iteration accepted as a whole, which
+ * counts once however many children it has.
  */
-const AUTO_ACCEPTED_EVENTS = ['issue.auto_accepted', 'proposal.auto_accepted'] as const;
+const AUTO_ACCEPTED_EVENTS = [
+  'issue.auto_accepted',
+  'proposal.auto_accepted',
+  'iteration.auto_accepted',
+] as const;
 
 /**
  * Spend of today on what this repo did without a human: scouts, auto-accepted Runs (from issues

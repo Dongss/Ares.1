@@ -567,6 +567,15 @@ describe('GhCli writes', () => {
     ]);
   });
 
+  it('editIssue replaces the body through stdin', async () => {
+    const body = '### 计划\n\n- [ ] #58 第一步\n- [ ] #59 第二步（依赖 #58）\n';
+    const gh = fakeGh([{ when: ['issue', 'edit'] }]);
+    await new GhCli(gh.bin).editIssue('acme/widgets', 57, { body });
+    expect(gh.calls()).toMatchObject([
+      { args: ['issue', 'edit', '57', '-R', 'acme/widgets', '--body-file', '-'], stdin: body },
+    ]);
+  });
+
   it('setLabels replaces the labels with a PUT of {labels}', async () => {
     const gh = fakeGh([{ when: ['api', '-X', 'PUT'], keep: true }]);
     const cli = new GhCli(gh.bin);
@@ -1819,5 +1828,25 @@ describe('FakeGitHub pull requests', () => {
       gh.createPullRequest('me/demo', { head: 'ares1/run-1', base: 'main', title: 't', body: 'b' }),
     ).rejects.toThrow('down');
     expect(gh.calls).toEqual(['getPull #1', 'findPull ares1/run-1', 'createPull ares1/run-1']);
+  });
+});
+
+describe('FakeGitHub issues', () => {
+  it('replaces the body of an issue it created, as later reads show', async () => {
+    const gh = new FakeGitHub();
+    const { number } = await gh.createIssue('me/demo', {
+      title: '迭代',
+      body: '计划待定',
+      labels: ['ares1:iteration'],
+    });
+    await gh.editIssue('me/demo', number, { body: '- [ ] #2 第一步' });
+    expect((await gh.getIssue('me/demo', number)).body).toBe('- [ ] #2 第一步');
+    expect((await gh.listIssues('me/demo', { state: 'open', limit: 10 }))[0]?.body).toBe(
+      '- [ ] #2 第一步',
+    );
+    expect(gh.calls).toEqual(['create 迭代', 'editIssue #1', 'getIssue #1', 'list open']);
+    gh.failing.set('editIssue #1', 'boom');
+    await expect(gh.editIssue('me/demo', number, { body: 'x' })).rejects.toThrow('boom');
+    expect(gh.get(number).body).toBe('- [ ] #2 第一步');
   });
 });

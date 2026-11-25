@@ -133,6 +133,8 @@ export interface GitHub {
     repo: string,
     issue: { title: string; body: string; labels: string[] },
   ): Promise<{ number: number; url: string }>;
+  /** Replace the body of the issue. */
+  editIssue(repo: string, number: number, edit: { body: string }): Promise<void>;
   /** The issue as it is now, without its comments. */
   getIssue(repo: string, number: number): Promise<GhIssue>;
   getLabels(repo: string, number: number): Promise<string[]>;
@@ -641,6 +643,12 @@ export class GhCli implements GitHub {
       );
     }
     return { number, url };
+  }
+
+  async editIssue(repo: string, number: number, edit: { body: string }): Promise<void> {
+    await this.gh(['issue', 'edit', String(number), '-R', repo, '--body-file', '-'], {
+      stdin: edit.body,
+    });
   }
 
   async getIssue(repo: string, number: number): Promise<GhIssue> {

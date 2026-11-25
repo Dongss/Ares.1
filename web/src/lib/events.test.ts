@@ -94,6 +94,8 @@ const SAMPLES: [string, Record<string, unknown>][] = [
     { repo: 'demo', branch: 'main', reason: 'dirty', worktree: '/w/demo', status: ' M a.ts' },
   ],
   ['issue.auto_accepted', { repo: 'demo', issue: 12 }],
+  ['iteration.auto_accepted', { repo: 'demo', iterationId: 'iteration-1', issue: 20 }],
+  ['iteration.accepted', { repo: 'demo', iterationId: 'iteration-1', issue: 20 }],
   ['proposal.auto_accepted', { repo: 'demo', proposalId: 'proposal-1', runId: 'run-1' }],
   ['proposal.accepted', { repo: 'demo', proposalId: 'proposal-1', runId: 'run-1' }],
   // The reason is a human's own words, kept as written: English here, so the check below holds.
@@ -456,6 +458,23 @@ describe('globalEventText', () => {
     );
   });
 
+  it('says an iteration was accepted as a whole, by a human or not', () => {
+    const data = { repo: 'demo', iterationId: 'iteration-1', issue: 20 };
+    expect(text('iteration.auto_accepted', data)).toBe(
+      '整批自动采纳了 demo 的迭代 #20，子 issue 按依赖顺序开工',
+    );
+    expect(text('iteration.accepted', data)).toBe(
+      'demo 的迭代 #20 已整批采纳，子 issue 按依赖顺序开工',
+    );
+    setLang('en');
+    expect(text('iteration.auto_accepted', data)).toBe(
+      'Accepted iteration #20 of demo automatically as a whole; its sub-issues start in the order of their dependencies',
+    );
+    expect(text('iteration.accepted', { repo: 'demo' })).toBe(
+      'Iteration of demo was accepted as a whole; its sub-issues start in the order of their dependencies',
+    );
+  });
+
   it('says a local proposal was accepted, by a human or not, or rejected and why', () => {
     const accepted = { repo: 'demo', proposalId: 'proposal-1', runId: 'run-7' };
     expect(text('proposal.auto_accepted', accepted)).toBe(
@@ -552,6 +571,8 @@ describe('globalEventLink', () => {
     expect(globalEventLink(ev('scout.completed'))).toEqual(issues);
     expect(globalEventLink(ev('scout.failed'))).toEqual(issues);
     expect(globalEventLink(ev('issue.auto_accepted'))).toEqual(issues);
+    expect(globalEventLink(ev('iteration.auto_accepted'))).toEqual(issues);
+    expect(globalEventLink(ev('iteration.accepted'))).toEqual(issues);
     expect(globalEventLink(ev('logs.pruned'))).toBeNull();
     expect(globalEventLink(ev('master.restarted'))).toBeNull();
     setLang('en');

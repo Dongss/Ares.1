@@ -515,12 +515,13 @@ export class Scouting {
     scouts: Scout[],
     pollMinutes: number,
   ): Promise<(ScoutWait & { until: string }) | null> {
-    let backoff = scoutBackoff(scouts, pollMinutes);
+    const planned = this.iterationScouts(repo.id);
+    let backoff = scoutBackoff(scouts, pollMinutes, undefined, planned);
     if (!backoff || Date.parse(backoff.until) <= Date.now()) return null;
     // Scouts that ran before the target branch's latest commit do not count: they did not see it.
     // When git cannot tell, the back-off stays as counted.
     const changedAt = await commitTime(repo.path, repo.targetBranch).catch(() => undefined);
-    if (changedAt !== undefined) backoff = scoutBackoff(scouts, pollMinutes, changedAt);
+    if (changedAt !== undefined) backoff = scoutBackoff(scouts, pollMinutes, changedAt, planned);
     if (!backoff || Date.parse(backoff.until) <= Date.now()) return null;
     const k = backoff.count;
     return {
@@ -622,6 +623,18 @@ export class Scouting {
       limit: 1,
     });
     return open[0] ?? null;
+  }
+
+  /**
+   * The scouts of the repo that wrote out an iteration, which found work though they may have
+   * filed no proposal: on GitHub once its issue was created, in the local backlog once recorded.
+   */
+  private iterationScouts(repoId: string): Set<string> {
+    const planned = new Set<string>();
+    for (const it of this.deps.store.listIterations({ repoId })) {
+      if (it.scoutId && (it.issue || it.source === 'local')) planned.add(it.scoutId);
+    }
+    return planned;
   }
 
   /** What the iteration's digest reads of a Run of its steps; undefined once it is gone. */
