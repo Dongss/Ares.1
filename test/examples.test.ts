@@ -54,7 +54,12 @@ describe('configuration examples (docs/examples)', () => {
     const cfg = loadExamples();
     const repos = Object.entries(cfg.master.github?.repos ?? {});
     expect(repos.length).toBeGreaterThan(1);
-    for (const [name, repo] of repos) {
+    // A repo without GitHub is shown too, with a scout and auto-accept of its own.
+    const local = Object.entries(cfg.master.backlog?.repos ?? {});
+    expect(local.length).toBeGreaterThan(0);
+    expect(local.some(([, repo]) => repo.scout && repo.auto_accept.max_risk !== 'none')).toBe(true);
+    for (const [name] of local) expect(repos.map(([n]) => n)).not.toContain(name);
+    for (const [name, repo] of [...repos, ...local]) {
       expect(cfg.templates.has(repo.template), `${name}: template ${repo.template}`).toBe(true);
       if (!repo.scout) continue;
       const scout = cfg.agents.get(repo.scout.agent);

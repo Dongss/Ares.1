@@ -105,6 +105,31 @@ github:
       daily_budget_usd: 15
       # auto_merge、push 不写 = false：合并前等人审批，合并后不推送
 
+# 本地提案池：给不接 GitHub 的仓库用（只在本机的仓库、没有 GitHub 账号、托管在 GitLab 或内网的项目）。
+# 侦察的提案存在 Master 里，在看板上采纳，或填理由拒绝（理由会作为反例写进下一次侦察的提示词）；
+# 在 auto_accept 范围内的提案自动采纳，直接用提案正文作为目标建 Run。不需要 gh，全程不调用 GitHub。
+# 不写 backlog 就不用本地提案池
+backlog:
+  poll_minutes: 5              # 多久检查一次本地提案池：自动采纳范围内的提案、该侦察时侦察，默认 5
+
+  # 键是看板「仓库」页登记的仓库名。一个仓库只能选一种需求来源：不能和上面 github.repos 里的重名，
+  # 重名时这里的设置不生效（GitHub 一侧照常工作），看板「配置」页报错
+  repos:
+    # 内网的命令行工具：不接 GitHub，靠侦察和自动采纳自己转起来
+    my-intranet-tool:
+      template: cross-review   # 采纳的提案建 Run 用的模板
+      scout:                   # 各项的含义和默认值和 github.repos 里的一样；不写 = 不侦察，只能在看板上手动建 Run
+        agent: claude-reviewer
+        interval_minutes: 120
+        max_proposals: 3
+      auto_accept:             # 范围内的提案不经过人，直接建 Run；范围外的留在提案池里等你采纳或拒绝
+        max_risk: low
+        max_size: M            # cross-review 模板不拆分 L 的需求，L 留给人
+        max_per_day: 5
+      auto_merge: true         # true = 采纳的提案建出的 Run 合并前不等人审批；默认 false
+      daily_budget_usd: 10     # 当天侦察和自动采纳的 Run 一共花到这么多（美元）后停止这些自动行为，第二天恢复；
+                               # 在看板上手动采纳的不受影响。不写 = 不限
+
 # 需要人处理时（Run 卡住或失败、等审批、提案等人决定、推送或升级失败），Master 直接发系统通知，不用开着看板。
 # macOS 用通知中心；Linux 需要 notify-send（libnotify）；其他平台不支持，仍由浏览器发通知
 notify:

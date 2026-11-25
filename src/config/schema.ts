@@ -16,6 +16,66 @@ export const Level = z.enum(['low', 'mid', 'high']);
 // config.yaml
 // ---------------------------------------------------------------------------
 
+/**
+ * The AI scout of a repo: it reads the repo and its Run records and proposes requirements, as
+ * issues labeled ares1:proposal on GitHub or as proposals in the local backlog.
+ */
+export const ScoutConfigSchema = z.strictObject({
+  /** An agent of a CLI that can run read-only (claude-code, codex); it runs read-only. */
+  agent: z.string().min(1),
+  /** Scout on its own whenever the repo is idle; false = only from the dashboard. */
+  auto: z.boolean().default(true),
+  /** At least this many minutes between automatic scouts; 0 = no minimum. */
+  interval_minutes: z.number().min(0).default(0),
+  /** Proposals per scout; no automatic scout while this many proposals await triage. */
+  max_proposals: z.number().int().min(1).max(20).default(5),
+});
+export type ScoutConfig = z.infer<typeof ScoutConfigSchema>;
+
+/**
+ * Proposals accepted without a human: on GitHub they are labeled ares1:ready, in the local
+ * backlog a Run is created from them right away.
+ */
+export const AutoAcceptSchema = z.strictObject({
+  /** Highest risk accepted automatically; none = every proposal waits for a human. */
+  max_risk: z.enum(['none', ...RISKS]).default('none'),
+  /**
+   * Largest size accepted automatically, together with max_risk. L by default: a template whose
+   * coding stage plans (planning: auto or llm) splits an L requirement into steps, so one Run
+   * finishes it.
+   */
+  max_size: z.enum(PROPOSAL_SIZES).default('L'),
+  /** Omitted = no daily limit. */
+  max_per_day: z.number().int().min(1).optional(),
+});
+export type AutoAcceptConfig = z.infer<typeof AutoAcceptSchema>;
+
+/**
+ * What a repo's requirements are worked with, wherever they come from: GitHub issues
+ * (`github.repos`) or the local backlog (`backlog.repos`). Both spread its shape, so the fields
+ * read and validate the same in either.
+ */
+export const ProposalSourceSchema = z.strictObject({
+  /**
+   * Template of the Runs created from accepted requirements: issues labeled ares1:ready, or
+   * accepted local proposals.
+   */
+  template: z.string().min(1),
+  /** The AI scout that proposes requirements; omitted = no scouting. */
+  scout: ScoutConfigSchema.optional(),
+  auto_accept: AutoAcceptSchema.prefault({}),
+  /** Runs from the repo's requirements merge without the merge approval. */
+  auto_merge: z.boolean().default(false),
+  /**
+   * Spend of a day on what the Master does by itself (scouts, auto-accepted Runs, automatic
+   * redos where failed Runs are redone) after which automatic scouting, auto-accepting and
+   * redoing stop until the next day; omitted = no limit.
+   */
+  daily_budget_usd: z.number().positive().optional(),
+});
+/** The settings GitHub and local backlog repos share, for what works with either. */
+export type ProposalSourceConfig = z.infer<typeof ProposalSourceSchema>;
+
 /** GitHub Issues as the backlog of one registered repo. */
 export const GitHubRepoSchema = z.strictObject({
   /** "owner/name"; omitted = resolved by gh from the repo's remotes. */
@@ -25,38 +85,7 @@ export const GitHubRepoSchema = z.strictObject({
       error: () => t({ zh: '格式应为 owner/name', en: 'should be owner/name' }),
     })
     .optional(),
-  /** Template of the Runs created from issues labeled ares1:ready. */
-  template: z.string().min(1),
-  /** The AI scout that proposes issues; omitted = no scouting. */
-  scout: z
-    .strictObject({
-      /** An agent of a CLI that can run read-only (claude-code, codex); it runs read-only. */
-      agent: z.string().min(1),
-      /** Scout on its own whenever the repo is idle; false = only from the dashboard. */
-      auto: z.boolean().default(true),
-      /** At least this many minutes between automatic scouts; 0 = no minimum. */
-      interval_minutes: z.number().min(0).default(0),
-      /** Proposals per scout; no automatic scout while this many proposals await triage. */
-      max_proposals: z.number().int().min(1).max(20).default(5),
-    })
-    .optional(),
-  /** Proposals labeled ares1:ready without a human. */
-  auto_accept: z
-    .strictObject({
-      /** Highest risk accepted automatically; none = every proposal waits for a human. */
-      max_risk: z.enum(['none', ...RISKS]).default('none'),
-      /**
-       * Largest size accepted automatically, together with max_risk. L by default: a template
-       * whose coding stage plans (planning: auto or llm) splits an L requirement into steps, so
-       * one Run finishes it.
-       */
-      max_size: z.enum(PROPOSAL_SIZES).default('L'),
-      /** Omitted = no daily limit. */
-      max_per_day: z.number().int().min(1).optional(),
-    })
-    .prefault({}),
-  /** Runs from issues merge without the merge approval. */
-  auto_merge: z.boolean().default(false),
+  ...ProposalSourceSchema.shape,
   /** Push the target branch to the GitHub repo after each merge. */
   push: z.boolean().default(false),
   /**
@@ -67,11 +96,6 @@ export const GitHubRepoSchema = z.strictObject({
    * is merged on GitHub; the target branch itself is never pushed. pr needs push: true.
    */
   deliver: z.enum(['push', 'pr']).default('push'),
-  /**
-   * Spend of a day (scouts, auto-accepted Runs, automatic redos) after which automatic scouting,
-   * auto-accepting and redoing stop until the next day; omitted = no limit.
-   */
-  daily_budget_usd: z.number().positive().optional(),
   /**
    * Runs an issue gets at most, the first included: a failed Run is redone automatically until
    * then; after that the issue is closed as not planned with the reasons. 1 = never redone.
@@ -89,6 +113,25 @@ export const GitHubSchema = z.strictObject({
   repos: z.record(z.string(), GitHubRepoSchema).default({}),
 });
 export type GitHubConfig = z.infer<typeof GitHubSchema>;
+
+/**
+ * The local backlog as the source of one registered repo's requirements: the scout's proposals
+ * are kept by the Master, and accepted ones (on the dashboard, or by `auto_accept`) become Runs.
+ * For repos without GitHub; nothing here calls GitHub.
+ */
+export const BacklogRepoSchema = z.strictObject({ ...ProposalSourceSchema.shape });
+export type BacklogRepoConfig = z.infer<typeof BacklogRepoSchema>;
+
+export const BacklogSchema = z.strictObject({
+  /** How often to look at the local backlog for proposals to auto-accept and scouts to start. */
+  poll_minutes: z.number().positive().default(5),
+  /**
+   * Keyed by the repo name registered on the dashboard. A repo takes its requirements from one
+   * source only, so a name of `github.repos` is an error here.
+   */
+  repos: z.record(z.string(), BacklogRepoSchema).default({}),
+});
+export type BacklogConfig = z.infer<typeof BacklogSchema>;
 
 /** Notifications POSTed to an address of the user's (ntfy, a Slack incoming webhook, ...). */
 export const WebhookSchema = z.strictObject({
@@ -168,6 +211,8 @@ export const MasterConfigSchema = z.object({
     .prefault({}),
   /** Omitted = no GitHub integration. */
   github: GitHubSchema.optional(),
+  /** Omitted = no local backlog. */
+  backlog: BacklogSchema.optional(),
   /** Notifications sent by the Master itself, when a human is needed. */
   notify: z
     .strictObject({

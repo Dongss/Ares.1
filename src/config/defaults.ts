@@ -54,6 +54,22 @@ defaults:
 #       daily_budget_usd: 20     # 可选：当天侦察、自动采纳的 Run 和自动重做的 Run 花费达到后停止自动行为；不写 = 不限
 #       max_run_attempts: 3      # 一个 issue 最多跑几次 Run（含第一次）：失败后自动重做，带上失败原因；用完就关闭 issue 并写明每次的原因；1 = 不重做
 
+# 不接 GitHub 的仓库（本地仓库、没有 GitHub 账号、托管在 GitLab 或内网）用本地提案池：侦察的提案存在 Master 里，
+# 在看板上采纳，或按 auto_accept 自动采纳后直接建 Run；不需要 gh。字段的含义和 github.repos 里的同名字段一样
+# （说明见${brandName()}仓库的 docs/running.md「不用 GitHub 时」）。同一个仓库不能同时写在 github.repos 和 backlog.repos 里
+# backlog:
+#   poll_minutes: 5              # 多久检查一次本地提案池：自动采纳范围内的提案、该侦察时侦察
+#   repos:
+#     my-local-repo:             # 看板上登记的仓库名，不能和 github.repos 里的重名
+#       template: self-dev       # 采纳的提案建 Run 用的模板
+#       scout:
+#         agent: claude-reviewer # 以只读方式运行，要用支持只读的 CLI（claude-code、codex）的 Agent
+#         auto: true             # 仓库没有会自己往下走的 Run 时自动侦察；false = 只在看板上手动触发
+#       auto_accept:
+#         max_risk: low          # 风险和大小都在范围内的提案直接建 Run；范围外的等你在看板上采纳或拒绝
+#       auto_merge: false        # true = 采纳的提案建出的 Run 合并前不等人审批
+#       daily_budget_usd: 10     # 可选：当天侦察和自动采纳的 Run 花费达到后停止自动行为；不写 = 不限
+
 # 需要人处理时（Run 卡住或失败、等审批、提案等人决定、推送或升级失败），Master 直接发系统通知
 # macOS 用通知中心；Linux 需要 notify-send（libnotify）；其他平台不支持，仍由浏览器发通知
 # notify:
@@ -108,6 +124,22 @@ defaults:
 #       deliver: push            # push (default) = merge into the local target branch, then push it; pr = push the Run's branch and open a pull request, and the Run completes once it is merged on GitHub: for target branches that are protected or need a PR or CI; pr needs push: true
 #       daily_budget_usd: 20     # optional: stop automatic actions once the day's scouts, auto-accepted Runs and automatic redos cost this much; omitted = no limit
 #       max_run_attempts: 3      # Runs an issue gets at most, the first included: a failed Run is redone automatically with its reason; once they are used up, the issue is closed with every reason; 1 = never redone
+
+# Repos without GitHub (local only, no GitHub account, hosted on GitLab or an intranet) use the local backlog: the scout's proposals are kept by
+# the Master, and become Runs once accepted on the dashboard or automatically by auto_accept; no gh needed. The fields mean what they mean in
+# github.repos (see "Without GitHub" in docs/running.md of the ${brandName()} repo). A repo cannot be in both github.repos and backlog.repos
+# backlog:
+#   poll_minutes: 5              # how often to go over the local backlog: auto-accept proposals within range, scout when it is time
+#   repos:
+#     my-local-repo:             # the repo name registered on the dashboard; not one of github.repos
+#       template: self-dev       # template of the Runs created from accepted proposals
+#       scout:
+#         agent: claude-reviewer # runs read-only, so it needs an agent of a CLI that supports that (claude-code, codex)
+#         auto: true             # scout whenever no Run of the repo goes on by itself; false = only from the dashboard
+#       auto_accept:
+#         max_risk: low          # proposals within both risk and size become Runs right away; the others wait for you to accept or reject them on the dashboard
+#       auto_merge: false        # true = Runs from accepted proposals merge without waiting for approval
+#       daily_budget_usd: 10     # optional: stop automatic actions once the day's scouts and auto-accepted Runs cost this much; omitted = no limit
 
 # When a human is needed (a Run is stuck or failed, an approval or a proposal waits, a push or upgrade failed), the Master sends a system notification:
 # Notification Center on macOS; on Linux it needs notify-send (libnotify); other platforms are not supported, and the browser keeps sending them

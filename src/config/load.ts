@@ -21,9 +21,9 @@ import {
   AgentSchema,
   AgentsFileSchema,
   type Escalate,
-  type GitHubRepoConfig,
   type MasterConfig,
   MasterConfigSchema,
+  type ProposalSourceConfig,
   type SourceFile,
   type TemplateFile,
   TemplateSchema,
@@ -98,8 +98,9 @@ export interface LoadedConfig {
   /** Valid templates of the home directory (may still carry warnings). */
   templates: Map<string, WorkflowTemplate>;
   /**
-   * Problems keyed by "agents.yaml#<id>", "workflows/<file>" or a repo's
-   * "<repo>:.ares1/workflows/<file>". Those items are disabled.
+   * Problems keyed by "agents.yaml#<id>", "workflows/<file>", a repo's
+   * "<repo>:.ares1/workflows/<file>", or a repo's requirements source in config.yaml
+   * (`githubConfigKey` / `backlogConfigKey`). Those items are disabled.
    */
   errors: Record<string, string[]>;
   /** Problems that disable nothing, keyed by "config.yaml" or a template file's key. */
@@ -289,35 +290,17 @@ export function loadConfig(
     });
   }
 
-  // GitHub repos refer to templates and agents; a broken reference disables that repo only.
-  // Settings that work but likely not as meant only add to config.yaml's warnings.
+  // GitHub and local backlog repos refer to templates and agents; a broken reference disables
+  // that repo only. Settings that work but likely not as meant only add to config.yaml's warnings.
   const repoWarnings: string[] = [];
-  for (const [name, repo] of Object.entries(master.github?.repos ?? {})) {
-    const problems: string[] = [];
-    const template = findTemplate({ templates, repoTemplates }, name, repo.template)?.template;
-    if (!template) {
-      problems.push(
-        t({
-          zh: `模板 ${repo.template} 不存在或无效`,
-          en: `Template ${repo.template} does not exist or is invalid`,
-        }),
-      );
-    } else if (wholeLAutoAccepted(repo.auto_accept, template)) {
-      repoWarnings.push(
-        t({
-          zh: `仓库 ${name} 会自动采纳大小为 L 的提案（auto_accept.max_size: L），但它用的模板 ${repo.template} 没有 planning: auto 或 llm 的 Agent 阶段：L 的需求会整个交给一个 Run 一次做完，容易超时或返工。建议编码阶段用 planning: auto，或者把 max_size 调成 M，让 L 的提案留给人`,
-          en: `Repo ${name} auto-accepts size L proposals (auto_accept.max_size: L), but its template ${repo.template} has no agent stage with planning: auto or llm: an L requirement goes to one Run as a whole, done in one go and likely to time out or need rework. Better set planning: auto on the coding stage, or lower max_size to M to leave L proposals to a human`,
-        }),
-      );
-    }
-    if (repo.scout && !agents.has(repo.scout.agent)) {
-      problems.push(
-        t({
-          zh: `侦察用的 Agent ${repo.scout.agent} 不存在或未启用`,
-          en: `Scout agent ${repo.scout.agent} does not exist or is disabled`,
-        }),
-      );
-    }
+  const checkSource = (name: string, repo: ProposalSourceConfig): string[] => {
+    const checked = proposalSourceProblems(name, repo, { templates, repoTemplates }, agents);
+    repoWarnings.push(...checked.warnings);
+    return checked.problems;
+  };
+  const githubRepos = master.github?.repos ?? {};
+  for (const [name, repo] of Object.entries(githubRepos)) {
+    const problems = checkSource(name, repo);
     // A pull request needs the Run's branch on GitHub and the target branch pulled back after
     // the merge, which only repos with push do.
     if (repo.deliver === 'pr' && !repo.push) {
@@ -329,6 +312,21 @@ export function loadConfig(
       );
     }
     if (problems.length > 0) errors[githubConfigKey(name)] = problems;
+  }
+  for (const [name, repo] of Object.entries(master.backlog?.repos ?? {})) {
+    // Two sources would both scout and accept for the repo. GitHub keeps working as it did, so
+    // adding a backlog entry by mistake stops nothing; the entry itself is disabled.
+    if (Object.hasOwn(githubRepos, name)) {
+      errors[backlogConfigKey(name)] = [
+        t({
+          zh: `仓库 ${name} 同时写在 github.repos 和 backlog.repos 里：一个仓库只能选一种需求来源，要么用 GitHub issue，要么用本地提案池。这里的设置没有生效，GitHub 一侧照常工作；不用 GitHub 的话，就把它从 github.repos 里删掉`,
+          en: `Repo ${name} is in both github.repos and backlog.repos: a repo takes its requirements from one source only, either GitHub issues or the local backlog. These settings are not in effect and GitHub keeps working as before; to work without GitHub, remove the repo from github.repos`,
+        }),
+      ];
+      continue;
+    }
+    const problems = checkSource(name, repo);
+    if (problems.length > 0) errors[backlogConfigKey(name)] = problems;
   }
   if (repoWarnings.length > 0) {
     warnings['config.yaml'] = [...(warnings['config.yaml'] ?? []), ...repoWarnings];
@@ -515,11 +513,50 @@ function loadTemplateSource(
 }
 
 /**
+ * What GitHub and local backlog repos share, checked against the templates and agents: problems
+ * disable the repo; warnings are about settings that work, but likely not as meant.
+ */
+function proposalSourceProblems(
+  name: string,
+  repo: ProposalSourceConfig,
+  cfg: Pick<LoadedConfig, 'templates' | 'repoTemplates'>,
+  agents: Map<string, AgentConfig>,
+): { problems: string[]; warnings: string[] } {
+  const problems: string[] = [];
+  const warnings: string[] = [];
+  const template = findTemplate(cfg, name, repo.template)?.template;
+  if (!template) {
+    problems.push(
+      t({
+        zh: `模板 ${repo.template} 不存在或无效`,
+        en: `Template ${repo.template} does not exist or is invalid`,
+      }),
+    );
+  } else if (wholeLAutoAccepted(repo.auto_accept, template)) {
+    warnings.push(
+      t({
+        zh: `仓库 ${name} 会自动采纳大小为 L 的提案（auto_accept.max_size: L），但它用的模板 ${repo.template} 没有 planning: auto 或 llm 的 Agent 阶段：L 的需求会整个交给一个 Run 一次做完，容易超时或返工。建议编码阶段用 planning: auto，或者把 max_size 调成 M，让 L 的提案留给人`,
+        en: `Repo ${name} auto-accepts size L proposals (auto_accept.max_size: L), but its template ${repo.template} has no agent stage with planning: auto or llm: an L requirement goes to one Run as a whole, done in one go and likely to time out or need rework. Better set planning: auto on the coding stage, or lower max_size to M to leave L proposals to a human`,
+      }),
+    );
+  }
+  if (repo.scout && !agents.has(repo.scout.agent)) {
+    problems.push(
+      t({
+        zh: `侦察用的 Agent ${repo.scout.agent} 不存在或未启用`,
+        en: `Scout agent ${repo.scout.agent} does not exist or is disabled`,
+      }),
+    );
+  }
+  return { problems, warnings };
+}
+
+/**
  * Whether a repo auto-accepts size L proposals with a template that cannot split them into steps
  * (`templateSplits`), so a whole L requirement would go to one Run unseen by a human.
  */
 function wholeLAutoAccepted(
-  limits: GitHubRepoConfig['auto_accept'],
+  limits: ProposalSourceConfig['auto_accept'],
   template: WorkflowTemplate,
 ): boolean {
   return autoAcceptsL(limits) && !templateSplits(template);
@@ -528,6 +565,11 @@ function wholeLAutoAccepted(
 /** Key of a GitHub repo's problems in `errors`. */
 export function githubConfigKey(repoName: string): string {
   return `config.yaml#github.repos.${repoName}`;
+}
+
+/** Key of a local backlog repo's problems in `errors`. */
+export function backlogConfigKey(repoName: string): string {
+  return `config.yaml#backlog.repos.${repoName}`;
 }
 
 /** A string field of an unvalidated YAML mapping, or null. */
@@ -554,7 +596,7 @@ function parseMaster(file: string): { master: MasterConfig; warnings: string[] }
 
 /**
  * Keys of config.yaml the schema drops without a word: the top level and `defaults` are not
- * strict (unlike github, notify and upgrade), so a typo such as `upgarde:` would silently
+ * strict (unlike github, backlog, notify and upgrade), so a typo such as `upgarde:` would silently
  * leave a setting off. Only warned about, so an existing config.yaml still starts the Master.
  */
 function unknownMasterKeys(raw: unknown): string[] {

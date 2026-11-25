@@ -32,6 +32,7 @@ import {
   waitsForMaxRuns,
 } from '../src/config/flow.js';
 import {
+  backlogConfigKey,
   ConfigError,
   findTemplate,
   githubConfigKey,
@@ -43,10 +44,12 @@ import {
 } from '../src/config/load.js';
 import {
   agentEffort,
+  BacklogRepoSchema,
   defaultRollbackTarget,
   effectiveStage,
   failTarget,
   GitHubRepoSchema,
+  ProposalSourceSchema,
   replyTimeoutHours,
   rollbackTarget,
   stageVerifyCommands,
@@ -160,8 +163,8 @@ defaults:
     expect(cfg.master.notify.system).toBe(false);
     expect(cfg.master.defaults).toEqual({ timeout_minutes: 60, command_timeout_minutes: 10 });
     expect(cfg.warnings['config.yaml']).toEqual([
-      '未知的配置项 upgarde，已忽略（是不是写错了？可用：language、port、bins、defaults、concurrency、github、notify、upgrade）',
-      '未知的配置项 notfy，已忽略（是不是写错了？可用：language、port、bins、defaults、concurrency、github、notify、upgrade）',
+      '未知的配置项 upgarde，已忽略（是不是写错了？可用：language、port、bins、defaults、concurrency、github、backlog、notify、upgrade）',
+      '未知的配置项 notfy，已忽略（是不是写错了？可用：language、port、bins、defaults、concurrency、github、backlog、notify、upgrade）',
       '未知的配置项 defaults.timeout_minute，已忽略（是不是写错了？可用：timeout_minutes、command_timeout_minutes）',
     ]);
     expect(cfg.errors).toEqual({});
@@ -210,6 +213,10 @@ github:
   poll_minutes: 5
   repos:
     app: { template: self-dev, push: true }
+backlog:
+  poll_minutes: 10
+  repos:
+    local: { template: self-dev }
 notify: { system: true }
 upgrade: { auto: true }
 `,
@@ -783,6 +790,194 @@ stages:
       } finally {
         // Back to the default language, zod's messages included, for the other tests.
         load('{ template: self-dev }');
+      }
+    });
+  });
+
+  describe('backlog', () => {
+    function load(config: string, sources: Record<string, RepoTemplateSource> = {}) {
+      const paths = home();
+      writeFile(paths.configFile, config);
+      return loadConfig(paths, ['claude-code'], ['claude-code'], {
+        repoSources: new Map(Object.entries(sources)),
+      });
+    }
+    /** The reason told when a repo is in both github.repos and backlog.repos. */
+    const BOTH =
+      '仓库 app 同时写在 github.repos 和 backlog.repos 里：一个仓库只能选一种需求来源，要么用 GitHub issue，要么用本地提案池。这里的设置没有生效，GitHub 一侧照常工作；不用 GitHub 的话，就把它从 github.repos 里删掉';
+
+    it('is off unless written, and reads its repos with the defaults of github.repos', () => {
+      expect(load('port: 4870\n').master.backlog).toBeUndefined();
+      expect(load('backlog: {}\n').master.backlog).toEqual({ poll_minutes: 5, repos: {} });
+      const cfg = load(`backlog:
+  repos:
+    app: { template: self-dev }
+    busy:
+      template: self-dev
+      scout: { agent: claude-reviewer }
+      auto_accept: { max_risk: low, max_size: M, max_per_day: 2 }
+      auto_merge: true
+      daily_budget_usd: 7.5
+`);
+      expect(cfg.errors).toEqual({});
+      expect(cfg.warnings).toEqual({});
+      expect(cfg.master.github).toBeUndefined();
+      expect(cfg.master.backlog).toEqual({
+        poll_minutes: 5,
+        repos: {
+          app: {
+            template: 'self-dev',
+            auto_accept: { max_risk: 'none', max_size: 'L' },
+            auto_merge: false,
+          },
+          busy: {
+            template: 'self-dev',
+            scout: { agent: 'claude-reviewer', auto: true, interval_minutes: 0, max_proposals: 5 },
+            auto_accept: { max_risk: 'low', max_size: 'M', max_per_day: 2 },
+            auto_merge: true,
+            daily_budget_usd: 7.5,
+          },
+        },
+      });
+      expect(load('backlog: { poll_minutes: 0.5 }\n').master.backlog?.poll_minutes).toBe(0.5);
+    });
+
+    it('validates the fields it shares with github.repos the same way, and has none of the rest', () => {
+      const shared = {
+        template: 'x',
+        scout: { agent: 'a', interval_minutes: 30 },
+        auto_accept: { max_risk: 'mid' },
+        daily_budget_usd: 3,
+      };
+      const local = BacklogRepoSchema.parse(shared);
+      expect(local).toEqual(ProposalSourceSchema.parse(shared));
+      // GitHub reads the same fields alike, and keeps its own defaults.
+      expect(GitHubRepoSchema.parse(shared)).toEqual({
+        ...local,
+        push: false,
+        deliver: 'push',
+        max_run_attempts: 3,
+      });
+      for (const bad of [
+        { template: '' },
+        { template: 'x', scout: { agent: 'a', max_proposals: 21 } },
+        { template: 'x', scout: { agent: 'a', interval_minutes: -1 } },
+        { template: 'x', scout: { agent: 'a', every: 6 } },
+        { template: 'x', auto_accept: { max_risk: 'huge' } },
+        { template: 'x', auto_accept: { max_size: 'XL' } },
+        { template: 'x', auto_accept: { max_per_day: 0 } },
+        { template: 'x', daily_budget_usd: 0 },
+      ]) {
+        const what = JSON.stringify(bad);
+        expect(BacklogRepoSchema.safeParse(bad).success, what).toBe(false);
+        expect(GitHubRepoSchema.safeParse(bad).success, what).toBe(false);
+      }
+      // What only GitHub does is not a setting of the local backlog.
+      for (const key of ['issues_repo', 'push', 'deliver', 'max_run_attempts']) {
+        expect(
+          () => load(`backlog:\n  repos:\n    app: { template: x, ${key}: 1 }\n`),
+          key,
+        ).toThrow(new RegExp(`\\b${key}\\b`));
+      }
+      for (const bad of ['poll_minutes: 0', 'poll_minutes: -1', 'pol_minutes: 5']) {
+        expect(() => load(`backlog: { ${bad} }\n`), bad).toThrow(ConfigError);
+      }
+    });
+
+    it('disables a repo in both github.repos and backlog.repos on the backlog side, saying why', () => {
+      const cfg = load(`github:
+  repos:
+    app: { template: self-dev }
+backlog:
+  repos:
+    app: { template: nope, scout: { agent: nobody } }
+    local: { template: self-dev }
+`);
+      // Only the conflict is told: these settings are not used either way.
+      expect(cfg.errors).toEqual({ [backlogConfigKey('app')]: [BOTH] });
+      expect(cfg.warnings).toEqual({});
+      // GitHub keeps the repo, and the other backlog repo is fine.
+      expect(cfg.errors[githubConfigKey('app')]).toBeUndefined();
+      expect(cfg.errors[backlogConfigKey('local')]).toBeUndefined();
+      expect(backlogConfigKey('app')).toBe('config.yaml#backlog.repos.app');
+    });
+
+    it('disables only the repo whose template or scout agent is missing', () => {
+      const cfg = load(`backlog:
+  repos:
+    app: { template: nope, scout: { agent: nobody } }
+    scouted: { template: self-dev, scout: { agent: nobody } }
+    local: { template: self-dev, scout: { agent: claude-reviewer } }
+`);
+      expect(cfg.errors).toEqual({
+        [backlogConfigKey('app')]: [
+          '模板 nope 不存在或无效',
+          '侦察用的 Agent nobody 不存在或未启用',
+        ],
+        [backlogConfigKey('scouted')]: ['侦察用的 Agent nobody 不存在或未启用'],
+      });
+      expect(cfg.warnings).toEqual({});
+      expect(Object.keys(cfg.master.backlog?.repos ?? {})).toEqual(['app', 'scouted', 'local']);
+    });
+
+    it("finds the repo's own templates, and warns about auto-accepting L it cannot split", () => {
+      const X = `id: x
+stages:
+  - { id: implement, agent: claude-coder }
+  - { id: review, kind: review, agent: claude-reviewer }
+  - { id: merge, kind: merge }
+`;
+      const source = {
+        branch: 'main',
+        sha: '1'.repeat(40),
+        files: [{ file: 'x.yaml', source: X }],
+      };
+      const config = (accept: string) =>
+        `backlog:\n  repos:\n    app: { template: x, ${accept} }\n`;
+      const whole = load(config('auto_accept: { max_risk: low }'), { app: source });
+      expect(whole.errors).toEqual({});
+      expect(whole.warnings).toEqual({
+        'config.yaml': [
+          '仓库 app 会自动采纳大小为 L 的提案（auto_accept.max_size: L），但它用的模板 x 没有 planning: auto 或 llm 的 Agent 阶段：L 的需求会整个交给一个 Run 一次做完，容易超时或返工。建议编码阶段用 planning: auto，或者把 max_size 调成 M，让 L 的提案留给人',
+        ],
+      });
+      const leftToHuman = load(config('auto_accept: { max_risk: low, max_size: M }'), {
+        app: source,
+      });
+      expect(leftToHuman.errors).toEqual({});
+      expect(leftToHuman.warnings).toEqual({});
+      // Another repo's templates are not this one's.
+      expect(load(config('auto_merge: true'), { other: source }).errors).toEqual({
+        [backlogConfigKey('app')]: ['模板 x 不存在或无效'],
+      });
+    });
+
+    it('says so in English when config.yaml says so', () => {
+      try {
+        const cfg = load(`language: en
+github:
+  repos:
+    app: { template: self-dev }
+backlog:
+  repos:
+    app: { template: self-dev }
+    local: { template: nope, scout: { agent: nobody } }
+`);
+        expect(cfg.errors).toEqual({
+          [backlogConfigKey('app')]: [
+            'Repo app is in both github.repos and backlog.repos: a repo takes its requirements from one source only, either GitHub issues or the local backlog. These settings are not in effect and GitHub keeps working as before; to work without GitHub, remove the repo from github.repos',
+          ],
+          [backlogConfigKey('local')]: [
+            'Template nope does not exist or is invalid',
+            'Scout agent nobody does not exist or is disabled',
+          ],
+        });
+        for (const problem of Object.values(cfg.errors).flat()) {
+          expect(problem).not.toMatch(/[一-鿿]/);
+        }
+      } finally {
+        // Back to the default language, zod's messages included, for the other tests.
+        load('port: 4870\n');
       }
     });
   });
