@@ -3,6 +3,7 @@
 // has already reworked go in, the judgement comes out.
 
 import { join, t } from '../i18n.js';
+import type { EventRow } from '../store/types.js';
 import type { GhCheck, GhPullRequestStatus, GhReview, GhReviewComment } from './client.js';
 import { isTrusted, quote } from './issues.js';
 
@@ -290,15 +291,34 @@ function reasonText(
   checks: readonly GhCheck[],
   reviews: readonly GhReview[],
 ): string {
-  const parts = kinds.map((kind) => {
+  return reworkReason({
+    kinds,
+    base: pr.baseRefName,
+    checks: checks.map((c) => c.name),
+    reviewers: reviews.map((r) => r.author),
+  });
+}
+
+/**
+ * Why a pull request needs more work, in one line, from what a rework records: the conflict with
+ * `base`, the failed checks by name, who asked for changes (null for a deleted account).
+ */
+export function reworkReason(rework: {
+  kinds: readonly PrReworkKind[];
+  base: string;
+  checks: readonly string[];
+  reviewers: readonly (string | null)[];
+}): string {
+  const { base, checks, reviewers } = rework;
+  const parts = rework.kinds.map((kind) => {
     if (kind === 'conflict') {
       return t({
-        zh: `与目标分支 \`${pr.baseRefName}\` 冲突`,
-        en: `a conflict with the target branch \`${pr.baseRefName}\``,
+        zh: `与目标分支 \`${base}\` 冲突`,
+        en: `a conflict with the target branch \`${base}\``,
       });
     }
     if (kind === 'ci') {
-      const names = checks.slice(0, MAX_REASON_CHECKS).map((c) => c.name);
+      const names = checks.slice(0, MAX_REASON_CHECKS);
       const more = checks.length - names.length;
       const list =
         more > 0
@@ -312,8 +332,43 @@ function reasonText(
         en: `${checks.length === 1 ? 'a failed check' : 'failed checks'}: ${list}`,
       });
     }
-    const names = join(reviews.map((r) => who(r.author)));
+    const names = join(reviewers.map(who));
     return t({ zh: `${names} 要求修改`, en: `changes requested by ${names}` });
   });
   return parts.join(t({ zh: '；', en: '; ' }));
+}
+
+/** What `reworksDone` and `pullRequestPushPending` read of a Run's events. */
+type RunEventLike = Pick<EventRow, 'type' | 'data'>;
+
+const isKind = (value: unknown): value is PrReworkKind =>
+  typeof value === 'string' && (KIND_ORDER as readonly string[]).includes(value);
+
+/**
+ * The reworks a Run's pull request already had, from its events (`github.pr_rework`, oldest
+ * first): each head commit with the kinds reworked on it. Kept in the database, so that a head
+ * is not reworked twice for the same kind, also across a restart of the Master.
+ */
+export function reworksDone(
+  events: readonly RunEventLike[],
+): { head: string; kinds: PrReworkKind[] }[] {
+  return events.flatMap((e) => {
+    if (e.type !== 'github.pr_rework' || typeof e.data.head !== 'string') return [];
+    const kinds = Array.isArray(e.data.kinds) ? e.data.kinds.filter(isKind) : [];
+    return [{ head: e.data.head, kinds }];
+  });
+}
+
+/**
+ * Whether a Run waiting for its pull request (`pr_open`) still has to push its branch there: it
+ * got to wait again (`merge.pr_pending`) after its last push (`github.pr_opened`, or
+ * `github.pr_updated` after a rework). Until then the pull request on GitHub shows the Run's
+ * earlier work, which is not to be judged again.
+ */
+export function pullRequestPushPending(events: readonly RunEventLike[]): boolean {
+  const pending = events.findLastIndex((e) => e.type === 'merge.pr_pending');
+  const pushed = events.findLastIndex(
+    (e) => e.type === 'github.pr_opened' || e.type === 'github.pr_updated',
+  );
+  return pending > pushed;
 }

@@ -10,6 +10,9 @@ import {
   FAILED_CHECK_CONCLUSIONS,
   judgePullRequest,
   type PrReworkContext,
+  pullRequestPushPending,
+  reworkReason,
+  reworksDone,
 } from '../src/github/pr-rework.js';
 import { setLang } from '../src/i18n.js';
 
@@ -402,5 +405,73 @@ describe('judgePullRequest', () => {
     const single = judgePullRequest(pull({ checks: [check({ conclusion: 'ERROR' })] }), ctx());
     expect(single.rework?.reason).toBe('a failed check: build');
     expect(single.rework?.feedback).not.toMatch(CJK);
+  });
+});
+
+describe('reworkReason', () => {
+  it('says why from what a rework records', () => {
+    expect(reworkReason({ kinds: ['ci'], base: 'main', checks: ['build'], reviewers: [] })).toBe(
+      'CI 检查没通过：build',
+    );
+    expect(
+      reworkReason({
+        kinds: ['conflict', 'review'],
+        base: 'dev',
+        checks: [],
+        reviewers: ['alice', null],
+      }),
+    ).toBe('与目标分支 `dev` 冲突；@alice、已删除的账号 要求修改');
+    setLang('en');
+    const reason = reworkReason({
+      kinds: ['conflict', 'ci', 'review'],
+      base: 'main',
+      checks: ['build', 'lint'],
+      reviewers: ['alice'],
+    });
+    expect(reason).toBe(
+      'a conflict with the target branch `main`; failed checks: build, lint; changes requested by @alice',
+    );
+    expect(reason).not.toMatch(CJK);
+  });
+});
+
+describe('reworksDone', () => {
+  it("reads each head's reworked kinds from the Run's events", () => {
+    const events = [
+      { type: 'merge.pr_pending', data: { target: 'main', head: OLD } },
+      { type: 'github.pr_rework', data: { number: 9, head: OLD, kinds: ['review'] } },
+      { type: 'github.pr_rework', data: { number: 9, head: HEAD, kinds: ['ci', 'conflict'] } },
+      // Not what the Master records: skipped rather than trusted.
+      { type: 'github.pr_rework', data: { number: 9, kinds: ['ci'] } },
+      { type: 'github.pr_rework', data: { number: 9, head: HEAD, kinds: ['typo', 3] } },
+    ];
+    expect(reworksDone(events)).toEqual([
+      { head: OLD, kinds: ['review'] },
+      { head: HEAD, kinds: ['ci', 'conflict'] },
+      { head: HEAD, kinds: [] },
+    ]);
+    expect(reworksDone([])).toEqual([]);
+  });
+
+  it('is what judgePullRequest goes by', () => {
+    const asked = pull({ checks: [check({ conclusion: 'FAILURE' })] });
+    const events = [{ type: 'github.pr_rework', data: { head: HEAD, kinds: ['ci'] } }];
+    expect(judgePullRequest(asked, ctx({ done: reworksDone(events) })).rework).toBeNull();
+  });
+});
+
+describe('pullRequestPushPending', () => {
+  const pending = { type: 'merge.pr_pending', data: {} };
+  const opened = { type: 'github.pr_opened', data: {} };
+  const updated = { type: 'github.pr_updated', data: {} };
+  const rework = { type: 'github.pr_rework', data: {} };
+
+  it('is pending from when the Run waits again until its branch is pushed', () => {
+    expect(pullRequestPushPending([])).toBe(false);
+    expect(pullRequestPushPending([pending])).toBe(true);
+    expect(pullRequestPushPending([pending, opened])).toBe(false);
+    expect(pullRequestPushPending([pending, opened, rework])).toBe(false);
+    expect(pullRequestPushPending([pending, opened, rework, pending])).toBe(true);
+    expect(pullRequestPushPending([pending, opened, rework, pending, updated])).toBe(false);
   });
 });

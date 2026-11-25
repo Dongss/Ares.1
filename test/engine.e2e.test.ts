@@ -14,6 +14,7 @@ import {
 import { PLAN_REPORT_JSON_SCHEMA } from '../src/engine/contracts.js';
 import { AGENT_RETRY_BACKOFF, InvalidStateError } from '../src/engine/engine.js';
 import { LABELS, RETRIES_EXHAUSTED_MARKER } from '../src/github/issues.js';
+import type { PrReworkKind } from '../src/github/pr-rework.js';
 import { runDigest } from '../src/github/scout.js';
 import { setLang } from '../src/i18n.js';
 import { noticeFor } from '../src/notify/notice.js';
@@ -6953,12 +6954,12 @@ ${repo}`;
   const URL = 'https://github.com/me/demo/pull/7';
   let gh: FakeGitHub;
 
-  const start = async (cfg = PR_CONFIG, reuse?: Harness) => {
+  const start = async (cfg = PR_CONFIG, reuse?: Harness, workflow = WORKFLOW) => {
     gh = new FakeGitHub();
     h = await harness({
       config: cfg,
       github: gh,
-      workflow: WORKFLOW,
+      workflow,
       ...(reuse ? { home: reuse.home, repoDir: reuse.repoDir } : {}),
     });
     return h;
@@ -6973,6 +6974,33 @@ ${repo}`;
     const run = await t.waitStatus(runId, 'blocked');
     await waitFor(() => t.master.engine.activeRunIds.length === 0, 'the execution slot');
     return run;
+  };
+  const REVIEW_FEEDBACK = `PR #7 需要返工：${URL}\n\n评审要求修改：\n@alice 要求修改：\n> 把函数名改成 addFeature`;
+  /** What the bridge found on the pull request's head (`judgePullRequest`): a review by default. */
+  const reworkOf = (
+    run: Pick<Run, 'headCommit'>,
+    extra: Partial<Parameters<Harness['master']['engine']['pullRequestNeedsRework']>[2]> = {},
+  ) => ({
+    head: run.headCommit as string,
+    kinds: ['review'] as PrReworkKind[],
+    reviewers: ['alice'],
+    checks: [] as { name: string; url: string | null }[],
+    feedback: REVIEW_FEEDBACK,
+    ...extra,
+  });
+  /** Waiting for its pull request, with PR #7 opened for it. */
+  const withPullRequest = async (t: Harness, runId: string) => {
+    const run = await waitingForPr(t, runId);
+    expect(t.master.engine.recordPullRequest(run, { number: 7, url: URL })).toBe('opened');
+    return t.master.store.getRun(run.id);
+  };
+  /** Waiting for its pull request for the `times`th time, after reworks sent it back. */
+  const waitingAgain = async (t: Harness, runId: string, times = 2) => {
+    await waitFor(
+      () => eventData(t, runId, 'merge.pr_pending').length >= times,
+      'the Run to wait for its pull request again',
+    );
+    return waitingForPr(t, runId);
   };
 
   it('does not merge into the local target branch; the Run waits for its pull request', async () => {
@@ -7023,13 +7051,14 @@ ${repo}`;
     const { engine, store } = t.master;
     const run = await waitingForPr(t, t.run().id);
 
-    expect(engine.recordPullRequest(run, { number: 7, url: URL })).toBe(true);
+    expect(engine.recordPullRequest(run, { number: 7, url: URL })).toBe('opened');
     expect(store.getRun(run.id).pr).toEqual({ number: 7, url: URL });
     // Found again after a restart: recorded once.
-    expect(engine.recordPullRequest(run, { number: 7, url: URL })).toBe(true);
+    expect(engine.recordPullRequest(run, { number: 7, url: URL })).toBe('unchanged');
     expect(eventData(t, run.id, 'github.pr_opened')).toEqual([
       { number: 7, url: URL, head: run.branch, base: 'main' },
     ]);
+    expect(eventData(t, run.id, 'github.pr_updated')).toEqual([]);
     expect(store.getRun(run.id).status).toBe('blocked');
 
     // Squashed on GitHub and pulled back: the Run's own commits are not in main.
@@ -7055,7 +7084,9 @@ ${repo}`;
     // Handled once: the Run no longer waits for its pull request.
     expect(engine.pullRequestMerged(run, { number: 7, url: URL, mergeCommit: squash })).toBe(false);
     expect(engine.pullRequestClosed(run, { number: 7, url: URL })).toBe(false);
+    expect(engine.pullRequestNeedsRework(run, { number: 7, url: URL }, reworkOf(run))).toBe(false);
     expect(eventData(t, run.id, 'merge.done')).toHaveLength(1);
+    expect(eventData(t, run.id, 'github.pr_rework')).toEqual([]);
   });
 
   it('ends the Run as failed when the pull request is closed without being merged', async () => {
@@ -7111,15 +7142,263 @@ ${repo}`;
     expect(engine.pullRequestClosed({ id: run.id, blocked: null }, { number: 7, url: URL })).toBe(
       false,
     );
+    expect(engine.pullRequestNeedsRework(stale, { number: 7, url: URL }, reworkOf(run))).toBe(
+      false,
+    );
+    // Its pull request is not recorded yet: GitHub's results are not of the Run's.
+    expect(engine.pullRequestNeedsRework(run, { number: 7, url: URL }, reworkOf(run))).toBe(false);
     expect(store.listEvents(run.id)).toHaveLength(before);
     expect(store.getRun(run.id).pr).toBeNull();
+
+    // Another pull request than the one recorded, or another head than the Run's.
+    engine.recordPullRequest(run, { number: 7, url: URL });
+    const recorded = store.listEvents(run.id).length;
+    const other = { number: 8, url: 'https://github.com/me/demo/pull/8' };
+    expect(engine.pullRequestNeedsRework(run, other, reworkOf(run))).toBe(false);
+    const older = reworkOf(run, { head: git(run.worktreePath as string, 'rev-parse', 'HEAD~1') });
+    expect(engine.pullRequestNeedsRework(run, { number: 7, url: URL }, older)).toBe(false);
+    expect(
+      engine.pullRequestNeedsRework(run, { number: 7, url: URL }, reworkOf(run, { kinds: [] })),
+    ).toBe(false);
+    expect(store.listEvents(run.id)).toHaveLength(recorded);
 
     // Cancelled meanwhile.
     await engine.cancel(run.id);
     expect(engine.recordPullRequest(run, { number: 7, url: URL })).toBe(false);
     expect(engine.pullRequestMerged(run, { number: 7, url: URL, mergeCommit: null })).toBe(false);
     expect(engine.pullRequestClosed(run, { number: 7, url: URL })).toBe(false);
-    expect(store.getRun(run.id)).toMatchObject({ status: 'cancelled', pr: null });
+    expect(engine.pullRequestNeedsRework(run, { number: 7, url: URL }, reworkOf(run))).toBe(false);
+    expect(store.getRun(run.id)).toMatchObject({
+      status: 'cancelled',
+      pr: { number: 7, url: URL },
+    });
+    expect(eventData(t, run.id, 'github.pr_rework')).toEqual([]);
+  });
+
+  it('sends the Run back to coding with what its pull request needs, then updates the same one', async () => {
+    const t = await start();
+    const { engine, store } = t.master;
+    const prompts: string[] = [];
+    t.scripts.coder = (ctx) => {
+      prompts.push(ctx.input.prompt);
+      const content = prompts.length === 1 ? 'ok\n' : 'ok\naddFeature\n';
+      writeFile(join(ctx.input.workdir, 'feature.txt'), content);
+      return done(`第 ${prompts.length} 轮`);
+    };
+    const main = git(t.repoDir, 'rev-parse', 'main');
+    const run = await withPullRequest(t, t.run().id);
+    const first = run.headCommit as string;
+    const pr = { number: 7, url: URL };
+
+    expect(engine.pullRequestNeedsRework(run, pr, reworkOf(run))).toBe(true);
+    // The merge stage's round did not pass, for what the pull request needs.
+    expect(store.getStageRun(run.currentStageRunId as string)).toMatchObject({
+      status: 'failed',
+      failReason: 'check',
+      failFeedback: REVIEW_FEEDBACK,
+    });
+    expect(eventData(t, run.id, 'github.pr_rework')).toEqual([
+      { number: 7, url: URL, head: first, kinds: ['review'], reviewers: ['alice'], checks: [] },
+    ]);
+    const merge = store.listChecks(run.id).filter((c) => c.kind === 'merge');
+    expect(merge.map((c) => [c.name, c.passed, c.detail])).toEqual([
+      ['通过 PR #7 合并到 main', false, `PR #7 需要返工：@alice 要求修改\n${URL}`],
+    ]);
+    // Handled once: the Run no longer waits.
+    expect(engine.pullRequestNeedsRework(run, pr, reworkOf(run))).toBe(false);
+
+    const again = await waitingAgain(t, run.id);
+    // Back to coding, with the reviewer's words, then through the merge stage again.
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toContain(URL);
+    expect(prompts[1]).toContain('把函数名改成 addFeature');
+    expect(eventData(t, run.id, 'stage.rollback')).toEqual([{ from: 'merge', to: 'implement' }]);
+    expect(store.listStageRuns(run.id).map((sr) => [sr.stageId, sr.status])).toEqual([
+      ['implement', 'passed'],
+      ['merge', 'failed'],
+      ['implement', 'passed'],
+      ['merge', 'executing'],
+    ]);
+    // The Run keeps its pull request and waits to push the new commit there.
+    expect(again.blocked?.kind).toBe('pr_open');
+    expect(again.pr).toEqual(pr);
+    expect(again.headCommit).not.toBe(first);
+    expect(git(again.worktreePath as string, 'rev-parse', 'HEAD')).toBe(again.headCommit);
+    expect(eventData(t, run.id, 'merge.pr_pending')).toEqual([
+      { target: 'main', head: first },
+      { target: 'main', head: again.headCommit },
+    ]);
+    // Until then GitHub shows the earlier work: nothing there counts.
+    const ci = { kinds: ['ci'] as PrReworkKind[], checks: [{ name: 'build', url: null }] };
+    expect(engine.pullRequestNeedsRework(again, pr, reworkOf(again, ci))).toBe(false);
+
+    // Pushed to the same pull request: updated, not opened again.
+    expect(engine.recordPullRequest(again, pr)).toBe('updated');
+    expect(engine.recordPullRequest(again, pr)).toBe('unchanged');
+    expect(eventData(t, run.id, 'github.pr_opened')).toHaveLength(1);
+    expect(eventData(t, run.id, 'github.pr_updated')).toEqual([
+      { number: 7, url: URL, head: again.headCommit },
+    ]);
+    expect(store.getRun(run.id).pr).toEqual(pr);
+    // What GitHub said of the earlier head no longer counts.
+    expect(engine.pullRequestNeedsRework(again, pr, reworkOf(run))).toBe(false);
+    expect(eventData(t, run.id, 'github.pr_rework')).toHaveLength(1);
+    expect(git(t.repoDir, 'rev-parse', 'main')).toBe(main);
+  });
+
+  it('reworks each kind once per head commit, also after a restart', async () => {
+    const first = await start();
+    const pr = { number: 7, url: URL };
+    const run = await withPullRequest(first, first.run().id);
+    const head = run.headCommit as string;
+    expect(first.master.engine.pullRequestNeedsRework(run, pr, reworkOf(run))).toBe(true);
+    // The coder changes nothing this time: the Run delivers the same commit again.
+    const again = await waitingAgain(first, run.id);
+    expect(again.headCommit).toBe(head);
+    expect(first.master.engine.recordPullRequest(again, pr)).toBe('updated');
+    await first.close();
+    h = undefined;
+
+    const t = await start(PR_CONFIG, first);
+    const { engine, store } = t.master;
+    const waiting = store.getRun(run.id);
+    expect(waiting.blocked?.kind).toBe('pr_open');
+    const before = store.listEvents(run.id).length;
+    // The same review on the same head: reworked already.
+    expect(engine.pullRequestNeedsRework(waiting, pr, reworkOf(waiting))).toBe(false);
+    expect(store.listEvents(run.id)).toHaveLength(before);
+    expect(store.getRun(run.id)).toMatchObject({ status: 'blocked', blocked: waiting.blocked });
+
+    // A check failing on it is new: only that is reworked.
+    const build = { name: 'build', url: 'https://github.com/me/demo/actions/runs/1' };
+    const both = reworkOf(waiting, { kinds: ['ci', 'review'], checks: [build] });
+    expect(engine.pullRequestNeedsRework(waiting, pr, both)).toBe(true);
+    expect(eventData(t, run.id, 'github.pr_rework')).toEqual([
+      { number: 7, url: URL, head, kinds: ['review'], reviewers: ['alice'], checks: [] },
+      { number: 7, url: URL, head, kinds: ['ci'], reviewers: [], checks: [build] },
+    ]);
+    const details = store
+      .listChecks(run.id)
+      .filter((c) => c.kind === 'merge')
+      .map((c) => c.detail);
+    expect(details).toEqual([
+      `PR #7 需要返工：@alice 要求修改\n${URL}`,
+      `PR #7 需要返工：CI 检查没通过：build\n${URL}`,
+    ]);
+    await waitingAgain(t, run.id, 3);
+    expect(eventData(t, run.id, 'stage.rollback')).toHaveLength(2);
+  });
+
+  /** WORKFLOW that rolls back at most once, then goes by `onExhausted`. */
+  const oneLoop = (onExhausted: 'fail' | 'human') =>
+    WORKFLOW.replace(
+      'stages:\n',
+      `defaults:\n  max_loops: 1\n  escalate:\n    on_exhausted: ${onExhausted}\nstages:\n`,
+    );
+
+  it('counts reworks toward max_loops, then goes by on_exhausted', async () => {
+    for (const onExhausted of ['fail', 'human'] as const) {
+      const t = await start(PR_CONFIG, undefined, oneLoop(onExhausted));
+      const { engine, store } = t.master;
+      const pr = { number: 7, url: URL };
+      const run = await withPullRequest(t, t.run().id);
+      expect(engine.pullRequestNeedsRework(run, pr, reworkOf(run))).toBe(true);
+      const again = await waitingAgain(t, run.id);
+      expect(engine.recordPullRequest(again, pr)).toBe('updated');
+
+      const ci = reworkOf(again, {
+        kinds: ['ci'],
+        checks: [{ name: 'build', url: null }],
+        feedback: 'CI 检查没通过：build',
+      });
+      expect(engine.pullRequestNeedsRework(again, pr, ci)).toBe(true);
+      if (onExhausted === 'fail') {
+        const failed = await t.waitStatus(run.id, 'failed');
+        expect(failed.error).toContain('超过回退上限 1');
+        expect(failed.error).toContain('CI 检查没通过：build');
+      } else {
+        const blocked = await t.waitStatus(run.id, 'blocked');
+        expect(blocked.blocked?.kind).toBe('max_loops');
+        expect(blocked.blocked?.message).toContain('CI 检查没通过：build');
+      }
+      // No third round of coding; the Run still has its pull request.
+      const rounds = store.listStageRuns(run.id).filter((sr) => sr.stageId === 'implement');
+      expect(rounds).toHaveLength(2);
+      expect(eventData(t, run.id, 'stage.rollback')).toHaveLength(1);
+      expect(store.getRun(run.id).pr).toEqual(pr);
+      await t.close();
+      h = undefined;
+    }
+  });
+
+  it('on a conflict, goes back to coding, which starts by merging the target branch', async () => {
+    const t = await start();
+    const { engine, store } = t.master;
+    const pr = { number: 7, url: URL };
+    const run = await withPullRequest(t, t.run().id);
+    // main, pulled from GitHub, got feature.txt with other content meanwhile.
+    writeFile(join(t.repoDir, 'feature.txt'), 'from main\n');
+    git(t.repoDir, 'add', '-A');
+    git(t.repoDir, 'commit', '-q', '-m', 'main adds feature.txt');
+    const main = git(t.repoDir, 'rev-parse', 'main');
+    const feedback = `PR #7 需要返工：${URL}\n\n与目标分支冲突：PR 和目标分支 \`main\` 有冲突。`;
+    const conflict = reworkOf(run, { kinds: ['conflict'], reviewers: [], feedback });
+
+    expect(engine.pullRequestNeedsRework(run, pr, conflict)).toBe(true);
+    expect(store.getStageRun(run.currentStageRunId as string)).toMatchObject({
+      status: 'failed',
+      failReason: 'conflict',
+      failFeedback: feedback,
+    });
+    const again = await waitingAgain(t, run.id);
+    // The coding round merged main, the coder resolved the conflict, and the merge commit is
+    // what the Run delivers now.
+    expect(eventData(t, run.id, 'merge.started')).toEqual([
+      {
+        taskId: expect.any(String),
+        source: 'target',
+        target: 'main',
+        targetHead: main,
+        files: ['feature.txt'],
+      },
+    ]);
+    const worktree = again.worktreePath as string;
+    expect(git(worktree, 'rev-parse', 'HEAD')).toBe(again.headCommit);
+    expect(git(worktree, 'rev-list', '--parents', '-n', '1', 'HEAD').split(' ')).toContain(main);
+    expect(readFileSync(join(worktree, 'feature.txt'), 'utf8')).toBe('ok\n');
+    expect(again.blocked?.kind).toBe('pr_open');
+    expect(eventData(t, run.id, 'github.pr_rework')).toEqual([
+      { number: 7, url: URL, head: run.headCommit, kinds: ['conflict'], reviewers: [], checks: [] },
+    ]);
+    expect(git(t.repoDir, 'rev-parse', 'main')).toBe(main);
+  });
+
+  it('says why the pull request needs more work in English', async () => {
+    setLang('en');
+    try {
+      const t = await start(`language: en\n${PR_CONFIG}`);
+      const { engine, store } = t.master;
+      const run = await withPullRequest(t, t.run().id);
+      const rework = reworkOf(run, {
+        kinds: ['conflict', 'ci'],
+        reviewers: [],
+        checks: [
+          { name: 'build', url: null },
+          { name: 'lint', url: null },
+        ],
+        feedback: `Pull request #7 needs more work: ${URL}`,
+      });
+      expect(engine.pullRequestNeedsRework(run, { number: 7, url: URL }, rework)).toBe(true);
+      const [check] = store.listChecks(run.id).filter((c) => c.kind === 'merge');
+      expect(check?.name).toBe('Merge into main through PR #7');
+      expect(check?.detail).toBe(
+        `PR #7 needs more work: a conflict with the target branch \`main\`; failed checks: build, lint\n${URL}`,
+      );
+      expect(`${check?.name}${check?.detail}`).not.toMatch(/[一-鿿]/);
+      await waitingAgain(t, run.id);
+    } finally {
+      setLang('zh');
+    }
   });
 
   it('waits rather than merging locally when deliver: pr lacks push: true', async () => {

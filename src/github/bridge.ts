@@ -1063,7 +1063,8 @@ export class IssueBridge {
         body: redactForGitHub(text.body),
       });
     }
-    if (!this.deps.engine.recordPullRequest(run, { number: pr.number, url: pr.url })) return;
+    const recorded = this.deps.engine.recordPullRequest(run, { number: pr.number, url: pr.url });
+    if (recorded !== 'opened') return;
     const issue = run.issue;
     if (!issue) return;
     await this.comment(

@@ -64,6 +64,12 @@ import {
   stageVerifyCommands,
   type TemplateFile,
 } from '../config/schema.js';
+import {
+  type PrReworkKind,
+  pullRequestPushPending,
+  reworkReason,
+  reworksDone,
+} from '../github/pr-rework.js';
 import { redactForGitHub } from '../github/redact.js';
 import { join as joinList, t } from '../i18n.js';
 import { ConflictError, NotFoundError, type Store } from '../store/store.js';
@@ -3735,24 +3741,35 @@ export class Engine {
   }
 
   /**
-   * The bridge opened (or found open) the pull request of a Run waiting in `pr_open`, as `run`
-   * was when it read it: record it on the Run. Changes nothing and returns false when the Run no
-   * longer waits there; recording the same pull request again changes nothing either.
+   * The bridge pushed the branch of a Run waiting in `pr_open`, as `run` was when it read it, and
+   * opened (or found open) its pull request: record it on the Run.
+   * - 'opened': a pull request new to the Run (`github.pr_opened`);
+   * - 'updated': the one the Run already has, which now has the commits made since a rework sent
+   *   the Run back (`pullRequestPushPending`; `github.pr_updated`, with the commit pushed);
+   * - 'unchanged': recorded already, e.g. found again after a restart;
+   * - false: the Run no longer waits there; nothing changed.
    */
-  recordPullRequest(run: Pick<Run, 'id' | 'blocked'>, pr: RunPullRequest): boolean {
+  recordPullRequest(
+    run: Pick<Run, 'id' | 'blocked'>,
+    pr: RunPullRequest,
+  ): 'opened' | 'updated' | 'unchanged' | false {
     return this.store.tx(() => {
       const found = this.pullRequestStage(run);
       if (!found) return false;
       const current = found.run;
-      if (current.pr?.number === pr.number && current.pr.url === pr.url) return true;
-      this.store.updateRun(current.id, { pr: { number: pr.number, url: pr.url } });
+      const ref = { number: pr.number, url: pr.url };
+      if (current.pr?.number === pr.number && current.pr.url === pr.url) {
+        if (!pullRequestPushPending(this.store.listEvents(current.id))) return 'unchanged';
+        this.store.event(current.id, 'github.pr_updated', { ...ref, head: current.headCommit });
+        return 'updated';
+      }
+      this.store.updateRun(current.id, { pr: ref });
       this.store.event(current.id, 'github.pr_opened', {
-        number: pr.number,
-        url: pr.url,
+        ...ref,
         head: current.branch,
         base: this.store.getRepo(current.repoId).targetBranch,
       });
-      return true;
+      return 'opened';
     });
   }
 
@@ -3840,6 +3857,106 @@ export class Engine {
       );
       return true;
     });
+  }
+
+  /**
+   * The open pull request of a Run waiting in `pr_open`, as `run` was when the bridge read it,
+   * needs more work on the commit the Run delivered (`rework.head`): a reviewer asked for changes,
+   * a check failed, or it conflicts with the target branch (`judgePullRequest`). The merge stage's
+   * round fails with `rework.feedback`, and the Run goes back like after failed checks: `rollback`
+   * takes it to `failTarget` (on_fail, by default the coding stage), counted toward max_loops and
+   * by on_exhausted past them. The Run keeps its pull request: getting to the merge stage again,
+   * it waits once more, and the bridge pushes the new commits to the same one
+   * (`recordPullRequest`). With a conflict, when an agent stage can resolve it
+   * (`conflictTarget`), the round gone back to starts by merging the target branch
+   * (`conflictMerge`), the other kinds' feedback alongside.
+   *
+   * Each kind is reworked once per head commit, by the Run's `github.pr_rework` events, which
+   * also hold across a restart. Changes nothing and returns false when the Run no longer waits
+   * there, the pull request is not the one recorded or has not had the Run's latest commits
+   * pushed (`pullRequestPushPending`), `rework.head` is not the Run's head, or every kind was
+   * reworked on it already.
+   */
+  pullRequestNeedsRework(
+    run: Pick<Run, 'id' | 'blocked'>,
+    pr: RunPullRequest,
+    rework: {
+      head: string;
+      kinds: PrReworkKind[];
+      reviewers: string[];
+      checks: { name: string; url: string | null }[];
+      feedback: string;
+    },
+  ): boolean {
+    const reworked = this.store.tx(() => {
+      const found = this.pullRequestStage(run);
+      if (!found) return false;
+      const { run: current, sr } = found;
+      if (current.pr?.number !== pr.number || current.pr.url !== pr.url) return false;
+      if (rework.head !== current.headCommit) return false;
+      const events = this.store.listEvents(current.id);
+      if (pullRequestPushPending(events)) return false;
+      const done = new Set(
+        reworksDone(events)
+          .filter((d) => d.head === rework.head)
+          .flatMap((d) => d.kinds),
+      );
+      const kinds = rework.kinds.filter(
+        (kind, i, all) => !done.has(kind) && all.indexOf(kind) === i,
+      );
+      if (kinds.length === 0) return false;
+      const reviewers = kinds.includes('review') ? rework.reviewers : [];
+      const checks = kinds.includes('ci') ? rework.checks : [];
+
+      const target = this.store.getRepo(current.repoId).targetBranch;
+      const ref = { number: pr.number, url: pr.url };
+      const reason = reworkReason({
+        kinds,
+        base: target,
+        checks: checks.map((c) => c.name),
+        reviewers,
+      });
+      this.store.addCheck({
+        runId: current.id,
+        stageRunId: sr.id,
+        attemptId: null,
+        kind: 'merge',
+        name: t({
+          zh: `通过 PR #${pr.number} 合并到 ${target}`,
+          en: `Merge into ${target} through PR #${pr.number}`,
+        }),
+        passed: false,
+        detail: `${t({
+          zh: `PR #${pr.number} 需要返工：${reason}`,
+          en: `PR #${pr.number} needs more work: ${reason}`,
+        })}\n${pr.url}`,
+      });
+      // A round that starts by merging the target branch resolves the conflict; the agent gets
+      // the other kinds' feedback with it, rather than a further round for the conflict the
+      // merge stage would run into.
+      const failReason =
+        kinds.includes('conflict') && conflictTarget(current.template, sr.stageId)
+          ? 'conflict'
+          : 'check';
+      this.store.updateStageRun(sr.id, {
+        status: 'failed',
+        failReason,
+        failFeedback: rework.feedback,
+        endedAt: nowIso(),
+      });
+      this.store.event(current.id, 'stage.failed', { stageId: sr.stageId, reason: failReason });
+      this.store.event(current.id, 'github.pr_rework', {
+        ...ref,
+        head: rework.head,
+        kinds,
+        reviewers,
+        checks: checks.map((c) => ({ name: c.name, url: c.url })),
+      });
+      this.requeueHead(current.id, 'run.resumed');
+      return true;
+    });
+    if (reworked) this.kick();
+    return reworked;
   }
 
   /**
