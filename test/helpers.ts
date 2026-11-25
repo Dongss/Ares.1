@@ -523,11 +523,13 @@ export class FakeGitHub implements GitHub {
       }
       this.remoteBranches.set(branch, head);
       // An open pull request from the branch follows it, as on GitHub. Its checks are those of
-      // the head commit: a new head has none until a test sets them.
+      // the head commit: a new head has none until a test sets them. Whether it merges into its
+      // base is worked out again: unknown until a test says.
       for (const pull of this.pulls.values()) {
         if (pull.state === 'open' && pull.headRefName === branch && pull.headRefOid !== head) {
           pull.headRefOid = head;
           pull.checks = [];
+          pull.mergeable = null;
         }
       }
       return;

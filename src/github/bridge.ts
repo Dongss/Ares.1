@@ -66,7 +66,13 @@ import {
   revParse,
   git as runGit,
 } from '../workspace/git.js';
-import { GhCli, type GhIssue, type GhPullRequest, type GitHub } from './client.js';
+import {
+  GhCli,
+  type GhIssue,
+  type GhPullRequest,
+  type GhPullRequestStatus,
+  type GitHub,
+} from './client.js';
 import {
   autoAcceptedComment,
   discussionComment,
@@ -81,6 +87,7 @@ import {
   markComment,
   proposalBody,
   pullRequestComment,
+  pullRequestReworkComment,
   pullRequestText,
   pullRequestUpdatedComment,
   redoStartedComment,
@@ -89,7 +96,12 @@ import {
   untrustedGoalMessage,
   withStatusLabel,
 } from './issues.js';
-import { pullRequestPushPending } from './pr-rework.js';
+import {
+  type IgnoredReview,
+  judgePullRequest,
+  pullRequestPushPending,
+  reworksDone,
+} from './pr-rework.js';
 import { redactForGitHub } from './redact.js';
 import {
   filedProposal,
@@ -1136,7 +1148,9 @@ export class IssueBridge {
    *   completes (`completeMerged`);
    * - closed without being merged: the Run fails (`pullRequestClosed`), and is redone or waits
    *   for a human by the usual rules for failed Runs;
-   * - open: left as it is.
+   * - open: sent back for more work when it needs it (`reworkPullRequest`): a trusted reviewer
+   *   asked for changes, its checks failed, or it conflicts with the target branch; otherwise
+   *   left as it is.
    * Without push the target branch cannot be pulled: the Runs wait until it is on again. A GitHub
    * call that fails is reported and leaves the Run as it was, to be tried again the next round;
    * the other Runs go on. Returns false when some call failed.
@@ -1164,7 +1178,7 @@ export class IssueBridge {
         if (pr.state === 'merged') merged.push({ run, pr });
         else if (pr.state === 'closed') {
           this.deps.engine.pullRequestClosed(run, { number: pr.number, url: pr.url });
-        }
+        } else await this.reworkPullRequest(run, pr);
       } catch (err) {
         ok = false;
         this.report(err);
@@ -1178,6 +1192,85 @@ export class IssueBridge {
       this.report(err);
     }
     return ok;
+  }
+
+  /**
+   * The open pull request `pr` of `run`, waiting in `pr_open` as read, as GitHub has it now:
+   * judged on its head, the commit the Run delivered (`judgePullRequest`), and when a reviewer
+   * the Master trusts asked for changes there, its checks all finished with some failed, or it
+   * conflicts with the target branch, the Run goes back for more work
+   * (`pullRequestNeedsRework`) and its issue hears why. The label goes from needs-you back to
+   * running as the issue catches up with the Run (`syncRun`). Each kind counts once per head
+   * commit, by the Run's `github.pr_rework` events, so neither a later round nor a restarted
+   * Master reworks the same thing twice; a review approved over or dismissed since counts no
+   * more. Nothing is judged while the commits of the Run's latest round are still to be pushed
+   * (`pullRequestPushPending`): GitHub shows its earlier work. Reviews by people the Master does
+   * not trust trigger nothing and reach no prompt: only who wrote them is recorded
+   * (`recordIgnoredReviews`). The comment comes last, as in `openPullRequest`.
+   */
+  private async reworkPullRequest(run: Run, pr: GhPullRequestStatus): Promise<void> {
+    const master = await this.masterLogin();
+    // Read after the last await, so that what the engine did meanwhile counts.
+    const events = this.deps.store.listEvents(run.id);
+    if (pullRequestPushPending(events)) return;
+    const { rework, ignored } = judgePullRequest(pr, {
+      head: run.headCommit,
+      master,
+      done: reworksDone(events),
+    });
+    this.recordIgnoredReviews(run, pr, ignored);
+    if (!rework) return;
+    const ref = { number: pr.number, url: pr.url };
+    if (!this.deps.engine.pullRequestNeedsRework(run, ref, rework)) return;
+    const issue = run.issue;
+    if (!issue) return;
+    await this.comment(
+      issue.repo,
+      issue.number,
+      pullRequestReworkComment({
+        ...ref,
+        reason: rework.reason,
+        runId: run.id,
+        dashboardUrl: this.dashboardUrl(),
+      }),
+    );
+  }
+
+  /**
+   * Record on the Run each review in `ignored`, which asks for changes on the head of its pull
+   * request `pr` but was written by someone the Master does not trust
+   * (`github.pr_review_ignored`), once per head commit and reviewer: who wrote it and their
+   * relation to the repo, so that a human can see why it changed nothing; never its text.
+   */
+  private recordIgnoredReviews(
+    run: Run,
+    pr: GhPullRequestStatus,
+    ignored: readonly IgnoredReview[],
+  ): void {
+    if (ignored.length === 0) return;
+    const store = this.deps.store;
+    const head = pr.headRefOid;
+    const key = (reviewer: unknown) =>
+      JSON.stringify([head, typeof reviewer === 'string' ? reviewer.toLowerCase() : null]);
+    store.tx(() => {
+      const seen = new Set(
+        store
+          .listEvents(run.id)
+          .filter((e) => e.type === 'github.pr_review_ignored' && e.data.head === head)
+          .map((e) => key(e.data.reviewer)),
+      );
+      for (const review of ignored) {
+        if (seen.has(key(review.author))) continue;
+        seen.add(key(review.author));
+        store.event(run.id, 'github.pr_review_ignored', {
+          number: pr.number,
+          url: pr.url,
+          head,
+          reviewer: review.author,
+          association: review.association,
+        });
+      }
+    });
   }
 
   /**

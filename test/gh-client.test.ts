@@ -1652,12 +1652,14 @@ describe('FakeGitHub pull requests', () => {
     gh.setReviewDecision(number, null);
     expect((await gh.getPullRequest('me/demo', number)).reviewDecision).toBeNull();
 
-    // A push of the branch moves the pull request's head; the checks were the old head's. The
-    // reviews and comments stay on the commits they were made on.
+    // A push of the branch moves the pull request's head; the checks were the old head's, and
+    // whether it merges is not known yet. The reviews and comments stay on the commits they were
+    // made on.
+    gh.pull(number).mergeable = false;
     const second = commit(clone, 'ares1/run-1', 'b.txt');
     await gh.push(clone, 'me/demo', 'ares1/run-1');
     const pushed = await gh.getPullRequest('me/demo', number);
-    expect(pushed).toMatchObject({ headRefOid: second, checks: [] });
+    expect(pushed).toMatchObject({ headRefOid: second, checks: [], mergeable: null });
     expect(pushed.reviews.map((r) => r.commit)).toEqual([first, null]);
     expect(pushed.reviewComments.map((c) => c.commit)).toEqual([first]);
     gh.reviewPull(number, {

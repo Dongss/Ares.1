@@ -497,6 +497,25 @@ export function pullRequestUpdatedComment(input: {
   });
 }
 
+/**
+ * The comment on a Run's issue once its open pull request (deliver: pr) sent it back for more
+ * work: `reason` is the one line of `reworkReason`. The Run goes back by the workflow's rules, so
+ * past max_loops it may stop instead; then the issue hears of that as of any Run that stops.
+ */
+export function pullRequestReworkComment(input: {
+  number: number;
+  url: string;
+  reason: string;
+  runId: string;
+  dashboardUrl: string;
+}): string {
+  const link = dashboardLink(input.dashboardUrl, input.runId);
+  return t({
+    zh: `PR #${input.number} 需要返工：${input.reason}\n\nRun 带着这些反馈回去修改（计入回退上限），改好后推送到同一个 PR：${input.url}\n\n${link}`,
+    en: `Pull request #${input.number} needs more work: ${input.reason}\n\nThe Run goes back to work on it with this feedback (counted toward its rollback limit) and pushes the changes to the same pull request: ${input.url}\n\n${link}`,
+  });
+}
+
 const oneLine = (text: string, max: number) => {
   const line = text.replace(/\s+/g, ' ').trim();
   return line.length > max ? `${line.slice(0, max)}…` : line;
