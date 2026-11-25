@@ -37,6 +37,7 @@ import {
   proposalBody,
   pullRequestComment,
   pullRequestText,
+  pullRequestUpdatedComment,
   RETRIES_EXHAUSTED_MARKER,
   redoStartedComment,
   repliesAfterMaster,
@@ -44,6 +45,7 @@ import {
   untrustedGoalMessage,
   withStatusLabel,
 } from '../src/github/issues.js';
+import type { PrReworkKind } from '../src/github/pr-rework.js';
 import { filedProposal, issueDigest, proposalsHoldingScout } from '../src/github/scout.js';
 import { setLang } from '../src/i18n.js';
 import { noticeFor } from '../src/notify/notice.js';
@@ -3635,6 +3637,142 @@ describe('issues: delivering through pull requests (deliver: pr)', () => {
       expect(eventData(t, run.id, 'github.pr_merged')).toHaveLength(1);
       expect(eventData(t, run.id, 'merge.done')).toHaveLength(1);
     });
+
+    describe('after a rework sent the Run back', () => {
+      const FEEDBACK = '评审要求修改：把 feature.txt 写完整';
+      const UPDATED = '返工后的提交已推送';
+      /**
+       * The Run of a new ready issue with its pull request open, sent back by a rework (a
+       * review asking for changes, as the bridge would find it); the coder writes something new
+       * the second time, so the Run delivers a new commit.
+       */
+      async function reworked(t: Harness) {
+        const prompts: string[] = [];
+        t.scripts.coder = (ctx) => {
+          prompts.push(ctx.input.prompt);
+          const content = prompts.length === 1 ? 'ok\n' : 'ok\n完整\n';
+          writeFile(join(ctx.input.workdir, 'feature.txt'), content);
+          return done(`第 ${prompts.length} 轮`);
+        };
+        const { run, pull } = await prOpened(t);
+        const pr = { number: pull.number, url: pull.url };
+        const rework = {
+          head: run.headCommit as string,
+          kinds: ['review'] as PrReworkKind[],
+          reviewers: ['me'],
+          checks: [],
+          feedback: FEEDBACK,
+        };
+        expect(t.master.engine.pullRequestNeedsRework(run, pr, rework)).toBe(true);
+        return { run, pull, pr, prompts, branch: run.branch as string };
+      }
+      /** Done again and approved: the Run waits for its pull request once more. */
+      const waitingAgain = async (t: Harness, run: Run) =>
+        approveMerge(t, await t.waitStatus(run.id, 'waiting_approval'));
+      const updatedComments = () => gh.get(1).comments.filter((c) => c.includes(UPDATED));
+
+      it('pushes the new commits to the same pull request, once, and says so on the issue', async () => {
+        const t = await start(PR);
+        const store = t.master.store;
+        const { run, pull, pr, prompts, branch } = await reworked(t);
+        const first = run.headCommit as string;
+        const again = await waitingAgain(t, run);
+        expect(prompts).toHaveLength(2);
+        expect(prompts[1]).toContain(FEEDBACK);
+        expect(again.pr).toEqual(pr);
+        expect(again.headCommit).not.toBe(first);
+        // Until the bridge pushes, GitHub shows the earlier work.
+        expect(gh.remoteBranches.get(branch)).toBe(first);
+        expect(gh.pull(pull.number).headRefOid).toBe(first);
+
+        await t.master.issues.poll();
+        // Force-pushed to the branch of the pull request the Run has: no second one.
+        expect(gh.remoteBranches.get(branch)).toBe(again.headCommit);
+        expect(gh.pull(pull.number)).toMatchObject({ state: 'open', headRefOid: again.headCommit });
+        expect(gh.pulls.size).toBe(1);
+        expect(gh.calls.filter((c) => c.startsWith('createPull'))).toHaveLength(1);
+        expect(eventData(t, run.id, 'github.pr_opened')).toHaveLength(1);
+        expect(eventData(t, run.id, 'github.pr_updated')).toEqual([
+          { ...pr, head: again.headCommit },
+        ]);
+        expect(store.getRun(run.id)).toMatchObject({
+          status: 'blocked',
+          blocked: again.blocked,
+          pr,
+        });
+        // The issue hears of it, from the Master, and waits for a human again.
+        const said = updatedComments();
+        expect(said).toHaveLength(1);
+        expect(said[0]).toBe(
+          markComment(
+            `返工后的提交已推送到 PR #${pull.number}：${pull.url}\n\n看板：http://127.0.0.1:4870/#/runs/${run.id}`,
+          ),
+        );
+        expect(isMasterComment(said[0] ?? '')).toBe(true);
+        expect(gh.get(1)).toMatchObject({ state: 'open', labels: [LABELS.needsYou] });
+        expect(t.master.issues.status().lastError).toBeNull();
+
+        // Later rounds push and say no more, and still follow the pull request.
+        const calls = gh.calls.length;
+        await t.master.issues.poll();
+        await t.master.issues.sync();
+        expect(gh.calls.slice(calls)).not.toContain(`push ${branch}`);
+        expect(gh.calls.slice(calls)).toContain(`getPull #${pull.number}`);
+        expect(eventData(t, run.id, 'github.pr_updated')).toHaveLength(1);
+        expect(updatedComments()).toHaveLength(1);
+        expect(gh.pulls.size).toBe(1);
+      });
+
+      it('pushes after a restart what was not pushed yet, and nothing twice', async () => {
+        const first = await start(PR);
+        const { run, pull, branch } = await reworked(first);
+        const again = await waitingAgain(first, run);
+        await first.close();
+
+        const second = await restart(first, PR);
+        await second.master.issues.poll();
+        expect(gh.remoteBranches.get(branch)).toBe(again.headCommit);
+        expect(gh.calls.filter((c) => c === `push ${branch}`)).toHaveLength(2);
+        expect(eventData(second, run.id, 'github.pr_updated')).toHaveLength(1);
+        expect(updatedComments()).toHaveLength(1);
+        await second.close();
+
+        const t = await restart(second, PR);
+        const calls = gh.calls.length;
+        await t.master.issues.poll();
+        await t.master.issues.sync();
+        expect(gh.calls.slice(calls)).not.toContain(`push ${branch}`);
+        expect(gh.calls.slice(calls)).toContain(`getPull #${pull.number}`);
+        expect(eventData(t, run.id, 'github.pr_updated')).toHaveLength(1);
+        expect(updatedComments()).toHaveLength(1);
+        expect(gh.pulls.size).toBe(1);
+        expect(t.master.store.getRun(run.id)).toMatchObject({ status: 'blocked', pr: run.pr });
+      });
+
+      it('opens no new pull request when its own was closed during the rework; the Run fails', async () => {
+        const t = await start(PR);
+        const store = t.master.store;
+        const { run, pull, pr, branch } = await reworked(t);
+        const first = run.headCommit as string;
+        gh.closePull(pull.number);
+        await waitingAgain(t, run);
+        await t.master.issues.poll();
+
+        const failed = store.getRun(run.id);
+        expect(failed.status).toBe('failed');
+        expect(failed.error).toContain(`PR #${pull.number} 没有合并就被关掉了`);
+        expect(eventData(t, run.id, 'github.pr_closed')).toEqual([pr]);
+        // Neither pushed nor opened again.
+        expect(gh.remoteBranches.get(branch)).toBe(first);
+        expect(gh.calls.filter((c) => c === `push ${branch}`)).toHaveLength(1);
+        expect(gh.calls.filter((c) => c.startsWith('createPull'))).toHaveLength(1);
+        expect(gh.pulls.size).toBe(1);
+        expect(eventData(t, run.id, 'github.pr_updated')).toEqual([]);
+        expect(updatedComments()).toEqual([]);
+        // The redo waits as after any failure.
+        expect(store.listRuns()).toHaveLength(1);
+      });
+    });
   });
 });
 
@@ -5264,6 +5402,19 @@ describe('issues: texts', () => {
       );
     });
 
+    it('says the commits made after a rework were pushed to the same pull request', () => {
+      const comment = pullRequestUpdatedComment({
+        number: 13,
+        url: 'https://github.com/me/demo/pull/13',
+        runId: 'run_1',
+        dashboardUrl: ctx.dashboardUrl,
+      });
+      expect(comment).toBe(
+        '返工后的提交已推送到 PR #13：https://github.com/me/demo/pull/13\n\n看板：http://127.0.0.1:4870/#/runs/run_1',
+      );
+      expect(isMasterComment(comment)).toBe(false);
+    });
+
     it('says the pull request was merged, with the commit it put on the target branch', () => {
       const completed = run({ status: 'completed' });
       const pr = {
@@ -5759,6 +5910,17 @@ describe('issues: texts', () => {
       });
       expect(comment).toContain('pull request #13 into `main` is open');
       expect(markComment(comment)).not.toMatch(cjk);
+      const updated = pullRequestUpdatedComment({
+        number: 13,
+        url: 'https://github.com/me/demo/pull/13',
+        runId: 'run_1',
+        dashboardUrl: ctx.dashboardUrl,
+      });
+      expect(updated).toBe(
+        'The reworked commits were pushed to pull request #13: https://github.com/me/demo/pull/13' +
+          '\n\nDashboard: http://127.0.0.1:4870/#/runs/run_1',
+      );
+      expect(markComment(updated)).not.toMatch(cjk);
       const merged = issueUpdate(run({ status: 'completed' }), {
         ...ctx,
         pr: { number: 13, url: 'https://github.com/me/demo/pull/13', mergeCommit: '1234567890' },

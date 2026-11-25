@@ -82,12 +82,14 @@ import {
   proposalBody,
   pullRequestComment,
   pullRequestText,
+  pullRequestUpdatedComment,
   redoStartedComment,
   repliesAfterMaster,
   untrustedAuthor,
   untrustedGoalMessage,
   withStatusLabel,
 } from './issues.js';
+import { pullRequestPushPending } from './pr-rework.js';
 import { redactForGitHub } from './redact.js';
 import {
   filedProposal,
@@ -1002,11 +1004,13 @@ export class IssueBridge {
 
   /**
    * Deliver the repo's Runs that wait for a pull request (`pr_open`, deliver: pr) and have none
-   * yet: push each one's branch to the GitHub repo the target branch is pushed to, and open a
-   * pull request from it into the target branch (`openPullRequest`). Also for Runs that got to
-   * wait before the repo was switched back to deliver: push: nothing else delivers them, and they
-   * cannot be retried. A GitHub call that fails is reported and leaves the Run as it was, to be
-   * tried again the next round; the other Runs go on. Returns false when some call failed.
+   * yet, or have one but not the commits made since a rework sent them back
+   * (`pullRequestPushPending`): push each one's branch to the GitHub repo the target branch is
+   * pushed to, and open a pull request from it into the target branch, or update the one it has
+   * (`openPullRequest`). Also for Runs that got to wait before the repo was switched back to
+   * deliver: push: nothing else delivers them, and they cannot be retried. A GitHub call that
+   * fails is reported and leaves the Run as it was, to be tried again the next round; the other
+   * Runs go on. Returns false when some call failed.
    */
   private async openPullRequests(name: string): Promise<boolean> {
     const store = this.deps.store;
@@ -1014,7 +1018,12 @@ export class IssueBridge {
     if (!repo) return true;
     const waiting = store
       .listRuns({ status: 'blocked', repoId: repo.id })
-      .filter((run) => run.blocked?.kind === 'pr_open' && run.pr === null && run.branch);
+      .filter(
+        (run) =>
+          run.blocked?.kind === 'pr_open' &&
+          run.branch &&
+          (run.pr === null || pullRequestPushPending(store.listEvents(run.id))),
+      );
     if (waiting.length === 0) return true;
     // Throws while the repo is misconfigured, e.g. deliver: pr without push: the Runs wait.
     const { cfg } = this.repoSetup(name);
@@ -1042,11 +1051,15 @@ export class IssueBridge {
    * since an earlier push. The Run records the pull request (`github.pr_opened`), unless it no
    * longer waits for one (cancelled meanwhile); then its issue gets the link. The comment comes
    * last, so that a failed one does not hold the Run up: the pull request's `Closes #N` shows it
-   * on the issue anyway.
+   * on the issue anyway. A Run that has its pull request already goes to `updatePullRequest`.
    */
   private async openPullRequest(repo: Repo, full: string, run: Run): Promise<void> {
     const branch = run.branch;
     if (!branch) return;
+    if (run.pr) {
+      await this.updatePullRequest(repo, full, run, run.pr, branch);
+      return;
+    }
     const gh = this.gh();
     const target = repo.targetBranch;
     await gh.push(repo.path, full, branch, { force: true });
@@ -1074,6 +1087,41 @@ export class IssueBridge {
         number: pr.number,
         url: pr.url,
         targetBranch: target,
+        runId: run.id,
+        dashboardUrl: this.dashboardUrl(),
+      }),
+    );
+  }
+
+  /**
+   * Push the commits `run`, waiting in `pr_open` as read, made since a rework sent it back to the
+   * pull request `pr` it already has, rather than opening a second one. Only while `pr` is still
+   * open on GitHub: once merged or closed, nothing is pushed or opened, and followPullRequests
+   * completes or fails the Run by what became of it, so that a pull request a human closed is not
+   * followed by a new one. The push is forced, as in `openPullRequest`. The Run records the update
+   * (`github.pr_updated`), which ends the pending push, so a later round or a restarted Master
+   * pushes and comments no more; then its issue hears of it, the comment last as there.
+   */
+  private async updatePullRequest(
+    repo: Repo,
+    full: string,
+    run: Run,
+    pr: { number: number; url: string },
+    branch: string,
+  ): Promise<void> {
+    const gh = this.gh();
+    const latest = await gh.getPullRequest(full, pr.number);
+    if (latest.state !== 'open') return;
+    await gh.push(repo.path, full, branch, { force: true });
+    if (this.deps.engine.recordPullRequest(run, pr) !== 'updated') return;
+    const issue = run.issue;
+    if (!issue) return;
+    await this.comment(
+      issue.repo,
+      issue.number,
+      pullRequestUpdatedComment({
+        number: pr.number,
+        url: pr.url,
         runId: run.id,
         dashboardUrl: this.dashboardUrl(),
       }),

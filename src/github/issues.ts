@@ -480,6 +480,23 @@ export function pullRequestComment(input: {
   });
 }
 
+/**
+ * The comment on a Run's issue once the commits made since a rework sent the Run back are pushed
+ * to the pull request it already has (deliver: pr).
+ */
+export function pullRequestUpdatedComment(input: {
+  number: number;
+  url: string;
+  runId: string;
+  dashboardUrl: string;
+}): string {
+  const link = dashboardLink(input.dashboardUrl, input.runId);
+  return t({
+    zh: `返工后的提交已推送到 PR #${input.number}：${input.url}\n\n${link}`,
+    en: `The reworked commits were pushed to pull request #${input.number}: ${input.url}\n\n${link}`,
+  });
+}
+
 const oneLine = (text: string, max: number) => {
   const line = text.replace(/\s+/g, ' ').trim();
   return line.length > max ? `${line.slice(0, max)}…` : line;
