@@ -80,6 +80,7 @@ import {
   type Attempt,
   type BlockInfo,
   type DiscussionEntry,
+  type EventRow,
   FINISHED_RUN_STATUSES,
   type ReplyEntry,
   type ReplyTimeoutEntry,
@@ -371,6 +372,51 @@ type KeptWorkspaceRemoval = { manual: true } | LeftoverWorkspaceReason;
 
 const IN_FLIGHT_TASK = new Set<Task['status']>(['running', 'verifying']);
 
+/** No Run: a Run that has outlasted none (`outlasted`). */
+const NO_RUNS: ReadonlySet<string> = new Set();
+
+/**
+ * The stage whose passing puts the Run's work in the target branch: its template's merge stage
+ * (the last one, should it have several). undefined for a template without one.
+ */
+function mergeStageId(run: Pick<Run, 'template'>): string | undefined {
+  return run.template.stages.findLast((s) => s.kind === 'merge')?.id;
+}
+
+/**
+ * A wait for another Run, as the waiting Run's events recorded it: the Run waited for, and the
+ * ids of the events it lasted between (exclusive).
+ */
+interface RecordedConflictWait {
+  runId: string;
+  from: number;
+  to: number;
+}
+
+/**
+ * The waits for other Runs that a Run's `events` (oldest first) recorded: each begins with its
+ * `run.waiting_conflict` event and lasts until the Run leaves the queue (its next `run.status`
+ * event other than `queued`; a Run going back to the queue after its assessment records the
+ * wait just before it is queued) or waits for another Run. A wait the Run is still in lasts to
+ * the end (`to` is Infinity).
+ */
+function recordedConflictWaits(events: readonly EventRow[]): RecordedConflictWait[] {
+  const waits: RecordedConflictWait[] = [];
+  let current: { runId: string; from: number } | null = null;
+  for (const e of events) {
+    if (e.type === 'run.waiting_conflict') {
+      if (current) waits.push({ ...current, to: e.id });
+      current =
+        typeof e.data.blockedBy === 'string' ? { runId: e.data.blockedBy, from: e.id } : null;
+    } else if (current && e.type === 'run.status' && e.data.status !== 'queued') {
+      waits.push({ ...current, to: e.id });
+      current = null;
+    }
+  }
+  if (current) waits.push({ ...current, to: Number.POSITIVE_INFINITY });
+  return waits;
+}
+
 /**
  * The workflow engine: a deterministic state machine that executes up to `concurrency.per_repo`
  * Runs at a time per repo, each in the Run's own worktree, one task and one commit at a time.
@@ -378,7 +424,8 @@ const IN_FLIGHT_TASK = new Set<Task['status']>(['running', 'verifying']);
  * set. Side by side in one repo, two Runs whose assessments expect them to change the same place
  * (`touches`) do not work at once (`conflictWith`): the later one waits in the queue after its
  * assessment, progress kept, until the other has merged or ended, so that they do not conflict at
- * the merge. A repo's Runs share its git repository (the
+ * the merge; a Run it waited for that far does not hold it back again (`outlasted`). A repo's
+ * Runs share its git repository (the
  * target branch, worktrees, branches), so what they do there besides their own worktree goes one
  * Run at a time, under the repo's merge lock (`withMergeLock`): merging, creating and removing
  * worktrees.
@@ -427,6 +474,19 @@ export class Engine {
    * that the event is recorded once per Run waited for and not on every `kick`.
    */
   private readonly conflictWaits = new Map<string, ConflictBlock>();
+  /**
+   * The Runs each Run has outlasted, by Run id: those it waited for in the queue
+   * (`conflictWaits`) until they got past their merge stage or ended. None of them holds it back
+   * again (`conflictWith`). A Run that waits for another only has to wait until that one has
+   * merged once: were the other to go back before its merge after that (a merge stage is the
+   * last stage today, so it would take a template that goes back from after it), it could hold
+   * the waiting Run back once more each time, and the waiting Run could wait for the same Run
+   * without end while that one keeps going ahead of it. This holds for every Run that waited, not
+   * only the one at the head of the queue. Kept while the Run may queue again (an agent out of
+   * quota, a pause and resume, a Master restart, for which `start` reads it back from the events:
+   * `restoreConflictWaits`), dropped once it ends.
+   */
+  private readonly outlasted = new Map<string, Set<string>>();
   private readonly store: Store;
   private readonly now: () => number;
   private readonly backoff: Backoff;
@@ -468,6 +528,7 @@ export class Engine {
       this.requeueHead(run.id, 'run.recovered');
     }
     this.restoreLimitWaits();
+    this.restoreConflictWaits();
     // Discussions may have timed out while the Master was not running, and target branches may
     // have been cleaned up. Runs blocked on the environment try again in this Master's: it may
     // have been restarted on another node (after a version manager deleted the last one), or with
@@ -496,6 +557,52 @@ export class Engine {
     }
   }
 
+  /**
+   * The Runs each queued Run had outlasted (`outlasted`) when the last Master stopped, read back
+   * from its events, so that a restart does not make it wait for them again. Each wait it
+   * recorded (`run.waiting_conflict`) lasted until it left the queue or waited for another Run
+   * (`recordedConflictWaits`); it outlasted the Run it waited for when that one got past its
+   * merge stage within the wait (its `stage.passed` event for the merge stage comes in between),
+   * or has ended since. Which Run each waits for now (`conflictWaits`) is not read back: `kick`
+   * works it out again.
+   */
+  private restoreConflictWaits(): void {
+    const merges = new Map<string, number[]>();
+    /** The ids of the events with which the Run got past its merge stage, oldest first. */
+    const mergesOf = (blocker: Run): number[] => {
+      let ids = merges.get(blocker.id);
+      if (!ids) {
+        const stage = mergeStageId(blocker);
+        ids = this.store
+          .listEvents(blocker.id)
+          .filter((e) => e.type === 'stage.passed' && e.data.stageId === stage)
+          .map((e) => e.id);
+        merges.set(blocker.id, ids);
+      }
+      return ids;
+    };
+    for (const run of this.store.queuedRuns()) {
+      const outlasted = new Set<string>();
+      for (const wait of recordedConflictWaits(this.store.listEvents(run.id))) {
+        if (outlasted.has(wait.runId)) continue;
+        let blocker: Run;
+        try {
+          blocker = this.store.getRun(wait.runId);
+        } catch (err) {
+          if (err instanceof NotFoundError) continue;
+          throw err;
+        }
+        if (
+          FINISHED_RUN_STATUSES.includes(blocker.status) ||
+          mergesOf(blocker).some((id) => id > wait.from && id < wait.to)
+        ) {
+          outlasted.add(blocker.id);
+        }
+      }
+      if (outlasted.size > 0) this.outlasted.set(run.id, outlasted);
+    }
+  }
+
   /** Graceful shutdown: stop the active agents like a manual pause and requeue their Runs. */
   async stop(): Promise<void> {
     this.stopping = true;
@@ -509,6 +616,7 @@ export class Engine {
     this.limitTimer = undefined;
     this.limitWaits.clear();
     this.conflictWaits.clear();
+    this.outlasted.clear();
     // A sweep ends after the removal in progress; the store must stay open until it has.
     await Promise.all([this.stopActive(), this.sweeping?.catch(() => {})]);
   }
@@ -583,7 +691,8 @@ export class Engine {
    * With `concurrency.per_repo` above 1, an assessed Run that overlaps a Run of its slot not yet
    * past its merge (`conflictWith`) is passed by as well, so that later Runs that overlap nothing
    * start first; it is recorded once per Run it waits for (`run.waiting_conflict`). The Run it
-   * waits for kicks again once past its merge stage, and when it ends.
+   * waits for kicks again once past its merge stage, and when it ends; from then on that Run no
+   * longer holds it back (`outlasted`).
    */
   kick(): void {
     clearTimeout(this.limitTimer);
@@ -750,7 +859,8 @@ export class Engine {
    * (`pastMerge`): those executing, in the order they started, then those waiting for their pull
    * request to be merged on GitHub (`pr_open`), whose work is in no target branch yet either.
    * Other Runs that do not execute (queued, paused, waiting for a human) hold back none: they
-   * may wait for long, and whichever goes on first merges first.
+   * may wait for long, and whichever goes on first merges first. Nor does a Run that `run` has
+   * outlasted (`outlasted`): it already waited for that one until it merged or ended.
    */
   private conflictWith(run: Run, slot: string): ConflictBlock | null {
     if (this.cfg.master.concurrency.per_repo <= 1) return null;
@@ -773,21 +883,34 @@ export class Engine {
       if (other.repoId !== run.repoId && this.slotOf(other) !== slot) continue;
       consider(other);
     }
-    return conflictBlocker(touches, others, new Set());
+    return conflictBlocker(touches, others, this.outlasted.get(run.id) ?? NO_RUNS);
   }
 
   /**
-   * Whether the Run is past its merge stage (the last one, when the template has several): its
-   * work is in the target branch, so Runs that go on after it build on it. A Run of a template
-   * without a merge stage never is.
+   * Whether the Run is past its merge stage (`mergeStageId`): its work is in the target branch,
+   * so Runs that go on after it build on it. A Run of a template without a merge stage never is.
    */
   private pastMerge(run: Run): boolean {
     const stages = run.template.stages;
-    const merge = stages.findLastIndex((s) => s.kind === 'merge');
+    const merge = stages.findIndex((s) => s.id === mergeStageId(run));
     if (merge < 0 || !run.currentStageRunId) return false;
     const sr = this.store.getStageRun(run.currentStageRunId);
     const at = stages.findIndex((s) => s.id === sr.stageId);
     return at > merge || (at === merge && sr.status === 'passed');
+  }
+
+  /**
+   * The Run `blocker` got past its merge stage or ended: every queued Run waiting for it
+   * (`conflictWaits`) has outlasted it, and is held back by it no more (`outlasted`).
+   */
+  private outlast(blocker: string): void {
+    for (const [runId, block] of this.conflictWaits) {
+      // A Run that left the queue meanwhile (paused, cancelled) no longer waited for it.
+      if (block.runId !== blocker || this.store.getRun(runId).status !== 'queued') continue;
+      const outlasted = this.outlasted.get(runId);
+      if (outlasted) outlasted.add(blocker);
+      else this.outlasted.set(runId, new Set([blocker]));
+    }
   }
 
   /**
@@ -3541,6 +3664,8 @@ export class Engine {
   private passStage(run: Run, sr: StageRun): void {
     this.store.updateStageRun(sr.id, { status: 'passed', endedAt: nowIso() });
     this.store.event(run.id, 'stage.passed', { stageId: sr.stageId, round: sr.round });
+    // Past its merge: the Runs waiting for it have outlasted it.
+    if (sr.stageId === mergeStageId(run)) this.outlast(run.id);
   }
 
   private async advance(run: Run, sr: StageRun, signal: AbortSignal): Promise<void> {
@@ -4582,6 +4707,11 @@ export class Engine {
   private setStatus(runId: string, status: RunStatus, patch: Partial<Run> = {}): Run {
     const run = this.store.updateRun(runId, { ...patch, status });
     this.store.event(runId, 'run.status', { status });
+    if (FINISHED_RUN_STATUSES.includes(status)) {
+      // Ended: the Runs waiting for it have outlasted it, and it queues no more.
+      this.outlast(runId);
+      this.outlasted.delete(runId);
+    }
     return run;
   }
 

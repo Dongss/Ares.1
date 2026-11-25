@@ -5146,6 +5146,9 @@ ${mergeCheck ? `    verify:\n      commands:\n        - ${JSON.stringify(mergeCh
     /** Assessment → coding → review → merge without approval. */
     const start = (config = PER_REPO_2, more: HarnessOptions = {}) =>
       harness({ config, agents: ASSESS_AGENTS_YAML, workflow: ASSESS_WORKFLOW_YAML, ...more });
+    /** The repo delivers through pull requests: a Run waits for its pull request to be merged. */
+    const DELIVER_PR =
+      'github:\n  repos:\n    demo:\n      template: dev\n      push: true\n      deliver: pr\n';
 
     /**
      * An assessor that goes ahead with the touches of the Run's goal (found in its prompt), none
@@ -5333,9 +5336,7 @@ ${mergeCheck ? `    verify:\n      commands:\n        - ${JSON.stringify(mergeCh
     it.each(prEnds)(
       'holds an overlapping Run back while the first waits for its pull request, until it is $end',
       async ({ end, type, data }) => {
-        const deliverPr =
-          'github:\n  repos:\n    demo:\n      template: dev\n      push: true\n      deliver: pr\n';
-        h = await start(PER_REPO_2 + deliverPr, { github: new FakeGitHub() });
+        h = await start(PER_REPO_2 + DELIVER_PR, { github: new FakeGitHub() });
         const t = h;
         t.scripts.coder = coder;
         t.scripts.assessor = assessor({ 目标甲: ['src'], 目标乙: ['src'] });
@@ -5373,6 +5374,125 @@ ${mergeCheck ? `    verify:\n      commands:\n        - ${JSON.stringify(mergeCh
         expect(waits(t, b)).toHaveLength(1);
       },
     );
+
+    describe('a Run waited for until it merged holds the waiting Run back no more', () => {
+      /** Delivers through pull requests, so that a Run past its merge stage waits to go on. */
+      const startPr = (more: HarnessOptions = {}) =>
+        start(PER_REPO_2 + DELIVER_PR, { github: new FakeGitHub(), ...more });
+
+      /** The first Run (目标甲, touches src) up to waiting for its pull request. */
+      const untilPullRequest = async (t: Harness) => {
+        const first = t.run('目标甲');
+        const pending = await t.waitStatus(first.id, 'blocked');
+        expect(pending.blocked?.kind).toBe('pr_open');
+        await waitFor(() => t.master.engine.activeRunIds.length === 0, 'the first to leave');
+        return pending;
+      };
+
+      /**
+       * The Run's pull request is merged, which passes its merge stage, while the work switch is
+       * off; then the Run is put back before its merge, at a new round of coding. No template goes
+       * back from a passed merge today (the merge stage is the last stage), so the test does it by
+       * hand: it stands for any way a Run could, which is what makes a waiting Run starve. The
+       * work switch goes on again with `held` coding.
+       */
+      const mergeThenGoBack = (t: Harness, pending: Run, held: { script: Script }) => {
+        t.master.engine.setWorking(false);
+        const pr = { number: 7, url: 'https://github.com/me/demo/pull/7', mergeCommit: null };
+        expect(t.master.engine.pullRequestMerged(pending, pr)).toBe(true);
+        expect(status(t, pending)).toBe('queued');
+        const sr = t.master.store.createStageRun(pending.id, 'implement', null);
+        t.master.store.updateRun(pending.id, { currentStageRunId: sr.id });
+        t.scripts.coder = held.script;
+        t.master.engine.setWorking(true);
+      };
+
+      /** The Master stops and the next one starts on the same home, `held` coding. */
+      const restart = async (first: Harness, held: { script: Script }) => {
+        await first.close();
+        h = undefined;
+        h = await startPr({
+          home: first.home,
+          repoDir: first.repoDir,
+          scripts: { coder: held.script, reviewer: () => review() },
+        });
+        return h;
+      };
+
+      const touches = { 目标甲: ['src'], 目标乙: ['src/engine'] };
+
+      it('lets it go on beside that Run, after a pause and after a restart too', async () => {
+        h = await startPr();
+        const first = h;
+        first.scripts.coder = coder;
+        first.scripts.assessor = assessor(touches);
+        const pending = await untilPullRequest(first);
+        const a = first.run('目标乙');
+        const wait = { stageId: 'assess', blockedBy: pending.id, paths: ['src/engine'] };
+        await waitFor(() => waits(first, a).length === 1, 'the second to wait for the first');
+        await waitFor(() => first.master.engine.activeRunIds.length === 0, 'the second to leave');
+        expect(waits(first, a)).toEqual([wait]);
+
+        // The first merges while the second waits for it, then codes again before its merge.
+        const held = heldCoder(coder);
+        mergeThenGoBack(first, pending, held);
+        // It goes on first, and holds the second back no more: the second waited for it to merge.
+        await waitFor(() => held.started === 2, 'both coders to start');
+        expect(first.master.engine.activeRunIds).toEqual([pending.id, a.id]);
+        expect(waits(first, a)).toEqual([wait]);
+        expect(assessments(first, a)).toHaveLength(1);
+
+        // Also when the second queues again, here after a pause.
+        await first.master.engine.pause(a.id);
+        first.master.engine.resume(a.id);
+        await waitFor(() => held.started === 3, 'the second coder to start again');
+        expect(first.master.engine.activeRunIds).toEqual([pending.id, a.id]);
+
+        // And after a restart, read back from the events: both go back to the head of the queue,
+        // the first ahead, and the second starts beside it without waiting for it again.
+        const again = heldCoder(coder);
+        const t = await restart(first, again);
+        await waitFor(() => again.started === 2, 'both coders to start after the restart');
+        expect(t.master.engine.activeRunIds).toEqual([pending.id, a.id]);
+        expect(waits(t, a)).toEqual([wait]);
+        expect(assessments(t, a)).toHaveLength(1);
+      });
+
+      it('still holds back a Run that did not wait for it to merge, after a restart too', async () => {
+        h = await startPr();
+        const first = h;
+        first.scripts.coder = coder;
+        first.scripts.assessor = assessor(touches);
+        const pending = await untilPullRequest(first);
+        // The first merges and codes again before the second is created.
+        const held = heldCoder(coder);
+        mergeThenGoBack(first, pending, held);
+        await waitFor(() => held.started === 1, 'the first coder to start');
+
+        const a = first.run('目标乙');
+        const wait = { stageId: 'assess', blockedBy: pending.id, paths: ['src/engine'] };
+        await waitFor(() => waits(first, a).length === 1, 'the second to wait for the first');
+        await waitFor(() => first.master.engine.activeRunIds.length === 1, 'the second to leave');
+        expect(waits(first, a)).toEqual([wait]);
+        expect(waitingFor(first, a)).toEqual({ runId: pending.id, paths: ['src/engine'] });
+        first.master.engine.kick();
+        await sleep(100);
+        expect(status(first, a)).toBe('queued');
+        expect(held.started).toBe(1);
+
+        // The merge before its wait does not count: after a restart it waits on, recorded anew.
+        const again = heldCoder(coder);
+        const t = await restart(first, again);
+        await waitFor(() => again.started === 1, 'the first coder to start after the restart');
+        expect(waits(t, a)).toEqual([wait, wait]);
+        expect(waitingFor(t, a)).toEqual({ runId: pending.id, paths: ['src/engine'] });
+        t.master.engine.kick();
+        await sleep(100);
+        expect(status(t, a)).toBe('queued');
+        expect(again.started).toBe(1);
+        expect(t.master.engine.activeRunIds).toEqual([pending.id]);
+      });
+    });
   });
 });
 
