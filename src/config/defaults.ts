@@ -25,7 +25,8 @@ defaults:
   timeout_minutes: 60          # 单次 Agent 执行的超时
   command_timeout_minutes: 20  # 单条检查 / 准备命令的超时
 
-# 同一仓库最多同时执行几个 Run，各在自己的工作目录里做，合并时一个一个来；大于 1 时更容易出现合并冲突
+# 同一仓库最多同时执行几个 Run，各在自己的工作目录里做，合并时一个一个来；大于 1 时更容易出现合并冲突，
+# 所以评估预计改同一处（touches）的 Run 不会同时进入编码，后一个等前一个合并
 # max_runs：所有仓库合计最多同时执行几个 Run，不写 = 不限（只受 per_repo 限制）
 # concurrency:
 #   per_repo: 1
