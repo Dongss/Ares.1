@@ -398,8 +398,8 @@ export function cycleSteps(input: GuideInput, rule?: AutoAcceptRule): CycleStep[
         proposeName,
         ['human'],
         t({
-          zh: '还没有接入 GitHub，提不了需求：需求只从 GitHub issue 来，先在 config.yaml 里配置 github',
-          en: 'GitHub is not set up yet, so nothing can be requested: requirements only come from GitHub issues. Configure github in config.yaml first',
+          zh: '还没有接入 GitHub，提不了 issue：先在 config.yaml 里配置 github（不接 GitHub 的仓库用本地提案池，见「需求」页）',
+          en: 'GitHub is not set up yet, so no issue can be filed: configure github in config.yaml first (repos without GitHub use the local backlog, see the Issues page)',
         }),
       )
     : !scout
@@ -432,8 +432,8 @@ export function cycleSteps(input: GuideInput, rule?: AutoAcceptRule): CycleStep[
         'Run',
         runActors,
         t({
-          zh: '还没有接入 GitHub，建不了 Run：Run 只从带 ares1:ready 的 issue 来',
-          en: 'GitHub is not set up yet, so no Run can be created: Runs only come from issues labeled ares1:ready',
+          zh: '还没有接入 GitHub，从 issue 建不了 Run；不接 GitHub 的仓库从本地提案池建 Run，见「需求」页',
+          en: 'GitHub is not set up yet, so no Run comes from issues; repos without GitHub get Runs from the local backlog, see the Issues page',
         }),
       )
     : step(

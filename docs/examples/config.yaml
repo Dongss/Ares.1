@@ -38,7 +38,8 @@ concurrency:
                                # Agent 额度兜底。计入的 Run 和 per_repo 一样；调大保存后排队的 Run 马上开始，
                                # 调小时正在执行的 Run 照常做完
 
-# 用 GitHub Issues 管理需求：Run 只从带 ares1:ready 标签的 issue 来。需要安装并登录 gh；不写 github 就不接入
+# 用 GitHub Issues 管理需求：github.repos 里的仓库，Run 只从带 ares1:ready 标签的 issue 来。需要安装并登录 gh；
+# 不写 github 就不接入（不接 GitHub 的仓库用下面的 backlog）
 github:
   # account: my-account        # 用 gh 的哪个账号（登录了多个账号时）；不写 = gh 当前的账号
   poll_minutes: 5              # 多久查一次带 ares1:ready 标签的 issue、同步 issue 上的回复，默认 5
@@ -118,7 +119,7 @@ backlog:
     # 内网的命令行工具：不接 GitHub，靠侦察和自动采纳自己转起来
     my-intranet-tool:
       template: cross-review   # 采纳的提案建 Run 用的模板
-      scout:                   # 各项的含义和默认值和 github.repos 里的一样；不写 = 不侦察，只能在看板上手动建 Run
+      scout:                   # 各项的含义和默认值和 github.repos 里的一样；不写 = 不侦察，这个仓库就没有提案、不会有 Run
         agent: claude-reviewer
         interval_minutes: 120
         max_proposals: 3

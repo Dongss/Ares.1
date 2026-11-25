@@ -255,17 +255,20 @@ function Intro(props: {
           {t({
             zh: (
               <>
-                还没有接入 GitHub，现在建不了 Run：需求只从 GitHub issue 来。在{' '}
-                <code>config.yaml</code> 里加上 <code>github</code> 配置后自动生效，示例见
-                <a href={href.issues}>「需求」页</a>。
+                还没有接入 GitHub：这一页讲的循环靠 GitHub issue 转起来，在 <code>config.yaml</code>{' '}
+                里加上 <code>github</code> 配置后自动生效，示例见
+                <a href={href.issues}>「需求」页</a>。不接 GitHub 的仓库可以用本地提案池（
+                <code>config.yaml</code> 的 <code>backlog</code>），同样能自己侦察、采纳、建
+                Run，也在「需求」页。
               </>
             ),
             en: (
               <>
-                GitHub is not set up yet, so no Run can be created now: requirements only come from
-                GitHub issues. Add a <code>github</code> section to <code>config.yaml</code> and it
-                takes effect by itself; see the <a href={href.issues}>Issues page</a> for an
-                example.
+                GitHub is not set up yet: the loop on this page runs on GitHub issues. Add a{' '}
+                <code>github</code> section to <code>config.yaml</code> and it takes effect by
+                itself; see the <a href={href.issues}>Issues page</a> for an example. Repos without
+                GitHub can use the local backlog (<code>backlog</code> in <code>config.yaml</code>),
+                which scouts, accepts and creates Runs by itself too, also on the Issues page.
               </>
             ),
           })}
@@ -540,7 +543,8 @@ function YouSection(props: { input: GuideInput; home: string; working: boolean }
                   : '接入 GitHub 后 Master 会定时查看'}
                 ，工作中时就建 Run。写清楚为什么、要做什么和验收标准，Agent
                 就照着做。开工后、合并之前想改需求，直接改 issue 的标题或正文，Master
-                下次检查时终止旧 Run，按新内容重来。看板不提供手动建 Run，需求只从 GitHub issue 来。
+                下次检查时终止旧 Run，按新内容重来。看板不提供手动建 Run：接了 GitHub
+                的仓库，需求只从 GitHub issue 来。
               </>
             ),
             en: (
@@ -554,7 +558,7 @@ function YouSection(props: { input: GuideInput; home: string; working: boolean }
                 the agents follow it. To change the requirement after work started, before it
                 merges, just edit the issue's title or body: at its next check the Master cancels
                 the old Run and starts over on the new text. The dashboard does not create Runs by
-                hand: requirements only come from GitHub issues.
+                hand: for a repo on GitHub, requirements only come from GitHub issues.
               </>
             ),
           })}

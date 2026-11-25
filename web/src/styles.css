@@ -1322,6 +1322,95 @@ button.flow-stage-body:hover:not(:disabled) {
   color: var(--danger);
   font-size: 12px;
 }
+.config-example {
+  margin-top: 8px;
+}
+.config-example summary {
+  cursor: pointer;
+  color: var(--text-2);
+}
+
+/* local backlog: a repo's proposals, pending ones first */
+.proposal-list {
+  list-style: none;
+  margin: 14px 0 0;
+  padding: 0;
+  border-top: 1px solid var(--border);
+}
+.proposal {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+.proposal:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+.proposal summary {
+  cursor: pointer;
+  line-height: 1.8;
+}
+.proposal-title {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.proposal-rejected .proposal-title {
+  color: var(--text-2);
+}
+.proposal-body {
+  margin: 6px 0 4px 16px;
+  font-size: 13px;
+}
+.proposal-body h4 {
+  margin: 10px 0 2px;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+.proposal-body h4:first-child {
+  margin-top: 0;
+}
+.proposal-body p {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.proposal-body ul {
+  margin: 0;
+  padding-left: 18px;
+  overflow-wrap: anywhere;
+}
+.proposal-body li {
+  margin: 2px 0;
+}
+.proposal-outcome {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  margin-top: 4px;
+  font-size: 13px;
+}
+.proposal-reason {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.proposal .hint {
+  margin-top: 4px;
+}
+.proposal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+.proposal-actions input {
+  flex: 1 1 240px;
+  width: auto;
+  min-width: 0;
+}
+.proposals-none {
+  margin-top: 12px;
+}
 
 /* work switch */
 .work-toggle {

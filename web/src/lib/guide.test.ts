@@ -215,9 +215,13 @@ describe('the cycle', () => {
   it('works without GitHub', () => {
     const steps = byId(input(null));
     expect(steps.scout?.text).toContain('还没有接入 GitHub');
-    expect(steps.propose?.text).toContain('需求只从 GitHub issue 来');
+    expect(steps.propose?.text).toContain('提不了 issue');
     expect(steps.propose?.text).toContain('配置 github');
+    // Repos without GitHub have the local backlog, so neither says requirements need GitHub.
+    expect(steps.propose?.text).toContain('本地提案池');
+    expect(steps.propose?.text).not.toContain('需求只从 GitHub issue 来');
     expect(steps.run?.text).toContain('建不了 Run');
+    expect(steps.run?.text).toContain('本地提案池');
     expect(steps.push?.text).toBe('由你来做：合并只到本地的目标分支（main），需要时自己 git push');
     expect(runStages(input(null))).toBeNull();
   });

@@ -1,15 +1,19 @@
+import { type ReactNode, useState } from 'react';
 import type {
+  BacklogStatus,
   ConfigView,
   GitHubRepoStatus,
   GitHubStatus,
+  ProposalSourceStatus,
+  ProposalView,
   UpgradeStatus,
 } from '../../../src/api/types.js';
 import { t } from '../../../src/i18n.js';
 import type { Scout, ScoutGap } from '../../../src/store/types.js';
-import { Badge, Empty, ErrorBox, TemplateProblems } from '../components/ui.js';
+import { Badge, ConfirmButton, Empty, ErrorBox, TemplateProblems } from '../components/ui.js';
 import { api } from '../lib/api.js';
 import { repoTemplateChoice, repoTemplateProblems, templateSourceText } from '../lib/config.js';
-import { formatCost, formatTime } from '../lib/format.js';
+import { formatCost, formatTime, RUN_STATUS } from '../lib/format.js';
 import { useAction, useReloadOn, useResource } from '../lib/hooks.js';
 import {
   autoAcceptText,
@@ -19,20 +23,47 @@ import {
   gapsByGoal,
   gapsHeading,
   issuesUrl,
+  pollText,
   RISK,
   SCOUT_STATUS,
   scoutPlan,
   scoutWaitText,
   upgradeText,
 } from '../lib/issues.js';
+import {
+  acceptBlocker,
+  backlogOutdatedBy,
+  canReject,
+  decidedText,
+  mergeProposals,
+  PROPOSAL_STATUS,
+  type ProposalGroup,
+  pendingText,
+  proposalCountsText,
+  proposalGroups,
+  RECENT_PROPOSALS,
+  scoutProposalFiled,
+} from '../lib/proposals.js';
 import { href } from '../lib/router.js';
 
+/** Every pending proposal of the local backlog, and the latest decided ones. */
+async function loadProposals(): Promise<ProposalView[]> {
+  const [pending, recent] = await Promise.all([
+    api.proposals({ status: 'pending' }),
+    api.proposals({ limit: RECENT_PROPOSALS }),
+  ]);
+  return mergeProposals(pending, recent);
+}
+
 /**
- * GitHub issues as the backlog and the AI scouts that propose them. `config`: the configuration
- * in use (reloaded by the app), for where each repo's template comes from.
+ * Where requirements come from and the AI scouts that propose them: GitHub issues, and the local
+ * backlog of the repos without GitHub. `config`: the configuration in use (reloaded by the app),
+ * for where each repo's template comes from.
  */
 export function IssuesPage({ config }: { config: ConfigView | undefined }) {
   const github = useResource(() => api.github(), 'github');
+  const backlog = useResource(() => api.backlog(), 'backlog');
+  const proposals = useResource(loadProposals, 'proposals');
   const upgrade = useResource(() => api.upgrade(), 'upgrade');
   useReloadOn(upgrade.reload, (e) => e.type.startsWith('upgrade.') || e.type === 'run.status');
   const scouts = useResource(() => api.scouts(), 'scouts');
@@ -42,7 +73,13 @@ export function IssuesPage({ config }: { config: ConfigView | undefined }) {
     type.startsWith('config.') ||
     type === 'run.created';
   useReloadOn(github.reload, (e) => relevant(e.type));
+  useReloadOn(backlog.reload, (e) => backlogOutdatedBy(e.type));
+  useReloadOn(proposals.reload, (e) => backlogOutdatedBy(e.type));
   useReloadOn(scouts.reload, (e) => e.type.startsWith('scout.'));
+  const backlogChanged = () => {
+    backlog.reload();
+    proposals.reload();
+  };
 
   if (!github.data) {
     return github.error ? (
@@ -57,12 +94,20 @@ export function IssuesPage({ config }: { config: ConfigView | undefined }) {
       {github.data.enabled ? (
         <Overview status={github.data} onPolled={github.reload} />
       ) : (
-        <NotConfigured />
+        <NotConfigured backlog={backlog.data?.enabled ?? false} />
       )}
       {upgrade.data && <UpgradeCard status={upgrade.data} onChecked={upgrade.reload} />}
       {github.data.repos.map((r) => (
         <RepoIssues key={r.name} repo={r} config={config} onStarted={scouts.reload} />
       ))}
+      <BacklogSection
+        status={backlog.data}
+        error={backlog.error ?? proposals.error}
+        proposals={proposals.data}
+        config={config}
+        onChanged={backlogChanged}
+        onScoutStarted={scouts.reload}
+      />
       <h2>{t({ zh: '侦察记录', en: 'Scouts' })}</h2>
       {scouts.error && <ErrorBox>{scouts.error}</ErrorBox>}
       {scouts.data?.length === 0 && (
@@ -99,18 +144,19 @@ function Overview({ status, onPolled }: { status: GitHubStatus; onPolled: () => 
         {t({
           zh: (
             <>
-              需求用 GitHub Issues 管理，Run 只从 issue 来。带 <code>ares1:ready</code> 标签的 issue
-              会自动变成 Run，进展会回写到 issue 上，合并后关闭 issue。AI 侦察会读代码、文档和 Run
-              记录，把值得做的事提成带 <code>ares1:proposal</code> 标签的 issue，等你采纳。
+              <code>github.repos</code> 里的仓库用 GitHub Issues 管理需求，Run 只从 issue 来。带{' '}
+              <code>ares1:ready</code> 标签的 issue 会自动变成 Run，进展会回写到 issue
+              上，合并后关闭 issue。AI 侦察会读代码、文档和 Run 记录，把值得做的事提成带{' '}
+              <code>ares1:proposal</code> 标签的 issue，等你采纳。
             </>
           ),
           en: (
             <>
-              The backlog lives in GitHub Issues, and Runs only come from issues. An issue labeled{' '}
-              <code>ares1:ready</code> becomes a Run by itself; progress is written back to the
-              issue, and the issue is closed after the merge. The AI scout reads the code, the docs
-              and the Run records, and proposes what is worth doing as issues labeled{' '}
-              <code>ares1:proposal</code> for you to accept.
+              The repos of <code>github.repos</code> keep their backlog in GitHub Issues, and their
+              Runs only come from issues. An issue labeled <code>ares1:ready</code> becomes a Run by
+              itself; progress is written back to the issue, and the issue is closed after the
+              merge. The AI scout reads the code, the docs and the Run records, and proposes what is
+              worth doing as issues labeled <code>ares1:proposal</code> for you to accept.
             </>
           ),
         })}
@@ -120,16 +166,7 @@ function Overview({ status, onPolled }: { status: GitHubStatus; onPolled: () => 
           {status.account
             ? t({ zh: `gh 账号 ${status.account} · `, en: `gh account ${status.account} · ` })
             : ''}
-          {t({
-            zh: `每 ${status.pollMinutes} 分钟检查一次`,
-            en: `Checks every ${status.pollMinutes} ${status.pollMinutes === 1 ? 'minute' : 'minutes'}`,
-          })}
-          {status.lastPollAt
-            ? t({
-                zh: ` · 上次 ${formatTime(status.lastPollAt)}`,
-                en: ` · last ${formatTime(status.lastPollAt)}`,
-              })
-            : ''}
+          {pollText(status.pollMinutes, status.lastPollAt)}
         </span>
         <button
           type="button"
@@ -192,33 +229,9 @@ function UpgradeCard({ status, onChecked }: { status: UpgradeStatus; onChecked: 
   );
 }
 
-function NotConfigured() {
-  return (
-    <section className="card">
-      <p>
-        {t({
-          zh: (
-            <>
-              还没有接入 GitHub，现在建不了 Run：需求只从 GitHub issue 来，看板不提供手动建
-              Run，不配置 <code>github</code> 就不能建 Run。在 <code>config.yaml</code> 里加上{' '}
-              <code>github</code> 配置后自动生效（需要先安装并登录 gh），只有列在 <code>repos</code>{' '}
-              里的仓库才会从 issue 建 Run：
-            </>
-          ),
-          en: (
-            <>
-              GitHub is not connected yet, so no Run can be created: the backlog only comes from
-              GitHub issues and the dashboard does not create Runs by hand. Add a{' '}
-              <code>github</code> section to <code>config.yaml</code> and it takes effect by itself
-              (install gh and log in first); only repos listed under <code>repos</code> get Runs
-              from issues:
-            </>
-          ),
-        })}
-      </p>
-      <pre className="pre">
-        {t({
-          zh: `github:
+function githubExample(): string {
+  return t({
+    zh: `github:
   account: my-account        # 可选：用 gh 的哪个账号
   repos:
     my-repo:                 # 看板上登记的仓库名
@@ -234,7 +247,7 @@ function NotConfigured() {
       # deliver: pr          # 目标分支受保护时：推送 Run 的分支、开 PR，合并后 Run 完成（要配 push: true）
       # daily_budget_usd: 20 # 每天自动花费的上限，不写 = 不限
       max_run_attempts: 3    # 一个 issue 最多跑几次 Run（含第一次），失败后自动重做`,
-          en: `github:
+    en: `github:
   account: my-account        # optional: which gh account to use
   repos:
     my-repo:                 # the repo name registered on the dashboard
@@ -250,9 +263,248 @@ function NotConfigured() {
       # deliver: pr          # protected target branch: push the Run's branch, open a PR, done once merged (needs push: true)
       # daily_budget_usd: 20 # daily limit of automatic spend; omitted = no limit
       max_run_attempts: 3    # Runs an issue gets at most, the first included; failed ones are redone`,
+  });
+}
+
+function backlogExample(): string {
+  return t({
+    zh: `backlog:
+  poll_minutes: 5            # 多久检查一次本地提案池
+  repos:
+    my-local-repo:           # 看板上登记的仓库名，不能和 github.repos 里的重名
+      template: self-dev     # 采纳的提案建 Run 用的模板
+      scout:                 # 不写 = 不侦察，这个仓库就没有提案
+        agent: claude-reviewer
+        auto: true           # 没有在进行中的 Run 时自动侦察（只等人的 Run 不挡）；false = 只手动触发
+      auto_accept:
+        max_risk: low        # 自动采纳到哪个风险等级：none / low / mid / high
+        max_size: M          # 自动采纳到哪个大小：S / M / L
+      auto_merge: false      # 采纳的提案建出的 Run 合并前不再等你审批
+      # daily_budget_usd: 20 # 每天自动花费的上限，不写 = 不限`,
+    en: `backlog:
+  poll_minutes: 5            # how often to go over the local backlog
+  repos:
+    my-local-repo:           # the repo name registered on the dashboard; not one of github.repos
+      template: self-dev     # template of the Runs created from accepted proposals
+      scout:                 # omitted = no scout, so the repo gets no proposals
+        agent: claude-reviewer
+        auto: true           # scout by itself when no Run is in progress (Runs waiting only for you do not hold it back); false = by hand only
+      auto_accept:
+        max_risk: low        # highest risk accepted automatically: none / low / mid / high
+        max_size: M          # largest size accepted automatically: S / M / L
+      auto_merge: false      # Runs from accepted proposals merge without waiting for your approval
+      # daily_budget_usd: 20 # daily limit of automatic spend; omitted = no limit`,
+  });
+}
+
+/**
+ * No `github` section. With the local backlog configured, Runs come from it, so this only says
+ * how to add GitHub; without either, nothing can create a Run yet, and both ways are shown.
+ */
+function NotConfigured({ backlog }: { backlog: boolean }) {
+  if (backlog) {
+    return (
+      <section className="card">
+        <p>
+          {t({
+            zh: (
+              <>
+                没有接入 GitHub：下面「本地提案」里的仓库，需求来自 Master
+                自己保存的本地提案池。想让仓库改用 GitHub issue 管理需求，在{' '}
+                <code>config.yaml</code> 里加上 <code>github</code> 配置（需要先安装并登录
+                gh），把仓库从 <code>backlog.repos</code> 移到 <code>github.repos</code>
+                ：一个仓库只能用一种需求来源。
+              </>
+            ),
+            en: (
+              <>
+                GitHub is not connected: the requirements of the repos under Local backlog below
+                come from the local backlog the Master keeps. To have a repo use GitHub issues
+                instead, add a <code>github</code> section to <code>config.yaml</code> (install gh
+                and log in first) and move the repo from <code>backlog.repos</code> to{' '}
+                <code>github.repos</code>: a repo has one source of requirements only.
+              </>
+            ),
+          })}
+        </p>
+        <details className="config-example">
+          <summary>{t({ zh: 'github 配置示例', en: 'Example github section' })}</summary>
+          <pre className="pre">{githubExample()}</pre>
+        </details>
+      </section>
+    );
+  }
+  return (
+    <section className="card">
+      <p>
+        {t({
+          zh: (
+            <>
+              还没有需求来源，现在建不了 Run：Run 只从 GitHub issue 或本地提案池来，看板不提供手动建
+              Run。在 <code>config.yaml</code>{' '}
+              里加上下面两种配置之一，保存后自动生效；一个仓库只能用一种，只有列在{' '}
+              <code>repos</code> 里的仓库才会建 Run。
+            </>
+          ),
+          en: (
+            <>
+              No source of requirements yet, so no Run can be created: Runs only come from GitHub
+              issues or the local backlog, and the dashboard does not create Runs by hand. Add one
+              of the two sections below to <code>config.yaml</code> and it takes effect by itself; a
+              repo uses one of them only, and only repos listed under <code>repos</code> get Runs.
+            </>
+          ),
         })}
-      </pre>
+      </p>
+      <p>
+        {t({
+          zh: (
+            <>
+              接 GitHub（需要先安装并登录 gh）：带 <code>ares1:ready</code> 标签的 issue 建成 Run。
+            </>
+          ),
+          en: (
+            <>
+              With GitHub (install gh and log in first): issues labeled <code>ares1:ready</code>{' '}
+              become Runs.
+            </>
+          ),
+        })}
+      </p>
+      <pre className="pre">{githubExample()}</pre>
+      <p>
+        {t({
+          zh: '不用 GitHub（只在本机的仓库、没有 GitHub 账号、托管在 GitLab 或内网的项目）：AI 侦察把提案写进本地提案池，自动采纳范围内的直接建成 Run，其余的在这一页采纳或拒绝。',
+          en: 'Without GitHub (a repo only on this machine, no GitHub account, or hosted on GitLab or an intranet): the AI scout writes proposals into the local backlog; those within auto-accept become Runs right away, and you accept or reject the others on this page.',
+        })}
+      </p>
+      <pre className="pre">{backlogExample()}</pre>
     </section>
+  );
+}
+
+/** Problems that keep the Master from working on a repo's requirements. */
+function Problems({ problems }: { problems: string[] }) {
+  if (problems.length === 0) return null;
+  return (
+    <ErrorBox>
+      {problems.map((p) => (
+        <div key={p}>{p}</div>
+      ))}
+    </ErrorBox>
+  );
+}
+
+/**
+ * What a repo's requirements go by, whichever source they come from: the template of its Runs,
+ * the scout, auto-accept, approval before merging and today's automatic spend. `extra`: rows of
+ * the source's own, shown before the spend.
+ */
+function SourceSettings(props: {
+  repo: ProposalSourceStatus;
+  config: ConfigView | undefined;
+  extra?: ReactNode;
+}) {
+  const { repo, config, extra } = props;
+  const scout = repo.scout;
+  const template = config ? repoTemplateChoice(config, repo.name, repo.template) : null;
+  const templateProblems = config ? repoTemplateProblems(config, repo.name) : [];
+  return (
+    <dl className="meta">
+      <div className="wide">
+        <dt>{t({ zh: 'Run 模板', en: 'Run template' })}</dt>
+        <dd>
+          {repo.template}
+          {template && (
+            <span className="muted">
+              {t({
+                zh: `（${templateSourceText(template)}）`,
+                en: ` (${templateSourceText(template)})`,
+              })}
+            </span>
+          )}
+          <TemplateProblems problems={templateProblems} />
+        </dd>
+      </div>
+      <div className="wide">
+        <dt>{t({ zh: '侦察', en: 'Scout' })}</dt>
+        <dd>
+          {scout ? (
+            <>
+              {scout.agent}
+              {t({ zh: '，', en: ', ' })}
+              {scoutPlan(scout)}
+              {scout.lastAt
+                ? t({
+                    zh: `；上次 ${formatTime(scout.lastAt)}`,
+                    en: `; last ${formatTime(scout.lastAt)}`,
+                  })
+                : ''}
+              {scout.auto && !scout.running && scout.waiting && (
+                <div className="muted">
+                  {t({ zh: '现在没有自动侦察：', en: 'Not scouting by itself now: ' })}
+                  {scoutWaitText(scout.waiting)}
+                </div>
+              )}
+            </>
+          ) : (
+            <span className="muted">{t({ zh: '未配置', en: 'Not configured' })}</span>
+          )}
+        </dd>
+      </div>
+      <div className="wide">
+        <dt>{t({ zh: '自动采纳', en: 'Auto-accept' })}</dt>
+        <dd>{autoAcceptText(repo.autoAccept)}</dd>
+      </div>
+      <div>
+        <dt>{t({ zh: '合并前审批', en: 'Approval before merge' })}</dt>
+        <dd>
+          {repo.autoMerge
+            ? t({
+                zh: '不用审批，检查和评审通过后自动合并',
+                en: 'Not needed: merges once checks and review pass',
+              })
+            : t({ zh: '需要你审批', en: 'You approve' })}
+        </dd>
+      </div>
+      {extra}
+      <div>
+        <dt>{t({ zh: '今日自动花费', en: 'Automatic spend today' })}</dt>
+        <dd>{budgetText(repo.budget)}</dd>
+      </div>
+    </dl>
+  );
+}
+
+/** The scout started by hand, for a repo of either source; nothing without a scout configured. */
+function ScoutAction({ repo, onStarted }: { repo: ProposalSourceStatus; onStarted: () => void }) {
+  const action = useAction();
+  const scout = repo.scout;
+  if (!scout) return null;
+  return (
+    <>
+      <div className="form-actions">
+        <button
+          type="button"
+          className="btn-primary"
+          disabled={scout.running || action.busy || repo.problems.length > 0}
+          onClick={async () => {
+            if ((await action.run(() => api.startScout(repo.name))) !== undefined) onStarted();
+          }}
+        >
+          {scout.running
+            ? t({ zh: '侦察中…', en: 'Scouting…' })
+            : t({ zh: '让 AI 找活', en: 'Let the AI find work' })}
+        </button>
+        <span className="muted">
+          {t({
+            zh: `最多提 ${scout.maxProposals} 条，通常要几分钟`,
+            en: `Up to ${scout.maxProposals} ${scout.maxProposals === 1 ? 'proposal' : 'proposals'}; usually takes a few minutes`,
+          })}
+        </span>
+      </div>
+      <ErrorBox>{action.error}</ErrorBox>
+    </>
   );
 }
 
@@ -262,10 +514,6 @@ function RepoIssues(props: {
   onStarted: () => void;
 }) {
   const { repo, config, onStarted } = props;
-  const action = useAction();
-  const scout = repo.scout;
-  const template = config ? repoTemplateChoice(config, repo.name, repo.template) : null;
-  const templateProblems = config ? repoTemplateProblems(config, repo.name) : [];
   return (
     <section className="card repo">
       <div className="repo-head">
@@ -281,103 +529,298 @@ function RepoIssues(props: {
           </span>
         )}
       </div>
-      {repo.problems.length > 0 && (
+      <Problems problems={repo.problems} />
+      <SourceSettings
+        repo={repo}
+        config={config}
+        extra={
+          <div className="wide">
+            <dt>{t({ zh: '交付方式', en: 'Delivery' })}</dt>
+            <dd>{deliveryText(repo)}</dd>
+          </div>
+        }
+      />
+      <ScoutAction repo={repo} onStarted={onStarted} />
+    </section>
+  );
+}
+
+/**
+ * The local backlog of the repos without GitHub (backlog.repos): a card per repo with its
+ * settings and its proposals, pending ones first. Also shown, without the settings, for repos
+ * taken out of backlog.repos that still have proposals, so that pending ones can be rejected.
+ */
+function BacklogSection(props: {
+  status: BacklogStatus | undefined;
+  error: string | undefined;
+  proposals: ProposalView[] | undefined;
+  config: ConfigView | undefined;
+  onChanged: () => void;
+  onScoutStarted: () => void;
+}) {
+  const { status, proposals } = props;
+  if (!status) return props.error ? <ErrorBox>{props.error}</ErrorBox> : null;
+  const groups = proposalGroups(status.repos, proposals ?? []);
+  if (!status.enabled && groups.length === 0) return null;
+  return (
+    <>
+      <h2>{t({ zh: '本地提案', en: 'Local backlog' })}</h2>
+      <ErrorBox>{props.error}</ErrorBox>
+      {status.enabled && <BacklogOverview status={status} onPolled={props.onChanged} />}
+      {groups.map((g) => (
+        <BacklogRepo
+          key={g.repo}
+          group={g}
+          loading={proposals === undefined}
+          config={props.config}
+          onChanged={props.onChanged}
+          onScoutStarted={props.onScoutStarted}
+        />
+      ))}
+    </>
+  );
+}
+
+function BacklogOverview({ status, onPolled }: { status: BacklogStatus; onPolled: () => void }) {
+  const action = useAction();
+  return (
+    <section className="card">
+      <p>
+        {t({
+          zh: (
+            <>
+              <code>backlog.repos</code> 里的仓库不接 GitHub，需求来自 Master
+              自己保存的本地提案池：AI 侦察读代码、文档和 Run
+              记录，把值得做的事写成提案；在自动采纳范围内的直接建成
+              Run，其余的等你在下面采纳，或者填上理由拒绝。拒绝的理由会交给这个仓库之后的侦察，免得换个说法再提。
+            </>
+          ),
+          en: (
+            <>
+              The repos of <code>backlog.repos</code> have no GitHub: their requirements come from
+              the local backlog the Master keeps. The AI scout reads the code, the docs and the Run
+              records and writes down what is worth doing as proposals; those within auto-accept
+              become Runs right away, and the others wait for you to accept them below or reject
+              them with a reason. The reason goes to the repo's later scouts, so that they do not
+              propose the same thing in other words.
+            </>
+          ),
+        })}
+      </p>
+      <div className="issues-poll">
+        <span className="muted">{pollText(status.pollMinutes, status.lastPollAt)}</span>
+        <button
+          type="button"
+          disabled={action.busy}
+          onClick={async () => {
+            if ((await action.run(() => api.backlogPoll())) !== undefined) onPolled();
+          }}
+        >
+          {action.busy
+            ? t({ zh: '检查中…', en: 'Checking…' })
+            : t({ zh: '立即检查', en: 'Check now' })}
+        </button>
+      </div>
+      <ErrorBox>{action.error}</ErrorBox>
+      {status.lastError && (
         <ErrorBox>
-          {repo.problems.map((p) => (
-            <div key={p}>{p}</div>
-          ))}
+          {t({
+            zh: `上一轮检查有没做成的事（${formatTime(status.lastError.at)}），下次检查时重试：`,
+            en: `The last check could not do everything (${formatTime(status.lastError.at)}); retrying at the next check: `,
+          })}
+          {status.lastError.message}
         </ErrorBox>
       )}
-      <dl className="meta">
-        <div className="wide">
-          <dt>{t({ zh: 'Run 模板', en: 'Run template' })}</dt>
-          <dd>
-            {repo.template}
-            {template && (
-              <span className="muted">
-                {t({
-                  zh: `（${templateSourceText(template)}）`,
-                  en: ` (${templateSourceText(template)})`,
-                })}
-              </span>
-            )}
-            <TemplateProblems problems={templateProblems} />
-          </dd>
-        </div>
-        <div className="wide">
-          <dt>{t({ zh: '侦察', en: 'Scout' })}</dt>
-          <dd>
-            {scout ? (
-              <>
-                {scout.agent}
-                {t({ zh: '，', en: ', ' })}
-                {scoutPlan(scout)}
-                {scout.lastAt
-                  ? t({
-                      zh: `；上次 ${formatTime(scout.lastAt)}`,
-                      en: `; last ${formatTime(scout.lastAt)}`,
-                    })
-                  : ''}
-                {scout.auto && !scout.running && scout.waiting && (
-                  <div className="muted">
-                    {t({ zh: '现在没有自动侦察：', en: 'Not scouting by itself now: ' })}
-                    {scoutWaitText(scout.waiting)}
-                  </div>
-                )}
-              </>
-            ) : (
-              <span className="muted">{t({ zh: '未配置', en: 'Not configured' })}</span>
-            )}
-          </dd>
-        </div>
-        <div className="wide">
-          <dt>{t({ zh: '自动采纳', en: 'Auto-accept' })}</dt>
-          <dd>{autoAcceptText(repo.autoAccept)}</dd>
-        </div>
-        <div>
-          <dt>{t({ zh: '合并前审批', en: 'Approval before merge' })}</dt>
-          <dd>
-            {repo.autoMerge
-              ? t({
-                  zh: '不用审批，检查和评审通过后自动合并',
-                  en: 'Not needed: merges once checks and review pass',
-                })
-              : t({ zh: '需要你审批', en: 'You approve' })}
-          </dd>
-        </div>
-        <div className="wide">
-          <dt>{t({ zh: '交付方式', en: 'Delivery' })}</dt>
-          <dd>{deliveryText(repo)}</dd>
-        </div>
-        <div>
-          <dt>{t({ zh: '今日自动花费', en: 'Automatic spend today' })}</dt>
-          <dd>{budgetText(repo.budget)}</dd>
-        </div>
-      </dl>
-      {scout && (
-        <div className="form-actions">
-          <button
-            type="button"
-            className="btn-primary"
-            disabled={scout.running || action.busy || repo.problems.length > 0}
-            onClick={async () => {
-              if ((await action.run(() => api.startScout(repo.name))) !== undefined) onStarted();
-            }}
-          >
-            {scout.running
-              ? t({ zh: '侦察中…', en: 'Scouting…' })
-              : t({ zh: '让 AI 找活', en: 'Let the AI find work' })}
-          </button>
+    </section>
+  );
+}
+
+function BacklogRepo(props: {
+  group: ProposalGroup;
+  /** The proposals are not loaded yet. */
+  loading: boolean;
+  config: ConfigView | undefined;
+  onChanged: () => void;
+  onScoutStarted: () => void;
+}) {
+  const { group, loading } = props;
+  const { status } = group;
+  const counts = proposalCountsText(group.proposals);
+  return (
+    <section className="card repo">
+      <div className="repo-head">
+        <h2>{group.repo}</h2>
+        {counts && <span className="muted">{counts}</span>}
+      </div>
+      {status ? (
+        <>
+          <Problems problems={status.problems} />
+          <SourceSettings repo={status} config={props.config} />
+          {status.scout ? (
+            <ScoutAction repo={status} onStarted={props.onScoutStarted} />
+          ) : (
+            <p className="muted">
+              {t({
+                zh: '没有配置侦察（scout），这个仓库就没有新的提案。',
+                en: 'No scout is configured, so the repo gets no new proposals.',
+              })}
+            </p>
+          )}
+        </>
+      ) : (
+        <p className="muted">
+          {t({
+            zh: '已经不在 config.yaml 的 backlog.repos 里：不再侦察，也不能再采纳它的提案；待处理的还可以拒绝。',
+            en: 'No longer in backlog.repos of config.yaml: it is not scouted and its proposals cannot be accepted any more; pending ones can still be rejected.',
+          })}
+        </p>
+      )}
+      {group.proposals.length > 0 ? (
+        <ul className="proposal-list">
+          {group.proposals.map((p) => (
+            <ProposalItem key={p.id} proposal={p} group={group} onChanged={props.onChanged} />
+          ))}
+        </ul>
+      ) : (
+        !loading && (
+          <div className="muted proposals-none">
+            {t({ zh: '还没有本地提案。', en: 'No proposals yet.' })}
+          </div>
+        )
+      )}
+    </section>
+  );
+}
+
+/**
+ * One proposal: what it is, folded open to read why, the evidence, what to do and how to tell it
+ * is done. Pending ones can be accepted, or rejected with a reason; decided ones say how.
+ */
+function ProposalItem(props: {
+  proposal: ProposalView;
+  group: ProposalGroup;
+  onChanged: () => void;
+}) {
+  const { proposal: p, group, onChanged } = props;
+  const action = useAction();
+  const [reason, setReason] = useState('');
+  const status = PROPOSAL_STATUS[p.status];
+  const blocker = acceptBlocker(p, group.status);
+  const waiting = pendingText(p, group.status?.autoAccept ?? null);
+  const decided = decidedText(p);
+  const accept = async () => {
+    if ((await action.run(() => api.acceptProposal(p.id))) !== undefined) onChanged();
+  };
+  const reject = async () => {
+    if (!canReject(p, reason)) return;
+    if ((await action.run(() => api.rejectProposal(p.id, reason.trim()))) !== undefined) {
+      setReason('');
+      onChanged();
+    }
+  };
+  return (
+    <li className={`proposal proposal-${p.status}`}>
+      <details>
+        <summary>
+          <Badge tone={status.tone}>{status.label}</Badge>{' '}
+          <span className="proposal-title">{p.title}</span>{' '}
+          <Badge tone={RISK[p.risk].tone}>{RISK[p.risk].label}</Badge>{' '}
           <span className="muted">
-            {t({
-              zh: `最多提 ${scout.maxProposals} 条，通常要几分钟`,
-              en: `Up to ${scout.maxProposals} ${scout.maxProposals === 1 ? 'proposal' : 'proposals'}; usually takes a few minutes`,
-            })}
+            {CATEGORY[p.category]} · {p.size} · {formatTime(p.createdAt)}
           </span>
+        </summary>
+        <ProposalBody proposal={p} />
+      </details>
+      {p.status === 'accepted' && (
+        <div className="proposal-outcome">
+          {p.auto && <Badge tone="active">{t({ zh: '已自动采纳', en: 'Auto-accepted' })}</Badge>}
+          {decided && <span className="muted">{decided}</span>}
+          {p.runId && (
+            <>
+              <a href={href.run(p.runId)}>Run {p.runId}</a>
+              {p.runStatus && (
+                <Badge tone={RUN_STATUS[p.runStatus].tone}>{RUN_STATUS[p.runStatus].label}</Badge>
+              )}
+            </>
+          )}
         </div>
       )}
-      <ErrorBox>{action.error}</ErrorBox>
-    </section>
+      {p.status === 'rejected' && (
+        <div className="proposal-outcome">
+          {decided && <span className="muted">{decided}</span>}
+          {p.rejectReason && (
+            <span className="proposal-reason">
+              {t({ zh: '理由：', en: 'Reason: ' })}
+              {p.rejectReason}
+            </span>
+          )}
+        </div>
+      )}
+      {p.status === 'pending' && (
+        <>
+          {waiting && <div className="hint">{waiting}</div>}
+          <div className="proposal-actions">
+            <button
+              type="button"
+              className="btn-primary"
+              disabled={action.busy || blocker !== null}
+              title={blocker ?? undefined}
+              onClick={accept}
+            >
+              {t({ zh: '采纳', en: 'Accept' })}
+            </button>
+            <input
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              placeholder={t({
+                zh: '拒绝的理由（必填，之后的侦察会看到）',
+                en: 'Reason to reject (required; later scouts see it)',
+              })}
+              aria-label={t({ zh: '拒绝的理由', en: 'Reason to reject' })}
+            />
+            <ConfirmButton
+              label={t({ zh: '拒绝', en: 'Reject' })}
+              confirmLabel={t({ zh: '确认拒绝', en: 'Confirm reject' })}
+              disabled={action.busy || !canReject(p, reason)}
+              onConfirm={reject}
+            />
+          </div>
+          <ErrorBox>{action.error}</ErrorBox>
+        </>
+      )}
+    </li>
+  );
+}
+
+/** What the scout wrote: why, the evidence, what to do and the acceptance criteria. */
+function ProposalBody({ proposal: p }: { proposal: ProposalView }) {
+  const list = (items: string[]) => (
+    <ul>
+      {items.map((item, i) => (
+        // biome-ignore lint/suspicious/noArrayIndexKey: a recorded list that never changes
+        <li key={i}>{item}</li>
+      ))}
+    </ul>
+  );
+  return (
+    <div className="proposal-body">
+      <h4>{t({ zh: '为什么', en: 'Why' })}</h4>
+      <p>{p.why}</p>
+      {p.evidence.length > 0 && (
+        <>
+          <h4>{t({ zh: '证据', en: 'Evidence' })}</h4>
+          {list(p.evidence)}
+        </>
+      )}
+      <h4>{t({ zh: '要做什么', en: 'What to do' })}</h4>
+      <p>{p.what}</p>
+      {p.acceptance.length > 0 && (
+        <>
+          <h4>{t({ zh: '验收标准', en: 'Acceptance criteria' })}</h4>
+          {list(p.acceptance)}
+        </>
+      )}
+    </div>
   );
 }
 
@@ -405,33 +848,38 @@ function ScoutCard({ scout }: { scout: Scout }) {
       )}
       {scout.proposals.length > 0 && (
         <ul className="proposals">
-          {scout.proposals.map((p) => (
-            <li key={p.title}>
-              {p.issue ? (
-                <a href={p.issue.url} target="_blank" rel="noreferrer">
-                  #{p.issue.number} {p.title}
-                </a>
-              ) : (
-                <span>{p.title}</span>
-              )}{' '}
-              <Badge tone={RISK[p.risk].tone}>{RISK[p.risk].label}</Badge>{' '}
-              <span className="muted">
-                {CATEGORY[p.category]} · {p.size}
-              </span>
-              {p.issue?.auto && (
-                <>
-                  {' '}
-                  <Badge tone="active">{t({ zh: '已自动采纳', en: 'Auto-accepted' })}</Badge>
-                </>
-              )}
-              {p.error && (
-                <div className="error-text">
-                  {t({ zh: '没能建 issue：', en: 'Could not create the issue: ' })}
-                  {p.error}
-                </div>
-              )}
-            </li>
-          ))}
+          {scout.proposals.map((p) => {
+            const filed = scoutProposalFiled(p);
+            return (
+              <li key={p.title}>
+                {p.issue ? (
+                  <a href={p.issue.url} target="_blank" rel="noreferrer">
+                    #{p.issue.number} {p.title}
+                  </a>
+                ) : (
+                  <span>{p.title}</span>
+                )}{' '}
+                <Badge tone={RISK[p.risk].tone}>{RISK[p.risk].label}</Badge>{' '}
+                <span className="muted">
+                  {CATEGORY[p.category]} · {p.size}
+                  {filed.where === 'local' &&
+                    t({ zh: ' · 已写入本地提案', en: ' · In the local backlog' })}
+                </span>
+                {filed.auto && (
+                  <>
+                    {' '}
+                    <Badge tone="active">{t({ zh: '已自动采纳', en: 'Auto-accepted' })}</Badge>
+                  </>
+                )}
+                {p.error && (
+                  <div className="error-text">
+                    {t({ zh: '没能建 issue：', en: 'Could not create the issue: ' })}
+                    {p.error}
+                  </div>
+                )}
+              </li>
+            );
+          })}
         </ul>
       )}
       <GapAnalysis gaps={scout.gaps} />

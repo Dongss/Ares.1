@@ -64,26 +64,29 @@ export function HomePage({
         {t({
           zh: (
             <>
-              还没有 Run。Run 只从 GitHub issue 来：
+              还没有 Run。Run 从 GitHub issue 或本地提案池来：
               {repos.length === 0 ? (
                 <>
                   先<a href={href.repos}>登记仓库</a>，再
                 </>
               ) : null}
-              在 GitHub 提 issue 并加上 <code>ares1:ready</code>。接入情况和 issue 见
+              在 GitHub 提 issue 并加上 <code>ares1:ready</code>；不接 GitHub 的仓库由 AI
+              侦察写本地提案，采纳后建 Run。需求来源、issue 和本地提案见
               <a href={href.issues}>「需求」页</a>。
             </>
           ),
           en: (
             <>
-              No Runs yet. Runs only come from GitHub issues:{' '}
+              No Runs yet. Runs come from GitHub issues or the local backlog:{' '}
               {repos.length === 0 ? (
                 <>
                   <a href={href.repos}>register a repo</a>, then{' '}
                 </>
               ) : null}
-              open an issue on GitHub labeled <code>ares1:ready</code>. The GitHub connection and
-              issues are on the <a href={href.issues}>Issues</a> page.
+              open an issue on GitHub labeled <code>ares1:ready</code>; for a repo without GitHub,
+              the AI scout writes local proposals, which become Runs once accepted. Where
+              requirements come from, the issues and the local proposals are on the{' '}
+              <a href={href.issues}>Issues</a> page.
             </>
           ),
         })}

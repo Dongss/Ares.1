@@ -322,6 +322,45 @@ export function globalEventText(event: GlobalEvent, now = new Date()): string | 
         en: `Accepted proposal${which} of ${repoOf(event)} automatically; it waits to be worked on`,
       });
     }
+    case 'proposal.auto_accepted':
+    case 'proposal.accepted': {
+      const runId = str(d.runId);
+      const auto = event.type === 'proposal.auto_accepted';
+      const accepted = auto
+        ? t({
+            zh: `自动采纳了 ${repoOf(event)} 的一条本地提案`,
+            en: `Accepted a local proposal of ${repoOf(event)} automatically`,
+          })
+        : t({
+            zh: `采纳了 ${repoOf(event)} 的一条本地提案`,
+            en: `Accepted a local proposal of ${repoOf(event)}`,
+          });
+      return runId
+        ? t({
+            zh: `${accepted}，用它的正文建了 Run ${runId}`,
+            en: `${accepted} and created Run ${runId} from its text`,
+          })
+        : t({
+            zh: `${accepted}，用它的正文建了 Run`,
+            en: `${accepted} and created a Run from its text`,
+          });
+    }
+    case 'proposal.rejected': {
+      const rejected = t({
+        zh: `拒绝了 ${repoOf(event)} 的一条本地提案`,
+        en: `Rejected a local proposal of ${repoOf(event)}`,
+      });
+      const reason = str(d.reason);
+      return reason
+        ? t({
+            zh: `${rejected}，理由：${reason}；之后的侦察会看到这条理由`,
+            en: `${rejected} because: ${reason}; later scouts are shown the reason`,
+          })
+        : t({
+            zh: `${rejected}；之后的侦察会看到它和拒绝的理由`,
+            en: `${rejected}; later scouts are shown it with the reason`,
+          });
+    }
     case 'scout.started':
       if (d.trigger === 'auto') {
         return t({
@@ -341,26 +380,46 @@ export function globalEventText(event: GlobalEvent, now = new Date()): string | 
       if (created === null) {
         return t({ zh: `侦察 ${repoOf(event)} 完成`, en: `Scouting ${repoOf(event)} finished` });
       }
+      // A repo of the local backlog gets proposals kept by the Master instead of issues.
+      const local = d.backlog === true;
       if (created === 0) {
-        return t({
-          zh: `侦察 ${repoOf(event)} 完成，没有提出新的 issue`,
-          en: `Scouting ${repoOf(event)} finished without proposing any issue`,
-        });
+        return local
+          ? t({
+              zh: `侦察 ${repoOf(event)} 完成，没有提出新的本地提案`,
+              en: `Scouting ${repoOf(event)} finished without proposing anything for the local backlog`,
+            })
+          : t({
+              zh: `侦察 ${repoOf(event)} 完成，没有提出新的 issue`,
+              en: `Scouting ${repoOf(event)} finished without proposing any issue`,
+            });
       }
       const auto = num(d.auto) ?? 0;
       const pending = num(d.pending) ?? 0;
       const parts = [
-        auto > 0 ? t({ zh: `${auto} 个自动采纳`, en: `${auto} accepted automatically` }) : null,
+        auto > 0
+          ? t({
+              zh: local ? `${auto} 条自动采纳` : `${auto} 个自动采纳`,
+              en: `${auto} accepted automatically`,
+            })
+          : null,
         pending > 0
-          ? t({ zh: `${pending} 个等人采纳`, en: `${pending} waiting for a human` })
+          ? t({
+              zh: local ? `${pending} 条等人采纳或拒绝` : `${pending} 个等人采纳`,
+              en: `${pending} waiting for a human`,
+            })
           : null,
       ].filter((s): s is string => s !== null);
       const which =
         parts.length > 0 ? t({ zh: `，其中 ${join(parts)}`, en: `: ${parts.join(' and ')}` }) : '';
-      return t({
-        zh: `侦察 ${repoOf(event)} 完成，提出了 ${created} 个 issue${which}`,
-        en: `Scouting ${repoOf(event)} finished and proposed ${created} ${created === 1 ? 'issue' : 'issues'}${which}`,
-      });
+      return local
+        ? t({
+            zh: `侦察 ${repoOf(event)} 完成，写入了 ${created} 条本地提案${which}`,
+            en: `Scouting ${repoOf(event)} finished with ${created} ${created === 1 ? 'proposal' : 'proposals'} for the local backlog${which}`,
+          })
+        : t({
+            zh: `侦察 ${repoOf(event)} 完成，提出了 ${created} 个 issue${which}`,
+            en: `Scouting ${repoOf(event)} finished and proposed ${created} ${created === 1 ? 'issue' : 'issues'}${which}`,
+          });
     }
     case 'scout.failed': {
       const streak = num(d.streak);
@@ -461,16 +520,26 @@ export interface EventLink {
 }
 
 /**
- * Where to see more about the event: scouts and the issues they propose live on the Issues page;
- * a divergence handed to a Run, on that Run's page.
+ * Where to see more about the event: scouts, the issues they propose and the local proposals live
+ * on the Issues page; a divergence handed to a Run, and an accepted local proposal, on that Run's
+ * page.
  */
 export function globalEventLink(event: GlobalEvent): EventLink | null {
-  if (event.type.startsWith('scout.') || event.type === 'issue.auto_accepted') {
-    return { href: href.issues, label: t({ zh: '查看需求', en: 'See issues' }) };
-  }
   const runId = str(event.data.runId);
-  if ((event.type === 'github.diverged' || event.type === 'github.diverged_run') && runId) {
+  const toRun =
+    event.type === 'github.diverged' ||
+    event.type === 'github.diverged_run' ||
+    event.type === 'proposal.accepted' ||
+    event.type === 'proposal.auto_accepted';
+  if (toRun && runId) {
     return { href: href.run(runId), label: t({ zh: '查看 Run', en: 'See the Run' }) };
+  }
+  if (
+    event.type.startsWith('scout.') ||
+    event.type.startsWith('proposal.') ||
+    event.type === 'issue.auto_accepted'
+  ) {
+    return { href: href.issues, label: t({ zh: '查看需求', en: 'See issues' }) };
   }
   return null;
 }

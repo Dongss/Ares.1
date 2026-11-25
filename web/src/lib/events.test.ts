@@ -94,6 +94,14 @@ const SAMPLES: [string, Record<string, unknown>][] = [
     { repo: 'demo', branch: 'main', reason: 'dirty', worktree: '/w/demo', status: ' M a.ts' },
   ],
   ['issue.auto_accepted', { repo: 'demo', issue: 12 }],
+  ['proposal.auto_accepted', { repo: 'demo', proposalId: 'proposal-1', runId: 'run-1' }],
+  ['proposal.accepted', { repo: 'demo', proposalId: 'proposal-1', runId: 'run-1' }],
+  // The reason is a human's own words, kept as written: English here, so the check below holds.
+  ['proposal.rejected', { repo: 'demo', proposalId: 'proposal-1', reason: 'a duplicate' }],
+  [
+    'scout.completed',
+    { scoutId: 's-1', repo: 'demo', created: 2, auto: 1, pending: 1, backlog: true },
+  ],
   ['scout.started', { scoutId: 's-1', repo: 'demo', trigger: 'auto' }],
   ['scout.started', { scoutId: 's-1', repo: 'demo', trigger: 'manual' }],
   ['scout.completed', { scoutId: 's-1', repo: 'demo', created: 3, auto: 1, pending: 2 }],
@@ -428,6 +436,56 @@ describe('globalEventText', () => {
     );
   });
 
+  it('says a scout of the local backlog wrote proposals there rather than issues', () => {
+    const data = { repo: 'demo', created: 3, auto: 1, pending: 2, backlog: true };
+    expect(text('scout.completed', data)).toBe(
+      '侦察 demo 完成，写入了 3 条本地提案，其中 1 条自动采纳、2 条等人采纳或拒绝',
+    );
+    expect(text('scout.completed', { repo: 'demo', created: 0, backlog: true })).toBe(
+      '侦察 demo 完成，没有提出新的本地提案',
+    );
+    setLang('en');
+    expect(text('scout.completed', data)).toBe(
+      'Scouting demo finished with 3 proposals for the local backlog: 1 accepted automatically and 2 waiting for a human',
+    );
+    expect(text('scout.completed', { ...data, created: 1, auto: 0, pending: 1 })).toBe(
+      'Scouting demo finished with 1 proposal for the local backlog: 1 waiting for a human',
+    );
+    expect(text('scout.completed', { repo: 'demo', created: 0, backlog: true })).toBe(
+      'Scouting demo finished without proposing anything for the local backlog',
+    );
+  });
+
+  it('says a local proposal was accepted, by a human or not, or rejected and why', () => {
+    const accepted = { repo: 'demo', proposalId: 'proposal-1', runId: 'run-7' };
+    expect(text('proposal.auto_accepted', accepted)).toBe(
+      '自动采纳了 demo 的一条本地提案，用它的正文建了 Run run-7',
+    );
+    expect(text('proposal.accepted', accepted)).toBe(
+      '采纳了 demo 的一条本地提案，用它的正文建了 Run run-7',
+    );
+    const rejected = { repo: 'demo', proposalId: 'proposal-1', reason: '和已有的重复' };
+    expect(text('proposal.rejected', rejected)).toBe(
+      '拒绝了 demo 的一条本地提案，理由：和已有的重复；之后的侦察会看到这条理由',
+    );
+    expect(text('proposal.accepted', {})).toBe(
+      '采纳了 某个仓库 的一条本地提案，用它的正文建了 Run',
+    );
+    setLang('en');
+    expect(text('proposal.auto_accepted', accepted)).toBe(
+      'Accepted a local proposal of demo automatically and created Run run-7 from its text',
+    );
+    expect(text('proposal.accepted', accepted)).toBe(
+      'Accepted a local proposal of demo and created Run run-7 from its text',
+    );
+    expect(text('proposal.rejected', { ...rejected, reason: 'a duplicate' })).toBe(
+      'Rejected a local proposal of demo because: a duplicate; later scouts are shown the reason',
+    );
+    expect(text('proposal.rejected', { repo: 'demo' })).toBe(
+      'Rejected a local proposal of demo; later scouts are shown it with the reason',
+    );
+  });
+
   it('describes every global event in both languages, without Chinese left in English', () => {
     for (const [type, data] of SAMPLES) {
       expect(text(type, data), type).toBeTruthy();
@@ -498,6 +556,20 @@ describe('globalEventLink', () => {
     expect(globalEventLink(ev('master.restarted'))).toBeNull();
     setLang('en');
     expect(globalEventLink(ev('scout.completed'))).toEqual({
+      href: '#/issues',
+      label: 'See issues',
+    });
+  });
+
+  it('links an accepted local proposal to its Run, and a rejected one to the Issues page', () => {
+    const run = { href: '#/runs/run-7', label: '查看 Run' };
+    const issues = { href: '#/issues', label: '查看需求' };
+    expect(globalEventLink(ev('proposal.auto_accepted', { runId: 'run-7' }))).toEqual(run);
+    expect(globalEventLink(ev('proposal.accepted', { runId: 'run-7' }))).toEqual(run);
+    expect(globalEventLink(ev('proposal.accepted'))).toEqual(issues);
+    expect(globalEventLink(ev('proposal.rejected', { reason: 'x' }))).toEqual(issues);
+    setLang('en');
+    expect(globalEventLink(ev('proposal.rejected'))).toEqual({
       href: '#/issues',
       label: 'See issues',
     });

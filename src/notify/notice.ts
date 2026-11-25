@@ -311,6 +311,12 @@ export function noticeFor(event: EventRow, goal: string | undefined): Notice | n
         about: 'issues',
       };
     }
+    case 'proposal.auto_accepted':
+    case 'proposal.accepted':
+    case 'proposal.rejected':
+      // A local proposal decided, by auto-accept or by a human on the dashboard: nobody has to
+      // act on it. Those left for a human were told once, when the scout that filed them ended.
+      return null;
     case 'scout.failed':
       // A single failure only backs off; told once, when the failures in a row reach the
       // threshold. Events from before the streak was recorded have none and are not told.

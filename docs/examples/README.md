@@ -47,7 +47,7 @@ cp docs/examples/workflows/*.yaml ~/.ares1/workflows/
 
 在看板的「仓库」页填：
 
-- **名称**：只能包含字母、数字、`.`、`_`、`-`。`config.yaml` 的 `github.repos` 按这个名字找仓库。
+- **名称**：只能包含字母、数字、`.`、`_`、`-`。`config.yaml` 的 `github.repos` 和 `backlog.repos` 按这个名字找仓库。
 - **路径**：本地仓库的绝对路径。每个 Run 都会从这里建一个独立的 git worktree，在里面干活。
 - **目标分支**：合并进哪个分支；不填就用仓库当前检出的分支。
 - **准备命令**：每个 Run 建好工作目录后运行一次，通常是安装依赖。每个 Run 的工作目录都是新的，所以每次都要装。有一条失败，Run 就结束、标为失败，从 issue 来的会自动重做。

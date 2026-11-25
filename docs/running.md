@@ -18,7 +18,7 @@ node dist/cli.js      # 数据目录 ~/.ares1（或 $ARES1_HOME），端口 4870
 
 | 路径 | 内容 |
 |---|---|
-| `config.yaml` | 全局配置：语言、端口、同时执行几个 Run、GitHub、通知、自动升级 |
+| `config.yaml` | 全局配置：语言、端口、同时执行几个 Run、GitHub、本地提案池、通知、自动升级 |
 | `agents.yaml` | Agent 定义（CLI + 模型 + 运行参数） |
 | `workflows/` | 流程模板（仓库也可以自带，见「仓库自带的流程模板」） |
 | `data/ares1.db` | 运行状态（SQLite），升级迁移前自动备份成 `ares1.db.bak-v<版本>-<时间>`，只保留最近 5 份，更早的在迁移成功后自动删掉；旧版本遇到比自己新的库时恢复备份，较新的库改名成 `ares1.db.newer-v<版本>-<时间>` 留着（见「稳定副本和自动升级」） |
@@ -46,13 +46,13 @@ Agent CLI 的原始输出（stream-json）带着工具调用的完整结果：�
 
 ### 全局事件
 
-Master 把不属于任何 Run 的事记成全局事件（事件的 Run 为空）：上一个 Master 异常退出（`master.restarted`）、清理原始日志（`logs.pruned`）、恢复数据库备份（`store.backup_restored`）、node 不见了（`master.node_missing`）、打开或关闭工作开关（`master.working`）、配置重新加载（`config.reloaded`、`config.reload_failed`）、访问 GitHub 出错（`github.error`，同一串连续失败里同一个错误只记一次，见「通知」）、webhook 通知发送失败（`notify.webhook_failed`）、系统通知发送失败（`notify.system_failed`）、推送目标分支（`github.pushed`）、从 GitHub 拉取目标分支（`github.pulled`、`github.merged_remote`、`github.diverged`、`github.diverged_run`、`github.pull_blocked`，见「拉取 GitHub 上的新提交」）、自动采纳提案（`issue.auto_accepted`）、侦察（`scout.started`、`scout.completed`、`scout.failed`、`scout.rate_limited`）和升级（`upgrade.started`、`upgrade.done`、`upgrade.failed`）。这篇文档里说「事件列表里记一条」这些事件的地方，都指这里。
+Master 把不属于任何 Run 的事记成全局事件（事件的 Run 为空）：上一个 Master 异常退出（`master.restarted`）、清理原始日志（`logs.pruned`）、恢复数据库备份（`store.backup_restored`）、node 不见了（`master.node_missing`）、打开或关闭工作开关（`master.working`）、配置重新加载（`config.reloaded`、`config.reload_failed`）、访问 GitHub 出错（`github.error`，同一串连续失败里同一个错误只记一次，见「通知」）、webhook 通知发送失败（`notify.webhook_failed`）、系统通知发送失败（`notify.system_failed`）、推送目标分支（`github.pushed`）、从 GitHub 拉取目标分支（`github.pulled`、`github.merged_remote`、`github.diverged`、`github.diverged_run`、`github.pull_blocked`，见「拉取 GitHub 上的新提交」）、自动采纳提案（`issue.auto_accepted`）、本地提案的采纳和拒绝（`proposal.auto_accepted`、`proposal.accepted`、`proposal.rejected`，见「不用 GitHub 时」）、侦察（`scout.started`、`scout.completed`、`scout.failed`、`scout.rate_limited`）和升级（`upgrade.started`、`upgrade.done`、`upgrade.failed`）。这篇文档里说「事件列表里记一条」这些事件的地方，都指这里。
 
 Master 大部分时间没人看着，人回来时在看板的「事件」页查这段时间发生过什么：
 
 - 最新的在前，每页 200 条，底部「加载更早的」往前翻；有新的全局事件时自动刷新。
 - 每条有时间、类型和一句说明：比如删了几个原始日志、多大，上一个 Master 的 pid 和启动时间，恢复了哪个备份、较新的库移到了哪里。出错的（`github.error`、`notify.webhook_failed`、`notify.system_failed`、`config.reload_failed`、`upgrade.failed`、`scout.failed`）标成红色，值得留意的（`master.restarted`、`master.node_missing`、`store.backup_restored`、`github.diverged`、`github.pull_blocked`，有无效配置项的 `config.reloaded`）标成橙色，其余的（包括建了合并 Run 的 `github.diverged_run`：要留意的分叉由同时记的 `github.diverged` 标出）不标颜色。分叉交给 Run 处理时，`github.diverged` 的说明写「已交给 Run <id> 处理」，不再要你手动合并。升级失败带着脚本输出末尾时可以展开看。鼠标悬停在说明上能看到原始数据。
-- 侦察和自动采纳的事件带着去「需求」页的链接；交给 Run 的 `github.diverged` 和 `github.diverged_run` 带着去这个 Run 的链接。
+- 侦察、自动采纳和拒绝本地提案的事件带着去「需求」页的链接；交给 Run 的 `github.diverged` 和 `github.diverged_run`，以及采纳本地提案建出了 Run 的 `proposal.accepted`、`proposal.auto_accepted` 带着去这个 Run 的链接。
 - 看板还不认识的事件类型（以后新加的）照样列出，显示类型名和原始数据。
 - 每个 Run 自己的事件不在这里，在 Run 详情页。
 
@@ -68,8 +68,8 @@ Ares.1 自己的仓库就带着 [`.ares1/workflows/self-dev.yaml`](../.ares1/wor
 
 - **放在哪**：仓库目标分支上的 `.ares1/workflows/*.yaml`（`.yml` 也行），格式和数据目录里的模板完全一样，id 是文件里写的 `id`。只看这个目录里的文件，不看子目录和符号链接。
 - **只读已提交的**：Master 读目标分支所在的那个提交里的文件（`git ls-tree`、`git cat-file`），不碰工作目录。目标分支检出的目录里没提交的改动、别的分支上的改动都不算。目标分支指 Master 在本地合并 Run 用的那个分支（看板「仓库」页登记的）。
-- **什么时候重新读**：Master 启动时（在恢复 Run 和检查 GitHub 之前）；Run 合并进目标分支之后；从 GitHub 拉取到新提交（`github.pulled`、`github.merged_remote`）之后；每轮检查 GitHub（每 `poll_minutes` 分钟）开始时，人直接提交到本地目标分支的改动在这时读到；在看板「仓库」页增加、修改或删除仓库之后。目标分支还在同一个提交时不重新读。文件内容变了时，配置重新加载，事件列表里记一条 `config.reloaded`；只是提交变了、文件没变时只更新记下的提交，不记事件。目标分支读不出来（目录或分支没了、git 出错）时，沿用之前从同一路径、同一分支读到的文件，在 Master 的输出（`master.out`）里记一行原因，同样的错误连着出现只记一次。
-- **怎么找**：`config.yaml` 里 `github.repos.<仓库>.template` 写的 id，先在数据目录的 `workflows/` 里找，找不到再在这个仓库自带的模板里找。数据目录里的算这台机器的覆盖，由在这台机器上的人说了算。两边有同一个 id 时用数据目录那份，看板「配置」页在仓库那个文件（键是 `<仓库名>:.ares1/workflows/<文件>`）的警告里写明仓库里这份没有生效、数据目录里是哪个文件，以及想改用仓库里的就删掉数据目录里那个文件。两边都没有时，和以前一样在 `config.yaml` 下报「模板不存在或无效」，不建 Run。
+- **什么时候重新读**：Master 启动时（在恢复 Run 和检查 GitHub 之前）；Run 合并进目标分支之后；从 GitHub 拉取到新提交（`github.pulled`、`github.merged_remote`）之后；每轮检查 GitHub（每 `github.poll_minutes` 分钟）或本地提案池（每 `backlog.poll_minutes` 分钟）开始时，人直接提交到本地目标分支的改动在这时读到；在看板「仓库」页增加、修改或删除仓库之后。目标分支还在同一个提交时不重新读。文件内容变了时，配置重新加载，事件列表里记一条 `config.reloaded`；只是提交变了、文件没变时只更新记下的提交，不记事件。目标分支读不出来（目录或分支没了、git 出错）时，沿用之前从同一路径、同一分支读到的文件，在 Master 的输出（`master.out`）里记一行原因，同样的错误连着出现只记一次。
+- **怎么找**：`config.yaml` 里 `github.repos.<仓库>.template`（或 `backlog.repos.<仓库>.template`）写的 id，先在数据目录的 `workflows/` 里找，找不到再在这个仓库自带的模板里找。数据目录里的算这台机器的覆盖，由在这台机器上的人说了算。两边有同一个 id 时用数据目录那份，看板「配置」页在仓库那个文件（键是 `<仓库名>:.ares1/workflows/<文件>`）的警告里写明仓库里这份没有生效、数据目录里是哪个文件，以及想改用仓库里的就删掉数据目录里那个文件。两边都没有时，和以前一样在 `config.yaml` 下报「模板不存在或无效」，不建 Run。
 - **只对本仓库可见**：仓库自带的模板只给这个仓库的 Run 用，别的仓库写同一个 id 也找不到它。它们的 id 只和同一个仓库里的其他文件比，不和数据目录、别的仓库比。
 - **坏了会怎样**：目标分支上的模板改坏了（YAML 不合法、不符合格式、引用了不存在或没启用的 Agent 等），仓库也不会停转：继续用这个文件上次加载成功的版本，「配置」页在这个文件的警告里写明这次为什么失败、在用的是哪个提交上的版本。上次成功的版本只记在内存里，所以 Master 重启时目标分支上的文件还是坏的，就没有能用的版本：这个文件记为错误，按模板不存在处理，用它的仓库不建新的 Run。改好并提交到目标分支，下次重新读时就恢复。已经建好的 Run 用的是建 Run 时存下的模板，都不受影响。
 - **合并前先试加载**：Run 的分支改了 `.ares1/workflows/`（和合入后的目标分支不一样）时，合并阶段在合入目标分支的最新代码之后、重跑检查命令之前，用当前配置里的 Agent，把 Run 分支上已提交的这些文件试加载一遍；这里没有「上次成功的版本」兜底。有文件加载失败就不合并，和检查命令没通过一样：合并阶段标为没通过，合并阶段的检查里记一条「流程模板（.ares1/workflows/）」，回退到合并阶段 `on_fail` 指向的阶段（默认是它前面最近的 Agent 阶段，通常是编码）返工，反馈里逐个列出文件和加载错误，要求改好或撤回这些改动；和别的回退一样受 `max_loops` 限制，用完后按 `on_exhausted` 处理（默认 Run 结束、标为失败）。所以坏模板进不了目标分支。Run 没动这个目录时不试加载。
@@ -87,7 +87,7 @@ Master 只在数据目录里还没有 `workflows/` 目录时（第一次启动�
 
 ## 接入 GitHub
 
-Run 从 GitHub issue 来。例外只有一种：目标分支和 GitHub 上的分叉、Master 自己合并不了时，它自动建一个不关联 issue 的 Run 来合并（见「交给 Run 合并」）。
+接了 GitHub 的仓库（`github.repos`），Run 从 GitHub issue 来。例外只有一种：目标分支和 GitHub 上的分叉、Master 自己合并不了时，它自动建一个不关联 issue 的 Run 来合并（见「交给 Run 合并」）。不接 GitHub 的仓库从本地提案池建 Run，见下面的「不用 GitHub 时」。
 
 1. 安装并登录 [gh](https://cli.github.com/)。登录了多个账号时，在 `config.yaml` 的 `github.account` 里指定用哪个。
 2. 在看板的「仓库」页登记本地仓库：填仓库名、绝对路径、目标分支和检查命令。常见语言的项目怎么填检查命令和准备命令，见 [`docs/examples/`](examples/README.md#在看板上登记仓库)。
@@ -326,7 +326,112 @@ github:
 
 ## 不用 GitHub 时
 
-没有 GitHub 的仓库（本地仓库、托管在别处的项目）写在 `config.yaml` 的 `backlog.repos` 里，需求来自 Master 自己保存的本地提案池：侦察的提案存在 Master 里，在自动采纳范围内的直接建成 Run，其余的等人在看板上采纳或填理由拒绝。这一切都不调用 GitHub。
+不是每个仓库都能接 GitHub：只在本机的仓库、没有 GitHub 账号的环境，以及托管在 GitLab 或内网的项目，都没有 GitHub issue 可用。这些仓库写在 `config.yaml` 的 `backlog.repos` 里，需求来自 Master 自己保存的本地提案池：AI 侦察的提案存在 Master 的数据库里，在自动采纳范围内的直接建成 Run，其余的等人在看板上采纳，或者填上理由拒绝。整个过程不调用 GitHub，也不需要装 gh，仓库照样能自己侦察、自己采纳、自己建 Run，一直转下去。
+
+### 配置
+
+```yaml
+backlog:
+  poll_minutes: 5              # 多久检查一次本地提案池，默认 5，可以写小数
+  repos:
+    my-local-repo:             # 看板「仓库」页登记的仓库名
+      template: self-dev       # 采纳的提案建 Run 用的模板
+      scout:                   # 不写 = 不侦察，这个仓库就没有提案、不会有 Run
+        agent: claude-reviewer # 以只读方式运行，要用支持只读的 CLI（claude-code、codex）的 Agent
+        auto: true             # 默认 true：仓库没有会自己往下走的 Run 时自动侦察；false = 只在看板上手动触发
+        interval_minutes: 120  # 两次自动侦察至少间隔几分钟，默认 0（不限）
+        max_proposals: 3       # 一次最多提几条，默认 5（1 到 20）
+      auto_accept:
+        max_risk: low          # 自动采纳到哪个风险等级：none（默认，都由人采纳）/ low / mid / high
+        max_size: M            # 自动采纳到哪个大小：S / M / L（默认）
+        max_per_day: 5         # 每天最多自动采纳几条；不写 = 不限
+      auto_merge: false        # true = 采纳的提案建出的 Run 合并前不等人审批（模板里其他阶段的审批照旧）；默认 false
+      daily_budget_usd: 10     # 当天侦察和自动采纳的 Run 一共花到这么多（美元）后停止这些自动行为，第二天恢复；不写 = 不限
+```
+
+- `repos` 的键是看板「仓库」页登记的仓库名，必须和那里的一模一样。写在这里但没登记的仓库什么都不做，看板上写明「没有在看板上登记」。
+- `template`、`scout`、`auto_accept`、`auto_merge`、`daily_budget_usd` 的含义、默认值和校验都和 `github.repos` 里的同名字段一样（两边用同一份格式定义），模板也一样先在数据目录的 `workflows/` 里找，再在仓库自带的 `.ares1/workflows/` 里找（见「仓库自带的流程模板」）。`issues_repo`、`push`、`deliver`、`max_run_attempts` 是 GitHub 才有的，写在这里和写错的键一样，`config.yaml` 校验不通过。
+- 一个仓库只能选一种需求来源：同一个仓库名同时写在 `github.repos` 和 `backlog.repos` 里是配置错误，看板「配置」页在 `config.yaml#backlog.repos.<仓库名>` 下写明原因。这时 `backlog.repos` 里的设置不生效，GitHub 一侧照常工作，手动侦察也按 GitHub 侦察。
+- 某个仓库配置有误（比如模板不存在、侦察用的 Agent 不存在或没启用）时只停用这个仓库，看板「配置」页同样在 `config.yaml#backlog.repos.<仓库名>` 下写明原因，别的仓库照常工作。
+- 和 `github` 一样，改了保存后自动生效，不用重启。不写 `backlog` 就不用本地提案池。
+- 合并只合进本地的目标分支，Master 不推送；要推送到 GitLab 或内网的服务器，自己 `git push`。
+
+[`docs/examples/config.yaml`](examples/config.yaml) 里也有一个用本地提案池的仓库（`my-intranet-tool`）。
+
+### 侦察怎么调度
+
+本地提案池有自己的定时器，不管配没配 `github` 都会转：Master 启动约 2 秒后检查一次，之后每 `backlog.poll_minutes` 分钟一次；打开工作开关时马上检查一次。每一轮先重新读各仓库自带的模板（目标分支动了的话），再逐个仓库：
+
+1. 配置有误或没在看板上登记的仓库跳过，原因记下来显示在看板上。
+2. 工作开关关着时什么都不自动做，看板上写明「工作开关已关闭」。
+3. 把还没处理、在自动采纳范围内的提案按从早到晚自动采纳（见下面的「自动采纳」）。
+4. 看能不能自动侦察，能就开始一次侦察。
+
+自动侦察等什么，和 GitHub 仓库的规则完全一样（同一套代码，见「接入 GitHub」）：
+
+- `scout.auto` 为 `false` 时只在看板上手动触发；这个仓库正在侦察时不再开始。
+- 仓库有会自己往下走的 Run（排队的、执行中的、等回复但设了超时的、因为目标分支有未提交的改动而停下的）时，等它们做完。只等人的 Run 不挡侦察。Master 等着自动升级时也不侦察。
+- 当天的自动花费达到 `daily_budget_usd` 时不侦察，第二天恢复。
+- 离上次侦察不到 `scout.interval_minutes`。
+- 退避：从最近一次侦察往回数，连续 k 次一条提案都没写进提案池或失败时，下次自动侦察要等 `poll_minutes × 2^(k-1)` 分钟，最长 6 小时。有侦察写进了提案，或者目标分支有了比最近那次侦察更新的提交，退避马上解除。
+- 侦察的 Agent 额度用尽或被限流时，等额度恢复。
+- 等你处理的提案加上卡住的 Run 达到 `scout.max_proposals` 时不再侦察，免得堆积没人看的工作。`auto_accept.max_risk` 为 `none` 时所有待处理的提案都算；开了自动采纳时只算在采纳范围内、因为当天条数或预算用完还没采纳的，超出范围、等你决定的提案不会让侦察停下（否则没人在场时仓库就停转了），侦察在提示词里看得到它们，不会重复提。
+
+间隔、退避和等额度同时生效，取最晚的时间。看板「需求」页每个仓库的「侦察」一行写明现在为什么没有自动侦察，有时间的写到几点之后。在看板上点「让 AI 找活」手动侦察不受这些等待限制（正在侦察或仓库配置有误时不能点），但它的结果照样计入退避和连续失败的计数。侦察连续失败 3 次时通知一次（见「通知」）。
+
+侦察的提示词、输出格式和 GitHub 仓库的一样，只是「已有的 issue」换成这个仓库的本地提案，分三节：
+
+- 等人决定的（最多列 100 条）；
+- 已采纳的（最多 50 条），带建出的 Run 和它现在的状态、是不是自动采纳的；Run 失败了写失败原因，需求评估结论为不做的写不做的理由；
+- 被拒绝的，连同拒绝的理由，作为不要再提的反例。不管多早被拒绝都列出（最多 300 条），侦察不会换个说法再提同一件事。
+
+待处理和已采纳的提案在「要做什么」里写了后续步骤时，后续步骤也一起列出，前一步做完后侦察会接着提下一步。侦察照旧以只读方式运行，拿不到 GitHub 凭据（见「Agent 拿不到 GitHub 凭据」）。
+
+### 提案怎样写进提案池
+
+侦察结束后，它提的每条提案（最多 `max_proposals` 条）都写成提案池里的一条记录：标题、类别、大小、风险、为什么、证据、要做什么、验收标准、来自哪次侦察，状态为「待处理」（`pending`）。在自动采纳范围内的马上采纳（见下面），其余的留着等人。看板「需求」页的侦察记录里，这些提案标着「已写入本地提案」，自动采纳的另有「已自动采纳」。事件列表里记一条 `scout.completed`，数据里有 `created`（写进了几条）、`auto`（其中自动采纳了几条）、`pending`（留着等人的几条）和 `backlog: true`，看板「事件」页写成「侦察 <仓库> 完成，写入了 N 条本地提案……」。
+
+提案池的记录存在数据库的 `proposals` 表里，不会过期；在看板「仓库」页删掉仓库时，它的提案一起删掉。
+
+### 自动采纳
+
+判断范围的规则和 GitHub 仓库的是同一条：侦察给提案标的风险不超过 `max_risk`、大小也不超过 `max_size` 时自动采纳；`max_risk` 为 `none` 时一条都不自动采纳。另外还要同时满足：
+
+- 工作开关开着；
+- 当天这个仓库自动采纳的条数（按 `proposal.auto_accepted` 事件数）还没到 `max_per_day`；
+- 当天的自动花费还没到 `daily_budget_usd`。自动花费算的是这个仓库今天的侦察，加上今天从自动采纳的提案建出的 Run；你在看板上手动采纳建出的 Run 不算。
+
+满足时，侦察写进提案时就马上采纳；当时不满足的（工作开关关着、条数或预算用完），以及之后放宽了设置才落进范围的，留在「待处理」，之后每一轮检查按从早到晚补上采纳，直到条数或预算再次用完。
+
+采纳（不管是自动的还是人手动的）就是用提案正文建一个 Run：模板是这个仓库的 `template`，目标是提案的标题，后面依次是「为什么」「证据」「要做什么」「验收标准」，和侦察在 GitHub 上建的 issue 正文一样；`auto_merge: true` 时这个 Run 合并前不等人审批，模板里其他阶段的审批照旧。之后的需求评估、编码、评审、合并都和别的 Run 一样。建 Run 和把提案标成「已采纳」（`accepted`，记下 Run 的 id 和是不是自动采纳的）在一起完成，事件列表里记一条 `proposal.auto_accepted`（自动采纳）或 `proposal.accepted`（人在看板上采纳），数据是 `{ repo, proposalId, runId }`。建 Run 失败时（比如模板这时不存在了），提案保持「待处理」，原因显示在看板「本地提案」最上面的卡片里，下一轮再试。
+
+### 在看板上采纳或拒绝
+
+看板「需求」页的「本地提案」一节：
+
+- 最上面一张卡片说明本地提案池怎么转，写着多久检查一次、上次检查的时间，有「立即检查」按钮（不等下一轮，马上自动采纳、该侦察时侦察），上一轮检查有没做成的事时写明原因。
+- 每个仓库一张卡片：用的模板和它来自数据目录还是仓库、侦察的 Agent 和调度方式（以及现在为什么没有自动侦察）、自动采纳的范围和今天已经自动采纳了几条、合并前要不要审批、今天的自动花费和预算，以及「让 AI 找活」按钮。只配了 `backlog`、没配 `github` 的仓库也能在这里手动侦察。
+- 卡片下面是这个仓库的提案，待处理的排在前面（新的在前），之后是已经决定的（最近决定的在前）。看板加载全部待处理的提案和最近的 50 条，更早决定的不显示（仍在数据库里，侦察照样看得到）。每条显示状态、标题、风险、类别、大小和提出的时间，点开能看为什么、证据、要做什么和验收标准。
+- 待处理的提案写明它在不在自动采纳范围内：在范围内只是还没采纳（条数、预算或工作开关），之后会自动采纳；不在范围内就等你决定。点「采纳」马上用它建 Run，不受 `max_per_day` 和预算限制（这是人的决定）；仓库已经不在 `backlog.repos` 里或配置有误时不能采纳。要拒绝，先在输入框里写理由（必填，理由为空时「拒绝」按钮不能点），再点「拒绝」「确认拒绝」。拒绝后提案标成「已拒绝」（`rejected`），事件列表里记一条 `proposal.rejected`，数据是 `{ repo, proposalId, reason }`。
+- 已采纳的提案显示建出的 Run 的链接和状态，自动采纳的标着「已自动采纳」；已拒绝的显示拒绝的理由。
+- 被拒绝的提案连同理由会出现在这个仓库之后每次侦察的提示词里（上面「侦察怎么调度」里的「被拒绝的」一节），作为反例：理由写得越具体（为什么不做、什么情况下才值得做），侦察越不会再提类似的东西。
+- 从 `backlog.repos` 里拿掉的仓库，如果还有提案，仍然列在这里，写明已经不在 `backlog.repos` 里：不再侦察、不能采纳，待处理的还可以拒绝。
+
+页面在有提案写入、采纳、拒绝，侦察开始或结束，建了新 Run、Run 状态变化，以及配置重新加载时自动刷新。
+
+### 通知
+
+规则和 GitHub 仓库的一样（`src/notify/notice.ts`），通过浏览器、系统通知和 webhook 三条通道发（见「通知」）：
+
+- 侦察结束时，有留着等人的提案（`scout.completed` 的 `pending` 大于 0）就通知「有提案等你决定：N 条」，正文说明这些提案没有自动采纳（太大、超出自动采纳的风险，或今天的自动采纳额度用完了），去看板的需求页上采纳或拒绝；点开是「需求」页。每次侦察只通知一次。
+- 采纳、自动采纳和拒绝提案都不通知：要么是人自己做的，要么不需要人。
+- 侦察连续失败 3 次时通知「侦察连续失败：<仓库名>」，和 GitHub 仓库一样。
+- 从提案建出的 Run 和别的 Run 一样：等审批、卡住、失败时通知。
+
+### 暂时还不支持的
+
+- 本地提案的 Run 失败后自动重做：GitHub 仓库的 issue 失败后会按 `max_run_attempts` 带着失败原因自动重做（见「Run 失败后自动重做」），本地提案还不会。Run 失败了就停在失败，提案保持「已采纳」；失败原因会出现在之后侦察的提示词里（「已采纳的」一节），侦察可以换个思路重新提案。`max_run_attempts` 现在也不能写在 `backlog.repos` 里。
+- GitLab 等其他代码托管平台：还不能读写 GitLab 的 issue、开 MR。托管在 GitLab 或内网的项目现在先用本地提案池，合并后自己推送。
 
 ### 本地提案池的 API
 

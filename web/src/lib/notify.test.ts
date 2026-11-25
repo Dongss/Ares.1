@@ -46,6 +46,8 @@ describe('noticeFor', () => {
 });
 
 describe('noticeFor automation', () => {
+  afterEach(() => setLang('zh'));
+
   it('notifies only proposals that wait for a human, linking to the issues page', () => {
     expect(
       noticeFor(ev('scout.completed', { created: 3, auto: 1, pending: 2 }, null), undefined),
@@ -71,6 +73,25 @@ describe('noticeFor automation', () => {
     // Out of quota passes on its own: the automatic scout waits for it, nobody needs to act.
     const limited = { scoutId: 's', repo: 'demo', retryAt: '2026-11-19T01:00:00.000Z' };
     expect(noticeFor(ev('scout.rate_limited', limited, null), undefined)).toBeNull();
+  });
+
+  it('sends proposals of the local backlog to the Issues page, and not their decisions', () => {
+    const scout = { repo: 'demo', created: 3, auto: 1, pending: 2, backlog: true };
+    expect(noticeFor(ev('scout.completed', scout, null), undefined)).toEqual({
+      title: '有提案等你决定：2 条',
+      body: '这些提案没有自动采纳（太大、超出自动采纳的风险，或今天的自动采纳额度用完了），去看板的需求页上采纳或拒绝',
+      href: '#/issues',
+      tag: 'ares1-event-42',
+    });
+    // Accepted by auto-accept or a human, or rejected by a human: nobody has to act.
+    const decided = { repo: 'demo', proposalId: 'proposal-1', runId: 'run-1', reason: 'x' };
+    for (const type of ['proposal.auto_accepted', 'proposal.accepted', 'proposal.rejected']) {
+      expect(noticeFor(ev(type, decided, null), undefined), type).toBeNull();
+    }
+    setLang('en');
+    const en = noticeFor(ev('scout.completed', scout, null), undefined);
+    expect(en?.title).toBe('Proposals waiting for your decision: 2');
+    expect(`${en?.title} ${en?.body}`).not.toMatch(/[一-鿿]/);
   });
 
   it('notifies failures of GitHub access and upgrades', () => {

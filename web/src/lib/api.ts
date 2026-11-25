@@ -1,19 +1,22 @@
 import type {
   AgentEventRecord,
   AgentSummary,
+  BacklogStatus,
   ConfigView,
   DiffView,
   GitHubStatus,
   HealthView,
   KeptWorkspace,
   NotifyTestResult,
+  ProposalAccepted,
+  ProposalView,
   RunDetail,
   RunSummary,
   StatsView,
   UpgradeStatus,
 } from '../../../src/api/types.js';
 import { t } from '../../../src/i18n.js';
-import type { EventRow, Repo, Run, Scout } from '../../../src/store/types.js';
+import type { EventRow, ProposalStatus, Repo, Run, Scout } from '../../../src/store/types.js';
 import { type StatsFilter, statsQuery } from './stats.js';
 
 export class ApiError extends Error {
@@ -121,7 +124,27 @@ export const api = {
   upgradeCheck: () => request<UpgradeStatus>('POST', '/api/upgrade/check'),
   scouts: () => request<Scout[]>('GET', '/api/scouts'),
   stats: (filter: StatsFilter) => request<StatsView>('GET', `/api/stats?${statsQuery(filter)}`),
+  /** A scout by hand, whichever source the repo's requirements come from (GitHub or backlog). */
   startScout: (repo: string) => request<Scout>('POST', '/api/scouts', { repo }),
+
+  /** The local backlog of the repos without GitHub (backlog.repos). */
+  backlog: () => request<BacklogStatus>('GET', '/api/backlog'),
+  backlogPoll: () => request<BacklogStatus>('POST', '/api/backlog/poll'),
+  /** Proposals of the local backlog, newest first. */
+  proposals: (opts: { repo?: string; status?: ProposalStatus; limit?: number } = {}) => {
+    const q = new URLSearchParams();
+    if (opts.repo !== undefined) q.set('repo', opts.repo);
+    if (opts.status !== undefined) q.set('status', opts.status);
+    if (opts.limit !== undefined) q.set('limit', String(opts.limit));
+    const qs = q.toString();
+    return request<ProposalView[]>('GET', `/api/proposals${qs ? `?${qs}` : ''}`);
+  },
+  /** Accepting creates a Run whose goal is the proposal's text. */
+  acceptProposal: (proposalId: string) =>
+    request<ProposalAccepted>('POST', `/api/proposals/${id(proposalId)}/accept`),
+  /** The reason is required; the repo's next scouts are shown it. */
+  rejectProposal: (proposalId: string, reason: string) =>
+    request<ProposalView>('POST', `/api/proposals/${id(proposalId)}/reject`, { reason }),
 };
 
 export const urls = {

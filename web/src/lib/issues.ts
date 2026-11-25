@@ -16,7 +16,7 @@ import { formatCost, formatMinutes, formatTime, type Tone } from './format.js';
 // the language in use when read, not when this module is imported.
 
 /** A badge whose label is picked in the language in use when read. */
-function badge(zh: string, en: string, tone: Tone): { readonly label: string; tone: Tone } {
+export function badge(zh: string, en: string, tone: Tone): { readonly label: string; tone: Tone } {
   return {
     get label() {
       return t({ zh, en });
@@ -147,6 +147,20 @@ export function scoutWaitText(
     zh: `${waiting.reason}（${until} 之后）`,
     en: `${waiting.reason} (after ${until})`,
   });
+}
+
+/**
+ * How often the Master checks a source of requirements and when it last did: 「每 5 分钟检查一次
+ * · 上次 09:30:00」 / "Checks every 5 minutes · last 09:30:00".
+ */
+export function pollText(minutes: number, lastPollAt: string | null, now = new Date()): string {
+  const every = t({
+    zh: `每 ${minutes} 分钟检查一次`,
+    en: `Checks every ${minutes} ${minutes === 1 ? 'minute' : 'minutes'}`,
+  });
+  if (!lastPollAt) return every;
+  const last = formatTime(lastPollAt, now);
+  return t({ zh: `${every} · 上次 ${last}`, en: `${every} · last ${last}` });
 }
 
 /** "今天 $3.20 / $20"，达到上限时说明后果。 */
