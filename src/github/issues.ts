@@ -306,6 +306,11 @@ export interface IssueUpdateContext {
   stageName?: string;
   /** The target branch was pushed to GitHub before closing. */
   pushed?: boolean;
+  /**
+   * For a completed Run whose work was merged on GitHub through its pull request (deliver: pr):
+   * the pull request, and the commit its merge put on the target branch when GitHub gave it.
+   */
+  pr?: { number: number; url: string; mergeCommit: string | null };
   /** How long the Run took, split; for a completed Run. */
   times?: RunTimes;
   /**
@@ -563,13 +568,26 @@ export function issueUpdate(run: Run, ctx: IssueUpdateContext): IssueUpdate {
         close: null,
       };
     case 'completed': {
-      const short = run.headCommit?.slice(0, 7);
+      const pr = ctx.pr;
+      // What the target branch got: the pull request's merge, a squash or a rebase of the Run's
+      // commits, else the Run's last commit itself.
+      const short = (pr?.mergeCommit ?? run.headCommit)?.slice(0, 7);
       const sha = short ? t({ zh: `（\`${short}\`）`, en: ` (\`${short}\`)` }) : '';
       const cost = `$${run.costUsd.toFixed(2)}`;
       const stats = [t({ zh: `费用 ${cost}`, en: `cost ${cost}` }), tookText(ctx.times)]
         .filter(Boolean)
         .join(' · ');
       const branch = `\`${ctx.targetBranch}\``;
+      if (pr) {
+        return {
+          label: null,
+          comment: t({
+            zh: `PR #${pr.number} 已合并到 ${branch}${sha}：${pr.url}\n\n${stats}\n\n${link}`,
+            en: `Pull request #${pr.number} was merged into ${branch}${sha}: ${pr.url}\n\n${stats}\n\n${link}`,
+          }),
+          close: 'completed',
+        };
+      }
       return {
         label: null,
         comment: ctx.pushed

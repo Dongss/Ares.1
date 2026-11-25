@@ -66,7 +66,7 @@ import {
   revParse,
   git as runGit,
 } from '../workspace/git.js';
-import { GhCli, type GhIssue, type GitHub } from './client.js';
+import { GhCli, type GhIssue, type GhPullRequest, type GitHub } from './client.js';
 import {
   autoAcceptedComment,
   discussionComment,
@@ -368,6 +368,27 @@ function failedCheck(
   };
 }
 
+/** A Run waiting for its pull request (deliver: pr), and the pull request, merged on GitHub. */
+interface MergedPullRequest {
+  run: Run;
+  pr: GhPullRequest;
+}
+
+/** The pull request a Run's work was merged through, as recorded (`github.pr_merged`). */
+interface MergedPullRequestRecord {
+  number: number;
+  url: string;
+  mergeCommit: string | null;
+}
+
+/** What the Run recorded of its pull request's merge; undefined while it recorded none. */
+function mergedPullRequestOf(store: Store, runId: string): MergedPullRequestRecord | undefined {
+  const data = store.listEvents(runId).findLast((e) => e.type === 'github.pr_merged')?.data;
+  if (!data || typeof data.number !== 'number' || typeof data.url !== 'string') return undefined;
+  const mergeCommit = typeof data.mergeCommit === 'string' ? data.mergeCommit : null;
+  return { number: data.number, url: data.url, mergeCommit };
+}
+
 /** A scout in progress: its agent once started, and the whole scout including the cleanup. */
 interface ScoutEntry {
   scoutId: string;
@@ -423,6 +444,9 @@ export function startOfToday(now = new Date()): string {
  *   budget; then the issue is closed with every failure's reason;
  * - discussion: the requirement assessment's questions and conclusion are posted on the issue,
  *   and a human's replies there go back to the Run;
+ * - pull requests (deliver: pr): a Run whose checks passed pushes its branch and opens a pull
+ *   request into the target branch; once it is merged on GitHub the target branch is pulled and
+ *   the Run completes, once it is closed unmerged the Run fails;
  * - scout: an AI reads the repo and its Run history and proposes issues, on demand or by itself
  *   whenever no Run of the repo goes on by itself (backing off while scouts find nothing or
  *   fail, waiting for the quota when its agent ran out of it, and capping the proposals and
@@ -685,11 +709,12 @@ export class IssueBridge {
 
   /**
    * One round: catch the target branches up with GitHub (`syncTarget`), open the pull requests
-   * of Runs done but for one (deliver: pr), accept proposals the settings allow, start Runs for
-   * ready issues, terminate Runs whose issue a human closed and start over those whose issue a
-   * human changed, catch issues up, pass on replies to the assessments' questions, start a scout
-   * where the repo is idle. With the work switch off only the pulling, the pull requests, the
-   * terminating and the catching up happen: none of them starts new work.
+   * of Runs done but for one (deliver: pr) and follow those opened, accept proposals the
+   * settings allow, start Runs for ready issues, terminate Runs whose issue a human closed and
+   * start over those whose issue a human changed, catch issues up, pass on replies to the
+   * assessments' questions, start a scout where the repo is idle. With the work switch off only
+   * the pulling, the pull requests, the terminating and the catching up happen: none of them
+   * starts new work.
    */
   poll(): Promise<void> {
     return this.serial(async () => {
@@ -711,11 +736,18 @@ export class IssueBridge {
       await this.deps.refreshTemplates?.();
       // First, so that the Runs taken this round start from GitHub's latest commits and the
       // issues closed this round see whether the branch can be pushed.
-      await each((name) => this.syncTarget(name));
+      await each(async (name) => {
+        await this.syncTarget(name);
+      });
       // And of GitHub's commits just pulled, for the Runs taken this round.
       await this.deps.refreshTemplates?.();
       await each(async (name) => {
         if (!(await this.openPullRequests(name))) failed = true;
+      });
+      // Before followIssues: the issue of a Run whose pull request was merged is closed by its
+      // `Closes #N`, and the Run is to complete, not to be terminated for that.
+      await each(async (name) => {
+        if (!(await this.followPullRequests(name))) failed = true;
       });
       if (working) {
         await each((name) => this.acceptBacklog(name));
@@ -748,9 +780,9 @@ export class IssueBridge {
   }
 
   /**
-   * Open the pull requests of Runs that just got to wait for one (deliver: pr), catch issues up
-   * with their Runs now, and redo the failed Runs whose wait before the redo is over (see
-   * redoDueAt): a Run that just failed is not redone right away.
+   * Open the pull requests of Runs that just got to wait for one (deliver: pr) and follow those
+   * opened, catch issues up with their Runs now, and redo the failed Runs whose wait before the
+   * redo is over (see redoDueAt): a Run that just failed is not redone right away.
    */
   sync(): Promise<void> {
     return this.serial(async () => {
@@ -761,6 +793,11 @@ export class IssueBridge {
       for (const name of Object.keys(github.repos)) {
         try {
           await this.openPullRequests(name);
+        } catch (err) {
+          this.report(err);
+        }
+        try {
+          await this.followPullRequests(name);
         } catch (err) {
           this.report(err);
         }
@@ -1038,6 +1075,122 @@ export class IssueBridge {
   }
 
   /**
+   * Follow the pull requests of the repo's Runs that wait for theirs to be merged (`pr_open`,
+   * with the pull request recorded), by what GitHub says of each now, whichever way it was merged
+   * (a merge, a squash or a rebase):
+   * - merged: the local target branch catches up with GitHub's first, then the Run goes on and
+   *   completes (`completeMerged`);
+   * - closed without being merged: the Run fails (`pullRequestClosed`), and is redone or waits
+   *   for a human by the usual rules for failed Runs;
+   * - open: left as it is.
+   * Without push the target branch cannot be pulled: the Runs wait until it is on again. A GitHub
+   * call that fails is reported and leaves the Run as it was, to be tried again the next round;
+   * the other Runs go on. Returns false when some call failed.
+   */
+  private async followPullRequests(name: string): Promise<boolean> {
+    const store = this.deps.store;
+    const repo = store.findRepo(name);
+    if (!repo) return true;
+    const waiting = store
+      .listRuns({ status: 'blocked', repoId: repo.id })
+      .filter((run) => run.blocked?.kind === 'pr_open' && run.pr !== null);
+    if (waiting.length === 0) return true;
+    // Throws while the repo is misconfigured: the Runs wait.
+    const { cfg } = this.repoSetup(name);
+    if (!cfg.push) return true;
+    const full = await this.issuesRepo(repo, cfg);
+    let ok = true;
+    const merged: MergedPullRequest[] = [];
+    for (const run of waiting) {
+      if (this.stopping) return ok;
+      const number = run.pr?.number;
+      if (number === undefined) continue;
+      try {
+        const pr = await this.gh().getPullRequest(full, number);
+        if (pr.state === 'merged') merged.push({ run, pr });
+        else if (pr.state === 'closed') {
+          this.deps.engine.pullRequestClosed(run, { number: pr.number, url: pr.url });
+        }
+      } catch (err) {
+        ok = false;
+        this.report(err);
+      }
+    }
+    if (merged.length === 0) return ok;
+    try {
+      await this.completeMerged(name, repo, merged);
+    } catch (err) {
+      ok = false;
+      this.report(err);
+    }
+    return ok;
+  }
+
+  /**
+   * Pull requests of the repo's Runs that GitHub merged: the local target branch is caught up
+   * with GitHub's (`syncTarget`) unless it has each merge already, and then each Run whose merge
+   * it has goes on (`pullRequestMerged`), which completes it, with the work in the local target
+   * branch too. A Run whose merge the local branch does not have yet waits for the next round,
+   * its pull request still merged on GitHub: the fast-forward was refused (syncTarget records
+   * why, `github.pull_blocked`), the two diverged (merged as syncTarget does), or a Run of the
+   * repo merges meanwhile. A fetch that fails is thrown.
+   */
+  private async completeMerged(
+    name: string,
+    repo: Repo,
+    merged: readonly MergedPullRequest[],
+  ): Promise<void> {
+    let pulled = false;
+    let remote: string | null | undefined;
+    for (const { run, pr } of merged) {
+      if (this.stopping) return;
+      if (!(pr.mergeCommit && (await this.targetHas(repo, pr.mergeCommit)))) {
+        if (!pulled) {
+          remote = await this.syncTarget(name);
+          pulled = true;
+        }
+        // GitHub gives the merge commit of every merged pull request; without it, all that is
+        // known is that its branch has the merge.
+        const commit = pr.mergeCommit ?? remote;
+        if (!commit || !(await this.targetHas(repo, commit))) continue;
+      }
+      this.deps.engine.pullRequestMerged(run, {
+        number: pr.number,
+        url: pr.url,
+        mergeCommit: pr.mergeCommit,
+      });
+    }
+  }
+
+  /** Whether the repo's local target branch has `commit`, which may not be in the clone. */
+  private async targetHas(repo: Repo, commit: string): Promise<boolean> {
+    return isAncestor(repo.path, commit, repo.targetBranch);
+  }
+
+  /**
+   * Whether the Run, whose issue was found closed, delivers its work through a pull request that
+   * was merged: its `Closes #N` closed the issue, or a human did along with merging it, and the
+   * Run is to complete rather than be terminated. A Run that recorded the merge already goes on
+   * by itself. One still waiting has its pull request asked about, and once it is merged, the Run
+   * is moved on as followPullRequests does, or keeps waiting while the local target branch cannot
+   * catch up yet. GitHub errors are thrown, and the Run stays as it is.
+   */
+  private async mergedThroughPullRequest(run: Run): Promise<boolean> {
+    const pr = run.pr;
+    if (!pr) return false;
+    if (mergedPullRequestOf(this.deps.store, run.id)) return true;
+    if (run.status !== 'blocked' || run.blocked?.kind !== 'pr_open') return false;
+    const repo = this.deps.store.getRepo(run.repoId);
+    const cfg = this.cfg.master.github?.repos[repo.name];
+    // Nothing to ask GitHub with: the issue closed by a human ends the Run as before.
+    if (!cfg) return false;
+    const latest = await this.gh().getPullRequest(await this.issuesRepo(repo, cfg), pr.number);
+    if (latest.state !== 'merged') return false;
+    await this.completeMerged(repo.name, repo, [{ run, pr: latest }]);
+    return true;
+  }
+
+  /**
    * Keep `git status` in the clone honest when its origin is the GitHub repo `full`: its
    * remote-tracking branch of the target branch is set to `head`, which GitHub has.
    */
@@ -1070,10 +1223,12 @@ export class IssueBridge {
    *   takes the merge to GitHub. Otherwise a Run's agent merges them, or a human does when no
    *   Run can, and nothing is pushed until then (pushTarget).
    * A fetch that fails is thrown, to be reported like every GitHub error.
+   * Returns GitHub's commit of the target branch as fetched: null when GitHub has no such branch,
+   * undefined when nothing was fetched (no push, or a Run merges).
    */
-  private async syncTarget(name: string): Promise<void> {
+  private async syncTarget(name: string): Promise<string | null | undefined> {
     const { repo, cfg } = this.repoSetup(name);
-    if (!cfg.push || this.repoMerging(repo)) return;
+    if (!cfg.push || this.repoMerging(repo)) return undefined;
     const store = this.deps.store;
     const branch = repo.targetBranch;
     const full = await this.issuesRepo(repo, cfg);
@@ -1083,28 +1238,29 @@ export class IssueBridge {
       this.pullBlocked.delete(repo.id);
       // What was pushed is gone (or never was): the push later in the round creates it again.
       this.pushed.delete(repo.path);
-      return;
+      return null;
     }
     await this.trackOrigin(repo, full, remote);
     const local = await revParse(repo.path, branch);
     if (remote === local || (await isAncestor(repo.path, remote, local))) {
       this.diverged.delete(repo.id);
       this.pullBlocked.delete(repo.id);
-      return;
+      return remote;
     }
     if (!(await isAncestor(repo.path, local, remote))) {
       await this.mergeDiverged(repo, name, local, remote);
-      return;
+      return remote;
     }
     this.diverged.delete(repo.id);
     // GitHub has the local commit: pushing it would only be refused, as not a fast-forward.
     this.pushed.set(repo.path, local);
     // Looked at again: a Run may have started merging while GitHub answered.
-    if (this.repoMerging(repo)) return;
+    if (this.repoMerging(repo)) return remote;
     if (await this.fastForwardTarget(repo, name, remote)) {
       this.pushed.set(repo.path, remote);
       store.event(null, 'github.pulled', { repo: name, branch, from: local, to: remote });
     }
+    return remote;
   }
 
   /**
@@ -1382,10 +1538,11 @@ export class IssueBridge {
 
   /**
    * Follow what humans do to the issues of unfinished Runs. A human closed the issue (completed or
-   * not planned): nobody wants the work any more, so its Run is terminated. A human changed its
-   * title or body: the Run is started over on the new text (`restartForChangedIssue`). Returns
-   * false when some issue could not be read or its Run not terminated (retried on the next poll);
-   * the Run stays as it is then.
+   * not planned): nobody wants the work any more, so its Run is terminated; unless the Run's pull
+   * request was merged (deliver: pr), whose `Closes #N` closed it: that Run completes
+   * (`mergedThroughPullRequest`). A human changed its title or body: the Run is started over on
+   * the new text (`restartForChangedIssue`). Returns false when some issue could not be read or
+   * its Run not terminated (retried on the next poll); the Run stays as it is then.
    */
   private async followIssues(): Promise<boolean> {
     let ok = true;
@@ -1399,6 +1556,7 @@ export class IssueBridge {
       try {
         const latest = await this.gh().getIssue(issue.repo, issue.number);
         if (latest.state === 'closed') {
+          if (await this.mergedThroughPullRequest(run)) continue;
           await this.cancelForClosedIssue(run.id, issue, latest.stateReason);
         } else {
           await this.restartForChangedIssue(run, latest);
@@ -1574,10 +1732,18 @@ export class IssueBridge {
     // The issue closes once the code is on GitHub; a failed push is retried on the next poll.
     // While the target branch has diverged from GitHub's, the issue waits as it is, open, until
     // the two are merged (by the Master, or by a human when that failed) and the push goes through.
+    // A Run merged through its pull request (deliver: pr) is on GitHub already.
     let pushed = false;
-    if (run.status === 'completed') {
+    const merged =
+      run.status === 'completed' && run.pr
+        ? mergedPullRequestOf(this.deps.store, run.id)
+        : undefined;
+    if (run.status === 'completed' && !merged) {
       const name = repo.name;
-      if (this.cfg.master.github?.repos[name]?.push) {
+      const cfg = this.cfg.master.github?.repos[name];
+      // With deliver: pr the target branch is never pushed: a Run merged locally (before the
+      // repo was switched to it) is not on GitHub.
+      if (cfg?.push && cfg.deliver !== 'pr') {
         if (!(await this.pushTarget(name))) return;
         pushed = true;
       }
@@ -1589,6 +1755,7 @@ export class IssueBridge {
       targetBranch: repo.targetBranch,
       stageName,
       pushed,
+      pr: merged,
       times: run.status === 'completed' ? storedRunTimes(this.deps.store, run) : undefined,
       failure,
     });
@@ -1599,7 +1766,12 @@ export class IssueBridge {
       await gh.setLabels(issue.repo, issue.number, wanted);
     }
     if (update.comment) await this.comment(issue.repo, issue.number, update.comment);
-    if (update.close) await gh.close(issue.repo, issue.number, update.close);
+    let close = update.close;
+    // The pull request's `Closes #N` has most likely closed the issue already: not closed again.
+    if (close && merged && (await gh.getIssue(issue.repo, issue.number)).state === 'closed') {
+      close = null;
+    }
+    if (close) await gh.close(issue.repo, issue.number, close);
     const store = this.deps.store;
     store.tx(() => {
       store.setIssueSynced(run.id, run.status);

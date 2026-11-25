@@ -3242,6 +3242,221 @@ describe('issues: delivering through pull requests (deliver: pr)', () => {
     expect(gh.calls.filter((c) => c.startsWith('push'))).toEqual([]);
     expect(t.master.issues.status().lastError?.message).toContain('deliver: pr 要求 push: true');
   });
+
+  describe('following the pull request on GitHub', () => {
+    /** The Run of a new ready issue with its pull request open, and the pull request. */
+    async function prOpened(t: Harness) {
+      const waiting = await approveMerge(t, await awaitingMerge(t));
+      await t.master.issues.sync();
+      const pull = pulls().find((p) => p.headRefName === waiting.branch);
+      if (!pull) throw new Error('no pull request');
+      return { run: t.master.store.getRun(waiting.id), pull };
+    }
+    /**
+     * The commit GitHub's squash of the Run's pull request puts on the target branch: the files
+     * of the Run's branch on top of main, made without moving the local main.
+     */
+    const squashed = (t: Harness, run: Run) =>
+      git(t.repoDir, 'commit-tree', `${run.branch}^{tree}`, '-p', 'main', '-m', 'Squash PR');
+    /** As if the longest wait before a redo had passed since the failed Runs ended. */
+    const elapseRedoWait = (t: Harness) => {
+      const store = t.master.store;
+      for (const r of store.listRuns({ status: 'failed' })) {
+        if (!r.finishedAt) continue;
+        const ms = Date.parse(r.finishedAt) - REDO_BACKOFF_MAX_HOURS * 3_600_000;
+        store.updateRun(r.id, { finishedAt: new Date(ms).toISOString() });
+      }
+    };
+
+    it('completes the Run once the pull request is merged, after pulling the merge', async () => {
+      const t = await start(PR);
+      const { run, pull } = await prOpened(t);
+      const squash = squashed(t, run);
+      // Squashed on GitHub, whose `Closes #1` closes the issue before the Master looks.
+      gh.mergePull(pull.number, squash);
+      expect(gh.get(1).state).toBe('closed');
+      await t.master.issues.poll();
+      const completed = await t.waitStatus(run.id, 'completed');
+      await t.master.issues.sync();
+
+      // The local target branch has GitHub's merge, and the Run's work with it.
+      expect(head(t)).toBe(squash);
+      expect(gh.remoteHead).toBe(squash);
+      expect(readFileSync(join(t.repoDir, 'feature.txt'), 'utf8')).toBe('ok\n');
+      const ref = { number: pull.number, url: pull.url };
+      expect(completed.pr).toEqual(ref);
+      expect(eventData(t, run.id, 'github.pr_merged')).toEqual([{ ...ref, mergeCommit: squash }]);
+      expect(eventData(t, run.id, 'merge.done')).toEqual([
+        { target: 'main', head: run.headCommit, pr: { ...ref, mergeCommit: squash } },
+      ]);
+      // Completed, not terminated for its closed issue; the work is in main, so the worktree
+      // goes.
+      expect(eventData(t, run.id, 'run.issue_closed')).toEqual([]);
+      expect(existsSync(run.worktreePath as string)).toBe(false);
+      // The issue hears of the merge once, and is not closed a second time.
+      const issue = gh.get(1);
+      expect(issue).toMatchObject({ state: 'closed', stateReason: 'completed', labels: [] });
+      const said = issue.comments.filter((c) => c.includes('已合并到'));
+      expect(said).toHaveLength(1);
+      expect(said[0]).toContain(
+        `PR #${pull.number} 已合并到 \`main\`（\`${squash.slice(0, 7)}\`）：${pull.url}`,
+      );
+      expect(said[0]).toContain('费用 $');
+      expect(said[0]).not.toContain('推送');
+      expect(gh.calls.filter((c) => c.startsWith('close #'))).toEqual([]);
+      expect(gh.calls).not.toContain('push main');
+      expect(t.master.issues.status().lastError).toBeNull();
+    });
+
+    it('closes the issue as completed when the merge left it open', async () => {
+      const t = await start(PR);
+      const { run, pull } = await prOpened(t);
+      gh.mergePull(pull.number, squashed(t, run));
+      // Say a human took `Closes #1` out of the body before merging.
+      Object.assign(gh.get(1), { state: 'open', stateReason: null });
+      await t.master.issues.poll();
+      await t.waitStatus(run.id, 'completed');
+      await t.master.issues.sync();
+      expect(gh.calls.filter((c) => c.startsWith('close #'))).toEqual(['close #1 completed']);
+      expect(gh.get(1)).toMatchObject({ state: 'closed', stateReason: 'completed' });
+    });
+
+    it('keeps the Run waiting, not terminated, until the target branch can take the merge', async () => {
+      const t = await start(PR);
+      const store = t.master.store;
+      const { run, pull } = await prOpened(t);
+      const main = head(t);
+      const squash = squashed(t, run);
+      gh.mergePull(pull.number, squash);
+      // The checkout has uncommitted changes: main cannot be fast-forwarded.
+      writeFile(join(t.repoDir, 'README.md'), '# changed by hand\n');
+      await t.master.issues.poll();
+      await t.master.issues.poll();
+
+      expect(store.getRun(run.id)).toMatchObject({ status: 'blocked', blocked: run.blocked });
+      expect(head(t)).toBe(main);
+      expect(eventData(t, run.id, 'github.pr_merged')).toEqual([]);
+      expect(eventData(t, run.id, 'run.issue_closed')).toEqual([]);
+      // Why is told once, as for any pull that is refused.
+      expect(store.listGlobalEventsOfType('github.pull_blocked')).toHaveLength(1);
+
+      git(t.repoDir, 'checkout', '--', 'README.md');
+      await t.master.issues.poll();
+      await t.waitStatus(run.id, 'completed');
+      expect(head(t)).toBe(squash);
+      expect(eventData(t, run.id, 'github.pr_merged')).toHaveLength(1);
+      expect(eventData(t, run.id, 'run.issue_closed')).toEqual([]);
+    });
+
+    it('terminates the Run as before when a human closes the issue of an open pull request', async () => {
+      const t = await start(PR);
+      const { run, pull } = await prOpened(t);
+      await gh.close('me/demo', 1, 'not_planned');
+      await t.master.issues.poll();
+      expect(t.master.store.getRun(run.id).status).toBe('cancelled');
+      expect(eventData(t, run.id, 'run.issue_closed')).toHaveLength(1);
+      expect(gh.calls).toContain(`getPull #${pull.number}`);
+    });
+
+    it('leaves the Run as it is while the pull request is open', async () => {
+      const t = await start(PR);
+      const store = t.master.store;
+      const { run, pull } = await prOpened(t);
+      const events = store.listEvents(run.id).length;
+      await t.master.issues.poll();
+      await t.master.issues.sync();
+      await t.master.issues.poll();
+
+      expect(gh.calls.filter((c) => c === `getPull #${pull.number}`).length).toBeGreaterThan(1);
+      expect(store.getRun(run.id)).toMatchObject({
+        status: 'blocked',
+        blocked: run.blocked,
+        pr: run.pr,
+      });
+      expect(store.listEvents(run.id)).toHaveLength(events);
+      expect(gh.get(1)).toMatchObject({ state: 'open', labels: [LABELS.needsYou] });
+      expect(t.master.issues.status().lastError).toBeNull();
+    });
+
+    it('tries again the next round when GitHub does not answer about the pull request', async () => {
+      const t = await start(PR);
+      const { run, pull } = await prOpened(t);
+      gh.mergePull(pull.number, squashed(t, run));
+      gh.failing.set(`getPull #${pull.number}`, 'GitHub 502');
+      await t.master.issues.poll();
+      // Its closed issue does not end it either: what became of the pull request is not known.
+      expect(t.master.store.getRun(run.id).status).toBe('blocked');
+      expect(t.master.issues.status().lastError?.message).toContain('GitHub 502');
+
+      gh.failing.delete(`getPull #${pull.number}`);
+      await t.master.issues.poll();
+      await t.waitStatus(run.id, 'completed');
+    });
+
+    it('fails the Run when the pull request is closed unmerged; the redo opens a new one', async () => {
+      const t = await start(PR);
+      const store = t.master.store;
+      const { run, pull } = await prOpened(t);
+      const main = head(t);
+      gh.closePull(pull.number);
+      await t.master.issues.poll();
+
+      const failed = store.getRun(run.id);
+      expect(failed.status).toBe('failed');
+      expect(failed.error).toContain(`PR #${pull.number} 没有合并就被关掉了`);
+      const ref = { number: pull.number, url: pull.url };
+      expect(eventData(t, run.id, 'github.pr_closed')).toEqual([ref]);
+      expect(eventData(t, run.id, 'github.pr_merged')).toEqual([]);
+      // A human hears of it, as of any failed Run.
+      const status = store
+        .listEvents(run.id)
+        .filter((e) => e.type === 'run.status')
+        .at(-1);
+      expect(status?.data.status).toBe('failed');
+      expect(status && noticeFor(status, run.goal)?.kind).toBe('failed');
+      expect(head(t)).toBe(main);
+      // The issue stays open, told why and that it is redone.
+      await t.master.issues.sync();
+      const issue = gh.get(1);
+      expect(issue.state).toBe('open');
+      expect(issue.comments.at(-1)).toContain(`PR #${pull.number} 没有合并就被关掉了`);
+      expect(issue.comments.at(-1)).toContain('会自动重做');
+      expect(eventData(t, run.id, 'issue.redo_scheduled')).toHaveLength(1);
+
+      // Once the wait is over, the redo goes through on its own branch and pull request.
+      elapseRedoWait(t);
+      await t.master.issues.sync();
+      const created = store.listRuns().find((r) => r.id !== run.id);
+      if (!created) throw new Error('not redone');
+      expect(created.issue).toMatchObject({ number: 1, attempt: 2 });
+      const redo = await approveMerge(t, await t.waitStatus(created.id, 'waiting_approval'));
+      expect(redo.branch).toBeTruthy();
+      expect(redo.branch).not.toBe(run.branch);
+      await t.master.issues.sync();
+      expect(gh.pulls.size).toBe(2);
+      const next = pulls().find((p) => p.number !== pull.number);
+      expect(next).toMatchObject({ headRefName: redo.branch, baseRefName: 'main', state: 'open' });
+      expect(store.getRun(redo.id).pr).toEqual({ number: next?.number, url: next?.url });
+      expect(store.getRun(run.id).pr).toEqual(ref);
+      expect(gh.pull(pull.number).state).toBe('closed');
+    });
+
+    it('follows the pull request after the Master restarts', async () => {
+      const first = await start(PR);
+      const { run, pull } = await prOpened(first);
+      await first.close();
+
+      const t = await restart(first, PR);
+      expect(t.master.store.getRun(run.id)).toMatchObject({ status: 'blocked', pr: run.pr });
+      const squash = squashed(t, run);
+      gh.mergePull(pull.number, squash);
+      await t.master.issues.poll();
+      await t.waitStatus(run.id, 'completed');
+      expect(head(t)).toBe(squash);
+      expect(eventData(t, run.id, 'github.pr_merged')).toHaveLength(1);
+      expect(eventData(t, run.id, 'merge.done')).toHaveLength(1);
+    });
+  });
 });
 
 describe('issues: requirement assessment', () => {
@@ -4869,6 +5084,25 @@ describe('issues: texts', () => {
         '检查已通过，已开 PR #13，合并到 `main`：https://github.com/me/demo/pull/13\n\n在 GitHub 上合并这个 PR 后，Run 会自动完成，这个 issue 也会自动关闭；没合并就关掉 PR，Run 会结束为失败。\n\n看板：http://127.0.0.1:4870/#/runs/run_1',
       );
     });
+
+    it('says the pull request was merged, with the commit it put on the target branch', () => {
+      const completed = run({ status: 'completed' });
+      const pr = {
+        number: 13,
+        url: 'https://github.com/me/demo/pull/13',
+        mergeCommit: '1234567890',
+      };
+      // Nothing was pushed: GitHub merged it.
+      expect(issueUpdate(completed, { ...ctx, pushed: true, pr })).toEqual({
+        label: null,
+        comment:
+          'PR #13 已合并到 `main`（`1234567`）：https://github.com/me/demo/pull/13\n\n费用 $1.23\n\n看板：http://127.0.0.1:4870/#/runs/run_1',
+        close: 'completed',
+      });
+      // Without the merge commit, the Run's own.
+      const unknown = issueUpdate(completed, { ...ctx, pr: { ...pr, mergeCommit: null } });
+      expect(unknown.comment).toContain('PR #13 已合并到 `main`（`abcdef1`）');
+    });
   });
 
   it('keeps one status label and every other label', () => {
@@ -5346,6 +5580,14 @@ describe('issues: texts', () => {
       });
       expect(comment).toContain('pull request #13 into `main` is open');
       expect(markComment(comment)).not.toMatch(cjk);
+      const merged = issueUpdate(run({ status: 'completed' }), {
+        ...ctx,
+        pr: { number: 13, url: 'https://github.com/me/demo/pull/13', mergeCommit: '1234567890' },
+      });
+      expect(merged.comment).toBe(
+        'Pull request #13 was merged into `main` (`1234567`): https://github.com/me/demo/pull/13' +
+          '\n\ncost $1.23\n\nDashboard: http://127.0.0.1:4870/#/runs/run_1',
+      );
     });
   });
 });
