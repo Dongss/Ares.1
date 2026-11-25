@@ -34,6 +34,7 @@ export const BLOCK_KIND: Record<BlockKind, string> = localized<BlockKind, string
     en: 'Issue by a non-member: confirm the requirement',
   },
   environment: { zh: '运行环境缺少命令', en: 'Command missing from the environment' },
+  pr_open: { zh: '等 PR 合并', en: 'Waiting for the PR to merge' },
   error: { zh: 'Master 内部错误', en: 'Master internal error' },
 });
 
@@ -281,6 +282,8 @@ export function noticeFor(event: EventRow, goal: string | undefined): Notice | n
     case 'run.blocked':
       // Questions about the requirement are a conversation, not a breakdown.
       if (event.data.kind === 'discussion') return run('discussion');
+      // An open pull request is how deliver: pr goes, not a breakdown; GitHub tells its reviewers.
+      if (event.data.kind === 'pr_open') return null;
       if (event.data.kind === 'environment' && typeof event.data.missing === 'string') {
         return run('blocked', missingCommandText(event.data.missing));
       }

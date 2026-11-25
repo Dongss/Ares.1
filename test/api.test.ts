@@ -314,6 +314,29 @@ describe('HTTP API', () => {
     expect(events.json.map((e: { type: string }) => e.type)).toContain('merge.done');
   });
 
+  it("gives a Run's pull request (deliver: pr), and refuses to retry one waiting for it", async () => {
+    h = await harness({
+      config:
+        'github:\n  repos:\n    demo:\n      template: dev\n      push: true\n      deliver: pr\n',
+      github: new FakeGitHub(),
+    });
+    const t = h;
+    const id = t.run('加功能', { stages: { merge: { gate: false } } }).id;
+    await t.waitStatus(id, 'blocked');
+    await waitFor(() => t.master.engine.activeRunIds.length === 0, 'the execution slot');
+    const waiting = await call('GET', `/api/runs/${id}`);
+    expect(waiting.json.run).toMatchObject({ status: 'blocked', blocked: { kind: 'pr_open' } });
+    expect(waiting.json.run.pr).toBeNull();
+    expect((await call('GET', '/api/runs')).json[0].pr).toBeNull();
+    expect((await call('POST', `/api/runs/${id}/retry`, {})).status).toBe(409);
+
+    const pr = { number: 7, url: 'https://github.com/me/demo/pull/7' };
+    t.master.engine.recordPullRequest(t.master.store.getRun(id), pr);
+    expect((await call('GET', `/api/runs/${id}`)).json.run.pr).toEqual(pr);
+    const [summary] = (await call('GET', '/api/runs')).json as RunSummary[];
+    expect(summary?.pr).toEqual(pr);
+  });
+
   it('shows what a run changes, also after the target moved and the run merged', async () => {
     h = await harness();
     const run = h.run();

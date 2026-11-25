@@ -144,6 +144,41 @@ describe('store', () => {
     expect(store.listChecks(run.id)[0]).toEqual(check);
   });
 
+  it("keeps a Run's pull request in its own columns, none for Runs recorded before", () => {
+    const dir = tmpDir('ares1-db-');
+    const file = join(dir, 'ares1.db');
+    const old = new DatabaseSync(file);
+    for (const m of MIGRATIONS.slice(0, 9)) old.exec(m);
+    old.exec('PRAGMA user_version = 9');
+    old.exec(`
+      INSERT INTO repos (id, name, path, target_branch, created_at) VALUES ('r', 'r', '/r', 'main', 't');
+      INSERT INTO runs (id, repo_id, template_id, template, goal, status, created_at, updated_at)
+        VALUES ('old', 'r', 't', '{}', 'g', 'completed', 't', 't');
+    `);
+    old.close();
+
+    const store = new Store(file);
+    const before = store.getRun('old');
+    expect(before.pr).toBeNull();
+    expect(Object.keys(before)).not.toContain('prNumber');
+    expect(Object.keys(before)).not.toContain('prUrl');
+    const run = store.createRun({
+      repoId: 'r',
+      templateId: 't',
+      template,
+      goal: 'g',
+      overrides: {},
+    });
+    expect(store.getRun(run.id).pr).toBeNull();
+    const pr = { number: 12, url: 'https://github.com/me/r/pull/12' };
+    expect(store.updateRun(run.id, { pr }).pr).toEqual(pr);
+    expect(store.listRuns().find((r) => r.id === run.id)?.pr).toEqual(pr);
+    // Other changes leave it as it is.
+    expect(store.updateRun(run.id, { goal: 'h' }).pr).toEqual(pr);
+    expect(store.updateRun(run.id, { pr: null }).pr).toBeNull();
+    store.close();
+  });
+
   it('orders the queue; queueHead puts a run in front', () => {
     const store = new Store(':memory:');
     const { mk } = seed(store);

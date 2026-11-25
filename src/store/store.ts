@@ -46,6 +46,13 @@ const JSON_COLUMNS: Partial<Record<Table, readonly string[]>> = {
 const BOOL_COLUMNS: Partial<Record<Table, readonly string[]>> = {
   check_results: ['passed'],
 };
+/**
+ * Object fields kept one key per column, by field: key `number` of field `pr` in column
+ * `pr_number`. Null in every column is a null field.
+ */
+const SPLIT_COLUMNS: Partial<Record<Table, Record<string, readonly string[]>>> = {
+  runs: { pr: ['number', 'url'] },
+};
 
 const toSnake = (key: string) => key.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
 const toCamel = (key: string) => key.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
@@ -338,11 +345,16 @@ export class Store {
   private toRow(table: Table, obj: Record<string, unknown>): Record<string, SQLInputValue> {
     const json = JSON_COLUMNS[table] ?? [];
     const bool = BOOL_COLUMNS[table] ?? [];
+    const split = SPLIT_COLUMNS[table] ?? {};
     const row: Record<string, SQLInputValue> = {};
     for (const [key, value] of Object.entries(obj)) {
       if (value === undefined) continue;
       const col = toSnake(key);
-      if (json.includes(col)) row[col] = value === null ? null : JSON.stringify(value);
+      const parts = split[key];
+      if (parts) {
+        const fields = value as Record<string, SQLInputValue> | null;
+        for (const part of parts) row[`${col}_${toSnake(part)}`] = fields?.[part] ?? null;
+      } else if (json.includes(col)) row[col] = value === null ? null : JSON.stringify(value);
       else if (bool.includes(col)) row[col] = value ? 1 : 0;
       else row[col] = value as SQLInputValue;
     }
@@ -359,6 +371,14 @@ export class Store {
       if (json.includes(col)) v = typeof value === 'string' ? JSON.parse(value) : null;
       else if (bool.includes(col)) v = value === 1;
       obj[toCamel(col)] = v;
+    }
+    for (const [field, parts] of Object.entries(SPLIT_COLUMNS[table] ?? {})) {
+      const cols = parts.map((part) => `${toSnake(field)}_${toSnake(part)}`);
+      if (!cols.some((col) => col in row)) continue;
+      for (const col of cols) delete obj[toCamel(col)];
+      obj[field] = cols.every((col) => row[col] === null || row[col] === undefined)
+        ? null
+        : Object.fromEntries(parts.map((part, i) => [part, row[cols[i] as string]]));
     }
     return obj as T;
   }
@@ -587,6 +607,7 @@ export class Store {
       ...input,
       issue: input.issue ?? null,
       mergeRemote: input.mergeRemote ?? null,
+      pr: null,
       issueSynced: null,
       discussion: [],
       issueDiscussionSynced: 0,

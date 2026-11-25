@@ -6,8 +6,9 @@
 // automatically, how long the automatic scout backs off and which Runs it waits for, after how
 // many failed scouts in a row a human is notified, how long a failed Run of an issue waits before
 // it is redone, how long a Run or a scout waits for an agent that is out of quota or rate-limited,
-// how long the raw output of agents is kept, and which worktrees of failed or cancelled Runs of
-// issues are left over for the Master to remove.
+// how long the raw output of agents is kept, which worktrees of failed or cancelled Runs of
+// issues are left over for the Master to remove, and whether a repo delivers through pull
+// requests.
 // Pure logic (type imports, src/i18n.ts, src/store/types.ts and src/engine/discussion.ts only),
 // so the dashboard shows the same rules the engine applies.
 
@@ -23,7 +24,14 @@ import {
   type Run,
   type Scout,
 } from '../store/types.js';
-import type { AgentConfig, Escalate, RunOverrides, StageDef, WorkflowTemplate } from './schema.js';
+import type {
+  AgentConfig,
+  Escalate,
+  GitHubConfig,
+  RunOverrides,
+  StageDef,
+  WorkflowTemplate,
+} from './schema.js';
 
 /** Risk of a proposal, ordered; auto-accept takes everything up to a chosen level. */
 export const RISKS = ['low', 'mid', 'high'] as const;
@@ -433,6 +441,20 @@ export function resolveTemplate<T>(
  */
 export function runsAgent(kind: StageDef['kind']): boolean {
   return kind === 'agent' || kind === 'review' || kind === 'assess';
+}
+
+/**
+ * Whether the repo delivers its Runs' work through pull requests (`deliver: pr`): the merge stage
+ * then leaves the local target branch alone and the Run waits for its pull request on GitHub
+ * (`pr_open`). Goes by what config.yaml says, also when push is off, which disables the repo for
+ * GitHub: its Runs then wait at the merge until the configuration is fixed, rather than merge
+ * locally what was meant to go through a pull request.
+ */
+export function deliversByPr(
+  github: Pick<GitHubConfig, 'repos'> | undefined,
+  repoName: string,
+): boolean {
+  return github?.repos[repoName]?.deliver === 'pr';
 }
 
 /**

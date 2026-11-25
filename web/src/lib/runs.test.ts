@@ -44,6 +44,7 @@ function run(id: string, status: RunSummary['status'], extra: Partial<RunSummary
     headCommit: null,
     issue: null,
     mergeRemote: null,
+    pr: null,
     issueSynced: null,
     discussion: [],
     issueDiscussionSynced: 0,

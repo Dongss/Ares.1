@@ -198,4 +198,9 @@ export const MIGRATIONS: readonly string[] = [
   `
   ALTER TABLE runs ADD COLUMN merge_remote TEXT;
   `,
+  // v10: the pull request a Run's work goes through (deliver: pr); null for every other Run.
+  `
+  ALTER TABLE runs ADD COLUMN pr_number INTEGER;
+  ALTER TABLE runs ADD COLUMN pr_url TEXT;
+  `,
 ];

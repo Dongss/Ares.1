@@ -134,8 +134,8 @@ test/
     `src/engine/discussion.ts`), rate-limit waits of Runs and scouts,
     the redo wait (`redoDelayMs` / `redoDueAt`), raw log retention (`runRawLogsExpired` /
     `scoutRawLogExpired`), leftover worktrees (`leftoverWorkspaces`), which template a repo's
-    Runs get by id, the home directory's or the repo's own (`resolveTemplate`), and the like:
-    `src/config/flow.ts`
+    Runs get by id, the home directory's or the repo's own (`resolveTemplate`), whether a repo
+    delivers through pull requests (`deliversByPr`), and the like: `src/config/flow.ts`
   - notification rules: `src/notify/notice.ts`
   - assessment conclusion rules: `src/engine/discussion.ts`
   - how a Run's time is split, and the names and groups of the parts: `src/engine/times.ts`

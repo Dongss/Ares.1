@@ -35,6 +35,7 @@ import {
 import type { EventRow } from '../src/store/types.js';
 import {
   blockOnAgentError,
+  FakeGitHub,
   type Harness,
   harness,
   type Script,
@@ -202,6 +203,25 @@ describe('system notifications', () => {
     await h.master.engine.cancel(run.id);
     expect(ok.id).toBeTruthy();
     expect(sent).toHaveLength(1); // cancelled by a human: no notice
+  });
+
+  it('does not notify a Run waiting for its pull request, only one closed unmerged', async () => {
+    const sent: string[] = [];
+    h = await harness({
+      config: `notify:\n  system: true\ngithub:\n  repos:\n    demo:\n      template: dev\n      push: true\n      deliver: pr\n`,
+      github: new FakeGitHub(),
+      master: { notice: (title, body) => sent.push(`${title}|${body}`) },
+    });
+    const run = h.run('做一件事', { stages: { merge: { gate: false } } });
+    const blocked = await h.waitStatus(run.id, 'blocked');
+    expect(blocked.blocked?.kind).toBe('pr_open');
+    const event = h.master.store.listEvents(run.id).find((e) => e.type === 'run.blocked');
+    expect(event && noticeFor(event, run.goal)).toBeNull();
+    expect(sent).toEqual([]);
+
+    const pr = { number: 7, url: 'https://github.com/me/demo/pull/7' };
+    expect(h.master.engine.pullRequestClosed(blocked, pr)).toBe(true);
+    expect(sent).toEqual(['Run 失败了|做一件事']);
   });
 
   it('titles a macOS notification with the project name, quoting the texts', () => {

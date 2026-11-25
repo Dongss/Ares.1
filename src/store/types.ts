@@ -79,6 +79,14 @@ export type BlockKind =
    * the program.
    */
   | 'environment'
+  /**
+   * The repo delivers through pull requests (`deliver: pr`) and the merge stage's checks passed:
+   * the Run's branch waits for its pull request on GitHub to be merged, with the merge stage
+   * still executing. Takes no execution slot; the bridge's polls move it on (merged: the Run
+   * goes on, closed: it fails). Nothing for a human to retry on the dashboard: the pull request
+   * is merged or closed on GitHub.
+   */
+  | 'pr_open'
   | 'error';
 
 /** Why a Run is blocked; also tells `retry` what to redo. */
@@ -125,6 +133,13 @@ export interface Run {
    * that commit. The first agent task starts merging it in the worktree. Null for every other Run.
    */
   mergeRemote: string | null;
+  /**
+   * The pull request on GitHub the Run's work goes through, in repos with `deliver: pr`: opened
+   * once the merge stage's checks passed, and the merge stage passes when it is merged. Null until
+   * one is opened, and for the Runs of every other repo. A redo of the issue is a new Run, which
+   * opens its own.
+   */
+  pr: RunPullRequest | null;
   /** The last Run status reported on the issue; the issue is caught up when it differs. */
   issueSynced: RunStatus | null;
   /** Extra stage rollbacks granted by a human after hitting max_loops. */
@@ -138,6 +153,12 @@ export interface Run {
   createdAt: string;
   updatedAt: string;
   finishedAt: string | null;
+}
+
+/** A Run's pull request on GitHub, from its branch into the target branch. */
+export interface RunPullRequest {
+  number: number;
+  url: string;
 }
 
 export interface RunIssue {

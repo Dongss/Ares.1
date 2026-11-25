@@ -37,6 +37,7 @@ function run(
     headCommit: null,
     issue: null,
     mergeRemote: null,
+    pr: null,
     issueSynced: null,
     discussion: [],
     issueDiscussionSynced: 0,

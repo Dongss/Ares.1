@@ -18,7 +18,7 @@ import { runDigest } from '../src/github/scout.js';
 import { setLang } from '../src/i18n.js';
 import { noticeFor } from '../src/notify/notice.js';
 import { NotFoundError } from '../src/store/store.js';
-import type { Run, StageRun, Task } from '../src/store/types.js';
+import type { BlockInfo, Run, StageRun, Task } from '../src/store/types.js';
 import {
   ASSESS_AGENTS_YAML,
   ASSESS_WORKFLOW_YAML,
@@ -6774,5 +6774,242 @@ agents:
     expect(eventData(run.id, 'task.agent_switched')).toEqual([]);
     expect(failed.error).toContain('Agent big 不存在、未启用或没有对应的 Adapter');
     expect(failed.error).toContain('没有别的可用 Agent 能接手');
+  });
+});
+
+describe('engine: deliver: pr — the merge stage waits for a pull request', () => {
+  /** Coding → merge without approval. */
+  const WORKFLOW = `
+id: dev
+name: 测试流程
+stages:
+  - id: implement
+    name: 编码
+    kind: agent
+    agent: coder
+  - id: merge
+    name: 合并
+    kind: merge
+`;
+  const config = (repo: string) => `
+github:
+  repos:
+    demo:
+      template: dev
+${repo}`;
+  const PR_CONFIG = config('      push: true\n      deliver: pr\n');
+  const URL = 'https://github.com/me/demo/pull/7';
+  let gh: FakeGitHub;
+
+  const start = async (cfg = PR_CONFIG, reuse?: Harness) => {
+    gh = new FakeGitHub();
+    h = await harness({
+      config: cfg,
+      github: gh,
+      workflow: WORKFLOW,
+      ...(reuse ? { home: reuse.home, repoDir: reuse.repoDir } : {}),
+    });
+    return h;
+  };
+  const eventData = (t: Harness, runId: string, type: string) =>
+    t.master.store
+      .listEvents(runId)
+      .filter((e) => e.type === type)
+      .map((e) => e.data);
+  /** Waiting for its pull request, and done with what follows: no Run executes any more. */
+  const waitingForPr = async (t: Harness, runId: string) => {
+    const run = await t.waitStatus(runId, 'blocked');
+    await waitFor(() => t.master.engine.activeRunIds.length === 0, 'the execution slot');
+    return run;
+  };
+
+  it('does not merge into the local target branch; the Run waits for its pull request', async () => {
+    const t = await start();
+    const main = git(t.repoDir, 'rev-parse', 'main');
+    const run = await waitingForPr(t, t.run().id);
+    const { store } = t.master;
+
+    expect(run.blocked).toMatchObject({ kind: 'pr_open', stageRunId: run.currentStageRunId });
+    expect(run.blocked?.message).toContain('deliver: pr');
+    expect(run.pr).toBeNull();
+    // The work is accepted on the Run's branch, but the target branch has not moved.
+    const head = git(run.worktreePath as string, 'rev-parse', 'HEAD');
+    expect(run.headCommit).toBe(head);
+    expect(git(t.repoDir, 'rev-parse', 'main')).toBe(main);
+    expect(existsSync(join(t.repoDir, 'feature.txt'))).toBe(false);
+    expect(eventData(t, run.id, 'merge.done')).toEqual([]);
+    expect(eventData(t, run.id, 'merge.pr_pending')).toEqual([{ target: 'main', head }]);
+    expect(store.getStageRun(run.currentStageRunId as string).status).toBe('executing');
+    expect(store.listChecks(run.id).filter((c) => c.kind === 'merge')).toEqual([]);
+    // Nothing went to GitHub: pushing the branch and opening the pull request is the bridge's.
+    expect(gh.pushes).toEqual([]);
+    // It is how the delivery goes, not a breakdown: nobody is notified.
+    const blocked = store.listEvents(run.id).filter((e) => e.type === 'run.blocked');
+    expect(blocked.map((e) => noticeFor(e, run.goal))).toEqual([null]);
+  });
+
+  it('still waits after a restart, without merging again', async () => {
+    const first = await start();
+    const run = await waitingForPr(first, first.run().id);
+    await first.close();
+    h = undefined;
+
+    const t = await start(PR_CONFIG, first);
+    t.master.engine.kick();
+    await new Promise((r) => setTimeout(r, 100));
+    const after = t.master.store.getRun(run.id);
+    expect(after.status).toBe('blocked');
+    expect(after.blocked).toEqual(run.blocked);
+    expect(t.master.engine.activeRunIds).toEqual([]);
+    expect(eventData(t, run.id, 'merge.pr_pending')).toHaveLength(1);
+    expect(eventData(t, run.id, 'run.recovered')).toEqual([]);
+    expect(t.master.store.getStageRun(run.currentStageRunId as string).status).toBe('executing');
+  });
+
+  it('records the pull request, and completes once it is merged on GitHub', async () => {
+    const t = await start();
+    const { engine, store } = t.master;
+    const run = await waitingForPr(t, t.run().id);
+
+    expect(engine.recordPullRequest(run, { number: 7, url: URL })).toBe(true);
+    expect(store.getRun(run.id).pr).toEqual({ number: 7, url: URL });
+    // Found again after a restart: recorded once.
+    expect(engine.recordPullRequest(run, { number: 7, url: URL })).toBe(true);
+    expect(eventData(t, run.id, 'github.pr_opened')).toEqual([
+      { number: 7, url: URL, head: run.branch, base: 'main' },
+    ]);
+    expect(store.getRun(run.id).status).toBe('blocked');
+
+    // Squashed on GitHub and pulled back: the Run's own commits are not in main.
+    git(t.repoDir, 'merge', '-q', '--squash', run.branch as string);
+    git(t.repoDir, 'commit', '-q', '-m', 'squashed PR #7');
+    const squash = git(t.repoDir, 'rev-parse', 'main');
+    expect(engine.pullRequestMerged(run, { number: 7, url: URL, mergeCommit: squash })).toBe(true);
+    const completed = await t.waitStatus(run.id, 'completed');
+
+    expect(completed.pr).toEqual({ number: 7, url: URL });
+    expect(eventData(t, run.id, 'github.pr_merged')).toEqual([
+      { number: 7, url: URL, mergeCommit: squash },
+    ]);
+    expect(eventData(t, run.id, 'merge.done')).toEqual([
+      { target: 'main', head: run.headCommit, pr: { number: 7, url: URL, mergeCommit: squash } },
+    ]);
+    const merge = store.listChecks(run.id).filter((c) => c.kind === 'merge');
+    expect(merge.map((c) => [c.name, c.passed])).toEqual([['通过 PR #7 合并到 main', true]]);
+    expect(store.getStageRun(run.currentStageRunId as string).status).toBe('passed');
+    // The work is in main by the squash: the worktree and branch are removed.
+    expect(existsSync(run.worktreePath as string)).toBe(false);
+    expect(git(t.repoDir, 'branch', '--list', run.branch as string)).toBe('');
+    // Handled once: the Run no longer waits for its pull request.
+    expect(engine.pullRequestMerged(run, { number: 7, url: URL, mergeCommit: squash })).toBe(false);
+    expect(engine.pullRequestClosed(run, { number: 7, url: URL })).toBe(false);
+    expect(eventData(t, run.id, 'merge.done')).toHaveLength(1);
+  });
+
+  it('ends the Run as failed when the pull request is closed without being merged', async () => {
+    const t = await start();
+    const { engine, store } = t.master;
+    const main = git(t.repoDir, 'rev-parse', 'main');
+    const run = await waitingForPr(t, t.run().id);
+    engine.recordPullRequest(run, { number: 7, url: URL });
+
+    expect(engine.pullRequestClosed(run, { number: 7, url: URL })).toBe(true);
+    const failed = store.getRun(run.id);
+    expect(failed.status).toBe('failed');
+    expect(failed.error).toContain('PR #7 没有合并就被关掉了');
+    expect(failed.error).toContain('工作目录和分支已保留');
+    expect(eventData(t, run.id, 'github.pr_closed')).toEqual([{ number: 7, url: URL }]);
+    expect(eventData(t, run.id, 'merge.done')).toEqual([]);
+    const merge = store.listChecks(run.id).filter((c) => c.kind === 'merge');
+    expect(merge.map((c) => c.passed)).toEqual([false]);
+    // Kept for inspection; main never moved.
+    expect(existsSync(run.worktreePath as string)).toBe(true);
+    expect(git(t.repoDir, 'rev-parse', 'main')).toBe(main);
+    // A human hears of it, as of any failed Run.
+    const status = store
+      .listEvents(run.id)
+      .filter((e) => e.type === 'run.status')
+      .at(-1);
+    expect(status && noticeFor(status, run.goal)?.kind).toBe('failed');
+    expect(engine.pullRequestMerged(run, { number: 7, url: URL, mergeCommit: main })).toBe(false);
+  });
+
+  it('refuses a retry: the pull request is merged or closed on GitHub', async () => {
+    const t = await start();
+    const run = await waitingForPr(t, t.run().id);
+    await expect(t.master.engine.retry(run.id)).rejects.toThrow(InvalidStateError);
+    await expect(t.master.engine.retry(run.id, { agentId: 'coder2' })).rejects.toThrow(
+      '在等 GitHub 上的 PR 合并',
+    );
+    expect(t.master.store.getRun(run.id)).toMatchObject({
+      status: 'blocked',
+      blocked: run.blocked,
+    });
+  });
+
+  it('changes nothing for a Run that no longer waits on the pull request seen', async () => {
+    const t = await start();
+    const { engine, store } = t.master;
+    const run = await waitingForPr(t, t.run().id);
+    const before = store.listEvents(run.id).length;
+    // Seen before it got there.
+    const stale = { id: run.id, blocked: { ...(run.blocked as BlockInfo), stageRunId: 'other' } };
+    expect(engine.recordPullRequest(stale, { number: 7, url: URL })).toBe(false);
+    expect(engine.pullRequestMerged(stale, { number: 7, url: URL, mergeCommit: null })).toBe(false);
+    expect(engine.pullRequestClosed({ id: run.id, blocked: null }, { number: 7, url: URL })).toBe(
+      false,
+    );
+    expect(store.listEvents(run.id)).toHaveLength(before);
+    expect(store.getRun(run.id).pr).toBeNull();
+
+    // Cancelled meanwhile.
+    await engine.cancel(run.id);
+    expect(engine.recordPullRequest(run, { number: 7, url: URL })).toBe(false);
+    expect(engine.pullRequestMerged(run, { number: 7, url: URL, mergeCommit: null })).toBe(false);
+    expect(engine.pullRequestClosed(run, { number: 7, url: URL })).toBe(false);
+    expect(store.getRun(run.id)).toMatchObject({ status: 'cancelled', pr: null });
+  });
+
+  it('waits rather than merging locally when deliver: pr lacks push: true', async () => {
+    const t = await start(config('      deliver: pr\n'));
+    expect(Object.keys(t.master.config.errors)).toHaveLength(1);
+    const run = await waitingForPr(t, t.run().id);
+    expect(run.blocked?.kind).toBe('pr_open');
+    expect(existsSync(join(t.repoDir, 'feature.txt'))).toBe(false);
+  });
+
+  it('merges into the local target branch as before without deliver, or with deliver: push', async () => {
+    for (const repo of ['      push: true\n', '      push: true\n      deliver: push\n']) {
+      const t = await start(config(repo));
+      const run = await t.waitStatus(t.run().id, 'completed');
+      expect(readFileSync(join(t.repoDir, 'feature.txt'), 'utf8')).toBe('ok\n');
+      expect(run.pr).toBeNull();
+      expect(eventData(t, run.id, 'merge.pr_pending')).toEqual([]);
+      expect(eventData(t, run.id, 'merge.done')).toEqual([
+        { target: 'main', head: git(t.repoDir, 'rev-parse', 'main') },
+      ]);
+      await t.close();
+      h = undefined;
+    }
+  });
+
+  it('says so in English', async () => {
+    setLang('en');
+    try {
+      const t = await start(`language: en\n${PR_CONFIG}`);
+      const { engine, store } = t.master;
+      const run = await waitingForPr(t, t.run().id);
+      const refused = await engine.retry(run.id).catch((err: Error) => err.message);
+      engine.pullRequestClosed(run, { number: 7, url: URL });
+      const failed = store.getRun(run.id);
+      const checks = store.listChecks(run.id).filter((c) => c.kind === 'merge');
+      for (const text of [run.blocked?.message, refused, failed.error, checks[0]?.name]) {
+        expect(text).toBeTruthy();
+        expect(text).not.toMatch(/[一-鿿]/);
+      }
+      expect(failed.error).toContain('PR #7 was closed without being merged');
+    } finally {
+      setLang('zh');
+    }
   });
 });
