@@ -8,11 +8,20 @@ import {
   FOOTER_MARKER,
   markComment,
   proposalBody,
+  proposalSections,
   RETRIES_EXHAUSTED_MARKER,
 } from '../src/github/issues.js';
-import { issueDigest, nextSteps, runDigest, scoutPrompt } from '../src/github/scout.js';
+import {
+  issueDigest,
+  localProposalDigest,
+  nextSteps,
+  type ProposalRun,
+  proposalGoal,
+  runDigest,
+  scoutPrompt,
+} from '../src/github/scout.js';
 import { setLang, t } from '../src/i18n.js';
-import type { Run, RunStatus } from '../src/store/types.js';
+import type { AssessmentEntry, Proposal, Run, RunStatus } from '../src/store/types.js';
 import type { UpgradeFailure } from '../src/upgrade/upgrader.js';
 import {
   ASSESS_AGENTS_YAML,
@@ -2042,5 +2051,335 @@ describe('issueDigest: next steps of a large capability', () => {
       ].join('\n'),
     );
     expect(digest).not.toMatch(/[一-鿿]/);
+  });
+});
+
+/** A proposal of the local backlog, pending unless `extra` says otherwise. */
+const localProposal = (id: string, title: string, extra: Partial<Proposal> = {}): Proposal => ({
+  id,
+  repoId: 'repo-1',
+  scoutId: 'scout-1',
+  title,
+  category: 'feature',
+  size: 'M',
+  risk: 'low',
+  why: '现在只能手动建 Run',
+  evidence: ['src/config/schema.ts:19'],
+  what: '加一个本地需求来源',
+  acceptance: ['本地仓库能自动侦察'],
+  status: 'pending',
+  rejectReason: null,
+  auto: false,
+  runId: null,
+  createdAt: '2026-11-20T00:00:00.000Z',
+  decidedAt: null,
+  ...extra,
+});
+
+/** What the digest reads of a Run: its status, error and discussion. */
+const proposalRun = (status: RunStatus, extra: Partial<ProposalRun> = {}): ProposalRun => ({
+  status,
+  error: null,
+  discussion: [],
+  ...extra,
+});
+
+/** The assessment's conclusion to drop the requirement, for `reason`. */
+const dropped = (reason: string): AssessmentEntry => ({
+  role: 'assessor',
+  verdict: 'drop',
+  summary: reason,
+  questions: [],
+  suggestions: [],
+  revisedGoal: null,
+  proposedDrop: false,
+  stageRunId: 'sr-1',
+  at: '2026-11-20T00:00:00.000Z',
+});
+
+describe('localProposalDigest', () => {
+  afterEach(() => setLang('zh'));
+
+  it('lists the pending, accepted and rejected proposals, empty sections as none', () => {
+    expect(localProposalDigest([])).toBe(
+      ['### 等人决定', '（无）', '', '### 已采纳', '（无）', '', '### 被拒绝', '（无）'].join('\n'),
+    );
+    const runs: Record<string, ProposalRun> = {
+      'run-1': proposalRun('completed'),
+      'run-2': proposalRun('failed', { error: '`npm test` 未通过：\n  3 个测试失败' }),
+      'run-3': proposalRun('dropped', { discussion: [dropped('README 不要求\n这个能力')] }),
+    };
+    const digest = localProposalDigest(
+      [
+        localProposal('proposal-6', '等人的提案', { what: '做 A\n\n后续步骤：\n- 做 B\n- 做 C' }),
+        localProposal('proposal-5', '做完的第一步', {
+          status: 'accepted',
+          auto: true,
+          runId: 'run-1',
+          what: '做 A\n\n后续步骤：\n- 做 D',
+        }),
+        localProposal('proposal-4', '失败的提案', { status: 'accepted', runId: 'run-2' }),
+        localProposal('proposal-3', '评估不做的提案', { status: 'accepted', runId: 'run-3' }),
+        localProposal('proposal-2', 'Run 被删掉的提案', { status: 'accepted', runId: 'run-gone' }),
+        localProposal('proposal-1', '被拒绝的提案', {
+          status: 'rejected',
+          rejectReason: '这个方向\n不对',
+        }),
+        localProposal('proposal-0', '没写理由的', { status: 'rejected' }),
+      ],
+      (id) => runs[id],
+    );
+    expect(digest).toBe(
+      [
+        '### 等人决定',
+        '- proposal-6 等人的提案',
+        '  后续步骤：',
+        '    - 做 B',
+        '    - 做 C',
+        '',
+        '### 已采纳',
+        '- proposal-5 做完的第一步（Run run-1：已完成，自动采纳）',
+        '  后续步骤：',
+        '    - 做 D',
+        '- proposal-4 失败的提案（Run run-2：失败）',
+        '  失败原因：`npm test` 未通过： 3 个测试失败',
+        '- proposal-3 评估不做的提案（Run run-3：不做）',
+        '  需求评估结论为不做，理由：README 不要求 这个能力',
+        '- proposal-2 Run 被删掉的提案（Run run-gone）',
+        '',
+        '### 被拒绝',
+        '- proposal-1 被拒绝的提案',
+        '  理由：这个方向 不对',
+        '- proposal-0 没写理由的',
+      ].join('\n'),
+    );
+  });
+
+  it('names the Run without its status when it is not known', () => {
+    const accepted = localProposal('proposal-1', '已采纳', { status: 'accepted', runId: 'run-1' });
+    expect(localProposalDigest([accepted])).toContain('- proposal-1 已采纳（Run run-1）');
+  });
+
+  it('cuts long titles and reasons, and counts what does not fit', () => {
+    const long = localProposal('proposal-1', '题'.repeat(130), {
+      status: 'rejected',
+      rejectReason: '因'.repeat(310),
+    });
+    const digest = localProposalDigest([long]);
+    expect(digest).toContain(`- proposal-1 ${'题'.repeat(120)}…\n`);
+    expect(digest).toContain(`  理由：${'因'.repeat(300)}…`);
+    const many = Array.from({ length: 103 }, (_, i) =>
+      localProposal(`proposal-${i}`, `第 ${i} 条`),
+    );
+    const pending = localProposalDigest(many).split('\n\n')[0]?.split('\n') ?? [];
+    expect(pending).toHaveLength(1 + 100 + 1);
+    expect(pending.at(-2)).toBe('- proposal-99 第 99 条');
+    expect(pending.at(-1)).toBe('…另有 3 条');
+  });
+
+  it('says so in English', () => {
+    setLang('en');
+    const digest = localProposalDigest(
+      [
+        localProposal('proposal-3', 'Waiting', { what: 'Do A\n\nNext steps:\n- Do B' }),
+        localProposal('proposal-2', 'Accepted', {
+          status: 'accepted',
+          auto: true,
+          runId: 'run-1',
+        }),
+        localProposal('proposal-1', 'Turned down', {
+          status: 'rejected',
+          rejectReason: 'Not this way',
+        }),
+      ],
+      () => proposalRun('failed', { error: 'checks failed' }),
+    );
+    expect(digest).toBe(
+      [
+        '### Waiting for a human',
+        '- proposal-3 Waiting',
+        '  Next steps:',
+        '    - Do B',
+        '',
+        '### Accepted',
+        '- proposal-2 Accepted (Run run-1: failed; accepted automatically)',
+        '  Why it failed: checks failed',
+        '',
+        '### Rejected',
+        '- proposal-1 Turned down',
+        '  Reason: Not this way',
+      ].join('\n'),
+    );
+    expect(localProposalDigest([])).toBe(
+      [
+        '### Waiting for a human',
+        '(none)',
+        '',
+        '### Accepted',
+        '(none)',
+        '',
+        '### Rejected',
+        '(none)',
+      ].join('\n'),
+    );
+  });
+});
+
+describe('proposalGoal', () => {
+  afterEach(() => setLang('zh'));
+
+  it('is the title, why, evidence, what to do and acceptance criteria of the proposal', () => {
+    const p = localProposal('proposal-1', '本地提案池', {
+      evidence: ['src/a.ts:1', 'README.md'],
+      what: '做 A\n\n后续步骤：\n- 做 B',
+      acceptance: ['能侦察', '能采纳'],
+    });
+    expect(proposalGoal(p)).toBe(
+      [
+        '本地提案池',
+        '',
+        '### 为什么',
+        '',
+        '现在只能手动建 Run',
+        '',
+        '### 证据',
+        '',
+        '- src/a.ts:1',
+        '- README.md',
+        '',
+        '### 要做什么',
+        '',
+        '做 A',
+        '',
+        '后续步骤：',
+        '- 做 B',
+        '',
+        '### 验收标准',
+        '',
+        '- [ ] 能侦察',
+        '- [ ] 能采纳',
+      ].join('\n'),
+    );
+    // The goal's first line is the title, which the Run digest shows.
+    expect(proposalGoal(p).split('\n')[0]).toBe('本地提案池');
+  });
+
+  it('opens the same way as the issue of a proposal', () => {
+    const p = { ...localProposal('proposal-1', '本地提案池'), category: 'docs' as const };
+    expect(
+      proposalBody(p, 'scout-1', false).startsWith(`${proposalSections(p)}\n\n${FOOTER_MARKER}\n`),
+    ).toBe(true);
+    expect(proposalGoal(p)).toBe(`本地提案池\n\n${proposalSections(p)}`);
+  });
+
+  it('says so in English', () => {
+    setLang('en');
+    const p = localProposal('proposal-1', 'Local backlog', {
+      why: 'Only manual Runs now',
+      evidence: ['src/a.ts:1'],
+      what: 'Add a local source',
+      acceptance: ['It scouts'],
+    });
+    const goal = proposalGoal(p);
+    expect(goal).toContain('### Why\n\nOnly manual Runs now');
+    expect(goal).toContain('### Evidence\n\n- src/a.ts:1');
+    expect(goal).toContain('### What to do\n\nAdd a local source');
+    expect(goal).toContain('### Acceptance criteria\n\n- [ ] It scouts');
+    expect(goal).not.toMatch(/[一-鿿]/);
+  });
+});
+
+describe('scoutPrompt: the local backlog', () => {
+  afterEach(() => setLang('zh'));
+
+  const codeFailure: UpgradeFailure = {
+    at: '2026-11-20T00:00:00.000Z',
+    from: 'aaaaaaa1111',
+    to: 'bbbbbbb2222',
+    message: 'npm run build failed',
+    detail: 'error TS2304',
+    env: false,
+  };
+  const envFailure: UpgradeFailure = { ...codeFailure, env: true };
+
+  /** The prompts of every kind: splitting or not, L accepted or not, upgrades failed or not. */
+  const prompts = (source: 'github' | 'local' | undefined, issues: string) =>
+    [true, false].flatMap((splits) =>
+      [true, false].flatMap((autoAcceptsL) =>
+        [null, codeFailure, envFailure].map((upgrade) =>
+          scoutPrompt({
+            repoName: 'demo',
+            ...(source ? { source } : {}),
+            max: 3,
+            runs: '',
+            issues,
+            splits,
+            autoAcceptsL,
+            upgrade,
+          }),
+        ),
+      ),
+    );
+
+  it('lists the local proposals, rejections with their reasons, and never mentions issues', () => {
+    const issues = localProposalDigest([
+      localProposal('proposal-2', '等人的提案'),
+      localProposal('proposal-1', '被拒绝的提案', {
+        status: 'rejected',
+        rejectReason: '和 README 的目标无关',
+      }),
+    ]);
+    for (const prompt of prompts('local', issues)) {
+      expect(prompt).toContain(
+        '提案会存进 Master 的本地提案池，在看板上被采纳（或按自动采纳的设置采纳）后由 Agent 按「编码 → 评审 → 合并」完成。',
+      );
+      expect(section(prompt, '## 已有的本地提案')).toContain(issues);
+      expect(prompt).toContain('- proposal-1 被拒绝的提案\n  理由：和 README 的目标无关');
+      expect(prompt).toContain('被拒绝的提案是反例，注意其中的理由，不要换个说法再提');
+      expect(prompt).not.toMatch(/issue|GitHub/i);
+    }
+    const [splitting] = prompts('local', issues);
+    expect(splitting).toContain('不要拆成几条提案：每多一条提案，就多一轮评估、评审、合并和升级。');
+    expect(splitting).toContain('在 why 里写明接着哪条提案（写上它的 id）');
+    expect(splitting).toContain('已采纳、但 Run 失败了的提案不一样：它不是人拒绝的');
+  });
+
+  it('keeps the prompt of a GitHub repo as it was', () => {
+    const github = prompts('github', '（无）');
+    expect(prompts(undefined, '（无）')).toEqual(github);
+    for (const prompt of github) {
+      expect(prompt).toContain(
+        '提案会成为 GitHub issue，被采纳后由 Agent 按「编码 → 评审 → 合并」完成。',
+      );
+      expect(prompt).toContain('\n## 已有的 issue\n（无）\n');
+      expect(prompt).toContain('- 不要和下面已有的 issue 重复，包括已关闭的。');
+      expect(prompt).not.toContain('本地提案');
+    }
+  });
+
+  it('says so in English, with no Chinese left', () => {
+    setLang('en');
+    const issues = localProposalDigest(
+      [
+        localProposal('proposal-2', 'Waiting', { what: 'Do A\n\nNext steps:\n- Do B' }),
+        localProposal('proposal-1', 'Turned down', {
+          status: 'rejected',
+          rejectReason: 'Not a goal of README',
+        }),
+      ],
+      () => undefined,
+    );
+    for (const prompt of prompts('local', issues)) {
+      expect(prompt).toContain("Each proposal goes into the Master's local backlog;");
+      expect(section(prompt, '## Existing local proposals')).toContain(issues);
+      expect(prompt).toContain('- proposal-1 Turned down\n  Reason: Not a goal of README');
+      expect(prompt).toContain('Rejected proposals are counterexamples');
+      expect(prompt).not.toMatch(/issue|GitHub/i);
+      expect(prompt).not.toMatch(/[一-鿿]/);
+    }
+    for (const prompt of prompts('github', '')) {
+      expect(prompt).toContain('Each proposal becomes a GitHub issue;');
+      expect(prompt).toContain('\n## Existing issues\n');
+    }
   });
 });

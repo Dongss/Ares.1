@@ -6,6 +6,7 @@ import {
   chooseStageAgent,
   conflictBlocker,
   discussionReplyWait,
+  holdsScout,
   issueRunOverrides,
   leftoverWorkspaces,
   levelRank,
@@ -2793,7 +2794,7 @@ describe('scoutBackoff', () => {
   const scout = (
     min: number,
     status: Scout['status'],
-    proposals: Pick<ScoutProposal, 'issue'>[] = [],
+    proposals: Pick<ScoutProposal, 'issue' | 'local'>[] = [],
   ) => ({
     status,
     proposals: proposals as ScoutProposal[],
@@ -2805,6 +2806,16 @@ describe('scoutBackoff', () => {
   it('has none before any scout, or after a scout that filed an issue', () => {
     expect(scoutBackoff([], 5)).toBeNull();
     expect(scoutBackoff([scout(10, 'completed', filed), scout(0, 'failed')], 5)).toBeNull();
+  });
+
+  it('ends the streak at a scout that wrote a proposal into the local backlog, like an issue', () => {
+    const local = [{ local: { id: 'proposal-1', auto: false } }];
+    expect(scoutBackoff([scout(10, 'completed', local), scout(0, 'failed')], 5)).toBeNull();
+    const scouts = [scout(30, 'failed'), scout(20, 'completed'), scout(10, 'completed', local)];
+    expect(scoutBackoff(scouts, 5)).toEqual({ count: 2, until: at(31 + 10) });
+    // Accepted without a human or not, it found a requirement all the same.
+    const auto = [{ local: { id: 'proposal-2', auto: true } }];
+    expect(scoutBackoff([scout(10, 'completed', auto)], 5)).toBeNull();
   });
 
   it('doubles poll_minutes with every scout in a row that found nothing or failed', () => {
@@ -2861,6 +2872,31 @@ describe('scoutBackoff', () => {
     expect(scoutBackoff(scouts, 5)).toEqual({ count: 2, until: at(41 + 10) });
     expect(scoutBackoff([scout(10, 'rate_limited')], 5)).toBeNull();
     expect(scoutBackoff([scout(20, 'rate_limited'), scout(10, 'completed', filed)], 5)).toBeNull();
+  });
+});
+
+describe('holdsScout', () => {
+  const kinds = (['low', 'mid', 'high'] as const).flatMap((risk) =>
+    (['S', 'M', 'L'] as const).map((size) => ({ risk, size })),
+  );
+
+  it('counts every proposal without auto-accept: a human decides them all', () => {
+    for (const max_size of ['S', 'M', 'L'] as const) {
+      for (const kind of kinds) expect(holdsScout(kind, { max_risk: 'none', max_size })).toBe(true);
+      expect(holdsScout(null, { max_risk: 'none', max_size })).toBe(true);
+    }
+  });
+
+  it('counts only what auto-accept would take, and proposals of an unknown kind', () => {
+    const holding = (max_risk: 'low' | 'mid' | 'high', max_size: 'S' | 'M' | 'L') =>
+      kinds
+        .filter((kind) => holdsScout(kind, { max_risk, max_size }))
+        .map((k) => `${k.risk}/${k.size}`);
+    expect(holding('low', 'M')).toEqual(['low/S', 'low/M']);
+    expect(holding('mid', 'S')).toEqual(['low/S', 'mid/S']);
+    expect(holding('high', 'L')).toEqual(kinds.map((k) => `${k.risk}/${k.size}`));
+    // Without a scout record its kind is not known: it counts, to stay safe.
+    expect(holdsScout(null, { max_risk: 'low', max_size: 'S' })).toBe(true);
   });
 });
 

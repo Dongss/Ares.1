@@ -237,7 +237,14 @@ const categoryText = (category: ScoutProposal['category']) =>
     },
   })[category];
 
-export function proposalBody(p: ScoutProposal, scoutId: string, auto: boolean): string {
+/**
+ * What a proposal asks for, as Markdown sections: why, the evidence, what to do and the acceptance
+ * criteria. The text of a proposal's issue (`proposalBody`) and the goal of a Run from a local
+ * proposal (`proposalGoal`) both open with it.
+ */
+export function proposalSections(
+  p: Pick<ScoutProposal, 'why' | 'evidence' | 'what' | 'acceptance'>,
+): string {
   const list = (items: string[], prefix: string) => items.map((i) => `${prefix}${i}`).join('\n');
   return [
     t({ zh: '### 为什么', en: '### Why' }),
@@ -255,6 +262,12 @@ export function proposalBody(p: ScoutProposal, scoutId: string, auto: boolean): 
     t({ zh: '### 验收标准', en: '### Acceptance criteria' }),
     '',
     list(p.acceptance, '- [ ] '),
+  ].join('\n');
+}
+
+export function proposalBody(p: ScoutProposal, scoutId: string, auto: boolean): string {
+  return [
+    proposalSections(p),
     '',
     FOOTER_MARKER,
     '---',

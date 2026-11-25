@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { brandName } from '../brand.js';
 import {
   type AutoAcceptLimits,
-  isAutoAcceptable,
+  holdsScout,
   PROPOSAL_SIZES,
   RISKS,
   sizeMeanings,
@@ -45,6 +45,7 @@ import type {
   Attempt,
   CheckResult,
   EventRow,
+  Proposal,
   Run,
   Scout,
   ScoutGap,
@@ -60,6 +61,7 @@ import {
   isRetriesExhaustedComment,
   isTrusted,
   LABELS,
+  proposalSections,
   stripMarker,
 } from './issues.js';
 import { redactForGitHub } from './redact.js';
@@ -947,7 +949,7 @@ export function issueDigest(
     return ours.length ? ` [${ours.join(', ')}]` : '';
   };
   const openLines = trusted(open).map(
-    (i) => `- #${i.number}${labels(i)} ${i.title}${nextStepsLines(i)}`,
+    (i) => `- #${i.number}${labels(i)} ${i.title}${nextStepsLines(i.body)}`,
   );
   const closedLines = trusted(closed).map((i) => closedIssueLine(i, master));
   const olderLines = trusted(older).map((i) => closedIssueLine(i, master));
@@ -1003,7 +1005,7 @@ function closedIssueLine(i: GhIssue, master: string | null): string {
       : '';
     return `- #${i.number} ${t({ zh: '不做', en: 'Not planned' })}${colon()}${i.title}${why}`;
   }
-  return `- #${i.number} ${t({ zh: '已完成', en: 'Done' })}${colon()}${i.title}${nextStepsLines(i)}`;
+  return `- #${i.number} ${t({ zh: '已完成', en: 'Done' })}${colon()}${i.title}${nextStepsLines(i.body)}`;
 }
 
 /** Characters kept of the next steps an issue lists, in the scout's list of issues. */
@@ -1054,15 +1056,109 @@ export function nextSteps(body: string): string[] {
 }
 
 /**
- * The next steps of an issue under its line in the scout's list, so that a later scout goes on
- * with the next step once the issue is done; empty when it lists none. Only issues by people the
- * Master trusts reach here.
+ * The next steps of an issue's body, or of a local proposal's what, under its line in the scout's
+ * list, so that a later scout goes on with the next step once this one is done; empty when it
+ * lists none. Only issues by people the Master trusts reach here.
  */
-function nextStepsLines(i: GhIssue): string {
-  const steps = nextSteps(i.body);
+function nextStepsLines(body: string): string {
+  const steps = nextSteps(body);
   if (steps.length === 0) return '';
   const head = `\n  ${t({ zh: '后续步骤：', en: 'Next steps:' })}`;
   return `${head}${steps.map((s) => `\n    ${s}`).join('')}`;
+}
+
+/** Local proposals listed per section of the scout's list; more are only counted. */
+const MAX_LOCAL_PENDING = 100;
+const MAX_LOCAL_ACCEPTED = 50;
+/** Rejections stay counterexamples however old, as issues closed as not planned do. */
+const MAX_LOCAL_REJECTED = 300;
+
+/** What the scout's list of local proposals reads of the Run an accepted one became. */
+export type ProposalRun = Pick<Run, 'status' | 'error' | 'discussion'>;
+
+/** A section of the list: its lines, at most `max` of them, the rest only counted. */
+function digestSection(heading: string, lines: string[], max: number): string {
+  if (lines.length === 0) return `${heading}\n${t({ zh: '（无）', en: '(none)' })}`;
+  const shown = lines.slice(0, max);
+  if (lines.length > max) shown.push(moreText(lines.length - max));
+  return `${heading}\n${shown.join('\n')}`;
+}
+
+/**
+ * An accepted proposal: the Run it became and how that stands, whether it was accepted without a
+ * human; why the Run failed or why its assessment dropped the requirement, which the Run digest
+ * no longer shows once the Run is old; and its next steps.
+ */
+function acceptedProposalLine(p: Proposal, run: ProposalRun | undefined): string {
+  const parts: string[] = [];
+  if (p.runId) {
+    parts.push(run ? `Run ${p.runId}${colon()}${statusText(run.status)}` : `Run ${p.runId}`);
+  }
+  if (p.auto) parts.push(t({ zh: '自动采纳', en: 'accepted automatically' }));
+  const about = parts.length
+    ? t({ zh: `（${parts.join('，')}）`, en: ` (${parts.join('; ')})` })
+    : '';
+  const lines = [`- ${p.id} ${oneLine(p.title, 120)}${about}`];
+  const dropped = run?.status === 'dropped' ? conclusionOf(run.discussion) : null;
+  if (dropped) {
+    const reason = oneLine(dropped.summary, 300);
+    lines.push(
+      `  ${t({ zh: '需求评估结论为不做，理由', en: 'The assessment dropped it; reason' })}${colon()}${reason}`,
+    );
+  }
+  if (run?.status === 'failed' && run.error) {
+    lines.push(
+      `  ${t({ zh: '失败原因', en: 'Why it failed' })}${colon()}${oneLine(run.error, 300)}`,
+    );
+  }
+  return `${lines.join('\n')}${nextStepsLines(p.what)}`;
+}
+
+/**
+ * The repo's local proposals (backlog.repos), so the scout does not propose them again: those
+ * waiting for a human, those accepted with the Run each became (`runOf`, undefined when it is not
+ * known), and the rejected ones with the human's reason, as counterexamples. Pending and accepted
+ * proposals carry their next steps (see nextSteps), so that the scout proposes the next step of a
+ * large capability once the one before it is done. `proposals` are newest first; every one was
+ * written by a scout of the Master and decided on its dashboard, so all of them are trusted.
+ */
+export function localProposalDigest(
+  proposals: readonly Proposal[],
+  runOf?: (runId: string) => ProposalRun | undefined,
+): string {
+  const of = (status: Proposal['status']) => proposals.filter((p) => p.status === status);
+  const pending = of('pending').map(
+    (p) => `- ${p.id} ${oneLine(p.title, 120)}${nextStepsLines(p.what)}`,
+  );
+  const accepted = of('accepted').map((p) =>
+    acceptedProposalLine(p, p.runId ? runOf?.(p.runId) : undefined),
+  );
+  const rejected = of('rejected').map((p) => {
+    const reason = p.rejectReason?.trim();
+    const why = reason
+      ? `\n  ${t({ zh: '理由', en: 'Reason' })}${colon()}${oneLine(reason, 300)}`
+      : '';
+    return `- ${p.id} ${oneLine(p.title, 120)}${why}`;
+  });
+  return [
+    digestSection(
+      t({ zh: '### 等人决定', en: '### Waiting for a human' }),
+      pending,
+      MAX_LOCAL_PENDING,
+    ),
+    digestSection(t({ zh: '### 已采纳', en: '### Accepted' }), accepted, MAX_LOCAL_ACCEPTED),
+    digestSection(t({ zh: '### 被拒绝', en: '### Rejected' }), rejected, MAX_LOCAL_REJECTED),
+  ].join('\n\n');
+}
+
+/**
+ * The goal of a Run created from a local proposal: its title, then why, the evidence, what to do
+ * and the acceptance criteria, as the issue of a proposal reads (`proposalSections`).
+ */
+export function proposalGoal(
+  p: Pick<Proposal, 'title' | 'why' | 'evidence' | 'what' | 'acceptance'>,
+): string {
+  return `${p.title}\n\n${proposalSections(p)}`;
 }
 
 /** Proposals a human still has to look at. */
@@ -1086,30 +1182,33 @@ export function filedProposal<S extends Pick<Scout, 'proposals'>>(
 }
 
 /**
- * Untriaged proposals that hold the automatic scout back once there are `max_proposals` of them.
- * Without auto-accept, every one: a human decides them all. With it, only those auto-accept would
- * take but has not yet (today's count is used up), and those without a scout record, to stay
- * safe. Proposals beyond what auto-accept takes (over `max_size` or `max_risk`) still wait for a
- * human, but would otherwise stop the system for good, so they do not count; the scout sees them
- * among the open issues and does not propose them again.
+ * Untriaged proposals that hold the automatic scout back once there are `max_proposals` of them,
+ * by `holdsScout`: an issue without a scout record is of an unknown kind.
  */
 export function proposalsHoldingScout(
   open: GhIssue[],
   scouts: Pick<Scout, 'proposals'>[],
   limits: AutoAcceptLimits,
 ): GhIssue[] {
-  const waiting = untriaged(open);
-  if (limits.max_risk === 'none') return waiting;
-  return waiting.filter((issue) => {
-    const filed = filedProposal(scouts, issue.number);
-    return !filed || isAutoAcceptable(filed.proposal, limits);
-  });
+  return untriaged(open).filter((issue) =>
+    holdsScout(filedProposal(scouts, issue.number)?.proposal ?? null, limits),
+  );
 }
+
+/**
+ * Where a repo's requirements are, as the scout's prompt says it: GitHub issues, or the local
+ * backlog of a repo without GitHub (backlog.repos), where proposals stay in the Master and are
+ * accepted on the dashboard.
+ */
+export type ScoutSource = 'github' | 'local';
 
 interface ScoutPromptInput {
   repoName: string;
+  /** Where proposals go and the requirements there are come from; github when omitted. */
+  source?: ScoutSource;
   max: number;
   runs: string;
+  /** The requirements there are: `issueDigest` on GitHub, `localProposalDigest` otherwise. */
   issues: string;
   /**
    * Whether the repo's template splits an L requirement into steps done in one Run
@@ -1127,7 +1226,7 @@ interface ScoutPromptInput {
 }
 
 export function scoutPrompt(input: ScoutPromptInput): string {
-  return t({ zh: scoutPromptZh, en: scoutPromptEn })(input);
+  return t({ zh: scoutPromptZh, en: scoutPromptEn })(input, input.source ?? 'github');
 }
 
 /** `text` as a Markdown code block, fenced with more backticks than any run of them inside. */
@@ -1139,12 +1238,12 @@ function codeBlock(text: string): string {
 
 /**
  * The section on the Master's failed upgrade, followed by a blank line; empty without one. The
- * proposals go to GitHub, so paths under the home directory are left out of what the script
+ * proposals may go to GitHub, so paths under the home directory are left out of what the script
  * recorded, as they are from everything the Master publishes. A failure of the environment (no
  * node or npm) says nothing about the code and is retried by the Master, so the scout is told not
  * to spend a proposal on it rather than to put fixing it first.
  */
-function upgradeSection(failure: UpgradeFailure | null | undefined): string {
+function upgradeSection(failure: UpgradeFailure | null | undefined, source: ScoutSource): string {
   if (!failure) return '';
   const unknown = t({ zh: '（不知道是哪个）', en: '(unknown)' });
   const to = failure.to || unknown;
@@ -1169,31 +1268,39 @@ ${output}`,
 - Failure message: ${message}
 ${output}`,
   });
-  const advice = failure.env ? envFailureAdvice() : codeFailureAdvice(toShort);
+  const advice = failure.env ? envFailureAdvice(source) : codeFailureAdvice(toShort, source);
   return `${title}\n${facts}\n\n${advice}\n\n`;
 }
 
 /** What the scout does about an upgrade that failed for the environment, not for the code. */
-function envFailureAdvice(): string {
+function envFailureAdvice(source: ScoutSource): string {
+  const covered = t({
+    zh: source === 'local' ? '已有的提案已经覆盖时' : '已有的 issue 已经覆盖时',
+    en: source === 'local' ? 'an existing proposal' : 'an existing issue',
+  });
   return t({
     zh: `这次失败出在运行环境（比如稳定副本所在的机器上找不到能用的 node 或 npm），和这个提交的代码无关。Master 不会把这个提交记成失败过，会等一段时间后自己再试，环境好了升级就会成功。所以不要为此提代码修复，也不要把它排在上面的线索前面。
-- 只有输出表明仓库里的脚本（比如 \`scripts/find-node.sh\`、\`scripts/self-upgrade.sh\`）本身有缺陷时，比如机器上明明装着合适的 node 却没有找到，才提修复：先核对问题在现在的代码里是否还在，已有的 issue 已经覆盖时不要重复提。`,
+- 只有输出表明仓库里的脚本（比如 \`scripts/find-node.sh\`、\`scripts/self-upgrade.sh\`）本身有缺陷时，比如机器上明明装着合适的 node 却没有找到，才提修复：先核对问题在现在的代码里是否还在，${covered}不要重复提。`,
     en: `This failure is the environment's (for example, no usable node or npm on the machine of the stable copy), not the code's in that commit. The Master does not count the commit as failed: it waits a while and tries again by itself, and the upgrade succeeds once the environment is fixed. So do not propose a code fix for it, and do not put it before the leads above.
-- Propose a fix only if the output shows a defect in a script of the repo itself (such as \`scripts/find-node.sh\` or \`scripts/self-upgrade.sh\`), for example that it missed a suitable node installed on the machine: check first whether the problem is still in the code as it is now, and do not propose it again if an existing issue covers it.`,
+- Propose a fix only if the output shows a defect in a script of the repo itself (such as \`scripts/find-node.sh\` or \`scripts/self-upgrade.sh\`), for example that it missed a suitable node installed on the machine: check first whether the problem is still in the code as it is now, and do not propose it again if ${covered} covers it.`,
   });
 }
 
 /** What the scout does about an upgrade that failed for any other reason: fix it first. */
-function codeFailureAdvice(toShort: string): string {
+function codeFailureAdvice(toShort: string, source: ScoutSource): string {
+  const existing = t({
+    zh: source === 'local' ? '已有的提案里' : '已有的 issue 里',
+    en: source === 'local' ? 'the existing proposals' : 'the existing issues',
+  });
   return t({
     zh: `这很可能说明目标分支上的代码在稳定副本里无法构建、启动，或者启动后不久就出错退出。修好之前，每次升级都会失败，Master 一直停在旧版本上，系统的自我进化也就停了，所以修复它是最高优先级，排在上面所有线索之前：根据上面的输出和代码找出原因，把修复作为第一条提案，在证据里写上失败的提交和输出中的关键行。
 - 如果输出表明是网络、npm 源、磁盘空间这类环境问题，而不是代码的问题，就不要硬提代码修复。
 - 你读到的目标分支可能已经比 ${toShort} 新：先核对问题在现在的代码里是否还在，已经修好的不要再提。
-- 已有的 issue 里已经有针对这个失败的修复时，不要重复提。`,
+- ${existing}已经有针对这个失败的修复时，不要重复提。`,
     en: `Most likely the code on the target branch cannot be built or started in the stable copy, or exits with an error soon after it starts. Until that is fixed, every upgrade fails, the Master stays on the old version, and the system stops evolving, so fixing it comes first, before all the leads above: find the cause from the output and the code, make the fix your first proposal, and cite the failed commit and the key lines of the output in its evidence.
 - If the output shows a problem of the environment, such as the network, the npm registry or disk space, rather than of the code, do not force a code fix.
 - The target branch you read may be newer than ${toShort}: check first whether the problem is still in the code as it is now, and do not propose a fix for one already fixed.
-- Do not propose a fix again if one for this failure is among the existing issues.`,
+- Do not propose a fix again if one for this failure is among ${existing}.`,
   });
 }
 
@@ -1242,14 +1349,20 @@ function stepRule(): string {
  */
 function splitIntro(input: ScoutPromptInput): string {
   const note = autoAcceptLNote(input.autoAcceptsL);
+  const source = input.source ?? 'github';
   if (input.splits) {
+    const items = severalItems(source);
+    const extra = t({
+      zh: source === 'local' ? '每多一条提案' : '每多一个 issue',
+      en: source === 'local' ? 'every extra proposal' : 'every extra issue',
+    });
     return t({
       zh: `这个仓库用的模板能拆分大需求：size 为 L 的需求，在编码阶段会先拆成几步，再一步一步做、一步一步检查，一个 Run 就能做完。${note}
-- 一个能力一个 Run 拆成几步能做完的，作为一条提案，size 标 L，不要拆成几个 issue：每多一个 issue，就多一轮评估、评审、合并和升级。
-- 只有一个 Run 拆了也做不完，或者前面几步单独合并就有价值时，才把它拆成有先后的几个 issue。${stepRule()}这次只提第一步，第一步也可以是 L。`,
+- 一个能力一个 Run 拆成几步能做完的，作为一条提案，size 标 L，不要拆成${items}：${extra}，就多一轮评估、评审、合并和升级。
+- 只有一个 Run 拆了也做不完，或者前面几步单独合并就有价值时，才把它拆成有先后的${items}。${stepRule()}这次只提第一步，第一步也可以是 L。`,
       en: `The template this repo uses can split large requirements: a requirement of size L is first split into steps in the coding stage, then done and checked step by step, all in one Run. ${note}
-- When one Run can finish a capability by splitting it into steps, make it one proposal of size L; do not split it into several issues: every extra issue costs another round of assessment, review, merge and upgrade.
-- Only when one Run cannot finish it even split up, or when its first steps are worth merging on their own, split it into several issues in order. ${stepRule()} Propose only the first step now; it may be of size L too.`,
+- When one Run can finish a capability by splitting it into steps, make it one proposal of size L; do not split it into several ${items}: ${extra} costs another round of assessment, review, merge and upgrade.
+- Only when one Run cannot finish it even split up, or when its first steps are worth merging on their own, split it into several ${items} in order. ${stepRule()} Propose only the first step now; it may be of size L too.`,
     });
   }
   return t({
@@ -1262,12 +1375,24 @@ When a capability is too much for one Run, split it into steps in order. ${stepR
   });
 }
 
+/**
+ * 「几个 issue」, what a large capability is split into when one Run cannot finish it: issues, or
+ * proposals of the local backlog. In English the plural noun alone.
+ */
+function severalItems(source: ScoutSource): string {
+  return t({
+    zh: source === 'local' ? '几条提案' : '几个 issue',
+    en: source === 'local' ? 'proposals' : 'issues',
+  });
+}
+
 /** The requirement on how large a proposal is, by whether the repo's template splits. */
-function sizeRequirement(splits: boolean): string {
+function sizeRequirement(splits: boolean, source: ScoutSource): string {
+  const items = severalItems(source);
   return splits
     ? t({
-        zh: '每条要能独立完成、独立合并，一个 Run 能做完。一个 Run 拆成几步能做完的能力，作为一条提案、size 标 L，不要拆成几个 issue；什么时候才拆成几个 issue，见上面「拆一个大能力」。',
-        en: 'Each proposal must be doable and mergeable on its own, within one Run. A capability one Run can finish by splitting it into steps is one proposal of size L, not several issues; when to split it into issues anyway is described in "Splitting a large capability".',
+        zh: `每条要能独立完成、独立合并，一个 Run 能做完。一个 Run 拆成几步能做完的能力，作为一条提案、size 标 L，不要拆成${items}；什么时候才拆成${items}，见上面「拆一个大能力」。`,
+        en: `Each proposal must be doable and mergeable on its own, within one Run. A capability one Run can finish by splitting it into steps is one proposal of size L, not several ${items}; when to split it into ${items} anyway is described in "Splitting a large capability".`,
       })
     : t({
         zh: '每条要能独立完成、独立合并，一个 Run 能做完。太大的按上面「拆一个大能力」的做法拆开，只提第一步；那样也拆不开的，才把 size 标为 L。',
@@ -1275,8 +1400,117 @@ function sizeRequirement(splits: boolean): string {
       });
 }
 
-const scoutPromptZh = (input: ScoutPromptInput) =>
-  `你是${brandName()}的「侦察」：为仓库 ${input.repoName} 找出接下来最值得做的事，写成需求提案。提案会成为 GitHub issue，被采纳后由 Agent 按「编码 → 评审 → 合并」完成。你只能读代码和文档，不能修改任何文件。
+// The parts of the prompt that depend on where the repo's requirements are (`ScoutSource`): on
+// GitHub, proposals become issues and the requirements there are are issues, open or closed; in
+// the local backlog, proposals stay in the Master, waiting for a human, accepted or rejected.
+
+/** What becomes of a proposal. */
+function proposalFate(source: ScoutSource): string {
+  return source === 'local'
+    ? t({
+        zh: '提案会存进 Master 的本地提案池，在看板上被采纳（或按自动采纳的设置采纳）后由 Agent 按「编码 → 评审 → 合并」完成。',
+        en: `Each proposal goes into the Master's local backlog; once accepted on the dashboard (or under the auto-accept setting), agents carry it out through "code → review → merge".`,
+      })
+    : t({
+        zh: '提案会成为 GitHub issue，被采纳后由 Agent 按「编码 → 评审 → 合并」完成。',
+        en: 'Each proposal becomes a GitHub issue; once accepted, agents carry it out through "code → review → merge".',
+      });
+}
+
+/** That gaps some requirement already works on are listed too. */
+function coveredGapsText(source: ScoutSource): string {
+  return source === 'local'
+    ? t({
+        zh: '已经有提案在做的缺口也照样列出。',
+        en: 'List gaps that existing proposals already work on as well.',
+      })
+    : t({
+        zh: '已经有 issue 在做的缺口也照样列出。',
+        en: 'List gaps that existing issues already work on as well.',
+      });
+}
+
+/** What a review suggestion is checked against besides the code, within lead 4. */
+function coveredCheck(source: ScoutSource): string {
+  return source === 'local'
+    ? t({ zh: '是否已经有提案覆盖', en: 'that no existing proposal covers it' })
+    : t({ zh: '是否已经有 issue 覆盖', en: 'that no existing issue covers it' });
+}
+
+/** What to do about a gap some requirement already works on, in the mix of proposals. */
+function takenGapText(source: ScoutSource): string {
+  return source === 'local'
+    ? t({
+        zh: '缺口已经有提案在做（还在等人决定，或已采纳、Run 还没完成）时，换一个缺口；只有那条提案覆盖面很大、还在等人决定时，才提它能独立合并的第一步（见下面「拆一个大能力」里等人决定的大提案那一条）。',
+        en: 'When a proposal already works on a gap (still waiting for a human, or accepted with its Run not completed yet), take another gap; only when that proposal covers a lot and is still waiting for a human, propose a first step of it that can be merged on its own (see the point on large proposals waiting for a human in "Splitting a large capability" below).',
+      })
+    : t({
+        zh: '缺口已经有未关闭的 issue 在做时，换一个缺口；只有那个 issue 覆盖面很大、还在等人采纳时，才提它能独立合并的第一步（见下面「拆一个大能力」里等人采纳的大 issue 那一条）。',
+        en: 'When an open issue already works on a gap, take another gap; only when that issue covers a lot and is still waiting for a human to accept it, propose a first step of it that can be merged on its own (see the point on large issues waiting for a human in "Splitting a large capability" below).',
+      });
+}
+
+/** Going on with the next step of a requirement whose step was merged, and not before. */
+function followUpText(source: ScoutSource): string {
+  return source === 'local'
+    ? t({
+        zh: '- 下面已有的本地提案里，列着「后续步骤」、而且已采纳、Run 已完成（前一步已经合并）的，优先考虑提它的下一步：在 why 里写明接着哪条提案（写上它的 id），what 末尾的「后续步骤」只列还剩下的步骤。列着「后续步骤」、但还在等人决定或 Run 还没完成的提案，说明这一步还没合并，不要提它后面的步骤。',
+        en: '- Among the existing local proposals below, when a proposal lists "Next steps", was accepted and its Run completed (its step was merged), consider its next step first: say in why which proposal it follows (with its id), and list only the steps still left under "Next steps" at the end of what. A proposal listing "Next steps" that still waits for a human, or whose Run has not completed, has its step not merged yet: do not propose the steps after it.',
+      })
+    : t({
+        zh: '- 下面已有的 issue 里，列着「后续步骤」、而且已完成（前一步已经合并）的，优先考虑提它的下一步：在 why 里写明接着哪条 issue，what 末尾的「后续步骤」只列还剩下的步骤。已经拆好、列着「后续步骤」但还没关闭的 issue，说明这一步正在做、还没合并，不要提它后面的步骤。',
+        en: '- Among the existing issues below, when an issue lists "Next steps" and is done (its step was merged), consider its next step first: say in why which issue it follows, and list only the steps still left under "Next steps" at the end of what. An issue already split up, listing "Next steps" and still open, has its step in progress and not merged yet: do not propose the steps after it.',
+      });
+}
+
+/** Proposing the first step of a large requirement still waiting for a human. */
+function largeWaitingText(source: ScoutSource): string {
+  return source === 'local'
+    ? t({
+        zh: '- 这和还在等人决定的大提案不同：已有的提案覆盖的能力太大、没有拆过、一直在等人决定的，可以提它能独立合并的第一步，在 why 里注明对应哪条提案（写上它的 id），这不算重复。',
+        en: '- A large proposal still waiting for a human is different: when an existing proposal covers a capability too large to have been taken up, was never split, and still waits for a human, you may propose a first step of it that can be merged on its own, saying in why which proposal it belongs to (with its id); that is not a duplicate.',
+      })
+    : t({
+        zh: '- 这和还在等人采纳的大 issue 不同：已有的 issue 覆盖的能力太大、没有拆过、一直没人做的（比如还在等人采纳的大提案），可以提它能独立合并的第一步，在 why 里注明对应哪条 issue，这不算重复。',
+        en: '- A large issue still waiting for a human is different: when an existing issue covers a capability too large to have been taken up, was never split, and nobody has worked on it (such as a large proposal still waiting for a human), you may propose a first step of it that can be merged on its own, saying in why which issue it belongs to; that is not a duplicate.',
+      });
+}
+
+/** Not proposing what there is already, and the rejections as counterexamples. */
+function duplicatesText(source: ScoutSource): string {
+  return source === 'local'
+    ? t({
+        zh: '- 不要和下面已有的本地提案重复，包括已采纳的和被拒绝的。被拒绝的提案是反例，注意其中的理由，不要换个说法再提；已采纳、但需求评估结论为不做的，也一样。',
+        en: '- Do not duplicate the existing local proposals below, including accepted and rejected ones. Rejected proposals are counterexamples: note their reasons and do not propose them again in other words; the same goes for accepted ones the requirement assessment dropped.',
+      })
+    : t({
+        zh: '- 不要和下面已有的 issue 重复，包括已关闭的。被关闭为「不做」的 issue 是反例，注意其中的理由，不要换个说法再提。',
+        en: '- Do not duplicate the existing issues below, including closed ones. Issues closed as not planned are counterexamples: note their reasons and do not propose them again in other words.',
+      });
+}
+
+/** Requirements whose Runs failed: no human turned them down. */
+function failedRequirementsText(source: ScoutSource): string {
+  return source === 'local'
+    ? t({
+        zh: '- 已采纳、但 Run 失败了的提案不一样：它不是人拒绝的，需求本身可能仍然需要。可以根据其中的失败原因换个思路重新提案（比如拆小、先补上缺的能力、换一种做法），在 why 里说明和上次的不同；不要原样再提。',
+        en: '- Accepted proposals whose Run failed are different: no human rejected them, and the requirement may well still be wanted. You may propose them again with another approach based on the failure (e.g. split them up, first add a missing capability, do it another way), saying in why what is different this time; do not propose them again as they were.',
+      })
+    : t({
+        zh: '- 「多次失败后关闭」的 issue 不一样：它不是人拒绝的，而是 Run 尝试了几次都失败了，需求本身可能仍然需要。可以根据其中的失败原因换个思路重新提案（比如拆小、先补上缺的能力、换一种做法），在 why 里说明和上次的不同；不要原样再提。',
+        en: '- Issues "closed after repeated failures" are different: no human rejected them; their Runs failed attempt after attempt, and the requirement may well still be wanted. You may propose them again with another approach based on the failures (e.g. split them up, first add a missing capability, do it another way), saying in why what is different this time; do not propose them again as they were.',
+      });
+}
+
+/** The heading of the requirements there are. */
+function existingHeading(source: ScoutSource): string {
+  return source === 'local'
+    ? t({ zh: '## 已有的本地提案', en: '## Existing local proposals' })
+    : t({ zh: '## 已有的 issue', en: '## Existing issues' });
+}
+
+const scoutPromptZh = (input: ScoutPromptInput, source: ScoutSource) =>
+  `你是${brandName()}的「侦察」：为仓库 ${input.repoName} 找出接下来最值得做的事，写成需求提案。${proposalFate(source)}你只能读代码和文档，不能修改任何文件。
 
 ## 先弄清方向
 - 读 README.md 和 AGENTS.md（有 CLAUDE.md 的也读）。README.md 写着项目的目标，是一切决定的依据；AGENTS.md 写着目录结构、命令和约定。
@@ -1285,47 +1519,47 @@ const scoutPromptZh = (input: ScoutPromptInput) =>
 ## 先做差距分析
 提案之前，先按 README.md 的原文列出它写的目标（只用来对照，不写进结果），再对照其中的每个目标，在能力层面列出这个项目现在还做不到什么，写进结果的 gaps。要看的是缺了哪些能力，不是零碎的缺陷：比如能对接哪些外部工具和服务、能做多大的任务、能不能并行、能服务什么样的用户、场景和需求来源、出了问题能不能自己恢复。代码里定义了却没有实现的选项、只支持一种情况的地方、写死的上限，往往就是缺口。
 - 每个缺口写明：goal 是上面列出的哪个目标，一字不差地照抄 README.md 里这个目标的原文，同一个目标在每个缺口里写法相同；gap 是缺什么能力，evidence 是限制这个能力的代码位置（文件:行号）或 README、文档里的段落。
-- 最重要的缺口放在最前：越是挡住目标、越多事情依赖它，越重要。已经有 issue 在做的缺口也照样列出。
+- 最重要的缺口放在最前：越是挡住目标、越多事情依赖它，越重要。${coveredGapsText(source)}
 - 认真对照每个目标后仍然找不到缺口，gaps 才是空列表。
 
 ## 线索（按优先级从高到低）
 1. 让系统停转或空耗的问题：下面附的最近 Run 里卡住、失败、反复返工、评审反复提同类意见、费用或 Agent 执行用时异常的${upgradeLead(input.upgrade)}。用时里「${part('stoppedMs')}」「${part('approvalMs')}」「${part('blockedMs')}」「${part('pausedMs')}」的部分是在等人处理，「${part('queuedMs')}」的部分是在等别的 Run 做完（也包括等升级、Master 没运行的时候），「${part('conflictWaitMs')}」和排队一样是在等别的 Run（避开和它改同一处的 Run，免得合并时冲突），都不说明 Agent 慢。摘要开头写着当时的 concurrency.per_repo 和有几个 Run 并行执行过：per_repo 为 1、排队时间远多于 Agent 执行时间、并行带来的错开等待和「并行时合并冲突」又很少时，可以建议人调大 per_repo，并写明依据。per_repo 由用户在自己数据目录的 config.yaml 里设置，不在仓库里：侦察只提建议，不改用户的配置。需求评估提了疑问、需求在讨论后改过或结论为不做，说明这条需求没写清楚或方向有偏差：留意其中的疑问和理由，新提案不要再犯。
 2. 差距分析里最重要的能力缺口。
 3. 明显的缺陷和测试缺口，README.md、AGENTS.md 和代码不一致的地方，代码里的 TODO。
-4. 评审建议和对最近改动的修饰：评审通过时给的建议是评审有意留到以后的改进（超出当时目标范围的缺陷、测试缺口、重复代码等），对最近合并的改动还能再修一修的地方也归在这一类。要先到代码里核对它是否仍然存在、是否已经有 issue 覆盖；相关的几条合成一条提案，不要一条建议提一条。
+4. 评审建议和对最近改动的修饰：评审通过时给的建议是评审有意留到以后的改进（超出当时目标范围的缺陷、测试缺口、重复代码等），对最近合并的改动还能再修一修的地方也归在这一类。要先到代码里核对它是否仍然存在、${coveredCheck(source)}；相关的几条合成一条提案，不要一条建议提一条。
 
 ## 提案的配比
 - 第 1 类问题优先：有就先提；条数上限放不下时，以第 1 类为先。
-- 第 1 类之外，只要差距分析里有缺口，至少有一条提案是补能力的：category 为 feature，补上差距分析里的一个缺口，推进 README.md 的某个目标，而不是对最近改动的修补。缺口已经有未关闭的 issue 在做时，换一个缺口；只有那个 issue 覆盖面很大、还在等人采纳时，才提它能独立合并的第一步（见下面「拆一个大能力」里等人采纳的大 issue 那一条）。
+- 第 1 类之外，只要差距分析里有缺口，至少有一条提案是补能力的：category 为 feature，补上差距分析里的一个缺口，推进 README.md 的某个目标，而不是对最近改动的修补。${takenGapText(source)}
 - 第 4 类每次最多一条。
 
 ## 拆一个大能力
 ${splitIntro(input)}
 - what 的末尾单独起一行写「后续步骤：」（不要写成标题），下面按顺序列出剩下的几步，每步一句话，以后的侦察从这里接着往下提。
-- 下面已有的 issue 里，列着「后续步骤」、而且已完成（前一步已经合并）的，优先考虑提它的下一步：在 why 里写明接着哪条 issue，what 末尾的「后续步骤」只列还剩下的步骤。已经拆好、列着「后续步骤」但还没关闭的 issue，说明这一步正在做、还没合并，不要提它后面的步骤。
-- 这和还在等人采纳的大 issue 不同：已有的 issue 覆盖的能力太大、没有拆过、一直没人做的（比如还在等人采纳的大提案），可以提它能独立合并的第一步，在 why 里注明对应哪条 issue，这不算重复。
+${followUpText(source)}
+${largeWaitingText(source)}
 
 ## 要求
 - 最多 ${input.max} 条，宁缺毋滥；没有值得做的就返回空列表。按上面的优先级和配比排列，同一类里价值高的在前。
 - 每条都要有能核对的证据：Run id、文件:行号、README 或 AGENTS.md 中的段落。补能力的提案不需要有出错的 Run：README.md 里的目标加上限制这个能力的代码位置就是证据。拿不出证据的不要提。
-- 不要和下面已有的 issue 重复，包括已关闭的。被关闭为「不做」的 issue 是反例，注意其中的理由，不要换个说法再提。
-- 「多次失败后关闭」的 issue 不一样：它不是人拒绝的，而是 Run 尝试了几次都失败了，需求本身可能仍然需要。可以根据其中的失败原因换个思路重新提案（比如拆小、先补上缺的能力、换一种做法），在 why 里说明和上次的不同；不要原样再提。
-- ${sizeRequirement(input.splits)}
+${duplicatesText(source)}
+${failedRequirementsText(source)}
+- ${sizeRequirement(input.splits, source)}
 - risk 的含义：
   - low：只涉及文档、测试、看板展示，或不改变行为的重构；
   - mid：改变行为，但影响范围清楚；
   - high：涉及数据库迁移、合并或回滚等 git 操作、Agent 权限、配置格式、对外发布，或者改动 .ares1/ 下的文件（仓库自己的开发流程）。
 - 用中文写。不要写本机的绝对路径，也不要写任何个人信息。
 
-${upgradeSection(input.upgrade)}## 最近的 Run
+${upgradeSection(input.upgrade, source)}## 最近的 Run
 ${input.runs}
 
-## 已有的 issue
+${existingHeading(source)}
 ${input.issues}
 `;
 
-const scoutPromptEn = (input: ScoutPromptInput) =>
-  `You are the scout of ${brandName()}: find what is most worth doing next in the repo ${input.repoName} and write it up as proposals. Each proposal becomes a GitHub issue; once accepted, agents carry it out through "code → review → merge". You may only read code and documents; you must not change any file.
+const scoutPromptEn = (input: ScoutPromptInput, source: ScoutSource) =>
+  `You are the scout of ${brandName()}: find what is most worth doing next in the repo ${input.repoName} and write it up as proposals. ${proposalFate(source)} You may only read code and documents; you must not change any file.
 
 ## First, get the direction
 - Read README.md and AGENTS.md (and CLAUDE.md if there is one). README.md states the project's goals and is the basis for every decision. AGENTS.md describes the layout, commands and conventions.
@@ -1334,41 +1568,41 @@ const scoutPromptEn = (input: ScoutPromptInput) =>
 ## First, a gap analysis
 Before proposing anything, list the goals README.md states, in its own words (only to go by, not part of your answer); then go through each of them and list, as capabilities, what the project cannot do yet; put them in the gaps of your answer. Look for missing capabilities, not scattered bugs: for example which outside tools and services it can work with, how large a task it can take on, whether it can do things in parallel, what users, situations and sources of requirements it can serve, and whether it can recover by itself when something goes wrong. Options defined in the code but never implemented, places that support only one case, and hard-coded limits are often gaps.
 - For each gap, give goal: one of the goals you listed, copied word for word as README.md writes it, and written the same way in every gap of that goal; gap: the missing capability; evidence: where the code limits this capability (file:line), or passages of README or other documents.
-- Put the most important gaps first: the more a gap stands in the way of a goal and the more depends on it, the more important it is. List gaps that existing issues already work on as well.
+- Put the most important gaps first: the more a gap stands in the way of a goal and the more depends on it, the more important it is. ${coveredGapsText(source)}
 - Leave gaps empty only if you find none after carefully going through every goal.
 
 ## Leads (highest priority first)
 1. Problems that stop the system or make it spin without progress: Runs below that got stuck, failed, needed rework again and again, drew the same kind of review comments again and again, or took unusual cost or agent time${upgradeLead(input.upgrade)}. In the times, "${part('stoppedMs')}", "${part('approvalMs')}", "${part('blockedMs')}" and "${part('pausedMs')}" are time spent waiting for a human; "${part('queuedMs')}" is time spent waiting for other Runs to finish (including while an upgrade is pending or the Master is not running), and "${part('conflictWaitMs')}" is waiting for another Run just like the queue (keeping clear of a Run that changes the same place, so that the two do not conflict at the merge): none of these mean the agents were slow. The digest of the Runs opens with concurrency.per_repo at the time and how many Runs executed side by side: when per_repo is 1, the Runs spent far more time queued than executing, and working side by side brought few waits for overlapping Runs and few merge conflicts, you may suggest that a human raise per_repo, giving your grounds. per_repo is set by the user in config.yaml in their own data directory, not in the repo: the scout only suggests it and does not change the user's configuration. When the requirement assessment asked questions, the requirement was revised in the discussion, or the conclusion was to drop it, the requirement was unclear or off course: note the questions and reasons, and do not repeat those mistakes in new proposals.
 2. The most important capability gaps from your gap analysis.
 3. Obvious bugs and gaps in tests, places where README.md, AGENTS.md and the code disagree, TODOs in the code.
-4. Review suggestions and polish of recent changes: the suggestions given by a review that passed are improvements the reviewer left for later on purpose (bugs beyond the goal of the time, gaps in tests, duplicated code and the like), and whatever could still be touched up in recently merged changes belongs here too. First check in the code that each one is still there and that no existing issue covers it; merge related ones into one proposal rather than proposing each suggestion on its own.
+4. Review suggestions and polish of recent changes: the suggestions given by a review that passed are improvements the reviewer left for later on purpose (bugs beyond the goal of the time, gaps in tests, duplicated code and the like), and whatever could still be touched up in recently merged changes belongs here too. First check in the code that each one is still there and ${coveredCheck(source)}; merge related ones into one proposal rather than proposing each suggestion on its own.
 
 ## Mix of proposals
 - Problems of lead 1 come first: propose them before anything else, and when the limit leaves no room for more, they take it.
-- Besides lead 1, as long as your gap analysis found a gap, at least one proposal must add a capability: category feature, closing a gap from your gap analysis and advancing a goal of README.md, not patching a recent change. When an open issue already works on a gap, take another gap; only when that issue covers a lot and is still waiting for a human to accept it, propose a first step of it that can be merged on its own (see the point on large issues waiting for a human in "Splitting a large capability" below).
+- Besides lead 1, as long as your gap analysis found a gap, at least one proposal must add a capability: category feature, closing a gap from your gap analysis and advancing a goal of README.md, not patching a recent change. ${takenGapText(source)}
 - At most one proposal from lead 4 per scout.
 
 ## Splitting a large capability
 ${splitIntro(input)}
 - End what with a line of its own reading "Next steps:" (not a heading), followed by the remaining steps in order, one sentence each, for later scouts to go on from.
-- Among the existing issues below, when an issue lists "Next steps" and is done (its step was merged), consider its next step first: say in why which issue it follows, and list only the steps still left under "Next steps" at the end of what. An issue already split up, listing "Next steps" and still open, has its step in progress and not merged yet: do not propose the steps after it.
-- A large issue still waiting for a human is different: when an existing issue covers a capability too large to have been taken up, was never split, and nobody has worked on it (such as a large proposal still waiting for a human), you may propose a first step of it that can be merged on its own, saying in why which issue it belongs to; that is not a duplicate.
+${followUpText(source)}
+${largeWaitingText(source)}
 
 ## Requirements
 - At most ${input.max}, and only ones that are worth it; return an empty list if nothing is. Order them by the priorities and the mix above, the more valuable first within each lead.
 - Every proposal needs verifiable evidence: Run ids, file:line, passages of README or AGENTS.md. A proposal that adds a capability needs no failed Run: a goal in README.md together with where the code limits the capability is evidence. Do not propose anything you cannot back with evidence.
-- Do not duplicate the existing issues below, including closed ones. Issues closed as not planned are counterexamples: note their reasons and do not propose them again in other words.
-- Issues "closed after repeated failures" are different: no human rejected them; their Runs failed attempt after attempt, and the requirement may well still be wanted. You may propose them again with another approach based on the failures (e.g. split them up, first add a missing capability, do it another way), saying in why what is different this time; do not propose them again as they were.
-- ${sizeRequirement(input.splits)}
+${duplicatesText(source)}
+${failedRequirementsText(source)}
+- ${sizeRequirement(input.splits, source)}
 - What risk means:
   - low: only documentation, tests, how the dashboard shows things, or refactoring without behavior change;
   - mid: changes behavior, with a clear scope;
   - high: database migrations, git operations such as merging or rollback, agent permissions, the configuration format, publishing anything outside, or changes to files under .ares1/ (the repo's own development workflow).
 - Write in English. Do not write absolute paths of this machine or any personal information.
 
-${upgradeSection(input.upgrade)}## Recent Runs
+${upgradeSection(input.upgrade, source)}## Recent Runs
 ${input.runs}
 
-## Existing issues
+${existingHeading(source)}
 ${input.issues}
 `;

@@ -125,6 +125,21 @@ export function autoAcceptsL(limits: AutoAcceptLimits): boolean {
 }
 
 /**
+ * Whether a proposal waiting for a human holds the automatic scout back, once max_proposals of
+ * them do; the same for every source of requirements (GitHub issues, the local backlog). Without
+ * auto-accept (`max_risk: none`), every one does: a human decides them all. With it, only those
+ * auto-accept would take but has not yet (today's count is used up), and those of an unknown kind
+ * (`p` null: no scout record), to stay safe. Proposals beyond what auto-accept takes (over
+ * `max_size` or `max_risk`) still wait for a human, but would otherwise stop the system for good,
+ * so they do not count; the scout sees them among the requirements there are and does not propose
+ * them again.
+ */
+export function holdsScout(p: ProposalKind | null, limits: AutoAcceptLimits): boolean {
+  if (limits.max_risk === 'none') return true;
+  return !p || isAutoAcceptable(p, limits);
+}
+
+/**
  * Every kind of proposal (risk × size), split into those the Master accepts by itself under
  * `limits` and those left to a human. `rule` is the auto-accept rule; tests may pass another.
  */
@@ -791,9 +806,10 @@ export interface ScoutBackoff {
  * How long the automatic scout backs off: scouting an unchanged repo again most likely finds
  * nothing again, at the price of a full read of the repo every poll. Counting back from the newest
  * scout (started by hand or not), k is the number of scouts in a row that failed or filed no
- * issue (proposals that were all duplicates or could not be filed find nothing). The next one may
- * start poll_minutes × 2^(k-1) after the newest of them ended, at most MAX_SCOUT_BACKOFF_HOURS.
- * - A scout that filed an issue ends the streak.
+ * proposal (proposals that were all duplicates or could not be filed find nothing). The next one
+ * may start poll_minutes × 2^(k-1) after the newest of them ended, at most
+ * MAX_SCOUT_BACKOFF_HOURS.
+ * - A scout that filed a proposal ends the streak: as an issue, or into the local backlog.
  * - So does a scout started before `changedAt` (the target branch's latest commit): it did not
  *   see the repo as it is now.
  * - A scout cut short by the Master stopping, or still running, neither counts nor ends it.
@@ -813,7 +829,7 @@ export function scoutBackoff(
       continue;
     }
     if (Date.parse(s.startedAt) < changedAt) break;
-    if (s.status === 'completed' && s.proposals.some((p) => p.issue)) break;
+    if (s.status === 'completed' && s.proposals.some((p) => p.issue || p.local)) break;
     count++;
     newest ??= s;
   }

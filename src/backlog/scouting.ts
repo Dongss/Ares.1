@@ -27,6 +27,7 @@ import { type Engine, estimateCost, InvalidStateError } from '../engine/engine.j
 import {
   parseScoutReport,
   runDigest,
+  type ScoutSource,
   scoutPrompt,
   scoutReportJsonSchema,
 } from '../github/scout.js';
@@ -129,7 +130,7 @@ export function busyText(moving: number, redo: number): string | null {
 export interface KnownRequirements {
   /**
    * The requirements there are, so the scout does not propose them again, and the rejected
-   * ones with their reasons as counterexamples (`issueDigest`).
+   * ones with their reasons as counterexamples (`issueDigest`, `localProposalDigest`).
    */
   issues: string;
   /**
@@ -154,6 +155,8 @@ export interface FiledProposals {
  * backlog. `C` is the repo's settings there.
  */
 export interface ProposalSource<C extends ProposalSourceConfig> {
+  /** Which source it is, for what the scout's prompt says of proposals and requirements. */
+  readonly kind: ScoutSource;
   /** Where the repo's settings are in config.yaml, for messages: `github.repos.<name>`. */
   configPath(name: string): string;
   /**
@@ -548,6 +551,7 @@ export class Scouting {
       const template = findTemplate(this.cfg, repo.name, cfg.template)?.template;
       const prompt = scoutPrompt({
         repoName: repo.name,
+        source: source.kind,
         max: scoutCfg.max_proposals,
         runs: runDigest(store, repo.id, this.cfg.master.concurrency.per_repo),
         issues: known.issues,

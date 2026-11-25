@@ -2096,6 +2096,7 @@ export class IssueBridge {
    * ares1:proposal, and the scout is shown the repo's issues by people the Master trusts.
    */
   private readonly scoutSource: ProposalSource<GitHubRepoConfig> = {
+    kind: 'github',
     configPath: (name) => `github.repos.${name}`,
     pollMinutes: () => this.pollMinutes,
     prepareScout: async (repo, cfg) => {
