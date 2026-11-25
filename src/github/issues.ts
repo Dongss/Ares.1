@@ -485,7 +485,8 @@ const oneLine = (text: string, max: number) => {
   return line.length > max ? `${line.slice(0, max)}…` : line;
 };
 
-const quote = (text: string, max = 800) => {
+/** `text` as a Markdown quote, cut to `max` characters with an ellipsis. */
+export const quote = (text: string, max = 800) => {
   const cut = text.length > max ? `${text.slice(0, max)}…` : text;
   return cut
     .split('\n')
