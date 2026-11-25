@@ -61,6 +61,9 @@ src/
     discussion.ts     an assessment's conclusion and discussion (shared with the dashboard)
     times.ts          how a Run's time is split into parts (shared with the dashboard)
     plan.ts           which step of its round's plan a task is (shared with the dashboard)
+  backlog/            where requirements come from, whatever the source (GitHub or local):
+    scouting.ts       the AI scout's scheduling and runs, filing through a ProposalSource
+    guard.ts          the day's budget and auto-accept limits
   github/
     client.ts         GitHub through the gh CLI (FakeGitHub in tests)
     bridge.ts         polling, Runs from issues, progress on issues, auto-accept, push, auto-scout

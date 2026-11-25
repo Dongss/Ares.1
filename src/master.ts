@@ -10,6 +10,7 @@ import { CursorAgentAdapter } from './adapters/cursor-agent.js';
 import { type AgentAdapter, readOnlyClis as readOnlyClisOf } from './adapters/types.js';
 import { createApi } from './api/server.js';
 import { defaultWebDir } from './api/static.js';
+import { Scouting } from './backlog/scouting.js';
 import { brandName } from './brand.js';
 import type { Backoff, RateLimitWait } from './config/flow.js';
 import {
@@ -215,6 +216,8 @@ export class Master {
     readonly repoWorkflows: RepoWorkflows,
     readonly store: Store,
     readonly engine: Engine,
+    /** The scouts of every repo, whichever source their proposals go to. */
+    readonly scouting: Scouting,
     readonly issues: IssueBridge,
     readonly notifier: SystemNotifier,
     readonly webhook: WebhookNotifier,
@@ -291,14 +294,14 @@ export class Master {
       ? await git(installDir, ['remote', 'get-url', 'origin']).catch(() => null)
       : null;
     const masterOrigin = installDir && originUrl ? { installDir, url: originUrl } : null;
+    const scouting = new Scouting({ store, engine, paths, config, adapters, masterOrigin });
     const issues = new IssueBridge({
       store,
       engine,
       paths,
       config,
-      adapters,
+      scouting,
       github: opts.github,
-      masterOrigin,
       nodeMissing,
       refreshTemplates,
     });
@@ -311,7 +314,7 @@ export class Master {
       paths,
       config,
       installDir,
-      busy: () => issues.scoutRunning,
+      busy: () => scouting.running,
       nodeMissing,
       now: opts.now,
       launch: async (plan) => {
@@ -360,6 +363,7 @@ export class Master {
       repoWorkflows,
       store,
       engine,
+      scouting,
       issues,
       notifier,
       webhook,
@@ -376,6 +380,8 @@ export class Master {
     started = true;
     store.bus.on('event', master.onEvent);
     await engine.start();
+    // Before the polls, which may start scouts: the scouts the last Master left are put to rest.
+    await scouting.start();
     await issues.start({ poll: opts.pollIssues !== false });
     upgrader.start({ timer: opts.upgradeTimer !== false });
     logPruner.start();
@@ -420,7 +426,9 @@ export class Master {
     // failure is recorded) before the store closes, at most the webhook's timeout later. Never
     // rejects.
     const drained = this.webhook.drain();
-    await this.issues.stop();
+    // Together: the scouts record that they were cut short and delete their temporary worktrees
+    // while the bridge finishes its round.
+    await Promise.all([this.issues.stop(), this.scouting.stop()]);
     await this.engine.stop();
     await this.repoWorkflows.stop();
     const server = this.server;
