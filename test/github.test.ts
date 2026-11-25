@@ -35,6 +35,8 @@ import {
   labelDefs,
   markComment,
   proposalBody,
+  pullRequestComment,
+  pullRequestText,
   RETRIES_EXHAUSTED_MARKER,
   redoStartedComment,
   repliesAfterMaster,
@@ -86,6 +88,8 @@ interface ConfigOptions {
   maxPerDay?: number | null;
   autoMerge?: boolean;
   push?: boolean;
+  /** deliver; omitted = the default (push). */
+  deliver?: 'push' | 'pr';
   /** null = no daily limit. */
   budget?: number | null;
   template?: string;
@@ -114,6 +118,7 @@ ${opts.maxSize === undefined ? '' : `        max_size: ${opts.maxSize}`}
 ${maxPerDay === null ? '' : `        max_per_day: ${maxPerDay}`}
       auto_merge: ${opts.autoMerge ?? false}
       push: ${opts.push ?? false}
+${opts.deliver === undefined ? '' : `      deliver: ${opts.deliver}`}
 ${opts.budget === null ? '' : `      daily_budget_usd: ${opts.budget ?? 20}`}
 ${opts.maxAttempts === undefined ? '' : `      max_run_attempts: ${opts.maxAttempts}`}
 `;
@@ -3039,6 +3044,206 @@ stages:
   });
 });
 
+describe('issues: delivering through pull requests (deliver: pr)', () => {
+  const PR = config({ push: true, deliver: 'pr' });
+  const head = (t: Harness) => git(t.repoDir, 'rev-parse', 'main');
+  const eventData = (t: Harness, runId: string, type: string) =>
+    t.master.store
+      .listEvents(runId)
+      .filter((e) => e.type === type)
+      .map((e) => e.data);
+  const pulls = () => [...gh.pulls.values()];
+  /** The Run of a new ready issue, once it waits for the approval to merge. */
+  async function awaitingMerge(t: Harness, title = '加 feature', body = '写 feature.txt') {
+    gh.add({ title, body, labels: [LABELS.ready] });
+    await t.master.issues.poll();
+    const [created] = t.master.store.listRuns();
+    if (!created) throw new Error('no run');
+    return t.waitStatus(created.id, 'waiting_approval');
+  }
+  /** Approve the merge: the checks pass, and the Run waits for its pull request. */
+  async function approveMerge(t: Harness, run: Run) {
+    t.master.engine.approve(run.id);
+    const waiting = await t.waitStatus(run.id, 'blocked');
+    expect(waiting.blocked?.kind).toBe('pr_open');
+    return waiting;
+  }
+
+  it("pushes the Run's branch and opens a pull request into the target branch, once", async () => {
+    const t = await start(PR);
+    const store = t.master.store;
+    const file = join(homedir(), 'work', 'a.ts');
+    const run = await awaitingMerge(t, `改 ${file}`, `见 ${file}\n\n第二行`);
+    const main = head(t);
+    const waiting = await approveMerge(t, run);
+    await t.master.issues.sync();
+
+    expect(gh.pulls.size).toBe(1);
+    const [pull] = pulls();
+    if (!pull) throw new Error('no pull request');
+    expect(pull).toMatchObject({ headRefName: run.branch, baseRefName: 'main', state: 'open' });
+    expect(pull.title).toBe('#1 改 ~/work/a.ts');
+    expect(pull.body).toContain('> 见 ~/work/a.ts\n> \n> 第二行');
+    expect(pull.body).toContain(`Run \`${run.id}\``);
+    expect(pull.body).toContain(`看板：http://127.0.0.1:4870/#/runs/${run.id}`);
+    expect(pull.body.endsWith('\n\nCloses #1')).toBe(true);
+    expect(`${pull.title}\n${pull.body}`).not.toContain(homedir());
+    expect(isMasterComment(pull.body)).toBe(false);
+    // The Run's branch is on GitHub as it was accepted; the target branch is not pushed, and the
+    // local one has not moved.
+    expect(waiting.headCommit).toBe(git(t.repoDir, 'rev-parse', run.branch as string));
+    expect(gh.remoteBranches.get(run.branch as string)).toBe(waiting.headCommit);
+    expect(gh.calls).not.toContain('push main');
+    expect(gh.pushes).toEqual([]);
+    expect(head(t)).toBe(main);
+
+    const ref = { number: pull.number, url: pull.url };
+    expect(store.getRun(run.id)).toMatchObject({ status: 'blocked', pr: ref });
+    expect(eventData(t, run.id, 'github.pr_opened')).toEqual([
+      { ...ref, head: run.branch, base: 'main' },
+    ]);
+    // The issue gets the link and waits for a human, open; nothing is stuck.
+    const issue = gh.get(1);
+    const linked = issue.comments.filter((c) => c.includes(pull.url));
+    expect(linked).toHaveLength(1);
+    expect(linked[0]).toContain(`已开 PR #${pull.number}，合并到 \`main\``);
+    expect(isMasterComment(linked[0] ?? '')).toBe(true);
+    expect(issue.comments.some((c) => c.includes('卡住了'))).toBe(false);
+    expect(issue.labels).toEqual([LABELS.needsYou]);
+    expect(issue.state).toBe('open');
+
+    // Later rounds leave it be.
+    const calls = gh.calls.length;
+    await t.master.issues.poll();
+    await t.master.issues.sync();
+    expect(gh.pulls.size).toBe(1);
+    expect(gh.calls.slice(calls).filter((c) => c.includes(run.branch as string))).toEqual([]);
+    expect(eventData(t, run.id, 'github.pr_opened')).toHaveLength(1);
+    expect(gh.get(1).comments.filter((c) => c.includes(pull.url))).toHaveLength(1);
+    expect(t.master.issues.status().lastError).toBeNull();
+  });
+
+  it("takes the pull request already open from the Run's branch", async () => {
+    const t = await start(PR);
+    const run = await awaitingMerge(t);
+    const branch = run.branch as string;
+    // Opened by an earlier Master that stopped before recording it, from an older commit.
+    gh.remoteBranches.set(branch, run.baseCommit as string);
+    const earlier = await gh.createPullRequest('me/demo', {
+      head: branch,
+      base: 'main',
+      title: 'earlier',
+      body: 'earlier',
+    });
+    const waiting = await approveMerge(t, run);
+    await t.master.issues.sync();
+
+    expect(gh.pulls.size).toBe(1);
+    expect(gh.calls.filter((c) => c.startsWith('createPull'))).toHaveLength(1);
+    expect(t.master.store.getRun(run.id).pr).toEqual(earlier);
+    // Pushed over what GitHub had.
+    expect(gh.remoteBranches.get(branch)).toBe(waiting.headCommit);
+    expect(gh.get(1).comments.filter((c) => c.includes(earlier.url))).toHaveLength(1);
+  });
+
+  it("opens its own when the one open from the Run's branch goes into another branch", async () => {
+    const t = await start(PR);
+    const run = await awaitingMerge(t);
+    const branch = run.branch as string;
+    gh.remoteBranches.set(branch, run.baseCommit as string);
+    const other = await gh.createPullRequest('me/demo', {
+      head: branch,
+      base: 'release',
+      title: 'by a human',
+      body: '',
+    });
+    await approveMerge(t, run);
+    await t.master.issues.sync();
+
+    expect(gh.pulls.size).toBe(2);
+    const own = pulls().find((p) => p.baseRefName === 'main');
+    expect(own).toBeDefined();
+    expect(t.master.store.getRun(run.id).pr).toEqual({ number: own?.number, url: own?.url });
+    expect(gh.pull(other.number).state).toBe('open');
+  });
+
+  it('leaves the Run as it was when the push fails, and opens the pull request the next round', async () => {
+    const t = await start(PR);
+    const run = await awaitingMerge(t);
+    gh.failing.set(`push ${run.branch}`, '推送被拒绝');
+    await approveMerge(t, run);
+    await t.master.issues.sync();
+
+    expect(gh.pulls.size).toBe(0);
+    expect(t.master.store.getRun(run.id)).toMatchObject({ status: 'blocked', pr: null });
+    expect(eventData(t, run.id, 'github.pr_opened')).toEqual([]);
+    expect(t.master.issues.status().lastError?.message).toContain('推送被拒绝');
+    expect(
+      t.master.store.listGlobalEventsOfType('github.error').map((e) => e.data.message),
+    ).toContain('推送被拒绝');
+
+    gh.failing.delete(`push ${run.branch}`);
+    await t.master.issues.poll();
+    const [pull] = pulls();
+    expect(gh.pulls.size).toBe(1);
+    expect(t.master.store.getRun(run.id).pr).toEqual({ number: pull?.number, url: pull?.url });
+    expect(gh.get(1).comments.filter((c) => c.includes(pull?.url ?? '?'))).toHaveLength(1);
+    expect(t.master.issues.status().lastError).toBeNull();
+  });
+
+  it('tries again the next round when opening the pull request fails', async () => {
+    const t = await start(PR);
+    const run = await awaitingMerge(t);
+    gh.failing.set(`createPull ${run.branch}`, 'GitHub 502');
+    await approveMerge(t, run);
+    await t.master.issues.sync();
+    expect(t.master.store.getRun(run.id).pr).toBeNull();
+    expect(t.master.issues.status().lastError?.message).toContain('GitHub 502');
+
+    gh.failing.delete(`createPull ${run.branch}`);
+    await t.master.issues.poll();
+    expect(gh.pulls.size).toBe(1);
+    expect(t.master.store.getRun(run.id).pr?.number).toBe(pulls()[0]?.number);
+  });
+
+  it('opens the pull request of a Run without an issue, closing nothing and commenting nowhere', async () => {
+    const t = await start(PR);
+    const run = t.run('合并 GitHub 上的提交', { stages: { merge: { gate: false } } });
+    await t.waitStatus(run.id, 'blocked');
+    await t.master.issues.sync();
+
+    const [pull] = pulls();
+    expect(pull?.title).toBe('合并 GitHub 上的提交');
+    expect(pull?.body).not.toContain('Closes');
+    expect(t.master.store.getRun(run.id).pr?.number).toBe(pull?.number);
+    expect(gh.calls.filter((c) => c.startsWith('comment'))).toEqual([]);
+  });
+
+  it('never pushes the target branch, even when the local one is ahead of GitHub', async () => {
+    const t = await start(PR);
+    gh.remoteHead = head(t);
+    writeFile(join(t.repoDir, 'ours.txt'), 'ours\n');
+    git(t.repoDir, 'add', '-A');
+    git(t.repoDir, 'commit', '-q', '-m', 'ours');
+    await t.master.issues.poll();
+    await t.master.issues.poll();
+    expect(gh.calls).toContain('fetch main');
+    expect(gh.calls).not.toContain('push main');
+    expect(gh.pushes).toEqual([]);
+    expect(t.master.store.listGlobalEventsOfType('github.pushed')).toEqual([]);
+  });
+
+  it('opens no pull request while deliver: pr lacks push: true, and says why', async () => {
+    const t = await start(config({ deliver: 'pr' }));
+    const run = t.run('添加 feature.txt', { stages: { merge: { gate: false } } });
+    await t.waitStatus(run.id, 'blocked');
+    await t.master.issues.sync();
+    expect(gh.pulls.size).toBe(0);
+    expect(gh.calls.filter((c) => c.startsWith('push'))).toEqual([]);
+    expect(t.master.issues.status().lastError?.message).toContain('deliver: pr 要求 push: true');
+  });
+});
+
 describe('issues: requirement assessment', () => {
   const startAssessing = () => start(config(), ASSESS_WORKFLOW_YAML);
   /** The Run of issue #1, once it is created. */
@@ -4588,6 +4793,84 @@ describe('issues: texts', () => {
     });
   });
 
+  describe('the pull request of a Run (deliver: pr)', () => {
+    const issue = {
+      repo: 'me/demo',
+      number: 12,
+      url: 'https://github.com/me/demo/issues/12',
+      auto: false,
+      attempt: 1,
+    };
+    const prCtx = { repo: 'me/demo', dashboardUrl: ctx.dashboardUrl };
+    const lines = (n: number) => Array.from({ length: n }, (_, i) => `第 ${i + 1} 行`);
+
+    it('titles it with the goal, sums the Run up and closes its issue', () => {
+      const goal = ['#12 加 feature', '', ...lines(12)].join('\n');
+      const pr = pullRequestText(run({ goal, issue }), prCtx);
+      expect(pr.title).toBe('#12 加 feature');
+      // The goal's first ten lines.
+      const quoted = ['#12 加 feature', '', ...lines(8), '…'].map((l) => `> ${l}`).join('\n');
+      expect(pr.body).toBe(
+        [
+          quoted,
+          '由战神一号的 Run `run_1` 完成，检查都已通过。在 GitHub 上合并这个 PR 后 Run 会自动完成；没合并就关掉，Run 会结束为失败。',
+          '费用 $1.23 · 看板：http://127.0.0.1:4870/#/runs/run_1',
+          'Closes #12',
+        ].join('\n\n'),
+      );
+      expect(isMasterComment(pr.body)).toBe(false);
+      // A short goal is quoted whole.
+      expect(pullRequestText(run({ goal: '#12 加 feature', issue }), prCtx).body).toMatch(
+        /^> #12 加 feature\n\n由战神一号/,
+      );
+    });
+
+    it('names the repo of an issue in another repo, and closes nothing without an issue', () => {
+      const other = pullRequestText(run({ goal: 'x', issue: { ...issue, repo: 'org/tasks' } }), {
+        ...prCtx,
+      });
+      expect(other.body.endsWith('\n\nCloses org/tasks#12')).toBe(true);
+      // GitHub's names are case-insensitive.
+      const same = pullRequestText(run({ goal: 'x', issue: { ...issue, repo: 'Me/Demo' } }), prCtx);
+      expect(same.body.endsWith('\n\nCloses #12')).toBe(true);
+      const none = pullRequestText(run({ goal: '合并 GitHub 上的提交', issue: null }), prCtx);
+      expect(none.title).toBe('合并 GitHub 上的提交');
+      expect(none.body).not.toContain('Closes');
+      expect(none.body.endsWith('看板：http://127.0.0.1:4870/#/runs/run_1')).toBe(true);
+    });
+
+    it('keeps the title to one line of 200 characters, never empty', () => {
+      const long = pullRequestText(run({ goal: `${'长'.repeat(300)}\n第二行`, issue }), prCtx);
+      expect(long.title).toBe(`${'长'.repeat(200)}…`);
+      expect(pullRequestText(run({ goal: '  标题  \t多余的空白 ', issue }), prCtx).title).toBe(
+        '标题 多余的空白',
+      );
+      expect(pullRequestText(run({ goal: '', issue }), prCtx).title).toBe('Run run_1');
+    });
+
+    it('waits on the issue for a human, with the link posted once it is opened', () => {
+      const waiting = run({
+        status: 'blocked',
+        blocked: { kind: 'pr_open', message: '检查已通过。这个仓库通过 PR 交付' },
+      });
+      expect(issueUpdate(waiting, ctx)).toEqual({
+        label: LABELS.needsYou,
+        comment: null,
+        close: null,
+      });
+      const comment = pullRequestComment({
+        number: 13,
+        url: 'https://github.com/me/demo/pull/13',
+        targetBranch: 'main',
+        runId: 'run_1',
+        dashboardUrl: ctx.dashboardUrl,
+      });
+      expect(comment).toBe(
+        '检查已通过，已开 PR #13，合并到 `main`：https://github.com/me/demo/pull/13\n\n在 GitHub 上合并这个 PR 后，Run 会自动完成，这个 issue 也会自动关闭；没合并就关掉 PR，Run 会结束为失败。\n\n看板：http://127.0.0.1:4870/#/runs/run_1',
+      );
+    });
+  });
+
   it('keeps one status label and every other label', () => {
     expect(withStatusLabel(['bug', LABELS.proposal, LABELS.ready], LABELS.running)).toEqual([
       'bug',
@@ -5031,7 +5314,38 @@ describe('issues: texts', () => {
       expect(body).toContain('To accept, add the label `ares1:ready`');
       const defs = labelDefs();
       expect(defs.map((d) => d.name)).toEqual(Object.values(LABELS));
-      for (const d of defs) expect(d.description).not.toMatch(cjk);
+      for (const d of defs) {
+        expect(d.description).not.toMatch(cjk);
+        // GitHub refuses longer descriptions.
+        expect(d.description.length).toBeLessThanOrEqual(100);
+      }
+    });
+
+    it("writes a Run's pull request and its comment on the issue in English", () => {
+      setLang('en');
+      const issue = { repo: 'me/demo', number: 12, url: '', auto: false, attempt: 1 };
+      const pr = pullRequestText(run({ goal: '#12 Add a thing\n\nWrite it.', issue }), {
+        repo: 'me/demo',
+        dashboardUrl: ctx.dashboardUrl,
+      });
+      expect(pr.title).toBe('#12 Add a thing');
+      expect(pr.body).toBe(
+        [
+          '> #12 Add a thing\n> \n> Write it.',
+          'Done by Ares.1 in Run `run_1`, and its checks passed. Once this pull request is merged on GitHub, the Run completes by itself; if it is closed without being merged, the Run ends as failed.',
+          'Cost $1.23 · Dashboard: http://127.0.0.1:4870/#/runs/run_1',
+          'Closes #12',
+        ].join('\n\n'),
+      );
+      const comment = pullRequestComment({
+        number: 13,
+        url: 'https://github.com/me/demo/pull/13',
+        targetBranch: 'main',
+        runId: 'run_1',
+        dashboardUrl: ctx.dashboardUrl,
+      });
+      expect(comment).toContain('pull request #13 into `main` is open');
+      expect(markComment(comment)).not.toMatch(cjk);
     });
   });
 });

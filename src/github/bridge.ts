@@ -80,6 +80,8 @@ import {
   labelDefs,
   markComment,
   proposalBody,
+  pullRequestComment,
+  pullRequestText,
   redoStartedComment,
   repliesAfterMaster,
   untrustedAuthor,
@@ -682,11 +684,12 @@ export class IssueBridge {
   // ---- poll: intake, sync, scheduled scouts ----------------------------------
 
   /**
-   * One round: catch the target branches up with GitHub (`syncTarget`), accept proposals the
-   * settings allow, start Runs for ready issues, terminate Runs whose issue a human closed and
-   * start over those whose issue a human changed, catch issues up, pass on replies to the
-   * assessments' questions, start a scout where the repo is idle. With the work switch off only
-   * the pulling, the terminating and the catching up happen: none of them starts new work.
+   * One round: catch the target branches up with GitHub (`syncTarget`), open the pull requests
+   * of Runs done but for one (deliver: pr), accept proposals the settings allow, start Runs for
+   * ready issues, terminate Runs whose issue a human closed and start over those whose issue a
+   * human changed, catch issues up, pass on replies to the assessments' questions, start a scout
+   * where the repo is idle. With the work switch off only the pulling, the pull requests, the
+   * terminating and the catching up happen: none of them starts new work.
    */
   poll(): Promise<void> {
     return this.serial(async () => {
@@ -711,6 +714,9 @@ export class IssueBridge {
       await each((name) => this.syncTarget(name));
       // And of GitHub's commits just pulled, for the Runs taken this round.
       await this.deps.refreshTemplates?.();
+      await each(async (name) => {
+        if (!(await this.openPullRequests(name))) failed = true;
+      });
       if (working) {
         await each((name) => this.acceptBacklog(name));
         await each((name) => this.intake(name));
@@ -742,13 +748,23 @@ export class IssueBridge {
   }
 
   /**
-   * Catch issues up with their Runs now, and redo the failed Runs whose wait before the redo is
-   * over (see redoDueAt): a Run that just failed is not redone right away.
+   * Open the pull requests of Runs that just got to wait for one (deliver: pr), catch issues up
+   * with their Runs now, and redo the failed Runs whose wait before the redo is over (see
+   * redoDueAt): a Run that just failed is not redone right away.
    */
   sync(): Promise<void> {
     return this.serial(async () => {
       const github = this.cfg.master.github;
       if (!github || this.stopping) return;
+      // Before the issues are caught up, so the pull request's link is posted before the label
+      // says the issue waits for a human.
+      for (const name of Object.keys(github.repos)) {
+        try {
+          await this.openPullRequests(name);
+        } catch (err) {
+          this.report(err);
+        }
+      }
       await this.syncRuns();
       if (this.deps.store.working) {
         for (const name of Object.keys(github.repos)) {
@@ -928,6 +944,9 @@ export class IssueBridge {
   private async pushTarget(name: string): Promise<boolean> {
     const { repo, cfg } = this.repoSetup(name);
     if (!cfg.push) return true;
+    // The work reaches GitHub through pull requests (openPullRequests); the target branch there
+    // only takes them, and the local one moves only by pulling GitHub's (syncTarget).
+    if (cfg.deliver === 'pr') return true;
     if (this.diverged.has(repo.id)) return false;
     const head = await revParse(repo.path, repo.targetBranch);
     if (this.pushed.get(repo.path) === head) return true;
@@ -937,6 +956,85 @@ export class IssueBridge {
     this.deps.store.event(null, 'github.pushed', { repo: name, branch: repo.targetBranch, head });
     await this.trackOrigin(repo, full, head);
     return true;
+  }
+
+  /**
+   * Deliver the repo's Runs that wait for a pull request (`pr_open`, deliver: pr) and have none
+   * yet: push each one's branch to the GitHub repo the target branch is pushed to, and open a
+   * pull request from it into the target branch (`openPullRequest`). Also for Runs that got to
+   * wait before the repo was switched back to deliver: push: nothing else delivers them, and they
+   * cannot be retried. A GitHub call that fails is reported and leaves the Run as it was, to be
+   * tried again the next round; the other Runs go on. Returns false when some call failed.
+   */
+  private async openPullRequests(name: string): Promise<boolean> {
+    const store = this.deps.store;
+    const repo = store.findRepo(name);
+    if (!repo) return true;
+    const waiting = store
+      .listRuns({ status: 'blocked', repoId: repo.id })
+      .filter((run) => run.blocked?.kind === 'pr_open' && run.pr === null && run.branch);
+    if (waiting.length === 0) return true;
+    // Throws while the repo is misconfigured, e.g. deliver: pr without push: the Runs wait.
+    const { cfg } = this.repoSetup(name);
+    // Without push nothing of the repo goes to GitHub: the Runs wait until it is on again.
+    if (!cfg.push) return true;
+    const full = await this.issuesRepo(repo, cfg);
+    let ok = true;
+    for (const run of waiting) {
+      if (this.stopping) break;
+      try {
+        await this.openPullRequest(repo, full, run);
+      } catch (err) {
+        ok = false;
+        this.report(err);
+      }
+    }
+    return ok;
+  }
+
+  /**
+   * Push the branch of `run`, waiting in `pr_open` as read, to `full` and open its pull request
+   * into the target branch, or take the one already open from that branch (opened before a
+   * restart, or in a round whose later steps failed), so a Run never gets two. The push is
+   * forced: the branch is the Run's own, and its history may have been rewritten (by a rollback)
+   * since an earlier push. The Run records the pull request (`github.pr_opened`), unless it no
+   * longer waits for one (cancelled meanwhile); then its issue gets the link. The comment comes
+   * last, so that a failed one does not hold the Run up: the pull request's `Closes #N` shows it
+   * on the issue anyway.
+   */
+  private async openPullRequest(repo: Repo, full: string, run: Run): Promise<void> {
+    const branch = run.branch;
+    if (!branch) return;
+    const gh = this.gh();
+    const target = repo.targetBranch;
+    await gh.push(repo.path, full, branch, { force: true });
+    const open = await gh.findOpenPullRequest(full, branch);
+    let pr: { number: number; url: string };
+    // One a human opened from it into another branch is not how the Run delivers.
+    if (open && open.baseRefName === target) pr = open;
+    else {
+      const text = pullRequestText(run, { repo: full, dashboardUrl: this.dashboardUrl() });
+      pr = await gh.createPullRequest(full, {
+        head: branch,
+        base: target,
+        title: redactForGitHub(text.title),
+        body: redactForGitHub(text.body),
+      });
+    }
+    if (!this.deps.engine.recordPullRequest(run, { number: pr.number, url: pr.url })) return;
+    const issue = run.issue;
+    if (!issue) return;
+    await this.comment(
+      issue.repo,
+      issue.number,
+      pullRequestComment({
+        number: pr.number,
+        url: pr.url,
+        targetBranch: target,
+        runId: run.id,
+        dashboardUrl: this.dashboardUrl(),
+      }),
+    );
   }
 
   /**

@@ -23,7 +23,10 @@ export const LABELS = {
   /** Accepted by the Master without a human. */
   auto: 'ares1:auto',
   running: 'ares1:running',
-  /** The Run waits for an approval or a reply to the assessment, is blocked or paused. */
+  /**
+   * The Run waits for an approval, a reply to the assessment or its pull request to be merged
+   * (deliver: pr), is blocked or paused.
+   */
   needsYou: 'ares1:needs-you',
   /**
    * The Run was cancelled, or failed and is not redone (the attempts ran out); add ares1:ready
@@ -76,8 +79,9 @@ export function labelDefs(): LabelDef[] {
       name: LABELS.needsYou,
       color: 'd93f0b',
       description: t({
-        zh: 'Run 在等审批、卡住了或需求待讨论，需要人处理',
-        en: 'The Run waits for an approval, is stuck or has questions: a human is needed',
+        zh: 'Run 在等审批、等 PR 合并、卡住了或需求待讨论，需要人处理',
+        // GitHub takes at most 100 characters.
+        en: 'The Run waits for an approval or its PR to merge, is stuck or has questions: a human is needed',
       }),
     },
     {
@@ -403,6 +407,74 @@ export function goalChangedComment(input: {
   });
 }
 
+/** The title and body of the pull request a Run's work goes through (deliver: pr). */
+export interface PullRequestText {
+  title: string;
+  body: string;
+}
+
+export interface PullRequestTextContext {
+  /** "owner/name" of the GitHub repo the pull request is opened on. */
+  repo: string;
+  dashboardUrl: string;
+}
+
+/** Lines of the goal the body of a pull request quotes, and the most characters of them. */
+const PR_GOAL_LINES = 10;
+const PR_GOAL_MAX = 1_500;
+/** GitHub takes longer titles, but they no longer fit on a line of its lists. */
+const PR_TITLE_MAX = 200;
+
+/**
+ * The pull request of a Run of a repo with `deliver: pr`, from the Run's branch into the target
+ * branch. The title is the goal's first line; the body sums the Run up (the goal's first lines,
+ * its id, cost and dashboard link) and, for a Run of an issue, closes the issue once merged:
+ * `Closes #N`, or `Closes owner/name#N` when the issue is in another repo than `ctx.repo`.
+ * Runs without an issue (merging GitHub's commits) close nothing. The body carries no comment
+ * marker: it is no issue comment. Not redacted: the caller passes both through redactForGitHub.
+ */
+export function pullRequestText(
+  run: Pick<Run, 'id' | 'goal' | 'issue' | 'costUsd'>,
+  ctx: PullRequestTextContext,
+): PullRequestText {
+  const lines = run.goal.trim().split('\n');
+  const title = oneLine(lines[0] ?? '', PR_TITLE_MAX) || `Run ${run.id}`;
+  const more = lines.length > PR_GOAL_LINES ? '\n…' : '';
+  const goal = quote(`${lines.slice(0, PR_GOAL_LINES).join('\n')}${more}`, PR_GOAL_MAX);
+  const cost = `$${run.costUsd.toFixed(2)}`;
+  const issue = run.issue;
+  // GitHub knows only the English keyword, in either language.
+  const closes = issue
+    ? `Closes ${issue.repo.toLowerCase() === ctx.repo.toLowerCase() ? '' : issue.repo}#${issue.number}`
+    : null;
+  const body = [
+    goal,
+    t({
+      zh: `由${brandName()}的 Run \`${run.id}\` 完成，检查都已通过。在 GitHub 上合并这个 PR 后 Run 会自动完成；没合并就关掉，Run 会结束为失败。`,
+      en: `Done by ${brandName()} in Run \`${run.id}\`, and its checks passed. Once this pull request is merged on GitHub, the Run completes by itself; if it is closed without being merged, the Run ends as failed.`,
+    }),
+    `${t({ zh: `费用 ${cost}`, en: `Cost ${cost}` })} · ${dashboardLink(ctx.dashboardUrl, run.id)}`,
+    closes,
+  ];
+  return { title, body: body.filter((part) => part !== null).join('\n\n') };
+}
+
+/** The comment on the issue that its Run's pull request (deliver: pr) is open. */
+export function pullRequestComment(input: {
+  number: number;
+  url: string;
+  targetBranch: string;
+  runId: string;
+  dashboardUrl: string;
+}): string {
+  const link = dashboardLink(input.dashboardUrl, input.runId);
+  const branch = `\`${input.targetBranch}\``;
+  return t({
+    zh: `检查已通过，已开 PR #${input.number}，合并到 ${branch}：${input.url}\n\n在 GitHub 上合并这个 PR 后，Run 会自动完成，这个 issue 也会自动关闭；没合并就关掉 PR，Run 会结束为失败。\n\n${link}`,
+    en: `The checks passed, and pull request #${input.number} into ${branch} is open: ${input.url}\n\nOnce it is merged on GitHub, the Run completes and this issue is closed automatically; if the pull request is closed without being merged, the Run ends as failed.\n\n${link}`,
+  });
+}
+
 const oneLine = (text: string, max: number) => {
   const line = text.replace(/\s+/g, ' ').trim();
   return line.length > max ? `${line.slice(0, max)}…` : line;
@@ -463,6 +535,11 @@ export function issueUpdate(run: Run, ctx: IssueUpdateContext): IssueUpdate {
     case 'blocked':
       // The assessment's questions are posted with the discussion (`discussionComment`).
       if (run.blocked?.kind === 'discussion') {
+        return { label: LABELS.needsYou, comment: null, close: null };
+      }
+      // The pull request waits for a human on GitHub; its link is posted when it is opened
+      // (`pullRequestComment`). Nothing is stuck.
+      if (run.blocked?.kind === 'pr_open') {
         return { label: LABELS.needsYou, comment: null, close: null };
       }
       if (run.blocked?.kind === 'untrusted_issue') {

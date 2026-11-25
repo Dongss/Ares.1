@@ -110,7 +110,7 @@ Master 第一次访问仓库时会自动创建这些标签：
 | `ares1:proposal` | AI 侦察提出的需求，等你决定。采纳就加 `ares1:ready`，不做就关闭为 not planned 并写一句理由 |
 | `ares1:ready` | 可以开工。你自己写的 issue 加上它也会被做 |
 | `ares1:running` | 正在做 |
-| `ares1:needs-you` | 等你处理：审批、卡住、需求待讨论（在 issue 下回复即可），或在看板上确认非仓库成员写的需求 |
+| `ares1:needs-you` | 等你处理：审批、卡住、需求待讨论（在 issue 下回复即可）、在看板上确认非仓库成员写的需求，或在 GitHub 上审 PR、合并（`deliver: pr`） |
 | `ares1:failed` | 被终止，或失败次数达到上限后不再自动重做。重新加 `ares1:ready` 会再做一次 |
 | `ares1:auto` | 按 `auto_accept` 的设置自动采纳的 |
 
@@ -121,6 +121,7 @@ AI 侦察、自动采纳、自动合并、推送和每日预算的设置写在 `
 - `push`（默认）：合并阶段把 Run 合并进本地目标分支，`push: true` 时之后推送目标分支。不写时就是这样。
 - `pr`：给目标分支受保护、只能走 PR 或要过 CI 的仓库用。合并阶段照常先把目标分支的新提交合进 Run 分支、跑检查，但不动本地目标分支，而是推送 Run 分支、开一个以目标分支为 base 的 PR，PR 在 GitHub 上合并后 Run 才完成；Master 不直接推送这个仓库的目标分支。`pr` 要求 `push: true`（推送 Run 分支、PR 合并后拉取目标分支都靠它），不满足时这个仓库停用，看板「配置」页在 `config.yaml#github.repos.<name>` 下写明原因；这期间它的 Run 检查通过后也不在本地合并，停在合并阶段等配置改好。`GET /api/github` 里每个仓库的 `deliver` 是这个设置。
   - 检查通过后 Run 进入「等 PR 合并」：状态是 `blocked`，`blocked.kind` 为 `pr_open`，合并阶段保持执行中，不占执行名额，也不发通知；Master 重启后仍然等着，不会重跑合并。这种卡住不能在看板上重试（`POST /api/runs/:id/retry` 返回 409），只看 GitHub 上的 PR：合并了（merge、squash、rebase 都算），合并阶段通过、记 `merge.done` 事件，Run 完成；没合并就被关掉，Run 结束为失败（工作目录和分支保留），记 `github.pr_closed` 事件并按失败的 Run 通知，从 issue 来的按重做规则处理。
+  - 开 PR：Run 一进入「等 PR 合并」，大约 1 秒后（之后每轮检查也会看一遍）Master 把 Run 分支推送到目标分支推送去的那个 GitHub 仓库（强制推送，只用于 `ares1/` 开头的 Run 分支，因为回滚可能改写过它的历史），再开一个从 Run 分支到目标分支的 PR。这个分支上已经有开着、合并到目标分支的 PR 时（比如开完 PR 还没记下 Master 就重启了）直接用它，不会开第二个。PR 标题是目标的第一行，正文是 Run 摘要（目标的前几行、Run id、费用、看板链接）；从 issue 来的 Run 在正文末尾写 `Closes #N`（issue 在别的仓库时写 `Closes owner/name#N`），PR 合并后 GitHub 会关闭 issue；Master 自己建的 Run（合并远端提交）不关联 issue。标题和正文里用户主目录的路径换成 `~`，正文不带 Master 评论的隐藏标记。开好后 Run 记下 PR、记 `github.pr_opened` 事件，issue 上发一条带 PR 链接的评论，标签换成 `ares1:needs-you`（不发「Run 卡住了」的评论）。推送或开 PR 失败时记 `github.error`，Run 保持原样，下一轮再试。仓库从 `pr` 改回 `push` 后，之前已经在等的 Run 只要还是 `push: true` 也照样开 PR，否则没有别的办法交付它们。
   - Run 数据里的 `pr` 是它的 PR（`{ number, url }`），开 PR 之前和 `deliver: push` 的仓库都是 `null`。
 
 自动采纳（`auto_accept`）按侦察给提案标的风险和大小决定采纳哪些：风险不超过 `max_risk`（`none` / `low` / `mid` / `high`，默认 `none`）、大小也不超过 `max_size`（`S` / `M` / `L`，默认 `L`）的提案，Master 不等人，直接加上 `ares1:ready` 和 `ares1:auto`。`max_risk` 为 `none` 时不自动采纳任何提案，不管 `max_size` 是什么。`max_size` 默认是 `L`，因为编码阶段设了 `planning: auto` 或 `llm` 的模板（默认的 self-dev 就是）会先把 L 的需求拆成几步，在一个 Run 里一步一步做完；想让大需求先经过人，就设成 `M`。开了自动采纳、`max_size` 是 `L`（包括不写），而仓库用的模板里没有一个 Agent 阶段是 `planning: auto` 或 `llm` 时，L 的需求会整个交给一个 Run 一次做完，容易超时或返工，看板「配置」页会在 `config.yaml` 的警告里写明是哪个仓库、哪个模板，建议给编码阶段设 `planning: auto`，或把 `max_size` 调成 `M`。这只是提醒，仓库照常工作；模板不存在时那里已经报错，不再另外提醒。`max_per_day` 限制每天最多自动采纳几条，不写就不限。每轮检查时，还在等人的提案落在采纳范围内的（比如刚放宽了设置），也会被自动采纳。
