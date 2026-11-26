@@ -1,5 +1,8 @@
 import { t } from '../../../src/i18n.js';
-import { noticeFor as sharedNotice } from '../../../src/notify/notice.js';
+import {
+  type Notice as SharedNotice,
+  noticeFor as sharedNotice,
+} from '../../../src/notify/notice.js';
 import type { EventRow } from '../../../src/store/types.js';
 import { href } from './router.js';
 
@@ -23,8 +26,22 @@ export interface Notice {
 export function noticeFor(event: EventRow, goal: string | undefined): Notice | null {
   const n = sharedNotice(event, goal);
   if (!n) return null;
-  const to = n.runId ? href.run(n.runId) : n.about === 'issues' ? href.issues : href.home;
-  return { title: n.title, body: n.body, href: to, tag: `ares1-event-${event.id}` };
+  return {
+    title: n.title,
+    body: n.body,
+    href: noticeHref(event, n),
+    tag: `ares1-event-${event.id}`,
+  };
+}
+
+/** Where a click leads: the Run it is about, the iteration's page, the Issues page or Home. */
+function noticeHref(event: EventRow, n: SharedNotice): string {
+  if (n.runId) return href.run(n.runId);
+  const iterationId = event.data.iterationId;
+  if (event.type.startsWith('iteration.') && typeof iterationId === 'string' && iterationId) {
+    return href.iteration(iterationId);
+  }
+  return n.about === 'issues' ? href.issues : href.home;
 }
 
 /**

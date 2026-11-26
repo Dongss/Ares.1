@@ -1,8 +1,11 @@
 import type { ReactNode } from 'react';
 import type { RunSummary } from '../../../src/api/types.js';
+import { ITERATION_OPEN_STATUSES } from '../../../src/config/flow.js';
 import { t } from '../../../src/i18n.js';
 import type { Repo } from '../../../src/store/types.js';
-import { Badge, Empty } from '../components/ui.js';
+import { IterationCard } from '../components/IterationCard.js';
+import { Badge, Empty, ErrorBox } from '../components/ui.js';
+import { api } from '../lib/api.js';
 import {
   countRunFilters,
   effectiveRunFilter,
@@ -22,7 +25,8 @@ import {
   goalTitle,
   messageExcerpt,
 } from '../lib/format.js';
-import { useTick } from '../lib/hooks.js';
+import { useReloadOn, useResource, useTick } from '../lib/hooks.js';
+import { iterationsOutdatedBy, openIterations } from '../lib/iterations.js';
 import { href } from '../lib/router.js';
 import {
   conflictWaitText,
@@ -60,37 +64,40 @@ export function HomePage({
 
   if (runs.length === 0) {
     return (
-      <Empty>
-        {t({
-          zh: (
-            <>
-              还没有 Run。Run 从 GitHub issue 或本地提案池来：
-              {repos.length === 0 ? (
-                <>
-                  先<a href={href.repos}>登记仓库</a>，再
-                </>
-              ) : null}
-              在 GitHub 提 issue 并加上 <code>ares1:ready</code>；不接 GitHub 的仓库由 AI
-              侦察写本地提案，采纳后建 Run。需求来源、issue 和本地提案见
-              <a href={href.issues}>「需求」页</a>。
-            </>
-          ),
-          en: (
-            <>
-              No Runs yet. Runs come from GitHub issues or the local backlog:{' '}
-              {repos.length === 0 ? (
-                <>
-                  <a href={href.repos}>register a repo</a>, then{' '}
-                </>
-              ) : null}
-              open an issue on GitHub labeled <code>ares1:ready</code>; for a repo without GitHub,
-              the AI scout writes local proposals, which become Runs once accepted. Where
-              requirements come from, the issues and the local proposals are on the{' '}
-              <a href={href.issues}>Issues</a> page.
-            </>
-          ),
-        })}
-      </Empty>
+      <div className="home">
+        <OpenIterations repoId={null} />
+        <Empty>
+          {t({
+            zh: (
+              <>
+                还没有 Run。Run 从 GitHub issue 或本地提案池来：
+                {repos.length === 0 ? (
+                  <>
+                    先<a href={href.repos}>登记仓库</a>，再
+                  </>
+                ) : null}
+                在 GitHub 提 issue 并加上 <code>ares1:ready</code>；不接 GitHub 的仓库由 AI
+                侦察写本地提案，采纳后建 Run。需求来源、issue 和本地提案见
+                <a href={href.issues}>「需求」页</a>。
+              </>
+            ),
+            en: (
+              <>
+                No Runs yet. Runs come from GitHub issues or the local backlog:{' '}
+                {repos.length === 0 ? (
+                  <>
+                    <a href={href.repos}>register a repo</a>, then{' '}
+                  </>
+                ) : null}
+                open an issue on GitHub labeled <code>ares1:ready</code>; for a repo without GitHub,
+                the AI scout writes local proposals, which become Runs once accepted. Where
+                requirements come from, the issues and the local proposals are on the{' '}
+                <a href={href.issues}>Issues</a> page.
+              </>
+            ),
+          })}
+        </Empty>
+      </div>
     );
   }
 
@@ -107,6 +114,7 @@ export function HomePage({
   return (
     <div className="home">
       <RunFilters filter={filter} counts={counts} repos={repos} />
+      <OpenIterations repoId={filter.repoId} />
       {sections.length === 0 ? (
         <Empty>{t({ zh: '没有符合条件的 Run。', en: 'No Runs match.' })}</Empty>
       ) : (
@@ -136,6 +144,36 @@ export function HomePage({
         ))
       )}
     </div>
+  );
+}
+
+/**
+ * The iterations not over (waiting to be accepted, under way or blocked), of the repo the Runs are
+ * filtered by or of all, each with its progress and what blocks it; nothing when there are none.
+ */
+function OpenIterations({ repoId }: { repoId: string | null }) {
+  const iterations = useResource(
+    () => api.iterations({ status: ITERATION_OPEN_STATUSES }),
+    'open-iterations',
+  );
+  useReloadOn(iterations.reload, (e) => iterationsOutdatedBy(e.type));
+  if (!iterations.data) return <ErrorBox>{iterations.error}</ErrorBox>;
+  const list = openIterations(iterations.data, repoId);
+  if (list.length === 0) return null;
+  return (
+    <Section
+      title={t({ zh: '进行中的迭代', en: 'Iterations in progress' })}
+      count={list.length}
+      highlight={list.some((it) => it.status === 'blocked')}
+      note={t({
+        zh: '每个迭代是围绕一个大目标的一组需求，按依赖顺序开工',
+        en: 'Each is a set of requirements around one larger goal, started in the order of their dependencies',
+      })}
+    >
+      {list.map((it) => (
+        <IterationCard key={it.id} iteration={it} />
+      ))}
+    </Section>
   );
 }
 

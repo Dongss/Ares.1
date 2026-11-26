@@ -22,6 +22,17 @@ describe('parseRoute', () => {
     expect(parseRoute('#/guide/')).toEqual({ name: 'guide' });
     expect(parseRoute('#/guide/labels')).toEqual({ name: 'guide', section: 'labels' });
     expect(parseRoute('#/guide/a/b')).toEqual({ name: 'notFound', path: '/guide/a/b' });
+    expect(parseRoute('#/iterations')).toEqual({ name: 'iterations' });
+    expect(parseRoute('#/iterations/')).toEqual({ name: 'iterations' });
+    expect(parseRoute('#/iterations/iteration-abc')).toEqual({
+      name: 'iteration',
+      id: 'iteration-abc',
+    });
+    expect(parseRoute('#/iterations/iteration-abc/')).toEqual({
+      name: 'iteration',
+      id: 'iteration-abc',
+    });
+    expect(parseRoute('#/iterations/a/b')).toEqual({ name: 'notFound', path: '/iterations/a/b' });
     expect(parseRoute('#/nope')).toEqual({ name: 'notFound', path: '/nope' });
     expect(parseRoute('#/?status=active&repo=repo-1')).toEqual({ name: 'home' });
     expect(parseRoute('#/runs/run-abc?x=1')).toEqual({ name: 'run', id: 'run-abc' });
@@ -30,6 +41,12 @@ describe('parseRoute', () => {
   it('round-trips run links', () => {
     expect(parseRoute(href.run('run-1'))).toEqual({ name: 'run', id: 'run-1' });
     expect(parseRoute(href.workspaces)).toEqual({ name: 'workspaces' });
+    expect(parseRoute(href.iterations)).toEqual({ name: 'iterations' });
+    expect(parseRoute(href.iteration('iteration-1'))).toEqual({
+      name: 'iteration',
+      id: 'iteration-1',
+    });
+    expect(parseRoute(href.iteration('a/b c'))).toEqual({ name: 'iteration', id: 'a/b c' });
     expect(parseRoute(href.agents)).toEqual({ name: 'agents' });
     expect(parseRoute(href.events)).toEqual({ name: 'events' });
     expect(parseRoute(href.guide)).toEqual({ name: 'guide' });

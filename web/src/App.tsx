@@ -20,6 +20,7 @@ import { EventsPage } from './pages/Events.js';
 import { GuidePage } from './pages/Guide.js';
 import { HomePage } from './pages/Home.js';
 import { IssuesPage } from './pages/Issues.js';
+import { IterationsPage } from './pages/Iterations.js';
 import { ReposPage } from './pages/Repos.js';
 import { RunDetailPage } from './pages/RunDetail.js';
 import { StatsPage } from './pages/Stats.js';
@@ -88,6 +89,12 @@ export function App() {
           </NavLink>
           <NavLink to={href.issues} active={route.name === 'issues'}>
             {t({ zh: '需求', en: 'Issues' })}
+          </NavLink>
+          <NavLink
+            to={href.iterations}
+            active={route.name === 'iterations' || route.name === 'iteration'}
+          >
+            {t({ zh: '迭代', en: 'Iterations' })}
           </NavLink>
           <NavLink to={href.stats} active={route.name === 'stats'}>
             {t({ zh: '统计', en: 'Stats' })}
@@ -223,6 +230,8 @@ function Page(props: {
 }) {
   const { route, runs, repos } = props;
   if (route.name === 'issues') return <IssuesPage config={props.config} />;
+  if (route.name === 'iterations') return <IterationsPage />;
+  if (route.name === 'iteration') return <IterationsPage id={route.id} />;
   if (route.name === 'workspaces') return <WorkspacesPage />;
   if (route.name === 'agents') return <AgentsPage />;
   if (route.name === 'events') return <EventsPage />;

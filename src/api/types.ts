@@ -19,6 +19,8 @@ import type {
   Attempt,
   BlockKind,
   CheckResult,
+  Iteration,
+  IterationChild,
   Proposal,
   Repo,
   Run,
@@ -427,6 +429,49 @@ export interface ProposalView extends Proposal {
 export interface ProposalAccepted {
   proposal: ProposalView;
   run: RunSummary;
+}
+
+/** One Run that worked on a step of an iteration. */
+export interface IterationRunView {
+  id: string;
+  status: RunStatus;
+  costUsd: number;
+  /** Some of its attempts have no known cost, so `costUsd` is a lower bound. */
+  costUnknown: boolean;
+}
+
+/** One step of an iteration's plan, with where it stands. */
+export interface IterationChildView extends IterationChild {
+  /**
+   * The steps it still waits for, by position (`unmetDependencies` in src/config/flow.ts), while
+   * it has not started (planned, waiting or ready); empty once it has, or with nothing to wait for.
+   */
+  waitingFor: number[];
+  /** Every Run that worked on it, oldest first: failed attempts and redos included. */
+  runs: IterationRunView[];
+}
+
+/**
+ * GET /api/iterations items (newest first) and GET /api/iterations/:id: an iteration with its
+ * repo's name, each step with its Runs, and what it got done and used so far.
+ */
+export interface IterationView extends Omit<Iteration, 'children'> {
+  /** Name of its repo as registered on the dashboard. */
+  repo: string;
+  children: IterationChildView[];
+  /** Its steps that are done, of all of them; replaced ones not counted (`iterationProgress`). */
+  progress: { done: number; total: number };
+  /** Over every Run of every step, failed attempts and replaced steps included. */
+  totals: {
+    runs: number;
+    costUsd: number;
+    /** Some attempts have no known cost, so `costUsd` is a lower bound. */
+    costUnknown: boolean;
+    /** From its acceptance to its end, or to when it was read; null while not accepted. */
+    elapsedMs: number | null;
+    /** The agents' executions in all of its Runs. */
+    agentMs: number;
+  };
 }
 
 /** GET /api/upgrade: the Master upgrading itself. */

@@ -447,6 +447,14 @@ backlog:
 - `POST /api/proposals/:id/reject`：拒绝一条待处理的提案，请求体是 `{ "reason": "…" }`，理由必填，去掉首尾空白后为空时返回 400。理由会和提案一起出现在这个仓库之后的侦察提示词里，作为不要再提的反例。返回拒绝后的提案；不存在时返回 404，已经采纳或拒绝过时返回 409。
 - `POST /api/scouts`：手动侦察，请求体是 `{ "repo": "<仓库名>" }`。仓库在 `backlog.repos` 里时交给本地提案池，提案写进本地提案池；在 `github.repos` 里时照旧建 issue。同一个仓库同时写在两处属于配置错误，这时 `backlog.repos` 里的设置不生效，按 GitHub 侦察。两处都没有时返回 404。
 
+### 迭代的看板和 API
+
+看板顶栏的「迭代」页列出所有仓库的迭代：没结束的在前（受阻的、等采纳的、进行中的），然后是最近结束的。每个迭代显示目标、状态、进度条（完成几步 / 共几步，被替换的步骤不算）、用了几个 Run、费用和用时，受阻时写明是哪一步失败或不做了。点进去是这个迭代的页面（`#/iterations/<id>`）：目标和对应的 README 目标、完成标准（每条后面写着推进它的步骤）、不做的事、计划里每一步的状态、在等哪几步、被哪一步替换、它的 issue 或本地提案、做过它的每个 Run（链到 Run 详情页，带状态和费用），以及侦察的计划调整和完成后的总结。本地提案池的迭代在这里整体采纳、填理由拒绝或终止；GitHub 的迭代链到迭代 issue，在 GitHub 上操作。首页在 Run 列表上面列出没结束的迭代（按仓库筛选时只列这个仓库的），有受阻的时这一栏标成橙色。「需求」页里属于迭代的本地提案不能单独采纳或拒绝，链到它的迭代。
+
+- `GET /api/iterations`：两种来源的迭代，新的在前。参数 `repo`（仓库名或 id）只列这个仓库的；`status` 是一个状态或用逗号隔开的几个（`pending`、`active`、`blocked`、`done`、`cancelled`），比如 `pending,active,blocked` 列出没结束的；`limit`（1–500 的整数）最多返回几条，不写时全部返回。每一项除了迭代本身的字段（`id`、`repoId`、`source`、`issue`、`title`、`goal`、`readmeGoal`、`criteria`、`outOfScope`、`notes`、`status`、`auto`、`summary`、`createdAt`、`decidedAt`、`endedAt` 等），还有仓库名 `repo`；`children` 的每一步另有 `waitingFor`（还没开工时在等的步骤序号，开工后为空）和 `runs`（做过它的每个 Run 的 `id`、`status`、`costUsd`、`costUnknown`，旧的在前，失败后重做的也在内）；`progress` 是 `{ done, total }`；`totals` 是所有步骤的 Run 合计：`runs`（几个 Run）、`costUsd`、`costUnknown`（有的执行费用未知，`costUsd` 只是下限）、`elapsedMs`（从采纳到结束，没结束时到读取的时候；没采纳时为 `null`）和 `agentMs`（Agent 执行的时间）。参数不合法时返回 400，仓库不存在时返回 404。
+- `GET /api/iterations/:id`：一个迭代，格式同上；不存在时返回 404。
+- `POST /api/iterations/:id/accept`、`POST /api/iterations/:id/reject`（请求体 `{ "reason": "…" }`，理由必填）、`POST /api/iterations/:id/cancel`：整体采纳、拒绝等采纳的、终止已采纳的本地提案池迭代，返回处理后的迭代（不带上面那些合计）。GitHub 的迭代和状态不对时返回 409，不存在时返回 404。
+
 ## Agent 用的 CLI
 
 `agents.yaml` 里每个 Agent 的 `cli` 决定用哪个 CLI 运行它。可执行文件默认从 PATH 里找，不在 PATH 上时在 `config.yaml` 的 `bins` 里写路径（键就是 `cli` 的值，改了要重启 Master）。看板「配置」页的 Agent 一节列出了 Master 支持的 CLI 和其中能以只读方式运行的（API `GET /api/config` 的 `clis`：每项是 `{ cli, readOnly }`）；某个 Agent 的设置它的 CLI 做不到时（比如下面 Codex 的 `permission: safe`），「配置」页和「Agent」页在这个 Agent 的状态下面写明，API 里是 `agentEntries` 各项的 `warnings`，键为 `agents.yaml#<id>` 的 `warnings` 里也有一份。
@@ -719,7 +727,7 @@ Agent 出错且重试、换 Agent 都用完，Agent 不可用且没有可换的 
 
 侦察失败（Agent 出错或超时、输出不符合约定、建临时工作目录失败等）时，事件列表里记一条 `scout.failed`（看板「事件」页能看到，标成红色），数据里有 `scoutId`、`repo`、`message`（错误信息）和 `streak`：这个仓库从最近一次侦察往回数连续失败的次数（包括这一次；自动和手动触发的都算）。额度用尽或被限流的、被 Master 停止打断的、还在进行的侦察既不计数，也不打断计数；正常结束的侦察（哪怕没找到需求）让计数从头开始。`streak` 正好到 3 时通知一次「侦察连续失败：<仓库名>」，正文是错误信息的第一行，点开是「需求」页；之后接着失败不再通知，直到有侦察正常结束、又连续失败 3 次。被 Master 停止打断的侦察也记 `scout.failed`，但不带 `streak`，不通知。
 
-迭代的一个子 issue 用完重做次数后以失败关闭，或者被人关成不做，又没有别的子 issue 替换它时，迭代进入「受阻」，事件列表里记一条 `iteration.blocked`（看板「事件」页能看到，标成橙色），数据里有 `repo`、`iterationId`、`issue`（迭代 issue）、`position` 和 `child`（是计划里的第几步、哪个子 issue）、`reason`（`failed` 是用完重做次数，`dropped` 是被人关掉），并通知「迭代受阻：<仓库名>」，点开是「需求」页。每次进入受阻通知一次；那个子 issue 被重新打开、或者侦察换个做法补了一个子 issue 替换它之后，迭代回到进行中（`iteration.unblocked`），之后再受阻会再通知。
+迭代的一个子 issue 用完重做次数后以失败关闭，或者被人关成不做，又没有别的子 issue 替换它时，迭代进入「受阻」，事件列表里记一条 `iteration.blocked`（看板「事件」页能看到，标成橙色），数据里有 `repo`、`iterationId`、`issue`（迭代 issue）、`position` 和 `child`（是计划里的第几步、哪个子 issue）、`reason`（`failed` 是用完重做次数，`dropped` 是被人关掉），并通知「迭代受阻：<仓库名>」，点开是看板上这个迭代的页面（`#/iterations/<id>`）。每次进入受阻通知一次；那个子 issue 被重新打开、或者侦察换个做法补了一个子 issue 替换它之后，迭代回到进行中（`iteration.unblocked`），之后再受阻会再通知。
 
 访问 GitHub 失败（读写 issue、推送目标分支、侦察时搜索 issue 等）时，事件列表里记一条 `github.error`（数据是 `{ message }`，错误信息），并通知「GitHub 访问失败」，正文是错误信息的第一行，点开是「需求」页。一轮轮询要对每个登记的仓库做好几步，每一步都可能失败，所以按「一串连续失败」去重：从第一次失败起，到有一轮轮询对 GitHub 的访问全部成功为止，同一个错误只记一条、只通知一次，哪怕几种错误轮流出现（比如两个仓库一个返回 404、一个返回 502）也是每种各一条，不会每轮都通知。有一轮访问全部成功后重新开始，之后同样的错误再出现会再记、再通知。错误信息里可能带每次都变的内容（比如请求 id），所以一串失败最多记 20 种不同的错误，超过后这串失败不再记新的 `github.error`。看板「需求」页上的「GitHub 调用失败」不去重，始终显示最近一次失败的时间和信息，有一轮访问全部成功后消失。
 

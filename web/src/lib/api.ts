@@ -6,6 +6,7 @@ import type {
   DiffView,
   GitHubStatus,
   HealthView,
+  IterationView,
   KeptWorkspace,
   NotifyTestResult,
   ProposalAccepted,
@@ -16,7 +17,15 @@ import type {
   UpgradeStatus,
 } from '../../../src/api/types.js';
 import { t } from '../../../src/i18n.js';
-import type { EventRow, ProposalStatus, Repo, Run, Scout } from '../../../src/store/types.js';
+import type {
+  EventRow,
+  Iteration,
+  IterationStatus,
+  ProposalStatus,
+  Repo,
+  Run,
+  Scout,
+} from '../../../src/store/types.js';
 import { type StatsFilter, statsQuery } from './stats.js';
 
 export class ApiError extends Error {
@@ -145,6 +154,29 @@ export const api = {
   /** The reason is required; the repo's next scouts are shown it. */
   rejectProposal: (proposalId: string, reason: string) =>
     request<ProposalView>('POST', `/api/proposals/${id(proposalId)}/reject`, { reason }),
+
+  /** Iterations of both sources, newest first; `status`: any of these. */
+  iterations: (
+    opts: { repo?: string; status?: readonly IterationStatus[]; limit?: number } = {},
+  ) => {
+    const q = new URLSearchParams();
+    if (opts.repo !== undefined) q.set('repo', opts.repo);
+    if (opts.status !== undefined) q.set('status', opts.status.join(','));
+    if (opts.limit !== undefined) q.set('limit', String(opts.limit));
+    const qs = q.toString();
+    return request<IterationView[]>('GET', `/api/iterations${qs ? `?${qs}` : ''}`);
+  },
+  iteration: (iterationId: string) =>
+    request<IterationView>('GET', `/api/iterations/${id(iterationId)}`),
+  /** A pending iteration of the local backlog, as a whole: its steps start by dependencies. */
+  acceptIteration: (iterationId: string) =>
+    request<Iteration>('POST', `/api/iterations/${id(iterationId)}/accept`),
+  /** A pending iteration of the local backlog, with every step; the reason is required. */
+  rejectIteration: (iterationId: string, reason: string) =>
+    request<Iteration>('POST', `/api/iterations/${id(iterationId)}/reject`, { reason }),
+  /** An accepted iteration of the local backlog: the Runs of its steps not done are terminated. */
+  cancelIteration: (iterationId: string) =>
+    request<Iteration>('POST', `/api/iterations/${id(iterationId)}/cancel`),
 };
 
 export const urls = {

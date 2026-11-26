@@ -8,6 +8,10 @@ export type Route =
   | { name: 'repos' }
   /** GitHub issues and AI scouts. */
   | { name: 'issues' }
+  /** Iterations of every repo, those not over first. */
+  | { name: 'iterations' }
+  /** One iteration: its goal, criteria, plan with each step's Runs, notes and summary. */
+  | { name: 'iteration'; id: string }
   /** Totals of Runs, issues, cost, tokens and time; filters live in the hash query. */
   | { name: 'stats' }
   /** Worktrees and branches finished Runs kept. */
@@ -27,6 +31,8 @@ export const href = {
   run: (id: string) => `#/runs/${encodeURIComponent(id)}`,
   repos: '#/repos',
   issues: '#/issues',
+  iterations: '#/iterations',
+  iteration: (id: string) => `#/iterations/${encodeURIComponent(id)}`,
   stats: '#/stats',
   workspaces: '#/workspaces',
   agents: '#/agents',
@@ -43,6 +49,7 @@ export function parseRoute(hash: string): Route {
   if (path === '/') return { name: 'home' };
   if (path === '/repos') return { name: 'repos' };
   if (path === '/issues') return { name: 'issues' };
+  if (path === '/iterations') return { name: 'iterations' };
   if (path === '/stats') return { name: 'stats' };
   if (path === '/workspaces') return { name: 'workspaces' };
   if (path === '/agents') return { name: 'agents' };
@@ -55,6 +62,8 @@ export function parseRoute(hash: string): Route {
   if (template?.[1]) return { name: 'config', template: decodeURIComponent(template[1]) };
   const run = /^\/runs\/([^/]+)$/.exec(path);
   if (run?.[1]) return { name: 'run', id: decodeURIComponent(run[1]) };
+  const iteration = /^\/iterations\/([^/]+)$/.exec(path);
+  if (iteration?.[1]) return { name: 'iteration', id: decodeURIComponent(iteration[1]) };
   return { name: 'notFound', path };
 }
 

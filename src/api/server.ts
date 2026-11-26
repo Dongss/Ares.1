@@ -22,6 +22,7 @@ import type { WebhookNotifier } from '../notify/webhook.js';
 import { ConflictError, NotFoundError, type Store } from '../store/store.js';
 import {
   type EventRow,
+  ITERATION_STATUSES,
   type Iteration,
   PROPOSAL_STATUSES,
   type Proposal,
@@ -32,6 +33,7 @@ import { branchExists, currentBranch, isGitRepo } from '../workspace/git.js';
 import { agentSummaries } from './agents.js';
 import { isCostUnknown } from './cost.js';
 import { diffView, runDiffRange } from './diff.js';
+import { iterationView } from './iterations.js';
 import { mountDashboard } from './static.js';
 import { collectStats, STATS_RANGES } from './stats.js';
 import type {
@@ -41,6 +43,7 @@ import type {
   ConfigView,
   GitHubStatus,
   HealthView,
+  IterationView,
   KeptWorkspace,
   LiveAgentEvent,
   NotifyTestResult,
@@ -126,6 +129,18 @@ const reasonNeeded = () =>
   t({ zh: '拒绝提案时必须填写理由', en: 'Rejecting a proposal needs a reason' });
 const RejectProposalInput = z.strictObject({
   reason: z.string({ error: reasonNeeded }).trim().min(1, { error: reasonNeeded }),
+});
+/** Most iterations one request returns. */
+const ITERATIONS_MAX = 500;
+const IterationsQuery = z.strictObject({
+  repo: z.string().min(1).optional(),
+  /** One status, or several separated by commas: `pending,active,blocked` for those not over. */
+  status: z
+    .string()
+    .transform((s) => s.split(','))
+    .pipe(z.array(z.enum(ITERATION_STATUSES)))
+    .optional(),
+  limit: z.coerce.number().int().min(1).max(ITERATIONS_MAX).optional(),
 });
 const iterationReasonNeeded = () =>
   t({ zh: '拒绝迭代时必须填写理由', en: 'Rejecting an iteration needs a reason' });
@@ -534,6 +549,26 @@ export function createApi(deps: ApiDeps): Hono {
       proposalView(store, backlog.reject(c.req.param('id'), reason)) satisfies ProposalView,
     );
   });
+
+  // Iterations of both sources, newest first; ?repo= and ?status= (one, or several separated by
+  // commas) filter, ?limit= caps. Each with its steps' Runs, its progress and what it used.
+  app.get('/api/iterations', (c) => {
+    const { repo, status, limit } = query(c, IterationsQuery);
+    const repoId = repo ? store.getRepo(repo).id : undefined;
+    const names = new Map(store.listRepos().map((r) => [r.id, r.name]));
+    const at = now();
+    return c.json(
+      store
+        .listIterations({ repoId, status, limit })
+        .map((it) => iterationView(store, it, at, names)) satisfies IterationView[],
+    );
+  });
+
+  app.get('/api/iterations/:id', (c) =>
+    c.json(
+      iterationView(store, store.getIteration(c.req.param('id')), now()) satisfies IterationView,
+    ),
+  );
 
   // Iterations of the local backlog are decided as a whole here; those of GitHub on GitHub (409).
   // Accepting accepts every step, and the steps whose dependencies are done become Runs.

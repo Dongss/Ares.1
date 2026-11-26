@@ -723,11 +723,18 @@ export interface EventLink {
 }
 
 /**
- * Where to see more about the event: scouts, the issues and iterations they propose and the local
- * proposals live on the Issues page; a divergence handed to a Run, and an accepted local proposal,
- * on that Run's page.
+ * Where to see more about the event: an iteration on its own page; scouts, the issues they propose
+ * and the local proposals on the Issues page; a divergence handed to a Run, and an accepted local
+ * proposal, on that Run's page.
  */
 export function globalEventLink(event: GlobalEvent): EventLink | null {
+  const iterationId = str(event.data.iterationId);
+  if (event.type.startsWith('iteration.') && iterationId) {
+    return {
+      href: href.iteration(iterationId),
+      label: t({ zh: '查看迭代', en: 'See the iteration' }),
+    };
+  }
   const runId = str(event.data.runId);
   const toRun =
     event.type === 'github.diverged' ||

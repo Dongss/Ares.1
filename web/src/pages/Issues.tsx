@@ -756,7 +756,20 @@ function ProposalItem(props: {
           )}
         </div>
       )}
-      {p.status === 'pending' && (
+      {p.iterationId && (
+        <div className="hint">
+          {p.status === 'pending'
+            ? t({
+                zh: '这是一个迭代的一步，和迭代一起整体采纳或拒绝：',
+                en: 'A step of an iteration, accepted or rejected with it as a whole: ',
+              })
+            : t({ zh: '这是一个迭代的一步：', en: 'A step of an iteration: ' })}
+          <a href={href.iteration(p.iterationId)}>
+            {t({ zh: '查看迭代', en: 'See the iteration' })}
+          </a>
+        </div>
+      )}
+      {p.status === 'pending' && !p.iterationId && (
         <>
           {waiting && <div className="hint">{waiting}</div>}
           <div className="proposal-actions">

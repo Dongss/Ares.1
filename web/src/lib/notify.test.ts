@@ -94,6 +94,29 @@ describe('noticeFor automation', () => {
     expect(`${en?.title} ${en?.body}`).not.toMatch(/[一-鿿]/);
   });
 
+  it('sends a blocked iteration to its page', () => {
+    const blocked = {
+      repo: 'demo',
+      iterationId: 'iteration-7',
+      issue: 12,
+      position: 2,
+      child: 14,
+      reason: 'failed',
+    };
+    expect(noticeFor(ev('iteration.blocked', blocked, null), undefined)).toMatchObject({
+      title: expect.stringContaining('demo'),
+      href: '#/iterations/iteration-7',
+    });
+    const local = { repo: 'demo', iterationId: 'iteration-8', position: 1, backlog: true };
+    expect(noticeFor(ev('iteration.blocked', local, null), undefined)?.href).toBe(
+      '#/iterations/iteration-8',
+    );
+    // Recorded without its id: the Issues page.
+    expect(noticeFor(ev('iteration.blocked', { repo: 'demo' }, null), undefined)?.href).toBe(
+      '#/issues',
+    );
+  });
+
   it('notifies failures of GitHub access and upgrades', () => {
     expect(
       noticeFor(ev('github.error', { message: '推送失败\n详情' }, null), undefined),

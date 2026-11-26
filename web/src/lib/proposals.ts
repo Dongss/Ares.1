@@ -177,12 +177,14 @@ export function scoutProposalFiled(p: Pick<ScoutProposal, 'issue' | 'local'>): {
 
 /**
  * The live events after which the local backlog on the page is out of date: proposals filed,
- * accepted or rejected, scouts, Runs created or changing status (an accepted proposal shows its
- * Run's status), and configuration reloads (backlog.repos changed).
+ * accepted or rejected, on their own or with their iteration, scouts, Runs created or changing
+ * status (an accepted proposal shows its Run's status), and configuration reloads (backlog.repos
+ * changed).
  */
 export function backlogOutdatedBy(type: string): boolean {
   return (
     type.startsWith('proposal.') ||
+    type.startsWith('iteration.') ||
     type.startsWith('scout.') ||
     type.startsWith('config.') ||
     type === 'run.created' ||

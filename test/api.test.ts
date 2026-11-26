@@ -12,6 +12,7 @@ import type {
   ConflictWait,
   GitHubStatus,
   HealthView,
+  IterationView,
   KeptWorkspace,
   LiveAgentEvent,
   NotifyTestResult,
@@ -1855,6 +1856,168 @@ backlog:
       });
     }
     expect(t.master.store.getIteration(iteration.id).status).toBe('pending');
+    expect(gh.calls).toEqual([]);
+  });
+
+  it('shows an iteration with its steps, their Runs, its progress and what it used', async () => {
+    const t = await start();
+    const iteration = planIteration(t);
+    const view = async () => {
+      const res = await call('GET', `/api/iterations/${iteration.id}`);
+      expect(res.status).toBe(200);
+      return res.json as IterationView;
+    };
+
+    // Waiting to be accepted: nothing run, nothing used; the second step depends on the first.
+    const pending = await view();
+    expect(pending).toMatchObject({
+      id: iteration.id,
+      repo: 'demo',
+      source: 'local',
+      status: 'pending',
+      goal: '本地仓库也能永动',
+      criteria: ['能演示'],
+      progress: { done: 0, total: 2 },
+      totals: { runs: 0, costUsd: 0, costUnknown: false, elapsedMs: null, agentMs: 0 },
+    });
+    expect(pending.children.map((c) => [c.position, c.status, c.waitingFor, c.runs])).toEqual([
+      [1, 'planned', [], []],
+      [2, 'planned', [1], []],
+    ]);
+    expect(pending.children[0]).toMatchObject({ title: '第一步', what: '第一步的做法' });
+
+    // The first step's agents report what they cost, the second's coder does not.
+    let step = 0;
+    t.scripts.coder = (ctx) => {
+      step += 1;
+      writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+      writeFile(join(ctx.input.workdir, `step-${step}.txt`), 'ok\n');
+      return step === 1 ? { ...done(), costUsd: 0.5 } : done();
+    };
+    t.scripts.reviewer = () => ({ ...review(), costUsd: 0.25 });
+
+    // Accepted: the first step runs, the second waits for it.
+    await call('POST', `/api/iterations/${iteration.id}/accept`);
+    const [first] = stepsOf(t, iteration.id);
+    const firstRun = first?.runId ?? '';
+    await t.waitStatus(firstRun, 'completed');
+    const started = await view();
+    expect(started.status).toBe('active');
+    expect(started.children.map((c) => [c.status, c.waitingFor])).toEqual([
+      ['running', []],
+      ['waiting', [1]],
+    ]);
+    expect(started.children[0]?.runs).toEqual([
+      { id: firstRun, status: 'completed', costUsd: 0.75, costUnknown: false },
+    ]);
+    expect(started.totals).toMatchObject({ runs: 1, costUsd: 0.75, costUnknown: false });
+    expect(started.totals.elapsedMs).toEqual(expect.any(Number));
+
+    // The next check finds the first done and starts the second; the one after, the iteration done.
+    await call('POST', '/api/backlog/poll');
+    const second = stepsOf(t, iteration.id)[1];
+    const secondRun = second?.runId ?? '';
+    expect(secondRun).not.toBe('');
+    await t.waitStatus(secondRun, 'completed');
+    await call('POST', '/api/backlog/poll');
+    const finished = await view();
+    const stored = t.master.store.getIteration(iteration.id);
+    // The second Run's coder reported no cost, so the total is a lower bound.
+    expect(finished).toMatchObject({
+      status: 'done',
+      summary: expect.any(String),
+      progress: { done: 2, total: 2 },
+      totals: {
+        runs: 2,
+        costUsd: 1,
+        costUnknown: true,
+        elapsedMs: Date.parse(stored.endedAt ?? '') - Date.parse(stored.decidedAt ?? ''),
+      },
+    });
+    expect(
+      finished.children.map((c) => [
+        c.status,
+        c.waitingFor,
+        c.runs.map((r) => [r.id, r.costUnknown]),
+      ]),
+    ).toEqual([
+      ['done', [], [[firstRun, false]]],
+      ['done', [], [[secondRun, true]]],
+    ]);
+    expect(finished.totals.agentMs).toBeGreaterThanOrEqual(0);
+
+    expect((await call('GET', '/api/iterations/iteration_none')).status).toBe(404);
+    expect(gh.calls).toEqual([]);
+  });
+
+  it('lists iterations of both sources newest first, by repo and status', async () => {
+    const t = await start();
+    const store = t.master.store;
+    const older = planIteration(t, 'github');
+    store.updateIteration(older.id, { status: 'done', endedAt: '2026-11-20T00:00:00.000Z' });
+    const newer = planIteration(t);
+    const other = store.createRepo({
+      name: 'other',
+      path: initRepo(),
+      targetBranch: 'main',
+      verifyCommands: [],
+      setupCommands: [],
+      mergeMode: 'direct',
+    });
+    const elsewhere = store.createIteration({
+      repoId: other.id,
+      scoutId: null,
+      source: 'local',
+      issuesRepo: '',
+      title: '别处的迭代',
+      goal: '别处',
+      readmeGoal: '永动',
+      criteria: [],
+      outOfScope: [],
+      children: [],
+    });
+    const ids = async (path: string) => {
+      const res = await call('GET', path);
+      expect(res.status).toBe(200);
+      return (res.json as IterationView[]).map((i) => i.id);
+    };
+
+    const all = (await call('GET', '/api/iterations')).json as IterationView[];
+    expect(all.map((i) => [i.id, i.repo, i.source, i.status])).toEqual([
+      [elsewhere.id, 'other', 'local', 'pending'],
+      [newer.id, 'demo', 'local', 'pending'],
+      [older.id, 'demo', 'github', 'done'],
+    ]);
+    // An iteration of GitHub: its issue; its steps without issues have no Runs.
+    expect(all[2]).toMatchObject({
+      issue: { number: 1, url: 'https://github.com/me/demo/1' },
+      issuesRepo: 'me/demo',
+      progress: { done: 0, total: 2 },
+      totals: { runs: 0, costUsd: 0, costUnknown: false, elapsedMs: null },
+    });
+    expect(all[2]?.children.map((c) => c.runs)).toEqual([[], []]);
+    expect(all[0]).toMatchObject({ progress: { done: 0, total: 0 }, children: [] });
+
+    expect(await ids('/api/iterations?repo=demo')).toEqual([newer.id, older.id]);
+    expect(await ids(`/api/iterations?repo=${other.id}`)).toEqual([elsewhere.id]);
+    expect(await ids('/api/iterations?status=done')).toEqual([older.id]);
+    expect(await ids('/api/iterations?status=pending,active,blocked&repo=demo')).toEqual([
+      newer.id,
+    ]);
+    expect(await ids('/api/iterations?status=active,blocked')).toEqual([]);
+    expect(await ids('/api/iterations?limit=2')).toEqual([elsewhere.id, newer.id]);
+
+    for (const path of [
+      '/api/iterations?status=open',
+      '/api/iterations?status=pending,',
+      '/api/iterations?status=',
+      '/api/iterations?limit=0',
+      '/api/iterations?limit=501',
+      '/api/iterations?state=pending',
+    ]) {
+      expect((await call('GET', path)).status, path).toBe(400);
+    }
+    expect((await call('GET', '/api/iterations?repo=nowhere')).status).toBe(404);
     expect(gh.calls).toEqual([]);
   });
 

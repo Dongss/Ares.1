@@ -92,7 +92,8 @@ src/
   api/
     server.ts         HTTP API (Hono) and SSE
     types.ts          API data types, shared by Master and dashboard
-    agents.ts, stats.ts, workspaces.ts, diff.ts   Agents, Stats and Workspaces page data, diffs
+    agents.ts, stats.ts, workspaces.ts, iterations.ts, diff.ts   Agents, Stats, Workspaces and
+                      Iterations page data, diffs
     cost.ts           whether a cost is unknown (shared with the dashboard)
     static.ts         serves the built dashboard
 scripts/
@@ -102,9 +103,10 @@ scripts/
   webhook.sh          the scripts' webhook notification when the Master is down
 web/                  dashboard (React + Vite)
   src/App.tsx         top bar (navigation, work, notification and language switches) and routing
-  src/pages/          Home, RunDetail, Issues, Stats, Agents, Events, Workspaces, Repos, Config,
-                      Guide
-  src/components/     ui.tsx (common), AgentOutput, DiffPanel, FlowChart, Notifications, WorkSwitch
+  src/pages/          Home, RunDetail, Issues, Iterations, Stats, Agents, Events, Workspaces, Repos,
+                      Config, Guide
+  src/components/     ui.tsx (common), AgentOutput, DiffPanel, FlowChart, IterationCard,
+                      Notifications, WorkSwitch
   src/lib/            API calls, SSE, routing, language choice, formatting, each page's pure logic
   src/styles.css      all styles
 docs/                 documents for people besides the README (in Chinese)

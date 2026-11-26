@@ -752,6 +752,36 @@ describe('globalEventLink', () => {
     });
   });
 
+  it('links iteration events to the iteration, and those recorded without one to Issues', () => {
+    const page = { href: '#/iterations/iteration-7', label: '查看迭代' };
+    for (const type of [
+      'iteration.accepted',
+      'iteration.auto_accepted',
+      'iteration.child_status',
+      'iteration.blocked',
+      'iteration.unblocked',
+      'iteration.adjusted',
+      'iteration.completed',
+      'iteration.cancelled',
+    ]) {
+      expect(globalEventLink(ev(type, { repo: 'demo', iterationId: 'iteration-7' }))).toEqual(page);
+    }
+    expect(globalEventLink(ev('iteration.blocked', { iterationId: '' }))).toEqual({
+      href: '#/issues',
+      label: '查看需求',
+    });
+    // Not an iteration's event, even with an iterationId.
+    expect(globalEventLink(ev('scout.completed', { iterationId: 'iteration-7' }))).toEqual({
+      href: '#/issues',
+      label: '查看需求',
+    });
+    setLang('en');
+    expect(globalEventLink(ev('iteration.completed', { iterationId: 'iteration-7' }))).toEqual({
+      href: '#/iterations/iteration-7',
+      label: 'See the iteration',
+    });
+  });
+
   it('links an accepted local proposal to its Run, and a rejected one to the Issues page', () => {
     const run = { href: '#/runs/run-7', label: '查看 Run' };
     const issues = { href: '#/issues', label: '查看需求' };

@@ -80,6 +80,23 @@ export function Collapsible(props: {
   );
 }
 
+/** A bar filled to `percent` (0–100), colored by tone, with `label` read out for it. */
+export function ProgressBar(props: { percent: number; tone: Tone; label: string }) {
+  const percent = Math.max(0, Math.min(100, props.percent));
+  return (
+    <div
+      className="progress"
+      role="progressbar"
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={percent}
+      aria-label={props.label}
+    >
+      <div className={`progress-fill progress-${props.tone}`} style={{ width: `${percent}%` }} />
+    </div>
+  );
+}
+
 /** Preformatted text that can get long: scrolls instead of growing forever. */
 export function Pre({ children, className }: { children: ReactNode; className?: string }) {
   return <pre className={`pre ${className ?? ''}`}>{children}</pre>;

@@ -262,11 +262,13 @@ describe('scoutProposalFiled', () => {
 });
 
 describe('backlogOutdatedBy', () => {
-  it('reloads the local backlog on proposals, scouts, new Runs, Run statuses and reloads', () => {
+  it('reloads the local backlog on proposals, iterations, scouts, new Runs, Run statuses and reloads', () => {
     for (const type of [
       'proposal.auto_accepted',
       'proposal.accepted',
       'proposal.rejected',
+      'iteration.accepted',
+      'iteration.cancelled',
       'scout.started',
       'scout.completed',
       'run.created',
