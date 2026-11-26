@@ -1,6 +1,13 @@
 import { execFile } from 'node:child_process';
 import { z } from 'zod';
-import type { CodeHost, LabelDef } from '../host/code-host.js';
+import { LABELS } from '../github/issues.js';
+import type {
+  CodeHost,
+  HostAuthored,
+  HostComment,
+  HostIssue,
+  LabelDef,
+} from '../host/code-host.js';
 import { t } from '../i18n.js';
 
 /** A failure of glab or of GitLab, or what glab printed that cannot be read. */
@@ -14,6 +21,50 @@ const MAX_PAGE = 100;
  * limit only keeps a server that ignores `page` from being asked forever.
  */
 const MAX_LABEL_PAGES = 20;
+
+/**
+ * How long the client keeps what it learned of a member's access level. Long enough that a round
+ * of the bridge asks once per person, short enough that a change of the project's members counts
+ * from the next rounds on.
+ */
+const MEMBER_TTL_MS = 5 * 60_000;
+
+/** GitLab's access levels by the names it gives them. */
+const ACCESS_LEVELS: ReadonlyMap<number, string> = new Map([
+  [0, 'NONE'],
+  [5, 'MINIMAL_ACCESS'],
+  [10, 'GUEST'],
+  [15, 'PLANNER'],
+  [20, 'REPORTER'],
+  [30, 'DEVELOPER'],
+  [40, 'MAINTAINER'],
+  [50, 'OWNER'],
+]);
+
+/** The lowest access level that can push to the project: Developer. */
+const TRUSTED_ACCESS_LEVEL = 30;
+
+/**
+ * Who wrote something, from the username and the access level to the project GitLab gave:
+ * trusted from Developer up, as those can change the project anyway. `accessLevel` is null for
+ * somebody who is no member (or not let in yet); `username` is empty when the account is gone.
+ * The role is GitLab's name for the level, or ACCESS_LEVEL_<n> for a level GitLab added later;
+ * trust goes by the number alone.
+ */
+export function gitlabAuthor(
+  username: string | null | undefined,
+  accessLevel: number | null | undefined,
+): HostAuthored {
+  if (!username) return { author: null, trusted: false, role: 'NONE' };
+  if (accessLevel === null || accessLevel === undefined) {
+    return { author: username, trusted: false, role: 'NONE' };
+  }
+  return {
+    author: username,
+    trusted: accessLevel >= TRUSTED_ACCESS_LEVEL,
+    role: ACCESS_LEVELS.get(accessLevel) ?? `ACCESS_LEVEL_${accessLevel}`,
+  };
+}
 
 /**
  * What `command` printed as JSON, read with `schema`. Anything else (a proxy's HTML page, a glab
@@ -128,6 +179,78 @@ function sameLabel(raw: RawLabel, def: LabelDef): boolean {
   );
 }
 
+/** An account as GitLab names the author of an issue or a note; absent when it gave none. */
+const RawUser = z.object({ id: z.number().int(), username: z.string() }).nullish();
+type RawUser = z.infer<typeof RawUser>;
+
+/** An issue as GitLab returns it. */
+const RawIssue = z.object({
+  iid: z.number().int().positive(),
+  title: z.string(),
+  description: z.string().nullish(),
+  /** opened or closed. */
+  state: z.string(),
+  labels: z.array(z.string()),
+  web_url: z.string().min(1),
+  author: RawUser,
+});
+type RawIssue = z.infer<typeof RawIssue>;
+
+/** A note (a comment) on an issue as GitLab returns it. */
+const RawNote = z.object({
+  body: z.string().nullish(),
+  author: RawUser,
+  /** Written by GitLab itself (a mention elsewhere, a change of assignee), not by a person. */
+  system: z.boolean().nullish(),
+});
+type RawNote = z.infer<typeof RawNote>;
+
+/** A member of a project as `members/all` lists it, memberships of its groups included. */
+const RawMember = z.object({
+  id: z.number().int(),
+  access_level: z.number().int(),
+  /** The account's state: active, blocked, deactivated, ... */
+  state: z.string().nullish(),
+  /** active, or awaiting while GitLab has not let the member in yet (no seat, no approval). */
+  membership_state: z.string().nullish(),
+});
+type RawMember = z.infer<typeof RawMember>;
+
+/** Whether the member can act as one: the account and its membership are active. */
+function activeMember(m: RawMember): boolean {
+  return (m.state ?? 'active') === 'active' && (m.membership_state ?? 'active') === 'active';
+}
+
+/** Who wrote an issue or a note, by the access level the client found for its author. */
+type Authors = (user: RawUser) => HostAuthored;
+
+function fromRawNote(note: RawNote, authors: Authors): HostComment {
+  return { body: note.body ?? '', ...authors(note.author) };
+}
+
+/**
+ * GitLab closes an issue without a reason: one closed as not planned carries LABELS.notPlanned
+ * (as `close` leaves it), any other closed one counts as completed.
+ */
+function fromRawIssue(raw: RawIssue, authors: Authors, comments: HostComment[]): HostIssue {
+  const closed = raw.state === 'closed';
+  return {
+    ...authors(raw.author),
+    number: raw.iid,
+    title: raw.title,
+    body: raw.description ?? '',
+    state: closed ? 'closed' : 'open',
+    stateReason: closed
+      ? raw.labels.includes(LABELS.notPlanned)
+        ? 'not_planned'
+        : 'completed'
+      : null,
+    labels: raw.labels,
+    url: raw.web_url,
+    comments,
+  };
+}
+
 type Method = 'GET' | 'POST' | 'PUT' | 'DELETE';
 
 /**
@@ -135,7 +258,9 @@ type Method = 'GET' | 'POST' | 'PUT' | 'DELETE';
  * Everything goes through `glab api` and GitLab's REST API; `repo` is a project's path, as
  * "group/subgroup/name", and the number of an issue or a merge request is its iid, the one in
  * its link. With `host`, every call goes to that GitLab (a self-hosted one), else to the one glab
- * picks. With `account`, the client checks it is the account glab is logged in as.
+ * picks. With `account`, the client checks it is the account glab is logged in as. Authors are
+ * trusted by their access level to the project (`gitlabAuthor`), which the client asks GitLab
+ * for and keeps a few minutes.
  */
 export class GlabCli
   implements
@@ -144,15 +269,25 @@ export class GlabCli
       | 'resolveRepo'
       | 'viewer'
       | 'ensureLabels'
+      | 'listIssues'
+      | 'listNotPlannedIssues'
+      | 'getIssue'
       | 'getLabels'
       | 'setLabels'
       | 'comment'
+      | 'listComments'
+      | 'close'
       | 'createIssue'
       | 'editIssue'
     >
 {
   private readonly host: string | undefined;
   private readonly account: string | undefined;
+  /**
+   * Access levels found, by project and user id: null for somebody who is no active member;
+   * `at` is when it was found (Date.now).
+   */
+  private readonly members = new Map<string, { level: number | null; at: number }>();
 
   constructor(
     private readonly bin = 'glab',
@@ -225,6 +360,72 @@ export class GlabCli
       if (found.length < MAX_PAGE) break;
     }
     return labels;
+  }
+
+  /**
+   * The access level to the project of each of the users, null for one who is no active member:
+   * from what the client found in the last few minutes, the rest asked of GitLab together. Who is
+   * no member is told by being left out of the members listed, never by an error's text; a
+   * request that fails is a GlabError, never taken for "no member".
+   */
+  private async accessLevels(
+    project: string,
+    ids: readonly number[],
+  ): Promise<Map<number, number | null>> {
+    const now = Date.now();
+    const levels = new Map<number, number | null>();
+    const missing: number[] = [];
+    for (const id of new Set(ids)) {
+      const known = this.members.get(`${project}/${id}`);
+      if (known && now - known.at < MEMBER_TTL_MS) levels.set(id, known.level);
+      else missing.push(id);
+    }
+    missing.sort((a, b) => a - b);
+    for (let i = 0; i < missing.length; i += MAX_PAGE) {
+      const batch = missing.slice(i, i + MAX_PAGE);
+      const users = batch.map((id) => `user_ids[]=${id}`).join('&');
+      const path = `projects/${project}/members/all?${users}&per_page=${MAX_PAGE}`;
+      const found = await this.read(path, z.array(RawMember));
+      for (const id of batch) {
+        // A member of several of the project's groups may be listed more than once.
+        const own = found.filter((m) => m.id === id && activeMember(m)).map((m) => m.access_level);
+        const level = own.length > 0 ? Math.max(...own) : null;
+        levels.set(id, level);
+        this.members.set(`${project}/${id}`, { level, at: now });
+      }
+    }
+    return levels;
+  }
+
+  /** Who wrote what the users wrote in the project, their access levels found first. */
+  private async authors(project: string, users: readonly RawUser[]): Promise<Authors> {
+    const ids = users.flatMap((u) => (u?.username ? [u.id] : []));
+    const levels = await this.accessLevels(project, ids);
+    return (user) => gitlabAuthor(user?.username, user ? levels.get(user.id) : null);
+  }
+
+  /** The latest notes (up to 100) people wrote on the issue, oldest first. */
+  private async notes(project: string, number: number): Promise<RawNote[]> {
+    const path = `projects/${project}/issues/${number}/notes?order_by=created_at&sort=desc&per_page=${MAX_PAGE}`;
+    const notes = await this.read(path, z.array(RawNote));
+    return notes.filter((n) => n.system !== true).reverse();
+  }
+
+  /** The issues as the Master needs them, with their notes when `comments`. */
+  private async issues(
+    project: string,
+    raws: readonly RawIssue[],
+    comments: boolean,
+  ): Promise<HostIssue[]> {
+    // One at a time: a page of issues is at most 100 of them.
+    const notes: RawNote[][] = [];
+    for (const raw of raws) notes.push(comments ? await this.notes(project, raw.iid) : []);
+    const authors = await this.authors(project, [
+      ...raws.map((r) => r.author),
+      ...notes.flat().map((n) => n.author),
+    ]);
+    const comment = (n: RawNote) => fromRawNote(n, authors);
+    return raws.map((raw, i) => fromRawIssue(raw, authors, (notes[i] ?? []).map(comment)));
   }
 
   async resolveRepo(path: string): Promise<string> {
@@ -300,6 +501,82 @@ export class GlabCli
       }
       // A label of one of the project's groups serves as it is: the project cannot change it.
     }
+  }
+
+  async listIssues(
+    repo: string,
+    query: { state: 'open' | 'closed'; label?: string; limit: number; comments?: boolean },
+  ): Promise<HostIssue[]> {
+    const project = projectId(repo);
+    const params = [`state=${query.state === 'open' ? 'opened' : 'closed'}`];
+    if (query.label) params.push(`labels=${encodeURIComponent(query.label)}`);
+    params.push('order_by=created_at', 'sort=desc');
+    params.push(`per_page=${Math.min(Math.max(query.limit, 1), MAX_PAGE)}`);
+    const raws = await this.read(
+      `projects/${project}/issues?${params.join('&')}`,
+      z.array(RawIssue),
+    );
+    return this.issues(project, raws, query.comments === true);
+  }
+
+  async listNotPlannedIssues(repo: string, query: { limit: number }): Promise<HostIssue[]> {
+    const project = projectId(repo);
+    const limit = Math.max(query.limit, 0);
+    if (limit === 0) return [];
+    // The same page size on every page, so that the pages follow each other.
+    const perPage = Math.min(limit, MAX_PAGE);
+    const label = encodeURIComponent(LABELS.notPlanned);
+    const found: RawIssue[] = [];
+    // The label selects only such issues, so the pages needed are known; one more covers those
+    // reopened or relabelled meanwhile. Never page on and on.
+    const maxPages = Math.ceil(limit / perPage) + 1;
+    for (let page = 1; page <= maxPages && found.length < limit; page++) {
+      const path =
+        `projects/${project}/issues?state=closed&labels=${label}` +
+        `&order_by=created_at&sort=desc&per_page=${perPage}&page=${page}`;
+      const raws = await this.read(path, z.array(RawIssue));
+      for (const raw of raws) {
+        // Pages overlap when issues are closed meanwhile.
+        const seen = found.some((f) => f.iid === raw.iid);
+        if (!seen && raw.state === 'closed' && raw.labels.includes(LABELS.notPlanned)) {
+          found.push(raw);
+        }
+      }
+      if (raws.length < perPage) break;
+    }
+    return this.issues(project, found.slice(0, limit), true);
+  }
+
+  async getIssue(repo: string, number: number): Promise<HostIssue> {
+    const project = projectId(repo);
+    const raw = await this.read(`projects/${project}/issues/${number}`, RawIssue);
+    const authors = await this.authors(project, [raw.author]);
+    return fromRawIssue(raw, authors, []);
+  }
+
+  async listComments(repo: string, number: number): Promise<HostComment[]> {
+    const project = projectId(repo);
+    const notes = await this.notes(project, number);
+    const authors = await this.authors(
+      project,
+      notes.map((n) => n.author),
+    );
+    return notes.map((n) => fromRawNote(n, authors));
+  }
+
+  /**
+   * GitLab closes an issue without a reason, so LABELS.notPlanned says it was not planned: added
+   * with the closing, or removed when it is closed as completed (as when it was reopened since).
+   */
+  async close(repo: string, number: number, reason: 'completed' | 'not_planned'): Promise<void> {
+    const labels =
+      reason === 'not_planned'
+        ? { add_labels: LABELS.notPlanned }
+        : { remove_labels: LABELS.notPlanned };
+    await this.api('PUT', `projects/${projectId(repo)}/issues/${number}`, {
+      state_event: 'close',
+      ...labels,
+    });
   }
 
   async getLabels(repo: string, number: number): Promise<string[]> {

@@ -39,6 +39,13 @@ export const LABELS = {
    * what the issue is, not where it stands: it keeps a status label beside it.
    */
   iteration: 'ares1:iteration',
+  /**
+   * Closed as not planned. GitLab closes an issue without a reason, so its client marks one
+   * closed as not planned with this label, and reads it back from it. Says how the issue was
+   * closed, not where it stands: not a status label. GitHub keeps the reason itself; the label
+   * is created there too, unused.
+   */
+  notPlanned: 'ares1:not-planned',
 } as const;
 
 /** Labels that say where the issue stands; exactly one of them is on an issue at a time. */
@@ -104,6 +111,14 @@ export function labelDefs(): LabelDef[] {
       description: t({
         zh: 'AI 规划的迭代：一个大目标和按依赖排好的子 issue；加 ares1:ready 就整批采纳',
         en: 'An iteration planned by AI: one goal and its ordered sub-issues; add ares1:ready to accept all',
+      }),
+    },
+    {
+      name: LABELS.notPlanned,
+      color: 'cfd3d7',
+      description: t({
+        zh: '关闭为不做：GitLab 关闭 issue 时不记原因，用这个标签表示',
+        en: 'Closed as not planned (on GitLab, which keeps no reason for closing an issue)',
       }),
     },
   ];

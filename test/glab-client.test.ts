@@ -1,7 +1,8 @@
 import { chmodSync, existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { GlabCli, GlabError } from '../src/gitlab/client.js';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { isTrusted, LABELS } from '../src/github/issues.js';
+import { GlabCli, GlabError, gitlabAuthor } from '../src/gitlab/client.js';
 import { setLang } from '../src/i18n.js';
 import { git, tmpDir, writeFile } from './helpers.js';
 
@@ -173,6 +174,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   for (const [name, value] of savedEnv) {
     if (value === undefined) delete process.env[name];
     else process.env[name] = value;
@@ -225,6 +227,11 @@ describe('GlabCli projects and hosts', () => {
       await glabError(
         cli.ensureLabels(repo, [{ name: 'ares1:ready', color: '0e8a16', description: '' }]),
       );
+      await glabError(cli.listIssues(repo, { state: 'open', limit: 10 }));
+      await glabError(cli.listNotPlannedIssues(repo, { limit: 0 }));
+      await glabError(cli.getIssue(repo, 1));
+      await glabError(cli.listComments(repo, 1));
+      await glabError(cli.close(repo, 1, 'completed'));
     }
     expect(glab.calls()).toEqual([]);
   });
@@ -482,6 +489,620 @@ describe('GlabCli issue writes', () => {
     const [call] = glab.calls();
     expect(call?.args).toEqual(apiArgs('PUT', `${PROJECT}/issues/57`, { body: true }));
     expect(body(call)).toEqual({ description: plan });
+  });
+});
+
+/** An account as GitLab names the author of an issue or a note. */
+function user(id: number, username: string) {
+  return {
+    id,
+    username,
+    name: username.toUpperCase(),
+    state: 'active',
+    locked: false,
+    avatar_url: null,
+    web_url: `https://gitlab.com/${username}`,
+  };
+}
+
+const ALICE = user(1, 'alice');
+const BOB = user(2, 'bob');
+const CAROL = user(3, 'carol');
+
+/** An issue as GitLab returns it. */
+function rawIssue(iid: number, fields: Record<string, unknown> = {}) {
+  return {
+    id: 9000 + iid,
+    iid,
+    project_id: 42,
+    title: `Issue ${iid}`,
+    description: `Body ${iid}`,
+    state: 'opened',
+    labels: [],
+    author: ALICE,
+    assignees: [],
+    milestone: null,
+    user_notes_count: 0,
+    created_at: '2026-11-01T00:00:00.000Z',
+    web_url: `https://gitlab.com/acme/widgets/-/issues/${iid}`,
+    ...fields,
+  };
+}
+
+/** A note on an issue as GitLab returns it. */
+function note(id: number, author: unknown, body: string | null, fields = {}) {
+  return {
+    id,
+    type: null,
+    body,
+    author,
+    created_at: '2026-11-01T00:00:00.000Z',
+    system: false,
+    noteable_type: 'Issue',
+    internal: false,
+    ...fields,
+  };
+}
+
+/** A member of the project as `members/all` lists it. */
+function member(who: { id: number; username: string }, level: number, fields = {}) {
+  return {
+    ...user(who.id, who.username),
+    access_level: level,
+    expires_at: null,
+    membership_state: 'active',
+    created_at: '2026-01-01T00:00:00.000Z',
+    ...fields,
+  };
+}
+
+/** The members of the project among the users, as the client asks for them. */
+function membersPath(ids: number[], project = PROJECT): string {
+  return `${project}/members/all?${ids.map((id) => `user_ids[]=${id}`).join('&')}&per_page=100`;
+}
+
+/** The latest notes of the issue, as the client asks for them. */
+function notesPath(iid: number, project = PROJECT): string {
+  return `${project}/issues/${iid}/notes?order_by=created_at&sort=desc&per_page=100`;
+}
+
+/** The API paths of the calls glab got, in order. */
+function paths(calls: GlabCall[]): string[] {
+  return calls.map((c) => `${c.args[3]} ${c.args[1]}`);
+}
+
+describe('gitlabAuthor', () => {
+  it('trusts Developer and above by the number alone, naming each level', () => {
+    const levels: [level: number | null | undefined, role: string, trusted: boolean][] = [
+      [null, 'NONE', false],
+      [undefined, 'NONE', false],
+      [0, 'NONE', false],
+      [5, 'MINIMAL_ACCESS', false],
+      [10, 'GUEST', false],
+      [15, 'PLANNER', false],
+      [20, 'REPORTER', false],
+      [25, 'ACCESS_LEVEL_25', false],
+      [30, 'DEVELOPER', true],
+      [40, 'MAINTAINER', true],
+      [50, 'OWNER', true],
+      [60, 'ACCESS_LEVEL_60', true],
+    ];
+    for (const [level, role, trusted] of levels) {
+      expect(gitlabAuthor('carol', level), String(level)).toEqual({
+        author: 'carol',
+        trusted,
+        role,
+      });
+    }
+  });
+
+  it('trusts no deleted account, whatever the level', () => {
+    for (const username of [null, undefined, '']) {
+      expect(gitlabAuthor(username, 50)).toEqual({ author: null, trusted: false, role: 'NONE' });
+    }
+  });
+});
+
+describe('GlabCli issues', () => {
+  it('getIssue maps the issue, its author trusted by the access level', async () => {
+    const description = '## 为什么\n\n需要它。\n';
+    const glab = fakeGlab([
+      get(
+        `${PROJECT}/issues/7`,
+        rawIssue(7, {
+          description,
+          labels: ['ares1:ready', 'bug'],
+          // Fields the client does not read are ignored.
+          task_completion_status: { count: 0 },
+          extra: [1, 2],
+        }),
+      ),
+      get(membersPath([1]), [member(ALICE, 40)]),
+    ]);
+    const cli = new GlabCli(glab.bin, { host: 'gitlab.example.com' });
+    expect(await cli.getIssue('acme/widgets', 7)).toEqual({
+      number: 7,
+      title: 'Issue 7',
+      body: description,
+      state: 'open',
+      stateReason: null,
+      labels: ['ares1:ready', 'bug'],
+      url: 'https://gitlab.com/acme/widgets/-/issues/7',
+      author: 'alice',
+      trusted: true,
+      role: 'MAINTAINER',
+      comments: [],
+    });
+    expect(glab.calls().map((c) => c.args)).toEqual([
+      apiArgs('GET', `${PROJECT}/issues/7`, { host: 'gitlab.example.com' }),
+      apiArgs('GET', membersPath([1]), { host: 'gitlab.example.com' }),
+    ]);
+  });
+
+  it('getIssue tells closed as not planned by ares1:not-planned, any other closed as completed', async () => {
+    const glab = fakeGlab([
+      get(
+        `${PROJECT}/issues/8`,
+        rawIssue(8, { state: 'closed', labels: ['bug', LABELS.notPlanned], description: null }),
+      ),
+      get(`${PROJECT}/issues/9`, rawIssue(9, { state: 'closed', labels: ['bug'] })),
+      // Reopened since: open, whatever label it kept.
+      get(`${PROJECT}/issues/10`, rawIssue(10, { labels: [LABELS.notPlanned] })),
+      // Asked once: the same author's level is kept.
+      get(membersPath([1]), [member(ALICE, 30)]),
+    ]);
+    const cli = new GlabCli(glab.bin);
+    const issues = [
+      await cli.getIssue('acme/widgets', 8),
+      await cli.getIssue('acme/widgets', 9),
+      await cli.getIssue('acme/widgets', 10),
+    ];
+    expect(issues.map((i) => [i.number, i.state, i.stateReason, i.body])).toEqual([
+      [8, 'closed', 'not_planned', ''],
+      [9, 'closed', 'completed', 'Body 9'],
+      [10, 'open', null, 'Body 10'],
+    ]);
+    expect(issues.every((i) => i.trusted && i.role === 'DEVELOPER')).toBe(true);
+    expect(paths(glab.calls())).toEqual([
+      `GET ${PROJECT}/issues/8`,
+      `GET ${membersPath([1])}`,
+      `GET ${PROJECT}/issues/9`,
+      `GET ${PROJECT}/issues/10`,
+    ]);
+  });
+
+  it('listIssues asks for one page of the state and label, newest first, without notes', async () => {
+    const path = `${PROJECT}/issues?state=opened&labels=ares1%3Aready&order_by=created_at&sort=desc&per_page=50`;
+    const glab = fakeGlab([
+      get(path, [
+        rawIssue(12, { author: BOB, labels: [LABELS.ready] }),
+        rawIssue(11, { labels: [LABELS.ready, 'bug'] }),
+        rawIssue(10, { author: BOB, labels: [LABELS.ready] }),
+      ]),
+      get(membersPath([1, 2]), [member(BOB, 10), member(ALICE, 30)]),
+    ]);
+    const issues = await new GlabCli(glab.bin).listIssues('acme/widgets', {
+      state: 'open',
+      label: LABELS.ready,
+      limit: 50,
+    });
+    expect(issues.map((i) => [i.number, i.author, i.trusted, i.role, i.labels])).toEqual([
+      [12, 'bob', false, 'GUEST', [LABELS.ready]],
+      [11, 'alice', true, 'DEVELOPER', [LABELS.ready, 'bug']],
+      [10, 'bob', false, 'GUEST', [LABELS.ready]],
+    ]);
+    expect(issues.every((i) => i.comments.length === 0)).toBe(true);
+    expect(glab.calls().map((c) => c.args)).toEqual([
+      apiArgs('GET', path),
+      apiArgs('GET', membersPath([1, 2])),
+    ]);
+  });
+
+  it('listIssues keeps the page within 1 and 100 issues, and lists them without a label', async () => {
+    const closed = (perPage: number) =>
+      `${PROJECT}/issues?state=closed&order_by=created_at&sort=desc&per_page=${perPage}`;
+    const glab = fakeGlab([
+      get(closed(1), [rawIssue(5, { state: 'closed', author: null })]),
+      get(closed(100), []),
+      get(closed(1), []),
+    ]);
+    const cli = new GlabCli(glab.bin);
+    const [deleted] = await cli.listIssues('acme/widgets', { state: 'closed', limit: 0 });
+    expect(deleted).toMatchObject({
+      number: 5,
+      state: 'closed',
+      stateReason: 'completed',
+      author: null,
+      trusted: false,
+      role: 'NONE',
+    });
+    expect(await cli.listIssues('acme/widgets', { state: 'closed', limit: 500 })).toEqual([]);
+    expect(await cli.listIssues('acme/widgets', { state: 'closed', label: '', limit: -3 })).toEqual(
+      [],
+    );
+    // Nobody to ask about: no members are asked for.
+    expect(paths(glab.calls())).toEqual([
+      `GET ${closed(1)}`,
+      `GET ${closed(100)}`,
+      `GET ${closed(1)}`,
+    ]);
+  });
+
+  it("listIssues with comments reads each issue's notes, people's only, oldest first", async () => {
+    const path = `${PROJECT}/issues?state=opened&labels=ares1%3Aproposal&order_by=created_at&sort=desc&per_page=2`;
+    const glab = fakeGlab([
+      get(path, [rawIssue(12), rawIssue(11, { author: BOB })]),
+      // Newest first, as asked.
+      get(notesPath(12), [
+        note(103, BOB, 'third'),
+        note(102, ALICE, 'mentioned in merge request !4', { system: true }),
+        note(101, CAROL, 'first', { type: 'DiscussionNote', resolvable: false, unknown: {} }),
+      ]),
+      get(notesPath(11), []),
+      get(membersPath([1, 2, 3]), [member(ALICE, 50), member(BOB, 20)]),
+    ]);
+    const issues = await new GlabCli(glab.bin).listIssues('acme/widgets', {
+      state: 'open',
+      label: LABELS.proposal,
+      limit: 2,
+      comments: true,
+    });
+    expect(issues.map((i) => [i.number, i.author, i.role])).toEqual([
+      [12, 'alice', 'OWNER'],
+      [11, 'bob', 'REPORTER'],
+    ]);
+    expect(issues[0]?.comments).toEqual([
+      { body: 'first', author: 'carol', trusted: false, role: 'NONE' },
+      { body: 'third', author: 'bob', trusted: false, role: 'REPORTER' },
+    ]);
+    expect(issues[1]?.comments).toEqual([]);
+    expect(paths(glab.calls())).toEqual([
+      `GET ${path}`,
+      `GET ${notesPath(12)}`,
+      `GET ${notesPath(11)}`,
+      `GET ${membersPath([1, 2, 3])}`,
+    ]);
+  });
+
+  it("listComments reads the issue's notes, people's only, oldest first", async () => {
+    const glab = fakeGlab([
+      get(notesPath(7, NESTED_PROJECT), [
+        note(4, ALICE, null),
+        note(3, null, 'from an account deleted since'),
+        note(2, BOB, 'changed the description', { system: true }),
+        note(1, BOB, 'first'),
+      ]),
+      get(membersPath([1, 2], NESTED_PROJECT), [member(ALICE, 30), member(BOB, 30)]),
+    ]);
+    expect(await new GlabCli(glab.bin).listComments(NESTED, 7)).toEqual([
+      { body: 'first', author: 'bob', trusted: true, role: 'DEVELOPER' },
+      { body: 'from an account deleted since', author: null, trusted: false, role: 'NONE' },
+      { body: '', author: 'alice', trusted: true, role: 'DEVELOPER' },
+    ]);
+  });
+
+  it('close closes the issue, ares1:not-planned saying whether it was planned', async () => {
+    const glab = fakeGlab([
+      { path: `${PROJECT}/issues/7`, method: 'PUT', stdout: '{}', keep: true },
+    ]);
+    const cli = new GlabCli(glab.bin);
+    await cli.close('acme/widgets', 7, 'not_planned');
+    await cli.close('acme/widgets', 7, 'completed');
+    const calls = glab.calls();
+    expect(calls.map((c) => c.args)).toEqual([
+      apiArgs('PUT', `${PROJECT}/issues/7`, { body: true }),
+      apiArgs('PUT', `${PROJECT}/issues/7`, { body: true }),
+    ]);
+    expect(calls.map(body)).toEqual([
+      { state_event: 'close', add_labels: 'ares1:not-planned' },
+      { state_event: 'close', remove_labels: 'ares1:not-planned' },
+    ]);
+  });
+});
+
+describe('GlabCli listNotPlannedIssues', () => {
+  const page = (n: number, perPage: number) =>
+    `${PROJECT}/issues?state=closed&labels=ares1%3Anot-planned&order_by=created_at&sort=desc&per_page=${perPage}&page=${n}`;
+  const notPlanned = (iid: number, fields: Record<string, unknown> = {}) =>
+    rawIssue(iid, { state: 'closed', labels: ['bug', LABELS.notPlanned], ...fields });
+
+  it('pages through the closed issues with ares1:not-planned, with their notes', async () => {
+    const glab = fakeGlab([
+      get(page(1, 3), [
+        notPlanned(30),
+        notPlanned(29, { author: BOB }),
+        // Its label was removed after the page was listed.
+        notPlanned(28, { labels: ['bug'] }),
+      ]),
+      get(page(2, 3), [
+        // Pages overlap when issues are closed meanwhile.
+        notPlanned(29, { author: BOB }),
+        notPlanned(27, { author: CAROL }),
+        notPlanned(26),
+      ]),
+      get(notesPath(30), [note(1, BOB, 'not now')]),
+      get(notesPath(29), []),
+      get(notesPath(27), [note(2, ALICE, 'no', { system: true })]),
+      get(membersPath([1, 2, 3]), [member(ALICE, 40)]),
+    ]);
+    const issues = await new GlabCli(glab.bin).listNotPlannedIssues('acme/widgets', { limit: 3 });
+    expect(issues.map((i) => [i.number, i.state, i.stateReason, i.author, i.trusted])).toEqual([
+      [30, 'closed', 'not_planned', 'alice', true],
+      [29, 'closed', 'not_planned', 'bob', false],
+      [27, 'closed', 'not_planned', 'carol', false],
+    ]);
+    expect(issues.map((i) => i.comments)).toEqual([
+      [{ body: 'not now', author: 'bob', trusted: false, role: 'NONE' }],
+      [],
+      [],
+    ]);
+    // The notes of the issues past the limit are not read.
+    expect(paths(glab.calls())).toEqual([
+      `GET ${page(1, 3)}`,
+      `GET ${page(2, 3)}`,
+      `GET ${notesPath(30)}`,
+      `GET ${notesPath(29)}`,
+      `GET ${notesPath(27)}`,
+      `GET ${membersPath([1, 2, 3])}`,
+    ]);
+  });
+
+  it('stops at a short page, and one page past what the limit needs', async () => {
+    const glab = fakeGlab([
+      get(page(1, 5), [notPlanned(9), notPlanned(8)]),
+      // A server that ignores the page, listing an issue reopened since.
+      get(page(1, 2), [notPlanned(5), notPlanned(4, { state: 'opened' })]),
+      get(page(2, 2), [notPlanned(5), notPlanned(4, { state: 'opened' })]),
+      get(notesPath(9), []),
+      get(notesPath(8), []),
+      get(notesPath(5), []),
+      get(membersPath([1]), [member(ALICE, 10)]),
+    ]);
+    const cli = new GlabCli(glab.bin);
+    expect(
+      (await cli.listNotPlannedIssues('acme/widgets', { limit: 5 })).map((i) => i.number),
+    ).toEqual([9, 8]);
+    expect(
+      (await cli.listNotPlannedIssues('acme/widgets', { limit: 2 })).map((i) => i.number),
+    ).toEqual([5]);
+    expect(paths(glab.calls())).toEqual([
+      `GET ${page(1, 5)}`,
+      `GET ${notesPath(9)}`,
+      `GET ${notesPath(8)}`,
+      `GET ${membersPath([1])}`,
+      `GET ${page(1, 2)}`,
+      `GET ${page(2, 2)}`,
+      `GET ${notesPath(5)}`,
+    ]);
+  });
+
+  it('asks nothing for none', async () => {
+    const glab = fakeGlab([]);
+    const cli = new GlabCli(glab.bin);
+    expect(await cli.listNotPlannedIssues('acme/widgets', { limit: 0 })).toEqual([]);
+    expect(await cli.listNotPlannedIssues('acme/widgets', { limit: -1 })).toEqual([]);
+    expect(glab.calls()).toEqual([]);
+  });
+});
+
+describe('GlabCli trust', () => {
+  it('trusts active members from Developer up, and nobody else but the Master', async () => {
+    const guest = user(11, 'guest');
+    const planner = user(12, 'planner');
+    const reporter = user(13, 'reporter');
+    const minimal = user(14, 'minimal');
+    const stranger = user(15, 'stranger');
+    const awaiting = user(16, 'awaiting');
+    const blocked = user(17, 'blocked');
+    const developer = user(18, 'developer');
+    const maintainer = user(19, 'maintainer');
+    const owner = user(20, 'owner');
+    const inherited = user(21, 'inherited');
+    const bot = user(22, 'ares1-bot');
+    const authors = [
+      guest,
+      planner,
+      reporter,
+      minimal,
+      stranger,
+      awaiting,
+      blocked,
+      null,
+      developer,
+      maintainer,
+      owner,
+      inherited,
+      bot,
+    ];
+    const glab = fakeGlab([
+      get(
+        notesPath(7),
+        authors.map((a, i) => note(i + 1, a, `by ${a?.username ?? 'nobody'}`)).reverse(),
+      ),
+      get(membersPath([11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]), [
+        member(owner, 50),
+        member(guest, 10),
+        member(planner, 15),
+        member(reporter, 20),
+        member(minimal, 5),
+        member(awaiting, 30, { membership_state: 'awaiting' }),
+        member(blocked, 40, { state: 'blocked' }),
+        member(developer, 30),
+        member(maintainer, 40),
+        // Listed by each of the groups it is a member of.
+        member(inherited, 10),
+        member(inherited, 30),
+        member(bot, 10),
+        // Somebody it did not ask about counts for nothing.
+        member(user(99, 'other'), 50),
+      ]),
+    ]);
+    const comments = await new GlabCli(glab.bin).listComments('acme/widgets', 7);
+    expect(comments.map((c) => [c.author, c.role, c.trusted])).toEqual([
+      ['guest', 'GUEST', false],
+      ['planner', 'PLANNER', false],
+      ['reporter', 'REPORTER', false],
+      ['minimal', 'MINIMAL_ACCESS', false],
+      ['stranger', 'NONE', false],
+      ['awaiting', 'NONE', false],
+      ['blocked', 'NONE', false],
+      [null, 'NONE', false],
+      ['developer', 'DEVELOPER', true],
+      ['maintainer', 'MAINTAINER', true],
+      ['owner', 'OWNER', true],
+      ['inherited', 'DEVELOPER', true],
+      ['ares1-bot', 'GUEST', false],
+    ]);
+    const by = (name: string | null) => {
+      const found = comments.find((c) => c.author === name);
+      if (!found) throw new Error(`no comment by ${name}`);
+      return found;
+    };
+    // The Master's own account is trusted whatever its level; nobody else gains from it.
+    expect(isTrusted(by('ares1-bot'), 'ares1-bot')).toBe(true);
+    expect(isTrusted(by('ares1-bot'), 'Ares1-Bot')).toBe(true);
+    expect(isTrusted(by('ares1-bot'), null)).toBe(false);
+    for (const name of ['guest', 'reporter', 'stranger', 'awaiting', null]) {
+      expect(isTrusted(by(name), 'ares1-bot'), String(name)).toBe(false);
+    }
+    expect(isTrusted(by('developer'), null)).toBe(true);
+  });
+
+  it('asks for the members of a project at most 100 at a time', async () => {
+    const people = Array.from({ length: 150 }, (_, i) => user(i + 1, `user${i + 1}`));
+    const ids = people.map((p) => p.id);
+    const last = user(150, 'user150');
+    const glab = fakeGlab([
+      get(
+        notesPath(7),
+        people.map((p) => note(p.id, p, 'hi')),
+      ),
+      get(
+        membersPath(ids.slice(0, 100)),
+        people.slice(0, 100).flatMap((p) => (p.id % 2 === 0 ? [member(p, 30)] : [])),
+      ),
+      get(membersPath(ids.slice(100)), [member(last, 40)]),
+    ]);
+    const comments = await new GlabCli(glab.bin).listComments('acme/widgets', 7);
+    expect(comments).toHaveLength(150);
+    expect(comments.filter((c) => c.trusted).map((c) => c.author)).toEqual([
+      'user150',
+      ...people
+        .slice(0, 100)
+        .filter((p) => p.id % 2 === 0)
+        .map((p) => p.username)
+        .reverse(),
+    ]);
+    expect(paths(glab.calls())).toEqual([
+      `GET ${notesPath(7)}`,
+      `GET ${membersPath(ids.slice(0, 100))}`,
+      `GET ${membersPath(ids.slice(100))}`,
+    ]);
+  });
+
+  it('keeps what it learned of a member for five minutes, per project', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const start = new Date('2026-01-01T00:00:00Z').getTime();
+    vi.setSystemTime(start);
+    const glab = fakeGlab([
+      get(`${PROJECT}/issues/7`, rawIssue(7), { keep: true }),
+      get(notesPath(7), [note(2, BOB, 'b'), note(1, ALICE, 'a')], { keep: true }),
+      get(`${NESTED_PROJECT}/issues/7`, rawIssue(7)),
+      get(membersPath([1]), [member(ALICE, 30)]),
+      get(membersPath([2]), [member(BOB, 40)]),
+      get(membersPath([1], NESTED_PROJECT), []),
+      get(membersPath([1, 2]), [member(ALICE, 10), member(BOB, 40)]),
+    ]);
+    const cli = new GlabCli(glab.bin);
+    const roles = async () =>
+      (await cli.listComments('acme/widgets', 7)).map((c) => [c.author, c.role, c.trusted]);
+
+    expect((await cli.getIssue('acme/widgets', 7)).role).toBe('DEVELOPER');
+    // Only bob is asked about.
+    expect(await roles()).toEqual([
+      ['alice', 'DEVELOPER', true],
+      ['bob', 'MAINTAINER', true],
+    ]);
+    vi.setSystemTime(start + 4 * 60_000);
+    await cli.getIssue('acme/widgets', 7);
+    await roles();
+    // Another project has members of its own.
+    expect((await cli.getIssue(NESTED, 7)).trusted).toBe(false);
+    vi.setSystemTime(start + 5 * 60_000);
+    // What was learned at the start is too old: both asked about again, together.
+    expect(await roles()).toEqual([
+      ['alice', 'GUEST', false],
+      ['bob', 'MAINTAINER', true],
+    ]);
+    expect(paths(glab.calls()).filter((p) => p.includes('/members/'))).toEqual([
+      `GET ${membersPath([1])}`,
+      `GET ${membersPath([2])}`,
+      `GET ${membersPath([1], NESTED_PROJECT)}`,
+      `GET ${membersPath([1, 2])}`,
+    ]);
+  });
+
+  it('fails when the members cannot be read, never taking the author for no member', async () => {
+    const glab = fakeGlab([
+      get(notesPath(7), [note(1, ALICE, 'a')], { keep: true }),
+      { path: membersPath([1]), stderr: 'glab: 403 Forbidden (HTTP 403)\n', code: 1 },
+      get(membersPath([1]), [{ id: 1, username: 'alice' }]),
+      get(membersPath([1]), [member(ALICE, 30)]),
+    ]);
+    const cli = new GlabCli(glab.bin);
+    expect((await glabError(cli.listComments('acme/widgets', 7))).message).toBe(
+      `glab api ${membersPath([1])} 失败：glab: 403 Forbidden (HTTP 403)`,
+    );
+    expect((await glabError(cli.listComments('acme/widgets', 7))).message).toContain(
+      `glab api ${membersPath([1])} 返回的数据无法识别（0.access_level）：`,
+    );
+    // Nothing was kept of the failures: asked again.
+    expect(await cli.listComments('acme/widgets', 7)).toEqual([
+      { body: 'a', author: 'alice', trusted: true, role: 'DEVELOPER' },
+    ]);
+  });
+});
+
+describe('GlabCli issue failures', () => {
+  it('names the issue it cannot find', async () => {
+    const notFound = { stderr: 'glab: 404 Not found (HTTP 404)\n', code: 1 };
+    const glab = fakeGlab([
+      { path: `${PROJECT}/issues/404`, ...notFound },
+      { path: notesPath(404), ...notFound },
+      { path: `${PROJECT}/issues/404`, method: 'PUT', ...notFound },
+    ]);
+    const cli = new GlabCli(glab.bin);
+    expect((await glabError(cli.getIssue('acme/widgets', 404))).message).toBe(
+      `glab api ${PROJECT}/issues/404 失败：glab: 404 Not found (HTTP 404)`,
+    );
+    expect((await glabError(cli.listComments('acme/widgets', 404))).message).toBe(
+      `glab api ${notesPath(404)} 失败：glab: 404 Not found (HTTP 404)`,
+    );
+    expect((await glabError(cli.close('acme/widgets', 404, 'not_planned'))).message).toBe(
+      `glab api -X PUT ${PROJECT}/issues/404 失败：glab: 404 Not found (HTTP 404)`,
+    );
+  });
+
+  it('names the fields of an issue or a note it cannot read', async () => {
+    const list = `${PROJECT}/issues?state=opened&order_by=created_at&sort=desc&per_page=10`;
+    const glab = fakeGlab([
+      get(`${PROJECT}/issues/7`, { ...rawIssue(7), iid: '7', labels: null }),
+      get(notesPath(7), [note(1, ALICE, 'a', { system: 'no' })]),
+      get(list, { message: '403 Forbidden' }),
+      get(list, [rawIssue(1), { iid: 2 }]),
+    ]);
+    const cli = new GlabCli(glab.bin);
+    expect((await glabError(cli.getIssue('acme/widgets', 7))).message).toContain(
+      `glab api ${PROJECT}/issues/7 返回的数据无法识别（iid, labels）：`,
+    );
+    expect((await glabError(cli.listComments('acme/widgets', 7))).message).toContain(
+      '（0.system）',
+    );
+    const query = { state: 'open', limit: 10 } as const;
+    expect((await glabError(cli.listIssues('acme/widgets', query))).message).toContain('（$）');
+    expect((await glabError(cli.listIssues('acme/widgets', query))).message).toContain(
+      '（1.title, 1.state, 1.labels, 1.web_url）',
+    );
   });
 });
 
