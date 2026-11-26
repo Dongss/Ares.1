@@ -578,7 +578,7 @@ backlog:
 ### 暂时还不支持的
 
 - 自动删掉本地提案更早失败的尝试的工作目录和分支：GitHub 仓库的 issue 重做成功或用完次数后会自动删掉（见「Run 失败后自动重做」），本地提案的还要手动清理。
-- GitLab 仓库的完整支持：`config.yaml` 的 `gitlab.repos` 已经能登记 GitLab 仓库（`issues_repo` 写项目路径，如 `grp/sub/demo`），Master 给 GitLab 单独开一路检查（和 GitHub 的各自轮询、各自记错误），把 `ares1:ready` 的 issue 建成 Run、在 issue 上回写进度（评论同样带隐藏标记、去掉家目录）、完成后关闭 issue，`push: true` 时把目标分支推送到 GitLab；作者对项目的权限在 Developer 及以上才算受信任，否则 Run 先等人确认目标。`GET /api/gitlab` 和 `POST /api/gitlab/poll` 的格式和 `GET /api/github`、`POST /api/github/poll` 相同，`platform` 是 `gitlab`，`host` 是 `gitlab.host`（GitHub 的 `platform` 是 `github`，`host` 为 `null`）。看板上的显示和完整的登记说明还没做完，不支持 MR（`deliver` 只能是 `push`）。
+- GitLab 仓库的完整支持：`config.yaml` 的 `gitlab.repos` 已经能登记 GitLab 仓库（`issues_repo` 写项目路径，如 `grp/sub/demo`），Master 给 GitLab 单独开一路检查（和 GitHub 的各自轮询、各自记错误），把 `ares1:ready` 的 issue 建成 Run、在 issue 上回写进度（评论同样带隐藏标记、去掉家目录）、完成后关闭 issue，`push: true` 时把目标分支推送到 GitLab；作者对项目的权限在 Developer 及以上才算受信任，否则 Run 先等人确认目标。侦察也一样：提案和迭代建成 GitLab 上的 issue（标签、页脚的隐藏标记、迭代 issue 计划里的任务列表都和 GitHub 上相同），侦察的提示词里列的是 GitLab 上已有的 issue，说的也是 GitLab issue；在 `auto_accept` 范围内的自动采纳，迭代整批采纳后子 issue 按依赖开工，全部完成后在迭代 issue 上发总结并关闭；自动侦察的退避按 `gitlab.poll_minutes` 计算。GitLab 仓库的 `scout.completed`、`issue.auto_accepted` 和迭代事件（`iteration.*`）的数据里带 `platform: 'gitlab'`，「有提案等你决定」的通知让你去 GitLab 上采纳或关闭。`GET /api/gitlab` 和 `POST /api/gitlab/poll` 的格式和 `GET /api/github`、`POST /api/github/poll` 相同，`platform` 是 `gitlab`，`host` 是 `gitlab.host`（GitHub 的 `platform` 是 `github`，`host` 为 `null`）。看板上的显示和完整的登记说明还没做完，不支持 MR（`deliver` 只能是 `push`）。
 
 ### 本地提案池的 API
 

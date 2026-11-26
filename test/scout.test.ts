@@ -2516,7 +2516,7 @@ describe('scoutPrompt: the local backlog', () => {
   const envFailure: UpgradeFailure = { ...codeFailure, env: true };
 
   /** The prompts of every kind: splitting or not, L accepted or not, upgrades failed or not. */
-  const prompts = (source: 'github' | 'local' | undefined, issues: string) =>
+  const prompts = (source: 'github' | 'gitlab' | 'local' | undefined, issues: string) =>
     [true, false].flatMap((splits) =>
       [true, false].flatMap((autoAcceptsL) =>
         [null, codeFailure, envFailure].map((upgrade) =>
@@ -2578,6 +2578,28 @@ describe('scoutPrompt: the local backlog', () => {
       expect(prompt).toContain('- 不要和下面已有的 issue 重复，包括已关闭的。');
       expect(prompt).not.toContain('本地提案');
     }
+  });
+
+  it('says a GitLab repo files its proposals and iterations as GitLab issues, in either language', () => {
+    const github = prompts('github', '（无）');
+    const gitlab = prompts('gitlab', '（无）');
+    // The same prompt as GitHub's but for the code host it names.
+    expect(gitlab).toEqual(github.map((p) => p.replaceAll('GitHub', 'GitLab')));
+    for (const prompt of gitlab) {
+      expect(prompt).toContain(
+        '提案会成为 GitLab issue，被采纳后由 Agent 按「编码 → 评审 → 合并」完成。',
+      );
+      expect(prompt).toContain('\n## 已有的 issue\n（无）\n');
+      expect(prompt).not.toContain('GitHub');
+    }
+    expect(gitlab[0]).toContain('迭代会成为一个 GitLab issue，写明目标、完成标准、计划和不做的事');
+
+    setLang('en');
+    const [english] = prompts('gitlab', '(none)');
+    expect(english).toContain('Each proposal becomes a GitLab issue;');
+    expect(english).toContain('An iteration becomes a GitLab issue stating its goal');
+    expect(english).not.toContain('GitHub');
+    expect(english).not.toMatch(/[一-鿿]/);
   });
 
   it('says so in English, with no Chinese left', () => {

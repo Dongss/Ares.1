@@ -596,9 +596,18 @@ describe('proposals waiting for a human', () => {
       runId: null,
       about: 'issues',
     });
+    // A repo of gitlab.repos has its proposals on GitLab.
+    expect(noticeFor(completed({ pending: 2, platform: 'gitlab' }), undefined)).toEqual({
+      kind: 'proposals',
+      title: '有提案等你决定：2 条',
+      body: '这些提案不能自动采纳（太大或超出自动采纳的风险），去 GitLab 上采纳或关闭',
+      runId: null,
+      about: 'issues',
+    });
     // Only when some wait for a human, whatever the source.
     expect(noticeFor(completed({ pending: 0, auto: 3, backlog: true }), undefined)).toBeNull();
     expect(noticeFor(completed({ pending: 0, auto: 3 }), undefined)).toBeNull();
+    expect(noticeFor(completed({ pending: 0, auto: 3, platform: 'gitlab' }), undefined)).toBeNull();
   });
 
   it('is told in English without Chinese', () => {
@@ -611,6 +620,15 @@ describe('proposals waiting for a human', () => {
     });
     expect(notice?.body).toContain("accept or reject them on the dashboard's Issues page");
     expect(`${notice?.title}\n${notice?.body}`).not.toMatch(/[一-鿿]/);
+    for (const [platform, host] of [
+      [undefined, 'GitHub'],
+      ['gitlab', 'GitLab'],
+    ] as const) {
+      const onHost = noticeFor(completed({ pending: 2, platform }), undefined);
+      expect(onHost?.body).toBe(
+        `These proposals cannot be accepted automatically (too large or above the auto-accept risk); accept or close them on ${host}`,
+      );
+    }
   });
 });
 

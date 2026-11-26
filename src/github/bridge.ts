@@ -572,8 +572,9 @@ class BridgePlatform {
   }
 
   /**
-   * The data of a `github.*` event the bridge records, with `platform: 'gitlab'` on GitLab, so
-   * that the dashboard and the notifications tell the two apart; GitHub's go without, as before.
+   * The data of an event the bridge records about the platform or an issue on it (`github.*`,
+   * `issue.auto_accepted`), with `platform: 'gitlab'` on GitLab, so that the dashboard and the
+   * notifications tell the two apart; GitHub's go without, as before.
    */
   eventData(data: Record<string, unknown>): Record<string, unknown> {
     return this.platform === 'gitlab' ? { ...data, platform: 'gitlab' } : data;
@@ -697,8 +698,12 @@ export class IssueBridge {
     if (e.type === 'master.working' && e.data.on === true) void this.poll();
   };
 
+  /** The platform's issues as where the scouts' proposals go (`newScoutSource`). */
+  private readonly scoutSource: ProposalSource<HostRepoConfig>;
+
   constructor(private readonly deps: BridgeDeps) {
     this.platform = new BridgePlatform(deps.platform ?? 'github', deps.config, deps.host);
+    this.scoutSource = this.newScoutSource();
   }
 
   private get cfg() {
@@ -1256,7 +1261,11 @@ export class IssueBridge {
       proposal.issue.auto = true;
       this.deps.store.tx(() => {
         this.deps.store.updateScout(scout.id, { proposals: scout.proposals });
-        this.deps.store.event(null, 'issue.auto_accepted', { repo: name, issue: issue.number });
+        this.deps.store.event(
+          null,
+          'issue.auto_accepted',
+          this.platform.eventData({ repo: name, issue: issue.number }),
+        );
       });
     }
   }
@@ -2596,37 +2605,40 @@ export class IssueBridge {
   /**
    * The platform's issues as where the scouts' proposals go: each proposal becomes an issue
    * labeled ares1:proposal, and the scout is shown the repo's issues by people the Master trusts.
-   * Its kind is 'github' on GitLab too: it only tells issues from local proposals in the prompt.
+   * Its kind is the platform, which the prompt and the scout's events name. Made once, by the
+   * constructor, once the platform is known.
    */
-  private readonly scoutSource: ProposalSource<HostRepoConfig> = {
-    kind: 'github',
-    configPath: (name) => this.platform.configPath(name),
-    pollMinutes: () => this.pollMinutes,
-    prepareScout: async (repo, cfg) => {
-      const full = await this.issuesRepo(repo, cfg);
-      await this.ensureLabels(full);
-      return full;
-    },
-    known: (scout, repo) => this.knownIssues(scout, repo),
-    file: (scout, repo, cfg, proposals) => this.fileProposals(scout, repo, cfg, proposals),
-    fileIteration: (scout, repo, cfg, plan) => this.fileIteration(scout, repo, cfg, plan),
-    adjustIteration: (scout, repo, _cfg, iteration, update) =>
-      this.adjustIteration(scout, repo, iteration, update),
-    // The auto-accepted issues are labeled ares1:ready: take them at once.
-    completed: (_repo, filed) => {
-      if (filed.auto > 0 || filed.iteration?.auto) void this.poll();
-    },
-    holdingProposals: async (repo, cfg, scouts) => {
-      const full = await this.issuesRepo(repo, cfg);
-      const open = await this.host().listIssues(full, {
-        state: 'open',
-        label: LABELS.proposal,
-        limit: 100,
-      });
-      const iterations = this.hostIterations(repo, full);
-      return proposalsHoldingScout(open, scouts, cfg.auto_accept, iterations).length;
-    },
-  };
+  private newScoutSource(): ProposalSource<HostRepoConfig> {
+    return {
+      kind: this.platform.platform,
+      configPath: (name) => this.platform.configPath(name),
+      pollMinutes: () => this.pollMinutes,
+      prepareScout: async (repo, cfg) => {
+        const full = await this.issuesRepo(repo, cfg);
+        await this.ensureLabels(full);
+        return full;
+      },
+      known: (scout, repo) => this.knownIssues(scout, repo),
+      file: (scout, repo, cfg, proposals) => this.fileProposals(scout, repo, cfg, proposals),
+      fileIteration: (scout, repo, cfg, plan) => this.fileIteration(scout, repo, cfg, plan),
+      adjustIteration: (scout, repo, _cfg, iteration, update) =>
+        this.adjustIteration(scout, repo, iteration, update),
+      // The auto-accepted issues are labeled ares1:ready: take them at once.
+      completed: (_repo, filed) => {
+        if (filed.auto > 0 || filed.iteration?.auto) void this.poll();
+      },
+      holdingProposals: async (repo, cfg, scouts) => {
+        const full = await this.issuesRepo(repo, cfg);
+        const open = await this.host().listIssues(full, {
+          state: 'open',
+          label: LABELS.proposal,
+          limit: 100,
+        });
+        const iterations = this.hostIterations(repo, full);
+        return proposalsHoldingScout(open, scouts, cfg.auto_accept, iterations).length;
+      },
+    };
+  }
 
   /**
    * The repo's issues for the scout's prompt: open ones, the latest closed, and the ones closed
@@ -2695,10 +2707,11 @@ export class IssueBridge {
         });
         p.issue = { ...issue, auto };
         if (auto) {
-          this.deps.store.event(null, 'issue.auto_accepted', {
-            repo: repo.name,
-            issue: issue.number,
-          });
+          this.deps.store.event(
+            null,
+            'issue.auto_accepted',
+            this.platform.eventData({ repo: repo.name, issue: issue.number }),
+          );
         }
       } catch (err) {
         p.error = errorMessage(err);

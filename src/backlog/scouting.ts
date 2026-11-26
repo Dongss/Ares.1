@@ -190,11 +190,14 @@ export interface FiledIteration {
 }
 
 /**
- * Where a repo's requirements come from, as the scout sees it: GitHub issues or the local
- * backlog. `C` is the repo's settings there.
+ * Where a repo's requirements come from, as the scout sees it: issues on GitHub or GitLab, or the
+ * local backlog. `C` is the repo's settings there.
  */
 export interface ProposalSource<C extends ProposalSourceConfig> {
-  /** Which source it is, for what the scout's prompt says of proposals and requirements. */
+  /**
+   * Which source it is, for what the scout's prompt says of proposals and requirements, and for
+   * the scout's events: where the proposals left for a human are decided.
+   */
   readonly kind: ScoutSource;
   /** Where the repo's settings are in config.yaml, for messages: `github.repos.<name>`. */
   configPath(name: string): string;
@@ -810,7 +813,8 @@ export class Scouting {
           pending: filed.pending,
           // The iteration the scout planned, once written out.
           ...(iteration ? { iteration: { id: iteration.id, auto: iteration.auto } } : {}),
-          // Decided on the dashboard rather than on GitHub (see noticeFor).
+          // Decided on GitLab or on the dashboard rather than on GitHub (see noticeFor).
+          ...(source.kind === 'gitlab' ? { platform: 'gitlab' } : {}),
           ...(source.kind === 'local' ? { backlog: true } : {}),
         });
       });

@@ -340,6 +340,14 @@ function localIterationBlockedNotice(event: EventRow): Notice {
 
 const capitalize = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
+/** Where to decide the proposals a scout left for a human, on the code host its issues are on. */
+function proposalsOnHostText(host: 'GitHub' | 'GitLab'): string {
+  return t({
+    zh: `这些提案不能自动采纳（太大或超出自动采纳的风险），去 ${host} 上采纳或关闭`,
+    en: `These proposals cannot be accepted automatically (too large or above the auto-accept risk); accept or close them on ${host}`,
+  });
+}
+
 /**
  * The notification for an event, or null when nobody has to act. Only things that wait for a
  * human: approvals, stuck or failed Runs, proposals the Master may not accept by itself, an
@@ -375,17 +383,15 @@ export function noticeFor(event: EventRow, goal: string | undefined): Notice | n
       return {
         kind: 'proposals',
         title: titleOf('proposals', t({ zh: `${pending} 条`, en: String(pending) })),
-        // A repo of the local backlog has its proposals in the Master, not on GitHub.
+        // A repo of the local backlog has its proposals in the Master; a repo of gitlab.repos has
+        // them on GitLab (`platform`), the others on GitHub.
         body:
           event.data.backlog === true
             ? t({
                 zh: '这些提案没有自动采纳（太大、超出自动采纳的风险，或今天的自动采纳额度用完了），去看板的需求页上采纳或拒绝',
                 en: "These proposals were not accepted automatically (too large, above the auto-accept risk, or past today's auto-accept limit); accept or reject them on the dashboard's Issues page",
               })
-            : t({
-                zh: '这些提案不能自动采纳（太大或超出自动采纳的风险），去 GitHub 上采纳或关闭',
-                en: 'These proposals cannot be accepted automatically (too large or above the auto-accept risk); accept or close them on GitHub',
-              }),
+            : proposalsOnHostText(event.data.platform === 'gitlab' ? 'GitLab' : 'GitHub'),
         runId: null,
         about: 'issues',
       };

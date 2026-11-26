@@ -2098,11 +2098,14 @@ export function proposalsHoldingScout(
 }
 
 /**
- * Where a repo's requirements are, as the scout's prompt says it: GitHub issues, or the local
- * backlog of a repo without GitHub (backlog.repos), where proposals stay in the Master and are
- * accepted on the dashboard.
+ * Where a repo's requirements are, as the scout's prompt says it: issues on GitHub or GitLab, or
+ * the local backlog of a repo on neither (backlog.repos), where proposals stay in the Master and
+ * are accepted on the dashboard.
  */
-export type ScoutSource = 'github' | 'local';
+export type ScoutSource = 'github' | 'gitlab' | 'local';
+
+/** The code host a source's issues are on, as people know it; the same in every language. */
+const hostName = (source: ScoutSource) => (source === 'gitlab' ? 'GitLab' : 'GitHub');
 
 interface ScoutPromptInput {
   repoName: string;
@@ -2111,7 +2114,10 @@ interface ScoutPromptInput {
   /** At most this many proposals outside an iteration (`max_proposals`). */
   max: number;
   runs: string;
-  /** The requirements there are: `issueDigest` on GitHub, `localProposalDigest` otherwise. */
+  /**
+   * The requirements there are: `issueDigest` on GitHub or GitLab, `localProposalDigest`
+   * otherwise.
+   */
   issues: string;
   /**
    * Whether the repo's template splits an L requirement into steps done in one Run
@@ -2298,8 +2304,9 @@ function stepSizeText(splits: boolean): string {
 }
 
 // The parts of the prompt that depend on where the repo's requirements are (`ScoutSource`): on
-// GitHub, proposals become issues and the requirements there are are issues, open or closed; in
-// the local backlog, proposals stay in the Master, waiting for a human, accepted or rejected.
+// GitHub or GitLab, proposals become issues and the requirements there are are issues, open or
+// closed; in the local backlog, proposals stay in the Master, waiting for a human, accepted or
+// rejected.
 
 /** What becomes of a proposal. */
 function proposalFate(source: ScoutSource): string {
@@ -2309,8 +2316,8 @@ function proposalFate(source: ScoutSource): string {
         en: `Each proposal goes into the Master's local backlog; once accepted on the dashboard (or under the auto-accept setting), agents carry it out through "code → review → merge".`,
       })
     : t({
-        zh: '提案会成为 GitHub issue，被采纳后由 Agent 按「编码 → 评审 → 合并」完成。',
-        en: 'Each proposal becomes a GitHub issue; once accepted, agents carry it out through "code → review → merge".',
+        zh: `提案会成为 ${hostName(source)} issue，被采纳后由 Agent 按「编码 → 评审 → 合并」完成。`,
+        en: `Each proposal becomes a ${hostName(source)} issue; once accepted, agents carry it out through "code → review → merge".`,
       });
 }
 
@@ -2335,8 +2342,8 @@ function iterationFate(source: ScoutSource): string {
         en: "An iteration goes into the Master's local backlog, each of its steps as a proposal of its own; it is accepted as a whole on the dashboard (or under the auto-accept setting), its steps start in the order of their dependencies, and once all of them are done the Master writes a summary.",
       })
     : t({
-        zh: '迭代会成为一个 GitHub issue，写明目标、完成标准、计划和不做的事，它的每个子项各成为一个 issue；迭代整个一起采纳，子项按依赖顺序开工，全部完成后 Master 发一份总结。',
-        en: 'An iteration becomes a GitHub issue stating its goal, completion criteria, plan and what it leaves out, and each of its steps becomes an issue of its own; the iteration is accepted as a whole, its steps start in the order of their dependencies, and once all of them are done the Master posts a summary.',
+        zh: `迭代会成为一个 ${hostName(source)} issue，写明目标、完成标准、计划和不做的事，它的每个子项各成为一个 issue；迭代整个一起采纳，子项按依赖顺序开工，全部完成后 Master 发一份总结。`,
+        en: `An iteration becomes a ${hostName(source)} issue stating its goal, completion criteria, plan and what it leaves out, and each of its steps becomes an issue of its own; the iteration is accepted as a whole, its steps start in the order of their dependencies, and once all of them are done the Master posts a summary.`,
       });
 }
 
