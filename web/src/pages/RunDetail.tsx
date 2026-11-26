@@ -31,6 +31,7 @@ import {
   agentOptionLabel,
   attemptAgentLabel,
   BLOCK_KIND,
+  blockKindText,
   FAIL_REASON,
   formatAttemptCost,
   formatCost,
@@ -64,6 +65,7 @@ import {
   latestPrRework,
   maxRunsWaitText,
   prCancelHint,
+  prRetryHint,
   prReworkNote,
   prSummary,
   prWaitText,
@@ -422,7 +424,11 @@ function RunActions(props: {
         <DiscussionPanel detail={props.detail} onChanged={props.onChanged} />
       )}
       {run.status === 'blocked' && run.blocked?.kind === 'untrusted_issue' && (
-        <ConfirmGoalPanel detail={props.detail} onChanged={props.onChanged} />
+        <ConfirmGoalPanel
+          detail={props.detail}
+          platform={props.platform}
+          onChanged={props.onChanged}
+        />
       )}
       {waitingForPr(run) && (
         <PullRequestPanel detail={props.detail} rework={props.prRework} platform={props.platform} />
@@ -432,7 +438,12 @@ function RunActions(props: {
         run.blocked.kind !== 'discussion' &&
         run.blocked.kind !== 'untrusted_issue' &&
         run.blocked.kind !== 'pr_open' && (
-          <BlockedPanel detail={props.detail} config={props.config} onChanged={props.onChanged} />
+          <BlockedPanel
+            detail={props.detail}
+            config={props.config}
+            platform={props.platform}
+            onChanged={props.onChanged}
+          />
         )}
       {run.status === 'failed' && run.error && <ErrorBox>{run.error}</ErrorBox>}
       {props.detail.redoAt && (
@@ -613,9 +624,13 @@ function ApprovalPanel({ detail, onChanged }: { detail: RunDetail; onChanged: ()
   );
 }
 
-/** What a retry does for each kind of block, in the language in use. */
-function retryHint(kind: BlockKind): string {
-  const hints: Record<BlockKind, Record<'zh' | 'en', string>> = {
+/**
+ * What a retry does for each kind of block, in the language in use; of a pull request in the
+ * words of the code host the Run goes with (`platform`).
+ */
+function retryHint(kind: BlockKind, platform: HostPlatform): string {
+  if (kind === 'pr_open') return prRetryHint(platform);
+  const hints: Record<Exclude<BlockKind, 'pr_open'>, Record<'zh' | 'en', string>> = {
     task_failed: {
       zh: '重试会从这个 Task 开始前的提交重做，返工次数清零。可以换一个 Agent，或补充说明。',
       en: 'Retrying redoes this Task from the commit before it started, with the rework count reset. You can switch to another agent or add a note.',
@@ -663,10 +678,6 @@ function retryHint(kind: BlockKind): string {
     environment: {
       zh: '装好缺的程序，或者让 Master 的 PATH 能找到它（换了 Node 版本就重启 Master）之后，Run 会在约一分钟内自动接着做，Master 重启后也会，不用重试；也可以手动重试，立刻再跑一次被卡住的命令（Agent 已经做完的改动保留，只重跑检查；Agent 报告没做完的，这个 Task 从开始前的提交重新执行）。这不消耗返工和重做次数。',
       en: 'Once the missing program is installed or the Master’s PATH finds it (restart the Master after switching Node versions), the Run goes on by itself within about a minute, and after a restart; no retry needed. You can also retry by hand to run the blocked commands again at once (work the agent already did is kept, and only the checks run again; if the agent reported its task incomplete, the task starts over from the commit before it). No rework or redo is used up.',
-    },
-    pr_open: {
-      zh: '不能重试：PR（GitLab 上是 MR）合并后 Run 会完成；没合并就关掉，Run 会结束为失败。',
-      en: 'No retry here: merge the pull request (the merge request on GitLab) and the Run completes; close it unmerged and the Run ends as failed.',
     },
     error: {
       zh: '重试会从出错的 Task 开始前的提交重做。',
@@ -750,7 +761,16 @@ function DiscussionPanel({ detail, onChanged }: { detail: RunDetail; onChanged: 
  * The Run's goal was written by someone the Master does not trust: nothing runs until a human
  * read it and confirmed it can go to the agents (POST /retry). Cancelling is in the controls.
  */
-function ConfirmGoalPanel({ detail, onChanged }: { detail: RunDetail; onChanged: () => void }) {
+function ConfirmGoalPanel({
+  detail,
+  platform,
+  onChanged,
+}: {
+  detail: RunDetail;
+  /** The code host the Run goes with (`runPlatform`). */
+  platform: HostPlatform;
+  onChanged: () => void;
+}) {
   const { run } = detail;
   const action = useAction();
   if (!run.blocked) return null;
@@ -761,7 +781,7 @@ function ConfirmGoalPanel({ detail, onChanged }: { detail: RunDetail; onChanged:
     <div className="panel panel-attention">
       <h2>{BLOCK_KIND.untrusted_issue}</h2>
       <Pre>{run.blocked.message}</Pre>
-      <p className="hint">{retryHint('untrusted_issue')}</p>
+      <p className="hint">{retryHint('untrusted_issue', platform)}</p>
       <div className="form-actions">
         <ConfirmButton
           label={t({ zh: '确认并开始', en: 'Confirm and start' })}
@@ -885,6 +905,8 @@ function AssessmentCard({ detail }: { detail: RunDetail }) {
 function BlockedPanel(props: {
   detail: RunDetail;
   config: ConfigView | undefined;
+  /** The code host the Run goes with (`runPlatform`). */
+  platform: HostPlatform;
   onChanged: () => void;
 }) {
   const { run, tasks } = props.detail;
@@ -919,10 +941,10 @@ function BlockedPanel(props: {
         {t({ zh: '卡住了：', en: 'Blocked: ' })}
         {info.kind === 'environment' && info.missing
           ? missingCommandText(info.missing)
-          : BLOCK_KIND[info.kind]}
+          : blockKindText(info.kind, props.platform)}
       </h2>
       <Pre>{info.message}</Pre>
-      <p className="hint">{retryHint(info.kind)}</p>
+      <p className="hint">{retryHint(info.kind, props.platform)}</p>
       {task && (
         <div className="form-row">
           <label className="field">

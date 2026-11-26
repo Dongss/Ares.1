@@ -43,7 +43,10 @@ export function childRuns(
   child: Pick<IterationChild, 'issue' | 'proposalId'>,
 ): Run[] {
   if (iteration.source !== 'local') {
-    return child.issue ? store.runsForIssue(iteration.issuesRepo, child.issue.number) : [];
+    if (!child.issue) return [];
+    const { number } = child.issue;
+    const platform = iteration.source === 'gitlab' ? { platform: 'gitlab' as const } : {};
+    return store.runsForIssue({ repo: iteration.issuesRepo, number, ...platform });
   }
   if (!child.proposalId) return [];
   const p = store.getProposal(child.proposalId);

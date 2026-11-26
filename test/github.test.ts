@@ -2389,7 +2389,7 @@ describe('issues: iterations', () => {
   };
 
   const runOfIssue = (t: Harness, issue: number) => {
-    const run = t.master.store.latestRunForIssue('me/demo', issue);
+    const run = t.master.store.latestRunForIssue({ repo: 'me/demo', number: issue });
     if (!run) throw new Error(`no Run of #${issue}`);
     return run;
   };
@@ -3001,7 +3001,9 @@ stages:
     expect(gh.get(1).comments.at(-1)).toContain('- 补上第 4 步：#5 丁：补上漏掉的迁移');
     // It depends on nothing: the next round starts it beside the first step.
     await t.master.issues.poll();
-    expect(t.master.store.latestRunForIssue('me/demo', 5)?.issue).toMatchObject({ auto: true });
+    expect(t.master.store.latestRunForIssue({ repo: 'me/demo', number: 5 })?.issue).toMatchObject({
+      auto: true,
+    });
   });
 
   it('finishes writing out a change to the plan where GitHub failed, at a later round', async () => {
@@ -3040,7 +3042,7 @@ stages:
     // Written out once: the comment is not posted again.
     expect(gh.get(1).comments.filter((c) => c.includes('### 计划调整'))).toHaveLength(1);
     await t.master.issues.poll();
-    expect(t.master.store.latestRunForIssue('me/demo', 5)).toBeDefined();
+    expect(t.master.store.latestRunForIssue({ repo: 'me/demo', number: 5 })).toBeDefined();
   });
 
   it('drops a change that does not fit the plan, saying why, and still files the problems', async () => {

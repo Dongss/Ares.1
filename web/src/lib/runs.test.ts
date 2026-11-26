@@ -28,6 +28,7 @@ import {
   patchLineClass,
   prCancelHint,
   prName,
+  prRetryHint,
   prReworkNote,
   prReworkReasonText,
   prSummary,
@@ -1473,6 +1474,26 @@ describe('waiting for a merge request on GitLab', () => {
     expect(prCancelHint('github')).toBe(
       '终止后，Master 下次检查 GitHub 时关掉这个 PR 并留言说明（已经合并的不动）。',
     );
+  });
+
+  it('says there is nothing to retry in the words of its code host, not both', () => {
+    expect(prRetryHint('gitlab')).toBe(
+      '不能重试：MR 合并后 Run 会完成；没合并就关掉，Run 会结束为失败。',
+    );
+    expect(prRetryHint('github')).toBe(
+      '不能重试：PR 合并后 Run 会完成；没合并就关掉，Run 会结束为失败。',
+    );
+    setLang('en');
+    try {
+      expect(prRetryHint('gitlab')).toBe(
+        'No retry here: merge the merge request and the Run completes; close it unmerged and the Run ends as failed.',
+      );
+      expect(prRetryHint('github')).toBe(
+        'No retry here: merge the pull request and the Run completes; close it unmerged and the Run ends as failed.',
+      );
+    } finally {
+      setLang('zh');
+    }
   });
 
   it('sums it up as !N, with a failed pipeline as the reason of a rework', () => {

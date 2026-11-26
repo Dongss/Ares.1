@@ -50,7 +50,7 @@ import { storedRunTimes } from '../engine/times.js';
 import type { ChangeRequest, ChangeRequestStatus, CodeHost, HostIssue } from '../host/code-host.js';
 import { CodeHostFactory, type CodeHostPlatform } from '../host/factory.js';
 import { join as joinList, t } from '../i18n.js';
-import { NotFoundError, type Store } from '../store/store.js';
+import { NotFoundError, type RunIssueKey, type Store } from '../store/store.js';
 import {
   type DiscussionEntry,
   type EventRow,
@@ -573,6 +573,14 @@ class BridgePlatform {
   }
 
   /**
+   * Issue `number` of `repo` on this platform, as the store looks up its Runs: an issue of the
+   * same path and number on the other platform is another issue.
+   */
+  issueRef(repo: string, number: number): RunIssueKey {
+    return { repo, number, ...this.issueFields() };
+  }
+
+  /**
    * The data of an event the bridge records about the platform or an issue on it (`github.*`,
    * `issue.auto_accepted`), with `platform: 'gitlab'` on GitLab, so that the dashboard and the
    * notifications tell the two apart; GitHub's go without, as before.
@@ -1057,7 +1065,7 @@ export class IssueBridge {
       if (this.stopping) return;
       if (listed.labels.includes(LABELS.iteration)) continue;
       let issue = listed;
-      let run = this.deps.store.unfinishedRunForIssue(full, issue.number);
+      let run = this.deps.store.unfinishedRunForIssue(this.platform.issueRef(full, issue.number));
       if (!run) {
         let met = false;
         try {
@@ -1170,7 +1178,7 @@ export class IssueBridge {
   ): Promise<HostIssue> {
     if (hasReviewSuggestions(issue.body)) return issue;
     const store = this.deps.store;
-    if (store.latestRunForIssue(full, issue.number)) return issue;
+    if (store.latestRunForIssue(this.platform.issueRef(full, issue.number))) return issue;
     const iteration = this.hostIterations(repo, full).find((it) =>
       it.children.some((c) => c.closeout && c.issue?.number === issue.number),
     );
@@ -2413,7 +2421,7 @@ export class IssueBridge {
       if (this.stopping) return;
       const prev = failed.issue;
       if (!prev || failed.issueSynced !== 'failed') continue;
-      if (store.latestRunForIssue(prev.repo, prev.number)?.id !== failed.id) {
+      if (store.latestRunForIssue(prev)?.id !== failed.id) {
         // A human started the issue over with ares1:ready meanwhile.
         this.abandonRedo(name, failed, prev, 'restarted');
         continue;
@@ -3072,7 +3080,7 @@ export class IssueBridge {
         continue;
       }
       const number = child.issue.number;
-      const run = store.unfinishedRunForIssue(full, number);
+      const run = store.unfinishedRunForIssue(this.platform.issueRef(full, number));
       const terminated = run
         ? await this.cancelForClosedIteration(run.id, number, own.number)
         : null;

@@ -59,7 +59,7 @@ describe('prompts', () => {
     for (const prompt of Object.values(prompts)) expect(prompt).not.toContain('ares1');
   });
 
-  it('tells every agent that the issue is already in the prompt, not to read it on GitHub', () => {
+  it('tells every agent that the issue is already in the prompt, not to read it on GitHub or GitLab', () => {
     const prompts = {
       task: taskPrompt(ctx(), null, 'full'),
       safeTask: taskPrompt(ctx(), null, 'safe'),
@@ -68,7 +68,7 @@ describe('prompts', () => {
     };
     for (const [name, prompt] of Object.entries(prompts)) {
       expect(prompt, name).toContain(
-        '需求、讨论和 issue 的内容都已经写在这里，不要自己去 GitHub 读 issue 或评论（比如运行 `gh issue view`）。这里没有 GitHub 的登录凭据，这类命令也会失败。',
+        '需求、讨论和 issue 的内容都已经写在这里，不要自己去 GitHub 或 GitLab 读 issue 或评论（比如运行 `gh issue view`、`glab issue view`）。这里没有 GitHub 和 GitLab 的登录凭据，这类命令也会失败。',
       );
     }
     // Neither the coder nor the reviewer commits or pushes.
@@ -129,12 +129,37 @@ describe('prompts', () => {
     expect(clean).not.toContain('冲突的地方');
   });
 
+  it('tells the agent of a Run merging a commit from GitLab that it comes from GitLab', () => {
+    const merge = { ...remoteMerge(['a.ts']), host: 'GitLab' } as const;
+    const prompt = taskPrompt(ctx(), null, 'full', merge);
+    expect(prompt).toContain('这个 Run 要把 GitLab 上 main 的提交 abcdef1 合并进本地的 main');
+    expect(prompt).toContain('本地 main 上的和 GitLab 上的都不能丢');
+    expect(prompt).not.toContain('GitHub 上');
+    setLang('en');
+    try {
+      const en = taskPrompt(ctx(), null, 'full', merge);
+      expect(en).toContain(
+        'This Run merges commit abcdef1 from main on GitLab into the local main',
+      );
+      expect(en).toContain('those of the local main and those from GitLab');
+      expect(en).not.toContain('from GitHub');
+    } finally {
+      setLang('zh');
+    }
+  });
+
   it('names what a merge brings in', () => {
     expect(mergeSubject(targetMerge([]))).toBe('main');
     expect(mergeSubject(remoteMerge([]))).toBe('GitHub 上 main 的提交 abcdef1');
+    expect(mergeSubject({ ...remoteMerge([]), host: 'GitLab' })).toBe(
+      'GitLab 上 main 的提交 abcdef1',
+    );
     setLang('en');
     try {
       expect(mergeSubject(remoteMerge([]))).toBe('commit abcdef1 from main on GitHub');
+      expect(mergeSubject({ ...remoteMerge([]), host: 'GitLab' })).toBe(
+        'commit abcdef1 from main on GitLab',
+      );
     } finally {
       setLang('zh');
     }
@@ -408,7 +433,7 @@ describe('planning prompts', () => {
     expect(prompt).toContain('## 上一次拆分没有完成\n\nJSON 结果不符合约定：tasks: 太少');
     expect(prompt).toContain('Master 运行检查命令（`npm test`），全部通过后单独提交');
     expect(prompt).toContain('需求本来就小时只给一步，不要硬拆。最多 8 步');
-    expect(prompt).toContain('不要自己去 GitHub 读 issue 或评论');
+    expect(prompt).toContain('不要自己去 GitHub 或 GitLab 读 issue 或评论');
     expect(prompt).toContain('{"tasks": [{"title": "这一步的标题"');
     expect(prompt).toContain('title 和 instructions 用中文书写');
     expect(prompt).not.toContain('ares1');
@@ -672,7 +697,7 @@ describe('prompts in English', () => {
     expect(prompts.cleanMergeTask).toContain('This merge has no conflicts');
     for (const name of ['task', 'safeTask', 'review', 'assess'] as const) {
       expect(prompts[name], name).toContain(
-        'do not read issues or comments on GitHub yourself (with `gh issue view`, for example). There are no GitHub credentials here',
+        'do not read issues or comments on GitHub or GitLab yourself (with `gh issue view` or `glab issue view`, for example). There are no GitHub or GitLab credentials here',
       );
     }
     expect(prompts.review).toContain('do not run git commit or git push');

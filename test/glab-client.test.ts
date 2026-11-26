@@ -131,14 +131,16 @@ function get(path: string, data: unknown, more: Partial<Reply> = {}): Reply {
   return { path, stdout: JSON.stringify(data), ...more };
 }
 
-/** The arguments `glab api` gets for a request, as GlabCli builds them. */
+/**
+ * The arguments `glab api` gets for a request, as GlabCli builds them: to `host`, gitlab.com when
+ * not given.
+ */
 function apiArgs(
   method: string,
   path: string,
   opts: { host?: string; body?: boolean } = {},
 ): string[] {
-  const args = ['api', path, '-X', method];
-  if (opts.host) args.push('--hostname', opts.host);
+  const args = ['api', path, '-X', method, '--hostname', opts.host ?? 'gitlab.com'];
   if (opts.body) args.push('-H', 'Content-Type: application/json', '--input', '-');
   return args;
 }
@@ -223,18 +225,43 @@ describe('GlabCli projects and hosts', () => {
     ]);
   });
 
-  it('leaves the host to glab when none is given', async () => {
+  it('talks to gitlab.com when no host is given, as git does, whatever glab defaults to', async () => {
+    // glab's own default host (GITLAB_HOST, its config) may be another GitLab than git's.
+    setEnv('GITLAB_HOST', 'gitlab.example.com');
     const glab = fakeGlab([
-      get(`${PROJECT}/issues/7`, { labels: [] }),
-      { path: `${PROJECT}/issues/7/notes`, method: 'POST' },
+      get(`${PROJECT}/issues/7`, { labels: [] }, { keep: true }),
+      { path: `${PROJECT}/issues/7/notes`, method: 'POST', keep: true },
     ]);
-    const cli = new GlabCli(glab.bin, { host: '' });
-    expect(await cli.getLabels('acme/widgets', 7)).toEqual([]);
-    await cli.comment('acme/widgets', 7, 'hi');
-    expect(glab.calls().map((c) => c.args)).toEqual([
-      apiArgs('GET', `${PROJECT}/issues/7`),
-      apiArgs('POST', `${PROJECT}/issues/7/notes`, { body: true }),
-    ]);
+    for (const cli of [new GlabCli(glab.bin, { host: '' }), new GlabCli(glab.bin)]) {
+      const calls = glab.calls().length;
+      expect(await cli.getLabels('acme/widgets', 7)).toEqual([]);
+      await cli.comment('acme/widgets', 7, 'hi');
+      expect(
+        glab
+          .calls()
+          .slice(calls)
+          .map((c) => c.args),
+      ).toEqual([
+        ['api', `${PROJECT}/issues/7`, '-X', 'GET', '--hostname', 'gitlab.com'],
+        [
+          'api',
+          `${PROJECT}/issues/7/notes`,
+          '-X',
+          'POST',
+          '--hostname',
+          'gitlab.com',
+          '-H',
+          'Content-Type: application/json',
+          '--input',
+          '-',
+        ],
+      ]);
+    }
+    // git goes to the same GitLab.
+    const clone = tmpDir('ares1-clone-');
+    const calls = fakeGit();
+    await glabError(new GlabCli(glab.bin).push(clone, 'acme/widgets', 'main'));
+    expect(calls()[0]?.args).toContain('https://gitlab.com/acme/widgets.git');
   });
 
   it('rejects project paths that are no group/name before calling glab', async () => {
@@ -1788,8 +1815,11 @@ describe('GlabCli getChangeRequest', () => {
       'scheduled',
       'canceling',
       'waiting_for_callback',
+      // A manual job that may not fail (rawJob's allow_failure: false) blocks the pipeline until
+      // somebody plays it.
+      'manual',
     ];
-    const passed = ['success', 'skipped', 'manual'];
+    const passed = ['success', 'skipped'];
     const jobs = [
       ...running.map((s, i) => rawJob(i + 1, s, s)),
       ...passed.map((s, i) => rawJob(i + 20, s, s)),
@@ -1801,6 +1831,9 @@ describe('GlabCli getChangeRequest', () => {
       rawJob(34, 'allowed running', 'running', { allow_failure: true }),
       rawJob(35, 'no link', 'success', { web_url: null }),
       rawJob(36, 'empty link', 'failed', { web_url: '' }),
+      // A manual job that may fail holds nothing up; one GitLab says nothing about may not.
+      rawJob(37, 'allowed manual', 'manual', { allow_failure: true }),
+      rawJob(38, 'unsaid manual', 'manual', { allow_failure: null }),
     ];
     const glab = fakeGlab(mrReplies({ mr: { state: 'merged' }, jobs }));
     const pr = await new GlabCli(glab.bin).getChangeRequest('acme/widgets', 12);
@@ -1827,8 +1860,35 @@ describe('GlabCli getChangeRequest', () => {
       { name: 'allowed running', done: false, failed: false, conclusion: null, url: url(34) },
       { name: 'no link', done: true, failed: false, conclusion: 'success', url: null },
       { name: 'empty link', done: true, failed: true, conclusion: 'failed', url: null },
+      { name: 'allowed manual', done: true, failed: false, conclusion: 'manual', url: url(37) },
+      { name: 'unsaid manual', done: false, failed: false, conclusion: null, url: url(38) },
     ]);
     expect(paths(glab.calls())).toContain(`GET ${jobsPath()}`);
+  });
+
+  it('judges no failure while a blocking manual job waits, and does once only optional ones are left', async () => {
+    const replies = (manual: Record<string, unknown>) =>
+      mrReplies({
+        discussions: [],
+        jobs: [
+          rawJob(1, 'test', 'failed', { failure_reason: 'script_failure' }),
+          rawJob(2, 'deploy', 'manual', manual),
+        ],
+      });
+    const ctx = { ...judged(), platform: 'gitlab' as const };
+    const blocking = await new GlabCli(
+      fakeGlab(replies({ allow_failure: false })).bin,
+    ).getChangeRequest('acme/widgets', 12);
+    // Not finished: GitLab's pipeline waits for somebody to play the deploy.
+    expect(judgePullRequest(blocking, ctx).rework).toBeNull();
+
+    const optional = await new GlabCli(
+      fakeGlab(replies({ allow_failure: true })).bin,
+    ).getChangeRequest('acme/widgets', 12);
+    expect(judgePullRequest(optional, ctx).rework).toMatchObject({
+      kinds: ['ci'],
+      checks: [{ name: 'test' }],
+    });
   });
 
   it('pages through the discussions and the jobs, keeping the latest 100 line comments', async () => {

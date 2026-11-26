@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { parse as parseYaml } from 'yaml';
-import type { ProposalSize, Risk } from '../../../src/config/flow.js';
+import { type ProposalSize, type Risk, repoDeliversByPr } from '../../../src/config/flow.js';
 import { BacklogSchema, GitHubSchema, GitLabSchema } from '../../../src/config/schema.js';
 import { setLang } from '../../../src/i18n.js';
 import {
@@ -421,6 +421,15 @@ describe('how a repo delivers', () => {
     expect(deliveryText({ deliver: 'mr', push: false })).toBe(
       'MR，但没开 push：deliver: mr 要配 push: true，这个仓库现在停用',
     );
+  });
+
+  it('names a change request for exactly the repos repoDeliversByPr says deliver through one', () => {
+    for (const deliver of ['push', 'pr', 'mr'] as const) {
+      for (const push of [true, false]) {
+        const text = deliveryText({ deliver, push });
+        expect(/^(PR|MR)/.test(text), `${deliver} ${push}`).toBe(repoDeliversByPr({ deliver }));
+      }
+    }
   });
 
   it('in English', () => {

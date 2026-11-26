@@ -310,6 +310,19 @@ export function prWaitText(
 }
 
 /**
+ * What a retry does for a Run waiting for its pull request (`pr_open`): nothing, as merging or
+ * closing it on the code host (`platform`, from `runPlatform`) is what moves the Run on; in that
+ * host's words, a merge request on GitLab.
+ */
+export function prRetryHint(platform: HostPlatform): string {
+  const { short, long } = changeRequestTerms(platform);
+  return t({
+    zh: `不能重试：${short} 合并后 Run 会完成；没合并就关掉，Run 会结束为失败。`,
+    en: `No retry here: merge the ${long} and the Run completes; close it unmerged and the Run ends as failed.`,
+  });
+}
+
+/**
  * What the Run detail says, next to its cancel button, of the pull request of a Run waiting for
  * it: the Master closes it at its next check of the code host (`platform`), with a comment, unless
  * it was merged meanwhile.

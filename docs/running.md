@@ -425,7 +425,7 @@ GitLab 仓库按作者对项目的权限判断：Developer 及以上（Developer
 - 去掉 `GITLAB_TOKEN`、`GITLAB_ACCESS_TOKEN`、`OAUTH_TOKEN`、`GLAB_TOKEN`、`CI_JOB_TOKEN`、`GITLAB_PRIVATE_TOKEN`、`GITLAB_OAUTH_TOKEN`（glab 和 python-gitlab 等工具从这些变量读 token），再把 `GITLAB_TOKEN` 设成一个无效的值 `ares1-agent-no-gitlab-access`。glab 优先用 `GITLAB_TOKEN`，GitLab 会拒绝它，glab 也就不会退回去用存在 `~/.config/glab-cli` 里的登录。`GITLAB_HOST` 这类只说明连哪个 GitLab 的变量不是凭据，照常保留。
 - git 的凭据助手（钥匙串、gh 等）全部清掉，去掉 `GIT_ASKPASS`、`SSH_ASKPASS`，并设置 `GIT_TERMINAL_PROMPT=0`：通过 https 访问需要登录的仓库（GitHub、GitLab 都一样）会直接失败，不会弹出要密码的提示。
 - 其他环境变量原样保留，包括 `PATH`、`HOME`，以及 Claude Code、cursor-agent 和 Codex CLI 自己的登录信息（比如 `CODEX_HOME`、`OPENAI_API_KEY`）。
-- 给 Agent 的提示词也写明：需求、讨论和 issue 的内容都已经在提示词里，不要自己去 GitHub 读。
+- 给 Agent 的提示词也写明：需求、讨论和 issue 的内容都已经在提示词里，不要自己去 GitHub 或 GitLab 读（`gh issue view`、`glab issue view` 这类命令在这里也拿不到凭据）。
 
 副作用：准备命令和检查命令里需要 GitHub 或 GitLab 凭据的操作会失败，比如通过 https 安装 GitHub、GitLab 上的私有依赖，在测试里调用需要登录的 GitHub 或 GitLab API。
 
@@ -470,7 +470,7 @@ GitLab 仓库按作者对项目的权限判断：Developer 及以上（Developer
 
 ### gitlab 段的字段
 
-- `host`：GitLab 的主机名，默认 `gitlab.com`。自建的写它自己的主机名，有端口时带上端口（如 `gitlab.example.com:8443`），不带 `https://`；格式不对时 `config.yaml` 校验不通过。Master 调用 `glab api` 时带上 `--hostname <host>`，推送和拉取也连这个主机，所以它要和 `glab auth login --hostname` 登录的主机一致。
+- `host`：GitLab 的主机名，默认 `gitlab.com`。自建的写它自己的主机名，有端口时带上端口（如 `gitlab.example.com:8443`），不带 `https://`；格式不对时 `config.yaml` 校验不通过。Master 调用 `glab api` 时带上 `--hostname <host>`，推送和拉取也连这个主机，所以它要和 `glab auth login --hostname` 登录的主机一致。不写时两边都连 `gitlab.com`：`glab api` 也明确带上 `--hostname gitlab.com`，不用 glab 自己默认的主机（glab 配置里的或环境变量 `GITLAB_HOST` 设的），免得读写 issue 和推送、拉取连到两个不同的 GitLab。所以连自建的 GitLab 一定要写 `host`，只设 `GITLAB_HOST` 不行。
 - `account`：可选，Master 在 GitLab 上用的账号名。glab 在每个主机上只记一个登录，也不能换着用别的账号，所以这里选不了账号，只是告诉 Master 它以谁的身份操作：写了就把这个账号当作 Master 自己的（受信任，它写的隐藏标记算 Master 的），要和 `glab auth status` 显示的账号一致；不写时 Master 第一次需要时问 glab 当前登录的是谁。一般不用写。
 - `poll_minutes`：多久检查一次 GitLab，默认 5，可以写小数。GitLab 有自己的定时器，和 `github.poll_minutes` 互不影响；GitLab 仓库失败后的重做等待（见「Run 失败后自动重做」）和自动侦察的退避都按它算。
 - `repos`：键是看板「仓库」页登记的仓库名，必须和那里的一模一样；写在这里但没登记的仓库什么都不做。每个仓库：
@@ -501,8 +501,8 @@ GitLab 仓库按作者对项目的权限判断：Developer 及以上（Developer
 - **合并后**：MR 在 GitLab 上合并了（合并提交、squash、快进合并都算），Master 先把本地目标分支快进到 GitLab 上的提交（记 `github.pulled`），再记 `github.pr_merged` 和 `merge.done`，合并阶段通过，Run 完成，工作目录和分支随之删除；issue 上评论「MR !N 已合并到 `<目标分支>`」。GitLab 只在 MR 合进项目的默认分支、并且项目开着「自动关闭引用的 issue」时才按 `Closes #N` 关 issue，所以 issue 还开着时 Master 自己按完成关闭它（不加 `ares1:not-planned`）。本地目标分支暂时快进不了时（检出的地方有未提交的改动等），Run 接着等，下一轮再试。
 - **没合并就被关掉**：Run 结束为失败，记 `github.pr_closed`，按「Run 失败了」通知；从 issue 来的按「Run 失败后自动重做」处理，重做的 Run 用自己的分支开新的 MR，被关掉的 MR 保持关闭。
 - **返工**：MR 还开着时，Master 每轮检查（Run 状态变化后的同步也会）向 GitLab 查一遍 MR，只看 MR 当前的 head 提交，而且它要是 Run 推送上去的那个。下面三种情况任何一种出现，Run 就带着反馈回到合并阶段 `on_fail` 指向的阶段（默认是编码），和别的回退一样计入 `max_loops`，用完后按 `on_exhausted` 处理；一轮里出现几种时只返工一次，反馈里每种都写上；同一个 head 上的同一类问题只返工一次：
-  - 要求修改：MR 的评审人里有受信任的人（项目的 Developer 及以上，从组继承来的也算，以及 Master 自己用的账号）提交评审时选了「要求修改」（Request changes），评审人的状态是要求修改。GitLab 不记这个状态是在哪个提交上设的，Master 把它当作对当前 head 的：同一个 head 上只返工一次；返工后推送了新的 head，评审人的状态还是要求修改时会再返工一次；状态不再是要求修改（比如他批准了，或者 MR 的作者重新请求了评审）之后不再触发。反馈里有这些评审人，以及受信任的人在当前 head 上留下、还没解决的行内讨论（`文件:行` 和内容）。只有没解决的讨论、没有评审人要求修改时不触发返工。不受信任的人（Reporter、Guest、不是成员的人等）要求修改不触发返工，他们写的内容也不进提示词，只记一条 `github.pr_review_ignored`，`association` 是他在项目里的权限名（比如 `REPORTER`，不是成员时是 `NONE`）；同一个 head 上同一个人只记一次。
-  - 流水线没通过：MR 的 head 流水线（合并结果流水线也算）的 job 全部结束，并且至少一个失败或被取消。允许失败（`allow_failure`）的 job 失败了不算；等人手动触发的 job 和跳过的 job 算已结束、没失败；重试过的 job 只看最近一次。还有 job 在跑时等下一轮再看；没有流水线（项目没配 CI，或者 Master 的账号看不到流水线）时不触发。反馈里有每个失败 job 的名称、状态和链接，打不开日志时让 Agent 在工作目录里运行相应的命令复现。
+  - 要求修改：MR 的评审人里有受信任的人（项目的 Developer 及以上，从组继承来的也算，以及 Master 自己用的账号）提交评审时选了「要求修改」（Request changes），评审人的状态是要求修改。GitLab 不记这个状态是在哪个提交上设的，Master 把它当作对当前 head 的：同一个 head 上只返工一次；返工后推送了新的 head，评审人的状态还是要求修改时会再返工一次，所以评审人一直不改状态时，每推一个新 head 都会再返工一次，直到用完 `max_loops`；状态不再是要求修改（比如他批准了，或者 MR 的作者重新请求了评审）之后不再触发。反馈里有这些评审人，以及受信任的人在当前 head 上留下、还没解决的行内讨论（`文件:行` 和内容）。只有没解决的讨论、没有评审人要求修改时不触发返工。不受信任的人（Reporter、Guest、不是成员的人等）要求修改不触发返工，他们写的内容也不进提示词，只记一条 `github.pr_review_ignored`，`association` 是他在项目里的权限名（比如 `REPORTER`，不是成员时是 `NONE`）；同一个 head 上同一个人只记一次。
+  - 流水线没通过：MR 的 head 流水线（合并结果流水线也算）的 job 全部结束，并且至少一个失败或被取消。允许失败（`allow_failure`）的 job 失败了不算；跳过的 job 算已结束、没失败；等人手动触发的 job 看它是否允许失败：允许失败的（不写在 `rules` 里的 `when: manual` 默认如此）不挡流水线，算已结束、没失败；不允许失败的会卡住流水线，有人触发并跑完之前算还在跑，所以这时别的 job 失败了也要等它结束才返工；重试过的 job 只看最近一次。还有 job 在跑时等下一轮再看；没有流水线（项目没配 CI，或者 Master 的账号看不到流水线）时不触发。反馈里有每个失败 job 的名称、状态和链接，打不开日志时让 Agent 在工作目录里运行相应的命令复现。
   - 和目标分支冲突：GitLab 说 MR 有冲突（`has_conflicts`，或者 `detailed_merge_status` 是 `conflict`、`broken_status`）才算；GitLab 还在计算（`checking`、`unchecked` 等）时等下一轮再看。只是在等审批、等流水线的不算冲突。有冲突、回到的又是 Agent 阶段时，那一轮先合并目标分支、解决冲突。
   - 返工时合并阶段这一轮记为没通过（加一条 `merge` 检查，写明「MR !N 需要返工」和原因），记 `github.pr_rework`，issue 上评论「MR !N 需要返工：原因」（原因写冲突、没通过的 job 的名称和要求修改的人），说明改好后推送到同一个 MR；Run 回到队列后，issue 的标签由 `ares1:needs-you` 换回 `ares1:running`。返工不发通知，回退用完后停下来等人或失败时照常通知。
 - **推送到同一个 MR**：返工期间 Run 的 `pr` 不变。Run 改完、再次走到合并阶段并等 MR 合并时，Master 把 Run 分支强制推送上去，同一个 MR 随之更新，不开第二个；记 `github.pr_updated`，issue 上评论「返工后的提交已推送到 MR !N」。人直接推到 GitLab 上 Run 分支的提交会被覆盖，要改请在 MR 上要求修改、让 Run 返工。返工期间 MR 被关掉或合并了的，Run 再次等 MR 合并时不推送，按 MR 的状态失败或完成。
@@ -930,7 +930,7 @@ Run 等审批或卡住等人时不算在正在执行的 Run 里，同一仓库�
 - 冲突反复出现时，和别的回退一样受 `max_loops` 限制，用完后按 `on_exhausted` 处理（默认 Run 结束、标为失败）。
 - 合并阶段的 `on_fail` 指向的不是 Agent 阶段（比如评审阶段，它不能改文件）时，没有 Agent 能解决冲突，Run 不等人，直接结束、标为失败，`error` 里列出冲突的文件；从 issue 来的按 `max_run_attempts` 自动重做（见下面的「Run 什么时候停下来等人」）。重做在目标分支的最新代码上新建工作目录，编码 Agent 从一开始就基于最新代码改，原来的冲突也就没了。加载模板时会对这种设置给出警告；想让 Agent 解决冲突，就把 `on_fail` 指向一个 Agent 阶段。
 - git 合并因为冲突以外的原因失败时（git 锁、磁盘满、索引损坏等，git 没报出冲突的文件），没有冲突可解决，Run 结束、标为失败，从 issue 来的按 `max_run_attempts` 自动重做（见下面的「Run 什么时候停下来等人」）。
-- 分叉时 Master 建的合并 Run 也用这套做法让 Agent 解决冲突，只是合并的是 GitHub 上的那个提交，而且从第一个会改代码的 Agent 阶段一开始就合并，不用等合并阶段冲突回退，见上面的「交给 Run 合并」。
+- 分叉时 Master 建的合并 Run 也用这套做法让 Agent 解决冲突，只是合并的是 GitHub 上的那个提交（GitLab 仓库是 GitLab 上的，给 Agent 的提示词、合并检查的名称和找不到提交时的报错都写 GitLab），而且从第一个会改代码的 Agent 阶段一开始就合并，不用等合并阶段冲突回退，见上面的「交给 Run 合并」。
 
 ## Run 什么时候停下来等人
 

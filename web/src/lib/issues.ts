@@ -8,6 +8,7 @@ import {
   type ProposalSize,
   RISKS,
   type Risk,
+  repoDeliversByPr,
 } from '../../../src/config/flow.js';
 import { join, t } from '../../../src/i18n.js';
 import type {
@@ -239,7 +240,7 @@ export function budgetText(budget: GitHubRepoStatus['budget']): string {
  * without push: true disables the repo, which its configuration problems say too.
  */
 export function deliveryText(repo: Pick<GitHubRepoStatus, 'deliver' | 'push'>): string {
-  if (repo.deliver === 'pr' || repo.deliver === 'mr') {
+  if (repoDeliversByPr(repo)) {
     const { host, short, long, longCapital, deliver } = changeRequestTerms(
       repo.deliver === 'mr' ? 'gitlab' : 'github',
     );

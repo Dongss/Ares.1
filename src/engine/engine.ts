@@ -1680,7 +1680,7 @@ export class Engine {
     const issue = this.store.getRun(keptRunId).issue;
     if (!issue) return;
     const why = { reason: 'retries_exhausted', keptRun: keptRunId } as const;
-    const failed = this.store.issueRunsWithStatus(issue.repo, issue.number, 'failed');
+    const failed = this.store.issueRunsWithStatus(issue, 'failed');
     const wanted = new Set(earlierRunIds);
     for (const { id: runId } of failed) {
       if (runId === keptRunId || !wanted.has(runId)) continue;
@@ -2730,6 +2730,8 @@ export class Engine {
     if (!wanted) return null;
     const { source, targetHead } = wanted;
     const target = this.store.getRepo(run.repoId).targetBranch;
+    // Where a commit the Run merges from the code host comes from, for the texts that name it.
+    const { host } = this.changeRequestTermsOf(run);
     if (wanted.merging) {
       // The files that conflicted when it started; the agent may have staged some since.
       const recorded = this.store
@@ -2744,7 +2746,7 @@ export class Engine {
         ? recorded.filter((f): f is string => typeof f === 'string')
         : await conflictedFiles(workdir);
       this.checkAbort(signal);
-      return { source, target, targetHead, files, started: false };
+      return { source, target, targetHead, files, host, started: false };
     }
     // Only an agent that gave up the merge itself leaves changes without one: start over.
     if (await hasChanges(workdir)) await resetHard(workdir, 'HEAD');
@@ -2757,7 +2759,7 @@ export class Engine {
       targetHead,
       files,
     });
-    return { source, target, targetHead, files, started: true };
+    return { source, target, targetHead, files, host, started: true };
   }
 
   /**
@@ -4413,7 +4415,7 @@ export class Engine {
    */
   private async removeSupersededWorkspaces(run: Run, signal: AbortSignal): Promise<void> {
     if (!run.issue) return;
-    const failed = this.store.issueRunsWithStatus(run.issue.repo, run.issue.number, 'failed');
+    const failed = this.store.issueRunsWithStatus(run.issue, 'failed');
     for (const earlier of failed) {
       // Shutting down: the rest stay for a human to clean up.
       this.checkAbort(signal);

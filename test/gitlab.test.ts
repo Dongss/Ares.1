@@ -348,6 +348,55 @@ gitlab:
     expect(gitlab.repos[0]?.issuesRepo).toBe('grp/sub/demo');
   });
 
+  it('takes an issue on GitLab apart from one of the same path and number on GitHub', async () => {
+    const gh = new FakeGitHub();
+    // A mirror: the same project path on both platforms, issue #1 on each.
+    const t = await start(
+      `
+github:
+  repos:
+    hub:
+      issues_repo: grp/demo
+      template: dev
+gitlab:
+  repos:
+    demo:
+      issues_repo: grp/demo
+      template: dev
+`,
+      undefined,
+      gh,
+    );
+    t.master.store.createRepo({
+      name: 'hub',
+      path: initRepo(),
+      targetBranch: 'main',
+      verifyCommands: ['grep -q ok feature.txt'],
+      setupCommands: [],
+      mergeMode: 'direct',
+    });
+    gh.add({ title: 'GitHub 上的', labels: [LABELS.ready] });
+    gl.add({ title: 'GitLab 上的', labels: [LABELS.ready] });
+
+    await t.master.issues.poll();
+    await t.master.gitlabIssues.poll();
+    // The GitHub issue's Run does not stand for the GitLab one's: each gets its own.
+    const runs = t.master.store.listRuns();
+    expect(runs).toHaveLength(2);
+    const fromGitHub = runs.find((r) => !r.issue?.platform) as Run;
+    const fromGitLab = runs.find((r) => r.issue?.platform === 'gitlab') as Run;
+    expect(fromGitHub.goal).toContain('GitHub 上的');
+    expect(fromGitLab.goal).toContain('GitLab 上的');
+    expect([fromGitHub.issue?.repo, fromGitHub.issue?.number]).toEqual(['grp/demo', 1]);
+    expect([fromGitLab.issue?.repo, fromGitLab.issue?.number]).toEqual(['grp/demo', 1]);
+
+    // Polled again while both wait at the merge gate, unfinished: still one Run each.
+    for (const run of runs) await t.waitStatus(run.id, 'waiting_approval');
+    await t.master.issues.poll();
+    await t.master.gitlabIssues.poll();
+    expect(t.master.store.listRuns()).toHaveLength(2);
+  });
+
   it('leaves GitLab alone without a gitlab section', async () => {
     const t = await start('language: zh\n');
     await t.master.gitlabIssues.poll();
@@ -716,7 +765,11 @@ describe('gitlab: iterations', () => {
   }
 
   const runOfIssue = (t: Harness, issue: number) => {
-    const run = t.master.store.latestRunForIssue('grp/sub/demo', issue);
+    const run = t.master.store.latestRunForIssue({
+      repo: 'grp/sub/demo',
+      number: issue,
+      platform: 'gitlab',
+    });
     if (!run) throw new Error(`no Run of #${issue}`);
     return run;
   };
@@ -1457,5 +1510,65 @@ gitlab:
     expect(gl.calls).not.toContain('push main');
     expect([...gl.projects]).toEqual(['grp/sub/demo']);
     expect(t.master.gitlabIssues.status().lastError).toBeNull();
+  });
+});
+
+describe('gitlab: a Run that merges a commit from GitLab', () => {
+  const commit = (repoDir: string, content: string, message: string): string => {
+    writeFile(join(repoDir, 'README.md'), content);
+    git(repoDir, 'add', '-A');
+    git(repoDir, 'commit', '-q', '-m', message);
+    return git(repoDir, 'rev-parse', 'HEAD');
+  };
+
+  it('names GitLab, not GitHub, in what it tells the agent and in the merge check', async () => {
+    const prompts: string[] = [];
+    const t = await start();
+    t.scripts.coder = (ctx) => {
+      prompts.push(ctx.input.prompt);
+      writeFile(join(ctx.input.workdir, 'README.md'), '# ours\n# gitlab\n');
+      // For the harness's verify command.
+      writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+      return done('合并了 GitLab 上的提交');
+    };
+    // GitLab's main and the local one changed the same line since they diverged.
+    git(t.repoDir, 'checkout', '-q', '-b', 'gitlab');
+    const remote = commit(t.repoDir, '# gitlab\n', 'on GitLab');
+    git(t.repoDir, 'checkout', '-q', 'main');
+    commit(t.repoDir, '# ours\n', 'local');
+    const run = t.master.engine.createRun({
+      repo: 'demo',
+      template: 'dev',
+      goal: '合并 GitLab 上的提交',
+      overrides: { stages: { merge: { gate: false } } },
+      mergeRemote: remote,
+    });
+    await t.waitStatus(run.id, 'completed');
+
+    const short = remote.slice(0, 7);
+    expect(prompts[0]).toContain(`这个 Run 要把 GitLab 上 main 的提交 ${short} 合并进本地的 main`);
+    expect(prompts[0]).toContain('本地 main 上的和 GitLab 上的都不能丢');
+    expect(prompts[0]).not.toContain('GitHub 上');
+    const checks = t.master.store
+      .listChecks(run.id)
+      .filter((c) => c.kind === 'merge' && c.attemptId !== null);
+    expect(checks.map((c) => [c.name, c.passed])).toEqual([
+      [`合并 GitLab 上 main 的提交 ${short}`, true],
+    ]);
+    expect(git(t.repoDir, 'show', 'main:README.md')).toBe('# ours\n# gitlab');
+  });
+
+  it('names GitLab in the error when the commit is not in the repo', async () => {
+    const t = await start();
+    const missing = '0123456789abcdef0123456789abcdef01234567';
+    const run = t.master.engine.createRun({
+      repo: 'demo',
+      template: 'dev',
+      goal: '合并 GitLab 上的提交',
+      mergeRemote: missing,
+    });
+    const failed = await t.waitStatus(run.id, 'failed');
+    expect(failed.error).toContain(`要合并的 GitLab 上 main 的提交 ${missing} 在仓库里找不到`);
+    expect(failed.error).toContain('请手动合并 GitLab 上的 main');
   });
 });

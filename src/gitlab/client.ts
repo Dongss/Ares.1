@@ -151,7 +151,11 @@ function projectId(repo: string): string {
   return encodeURIComponent(projectPath(repo));
 }
 
-/** The GitLab git talks to when the client is given no host: glab's own default. */
+/**
+ * The GitLab the client talks to when it is given no host, glab and git alike. Named to glab too,
+ * rather than left to glab's default (its config, GITLAB_HOST), which may be another GitLab than
+ * the one git pushes to.
+ */
 const DEFAULT_HOST = 'gitlab.com';
 
 /** A GlabError for a force push of a branch `forcePushable` does not allow. */
@@ -442,8 +446,9 @@ const RawDiscussion = z.object({ notes: z.array(skippable(RawDiffNote)) });
 type JobOutcome = 'running' | 'passed' | 'failed';
 
 /**
- * GitLab's statuses of a job by how it stands. A manual job waiting for somebody to play it
- * counts as done; a canceled one as failed, as its work was not done.
+ * GitLab's statuses of a job by how it stands. A canceled job counts as failed, as its work was
+ * not done. A manual job waiting for somebody to play it is running here; `jobOutcome` tells the
+ * ones that may be left unplayed.
  */
 const JOB_STATUSES: ReadonlyMap<string, JobOutcome> = new Map([
   ['created', 'running'],
@@ -456,7 +461,7 @@ const JOB_STATUSES: ReadonlyMap<string, JobOutcome> = new Map([
   ['waiting_for_callback', 'running'],
   ['success', 'passed'],
   ['skipped', 'passed'],
-  ['manual', 'passed'],
+  ['manual', 'running'],
   ['failed', 'failed'],
   ['canceled', 'failed'],
 ]);
@@ -476,7 +481,7 @@ type RawJob = z.infer<typeof RawJob>;
  * excuses a failure only: a canceled job's work was not done either way.
  */
 function fromRawJob(raw: RawJob): HostCheck {
-  const outcome = JOB_STATUSES.get(raw.status) ?? 'running';
+  const outcome = jobOutcome(raw);
   const done = outcome !== 'running';
   const allowed = raw.status === 'failed' && raw.allow_failure === true;
   return {
@@ -486,6 +491,19 @@ function fromRawJob(raw: RawJob): HostCheck {
     conclusion: done ? raw.status : null,
     url: raw.web_url || null,
   };
+}
+
+/**
+ * How a job stands, by its status (`JOB_STATUSES`). A manual job that may fail (allow_failure,
+ * as a `when: manual` job outside `rules` is by default) holds nothing up: the pipeline goes on
+ * and finishes without it, so it counts as passed. A blocking one holds the pipeline up until
+ * somebody plays it, so it is still running, never passed: taking it for passed would have the
+ * Master think the CI passed when GitLab does not. A manual job GitLab does not say may fail is
+ * taken for a blocking one.
+ */
+function jobOutcome(raw: RawJob): JobOutcome {
+  if (raw.status === 'manual' && raw.allow_failure === true) return 'passed';
+  return JOB_STATUSES.get(raw.status) ?? 'running';
 }
 
 /**
@@ -506,8 +524,8 @@ type Method = 'GET' | 'POST' | 'PUT' | 'DELETE';
  * GitLab through the glab CLI, so the Master never stores a token: glab keeps it in its config.
  * Everything goes through `glab api` and GitLab's REST API; `repo` is a project's path, as
  * "group/subgroup/name", and the number of an issue or a merge request is its iid, the one in
- * its link. With `host`, every call goes to that GitLab (a self-hosted one), else to the one glab
- * picks, and git pushes to and fetches from it over https, else from gitlab.com. With `account`,
+ * its link. Every call goes to the GitLab `host` names (a self-hosted one), else to gitlab.com,
+ * and git pushes to and fetches from that same GitLab over https. With `account`,
  * the client checks it is the account glab is logged in as. Authors (of issues, notes, approvals
  * and reviews) are trusted by their access level to the project (`gitlabAuthor`), which the client
  * asks GitLab for and keeps a few minutes.
@@ -560,8 +578,7 @@ export class GlabCli implements CodeHost {
    * never in the arguments, so neither its size nor its text matters to the command line.
    */
   private api(method: Method, path: string, body?: unknown): Promise<string> {
-    const args = ['api', path, '-X', method];
-    if (this.host) args.push('--hostname', this.host);
+    const args = ['api', path, '-X', method, '--hostname', this.host ?? DEFAULT_HOST];
     if (body !== undefined) args.push('-H', 'Content-Type: application/json', '--input', '-');
     const command = method === 'GET' ? `glab api ${path}` : `glab api -X ${method} ${path}`;
     return this.exec(args, command, body === undefined ? undefined : JSON.stringify(body));
@@ -935,7 +952,11 @@ export class GlabCli implements CodeHost {
       // GitLab gives a reviewer's state without the commit it was set on. It stands for the head
       // as it is now: the state holds until the reviewer changes it, and judgePullRequest acts
       // only on a request for changes on the head. A Run is sent back for it once per head; after
-      // it pushes a new head, a reviewer who still asks for changes sends it back once more.
+      // it pushes a new head, a reviewer who still asks for changes sends it back once more. So a
+      // reviewer who never changes the state sends the Run back on every head it pushes, until
+      // the template's limit on loops (max_loops, then on_exhausted) stops it: that limit, not a
+      // check here, keeps it from going on for ever. Telling whether the reviewer looked at the
+      // new head would take the time the state was set, which GitLab does not give.
       ...asking.map((r) => ({
         ...authors(r.user),
         state: 'changes_requested' as const,

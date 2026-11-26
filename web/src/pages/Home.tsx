@@ -20,6 +20,7 @@ import {
 } from '../lib/filters.js';
 import {
   BLOCK_KIND,
+  blockKindText,
   formatRunCost,
   formatSpan,
   formatTime,
@@ -144,7 +145,7 @@ export function HomePage({
                   section.id === 'queued'
                     ? queueExtra(run, ranks.get(run.id), maxRuns)
                     : section.id === 'attention'
-                      ? attentionExtra(run)
+                      ? attentionExtra(run, platformOf(run))
                       : undefined,
                 ),
               )
@@ -228,7 +229,8 @@ function PrWaitNote({ run, platform }: { run: RunSummary; platform: HostPlatform
   );
 }
 
-function attentionExtra(run: RunSummary): ReactNode {
+/** `platform`: the code host the Run goes with, whose words name a block of its pull request. */
+function attentionExtra(run: RunSummary, platform: HostPlatform): ReactNode {
   // Said after the card's link (PrWaitNote), with the link to the pull request.
   if (waitingForPr(run)) return null;
   if (run.status === 'waiting_approval') {
@@ -251,8 +253,8 @@ function attentionExtra(run: RunSummary): ReactNode {
             : run.blocked.kind === 'untrusted_issue'
               ? BLOCK_KIND.untrusted_issue
               : t({
-                  zh: `卡住：${BLOCK_KIND[run.blocked.kind]}`,
-                  en: `Stuck: ${BLOCK_KIND[run.blocked.kind]}`,
+                  zh: `卡住：${blockKindText(run.blocked.kind, platform)}`,
+                  en: `Stuck: ${blockKindText(run.blocked.kind, platform)}`,
                 })}
         </div>
         <div className="run-card-note-detail">{messageExcerpt(run.blocked.message)}</div>

@@ -217,6 +217,47 @@ describe('store', () => {
     expect(store.endedRunsWithPullRequest('other', settled)).toEqual([]);
   });
 
+  it("finds an issue's Runs on its own platform, an issue of the same path and number on the other being another", () => {
+    const store = new Store(':memory:');
+    const { repo } = seed(store);
+    const ofIssue = (goal: string, platform: 'gitlab' | undefined) =>
+      store.createRun({
+        repoId: repo.id,
+        templateId: 't',
+        template,
+        goal,
+        overrides: {},
+        issue: {
+          repo: 'grp/demo',
+          number: 1,
+          url: 'https://example.com/grp/demo/issues/1',
+          auto: false,
+          // A Run of an issue on GitHub records no platform.
+          ...(platform ? { platform } : {}),
+        },
+      });
+    const hubFailed = ofIssue('GitHub 1', undefined);
+    store.updateRun(hubFailed.id, { status: 'failed' });
+    const hub = ofIssue('GitHub 2', undefined);
+    const labFailed = ofIssue('GitLab 1', 'gitlab');
+    store.updateRun(labFailed.id, { status: 'failed' });
+    const lab = ofIssue('GitLab 2', 'gitlab');
+    const onHub = { repo: 'grp/demo', number: 1 };
+    const onLab = { ...onHub, platform: 'gitlab' as const };
+    const ids = (runs: { id: string }[]) => runs.map((r) => r.id);
+
+    expect(store.latestRunForIssue(onHub)?.id).toBe(hub.id);
+    expect(store.latestRunForIssue(onLab)?.id).toBe(lab.id);
+    expect(store.unfinishedRunForIssue(onHub)?.id).toBe(hub.id);
+    expect(store.unfinishedRunForIssue(onLab)?.id).toBe(lab.id);
+    expect(ids(store.runsForIssue(onHub))).toEqual([hubFailed.id, hub.id]);
+    expect(ids(store.runsForIssue(onLab))).toEqual([labFailed.id, lab.id]);
+    expect(ids(store.issueRunsWithStatus(onHub, 'failed'))).toEqual([hubFailed.id]);
+    expect(ids(store.issueRunsWithStatus(onLab, 'failed'))).toEqual([labFailed.id]);
+    // Another issue of the path has none.
+    expect(store.latestRunForIssue({ ...onLab, number: 2 })).toBeUndefined();
+  });
+
   it('orders the queue; queueHead puts a run in front', () => {
     const store = new Store(':memory:');
     const { mk } = seed(store);

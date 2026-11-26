@@ -42,6 +42,25 @@ type Table =
   | 'proposals'
   | 'iterations';
 
+/**
+ * An issue as a Run records it (`RunIssue`): its repo and number on its code host, GitHub when it
+ * names none. The same path and number may be an issue on GitHub and another on GitLab (a mirror,
+ * say): the platform tells them apart.
+ */
+export type RunIssueKey = Pick<RunIssue, 'repo' | 'number' | 'platform'>;
+
+/**
+ * The condition on `runs` that picks the Runs of one issue, its parameters given by
+ * `issueParams`. A Run of an issue on GitHub records no platform.
+ */
+const OF_ISSUE = `json_extract(issue, '$.repo') = ? AND json_extract(issue, '$.number') = ?
+  AND COALESCE(json_extract(issue, '$.platform'), 'github') = ?`;
+
+/** The parameters of `OF_ISSUE` for the issue. */
+function issueParams(issue: RunIssueKey): SQLInputValue[] {
+  return [issue.repo, issue.number, issue.platform ?? 'github'];
+}
+
 /** Columns stored as JSON text. */
 const JSON_COLUMNS: Partial<Record<Table, readonly string[]>> = {
   repos: ['verify_commands', 'setup_commands'],
@@ -673,14 +692,13 @@ export class Store {
   }
 
   /** The newest Run created from this issue that has not finished, if any. */
-  unfinishedRunForIssue(issuesRepo: string, number: number): Run | undefined {
+  unfinishedRunForIssue(issue: RunIssueKey): Run | undefined {
     return this.one<Run>(
       'runs',
-      `SELECT * FROM runs WHERE json_extract(issue, '$.repo') = ? AND json_extract(issue, '$.number') = ?
+      `SELECT * FROM runs WHERE ${OF_ISSUE}
          AND status NOT IN (${FINISHED_RUN_STATUSES.map(() => '?').join(', ')})
          ORDER BY created_at DESC LIMIT 1`,
-      issuesRepo,
-      number,
+      ...issueParams(issue),
       ...FINISHED_RUN_STATUSES,
     );
   }
@@ -715,36 +733,30 @@ export class Store {
   }
 
   /** The newest Run created from this issue, finished or not. */
-  latestRunForIssue(issuesRepo: string, number: number): Run | undefined {
+  latestRunForIssue(issue: RunIssueKey): Run | undefined {
     return this.one<Run>(
       'runs',
-      `SELECT * FROM runs WHERE json_extract(issue, '$.repo') = ? AND json_extract(issue, '$.number') = ?
-         ORDER BY created_at DESC, rowid DESC LIMIT 1`,
-      issuesRepo,
-      number,
+      `SELECT * FROM runs WHERE ${OF_ISSUE} ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+      ...issueParams(issue),
     );
   }
 
   /** The Runs created from this issue that have the given status, oldest first. */
-  issueRunsWithStatus(issuesRepo: string, number: number, status: RunStatus): Run[] {
+  issueRunsWithStatus(issue: RunIssueKey, status: RunStatus): Run[] {
     return this.many<Run>(
       'runs',
-      `SELECT * FROM runs WHERE json_extract(issue, '$.repo') = ? AND json_extract(issue, '$.number') = ?
-         AND status = ? ORDER BY created_at, rowid`,
-      issuesRepo,
-      number,
+      `SELECT * FROM runs WHERE ${OF_ISSUE} AND status = ? ORDER BY created_at, rowid`,
+      ...issueParams(issue),
       status,
     );
   }
 
   /** Every Run created from this issue, finished or not, oldest first. */
-  runsForIssue(issuesRepo: string, number: number): Run[] {
+  runsForIssue(issue: RunIssueKey): Run[] {
     return this.many<Run>(
       'runs',
-      `SELECT * FROM runs WHERE json_extract(issue, '$.repo') = ? AND json_extract(issue, '$.number') = ?
-         ORDER BY created_at, rowid`,
-      issuesRepo,
-      number,
+      `SELECT * FROM runs WHERE ${OF_ISSUE} ORDER BY created_at, rowid`,
+      ...issueParams(issue),
     );
   }
 
