@@ -2,6 +2,7 @@ import type { GitHubRepoStatus, GitHubStatus, UpgradeStatus } from '../../../src
 import {
   type AutoAcceptRule,
   acceptSplit,
+  changeRequestTerms,
   PROPOSAL_SIZES,
   type ProposalKind,
   type ProposalSize,
@@ -233,19 +234,23 @@ export function budgetText(budget: GitHubRepoStatus['budget']): string {
 }
 
 /**
- * How the repo's Runs reach GitHub (`deliver` and `push`): 「推送：合并后自动推送」 or 「PR：……」.
- * deliver: pr without push: true disables the repo, which its configuration problems say too.
+ * How the repo's Runs reach its code host (`deliver` and `push`): 「推送：合并后自动推送」,
+ * 「PR：……」 on GitHub (deliver: pr) or 「MR：……」 on GitLab (deliver: mr). deliver: pr or mr
+ * without push: true disables the repo, which its configuration problems say too.
  */
 export function deliveryText(repo: Pick<GitHubRepoStatus, 'deliver' | 'push'>): string {
-  if (repo.deliver === 'pr') {
+  if (repo.deliver === 'pr' || repo.deliver === 'mr') {
+    const { host, short, long, longCapital, deliver } = changeRequestTerms(
+      repo.deliver === 'mr' ? 'gitlab' : 'github',
+    );
     return repo.push
       ? t({
-          zh: 'PR：推送 Run 的分支、开合并到目标分支的 PR，在 GitHub 上合并后 Run 完成；目标分支不由 Master 推送',
-          en: "Pull request: the Run's branch is pushed with a pull request into the target branch, and the Run completes once it is merged on GitHub; the Master never pushes the target branch",
+          zh: `${short}：推送 Run 的分支、开合并到目标分支的 ${short}，在 ${host} 上合并后 Run 完成；目标分支不由 Master 推送`,
+          en: `${longCapital}: the Run's branch is pushed with a ${long} into the target branch, and the Run completes once it is merged on ${host}; the Master never pushes the target branch`,
         })
       : t({
-          zh: 'PR，但没开 push：deliver: pr 要配 push: true，这个仓库现在停用',
-          en: 'Pull request, but push is off: deliver: pr needs push: true, so the repo is disabled now',
+          zh: `${short}，但没开 push：deliver: ${deliver} 要配 push: true，这个仓库现在停用`,
+          en: `${longCapital}, but push is off: deliver: ${deliver} needs push: true, so the repo is disabled now`,
         });
   }
   return repo.push
@@ -460,7 +465,8 @@ export function gitlabExample(): string {
         max_risk: none       # 自动采纳到哪个风险等级：none / low / mid / high
         max_size: L          # 自动采纳到哪个大小：S / M / L
       auto_merge: false      # 从 issue 来的 Run 合并前不再等你审批
-      push: false            # 合并后自动推送到 GitLab（只支持推送，还不支持 MR）
+      push: false            # 合并后自动推送到 GitLab
+      # deliver: mr          # 目标分支受保护时：推送 Run 的分支、开 MR，合并后 Run 完成（要配 push: true）
       # daily_budget_usd: 20 # 每天自动花费的上限，不写 = 不限
       max_run_attempts: 3    # 一个 issue 最多跑几次 Run（含第一次），失败后自动重做`,
     en: `gitlab:
@@ -478,7 +484,8 @@ export function gitlabExample(): string {
         max_risk: none       # highest risk accepted automatically: none / low / mid / high
         max_size: L          # largest size accepted automatically: S / M / L
       auto_merge: false      # Runs from issues merge without waiting for your approval
-      push: false            # push to GitLab after merging (push only: no merge requests yet)
+      push: false            # push to GitLab after merging
+      # deliver: mr          # protected target branch: push the Run's branch, open an MR, done once merged (needs push: true)
       # daily_budget_usd: 20 # daily limit of automatic spend; omitted = no limit
       max_run_attempts: 3    # Runs an issue gets at most, the first included; failed ones are redone`,
   });

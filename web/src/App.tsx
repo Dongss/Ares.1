@@ -267,7 +267,12 @@ function Page(props: {
   switch (route.name) {
     case 'home':
       return (
-        <HomePage runs={runs.data} repos={repos.data} maxRuns={props.config?.maxRuns ?? null} />
+        <HomePage
+          runs={runs.data}
+          repos={repos.data}
+          maxRuns={props.config?.maxRuns ?? null}
+          config={props.config}
+        />
       );
     case 'stats':
       return <StatsPage repos={repos.data} />;

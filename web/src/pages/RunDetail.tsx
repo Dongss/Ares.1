@@ -1,7 +1,11 @@
 import { Fragment, useEffect, useState } from 'react';
 import { isCostUnknown } from '../../../src/api/cost.js';
 import type { ConfigView, ConflictWait, RunDetail } from '../../../src/api/types.js';
-import { effectiveBudget, REDO_BACKOFF_MAX_HOURS } from '../../../src/config/flow.js';
+import {
+  changeRequestTerms,
+  effectiveBudget,
+  REDO_BACKOFF_MAX_HOURS,
+} from '../../../src/config/flow.js';
 import type { PlanStep } from '../../../src/engine/plan.js';
 import { t } from '../../../src/i18n.js';
 import type {
@@ -59,6 +63,7 @@ import {
   type LatestPrRework,
   latestPrRework,
   maxRunsWaitText,
+  prCancelHint,
   prReworkNote,
   prSummary,
   prWaitText,
@@ -138,9 +143,12 @@ export function RunDetailPage(props: {
     );
   }
 
+  // The code host the Run goes with: its issue's, else its repo's source of requirements.
+  const platform = runPlatform(d.run, config ? repoSourceOf(config, d.repo.name) : null);
+
   return (
     <div className="run-detail">
-      <RunHeader detail={d} prRework={prRework} onChanged={detail.reload} />
+      <RunHeader detail={d} prRework={prRework} platform={platform} onChanged={detail.reload} />
       <RunFlow
         detail={d}
         config={config}
@@ -151,7 +159,13 @@ export function RunDetailPage(props: {
         }}
       />
       <AssessmentCard detail={d} />
-      <RunActions detail={d} config={config} prRework={prRework} onChanged={detail.reload} />
+      <RunActions
+        detail={d}
+        config={config}
+        prRework={prRework}
+        platform={platform}
+        onChanged={detail.reload}
+      />
       <nav className="tabs">
         {tabs().map((item) => (
           <button
@@ -177,12 +191,7 @@ export function RunDetailPage(props: {
       {tab === 'diff' && (
         <DiffPanel runId={id} commit={commit} onShowAll={() => setCommit(undefined)} />
       )}
-      {tab === 'events' && (
-        <EventsPanel
-          runId={id}
-          platform={runPlatform(d.run, config ? repoSourceOf(config, d.repo.name) : null)}
-        />
-      )}
+      {tab === 'events' && <EventsPanel runId={id} platform={platform} />}
     </div>
   );
 }
@@ -198,17 +207,20 @@ function stageName(detail: RunDetail, stageId: string): string {
 function RunHeader({
   detail,
   prRework,
+  platform,
   onChanged,
 }: {
   detail: RunDetail;
   /** The latest rework of the Run's pull request, if it had any. */
   prRework: LatestPrRework | null;
+  /** The code host the Run goes with: its pull request is a merge request (MR !N) on GitLab. */
+  platform: HostPlatform;
   onChanged: () => void;
 }) {
   const { run, repo, stageRuns } = detail;
-  const status = runStatusBadge(run);
+  const status = runStatusBadge(run, platform);
   const current = stageRuns.find((s) => s.id === run.currentStageRunId);
-  const pr = prSummary(run, prRework);
+  const pr = prSummary(run, prRework, platform);
   const multiLine = run.goal.trim().includes('\n');
   const budget = effectiveBudget(run.template, run.overrides);
   const untrusted = untrustedIssueText(run.issue);
@@ -250,7 +262,7 @@ function RunHeader({
         )}
         {run.pr && pr && (
           <div>
-            <dt>PR</dt>
+            <dt>{changeRequestTerms(platform).short}</dt>
             <dd>
               <a href={run.pr.url} target="_blank" rel="noreferrer">
                 {pr.label}
@@ -388,6 +400,8 @@ function RunActions(props: {
   config: ConfigView | undefined;
   /** The latest rework of the Run's pull request, if it had any. */
   prRework: LatestPrRework | null;
+  /** The code host the Run goes with, whose words its pull request is told in. */
+  platform: HostPlatform;
   onChanged: () => void;
 }) {
   const { run } = props.detail;
@@ -410,7 +424,9 @@ function RunActions(props: {
       {run.status === 'blocked' && run.blocked?.kind === 'untrusted_issue' && (
         <ConfirmGoalPanel detail={props.detail} onChanged={props.onChanged} />
       )}
-      {waitingForPr(run) && <PullRequestPanel detail={props.detail} rework={props.prRework} />}
+      {waitingForPr(run) && (
+        <PullRequestPanel detail={props.detail} rework={props.prRework} platform={props.platform} />
+      )}
       {run.status === 'blocked' &&
         run.blocked &&
         run.blocked.kind !== 'discussion' &&
@@ -497,12 +513,9 @@ function RunActions(props: {
               zh: '终止后保留工作目录和分支，可再手动清理。',
               en: 'Cancelling keeps the worktree and branch, which you can clean up afterwards.',
             })}
-            {waitingForPr(run) &&
-              run.pr &&
-              t({
-                zh: 'GitHub 上的 PR 不会被关闭，不要了请到 GitHub 上关掉。',
-                en: ' The pull request on GitHub stays open; close it there if you no longer want it.',
-              })}
+            {/* The Master closes the pull request of a Run that ended unfinished, waiting for
+                it or reworking it. */}
+            {run.pr && prCancelHint(props.platform)}
           </span>
         </div>
       )}
@@ -652,8 +665,8 @@ function retryHint(kind: BlockKind): string {
       en: 'Once the missing program is installed or the Master’s PATH finds it (restart the Master after switching Node versions), the Run goes on by itself within about a minute, and after a restart; no retry needed. You can also retry by hand to run the blocked commands again at once (work the agent already did is kept, and only the checks run again; if the agent reported its task incomplete, the task starts over from the commit before it). No rework or redo is used up.',
     },
     pr_open: {
-      zh: '不能重试：在 GitHub 上合并 PR，Run 会完成；关掉 PR，Run 会结束为失败。',
-      en: 'No retry here: merge the pull request on GitHub and the Run completes; close it and the Run ends as failed.',
+      zh: '不能重试：PR（GitLab 上是 MR）合并后 Run 会完成；没合并就关掉，Run 会结束为失败。',
+      en: 'No retry here: merge the pull request (the merge request on GitLab) and the Run completes; close it unmerged and the Run ends as failed.',
     },
     error: {
       zh: '重试会从出错的 Task 开始前的提交重做。',
@@ -766,28 +779,31 @@ function ConfirmGoalPanel({ detail, onChanged }: { detail: RunDetail; onChanged:
 }
 
 /**
- * The Run waits for its pull request on GitHub (deliver: pr): where it is, the reworks it had,
- * and what merging it, asking for changes on it or closing it does. No retry: the Master moves
- * the Run on from what happens to it on GitHub.
+ * The Run waits for its pull request on its code host (deliver: pr on GitHub; deliver: mr, a merge
+ * request, on GitLab: `platform`): where it is, the reworks it had, and what merging it, asking
+ * for changes on it or closing it does. No retry: the Master moves the Run on from what happens
+ * to it there.
  */
 function PullRequestPanel({
   detail,
   rework,
+  platform,
 }: {
   detail: RunDetail;
   rework: LatestPrRework | null;
+  platform: HostPlatform;
 }) {
   const { run, repo } = detail;
-  const reworked = prReworkNote(run, rework);
+  const reworked = prReworkNote(run, rework, undefined, platform);
   return (
     <div className="panel panel-attention">
       <h2>
         {run.pr ? (
           <a href={run.pr.url} target="_blank" rel="noreferrer">
-            {prWaitTitle(run)}
+            {prWaitTitle(run, platform)}
           </a>
         ) : (
-          prWaitTitle(run)
+          prWaitTitle(run, platform)
         )}
       </h2>
       {run.pr && (
@@ -798,7 +814,7 @@ function PullRequestPanel({
         </p>
       )}
       {reworked && <p>{reworked}</p>}
-      {prWaitText(run, repo.targetBranch).map((line) => (
+      {prWaitText(run, repo.targetBranch, platform).map((line) => (
         <p key={line} className="hint">
           {line}
         </p>

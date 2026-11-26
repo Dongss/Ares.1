@@ -26,6 +26,8 @@ import {
   maxRunsWaitText,
   pageTitle,
   patchLineClass,
+  prCancelHint,
+  prName,
   prReworkNote,
   prReworkReasonText,
   prSummary,
@@ -1395,6 +1397,219 @@ describe('waiting for a pull request', () => {
     for (const text of texts) {
       expect(text).toBeTruthy();
       expect(text).not.toMatch(/[一-鿿]/);
+    }
+  });
+});
+
+describe('waiting for a merge request on GitLab', () => {
+  afterEach(() => setLang('zh'));
+  const mr = { number: 12, url: 'https://gitlab.com/my-group/demo/-/merge_requests/12' };
+  const issue = {
+    repo: 'my-group/demo',
+    number: 7,
+    url: 'https://gitlab.com/my-group/demo/-/issues/7',
+    auto: false,
+    platform: 'gitlab' as const,
+  } satisfies RunSummary['issue'];
+  const waiting = (extra: Partial<RunSummary> = {}) =>
+    run('w', 'blocked', {
+      blocked: { kind: 'pr_open', message: 'checks passed', stageRunId: 'sr' },
+      ...extra,
+    });
+  const HEAD = '0123456789abcdef0123456789abcdef01234567';
+  const JOB = { name: 'build', url: 'https://gitlab.com/my-group/demo/-/jobs/1' };
+  /** The data of a github.pr_rework event, as the engine records it for a GitLab Run. */
+  const reworkData = (extra: Record<string, unknown> = {}) => ({
+    ...mr,
+    head: HEAD,
+    kinds: ['ci'],
+    reviewers: [],
+    checks: [JOB],
+    platform: 'gitlab',
+    ...extra,
+  });
+
+  it('names the merge request MR !N', () => {
+    expect(prName(mr, 'gitlab')).toBe('MR !12');
+    expect(prName(mr, 'github')).toBe('PR #12');
+  });
+
+  it('badges and heads it as waiting for the MR, by the issue or the given platform', () => {
+    expect(runStatusBadge(waiting({ pr: mr, issue })).label).toBe('等 MR 合并');
+    // A Run of no issue on a GitLab repo: the caller gives the repo's platform.
+    expect(runStatusBadge(waiting({ pr: mr }), 'gitlab').label).toBe('等 MR 合并');
+    expect(prWaitTitle(waiting({ pr: mr }), 'gitlab')).toBe('等 MR 合并 !12');
+    expect(prWaitTitle(waiting(), 'gitlab')).toBe('等 MR 合并：下次检查 GitLab 时推送分支、开 MR');
+    expect(prWaitHint('gitlab')).toBe('在 GitLab 上合并后 Run 自动完成；没合并就关掉，Run 失败');
+  });
+
+  it('explains what merging, asking for changes on or closing it on GitLab does', () => {
+    const lines = prWaitText(waiting({ pr: mr, issue }), 'main', 'gitlab');
+    expect(lines[0]).toBe('检查已通过，Run 的分支已推送到 GitLab，MR !12 等着合并到 main。');
+    expect(lines[1]).toBe(
+      '在 GitLab 上合并它（合并方式不限）后，Master 下次检查 GitLab 时把本地的 main 快进到合并后的提交，Run 完成，issue 关闭。',
+    );
+    expect(lines[2]).toBe(
+      'MR 上受信任的人（项目里 Developer 及以上的成员，包括从群组继承的）要求修改、head 流水线结束且有失败的 job，或者和 main 冲突时，Master 下次检查 GitLab 时让 Run 带着这些反馈自动回去返工（回到合并阶段的 on_fail 指向的阶段，计入回退上限 max_loops），改好后推送到同一个 MR。其他人的评审不触发返工，也不交给 Agent。',
+    );
+    expect(lines[3]).toBe(
+      'MR 没合并就被关掉时，Run 结束为失败；还有重做次数（max_run_attempts）时 issue 自动重做，重做的 Run 开新的 MR。',
+    );
+    expect(lines[4]).toContain(
+      '终止 Run 后，Master 下次检查 GitLab 时会关掉这个 MR（已经合并的不动）',
+    );
+    const early = prWaitText(waiting(), 'main', 'gitlab');
+    expect(early[0]).toContain('Master 下次检查 GitLab 时推送 Run 的分支，开一个合并到 main 的 MR');
+    expect(early[3]).toBe('MR 没合并就被关掉时，Run 结束为失败。');
+    for (const line of [...lines, ...early]) {
+      expect(line).not.toMatch(/GitHub|PR\b/);
+    }
+  });
+
+  it('says the Master closes it once the Run is cancelled', () => {
+    expect(prCancelHint('gitlab')).toBe(
+      '终止后，Master 下次检查 GitLab 时关掉这个 MR 并留言说明（已经合并的不动）。',
+    );
+    expect(prCancelHint('github')).toBe(
+      '终止后，Master 下次检查 GitHub 时关掉这个 PR 并留言说明（已经合并的不动）。',
+    );
+  });
+
+  it('sums it up as !N, with a failed pipeline as the reason of a rework', () => {
+    expect(prSummary(waiting({ pr: mr }), null, 'gitlab')).toEqual({
+      label: '!12',
+      note: '（等合并）',
+    });
+    expect(prSummary(run('c', 'completed', { pr: mr }), null, 'gitlab')?.label).toBe('!12');
+    const rework = { number: 12, kinds: ['ci' as const], reviewers: [], checks: [JOB] };
+    expect(prSummary(run('r', 'running', { pr: mr }), rework, 'gitlab')).toEqual({
+      label: '!12',
+      note: '（返工中：流水线没通过：build）',
+    });
+    expect(prReworkReasonText({ kinds: ['ci'], reviewers: [], checks: [] }, 'gitlab')).toBe(
+      '流水线没通过',
+    );
+  });
+
+  it('words the reworks of the merge request for its panel', () => {
+    const now = new Date('2026-11-25T12:00:00');
+    const at = new Date('2026-11-25T11:00:00').toISOString();
+    const latest = latestPrRework([{ type: 'github.pr_rework', data: reworkData(), ts: at }]);
+    expect(prReworkNote({ pr: mr }, latest, now, 'gitlab')).toBe(
+      '这个 MR 返工过 1 次（11:00:00）：流水线没通过：build。',
+    );
+    expect(prReworkNote({ pr: mr }, latest && { ...latest, count: 2 }, now, 'gitlab')).toBe(
+      '这个 MR 返工过 2 次，最近一次（11:00:00）：流水线没通过：build。',
+    );
+  });
+
+  it('words the events of a merge request by the platform in their data', () => {
+    const gitlab = { ...mr, platform: 'gitlab' };
+    // The merge stage's wait names no platform: the Run's says it.
+    expect(
+      eventText({ type: 'merge.pr_pending', data: { target: 'main' } }, undefined, 'gitlab'),
+    ).toBe(
+      '检查已通过，这个仓库通过 MR 交付（deliver: mr）：不合并进本地的 main，等推送 Run 的分支、开 MR',
+    );
+    const text = (type: string, data: Record<string, unknown>) =>
+      eventText({ type, data: { ...gitlab, ...data } });
+    expect(text('github.pr_opened', { base: 'main' })).toBe(
+      '推送了 Run 的分支，MR !12 等着合并到 main',
+    );
+    expect(text('github.pr_merged', { mergeCommit: HEAD })).toBe(
+      'MR !12 在 GitLab 上合并了（合并提交 01234567），本地目标分支已快进',
+    );
+    expect(text('github.pr_merged', { mergeCommit: null })).toBe(
+      'MR !12 在 GitLab 上合并了，本地目标分支已快进',
+    );
+    expect(text('github.pr_closed', {})).toBe('MR !12 没合并就被关掉了，Run 结束为失败');
+    expect(text('github.pr_closed_by_master', { reason: 'cancelled' })).toBe(
+      'Run 没做完就结束了（被终止），MR !12 不会再更新：Master 关掉了它，并在 MR 上说明了原因',
+    );
+    expect(text('github.pr_found_closed', { state: 'merged' })).toBe(
+      'Run 没做完就结束了，它的 MR !12 在 GitLab 上已经合并，Master 没有动它',
+    );
+    expect(text('github.pr_found_closed', { state: 'closed' })).toBe(
+      'Run 没做完就结束了，它的 MR !12 在 GitLab 上已经关掉，不用 Master 再关',
+    );
+    expect(eventText({ type: 'github.pr_rework', data: reworkData() })).toBe(
+      'MR !12（提交 01234567）需要返工：流水线没通过：build。Run 带着这些反馈回到合并阶段的 on_fail 指向的阶段（计入回退上限 max_loops，用完后按 on_exhausted 处理），改好后推送到同一个 MR',
+    );
+    expect(text('github.pr_updated', { head: HEAD })).toBe(
+      '返工后的提交已推送到 MR !12（head 01234567），MR 接着等合并',
+    );
+    expect(text('github.pr_updated', { head: null })).toBe(
+      '返工后的提交已推送到 MR !12，MR 接着等合并',
+    );
+    expect(
+      text('github.pr_review_ignored', { head: HEAD, reviewer: 'rita', association: 'REPORTER' }),
+    ).toBe(
+      'MR !12 上 @rita（REPORTER）要求修改，但不是项目里 Developer 及以上的成员：评审已忽略，不触发返工，内容也不交给 Agent',
+    );
+    // An event of GitHub's, without the platform, stays GitHub's whatever the Run's.
+    expect(eventText({ type: 'github.pr_closed', data: mr }, undefined, 'gitlab')).toBe(
+      'PR #12 没合并就被关掉了，Run 结束为失败',
+    );
+  });
+
+  it('in English', () => {
+    setLang('en');
+    const now = new Date('2026-11-25T12:00:00');
+    const at = new Date('2026-11-25T11:00:00').toISOString();
+    const gitlab = { ...mr, platform: 'gitlab' };
+    expect(runStatusBadge(waiting({ pr: mr, issue })).label).toBe('Waiting for the MR to merge');
+    expect(prWaitTitle(waiting({ pr: mr }), 'gitlab')).toBe('Waiting for MR !12 to merge');
+    expect(prWaitHint('gitlab')).toBe(
+      'Merging it on GitLab completes the Run; closing it unmerged fails the Run',
+    );
+    const lines = prWaitText(waiting({ pr: mr, issue }), 'main', 'gitlab');
+    expect(lines[2]).toBe(
+      "If someone the Master trusts (a member of the project from Developer up, also through its groups) asks for changes on it, its head pipeline finishes with failed jobs, or it conflicts with main, the Master sends the Run back to work on it with that feedback at its next GitLab check (to the stage the merge stage's on_fail names, counted toward max_loops), and the changes are pushed to the same merge request. Reviews by anyone else trigger no rework and go to no agent.",
+    );
+    const latest = latestPrRework([{ type: 'github.pr_rework', data: reworkData(), ts: at }]);
+    expect(prReworkNote({ pr: mr }, latest, now, 'gitlab')).toBe(
+      'This merge request was reworked once (11:00:00), for a failed pipeline job: build.',
+    );
+    expect(eventText({ type: 'github.pr_rework', data: reworkData() })).toBe(
+      "MR !12 (commit 01234567) needs more work: a failed pipeline job: build. The Run goes back with this feedback to the stage the merge stage's on_fail names (counted toward max_loops; past them, on_exhausted decides), and the changes are pushed to the same merge request",
+    );
+    const event = (type: string, data: Record<string, unknown>) =>
+      eventText({ type, data: { ...gitlab, ...data } });
+    const texts = [
+      prWaitTitle(waiting(), 'gitlab'),
+      ...lines,
+      ...prWaitText(waiting(), 'main', 'gitlab'),
+      prCancelHint('gitlab'),
+      prSummary(waiting({ pr: mr }), null, 'gitlab')?.note,
+      prReworkReasonText({ kinds: ['ci'], reviewers: [], checks: [] }, 'gitlab'),
+      prReworkReasonText(
+        { kinds: ['ci'], reviewers: [], checks: [JOB, { name: 'lint', url: null }] },
+        'gitlab',
+      ),
+      eventText({ type: 'merge.pr_pending', data: { target: 'main' } }, undefined, 'gitlab'),
+      event('github.pr_opened', { base: 'main' }),
+      event('github.pr_merged', { mergeCommit: HEAD }),
+      event('github.pr_merged', {}),
+      event('github.pr_closed', {}),
+      ...PR_CLOSE_REASONS.map((reason) => event('github.pr_closed_by_master', { reason })),
+      event('github.pr_found_closed', { state: 'merged' }),
+      event('github.pr_found_closed', { state: 'closed' }),
+      event('github.pr_updated', { head: HEAD }),
+      event('github.pr_updated', {}),
+      event('github.pr_review_ignored', { reviewer: 'rita', association: 'REPORTER' }),
+    ];
+    expect(texts.at(-1)).toBe(
+      'The review by @rita (REPORTER) asking for changes on MR !12 was ignored, as they are not a member of the project from Developer up: it triggers no rework, and its text goes to no agent',
+    );
+    expect(
+      eventText({ type: 'merge.pr_pending', data: { target: 'main' } }, undefined, 'gitlab'),
+    ).toBe(
+      "The checks passed and this repo delivers through merge requests (deliver: mr): nothing is merged into the local main; the Run's branch is to be pushed and a merge request opened",
+    );
+    for (const text of texts) {
+      expect(text).toBeTruthy();
+      expect(text).not.toMatch(/[一-鿿]/);
+      expect(text).not.toMatch(/GitHub|pull request|PR #/);
     }
   });
 });

@@ -8,6 +8,7 @@ import type {
 import { brandTitle } from '../../../src/brand.js';
 import {
   type AgentSelection,
+  changeRequestTerms,
   difficultyMeanings,
   discussionReplyWait,
   RAW_LOG_KEEP_DAYS,
@@ -165,9 +166,10 @@ export function workspaceLines(
 // ---- delivery through a pull request -----------------------------------------------------
 
 /**
- * Whether the Run waits for its pull request on GitHub to be merged (deliver: pr): blocked on
- * `pr_open` with the merge stage's checks passed. Not stuck: it takes no execution slot, has
- * nothing to retry, and goes on by itself once the pull request is merged or closed on GitHub.
+ * Whether the Run waits for its pull request to be merged on its code host (deliver: pr on
+ * GitHub, deliver: mr on GitLab, its merge request): blocked on `pr_open` with the merge stage's
+ * checks passed. Not stuck: it takes no execution slot, has nothing to retry, and goes on by
+ * itself once the pull request is merged or closed there.
  */
 export function waitingForPr(run: Pick<Run, 'status' | 'blocked'>): boolean {
   return run.status === 'blocked' && run.blocked?.kind === 'pr_open';
@@ -175,106 +177,172 @@ export function waitingForPr(run: Pick<Run, 'status' | 'blocked'>): boolean {
 
 /**
  * The Run's status badge: a Run waiting for its pull request says so instead of "blocked", a
- * merge request for a Run of a GitLab issue (`blockKindText`).
+ * merge request on GitLab (`blockKindText`). `platform`: the code host the Run goes with
+ * (`runPlatform`), its issue's if not given.
  */
-export function runStatusBadge(run: Pick<Run, 'status' | 'blocked' | 'issue'>): {
+export function runStatusBadge(
+  run: Pick<Run, 'status' | 'blocked' | 'issue'>,
+  platform: HostPlatform = runPlatform(run, null),
+): {
   label: string;
   tone: Tone;
 } {
   if (waitingForPr(run)) {
-    return { label: blockKindText('pr_open', runPlatform(run, null)), tone: 'attention' };
+    return { label: blockKindText('pr_open', platform), tone: 'attention' };
   }
   return RUN_STATUS[run.status];
 }
 
 /**
- * 「等 PR 合并 #12」: the headline of a Run waiting for its pull request, on the home page and the
- * Run detail. Before the bridge has opened it (`pr` still null), says that it is about to.
+ * 「PR #12」, 「MR !12」: the Run's pull request as people know it on the code host the Run goes
+ * with (`platform`, from `runPlatform`).
  */
-export function prWaitTitle(run: Pick<Run, 'pr'>): string {
+export function prName(pr: { number: number }, platform: HostPlatform): string {
+  const cr = changeRequestTerms(platform);
+  return `${cr.short} ${cr.number(pr.number)}`;
+}
+
+/**
+ * 「等 PR 合并 #12」, 「等 MR 合并 !12」: the headline of a Run waiting for its pull request, on the
+ * home page and the Run detail, in the words of the code host the Run goes with (`platform`, from
+ * `runPlatform`). Before the bridge has opened it (`pr` still null), says that it is about to.
+ */
+export function prWaitTitle(run: Pick<Run, 'pr'>, platform: HostPlatform = 'github'): string {
+  const { host, short, number } = changeRequestTerms(platform);
   if (!run.pr) {
     return t({
-      zh: '等 PR 合并：下次检查 GitHub 时推送分支、开 PR',
-      en: 'Waiting for the PR to merge: the branch is pushed and the PR opened at the next GitHub check',
+      zh: `等 ${short} 合并：下次检查 ${host} 时推送分支、开 ${short}`,
+      en: `Waiting for the ${short} to merge: the branch is pushed and the ${short} opened at the next ${host} check`,
     });
   }
   return t({
-    zh: `等 PR 合并 #${run.pr.number}`,
-    en: `Waiting for PR #${run.pr.number} to merge`,
-  });
-}
-
-/** The short line under `prWaitTitle` on the home page: what merging or closing it does. */
-export function prWaitHint(): string {
-  return t({
-    zh: '在 GitHub 上合并后 Run 自动完成；没合并就关掉，Run 失败',
-    en: 'Merging it on GitHub completes the Run; closing it unmerged fails the Run',
+    zh: `等 ${short} 合并 ${number(run.pr.number)}`,
+    en: `Waiting for ${short} ${number(run.pr.number)} to merge`,
   });
 }
 
 /**
- * What the Run detail says about a Run waiting for its pull request into `target`: where it
- * stands, what merging it on GitHub, asking for changes on it (or failed checks, or a conflict)
- * and closing it do, and that there is nothing to retry here.
+ * The short line under `prWaitTitle` on the home page: what merging or closing it on the code
+ * host (`platform`) does.
  */
-export function prWaitText(run: Pick<Run, 'pr' | 'issue'>, target: string): string[] {
+export function prWaitHint(platform: HostPlatform = 'github'): string {
+  const { host } = changeRequestTerms(platform);
+  return t({
+    zh: `在 ${host} 上合并后 Run 自动完成；没合并就关掉，Run 失败`,
+    en: `Merging it on ${host} completes the Run; closing it unmerged fails the Run`,
+  });
+}
+
+/**
+ * Who the Master trusts to ask for changes on a pull request (`isTrusted`, by what the code host
+ * says of them): a GitHub repo's owner, members and collaborators; a GitLab project's members
+ * from Developer up, also by its groups.
+ */
+function trustedReviewers(platform: HostPlatform): string {
+  return platform === 'gitlab'
+    ? t({
+        zh: '项目里 Developer 及以上的成员，包括从群组继承的',
+        en: 'a member of the project from Developer up, also through its groups',
+      })
+    : t({
+        zh: '仓库所有者、成员和协作者',
+        en: "the repo's owner, a member or a collaborator",
+      });
+}
+
+/**
+ * What the Run detail says about a Run waiting for its pull request into `target`: where it
+ * stands, what merging it on the code host (`platform`, from `runPlatform`: a merge request on
+ * GitLab), asking for changes on it (or failed checks, or a conflict) and closing it do, and that
+ * there is nothing to retry here.
+ */
+export function prWaitText(
+  run: Pick<Run, 'pr' | 'issue'>,
+  target: string,
+  platform: HostPlatform = 'github',
+): string[] {
+  const { host, short, long, number } = changeRequestTerms(platform);
+  const gitlab = platform === 'gitlab';
   const opened = run.pr
     ? t({
-        zh: `检查已通过，Run 的分支已推送到 GitHub，PR #${run.pr.number} 等着合并到 ${target}。`,
-        en: `The checks passed and the Run's branch is pushed to GitHub, where PR #${run.pr.number} waits to be merged into ${target}.`,
+        zh: `检查已通过，Run 的分支已推送到 ${host}，${short} ${number(run.pr.number)} 等着合并到 ${target}。`,
+        en: `The checks passed and the Run's branch is pushed to ${host}, where ${short} ${number(run.pr.number)} waits to be merged into ${target}.`,
       })
     : t({
-        zh: `检查已通过。Master 下次检查 GitHub 时推送 Run 的分支，开一个合并到 ${target} 的 PR（已经有开着的就接着用）；推送或开 PR 失败时，在「需求」页能看到原因，之后每次检查都会再试。`,
-        en: `The checks passed. At its next GitHub check the Master pushes the Run's branch and opens a pull request into ${target} (or keeps using one already open); if the push or the pull request fails, the Issues page shows why, and every later check tries again.`,
+        zh: `检查已通过。Master 下次检查 ${host} 时推送 Run 的分支，开一个合并到 ${target} 的 ${short}（已经有开着的就接着用）；推送或开 ${short} 失败时，在「需求」页能看到原因，之后每次检查都会再试。`,
+        en: `The checks passed. At its next ${host} check the Master pushes the Run's branch and opens a ${long} into ${target} (or keeps using one already open); if the push or the ${long} fails, the Issues page shows why, and every later check tries again.`,
       });
+  // GitLab merges by a merge commit, a squash or a fast-forward, as the project is set up.
+  const how = gitlab
+    ? t({ zh: '（合并方式不限）', en: ' (by whichever merge method)' })
+    : t({ zh: '（merge、squash 或 rebase 都行）', en: ' (by a merge, a squash or a rebase)' });
   const merged = run.issue
     ? t({
-        zh: `在 GitHub 上合并它（merge、squash 或 rebase 都行）后，Master 下次检查 GitHub 时把本地的 ${target} 快进到合并后的提交，Run 完成，issue 关闭。`,
-        en: `Once it is merged on GitHub (by a merge, a squash or a rebase), the Master fast-forwards the local ${target} to the merged commit at its next GitHub check, the Run completes and the issue is closed.`,
+        zh: `在 ${host} 上合并它${how}后，Master 下次检查 ${host} 时把本地的 ${target} 快进到合并后的提交，Run 完成，issue 关闭。`,
+        en: `Once it is merged on ${host}${how}, the Master fast-forwards the local ${target} to the merged commit at its next ${host} check, the Run completes and the issue is closed.`,
       })
     : t({
-        zh: `在 GitHub 上合并它（merge、squash 或 rebase 都行）后，Master 下次检查 GitHub 时把本地的 ${target} 快进到合并后的提交，Run 完成。`,
-        en: `Once it is merged on GitHub (by a merge, a squash or a rebase), the Master fast-forwards the local ${target} to the merged commit at its next GitHub check, and the Run completes.`,
+        zh: `在 ${host} 上合并它${how}后，Master 下次检查 ${host} 时把本地的 ${target} 快进到合并后的提交，Run 完成。`,
+        en: `Once it is merged on ${host}${how}, the Master fast-forwards the local ${target} to the merged commit at its next ${host} check, and the Run completes.`,
       });
+  const checks = gitlab
+    ? t({ zh: 'head 流水线结束且有失败的 job', en: 'its head pipeline finishes with failed jobs' })
+    : t({ zh: 'CI 检查全部结束且有失败的', en: 'its checks all finish with some failed' });
+  const trusted = trustedReviewers(platform);
   const rework = t({
-    zh: `PR 上受信任的人（仓库所有者、成员和协作者）要求修改、CI 检查全部结束且有失败的，或者和 ${target} 冲突时，Master 下次检查 GitHub 时让 Run 带着这些反馈自动回去返工（回到合并阶段的 on_fail 指向的阶段，计入回退上限 max_loops），改好后推送到同一个 PR。其他人的评审不触发返工，也不交给 Agent。`,
-    en: `If someone the Master trusts (the repo's owner, a member or a collaborator) asks for changes on it, its checks all finish with some failed, or it conflicts with ${target}, the Master sends the Run back to work on it with that feedback at its next GitHub check (to the stage the merge stage's on_fail names, counted toward max_loops), and the changes are pushed to the same pull request. Reviews by anyone else trigger no rework and go to no agent.`,
+    zh: `${short} 上受信任的人（${trusted}）要求修改、${checks}，或者和 ${target} 冲突时，Master 下次检查 ${host} 时让 Run 带着这些反馈自动回去返工（回到合并阶段的 on_fail 指向的阶段，计入回退上限 max_loops），改好后推送到同一个 ${short}。其他人的评审不触发返工，也不交给 Agent。`,
+    en: `If someone the Master trusts (${trusted}) asks for changes on it, ${checks}, or it conflicts with ${target}, the Master sends the Run back to work on it with that feedback at its next ${host} check (to the stage the merge stage's on_fail names, counted toward max_loops), and the changes are pushed to the same ${long}. Reviews by anyone else trigger no rework and go to no agent.`,
   });
   const closed = run.issue
     ? t({
-        zh: 'PR 没合并就被关掉时，Run 结束为失败；还有重做次数（max_run_attempts）时 issue 自动重做，重做的 Run 开新的 PR。',
-        en: 'If the pull request is closed unmerged, the Run ends as failed; while attempts remain (max_run_attempts) the issue is redone, and the new Run opens a new pull request.',
+        zh: `${short} 没合并就被关掉时，Run 结束为失败；还有重做次数（max_run_attempts）时 issue 自动重做，重做的 Run 开新的 ${short}。`,
+        en: `If the ${long} is closed unmerged, the Run ends as failed; while attempts remain (max_run_attempts) the issue is redone, and the new Run opens a new ${long}.`,
       })
     : t({
-        zh: 'PR 没合并就被关掉时，Run 结束为失败。',
-        en: 'If the pull request is closed unmerged, the Run ends as failed.',
+        zh: `${short} 没合并就被关掉时，Run 结束为失败。`,
+        en: `If the ${long} is closed unmerged, the Run ends as failed.`,
       });
   const meanwhile = t({
-    zh: '等待期间不占执行名额，排队的 Run 照常执行；Master 重启后也接着等。这里没有可以重试的；终止 Run 后，Master 下次检查 GitHub 时会关掉这个 PR（已经合并的不动）。',
-    en: 'Meanwhile it takes no execution slot, so queued Runs go ahead, and it keeps waiting across Master restarts. There is nothing to retry here; once the Run is cancelled, the Master closes the pull request at its next GitHub check (unless it was merged).',
+    zh: `等待期间不占执行名额，排队的 Run 照常执行；Master 重启后也接着等。这里没有可以重试的；终止 Run 后，Master 下次检查 ${host} 时会关掉这个 ${short}（已经合并的不动）。`,
+    en: `Meanwhile it takes no execution slot, so queued Runs go ahead, and it keeps waiting across Master restarts. There is nothing to retry here; once the Run is cancelled, the Master closes the ${long} at its next ${host} check (unless it was merged).`,
   });
   return [opened, merged, rework, closed, meanwhile];
 }
 
 /**
- * The PR line of the Run detail's summary, for any Run that has one: 「#12」 (the link) and how it
- * stands when the Run tells: waiting for it; completed, which only a merge of it gets to; or
- * reworking. The merge stage is the last, and its pull request merged completes the Run, so a
- * Run with one that neither waits for it nor finished went back for more work: a reviewer asked
- * for changes, a check failed or it conflicts with the target branch. `rework`, the latest of the
- * Run's reworks (`latestPrRework`), says which, when it was of this pull request.
+ * What the Run detail says, next to its cancel button, of the pull request of a Run waiting for
+ * it: the Master closes it at its next check of the code host (`platform`), with a comment, unless
+ * it was merged meanwhile.
+ */
+export function prCancelHint(platform: HostPlatform = 'github'): string {
+  const { host, short, long } = changeRequestTerms(platform);
+  return t({
+    zh: `终止后，Master 下次检查 ${host} 时关掉这个 ${short} 并留言说明（已经合并的不动）。`,
+    en: ` Once cancelled, the Master closes the ${long} at its next ${host} check and says why on it (unless it was merged).`,
+  });
+}
+
+/**
+ * The PR line of the Run detail's summary, for any Run that has one: 「#12」 (the link; 「!12」 for
+ * a merge request on GitLab, `platform`) and how it stands when the Run tells: waiting for it;
+ * completed, which only a merge of it gets to; or reworking. The merge stage is the last, and its
+ * pull request merged completes the Run, so a Run with one that neither waits for it nor finished
+ * went back for more work: a reviewer asked for changes, a check failed or it conflicts with the
+ * target branch. `rework`, the latest of the Run's reworks (`latestPrRework`), says which, when it
+ * was of this pull request.
  */
 export function prSummary(
   run: Pick<Run, 'pr' | 'status' | 'blocked'>,
   rework: Pick<PullRequestRework, 'number' | 'kinds' | 'reviewers' | 'checks'> | null = null,
+  platform: HostPlatform = 'github',
 ): { label: string; note: string | null } | null {
   if (!run.pr) return null;
-  const label = `#${run.pr.number}`;
+  const label = changeRequestTerms(platform).number(run.pr.number);
   if (waitingForPr(run)) return { label, note: t({ zh: '（等合并）', en: ' (awaiting merge)' }) };
   if (run.status === 'completed') return { label, note: t({ zh: '（已合并）', en: ' (merged)' }) };
   if (FINISHED_RUN_STATUSES.includes(run.status)) return { label, note: null };
   if (rework?.number === run.pr.number) {
-    const why = prReworkReasonText(rework);
+    const why = prReworkReasonText(rework, platform);
     return { label, note: t({ zh: `（返工中：${why}）`, en: ` (reworking: ${why})` }) };
   }
   return { label, note: t({ zh: '（返工中）', en: ' (reworking)' }) };
@@ -332,24 +400,37 @@ const CHECKS_SHOWN = 5;
 
 /**
  * Why a pull request was sent back for more work, in one line: 「和目标分支冲突；CI 检查没通过：
- * build；@alice 要求修改」.
+ * build；@alice 要求修改」. The failed checks are CI checks on GitHub and the head pipeline's jobs
+ * on GitLab (`platform`, from `runPlatform`): 「流水线没通过：build」.
  */
 export function prReworkReasonText(
   rework: Pick<PullRequestRework, 'kinds' | 'reviewers' | 'checks'>,
+  platform: HostPlatform = 'github',
 ): string {
+  const gitlab = platform === 'gitlab';
   const parts = rework.kinds.map((kind) => {
     if (kind === 'conflict') {
       return t({ zh: '和目标分支冲突', en: 'a conflict with the target branch' });
     }
     if (kind === 'ci') {
       const all = rework.checks.map((c) => c.name);
-      if (all.length === 0) return t({ zh: 'CI 检查没通过', en: 'failed checks' });
+      if (all.length === 0) {
+        return gitlab
+          ? t({ zh: '流水线没通过', en: 'a failed pipeline' })
+          : t({ zh: 'CI 检查没通过', en: 'failed checks' });
+      }
       const shown = join(all.slice(0, CHECKS_SHOWN));
       const more = all.length - CHECKS_SHOWN;
       const list =
         more > 0
           ? t({ zh: `${shown} 等 ${all.length} 个`, en: `${shown} and ${more} more` })
           : shown;
+      if (gitlab) {
+        return t({
+          zh: `流水线没通过：${list}`,
+          en: `${all.length === 1 ? 'a failed pipeline job' : 'failed pipeline jobs'}: ${list}`,
+        });
+      }
       return t({
         zh: `CI 检查没通过：${list}`,
         en: `${all.length === 1 ? 'a failed check' : 'failed checks'}: ${list}`,
@@ -392,25 +473,29 @@ export function latestPrRework(
 
 /**
  * What the pull request panel says of the reworks a Run waiting for its pull request had: how
- * many, and the latest one's reason and time. null without any of this pull request's.
+ * many, and the latest one's reason and time, in the words of the code host the Run goes with
+ * (`platform`, from `runPlatform`: a merge request on GitLab). null without any of this pull
+ * request's.
  */
 export function prReworkNote(
   run: Pick<Run, 'pr'>,
   rework: LatestPrRework | null,
   now = new Date(),
+  platform: HostPlatform = 'github',
 ): string | null {
   if (!run.pr || !rework || rework.number !== run.pr.number) return null;
-  const why = prReworkReasonText(rework);
+  const { short, long } = changeRequestTerms(platform);
+  const why = prReworkReasonText(rework, platform);
   const at = formatTime(rework.at, now);
   if (rework.count === 1) {
     return t({
-      zh: `这个 PR 返工过 1 次（${at}）：${why}。`,
-      en: `This pull request was reworked once (${at}), for ${why}.`,
+      zh: `这个 ${short} 返工过 1 次（${at}）：${why}。`,
+      en: `This ${long} was reworked once (${at}), for ${why}.`,
     });
   }
   return t({
-    zh: `这个 PR 返工过 ${rework.count} 次，最近一次（${at}）：${why}。`,
-    en: `This pull request was reworked ${rework.count} times, most recently (${at}) for ${why}.`,
+    zh: `这个 ${short} 返工过 ${rework.count} 次，最近一次（${at}）：${why}。`,
+    en: `This ${long} was reworked ${rework.count} times, most recently (${at}) for ${why}.`,
   });
 }
 
@@ -763,71 +848,89 @@ function prCloseReasonText(reason: PrCloseReason): string {
 }
 
 /**
- * The events of delivering through a pull request (deliver: pr) in words: the merge stage waits
- * for it (`merge.pr_pending`), it was opened, merged or closed on GitHub, sent back for more work,
- * updated with the reworked commits, a review on it ignored, or, once the Run ended without
- * completing, closed by the Master or found merged or closed already (`github.pr_*`); null for
- * other events and data not of that shape.
+ * The code host of an event about a Run's pull request (`github.pr_*`): GitLab's carry it in their
+ * data (`platform: 'gitlab'`), GitHub's go without.
  */
-function pullRequestEventText(event: Pick<EventRow, 'type' | 'data'>): string | null {
+function pullRequestEventPlatform(data: Record<string, unknown>): HostPlatform {
+  return data.platform === 'gitlab' ? 'gitlab' : 'github';
+}
+
+/**
+ * The events of delivering through a pull request (deliver: pr; deliver: mr, a merge request on
+ * GitLab) in words: the merge stage waits for it (`merge.pr_pending`, in the words of the code
+ * host the Run goes with, `platform`), it was opened, merged or closed on its code host, sent back
+ * for more work, updated with the reworked commits, a review on it ignored, or, once the Run ended
+ * without completing, closed by the Master or found merged or closed already (`github.pr_*`, in
+ * the words of the code host the event names, `pullRequestEventPlatform`); null for other events
+ * and data not of that shape.
+ */
+function pullRequestEventText(
+  event: Pick<EventRow, 'type' | 'data'>,
+  platform: HostPlatform,
+): string | null {
   const { target, number, base, mergeCommit, head } = event.data;
   if (event.type === 'merge.pr_pending') {
     if (typeof target !== 'string') return null;
+    const { short, long, deliver } = changeRequestTerms(platform);
     return t({
-      zh: `检查已通过，这个仓库通过 PR 交付（deliver: pr）：不合并进本地的 ${target}，等推送 Run 的分支、开 PR`,
-      en: `The checks passed and this repo delivers through pull requests (deliver: pr): nothing is merged into the local ${target}; the Run's branch is to be pushed and a pull request opened`,
+      zh: `检查已通过，这个仓库通过 ${short} 交付（deliver: ${deliver}）：不合并进本地的 ${target}，等推送 Run 的分支、开 ${short}`,
+      en: `The checks passed and this repo delivers through ${long}s (deliver: ${deliver}): nothing is merged into the local ${target}; the Run's branch is to be pushed and a ${long} opened`,
     });
   }
   if (typeof number !== 'number') return null;
+  const on = pullRequestEventPlatform(event.data);
+  const { host, short, long } = changeRequestTerms(on);
+  /** 「PR #12」, 「MR !12」. */
+  const pr = prName({ number }, on);
   switch (event.type) {
     case 'github.pr_opened':
       return typeof base === 'string'
         ? t({
-            zh: `推送了 Run 的分支，PR #${number} 等着合并到 ${base}`,
-            en: `The Run's branch was pushed; PR #${number} waits to be merged into ${base}`,
+            zh: `推送了 Run 的分支，${pr} 等着合并到 ${base}`,
+            en: `The Run's branch was pushed; ${pr} waits to be merged into ${base}`,
           })
         : null;
     case 'github.pr_merged':
       return typeof mergeCommit === 'string'
         ? t({
-            zh: `PR #${number} 在 GitHub 上合并了（合并提交 ${shortSha(mergeCommit)}），本地目标分支已快进`,
-            en: `PR #${number} was merged on GitHub (merge commit ${shortSha(mergeCommit)}), and the local target branch fast-forwarded`,
+            zh: `${pr} 在 ${host} 上合并了（合并提交 ${shortSha(mergeCommit)}），本地目标分支已快进`,
+            en: `${pr} was merged on ${host} (merge commit ${shortSha(mergeCommit)}), and the local target branch fast-forwarded`,
           })
         : t({
-            zh: `PR #${number} 在 GitHub 上合并了，本地目标分支已快进`,
-            en: `PR #${number} was merged on GitHub, and the local target branch fast-forwarded`,
+            zh: `${pr} 在 ${host} 上合并了，本地目标分支已快进`,
+            en: `${pr} was merged on ${host}, and the local target branch fast-forwarded`,
           });
     case 'github.pr_closed':
       return t({
-        zh: `PR #${number} 没合并就被关掉了，Run 结束为失败`,
-        en: `PR #${number} was closed without being merged, so the Run ended as failed`,
+        zh: `${pr} 没合并就被关掉了，Run 结束为失败`,
+        en: `${pr} was closed without being merged, so the Run ended as failed`,
       });
     case 'github.pr_closed_by_master': {
       const reason = PR_CLOSE_REASONS.find((r) => r === event.data.reason);
       if (!reason) return null;
       return t({
-        zh: `Run 没做完就结束了（${prCloseReasonText(reason)}），PR #${number} 不会再更新：Master 关掉了它，并在 PR 上说明了原因`,
-        en: `The Run ended unfinished (${prCloseReasonText(reason)}), so PR #${number} gets no more updates: the Master closed it and said why on it`,
+        zh: `Run 没做完就结束了（${prCloseReasonText(reason)}），${pr} 不会再更新：Master 关掉了它，并在 ${short} 上说明了原因`,
+        en: `The Run ended unfinished (${prCloseReasonText(reason)}), so ${pr} gets no more updates: the Master closed it and said why on it`,
       });
     }
     case 'github.pr_found_closed':
       if (event.data.state === 'merged') {
         return t({
-          zh: `Run 没做完就结束了，它的 PR #${number} 在 GitHub 上已经合并，Master 没有动它`,
-          en: `The Run ended unfinished, and its PR #${number} was already merged on GitHub; the Master left it as it is`,
+          zh: `Run 没做完就结束了，它的 ${pr} 在 ${host} 上已经合并，Master 没有动它`,
+          en: `The Run ended unfinished, and its ${pr} was already merged on ${host}; the Master left it as it is`,
         });
       }
       if (event.data.state === 'closed') {
         return t({
-          zh: `Run 没做完就结束了，它的 PR #${number} 在 GitHub 上已经关掉，不用 Master 再关`,
-          en: `The Run ended unfinished, and its PR #${number} was already closed on GitHub; nothing for the Master to close`,
+          zh: `Run 没做完就结束了，它的 ${pr} 在 ${host} 上已经关掉，不用 Master 再关`,
+          en: `The Run ended unfinished, and its ${pr} was already closed on ${host}; nothing for the Master to close`,
         });
       }
       return null;
     case 'github.pr_rework': {
       const rework = pullRequestRework(event.data);
       if (!rework) return null;
-      const why = prReworkReasonText(rework);
+      const why = prReworkReasonText(rework, on);
       const at = rework.head
         ? t({ zh: `（提交 ${shortSha(rework.head)}）`, en: ` (commit ${shortSha(rework.head)})` })
         : t({ zh: ' ', en: '' });
@@ -838,28 +941,36 @@ function pullRequestEventText(event: Pick<EventRow, 'type' | 'data'>): string | 
           })
         : '';
       return t({
-        zh: `PR #${number}${at}需要返工：${why}。Run 带着这些反馈回到合并阶段的 on_fail 指向的阶段（计入回退上限 max_loops，用完后按 on_exhausted 处理）${merge}，改好后推送到同一个 PR`,
-        en: `PR #${number}${at} needs more work: ${why}. The Run goes back with this feedback to the stage the merge stage's on_fail names (counted toward max_loops; past them, on_exhausted decides)${merge}, and the changes are pushed to the same pull request`,
+        zh: `${pr}${at}需要返工：${why}。Run 带着这些反馈回到合并阶段的 on_fail 指向的阶段（计入回退上限 max_loops，用完后按 on_exhausted 处理）${merge}，改好后推送到同一个 ${short}`,
+        en: `${pr}${at} needs more work: ${why}. The Run goes back with this feedback to the stage the merge stage's on_fail names (counted toward max_loops; past them, on_exhausted decides)${merge}, and the changes are pushed to the same ${long}`,
       });
     }
     case 'github.pr_updated':
       return typeof head === 'string'
         ? t({
-            zh: `返工后的提交已推送到 PR #${number}（head ${shortSha(head)}），PR 接着等合并`,
-            en: `The reworked commits were pushed to PR #${number} (head ${shortSha(head)}), which waits to be merged again`,
+            zh: `返工后的提交已推送到 ${pr}（head ${shortSha(head)}），${short} 接着等合并`,
+            en: `The reworked commits were pushed to ${pr} (head ${shortSha(head)}), which waits to be merged again`,
           })
         : t({
-            zh: `返工后的提交已推送到 PR #${number}，PR 接着等合并`,
-            en: `The reworked commits were pushed to PR #${number}, which waits to be merged again`,
+            zh: `返工后的提交已推送到 ${pr}，${short} 接着等合并`,
+            en: `The reworked commits were pushed to ${pr}, which waits to be merged again`,
           });
     case 'github.pr_review_ignored': {
       const { reviewer, association } = event.data;
       if (reviewer !== null && typeof reviewer !== 'string') return null;
       if (typeof association !== 'string') return null;
       const who = reviewer ? `@${reviewer}` : t({ zh: '已删除的账号', en: 'a deleted account' });
+      // Who counts: a GitHub repo's members; a GitLab project's from Developer up.
+      const member =
+        on === 'gitlab'
+          ? t({
+              zh: '不是项目里 Developer 及以上的成员',
+              en: 'not a member of the project from Developer up',
+            })
+          : t({ zh: '不是仓库成员', en: 'not a member of the repo' });
       return t({
-        zh: `PR #${number} 上 ${who}（${association}）要求修改，但不是仓库成员：评审已忽略，不触发返工，内容也不交给 Agent`,
-        en: `The review by ${who} (${association}) asking for changes on PR #${number} was ignored, as they are not a member of the repo: it triggers no rework, and its text goes to no agent`,
+        zh: `${pr} 上 ${who}（${association}）要求修改，但${member}：评审已忽略，不触发返工，内容也不交给 Agent`,
+        en: `The review by ${who} (${association}) asking for changes on ${pr} was ignored, as they are ${member}: it triggers no rework, and its text goes to no agent`,
       });
     }
     default:
@@ -870,7 +981,8 @@ function pullRequestEventText(event: Pick<EventRow, 'type' | 'data'>): string | 
 /**
  * The event in words, for the events list, from its structured data; null for events that only
  * show their data. `platform`: the code host the Run goes with (`runPlatform`), named where an
- * event is about its commits.
+ * event is about its commits, and whose words the merge stage's wait for a pull request uses (a
+ * merge request on GitLab); the events about the pull request itself name their own.
  */
 export function eventText(
   event: Pick<EventRow, 'type' | 'data'>,
@@ -922,7 +1034,7 @@ export function eventText(
           en: `${what} is found in the environment again, so the Run goes on by itself`,
         });
   }
-  const pr = pullRequestEventText(event);
+  const pr = pullRequestEventText(event, platform);
   if (pr !== null) return pr;
   if (event.type === 'run.merge_remote_obsolete') {
     const { remote, target } = event.data;

@@ -24,7 +24,7 @@ import type {
   StatsView,
 } from '../src/api/types.js';
 import { SCOUT_FAILURE_NOTIFY_AFTER } from '../src/config/flow.js';
-import { findTemplate, githubConfigKey } from '../src/config/load.js';
+import { findTemplate, githubConfigKey, gitlabConfigKey } from '../src/config/load.js';
 import { storedRunTimes } from '../src/engine/times.js';
 import { setLang } from '../src/i18n.js';
 import { type ExecFile, noticeScript } from '../src/notify/system.js';
@@ -1516,6 +1516,33 @@ gitlab:
       url: 'https://gitlab.example.com:8443/grp/sub/demo/-/issues/1',
     });
     expect(gh.calls).toEqual([]);
+  });
+
+  it('gives deliver: mr for a repo delivering through merge requests, and why it needs push', async () => {
+    const config = (lines: string) => `
+gitlab:
+  host: gitlab.example.com:8443
+  repos:
+    demo:
+      issues_repo: grp/sub/demo
+      template: dev
+${lines}`;
+    h = await harness({
+      config: config('      push: true\n      deliver: mr\n'),
+      gitlab: new FakeGitLab('grp/sub/demo', 'gitlab.example.com:8443'),
+      github: new FakeGitHub(),
+    });
+    const repo = async () => ((await call('GET', '/api/gitlab')).json as GitHubStatus).repos[0];
+    expect(await repo()).toMatchObject({ name: 'demo', push: true, deliver: 'mr', problems: [] });
+
+    // Without push the repo is disabled; the problem shows on the repo and the config page.
+    writeFile(join(h.home, 'config.yaml'), config('      deliver: mr\n'));
+    h.master.configWatcher.reload();
+    const problem =
+      'deliver: mr 要求 push: true：开 MR 要先把 Run 的分支推送到 GitLab，MR 合并后还要从 GitLab 拉取目标分支';
+    expect(await repo()).toMatchObject({ push: false, deliver: 'mr', problems: [problem] });
+    const { json } = (await call('GET', '/api/config')) as { json: ConfigView };
+    expect(json.errors[gitlabConfigKey('demo')]).toEqual([problem]);
   });
 
   it("tells on GET /api/config where each repo's requirements come from", async () => {

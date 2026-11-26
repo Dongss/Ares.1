@@ -97,6 +97,10 @@ describe('config.yaml examples', () => {
       });
       const backlog = BacklogSchema.parse(parseYaml(backlogExample()).backlog);
       expect(Object.keys(backlog.repos)).toEqual(['my-local-repo']);
+      // Each section shows its own way of delivering through change requests, commented out.
+      expect(githubExample()).toContain('# deliver: pr');
+      expect(gitlabExample()).toContain('# deliver: mr');
+      expect(gitlabExample()).not.toContain('deliver: pr');
     }
   });
 
@@ -409,12 +413,30 @@ describe('how a repo delivers', () => {
     expect(deliveryText({ deliver: 'pr', push: false })).toContain('这个仓库现在停用');
   });
 
+  it('tells a GitLab repo delivering through merge requests', () => {
+    expect(deliveryText({ deliver: 'mr', push: true })).toBe(
+      'MR：推送 Run 的分支、开合并到目标分支的 MR，在 GitLab 上合并后 Run 完成；目标分支不由 Master 推送',
+    );
+    // deliver: mr without push disables the repo, as deliver: pr does.
+    expect(deliveryText({ deliver: 'mr', push: false })).toBe(
+      'MR，但没开 push：deliver: mr 要配 push: true，这个仓库现在停用',
+    );
+  });
+
   it('in English', () => {
     setLang('en');
-    const texts = (['push', 'pr'] as const).flatMap((deliver) =>
+    const texts = (['push', 'pr', 'mr'] as const).flatMap((deliver) =>
       [true, false].map((push) => deliveryText({ deliver, push })),
     );
     expect(texts[2]).toContain('the Master never pushes the target branch');
+    expect(texts[4]).toBe(
+      "Merge request: the Run's branch is pushed with a merge request into the target branch, and the Run completes once it is merged on GitLab; the Master never pushes the target branch",
+    );
+    expect(texts[5]).toBe(
+      'Merge request, but push is off: deliver: mr needs push: true, so the repo is disabled now',
+    );
     for (const text of texts) expect(text).not.toMatch(/[一-鿿]/);
+    // GitHub's words stay out of a GitLab repo's.
+    for (const text of texts.slice(4)) expect(text).not.toMatch(/GitHub|pull request|deliver: pr/);
   });
 });

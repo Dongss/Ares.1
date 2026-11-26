@@ -1,11 +1,12 @@
 import type { ReactNode } from 'react';
-import type { RunSummary } from '../../../src/api/types.js';
+import type { ConfigView, RunSummary } from '../../../src/api/types.js';
 import { ITERATION_OPEN_STATUSES } from '../../../src/config/flow.js';
 import { t } from '../../../src/i18n.js';
-import type { Repo } from '../../../src/store/types.js';
+import type { HostPlatform, Repo } from '../../../src/store/types.js';
 import { IterationCard } from '../components/IterationCard.js';
 import { Badge, Empty, ErrorBox } from '../components/ui.js';
 import { api } from '../lib/api.js';
+import { repoSourceOf } from '../lib/config.js';
 import {
   countRunFilters,
   effectiveRunFilter,
@@ -34,6 +35,7 @@ import {
   prWaitHint,
   prWaitTitle,
   queueRanks,
+  runPlatform,
   runStatusBadge,
   waitingForPr,
 } from '../lib/runs.js';
@@ -42,11 +44,14 @@ export function HomePage({
   runs,
   repos,
   maxRuns,
+  config,
 }: {
   runs: RunSummary[];
   repos: Repo[];
   /** config.yaml's `concurrency.max_runs`; null = no limit, or the configuration is not loaded. */
   maxRuns: number | null;
+  /** Where repos' requirements come from, for the code host of a Run of no issue. */
+  config: Pick<ConfigView, 'repoSources'> | undefined;
 }) {
   const filter = effectiveRunFilter(
     useRunListFilter(),
@@ -57,6 +62,9 @@ export function HomePage({
   // The queue is global. Ranks come from every run, not the filtered list.
   const ranks = queueRanks(runs);
   const repoName = (id: string) => repos.find((r) => r.id === id)?.name ?? id;
+  /** The code host the Run goes with: GitLab's words (MR !N) for its merge request there. */
+  const platformOf = (run: RunSummary) =>
+    runPlatform(run, config ? repoSourceOf(config, repoName(run.repoId)) : null);
   useTick(
     1000,
     sections.some((section) => section.id === 'running' && section.runs.length > 0),
@@ -106,8 +114,9 @@ export function HomePage({
       key={run.id}
       run={run}
       repo={repoName(run.repoId)}
+      platform={platformOf(run)}
       extra={extra}
-      after={waitingForPr(run) ? <PrWaitNote run={run} /> : undefined}
+      after={waitingForPr(run) ? <PrWaitNote run={run} platform={platformOf(run)} /> : undefined}
     />
   );
 
@@ -198,22 +207,23 @@ function queueExtra(run: RunSummary, rank: number | undefined, maxRuns: number |
 }
 
 /**
- * A Run waiting for its pull request: 「等 PR 合并 #N」 linking to it on GitHub. Rendered after the
- * card's link to the Run, since a link cannot sit inside another.
+ * A Run waiting for its pull request: 「等 PR 合并 #N」 linking to it on GitHub, 「等 MR 合并 !N」 on
+ * GitLab (`platform`). Rendered after the card's link to the Run, since a link cannot sit inside
+ * another.
  */
-function PrWaitNote({ run }: { run: RunSummary }) {
+function PrWaitNote({ run, platform }: { run: RunSummary; platform: HostPlatform }) {
   return (
     <div className="run-card-note run-card-after">
       <div className="run-card-note-title">
         {run.pr ? (
           <a href={run.pr.url} target="_blank" rel="noreferrer">
-            {prWaitTitle(run)}
+            {prWaitTitle(run, platform)}
           </a>
         ) : (
-          prWaitTitle(run)
+          prWaitTitle(run, platform)
         )}
       </div>
-      <div className="run-card-note-detail">{prWaitHint()}</div>
+      <div className="run-card-note-detail">{prWaitHint(platform)}</div>
     </div>
   );
 }
@@ -320,13 +330,15 @@ function Section(props: {
 function RunCard(props: {
   run: RunSummary;
   repo: string;
+  /** The code host the Run goes with, whose words its badge uses while it waits for a merge. */
+  platform: HostPlatform;
   /** Inside the link to the Run. */
   extra?: ReactNode;
   /** Below it, outside the link: for content with links of its own. */
   after?: ReactNode;
 }) {
   const { run, repo, extra, after } = props;
-  const status = runStatusBadge(run);
+  const status = runStatusBadge(run, props.platform);
   const finished = run.finishedAt !== null;
   return (
     <div className="run-card">

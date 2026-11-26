@@ -9,6 +9,7 @@ import {
   type AutoAcceptRule,
   backoffMs,
   budgetPauses,
+  changeRequestTerms,
   effectiveBudget,
   issueRunOverrides,
   MAX_ITERATION_CHILDREN,
@@ -18,12 +19,13 @@ import {
   REDO_BACKOFF_MAX_HOURS,
   REPO_WORKFLOWS_DIR,
   redoDelayMs,
+  repoDeliversByPr,
   type TemplateSource,
 } from '../../../src/config/flow.js';
 import { waitText } from '../../../src/engine/discussion.js';
 import { join, t } from '../../../src/i18n.js';
 import { BLOCK_KIND, NOTICE_KINDS, type NoticeKind } from '../../../src/notify/notice.js';
-import type { BlockKind } from '../../../src/store/types.js';
+import type { BlockKind, HostPlatform } from '../../../src/store/types.js';
 import { findRepoTemplate } from './config.js';
 import { buildFlow, type FlowStage } from './flow.js';
 import { formatCost, formatMinutes, type Tone } from './format.js';
@@ -226,32 +228,52 @@ export interface CycleStage {
 }
 
 /**
- * The push step of a repo delivering through pull requests (deliver: pr), `target` the target
- * branch in words: the Master pushes the Run's branch and opens the pull request, a human (or
- * GitHub) merges it, and changes asked for on it, failed checks or a conflict send the Run back
- * for more work. Without push: true the repo is disabled, which the step says.
+ * The push step of a repo delivering through pull requests (deliver: pr on GitHub; deliver: mr,
+ * merge requests, on GitLab: `platform`), `target` the target branch in words: the Master pushes
+ * the Run's branch and opens the pull request, a human (or the code host) merges it, and changes
+ * asked for on it, failed checks or a conflict send the Run back for more work. Without push: true
+ * the repo is disabled, which the step says.
  */
-export function prDeliveryStep(github: Pick<GitHubRepoStatus, 'push'>, target: string): CycleStep {
+export function prDeliveryStep(
+  github: Pick<GitHubRepoStatus, 'push'>,
+  target: string,
+  platform: HostPlatform = 'github',
+): CycleStep {
+  const { host, short, long, deliver } = changeRequestTerms(platform);
+  const gitlab = platform === 'gitlab';
   const id = 'push';
-  const name = t({ zh: '推送并开 PR', en: 'Push and open a PR' });
+  const name = gitlab
+    ? t({ zh: '推送并开 MR', en: 'Push and open an MR' })
+    : t({ zh: '推送并开 PR', en: 'Push and open a PR' });
   if (!github.push) {
     return {
       id,
       name,
       actors: ['human'],
       text: t({
-        zh: 'deliver: pr 要配 push: true：现在没开 push，这个仓库停用，先修好配置',
-        en: 'deliver: pr needs push: true: push is off, so the repo is disabled; fix the configuration first',
+        zh: `deliver: ${deliver} 要配 push: true：现在没开 push，这个仓库停用，先修好配置`,
+        en: `deliver: ${deliver} needs push: true: push is off, so the repo is disabled; fix the configuration first`,
       }),
     };
   }
+  // Who may ask for changes, and what fails: a GitHub repo's members and its CI checks; a GitLab
+  // project's members from Developer up and its pipeline.
+  const asking = gitlab
+    ? t({
+        zh: `项目里 Developer 及以上的成员在 ${short} 上要求修改、流水线没过`,
+        en: 'a member of the project from Developer up asks for changes on it, its pipeline fails',
+      })
+    : t({
+        zh: `仓库成员在 ${short} 上要求修改、CI 没过`,
+        en: 'a member of the repo asks for changes on it, its checks fail',
+      });
   return {
     id,
     name,
     actors: ['master', 'human'],
     text: t({
-      zh: `检查通过后 Master 推送 Run 的分支、开一个合并到${target}的 PR，正文用 Closes 关联 issue；你在 GitHub 上合并它之后，Master 把本地的${target}快进，Run 完成、issue 关闭；仓库成员在 PR 上要求修改、CI 没过或和${target}冲突时，Run 自动回去返工（计入回退上限），改好后推送到同一个 PR；PR 没合并就被关掉时 Run 失败。${target}本身 Master 从不推送`,
-      en: `Once the checks pass, the Master pushes the Run's branch and opens a pull request into ${target}, linked to the issue with Closes; once you merge it on GitHub, the Master fast-forwards the local ${target}, the Run completes and the issue is closed; if a member of the repo asks for changes on it, its checks fail or it conflicts with ${target}, the Run goes back to work on it (counted toward the rollback limit) and pushes the changes to the same pull request; if it is closed unmerged, the Run fails. The Master never pushes ${target} itself`,
+      zh: `检查通过后 Master 推送 Run 的分支、开一个合并到${target}的 ${short}，正文用 Closes 关联 issue；你在 ${host} 上合并它之后，Master 把本地的${target}快进，Run 完成、issue 关闭；${asking}或和${target}冲突时，Run 自动回去返工（计入回退上限），改好后推送到同一个 ${short}；${short} 没合并就被关掉时 Run 失败。${target}本身 Master 从不推送`,
+      en: `Once the checks pass, the Master pushes the Run's branch and opens a ${long} into ${target}, linked to the issue with Closes; once you merge it on ${host}, the Master fast-forwards the local ${target}, the Run completes and the issue is closed; if ${asking} or it conflicts with ${target}, the Run goes back to work on it (counted toward the rollback limit) and pushes the changes to the same ${long}; if it is closed unmerged, the Run fails. The Master never pushes ${target} itself`,
     }),
   };
 }
@@ -522,8 +544,8 @@ export function cycleSteps(input: GuideInput, rule?: AutoAcceptRule): CycleStep[
       })
     : t({ zh: '目标分支', en: 'the target branch' });
   const push =
-    github?.deliver === 'pr'
-      ? prDeliveryStep(github, target)
+    github && repoDeliversByPr(github)
+      ? prDeliveryStep(github, target, input.host.platform)
       : github?.push
         ? step(
             'push',
@@ -798,8 +820,9 @@ export function autonomy(
   );
   const hostName = platformName(input.host.platform);
   add(github?.push === true, t({ zh: `推送到 ${hostName}`, en: `Pushing to ${hostName}` }));
-  if (github?.deliver === 'pr') {
-    you.push(t({ zh: '在 GitHub 上合并 PR', en: 'Merging pull requests on GitHub' }));
+  if (github && repoDeliversByPr(github)) {
+    const { host, short, long } = changeRequestTerms(input.host.platform);
+    you.push(t({ zh: `在 ${host} 上合并 ${short}`, en: `Merging ${long}s on ${host}` }));
   }
   add(canUpgradeItself(input.upgrade), t({ zh: '升级 Master', en: 'Upgrading the Master' }));
   return { auto, you };
@@ -1444,14 +1467,15 @@ export function guardrails(input: GuideInput, working: boolean | undefined): Gua
     }),
   });
 
+  const cr = changeRequestTerms(input.host.platform);
   items.push({
     title: t({ zh: 'git 历史可回退', en: 'Revertible git history' }),
     on: true,
     text:
-      github?.deliver === 'pr'
+      github && repoDeliversByPr(github)
         ? t({
-            zh: 'Run 在单独的 worktree 和分支上做，每个 Task 一个 commit；合并后的任何改动都能用 git revert 回退。目标分支从不强推；只有 ares1/ 开头的 Run 分支会强制推送，让它的 PR 跟上它',
-            en: 'Each Run works in its own worktree and branch, one commit per Task; any merged change can be undone with git revert. The target branch is never force-pushed; only the Runs’ own branches (ares1/…) are, to keep their pull requests up to date',
+            zh: `Run 在单独的 worktree 和分支上做，每个 Task 一个 commit；合并后的任何改动都能用 git revert 回退。目标分支从不强推；只有 ares1/ 开头的 Run 分支会强制推送，让它的 ${cr.short} 跟上它`,
+            en: `Each Run works in its own worktree and branch, one commit per Task; any merged change can be undone with git revert. The target branch is never force-pushed; only the Runs’ own branches (ares1/…) are, to keep their ${cr.long}s up to date`,
           })
         : t({
             zh: 'Run 在单独的 worktree 和分支上做，每个 Task 一个 commit；合并后的任何改动都能用 git revert 回退，推送从不强推',

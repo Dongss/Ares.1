@@ -341,6 +341,66 @@ describe('delivering through pull requests', () => {
   });
 });
 
+describe('delivering through merge requests on GitLab', () => {
+  afterEach(() => setLang('zh'));
+  const GITLAB: IssueHost = { platform: 'gitlab', host: 'gitlab.example.com' };
+  const mrRepo: GitHubRepoStatus = {
+    ...partialRepo,
+    issuesRepo: 'my-group/ares1',
+    deliver: 'mr',
+  };
+  const onGitLab = (repo: GitHubRepoStatus): GuideInput => ({ ...input(repo), host: GITLAB });
+
+  it('pushes the Run branch and opens an MR that a human merges', () => {
+    const push = byId(onGitLab(mrRepo)).push;
+    expect(push?.name).toBe('推送并开 MR');
+    expect(push?.actors).toEqual(['master', 'human']);
+    expect(push?.text).toBe(
+      '检查通过后 Master 推送 Run 的分支、开一个合并到目标分支（main）的 MR，正文用 Closes 关联 issue；你在 GitLab 上合并它之后，Master 把本地的目标分支（main）快进，Run 完成、issue 关闭；项目里 Developer 及以上的成员在 MR 上要求修改、流水线没过或和目标分支（main）冲突时，Run 自动回去返工（计入回退上限），改好后推送到同一个 MR；MR 没合并就被关掉时 Run 失败。目标分支（main）本身 Master 从不推送',
+    );
+    // Without push the repo is disabled.
+    const off = byId(onGitLab({ ...mrRepo, push: false })).push;
+    expect(off?.actors).toEqual(['human']);
+    expect(off?.text).toBe('deliver: mr 要配 push: true：现在没开 push，这个仓库停用，先修好配置');
+    // A GitLab repo that pushes: the push step as before.
+    expect(byId(onGitLab({ ...mrRepo, deliver: 'push' })).push?.name).toBe('推送到 GitLab');
+  });
+
+  it('leaves merging the MR to you, and force-pushes only the Run branches', () => {
+    expect(autonomy(onGitLab(mrRepo)).you).toContain('在 GitLab 上合并 MR');
+    expect(autonomy(onGitLab(partialRepo)).you).not.toContain('在 GitLab 上合并 MR');
+    const history = guardrails(onGitLab(mrRepo), true).find(
+      (g) => g.title === 'git 历史可回退',
+    )?.text;
+    expect(history).toContain('只有 ares1/ 开头的 Run 分支会强制推送，让它的 MR 跟上它');
+  });
+
+  it('in English', () => {
+    setLang('en');
+    const i = onGitLab(mrRepo);
+    const push = byId(i).push;
+    expect(push?.name).toBe('Push and open an MR');
+    expect(push?.text).toContain(
+      "the Master pushes the Run's branch and opens a merge request into the target branch (main)",
+    );
+    expect(push?.text).toContain(
+      'if a member of the project from Developer up asks for changes on it, its pipeline fails or it conflicts with the target branch (main)',
+    );
+    expect(autonomy(i).you).toContain('Merging merge requests on GitLab');
+    const off = byId(onGitLab({ ...mrRepo, push: false })).push;
+    expect(off?.text).toBe(
+      'deliver: mr needs push: true: push is off, so the repo is disabled; fix the configuration first',
+    );
+    const history = guardrails(i, true).find((g) => g.title === 'Revertible git history')?.text;
+    expect(history).toContain('to keep their merge requests up to date');
+    for (const text of [push?.name, push?.text, off?.text, history, ...autonomy(i).you]) {
+      expect(text).toBeTruthy();
+      expect(text).not.toMatch(/[一-鿿]/);
+      expect(text).not.toMatch(/GitHub|pull request|deliver: pr/);
+    }
+  });
+});
+
 describe('the accept step', () => {
   afterEach(() => setLang('zh'));
 
@@ -1259,6 +1319,8 @@ describe('in English', () => {
     autoRepo,
     { ...autoRepo, deliver: 'pr' as const },
     { ...manualRepo, deliver: 'pr' as const },
+    { ...autoRepo, deliver: 'mr' as const },
+    { ...manualRepo, deliver: 'mr' as const },
   ];
 
   it('words the loop, its stages and what is left to you without Chinese', () => {

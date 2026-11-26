@@ -6,11 +6,12 @@ import type {
   RunSummary,
 } from '../../../src/api/types.js';
 import { brandName, brandSlogan } from '../../../src/brand.js';
+import { changeRequestTerms } from '../../../src/config/flow.js';
 import { join, t } from '../../../src/i18n.js';
-import type { Repo } from '../../../src/store/types.js';
+import type { HostPlatform, Repo } from '../../../src/store/types.js';
 import { Badge, Empty, ErrorBox, Pre } from '../components/ui.js';
 import { api } from '../lib/api.js';
-import { BLOCK_KIND, shortSha } from '../lib/format.js';
+import { BLOCK_KIND, blockKindText, shortSha } from '../lib/format.js';
 import {
   ACTOR,
   type Actor,
@@ -835,14 +836,27 @@ function GuardsSection({ input, working }: { input: GuideInput; working: boolean
   );
 }
 
-/** Delivering through pull requests (deliver: pr), for repos whose target branch is protected. */
-function PullRequestFaq({ github }: { github: GitHubRepoStatus | null }) {
+/**
+ * Delivering through pull requests, for repos whose target branch is protected: deliver: pr on
+ * GitHub, deliver: mr (merge requests) on GitLab, the code host of the repo the guide is about
+ * (`platform`).
+ */
+function PullRequestFaq({
+  github,
+  platform,
+}: {
+  github: GitHubRepoStatus | null;
+  platform: HostPlatform;
+}) {
+  const { host, short, long, deliver } = changeRequestTerms(platform);
+  const gitlab = platform === 'gitlab';
+  const section = gitlab ? 'gitlab' : 'github';
   return (
     <div>
       <h3>
         {t({
-          zh: '目标分支受保护、只能走 PR 怎么办？',
-          en: 'What if the target branch is protected and only takes pull requests?',
+          zh: `目标分支受保护、只能走 ${short} 怎么办？`,
+          en: `What if the target branch is protected and only takes ${long}s?`,
         })}
       </h3>
       {github && (
@@ -855,44 +869,52 @@ function PullRequestFaq({ github }: { github: GitHubRepoStatus | null }) {
         {t({
           zh: (
             <>
-              在 <code>config.yaml</code> 的 <code>github.repos.&lt;仓库名&gt;</code> 里写{' '}
-              <code>deliver: pr</code>（要同时配 <code>push: true</code>
-              ，不然这个仓库停用），保存后生效。 GitHub 上的 CI 和评审照常起作用：
+              在 <code>config.yaml</code> 的 <code>{section}.repos.&lt;仓库名&gt;</code> 里写{' '}
+              <code>deliver: {deliver}</code>（要同时配 <code>push: true</code>
+              ，不然这个仓库停用），保存后生效。 {host} 上的
+              {gitlab ? '流水线、评审和审批' : ' CI 和评审'}照常起作用：
             </>
           ),
           en: (
             <>
-              Set <code>deliver: pr</code> under <code>github.repos.&lt;repo name&gt;</code> in{' '}
-              <code>config.yaml</code> (with <code>push: true</code>, or the repo is disabled); it
-              takes effect when saved. CI and reviews on GitHub work as usual:
+              Set <code>deliver: {deliver}</code> under{' '}
+              <code>{section}.repos.&lt;repo name&gt;</code> in <code>config.yaml</code> (with{' '}
+              <code>push: true</code>, or the repo is disabled); it takes effect when saved.{' '}
+              {gitlab ? 'Pipelines, reviews and approvals' : 'CI and reviews'} on {host} work as
+              usual:
             </>
           ),
         })}
       </p>
-      <Pre>{'github:\n  repos:\n    my-repo:\n      push: true\n      deliver: pr'}</Pre>
+      <Pre>{`${section}:\n  repos:\n    my-repo:\n      push: true\n      deliver: ${deliver}`}</Pre>
       <ul className="guide-list">
         <li>
           {t({
-            zh: '合并阶段照常把目标分支的新提交合进 Run 的分支、跑检查，但不动本地的目标分支；Master 下次检查 GitHub 时推送 Run 的分支（ares1/ 开头，会强制推送），开一个合并到目标分支的 PR（已经有开着的就接着用），正文用 Closes 关联 issue。',
-            en: "The merge stage still merges the target branch's new commits into the Run's branch and runs the checks, but leaves the local target branch alone; at its next GitHub check the Master pushes the Run's branch (ares1/…, force-pushed) and opens a pull request into the target branch (or keeps using one already open), linked to the issue with Closes.",
+            zh: `合并阶段照常把目标分支的新提交合进 Run 的分支、跑检查，但不动本地的目标分支；Master 下次检查 ${host} 时推送 Run 的分支（ares1/ 开头，会强制推送），开一个合并到目标分支的 ${short}（已经有开着的就接着用），正文用 Closes 关联 issue。`,
+            en: `The merge stage still merges the target branch's new commits into the Run's branch and runs the checks, but leaves the local target branch alone; at its next ${host} check the Master pushes the Run's branch (ares1/…, force-pushed) and opens a ${long} into the target branch (or keeps using one already open), linked to the issue with Closes.`,
           })}
         </li>
         <li>
           {t({
-            zh: `Run 随后进入「${BLOCK_KIND.pr_open}」：不占执行名额，没有可以重试的，不算卡住，Master 重启后由每轮检查接着等。`,
-            en: `The Run then shows "${BLOCK_KIND.pr_open}": it takes no execution slot, has nothing to retry and is not stuck; after a Master restart each check goes on waiting.`,
+            zh: `Run 随后进入「${blockKindText('pr_open', platform)}」：不占执行名额，没有可以重试的，不算卡住，Master 重启后由每轮检查接着等。`,
+            en: `The Run then shows "${blockKindText('pr_open', platform)}": it takes no execution slot, has nothing to retry and is not stuck; after a Master restart each check goes on waiting.`,
           })}
         </li>
         <li>
-          {t({
-            zh: 'PR 在 GitHub 上合并后（merge、squash、rebase 都行），Master 把本地的目标分支快进到 GitHub 上的提交，Run 完成、issue 关闭。',
-            en: 'Once the pull request is merged on GitHub (by a merge, a squash or a rebase), the Master fast-forwards the local target branch to GitHub’s, the Run completes and the issue is closed.',
-          })}
+          {gitlab
+            ? t({
+                zh: 'MR 在 GitLab 上合并后（合并方式不限），Master 把本地的目标分支快进到 GitLab 上的提交，Run 完成、issue 关闭（GitLab 没自动关 issue 时 Master 自己关）。',
+                en: 'Once the merge request is merged on GitLab (by whichever merge method), the Master fast-forwards the local target branch to GitLab’s, the Run completes and the issue is closed (by the Master when GitLab does not close it).',
+              })
+            : t({
+                zh: 'PR 在 GitHub 上合并后（merge、squash、rebase 都行），Master 把本地的目标分支快进到 GitHub 上的提交，Run 完成、issue 关闭。',
+                en: 'Once the pull request is merged on GitHub (by a merge, a squash or a rebase), the Master fast-forwards the local target branch to GitHub’s, the Run completes and the issue is closed.',
+              })}
         </li>
         <li>
           {t({
-            zh: 'PR 没合并就被关掉时，Run 结束为失败并通知你；还有重做次数（max_run_attempts）时 issue 自动重做，重做的 Run 开新的 PR。Run 没做完就结束（失败、被终止，或因 issue 被关掉、内容改了而终止）时，Master 下次检查 GitHub 时关掉它还开着的 PR，并在 PR 上说明原因，所以一个 issue 同时只有一个开着的 PR；已经合并的 PR 不动。',
-            en: 'If the pull request is closed unmerged, the Run ends as failed and you are notified; while attempts remain (max_run_attempts) the issue is redone, and the new Run opens a new pull request. When a Run ends unfinished (it failed, was cancelled, or was terminated because its issue was closed or changed), the Master closes the pull request it left open at its next GitHub check and says why on it, so an issue has one open pull request at a time; one already merged is left alone.',
+            zh: `${short} 没合并就被关掉时，Run 结束为失败并通知你；还有重做次数（max_run_attempts）时 issue 自动重做，重做的 Run 开新的 ${short}。Run 没做完就结束（失败、被终止，或因 issue 被关掉、内容改了而终止）时，Master 下次检查 ${host} 时关掉它还开着的 ${short}，并在 ${short} 上说明原因，所以一个 issue 同时只有一个开着的 ${short}；已经合并的 ${short} 不动。`,
+            en: `If the ${long} is closed unmerged, the Run ends as failed and you are notified; while attempts remain (max_run_attempts) the issue is redone, and the new Run opens a new ${long}. When a Run ends unfinished (it failed, was cancelled, or was terminated because its issue was closed or changed), the Master closes the ${long} it left open at its next ${host} check and says why on it, so an issue has one open ${long} at a time; one already merged is left alone.`,
           })}
         </li>
         <li>
@@ -1019,7 +1041,7 @@ function FaqSection(props: { input: GuideInput; home: string; idle: string[] }) 
           </li>
         </ul>
       </div>
-      <PullRequestFaq github={github} />
+      <PullRequestFaq github={github} platform={input.host.platform} />
       <div>
         <h3>{t({ zh: '怎么让它完全停下来？', en: 'How do I stop it completely?' })}</h3>
         <ul className="guide-list">
