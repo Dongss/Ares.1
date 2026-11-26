@@ -13,7 +13,8 @@ import {
   type HostComment,
   type HostIssue,
   type LabelDef,
-  type ReviewDecision,
+  type ReviewState,
+  type ReviewVerdict,
 } from '../src/host/code-host.js';
 import { Master, type MasterOptions } from '../src/master.js';
 import type { Repo, Run, RunStatus } from '../src/store/types.js';
@@ -345,13 +346,12 @@ export interface FakeReview {
   author: string | null;
   /** GitHub's authorAssociation, e.g. OWNER or NONE. */
   association: string;
-  /** APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED or PENDING. */
-  state: string;
+  state: ReviewState;
   body: string;
   /** The commit reviewed; defaults to the pull request's head. */
   commit?: string | null;
-  /** The pull request's reviewDecision afterwards; left as it is when omitted. */
-  reviewDecision?: ReviewDecision | null;
+  /** The pull request's review verdict afterwards; left as it is when omitted. */
+  reviewVerdict?: ReviewVerdict | null;
 }
 
 /** A review comment a human writes on a line of FakeGitHub's pull request (`commentPull`). */
@@ -632,7 +632,7 @@ export class FakeGitHub implements CodeHost {
       headRefName: pr.head,
       baseRefName: pr.base,
       headRefOid,
-      reviewDecision: null,
+      reviewVerdict: null,
       reviews: [],
       reviewComments: [],
       checks: [],
@@ -660,7 +660,7 @@ export class FakeGitHub implements CodeHost {
 
   /**
    * A human submits a review on the pull request, on its head commit unless `commit` says
-   * otherwise; `reviewDecision`, when given, is what GitHub makes of the reviews afterwards.
+   * otherwise; `reviewVerdict`, when given, is what GitHub makes of the reviews afterwards.
    */
   reviewPull(number: number, review: FakeReview): void {
     const pull = this.pull(number);
@@ -669,9 +669,9 @@ export class FakeGitHub implements CodeHost {
       state: review.state,
       body: review.body,
       commit: review.commit === undefined ? pull.headRefOid : review.commit,
-      submittedAt: review.state === 'PENDING' ? null : new Date().toISOString(),
+      submittedAt: review.state === 'pending' ? null : new Date().toISOString(),
     });
-    if (review.reviewDecision !== undefined) pull.reviewDecision = review.reviewDecision;
+    if (review.reviewVerdict !== undefined) pull.reviewVerdict = review.reviewVerdict;
   }
 
   /** A human comments on a line of the pull request's changes, of its head unless told. */
@@ -692,8 +692,8 @@ export class FakeGitHub implements CodeHost {
   }
 
   /** What GitHub makes of the reviews, e.g. after a human dismissed one. */
-  setReviewDecision(number: number, value: ReviewDecision | null): void {
-    this.pull(number).reviewDecision = value;
+  setReviewVerdict(number: number, value: ReviewVerdict | null): void {
+    this.pull(number).reviewVerdict = value;
   }
 
   /**
@@ -744,7 +744,7 @@ function pullStatusView(pull: FakePull): ChangeRequestStatus {
   return {
     ...pullView(pull),
     headRefOid: pull.headRefOid,
-    reviewDecision: pull.reviewDecision,
+    reviewVerdict: pull.reviewVerdict,
     reviews: pull.reviews.map((r) => ({ ...r })),
     reviewComments: pull.state === 'open' ? pull.reviewComments.map((c) => ({ ...c })) : [],
     checks: pull.checks.map((c) => ({ ...c })),

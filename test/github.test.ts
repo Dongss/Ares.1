@@ -103,6 +103,7 @@ import {
   done,
   FakeGitHub,
   type FakeIssue,
+  type FakeReview,
   git,
   type Harness,
   harness,
@@ -5387,16 +5388,22 @@ describe('issues: delivering through pull requests (deliver: pr)', () => {
     describe('when the pull request needs more work', () => {
       const SAID = 'Run 带着这些反馈回去修改';
       const reworkComments = () => gh.get(1).comments.filter((c) => c.includes(SAID));
-      /** A review asking for changes, after which GitHub's reviewDecision says so. */
-      const changesBy = (author: string, association: string, body: string) => ({
+      /** A review asking for changes, after which GitHub's verdict on the reviews says so. */
+      const changesBy = (author: string, association: string, body: string): FakeReview => ({
         author,
         association,
-        state: 'CHANGES_REQUESTED',
+        state: 'changes_requested',
         body,
-        reviewDecision: 'CHANGES_REQUESTED' as const,
+        reviewVerdict: 'changes_requested',
       });
       const BUILD_URL = 'https://github.com/me/demo/actions/runs/1';
-      const failedBuild = { name: 'build', done: true, conclusion: 'FAILURE', url: BUILD_URL };
+      const failedBuild = {
+        name: 'build',
+        done: true,
+        failed: true,
+        conclusion: 'FAILURE',
+        url: BUILD_URL,
+      };
       /**
        * The coder's prompts, round by round. Each round writes feature.txt anew, so the Run
        * delivers a new commit each time, unless `same`; the rounds after the first wait for
@@ -5490,7 +5497,7 @@ describe('issues: delivering through pull requests (deliver: pr)', () => {
         const prompts = coderPrompts(t);
         const { run, pull } = await prOpened(t);
         const pr = { number: pull.number, url: pull.url };
-        const lint = { name: 'lint', done: false, conclusion: null, url: null };
+        const lint = { name: 'lint', done: false, failed: false, conclusion: null, url: null };
         gh.setChecks(pull.number, [failedBuild, lint]);
         await t.master.issues.poll();
         await t.master.issues.poll();
@@ -5683,9 +5690,9 @@ describe('issues: delivering through pull requests (deliver: pr)', () => {
         gh.reviewPull(pull.number, {
           author: 'alice',
           association: 'COLLABORATOR',
-          state: 'APPROVED',
+          state: 'approved',
           body: '没问题了',
-          reviewDecision: 'APPROVED',
+          reviewVerdict: 'approved',
         });
         await t.master.issues.poll();
         expect(store.getRun(run.id)).toMatchObject({ status: 'blocked', blocked: run.blocked });
@@ -5694,8 +5701,8 @@ describe('issues: delivering through pull requests (deliver: pr)', () => {
         // dismissed.
         gh.reviewPull(pull.number, changesBy('bob', 'MEMBER', '不行'));
         const dismissed = gh.pull(pull.number).reviews.at(-1);
-        if (dismissed) dismissed.state = 'DISMISSED';
-        gh.setReviewDecision(pull.number, 'APPROVED');
+        if (dismissed) dismissed.state = 'dismissed';
+        gh.setReviewVerdict(pull.number, 'approved');
         await t.master.issues.poll();
         expect(store.getRun(run.id)).toMatchObject({ status: 'blocked', blocked: run.blocked });
         expect(eventData(t, run.id, 'github.pr_rework')).toEqual([]);

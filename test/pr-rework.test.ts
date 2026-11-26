@@ -1,7 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import {
-  checkFailed,
-  FAILED_CHECK_CONCLUSIONS,
   judgePullRequest,
   type PrReworkContext,
   pullRequestPushPending,
@@ -33,7 +31,7 @@ function pull(over: Partial<ChangeRequestStatus> = {}): ChangeRequestStatus {
     headRefName: 'ares1/run-1',
     baseRefName: 'main',
     headRefOid: HEAD,
-    reviewDecision: null,
+    reviewVerdict: null,
     reviews: [],
     reviewComments: [],
     checks: [],
@@ -46,7 +44,7 @@ function review(over: Partial<HostReview> = {}): HostReview {
     author: 'alice',
     trusted: true,
     role: 'MEMBER',
-    state: 'CHANGES_REQUESTED',
+    state: 'changes_requested',
     body: 'Please handle the empty list.',
     commit: HEAD,
     submittedAt: '2026-11-25T00:00:00Z',
@@ -71,11 +69,16 @@ function check(over: Partial<HostCheck> = {}): HostCheck {
   return {
     name: 'build',
     done: true,
+    failed: false,
     conclusion: 'SUCCESS',
     url: 'https://ci.example/build/1',
     ...over,
   };
 }
+
+/** A check that finished and failed, as the host's client tells it. */
+const failing = (over: Partial<HostCheck> = {}): HostCheck =>
+  check({ failed: true, conclusion: 'FAILURE', ...over });
 
 const ctx = (over: Partial<PrReworkContext> = {}): PrReworkContext => ({
   head: HEAD,
@@ -86,7 +89,7 @@ const ctx = (over: Partial<PrReworkContext> = {}): PrReworkContext => ({
 
 describe('judgePullRequest', () => {
   it('finds nothing on a clean pull request', () => {
-    const pr = pull({ checks: [check()], reviews: [review({ state: 'APPROVED', body: '' })] });
+    const pr = pull({ checks: [check()], reviews: [review({ state: 'approved', body: '' })] });
     expect(judgePullRequest(pr, ctx())).toEqual({ rework: null, ignored: [] });
   });
 
@@ -113,7 +116,7 @@ describe('judgePullRequest', () => {
   describe('review', () => {
     it("reworks a trusted reviewer's request for changes on the head, with their line comments", () => {
       const pr = pull({
-        reviewDecision: 'CHANGES_REQUESTED',
+        reviewVerdict: 'changes_requested',
         reviews: [review()],
         reviewComments: [
           lineComment(),
@@ -200,17 +203,17 @@ describe('judgePullRequest', () => {
 
     it("counts each reviewer's latest stance: an approval or a dismissal ends a request", () => {
       const approved = pull({
-        reviews: [review(), review({ state: 'APPROVED', body: 'Fine now.' })],
+        reviews: [review(), review({ state: 'approved', body: 'Fine now.' })],
       });
       expect(judgePullRequest(approved, ctx()).rework).toBeNull();
-      const dismissed = pull({ reviews: [review({ state: 'DISMISSED' })] });
+      const dismissed = pull({ reviews: [review({ state: 'dismissed' })] });
       expect(judgePullRequest(dismissed, ctx()).rework).toBeNull();
       // A comment or a pending review leaves the request standing; logins match in any case.
       const commented = pull({
         reviews: [
           review({ author: 'Alice' }),
-          review({ state: 'COMMENTED', body: 'Also a typo.' }),
-          review({ state: 'PENDING', submittedAt: null }),
+          review({ state: 'commented', body: 'Also a typo.' }),
+          review({ state: 'pending', submittedAt: null }),
         ],
       });
       const rework = judgePullRequest(commented, ctx()).rework;
@@ -218,15 +221,15 @@ describe('judgePullRequest', () => {
       expect(rework?.feedback).not.toContain('Also a typo.');
       // A newer request replaces an approval.
       const again = pull({
-        reviews: [review({ state: 'APPROVED', body: '' }), review({ body: 'One more thing.' })],
+        reviews: [review({ state: 'approved', body: '' }), review({ body: 'One more thing.' })],
       });
       expect(judgePullRequest(again, ctx()).rework?.feedback).toContain('> One more thing.');
     });
 
-    it('reworks nothing once GitHub says it is approved or needs a review again', () => {
-      for (const reviewDecision of ['APPROVED', 'REVIEW_REQUIRED'] as const) {
+    it('reworks nothing once the host says it is approved or needs a review again', () => {
+      for (const reviewVerdict of ['approved', 'review_required'] as const) {
         const pr = pull({
-          reviewDecision,
+          reviewVerdict,
           reviews: [review(), review({ author: 'mallory', trusted: false, role: 'NONE' })],
         });
         expect(judgePullRequest(pr, ctx())).toEqual({ rework: null, ignored: [] });
@@ -261,8 +264,8 @@ describe('judgePullRequest', () => {
       const pr = pull({
         checks: [
           check(),
-          check({ name: 'test', conclusion: 'FAILURE', url: 'https://ci.example/test/2' }),
-          check({ name: 'lint', conclusion: 'TIMED_OUT', url: null }),
+          failing({ name: 'test', url: 'https://ci.example/test/2' }),
+          failing({ name: 'lint', conclusion: 'TIMED_OUT', url: null }),
           check({ name: 'docs', conclusion: 'SKIPPED' }),
           check({ name: 'deploy', conclusion: 'NEUTRAL' }),
         ],
@@ -284,10 +287,7 @@ describe('judgePullRequest', () => {
 
     it('waits while a check still runs', () => {
       const pr = pull({
-        checks: [
-          check({ conclusion: 'FAILURE' }),
-          check({ name: 'test', done: false, conclusion: null }),
-        ],
+        checks: [failing(), check({ name: 'test', done: false, conclusion: null })],
       });
       expect(judgePullRequest(pr, ctx()).rework).toBeNull();
     });
@@ -298,21 +298,21 @@ describe('judgePullRequest', () => {
       expect(judgePullRequest(passed, ctx()).rework).toBeNull();
     });
 
-    it('takes every failing conclusion, in any case', () => {
-      for (const conclusion of FAILED_CHECK_CONCLUSIONS) {
-        expect(checkFailed(check({ conclusion }))).toBe(true);
-        expect(checkFailed(check({ conclusion: conclusion.toLowerCase() }))).toBe(true);
-      }
-      for (const conclusion of ['SUCCESS', 'NEUTRAL', 'SKIPPED', 'STALE']) {
-        expect(checkFailed(check({ conclusion }))).toBe(false);
-      }
-      expect(checkFailed(check({ done: false, conclusion: null }))).toBe(false);
+    it("goes by whether the host's client counts a check as failed, showing its conclusion", () => {
+      // The client knows the platform's conclusions; the judgement does not read them.
+      const passed = pull({ checks: [check({ conclusion: 'FAILURE' })] });
+      expect(judgePullRequest(passed, ctx()).rework).toBeNull();
+      const broken = pull({ checks: [failing({ conclusion: 'broken' })] });
+      const rework = judgePullRequest(broken, ctx()).rework;
+      expect(rework).toMatchObject({ kinds: ['ci'], checks: [{ name: 'build' }] });
+      expect(rework?.feedback).toContain('- `build`（broken）：https://ci.example/build/1');
+      // Without a conclusion the parentheses stay empty.
+      const bare = pull({ checks: [failing({ conclusion: null, url: null })] });
+      expect(judgePullRequest(bare, ctx()).rework?.feedback).toContain('- `build`（）\n');
     });
 
     it('names at most five failed checks in the reason', () => {
-      const checks = Array.from({ length: 7 }, (_, i) =>
-        check({ name: `job${i + 1}`, conclusion: 'FAILURE' }),
-      );
+      const checks = Array.from({ length: 7 }, (_, i) => failing({ name: `job${i + 1}` }));
       const rework = judgePullRequest(pull({ checks }), ctx()).rework;
       expect(rework?.checks).toHaveLength(7);
       expect(rework?.reason).toBe('CI 检查没通过：job1、job2、job3、job4、job5 等 7 个');
@@ -334,7 +334,7 @@ describe('judgePullRequest', () => {
     const pr = pull({
       mergeable: false,
       reviews: [review()],
-      checks: [check({ conclusion: 'FAILURE' })],
+      checks: [failing()],
     });
     const rework = judgePullRequest(pr, ctx()).rework;
     expect(rework).toMatchObject({
@@ -354,7 +354,7 @@ describe('judgePullRequest', () => {
     const pr = pull({
       mergeable: false,
       reviews: [review()],
-      checks: [check({ conclusion: 'FAILURE' })],
+      checks: [failing()],
     });
     const once = judgePullRequest(pr, ctx({ done: [{ head: HEAD, kinds: ['conflict', 'ci'] }] }));
     expect(once.rework).toMatchObject({ kinds: ['review'], reviewers: ['alice'], checks: [] });
@@ -390,9 +390,7 @@ describe('judgePullRequest', () => {
         lineComment(),
         ...Array.from({ length: 30 }, (_, i) => lineComment({ line: i + 20 })),
       ],
-      checks: Array.from({ length: 6 }, (_, i) =>
-        check({ name: `job${i + 1}`, conclusion: 'FAILURE' }),
-      ),
+      checks: Array.from({ length: 6 }, (_, i) => failing({ name: `job${i + 1}` })),
     });
     const rework = judgePullRequest(pr, ctx()).rework;
     expect(rework?.feedback).toContain(`Pull request #9 needs more work: ${URL}`);
@@ -411,7 +409,7 @@ describe('judgePullRequest', () => {
     );
     expect(rework?.feedback).not.toMatch(CJK);
     expect(rework?.reason).not.toMatch(CJK);
-    const single = judgePullRequest(pull({ checks: [check({ conclusion: 'ERROR' })] }), ctx());
+    const single = judgePullRequest(pull({ checks: [failing({ conclusion: 'ERROR' })] }), ctx());
     expect(single.rework?.reason).toBe('a failed check: build');
     expect(single.rework?.feedback).not.toMatch(CJK);
   });
@@ -463,7 +461,7 @@ describe('reworksDone', () => {
   });
 
   it('is what judgePullRequest goes by', () => {
-    const asked = pull({ checks: [check({ conclusion: 'FAILURE' })] });
+    const asked = pull({ checks: [failing()] });
     const events = [{ type: 'github.pr_rework', data: { head: HEAD, kinds: ['ci'] } }];
     expect(judgePullRequest(asked, ctx({ done: reworksDone(events) })).rework).toBeNull();
   });

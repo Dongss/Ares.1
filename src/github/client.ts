@@ -11,7 +11,8 @@ import {
   type HostIssue,
   type HostReviewComment,
   type LabelDef,
-  type ReviewDecision,
+  type ReviewState,
+  type ReviewVerdict,
 } from '../host/code-host.js';
 import { t } from '../i18n.js';
 
@@ -226,33 +227,62 @@ const RawReviewComments = z.array(
   }),
 );
 
+/**
+ * Conclusions of a finished check (of a check run, or the state of a commit status) that mean it
+ * failed, whatever the case; the others (SUCCESS, NEUTRAL, SKIPPED, ...) do not.
+ */
+const FAILED_CHECK_CONCLUSIONS: readonly string[] = [
+  'FAILURE',
+  'TIMED_OUT',
+  'CANCELLED',
+  'ACTION_REQUIRED',
+  'STARTUP_FAILURE',
+  'ERROR',
+];
+
+/** A check, with how GitHub says it finished (`outcome`) kept only once it is done. */
+function githubCheck(
+  name: string,
+  done: boolean,
+  outcome: string | null,
+  url: string | null,
+): HostCheck {
+  const conclusion = done ? outcome : null;
+  const failed = conclusion !== null && FAILED_CHECK_CONCLUSIONS.includes(conclusion.toUpperCase());
+  return { name, done, failed, conclusion, url };
+}
+
 function fromRawCheck(raw: RawCheck): HostCheck {
   if (raw.__typename === 'CheckRun') {
     const done = raw.status === 'COMPLETED';
-    return {
-      name: raw.name,
-      done,
-      conclusion: done ? raw.conclusion || null : null,
-      url: raw.detailsUrl || null,
-    };
+    return githubCheck(raw.name, done, raw.conclusion || null, raw.detailsUrl || null);
   }
   const done = raw.state !== 'PENDING' && raw.state !== 'EXPECTED';
-  return {
-    name: raw.context,
-    done,
-    conclusion: done ? raw.state : null,
-    url: raw.targetUrl || null,
-  };
+  return githubCheck(raw.context, done, raw.state, raw.targetUrl || null);
 }
 
-const REVIEW_DECISIONS: readonly string[] = [
-  'CHANGES_REQUESTED',
-  'APPROVED',
-  'REVIEW_REQUIRED',
-] satisfies ReviewDecision[];
+/** GitHub's reviewDecision of a pull request, by the neutral verdict it means. */
+const REVIEW_VERDICTS: ReadonlyMap<string, ReviewVerdict> = new Map([
+  ['APPROVED', 'approved'],
+  ['CHANGES_REQUESTED', 'changes_requested'],
+  ['REVIEW_REQUIRED', 'review_required'],
+]);
 
-function isReviewDecision(value: string | null | undefined): value is ReviewDecision {
-  return typeof value === 'string' && REVIEW_DECISIONS.includes(value);
+/** GitHub's state of a review, by the neutral state it means. */
+const REVIEW_STATES: ReadonlyMap<string, ReviewState> = new Map([
+  ['APPROVED', 'approved'],
+  ['CHANGES_REQUESTED', 'changes_requested'],
+  ['COMMENTED', 'commented'],
+  ['DISMISSED', 'dismissed'],
+  ['PENDING', 'pending'],
+]);
+
+/**
+ * The state of a review, whatever the case. One GitHub may add later is taken as a comment: it
+ * leaves the reviewer's stance as it was.
+ */
+function reviewState(state: string): ReviewState {
+  return REVIEW_STATES.get(state.toUpperCase()) ?? 'commented';
 }
 
 /**
@@ -588,10 +618,11 @@ export class GhCli implements CodeHost {
     return {
       ...pr,
       headRefOid: raw.headRefOid,
-      reviewDecision: isReviewDecision(raw.reviewDecision) ? raw.reviewDecision : null,
+      // A decision GitHub may add later, or none (empty), is no verdict the Master knows.
+      reviewVerdict: REVIEW_VERDICTS.get(raw.reviewDecision ?? '') ?? null,
       reviews: (raw.reviews ?? []).map((r) => ({
         ...githubAuthor(r.author?.login, r.authorAssociation),
-        state: r.state,
+        state: reviewState(r.state),
         body: r.body ?? '',
         commit: r.commit?.oid || null,
         submittedAt: r.submittedAt || null,

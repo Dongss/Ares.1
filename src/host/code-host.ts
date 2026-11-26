@@ -63,10 +63,16 @@ export interface ChangeRequest {
   baseRefName: string;
 }
 
+/**
+ * What a review of a change request says. approved and changes_requested are the reviewer's
+ * stance; commented takes none (nor does any state the client does not know); dismissed is a
+ * stance somebody set aside; pending is not submitted yet.
+ */
+export type ReviewState = 'approved' | 'changes_requested' | 'commented' | 'dismissed' | 'pending';
+
 /** A review of a change request. */
 export interface HostReview extends HostAuthored {
-  /** As GitHub gives it: APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED or PENDING. */
-  state: string;
+  state: ReviewState;
   body: string;
   /** The commit it reviewed; null when the host gives none. */
   commit: string | null;
@@ -91,23 +97,31 @@ export interface HostCheck {
   /** Whether it has finished. */
   done: boolean;
   /**
-   * How it finished, as GitHub gives it: SUCCESS, FAILURE, TIMED_OUT, CANCELLED,
-   * ACTION_REQUIRED, STARTUP_FAILURE, ERROR, NEUTRAL, SKIPPED, ...; null while not done.
+   * Whether it finished and the platform counts how as a failure; each client works it out by its
+   * platform's rules. Always false while not done.
+   */
+  failed: boolean;
+  /**
+   * How it finished as the platform words it, to show to people (on GitHub e.g. SUCCESS, FAILURE
+   * or TIMED_OUT); null while not done.
    */
   conclusion: string | null;
   /** Where to see it; null when the host gives no link. */
   url: string | null;
 }
 
-/** Where a change request stands with the reviews its base branch requires. */
-export type ReviewDecision = 'CHANGES_REQUESTED' | 'APPROVED' | 'REVIEW_REQUIRED';
+/**
+ * Where a change request stands with the reviews its base branch requires: approved, changes
+ * requested, or a review still required (as when the request for changes was dismissed).
+ */
+export type ReviewVerdict = 'approved' | 'changes_requested' | 'review_required';
 
 /** A change request with what was said and checked on it: whether it needs more work. */
 export interface ChangeRequestStatus extends ChangeRequest {
   /** The commit its head branch points at. */
   headRefOid: string;
   /** null when the host gives none, as when the base branch requires no reviews. */
-  reviewDecision: ReviewDecision | null;
+  reviewVerdict: ReviewVerdict | null;
   /** Oldest first. */
   reviews: HostReview[];
   /** The latest (up to 100), oldest first; always empty once merged or closed. */

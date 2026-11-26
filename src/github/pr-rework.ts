@@ -1,12 +1,14 @@
 // Whether a Run's open pull request (deliver: pr) needs more work, and the feedback that hands it
-// back to the coding agent. Pure logic: what GitHub reported on the pull request and what the Run
-// has already reworked go in, the judgement comes out.
+// back to the coding agent. Pure logic: what the code host reported on the change request, in the
+// neutral terms of its client (review verdict and states, failed checks, conflicts), and what the
+// Run has already reworked go in, the judgement comes out.
 
 import type {
   ChangeRequestStatus,
   HostCheck,
   HostReview,
   HostReviewComment,
+  ReviewState,
 } from '../host/code-host.js';
 import { join, t } from '../i18n.js';
 import { type EventRow, PR_REWORK_KINDS, type PrReworkKind } from '../store/types.js';
@@ -21,30 +23,8 @@ export type { PrReworkKind };
  */
 const KIND_ORDER: readonly PrReworkKind[] = PR_REWORK_KINDS;
 
-/**
- * Conclusions of a finished check that mean it failed; the others (SUCCESS, NEUTRAL, SKIPPED, ...)
- * do not.
- */
-export const FAILED_CHECK_CONCLUSIONS: readonly string[] = [
-  'FAILURE',
-  'TIMED_OUT',
-  'CANCELLED',
-  'ACTION_REQUIRED',
-  'STARTUP_FAILURE',
-  'ERROR',
-];
-
-/** Whether a check finished and failed. */
-export function checkFailed(check: HostCheck): boolean {
-  return (
-    check.done &&
-    check.conclusion !== null &&
-    FAILED_CHECK_CONCLUSIONS.includes(check.conclusion.toUpperCase())
-  );
-}
-
-/** Review states that say where a reviewer stands; COMMENTED and PENDING leave it as it was. */
-const STANCES: readonly string[] = ['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'];
+/** Review states that say where a reviewer stands; commented and pending leave it as it was. */
+const STANCES: readonly ReviewState[] = ['approved', 'changes_requested', 'dismissed'];
 
 /**
  * A review asking for changes on the pull request's head by someone the Master does not trust:
@@ -65,7 +45,7 @@ export interface IgnoredReview {
 /** A failed check of the pull request's head. */
 export interface PrReworkCheck {
   name: string;
-  /** Where to see it; null when GitHub gives no link. */
+  /** Where to see it; null when the host gives no link. */
   url: string | null;
 }
 
@@ -118,13 +98,13 @@ const MAX_REASON_CHECKS = 5;
  * answered by the commits since, and a head the Run did not push is not its work to judge.
  *
  * - review: a reviewer the Master trusts (`isTrusted`) asks for changes. Each reviewer counts
- *   with their latest review that takes a stance (APPROVED, CHANGES_REQUESTED, DISMISSED), and it
- *   must be on the head. When GitHub's reviewDecision is APPROVED or REVIEW_REQUIRED somebody
- *   approved or dismissed it since, so nothing triggers. Reviews by people the Master does not
- *   trust go to `ignored`, without their text.
- * - ci: every check of the head finished, and at least one failed (`checkFailed`). None while a
- *   check still runs, nor when there are no checks.
- * - conflict: GitHub found it conflicts with its base (mergeable false); not while unknown.
+ *   with their latest review that takes a stance (approved, changes_requested, dismissed), and it
+ *   must be on the head. When the host's verdict on the reviews is approved or review_required
+ *   somebody approved or dismissed it since, so nothing triggers. Reviews by people the Master
+ *   does not trust go to `ignored`, without their text.
+ * - ci: every check of the head finished, and at least one failed (`failed`, as the host's client
+ *   tells it). None while a check still runs, nor when there are no checks.
+ * - conflict: the host found it conflicts with its base (mergeable false); not while unknown.
  *
  * A kind already reworked on the same head (`ctx.done`) does not count again.
  */
@@ -133,18 +113,16 @@ export function judgePullRequest(pr: ChangeRequestStatus, ctx: PrReworkContext):
   if (pr.state !== 'open' || ctx.head === null || head !== ctx.head) {
     return { rework: null, ignored: [] };
   }
-  const decided = pr.reviewDecision === null || pr.reviewDecision === 'CHANGES_REQUESTED';
+  const decided = pr.reviewVerdict === null || pr.reviewVerdict === 'changes_requested';
   const asking = decided
-    ? latestStances(pr.reviews).filter(
-        (r) => r.state.toUpperCase() === 'CHANGES_REQUESTED' && r.commit === head,
-      )
+    ? latestStances(pr.reviews).filter((r) => r.state === 'changes_requested' && r.commit === head)
     : [];
   const reviews = asking.filter((r) => isTrusted(r, ctx.master));
   const ignored = asking
     .filter((r) => !isTrusted(r, ctx.master))
     .map((r) => ({ author: r.author, association: r.role, commit: r.commit }));
   const finished = pr.checks.length > 0 && pr.checks.every((c) => c.done);
-  const failed = finished ? pr.checks.filter(checkFailed) : [];
+  const failed = finished ? pr.checks.filter((c) => c.failed) : [];
 
   const done = new Set(ctx.done.filter((d) => d.head === head).flatMap((d) => d.kinds));
   const found: Record<PrReworkKind, boolean> = {
@@ -177,7 +155,7 @@ export function judgePullRequest(pr: ChangeRequestStatus, ctx: PrReworkContext):
 function latestStances(reviews: readonly HostReview[]): HostReview[] {
   const latest = new Map<string, HostReview>();
   for (const review of reviews) {
-    if (!STANCES.includes(review.state.toUpperCase())) continue;
+    if (!STANCES.includes(review.state)) continue;
     const key = review.author?.toLowerCase() ?? '';
     latest.delete(key);
     latest.set(key, review);

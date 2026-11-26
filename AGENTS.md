@@ -72,11 +72,12 @@ src/
     code-host.ts      the platform-neutral code host interface (CodeHost) and its types
     factory.ts        the code host's client for the config, by platform
   github/
-    client.ts         GitHub through the gh CLI, implementing CodeHost (FakeGitHub in tests)
+    client.ts         GitHub through the gh CLI, implementing CodeHost: GitHub's fields turned into
+                      the neutral ones (trust, review verdict, failed checks) (FakeGitHub in tests)
     bridge.ts         polling, Runs from issues, progress on issues, auto-accept, push, auto-scout
     issues.ts         labels, issue texts, hidden comment markers, Run status ↔ issue (pure)
-    pr-rework.ts      whether an open pull request needs rework (reviews, CI, conflict) and has the
-                      reworked commits pushed, and the feedback for the coding agent (pure)
+    pr-rework.ts      whether an open pull request needs rework (reviews, CI, conflict; by the neutral
+                      status) and has the rework pushed, and the feedback for the coding agent (pure)
     redact.ts         text before it is published on GitHub: the user's home directory → ~
     scout.ts          the AI scout's prompt, output format and Run summary
   notify/
