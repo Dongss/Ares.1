@@ -7545,6 +7545,141 @@ describe('issues: texts', () => {
     });
   });
 
+  describe('the merge request of a Run on GitLab (deliver: mr)', () => {
+    const issue = {
+      repo: 'grp/sub/demo',
+      platform: 'gitlab' as const,
+      number: 12,
+      url: 'https://gitlab.com/grp/sub/demo/-/issues/12',
+      auto: false,
+      attempt: 1,
+    };
+    const url = 'https://gitlab.com/grp/sub/demo/-/merge_requests/13';
+    const mrCtx = {
+      repo: 'grp/sub/demo',
+      dashboardUrl: ctx.dashboardUrl,
+      platform: 'gitlab' as const,
+    };
+    const link = '看板：http://127.0.0.1:4870/#/runs/run_1';
+    /** Nothing names GitHub or its pull requests. */
+    const gitlabOnly = (text: string) => {
+      expect(text).not.toContain('GitHub');
+      expect(text).not.toMatch(/\bPR\b/);
+      expect(text).not.toContain('#13');
+    };
+
+    it('says GitLab and MR in the title and body, closing the issue by its project path', () => {
+      const mr = pullRequestText(run({ goal: '#12 加 feature', issue }), mrCtx);
+      expect(mr.title).toBe('#12 加 feature');
+      expect(mr.body).toBe(
+        [
+          '> #12 加 feature',
+          '由战神一号的 Run `run_1` 完成，检查都已通过。在 GitLab 上合并这个 MR 后 Run 会自动完成；没合并就关掉，Run 会结束为失败。',
+          `费用 $1.23 · ${link}`,
+          'Closes #12',
+        ].join('\n\n'),
+      );
+      gitlabOnly(mr.body);
+      // An issue of another project is named by its path, subgroups and all.
+      const other = pullRequestText(
+        run({ goal: 'x', issue: { ...issue, repo: 'grp/tasks/backlog' } }),
+        mrCtx,
+      );
+      expect(other.body.endsWith('\n\nCloses grp/tasks/backlog#12')).toBe(true);
+    });
+
+    it('comments on the issue with MR !N when it is opened, updated, sent back and merged', () => {
+      const opened = pullRequestComment({
+        number: 13,
+        url,
+        targetBranch: 'main',
+        runId: 'run_1',
+        dashboardUrl: ctx.dashboardUrl,
+        platform: 'gitlab',
+      });
+      expect(opened).toBe(
+        `检查已通过，已开 MR !13，合并到 \`main\`：${url}\n\n在 GitLab 上合并这个 MR 后，Run 会自动完成，这个 issue 也会自动关闭；没合并就关掉 MR，Run 会结束为失败。\n\n${link}`,
+      );
+      gitlabOnly(opened);
+
+      const updated = pullRequestUpdatedComment({
+        number: 13,
+        url,
+        runId: 'run_1',
+        dashboardUrl: ctx.dashboardUrl,
+        platform: 'gitlab',
+      });
+      expect(updated).toBe(`返工后的提交已推送到 MR !13：${url}\n\n${link}`);
+
+      const rework = pullRequestReworkComment({
+        number: 13,
+        url,
+        reason: reworkReason({
+          kinds: ['ci'],
+          base: 'main',
+          checks: ['test'],
+          reviewers: [],
+          platform: 'gitlab',
+        }),
+        runId: 'run_1',
+        dashboardUrl: ctx.dashboardUrl,
+        platform: 'gitlab',
+      });
+      expect(rework).toBe(
+        `MR !13 需要返工：流水线没通过：test\n\nRun 带着这些反馈回去修改（计入回退上限），改好后推送到同一个 MR：${url}\n\n${link}`,
+      );
+      gitlabOnly(rework);
+
+      const merged = issueUpdate(run({ status: 'completed' }), {
+        ...ctx,
+        platform: 'gitlab',
+        pr: { number: 13, url, mergeCommit: '1234567890' },
+      });
+      expect(merged.comment).toBe(
+        `MR !13 已合并到 \`main\`（\`1234567\`）：${url}\n\n费用 $1.23\n\n${link}`,
+      );
+      expect(merged.close).toBe('completed');
+      // Merged locally and pushed: GitLab is named as before.
+      const pushed = issueUpdate(run({ status: 'completed' }), {
+        ...ctx,
+        platform: 'gitlab',
+        pushed: true,
+      });
+      expect(pushed.comment).toContain('已合并到 `main`（`abcdef1`）并推送到 GitLab。');
+    });
+
+    it('says why the Master closed the merge request of a Run that ended unfinished', () => {
+      const closed = (reason: PrCloseReason, withIssue = true) =>
+        pullRequestClosedComment({
+          reason,
+          runId: 'run_1',
+          issue: withIssue,
+          dashboardUrl: ctx.dashboardUrl,
+          platform: 'gitlab',
+        });
+      expect(closed('failed')).toBe(
+        `Run \`run_1\` 失败了，这个 MR 不会再更新，战神一号把它关掉了。issue 重做时，新的 Run 会开新的 MR。\n\n${link}`,
+      );
+      expect(closed('cancelled')).toBe(
+        `Run \`run_1\` 被终止了，这个 MR 不会再更新，战神一号把它关掉了。\n\n${link}`,
+      );
+      expect(closed('restarted')).toContain(
+        '关掉了这个 MR。新的 Run 按新内容做，做完会开新的 MR。',
+      );
+      for (const reason of PR_CLOSE_REASONS) {
+        expect(closed(reason)).toContain('这个 MR');
+        gitlabOnly(closed(reason));
+      }
+    });
+
+    it('labels the issue needs-you in words that fit either code host', () => {
+      const needsYou = labelDefs().find((d) => d.name === LABELS.needsYou);
+      expect(needsYou?.description).toBe(
+        'Run 在等审批、等 PR/MR 合并、卡住了或需求待讨论，需要人处理',
+      );
+    });
+  });
+
   it('keeps one status label and every other label', () => {
     expect(withStatusLabel(['bug', LABELS.proposal, LABELS.ready], LABELS.running)).toEqual([
       'bug',
@@ -8123,6 +8258,79 @@ describe('issues: texts', () => {
         expect(closed(reason)).toContain('Run `run_1`');
         expect(closed(reason).endsWith(link)).toBe(true);
         expect(markComment(closed(reason))).not.toMatch(cjk);
+      }
+    });
+
+    it("writes a Run's merge request on GitLab and its comments in English", () => {
+      setLang('en');
+      const url = 'https://gitlab.com/grp/sub/demo/-/merge_requests/13';
+      const link = '\n\nDashboard: http://127.0.0.1:4870/#/runs/run_1';
+      const issue = {
+        repo: 'grp/sub/demo',
+        platform: 'gitlab' as const,
+        number: 12,
+        url: '',
+        auto: false,
+        attempt: 1,
+      };
+      const base = { runId: 'run_1', dashboardUrl: ctx.dashboardUrl, platform: 'gitlab' as const };
+      const mr = pullRequestText(run({ goal: '#12 Add a thing', issue }), {
+        repo: 'grp/sub/demo',
+        dashboardUrl: ctx.dashboardUrl,
+        platform: 'gitlab',
+      });
+      expect(mr.body).toContain(
+        'Once this merge request is merged on GitLab, the Run completes by itself; if it is closed without being merged, the Run ends as failed.',
+      );
+      expect(mr.body.endsWith('\n\nCloses #12')).toBe(true);
+      const opened = pullRequestComment({ ...base, number: 13, url, targetBranch: 'main' });
+      expect(opened).toBe(
+        `The checks passed, and merge request !13 into \`main\` is open: ${url}\n\nOnce it is merged on GitLab, the Run completes and this issue is closed automatically; if the merge request is closed without being merged, the Run ends as failed.${link}`,
+      );
+      const updated = pullRequestUpdatedComment({ ...base, number: 13, url });
+      expect(updated).toBe(`The reworked commits were pushed to merge request !13: ${url}${link}`);
+      const rework = pullRequestReworkComment({
+        ...base,
+        number: 13,
+        url,
+        reason: reworkReason({
+          kinds: ['conflict', 'ci'],
+          base: 'main',
+          checks: ['test', 'lint'],
+          reviewers: [],
+          platform: 'gitlab',
+        }),
+      });
+      expect(rework).toBe(
+        'Merge request !13 needs more work: a conflict with the target branch `main`; failed pipeline jobs: test, lint' +
+          `\n\nThe Run goes back to work on it with this feedback (counted toward its rollback limit) and pushes the changes to the same merge request: ${url}${link}`,
+      );
+      const merged = issueUpdate(run({ status: 'completed' }), {
+        ...ctx,
+        platform: 'gitlab',
+        pr: { number: 13, url, mergeCommit: '1234567890' },
+      });
+      expect(merged.comment).toBe(
+        `Merge request !13 was merged into \`main\` (\`1234567\`): ${url}\n\ncost $1.23${link}`,
+      );
+      const closed = (reason: PrCloseReason) =>
+        pullRequestClosedComment({ ...base, reason, issue: true });
+      expect(closed('failed')).toBe(
+        `Run \`run_1\` failed, so this merge request gets no more updates and Ares.1 closed it. If the issue is redone, the new Run opens a new merge request.${link}`,
+      );
+      const texts = [
+        mr.body,
+        opened,
+        updated,
+        rework,
+        merged.comment ?? '',
+        ...PR_CLOSE_REASONS.map(closed),
+      ];
+      for (const text of texts) {
+        expect(markComment(text)).not.toMatch(cjk);
+        expect(text).not.toContain('GitHub');
+        expect(text).not.toContain('pull request');
+        expect(text).not.toContain('#13');
       }
     });
   });

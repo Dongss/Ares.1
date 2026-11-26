@@ -9,7 +9,7 @@ import { SCOUT_FAILURE_NOTIFY_AFTER } from '../src/config/flow.js';
 import type { LoadedConfig } from '../src/config/load.js';
 import { WebhookSchema } from '../src/config/schema.js';
 import { setLang } from '../src/i18n.js';
-import { BLOCK_KIND, NOTICE_KINDS, noticeFor } from '../src/notify/notice.js';
+import { BLOCK_KIND, blockKindText, NOTICE_KINDS, noticeFor } from '../src/notify/notice.js';
 import {
   type ExecFile,
   makeSystemNotice,
@@ -956,6 +956,27 @@ describe('notifications in English', () => {
     expect(BLOCK_KIND.budget).toBe('Over budget');
     expect(Object.values(NOTICE_KINDS).every((k) => !/[\u4e00-\u9fff]/.test(k.label))).toBe(true);
     expect(noticeScript('Run is stuck', 'Add a thing')).toContain('with title "Ares.1"');
+  });
+
+  it("names a pull request on GitHub and a merge request on GitLab, either when it doesn't know", () => {
+    // Not knowing the Run: either code host's.
+    expect(BLOCK_KIND.pr_open).toBe('\u7b49 PR/MR \u5408\u5e76');
+    expect(blockKindText('pr_open')).toBe('\u7b49 PR/MR \u5408\u5e76');
+    expect(blockKindText('pr_open', 'github')).toBe('\u7b49 PR \u5408\u5e76');
+    expect(blockKindText('pr_open', 'gitlab')).toBe('\u7b49 MR \u5408\u5e76');
+    // Other reasons are the same on every code host.
+    expect(blockKindText('budget', 'gitlab')).toBe('\u8d85\u51fa\u9884\u7b97');
+    expect(NOTICE_KINDS.failed.when).toContain(
+      '\u901a\u8fc7 PR/MR \u4ea4\u4ed8\uff08GitHub \u7684 deliver: pr\u3001GitLab \u7684 deliver: mr\uff09\u65f6 PR/MR \u6ca1\u5408\u5e76\u5c31\u88ab\u5173\u6389',
+    );
+    setLang('en');
+    expect(BLOCK_KIND.pr_open).toBe('Waiting for the PR/MR to merge');
+    expect(blockKindText('pr_open', 'github')).toBe('Waiting for the PR to merge');
+    expect(blockKindText('pr_open', 'gitlab')).toBe('Waiting for the MR to merge');
+    expect(NOTICE_KINDS.failed.when).toContain(
+      'its pull request or merge request closed unmerged when the repo delivers through them (deliver: pr on GitHub, deliver: mr on GitLab)',
+    );
+    expect(NOTICE_KINDS.failed.when).not.toMatch(/[\u4e00-\u9fff]/);
   });
 
   it('names the app, and logs and records a failure in English', async () => {

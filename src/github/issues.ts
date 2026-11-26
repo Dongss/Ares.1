@@ -1,7 +1,7 @@
 // Labels, issue texts and how a Run's status shows on its issue. Pure functions.
 
 import { brandName } from '../brand.js';
-import type { ProposalKind, Risk } from '../config/flow.js';
+import { changeRequestTerms, type ProposalKind, type Risk } from '../config/flow.js';
 import { conclusionLabel, waitText } from '../engine/discussion.js';
 import { groupedTimeParts, minutes, type RunTimes, timeParts } from '../engine/times.js';
 import type { HostAuthored, HostComment, LabelDef } from '../host/code-host.js';
@@ -9,6 +9,7 @@ import { join, t } from '../i18n.js';
 import type {
   DiscussionEntry,
   FailedAttempt,
+  HostPlatform,
   PrCloseReason,
   Run,
   RunStatus,
@@ -26,7 +27,7 @@ export const LABELS = {
   running: 'ares1:running',
   /**
    * The Run waits for an approval, a reply to the assessment or its pull request to be merged
-   * (deliver: pr), is blocked or paused.
+   * (deliver: pr; its merge request with deliver: mr on GitLab), is blocked or paused.
    */
   needsYou: 'ares1:needs-you',
   /**
@@ -91,10 +92,11 @@ export function labelDefs(): LabelDef[] {
     {
       name: LABELS.needsYou,
       color: 'd93f0b',
+      // The same labels go on GitHub and on GitLab: PR/MR names either's.
       description: t({
-        zh: 'Run 在等审批、等 PR 合并、卡住了或需求待讨论，需要人处理',
+        zh: 'Run 在等审批、等 PR/MR 合并、卡住了或需求待讨论，需要人处理',
         // GitHub takes at most 100 characters.
-        en: 'The Run waits for an approval or its PR to merge, is stuck or has questions: a human is needed',
+        en: 'The Run waits for an approval or its PR/MR to merge, is stuck or has questions: a human is needed',
       }),
     },
     {
@@ -814,11 +816,12 @@ export interface IssueUpdateContext {
   stageName?: string;
   /** The target branch was pushed to the code host before closing. */
   pushed?: boolean;
-  /** The code host the issue is on, as people know it: GitHub (if omitted) or GitLab. */
-  host?: string;
+  /** The code host the issue is on, whose words the comments use: GitHub if omitted, or GitLab. */
+  platform?: HostPlatform;
   /**
-   * For a completed Run whose work was merged on GitHub through its pull request (deliver: pr):
-   * the pull request, and the commit its merge put on the target branch when GitHub gave it.
+   * For a completed Run whose work was merged on the code host through its pull request
+   * (deliver: pr; its merge request with deliver: mr on GitLab): the pull request, and the commit
+   * its merge put on the target branch when the code host gave it.
    */
   pr?: { number: number; url: string; mergeCommit: string | null };
   /** How long the Run took, split; for a completed Run. */
@@ -930,16 +933,24 @@ export function goalChangedComment(input: {
   });
 }
 
-/** The title and body of the pull request a Run's work goes through (deliver: pr). */
+/**
+ * The title and body of the pull request a Run's work goes through (deliver: pr; the merge
+ * request with deliver: mr on GitLab).
+ */
 export interface PullRequestText {
   title: string;
   body: string;
 }
 
 export interface PullRequestTextContext {
-  /** "owner/name" of the GitHub repo the pull request is opened on. */
+  /**
+   * The repo the pull request is opened on: "owner/name" on GitHub, the project's path on GitLab
+   * ("group/subgroup/name").
+   */
   repo: string;
   dashboardUrl: string;
+  /** The code host it is opened on, whose words the body uses: GitHub if omitted, or GitLab. */
+  platform?: HostPlatform;
 }
 
 /** Lines of the goal the body of a pull request quotes, and the most characters of them. */
@@ -949,32 +960,35 @@ const PR_GOAL_MAX = 1_500;
 const PR_TITLE_MAX = 200;
 
 /**
- * The pull request of a Run of a repo with `deliver: pr`, from the Run's branch into the target
- * branch. The title is the goal's first line; the body sums the Run up (the goal's first lines,
- * its id, cost and dashboard link) and, for a Run of an issue, closes the issue once merged:
- * `Closes #N`, or `Closes owner/name#N` when the issue is in another repo than `ctx.repo`.
- * Runs without an issue (merging GitHub's commits) close nothing. The body carries no comment
- * marker: it is no issue comment. Not redacted: the caller passes both through redactForGitHub.
+ * The pull request of a Run of a repo with `deliver: pr` (the merge request with `deliver: mr` on
+ * GitLab, `ctx.platform`), from the Run's branch into the target branch. The title is the goal's
+ * first line; the body sums the Run up (the goal's first lines, its id, cost and dashboard link)
+ * and, for a Run of an issue, closes the issue once merged: `Closes #N`, or `Closes owner/name#N`
+ * (`Closes group/subgroup/name#N` on GitLab) when the issue is in another repo than `ctx.repo`.
+ * Runs without an issue (merging the code host's commits) close nothing. The body carries no
+ * comment marker: it is no issue comment. Not redacted: the caller passes both through
+ * redactForGitHub.
  */
 export function pullRequestText(
   run: Pick<Run, 'id' | 'goal' | 'issue' | 'costUsd'>,
   ctx: PullRequestTextContext,
 ): PullRequestText {
+  const cr = changeRequestTerms(ctx.platform);
   const lines = run.goal.trim().split('\n');
   const title = oneLine(lines[0] ?? '', PR_TITLE_MAX) || `Run ${run.id}`;
   const more = lines.length > PR_GOAL_LINES ? '\n…' : '';
   const goal = quote(`${lines.slice(0, PR_GOAL_LINES).join('\n')}${more}`, PR_GOAL_MAX);
   const cost = `$${run.costUsd.toFixed(2)}`;
   const issue = run.issue;
-  // GitHub knows only the English keyword, in either language.
+  // GitHub and GitLab know the English keyword, in either language; an issue is #N on both.
   const closes = issue
     ? `Closes ${issue.repo.toLowerCase() === ctx.repo.toLowerCase() ? '' : issue.repo}#${issue.number}`
     : null;
   const body = [
     goal,
     t({
-      zh: `由${brandName()}的 Run \`${run.id}\` 完成，检查都已通过。在 GitHub 上合并这个 PR 后 Run 会自动完成；没合并就关掉，Run 会结束为失败。`,
-      en: `Done by ${brandName()} in Run \`${run.id}\`, and its checks passed. Once this pull request is merged on GitHub, the Run completes by itself; if it is closed without being merged, the Run ends as failed.`,
+      zh: `由${brandName()}的 Run \`${run.id}\` 完成，检查都已通过。在 ${cr.host} 上合并这个 ${cr.short} 后 Run 会自动完成；没合并就关掉，Run 会结束为失败。`,
+      en: `Done by ${brandName()} in Run \`${run.id}\`, and its checks passed. Once this ${cr.long} is merged on ${cr.host}, the Run completes by itself; if it is closed without being merged, the Run ends as failed.`,
     }),
     `${t({ zh: `费用 ${cost}`, en: `Cost ${cost}` })} · ${dashboardLink(ctx.dashboardUrl, run.id)}`,
     closes,
@@ -982,43 +996,53 @@ export function pullRequestText(
   return { title, body: body.filter((part) => part !== null).join('\n\n') };
 }
 
-/** The comment on the issue that its Run's pull request (deliver: pr) is open. */
+/**
+ * The comment on the issue that its Run's pull request (deliver: pr; the merge request with
+ * deliver: mr on GitLab, `platform`) is open.
+ */
 export function pullRequestComment(input: {
   number: number;
   url: string;
   targetBranch: string;
   runId: string;
   dashboardUrl: string;
+  platform?: HostPlatform;
 }): string {
+  const cr = changeRequestTerms(input.platform);
   const link = dashboardLink(input.dashboardUrl, input.runId);
   const branch = `\`${input.targetBranch}\``;
+  const number = cr.number(input.number);
   return t({
-    zh: `检查已通过，已开 PR #${input.number}，合并到 ${branch}：${input.url}\n\n在 GitHub 上合并这个 PR 后，Run 会自动完成，这个 issue 也会自动关闭；没合并就关掉 PR，Run 会结束为失败。\n\n${link}`,
-    en: `The checks passed, and pull request #${input.number} into ${branch} is open: ${input.url}\n\nOnce it is merged on GitHub, the Run completes and this issue is closed automatically; if the pull request is closed without being merged, the Run ends as failed.\n\n${link}`,
+    zh: `检查已通过，已开 ${cr.short} ${number}，合并到 ${branch}：${input.url}\n\n在 ${cr.host} 上合并这个 ${cr.short} 后，Run 会自动完成，这个 issue 也会自动关闭；没合并就关掉 ${cr.short}，Run 会结束为失败。\n\n${link}`,
+    en: `The checks passed, and ${cr.long} ${number} into ${branch} is open: ${input.url}\n\nOnce it is merged on ${cr.host}, the Run completes and this issue is closed automatically; if the ${cr.long} is closed without being merged, the Run ends as failed.\n\n${link}`,
   });
 }
 
 /**
  * The comment on a Run's issue once the commits made since a rework sent the Run back are pushed
- * to the pull request it already has (deliver: pr).
+ * to the pull request it already has (deliver: pr; the merge request on GitLab, `platform`).
  */
 export function pullRequestUpdatedComment(input: {
   number: number;
   url: string;
   runId: string;
   dashboardUrl: string;
+  platform?: HostPlatform;
 }): string {
+  const cr = changeRequestTerms(input.platform);
   const link = dashboardLink(input.dashboardUrl, input.runId);
+  const number = cr.number(input.number);
   return t({
-    zh: `返工后的提交已推送到 PR #${input.number}：${input.url}\n\n${link}`,
-    en: `The reworked commits were pushed to pull request #${input.number}: ${input.url}\n\n${link}`,
+    zh: `返工后的提交已推送到 ${cr.short} ${number}：${input.url}\n\n${link}`,
+    en: `The reworked commits were pushed to ${cr.long} ${number}: ${input.url}\n\n${link}`,
   });
 }
 
 /**
- * The comment on a Run's issue once its open pull request (deliver: pr) sent it back for more
- * work: `reason` is the one line of `reworkReason`. The Run goes back by the workflow's rules, so
- * past max_loops it may stop instead; then the issue hears of that as of any Run that stops.
+ * The comment on a Run's issue once its open pull request (deliver: pr; the merge request on
+ * GitLab, `platform`) sent it back for more work: `reason` is the one line of `reworkReason`. The
+ * Run goes back by the workflow's rules, so past max_loops it may stop instead; then the issue
+ * hears of that as of any Run that stops.
  */
 export function pullRequestReworkComment(input: {
   number: number;
@@ -1026,53 +1050,59 @@ export function pullRequestReworkComment(input: {
   reason: string;
   runId: string;
   dashboardUrl: string;
+  platform?: HostPlatform;
 }): string {
+  const cr = changeRequestTerms(input.platform);
   const link = dashboardLink(input.dashboardUrl, input.runId);
+  const number = cr.number(input.number);
   return t({
-    zh: `PR #${input.number} 需要返工：${input.reason}\n\nRun 带着这些反馈回去修改（计入回退上限），改好后推送到同一个 PR：${input.url}\n\n${link}`,
-    en: `Pull request #${input.number} needs more work: ${input.reason}\n\nThe Run goes back to work on it with this feedback (counted toward its rollback limit) and pushes the changes to the same pull request: ${input.url}\n\n${link}`,
+    zh: `${cr.short} ${number} 需要返工：${input.reason}\n\nRun 带着这些反馈回去修改（计入回退上限），改好后推送到同一个 ${cr.short}：${input.url}\n\n${link}`,
+    en: `${cr.longCapital} ${number} needs more work: ${input.reason}\n\nThe Run goes back to work on it with this feedback (counted toward its rollback limit) and pushes the changes to the same ${cr.long}: ${input.url}\n\n${link}`,
   });
 }
 
 /**
- * The comment the Master closes a Run's open pull request with (deliver: pr) once the Run ended
- * without completing, for `reason`: nobody follows the pull request any more. `issue`: the Run
- * came from an issue, which a new Run may take up with a pull request of its own.
+ * The comment the Master closes a Run's open pull request with (deliver: pr; the merge request on
+ * GitLab, `platform`) once the Run ended without completing, for `reason`: nobody follows the pull
+ * request any more. `issue`: the Run came from an issue, which a new Run may take up with a pull
+ * request of its own.
  */
 export function pullRequestClosedComment(input: {
   reason: PrCloseReason;
   runId: string;
   issue: boolean;
   dashboardUrl: string;
+  platform?: HostPlatform;
 }): string {
+  const { short, long } = changeRequestTerms(input.platform);
   const run = `Run \`${input.runId}\``;
   const brand = brandName();
   const why = (() => {
     switch (input.reason) {
       case 'failed':
         return t({
-          zh: `${run} 失败了，这个 PR 不会再更新，${brand}把它关掉了。${input.issue ? 'issue 重做时，新的 Run 会开新的 PR。' : ''}`,
-          en: `${run} failed, so this pull request gets no more updates and ${brand} closed it.${input.issue ? ' If the issue is redone, the new Run opens a new pull request.' : ''}`,
+          zh: `${run} 失败了，这个 ${short} 不会再更新，${brand}把它关掉了。${input.issue ? `issue 重做时，新的 Run 会开新的 ${short}。` : ''}`,
+          en: `${run} failed, so this ${long} gets no more updates and ${brand} closed it.${input.issue ? ` If the issue is redone, the new Run opens a new ${long}.` : ''}`,
         });
       case 'issue_closed':
         return t({
-          zh: `issue 被关掉了，${run} 随之终止，这个 PR 不会再更新，${brand}把它关掉了。`,
-          en: `The issue was closed, so ${run} was terminated; this pull request gets no more updates, and ${brand} closed it.`,
+          zh: `issue 被关掉了，${run} 随之终止，这个 ${short} 不会再更新，${brand}把它关掉了。`,
+          en: `The issue was closed, so ${run} was terminated; this ${long} gets no more updates, and ${brand} closed it.`,
         });
       case 'restarted':
         return t({
-          zh: `issue 的标题或正文改了，${brand}终止了按旧内容做的 ${run}，关掉了这个 PR。新的 Run 按新内容做，做完会开新的 PR。`,
-          en: `The issue's title or body changed: ${brand} terminated ${run}, which worked from the old text, and closed this pull request. A new Run works from the new text and opens a new pull request once it is done.`,
+          zh: `issue 的标题或正文改了，${brand}终止了按旧内容做的 ${run}，关掉了这个 ${short}。新的 Run 按新内容做，做完会开新的 ${short}。`,
+          en: `The issue's title or body changed: ${brand} terminated ${run}, which worked from the old text, and closed this ${long}. A new Run works from the new text and opens a new ${long} once it is done.`,
         });
       case 'dropped':
         return t({
-          zh: `需求评估决定不做了，${run} 结束，这个 PR 不会再更新，${brand}把它关掉了。`,
-          en: `The requirement assessment decided not to do it, so ${run} ended; this pull request gets no more updates, and ${brand} closed it.`,
+          zh: `需求评估决定不做了，${run} 结束，这个 ${short} 不会再更新，${brand}把它关掉了。`,
+          en: `The requirement assessment decided not to do it, so ${run} ended; this ${long} gets no more updates, and ${brand} closed it.`,
         });
       case 'cancelled':
         return t({
-          zh: `${run} 被终止了，这个 PR 不会再更新，${brand}把它关掉了。`,
-          en: `${run} was terminated, so this pull request gets no more updates and ${brand} closed it.`,
+          zh: `${run} 被终止了，这个 ${short} 不会再更新，${brand}把它关掉了。`,
+          en: `${run} was terminated, so this ${long} gets no more updates and ${brand} closed it.`,
         });
     }
   })();
@@ -1142,8 +1172,8 @@ export function issueUpdate(run: Run, ctx: IssueUpdateContext): IssueUpdate {
       if (run.blocked?.kind === 'discussion') {
         return { label: LABELS.needsYou, comment: null, close: null };
       }
-      // The pull request waits for a human on GitHub; its link is posted when it is opened
-      // (`pullRequestComment`). Nothing is stuck.
+      // The pull request (merge request) waits for a human on the code host; its link is posted
+      // when it is opened (`pullRequestComment`). Nothing is stuck.
       if (run.blocked?.kind === 'pr_open') {
         return { label: LABELS.needsYou, comment: null, close: null };
       }
@@ -1178,17 +1208,19 @@ export function issueUpdate(run: Run, ctx: IssueUpdateContext): IssueUpdate {
         .filter(Boolean)
         .join(' · ');
       const branch = `\`${ctx.targetBranch}\``;
+      const cr = changeRequestTerms(ctx.platform);
       if (pr) {
+        const number = cr.number(pr.number);
         return {
           label: null,
           comment: t({
-            zh: `PR #${pr.number} 已合并到 ${branch}${sha}：${pr.url}\n\n${stats}\n\n${link}`,
-            en: `Pull request #${pr.number} was merged into ${branch}${sha}: ${pr.url}\n\n${stats}\n\n${link}`,
+            zh: `${cr.short} ${number} 已合并到 ${branch}${sha}：${pr.url}\n\n${stats}\n\n${link}`,
+            en: `${cr.longCapital} ${number} was merged into ${branch}${sha}: ${pr.url}\n\n${stats}\n\n${link}`,
           }),
           close: 'completed',
         };
       }
-      const host = ctx.host ?? 'GitHub';
+      const host = cr.host;
       return {
         label: null,
         comment: ctx.pushed

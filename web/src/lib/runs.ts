@@ -11,6 +11,7 @@ import {
   difficultyMeanings,
   discussionReplyWait,
   RAW_LOG_KEEP_DAYS,
+  runPlatform as runPlatformOf,
   runRawLogsExpired,
   sizeMeanings,
 } from '../../../src/config/flow.js';
@@ -41,7 +42,7 @@ import {
   type Run,
 } from '../../../src/store/types.js';
 import {
-  BLOCK_KIND,
+  blockKindText,
   formatTime,
   missingCommandText,
   RUN_STATUS,
@@ -172,12 +173,17 @@ export function waitingForPr(run: Pick<Run, 'status' | 'blocked'>): boolean {
   return run.status === 'blocked' && run.blocked?.kind === 'pr_open';
 }
 
-/** The Run's status badge: a Run waiting for its pull request says so instead of "blocked". */
-export function runStatusBadge(run: Pick<Run, 'status' | 'blocked'>): {
+/**
+ * The Run's status badge: a Run waiting for its pull request says so instead of "blocked", a
+ * merge request for a Run of a GitLab issue (`blockKindText`).
+ */
+export function runStatusBadge(run: Pick<Run, 'status' | 'blocked' | 'issue'>): {
   label: string;
   tone: Tone;
 } {
-  if (waitingForPr(run)) return { label: BLOCK_KIND.pr_open, tone: 'attention' };
+  if (waitingForPr(run)) {
+    return { label: blockKindText('pr_open', runPlatform(run, null)), tone: 'attention' };
+  }
   return RUN_STATUS[run.status];
 }
 
@@ -1021,11 +1027,11 @@ export interface DiscussionItem {
 /**
  * The code host a Run goes with: its issue's (`RunIssue.platform`); for a Run of no issue, such as
  * one the Master created to merge the target branch's new commits, its repo's source of
- * requirements (`source`, from `repoSourceOf`); GitHub otherwise.
+ * requirements (`source`, from `repoSourceOf`); GitHub otherwise. The rule is `runPlatform` of
+ * src/config/flow.ts, which the Master's texts go by too.
  */
 export function runPlatform(run: Pick<Run, 'issue'>, source: RepoSourceView | null): HostPlatform {
-  if (run.issue) return run.issue.platform ?? 'github';
-  return source?.source === 'gitlab' ? 'gitlab' : 'github';
+  return runPlatformOf(run, source?.source);
 }
 
 /** How to answer the assessment's questions on the Run's issue, on the code host it is on. */

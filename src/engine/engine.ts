@@ -14,7 +14,9 @@ import {
   type AgentSelection,
   type Backoff,
   backoffMs,
+  type ChangeRequestTerms,
   type ConflictBlock,
+  changeRequestTerms,
   chooseStageAgent,
   conflictBlocker,
   deliversByPr,
@@ -31,7 +33,9 @@ import {
   type RunTouches,
   rateLimitDelayMs,
   recordedLimitWait,
+  requirementSource,
   roomUnderMaxRuns,
+  runPlatform,
   stageAgentIds,
   waitsForMaxRuns,
 } from '../config/flow.js';
@@ -74,6 +78,7 @@ import {
   type BlockInfo,
   type DiscussionEntry,
   FINISHED_RUN_STATUSES,
+  type HostPlatform,
   type ReplyEntry,
   type ReplyTimeoutEntry,
   type Run,
@@ -1068,11 +1073,12 @@ export class Engine {
       );
     }
     if (run.blocked.kind === 'pr_open') {
-      // The bridge moves it on from what becomes of the pull request on GitHub.
+      // The bridge moves it on from what becomes of the pull request on its code host.
+      const { host, short, long } = this.changeRequestTermsOf(run);
       throw new InvalidStateError(
         t({
-          zh: 'Run 在等 GitHub 上的 PR 合并，不能重试：在 GitHub 上合并 PR，Run 会完成；关掉 PR，Run 会结束为失败',
-          en: 'The Run waits for its pull request on GitHub and cannot be retried: merge the pull request on GitHub and the Run completes; close it and the Run ends as failed',
+          zh: `Run 在等 ${host} 上的 ${short} 合并，不能重试：在 ${host} 上合并 ${short}，Run 会完成；关掉 ${short}，Run 会结束为失败`,
+          en: `The Run waits for its ${long} on ${host} and cannot be retried: merge the ${long} on ${host} and the Run completes; close it and the Run ends as failed`,
         }),
       );
     }
@@ -2788,10 +2794,11 @@ export class Engine {
     const sha = await revParse(workdir, commit).catch(() => null);
     if (sha) return sha;
     const target = this.store.getRepo(run.repoId).targetBranch;
+    const { host } = this.changeRequestTermsOf(run);
     throw new MergeCommitMissing(
       t({
-        zh: `要合并的 GitHub 上 ${target} 的提交 ${commit} 在仓库里找不到（可能被垃圾回收了），没法开始合并。Run 结束，工作目录和分支已保留；需要的话请手动合并 GitHub 上的 ${target}。`,
-        en: `Commit ${commit} from ${target} on GitHub, which this Run merges, is not in the repo (it may have been garbage-collected), so the merge cannot start. The Run ended; the working directory and branch are kept. Merge ${target} from GitHub by hand if it is still needed.`,
+        zh: `要合并的 ${host} 上 ${target} 的提交 ${commit} 在仓库里找不到（可能被垃圾回收了），没法开始合并。Run 结束，工作目录和分支已保留；需要的话请手动合并 ${host} 上的 ${target}。`,
+        en: `Commit ${commit} from ${target} on ${host}, which this Run merges, is not in the repo (it may have been garbage-collected), so the merge cannot start. The Run ended; the working directory and branch are kept. Merge ${target} from ${host} by hand if it is still needed.`,
       }),
     );
   }
@@ -3922,26 +3929,71 @@ export class Engine {
   }
 
   /**
-   * deliver: pr, once the merge stage's checks passed: the work is ready to merge, but through a
-   * pull request on GitHub instead of into the local target branch. The Run waits blocked
-   * (`pr_open`) with the merge stage still executing, `head` accepted as its last commit. The
-   * bridge pushes the Run's branch, opens the pull request (`recordPullRequest`) and follows it
-   * until it is merged (`pullRequestMerged`) or closed (`pullRequestClosed`); the local target
-   * branch moves only when GitHub's is pulled.
+   * deliver: pr (mr on GitLab), once the merge stage's checks passed: the work is ready to merge,
+   * but through a pull request (a merge request on GitLab) on the code host instead of into the
+   * local target branch. The Run waits blocked (`pr_open`) with the merge stage still executing,
+   * `head` accepted as its last commit. The bridge pushes the Run's branch, opens the pull request
+   * (`recordPullRequest`) and follows it until it is merged (`pullRequestMerged`) or closed
+   * (`pullRequestClosed`); the local target branch moves only when the code host's is pulled.
    */
   private awaitPullRequest(run: Run, sr: StageRun, target: string, head: string): void {
+    const { host, short, long, deliver } = this.changeRequestTermsOf(run);
     this.store.tx(() => {
       this.store.updateRun(run.id, { headCommit: head });
       this.store.event(run.id, 'merge.pr_pending', { target, head });
       this.block(run.id, {
         kind: 'pr_open',
         message: t({
-          zh: `检查已通过。这个仓库通过 PR 交付（deliver: pr）：Run 的分支会推送到 GitHub，开一个合并到 ${target} 的 PR；PR 在 GitHub 上合并后 Run 完成，没合并就被关掉时 Run 失败。本地的 ${target} 不动。`,
-          en: `The checks passed. This repo delivers through pull requests (deliver: pr): the Run's branch is pushed to GitHub with a pull request into ${target}; the Run completes once it is merged on GitHub, and fails if it is closed unmerged. The local ${target} stays as it is.`,
+          zh: `检查已通过。这个仓库通过 ${short} 交付（deliver: ${deliver}）：Run 的分支会推送到 ${host}，开一个合并到 ${target} 的 ${short}；${short} 在 ${host} 上合并后 Run 完成，没合并就被关掉时 Run 失败。本地的 ${target} 不动。`,
+          en: `The checks passed. This repo delivers through ${long}s (deliver: ${deliver}): the Run's branch is pushed to ${host} with a ${long} into ${target}; the Run completes once it is merged on ${host}, and fails if it is closed unmerged. The local ${target} stays as it is.`,
         }),
         stageRunId: sr.id,
       });
     });
+  }
+
+  /**
+   * The words for the code host the Run delivers to and its change requests: PR #N on GitHub,
+   * MR !N on GitLab (`changeRequestTerms`), by the Run's issue, or for a Run of no issue its
+   * repo's source of requirements (`runPlatform`).
+   */
+  private changeRequestTermsOf(run: Pick<Run, 'issue' | 'repoId'>): ChangeRequestTerms {
+    return changeRequestTerms(this.platformOf(run));
+  }
+
+  /** The Run's pull request as the engine's texts name it: 「PR #12」, 「MR !12」 on GitLab. */
+  private pullRequestRef(run: Pick<Run, 'issue' | 'repoId'>, number: number): string {
+    const { short, number: numbered } = this.changeRequestTermsOf(run);
+    return `${short} ${numbered(number)}`;
+  }
+
+  /** The merge stage's check of the Run's pull request: 「通过 PR #12 合并到 main」. */
+  private pullRequestCheckName(
+    run: Pick<Run, 'issue' | 'repoId'>,
+    number: number,
+    target: string,
+  ): string {
+    const named = this.pullRequestRef(run, number);
+    return t({ zh: `通过 ${named} 合并到 ${target}`, en: `Merge into ${target} through ${named}` });
+  }
+
+  /** The code host the Run goes with (`runPlatform`). */
+  private platformOf(run: Pick<Run, 'issue' | 'repoId'>): HostPlatform {
+    if (run.issue) return runPlatform(run, null);
+    const repo = this.store.getRepo(run.repoId);
+    return runPlatform(run, requirementSource(this.cfg.master, repo.name));
+  }
+
+  /**
+   * The data of a `github.pr_*` event the engine records about the Run's pull request, with
+   * `platform: 'gitlab'` when the Run goes with GitLab, as the bridge records its own events
+   * there; GitHub's go without, as before.
+   */
+  private pullRequestEventData(
+    run: Pick<Run, 'issue' | 'repoId'>,
+    data: Record<string, unknown>,
+  ): Record<string, unknown> {
+    return this.platformOf(run) === 'gitlab' ? { ...data, platform: 'gitlab' } : data;
   }
 
   /**
@@ -3978,25 +4030,33 @@ export class Engine {
       const ref = { number: pr.number, url: pr.url };
       if (current.pr?.number === pr.number && current.pr.url === pr.url) {
         if (!pullRequestPushPending(this.store.listEvents(current.id))) return 'unchanged';
-        this.store.event(current.id, 'github.pr_updated', { ...ref, head: current.headCommit });
+        this.store.event(
+          current.id,
+          'github.pr_updated',
+          this.pullRequestEventData(current, { ...ref, head: current.headCommit }),
+        );
         return 'updated';
       }
       this.store.updateRun(current.id, { pr: ref });
-      this.store.event(current.id, 'github.pr_opened', {
-        ...ref,
-        head: current.branch,
-        base: this.store.getRepo(current.repoId).targetBranch,
-      });
+      this.store.event(
+        current.id,
+        'github.pr_opened',
+        this.pullRequestEventData(current, {
+          ...ref,
+          head: current.branch,
+          base: this.store.getRepo(current.repoId).targetBranch,
+        }),
+      );
       return 'opened';
     });
   }
 
   /**
    * The pull request of a Run waiting in `pr_open`, as `run` was when the bridge read it, was
-   * merged on GitHub (by a merge, a squash or a rebase): the merge stage passes as when it merges
-   * locally, and the Run goes on, which completes it after the last stage. The bridge pulls
-   * GitHub's target branch first, so that the work is in the local one too. Changes nothing and
-   * returns false when the Run no longer waits there.
+   * merged on its code host (by a merge, a squash or a rebase): the merge stage passes as when it
+   * merges locally, and the Run goes on, which completes it after the last stage. The bridge
+   * pulls the code host's target branch first, so that the work is in the local one too. Changes
+   * nothing and returns false when the Run no longer waits there.
    */
   pullRequestMerged(
     run: Pick<Run, 'id' | 'blocked'>,
@@ -4014,14 +4074,15 @@ export class Engine {
         stageRunId: sr.id,
         attemptId: null,
         kind: 'merge',
-        name: t({
-          zh: `通过 PR #${pr.number} 合并到 ${target}`,
-          en: `Merge into ${target} through PR #${pr.number}`,
-        }),
+        name: this.pullRequestCheckName(current, pr.number, target),
         passed: true,
         detail: pr.mergeCommit ? `${pr.url}\n${pr.mergeCommit}` : pr.url,
       });
-      this.store.event(current.id, 'github.pr_merged', { ...ref, mergeCommit: pr.mergeCommit });
+      this.store.event(
+        current.id,
+        'github.pr_merged',
+        this.pullRequestEventData(current, { ...ref, mergeCommit: pr.mergeCommit }),
+      );
       this.store.event(current.id, 'merge.done', {
         target,
         head: current.headCommit,
@@ -4037,9 +4098,9 @@ export class Engine {
 
   /**
    * The pull request of a Run waiting in `pr_open`, as `run` was when the bridge read it, was
-   * closed on GitHub without being merged: the Run ends as failed, and an issue's Run is redone
-   * or waits for a human by the usual rules. Changes nothing and returns false when the Run no
-   * longer waits there.
+   * closed on its code host without being merged: the Run ends as failed, and an issue's Run is
+   * redone or waits for a human by the usual rules. Changes nothing and returns false when the
+   * Run no longer waits there.
    */
   pullRequestClosed(run: Pick<Run, 'id' | 'blocked'>, pr: RunPullRequest): boolean {
     const closed = this.store.tx(() => {
@@ -4049,23 +4110,21 @@ export class Engine {
       const target = this.store.getRepo(current.repoId).targetBranch;
       const ref = { number: pr.number, url: pr.url };
       this.store.updateRun(current.id, { pr: ref });
+      const named = this.pullRequestRef(current, pr.number);
       const why = t({
-        zh: `PR #${pr.number} 没有合并就被关掉了`,
-        en: `PR #${pr.number} was closed without being merged`,
+        zh: `${named} 没有合并就被关掉了`,
+        en: `${named} was closed without being merged`,
       });
       this.store.addCheck({
         runId: current.id,
         stageRunId: sr.id,
         attemptId: null,
         kind: 'merge',
-        name: t({
-          zh: `通过 PR #${pr.number} 合并到 ${target}`,
-          en: `Merge into ${target} through PR #${pr.number}`,
-        }),
+        name: this.pullRequestCheckName(current, pr.number, target),
         passed: false,
         detail: `${why}\n${pr.url}`,
       });
-      this.store.event(current.id, 'github.pr_closed', ref);
+      this.store.event(current.id, 'github.pr_closed', this.pullRequestEventData(current, ref));
       this.failRun(
         current.id,
         t({
@@ -4131,25 +4190,25 @@ export class Engine {
 
       const target = this.store.getRepo(current.repoId).targetBranch;
       const ref = { number: pr.number, url: pr.url };
+      const platform = this.platformOf(current);
       const reason = reworkReason({
         kinds,
         base: target,
         checks: checks.map((c) => c.name),
         reviewers,
+        platform,
       });
+      const named = this.pullRequestRef(current, pr.number);
       this.store.addCheck({
         runId: current.id,
         stageRunId: sr.id,
         attemptId: null,
         kind: 'merge',
-        name: t({
-          zh: `通过 PR #${pr.number} 合并到 ${target}`,
-          en: `Merge into ${target} through PR #${pr.number}`,
-        }),
+        name: this.pullRequestCheckName(current, pr.number, target),
         passed: false,
         detail: `${t({
-          zh: `PR #${pr.number} 需要返工：${reason}`,
-          en: `PR #${pr.number} needs more work: ${reason}`,
+          zh: `${named} 需要返工：${reason}`,
+          en: `${named} needs more work: ${reason}`,
         })}\n${pr.url}`,
       });
       // A round that starts by merging the target branch resolves the conflict; the agent gets
@@ -4166,13 +4225,17 @@ export class Engine {
         endedAt: nowIso(),
       });
       this.store.event(current.id, 'stage.failed', { stageId: sr.stageId, reason: failReason });
-      this.store.event(current.id, 'github.pr_rework', {
-        ...ref,
-        head: rework.head,
-        kinds,
-        reviewers,
-        checks: checks.map((c) => ({ name: c.name, url: c.url })),
-      });
+      this.store.event(
+        current.id,
+        'github.pr_rework',
+        this.pullRequestEventData(current, {
+          ...ref,
+          head: rework.head,
+          kinds,
+          reviewers,
+          checks: checks.map((c) => ({ name: c.name, url: c.url })),
+        }),
+      );
       this.requeueHead(current.id, 'run.resumed');
       return true;
     });

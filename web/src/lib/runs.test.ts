@@ -1026,6 +1026,12 @@ describe('waiting for a pull request', () => {
 
   it('badges it as waiting for the PR rather than blocked', () => {
     expect(runStatusBadge(waiting({ pr }))).toEqual({ label: '等 PR 合并', tone: 'attention' });
+    // A merge request for a Run of a GitLab issue.
+    const onGitLab = { ...issue, platform: 'gitlab' as const };
+    expect(runStatusBadge(waiting({ pr, issue: onGitLab }))).toEqual({
+      label: '等 MR 合并',
+      tone: 'attention',
+    });
     expect(
       runStatusBadge(run('b', 'blocked', { blocked: { kind: 'budget', message: 'x' } })),
     ).toEqual({ label: '卡住', tone: 'danger' });

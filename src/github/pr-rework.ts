@@ -1,8 +1,11 @@
-// Whether a Run's open pull request (deliver: pr) needs more work, and the feedback that hands it
-// back to the coding agent. Pure logic: what the code host reported on the change request, in the
-// neutral terms of its client (review verdict and states, failed checks, conflicts), and what the
-// Run has already reworked go in, the judgement comes out.
+// Whether a Run's open pull request (deliver: pr; a merge request with deliver: mr on GitLab)
+// needs more work, and the feedback that hands it back to the coding agent. Pure logic: what the
+// code host reported on the change request, in the neutral terms of its client (review verdict
+// and states, failed checks, conflicts), and what the Run has already reworked go in, the
+// judgement comes out, worded for the code host (PR #N and checks on GitHub, MR !N and pipeline
+// jobs on GitLab).
 
+import { type ChangeRequestTerms, changeRequestTerms } from '../config/flow.js';
 import type {
   ChangeRequestStatus,
   HostCheck,
@@ -11,7 +14,12 @@ import type {
   ReviewState,
 } from '../host/code-host.js';
 import { join, t } from '../i18n.js';
-import { type EventRow, PR_REWORK_KINDS, type PrReworkKind } from '../store/types.js';
+import {
+  type EventRow,
+  type HostPlatform,
+  PR_REWORK_KINDS,
+  type PrReworkKind,
+} from '../store/types.js';
 import { isTrusted, quote } from './issues.js';
 
 // Declared with the store's types, so that the dashboard reads the events by the same kinds.
@@ -61,7 +69,7 @@ export interface PrRework {
   checks: PrReworkCheck[];
   /** For the coding agent: the link, the reviews and their line comments, the failed checks. */
   feedback: string;
-  /** One line on why, to follow 「PR #N 需要返工：」 in the issue comment. */
+  /** One line on why, to follow 「PR #N 需要返工：」 (「MR !N 需要返工：」) in the issue comment. */
   reason: string;
 }
 
@@ -72,6 +80,8 @@ export interface PrReworkContext {
   master: string | null;
   /** The reworks already triggered (from the Run's events): each head with its kinds. */
   done: readonly { head: string; kinds: readonly string[] }[];
+  /** The code host the pull request is on, which the texts name; GitHub if omitted. */
+  platform?: HostPlatform;
 }
 
 export interface PrJudgement {
@@ -144,8 +154,8 @@ export function judgePullRequest(pr: ChangeRequestStatus, ctx: PrReworkContext):
       kinds,
       reviewers: forReview.flatMap((r) => (r.author ? [r.author] : [])),
       checks: forCi.map((c) => ({ name: c.name, url: c.url })),
-      feedback: feedbackText(pr, kinds, forCi, forReview, comments),
-      reason: reasonText(pr, kinds, forCi, forReview),
+      feedback: feedbackText(pr, kinds, forCi, forReview, comments, ctx.platform),
+      reason: reasonText(pr, kinds, forCi, forReview, ctx.platform),
     },
     ignored,
   };
@@ -176,6 +186,15 @@ function quoted(text: string, max: number, indent = ''): string {
     .join('\n');
 }
 
+/**
+ * What the failed checks are called on the code host: CI checks on GitHub, the head pipeline's
+ * jobs on GitLab.
+ */
+const failedChecksTitle = (cr: ChangeRequestTerms) =>
+  cr.host === 'GitLab'
+    ? t({ zh: '流水线没通过：', en: 'Failed pipeline jobs:' })
+    : t({ zh: 'CI 检查没通过：', en: 'Failed checks:' });
+
 /** What the coding agent is told about the pull request, one part per kind. */
 function feedbackText(
   pr: ChangeRequestStatus,
@@ -183,20 +202,23 @@ function feedbackText(
   checks: readonly HostCheck[],
   reviews: readonly HostReview[],
   comments: readonly HostReviewComment[],
+  platform: HostPlatform | undefined,
 ): string {
+  const cr = changeRequestTerms(platform);
   const base = `\`${pr.baseRefName}\``;
+  const number = cr.number(pr.number);
   const parts = [
     t({
-      zh: `PR #${pr.number} 需要返工：${pr.url}`,
-      en: `Pull request #${pr.number} needs more work: ${pr.url}`,
+      zh: `${cr.short} ${number} 需要返工：${pr.url}`,
+      en: `${cr.longCapital} ${number} needs more work: ${pr.url}`,
     }),
   ];
   for (const kind of kinds) {
     if (kind === 'conflict') {
       parts.push(
         t({
-          zh: `与目标分支冲突：PR 和目标分支 ${base} 有冲突。合并阶段会合入 ${base} 的新提交并解决冲突。`,
-          en: `Conflict with the target branch: the pull request conflicts with ${base}. The merge stage merges the new commits of ${base} and resolves the conflicts.`,
+          zh: `与目标分支冲突：${cr.short} 和目标分支 ${base} 有冲突。合并阶段会合入 ${base} 的新提交并解决冲突。`,
+          en: `Conflict with the target branch: the ${cr.long} conflicts with ${base}. The merge stage merges the new commits of ${base} and resolves the conflicts.`,
         }),
       );
     } else if (kind === 'ci') {
@@ -210,16 +232,19 @@ function feedbackText(
       });
       parts.push(
         [
-          t({ zh: 'CI 检查没通过：', en: 'Failed checks:' }),
+          failedChecksTitle(cr),
           ...lines,
           t({
-            zh: '打不开检查的日志时，在工作目录里运行相应的构建和测试命令复现失败。',
+            zh:
+              cr.host === 'GitLab'
+                ? '打不开 job 的日志时，在工作目录里运行相应的构建和测试命令复现失败。'
+                : '打不开检查的日志时，在工作目录里运行相应的构建和测试命令复现失败。',
             en: 'If you cannot open the logs, reproduce the failures by running the matching build and test commands in the working directory.',
           }),
         ].join('\n'),
       );
     } else {
-      parts.push(reviewText(reviews, comments));
+      parts.push(reviewText(reviews, comments, cr));
     }
   }
   return parts.join('\n\n');
@@ -229,6 +254,7 @@ function feedbackText(
 function reviewText(
   reviews: readonly HostReview[],
   comments: readonly HostReviewComment[],
+  cr: ChangeRequestTerms,
 ): string {
   const lines = [t({ zh: '评审要求修改：', en: 'Changes requested in review:' })];
   for (const review of reviews) {
@@ -261,8 +287,8 @@ function reviewText(
     if (more > 0) {
       lines.push(
         t({
-          zh: `还有 ${more} 条行内评论没有列出，见 PR。`,
-          en: `${more} more line ${more === 1 ? 'comment is' : 'comments are'} not listed; see the pull request.`,
+          zh: `还有 ${more} 条行内评论没有列出，见 ${cr.short}。`,
+          en: `${more} more line ${more === 1 ? 'comment is' : 'comments are'} not listed; see the ${cr.long}.`,
         }),
       );
     }
@@ -276,26 +302,31 @@ function reasonText(
   kinds: readonly PrReworkKind[],
   checks: readonly HostCheck[],
   reviews: readonly HostReview[],
+  platform: HostPlatform | undefined,
 ): string {
   return reworkReason({
     kinds,
     base: pr.baseRefName,
     checks: checks.map((c) => c.name),
     reviewers: reviews.map((r) => r.author),
+    platform,
   });
 }
 
 /**
  * Why a pull request needs more work, in one line, from what a rework records: the conflict with
- * `base`, the failed checks by name, who asked for changes (null for a deleted account).
+ * `base`, the failed checks by name (CI checks on GitHub, the pipeline's jobs on GitLab:
+ * `platform`, GitHub if omitted), who asked for changes (null for a deleted account).
  */
 export function reworkReason(rework: {
   kinds: readonly PrReworkKind[];
   base: string;
   checks: readonly string[];
   reviewers: readonly (string | null)[];
+  platform?: HostPlatform | undefined;
 }): string {
   const { base, checks, reviewers } = rework;
+  const gitlab = rework.platform === 'gitlab';
   const parts = rework.kinds.map((kind) => {
     if (kind === 'conflict') {
       return t({
@@ -313,6 +344,12 @@ export function reworkReason(rework: {
               en: `${join(names)} and ${more} more`,
             })
           : join(names);
+      if (gitlab) {
+        return t({
+          zh: `流水线没通过：${list}`,
+          en: `${checks.length === 1 ? 'a failed pipeline job' : 'failed pipeline jobs'}: ${list}`,
+        });
+      }
       return t({
         zh: `CI 检查没通过：${list}`,
         en: `${checks.length === 1 ? 'a failed check' : 'failed checks'}: ${list}`,
@@ -348,8 +385,8 @@ export function reworksDone(
 /**
  * Whether a Run waiting for its pull request (`pr_open`) still has to push its branch there: it
  * got to wait again (`merge.pr_pending`) after its last push (`github.pr_opened`, or
- * `github.pr_updated` after a rework). Until then the pull request on GitHub shows the Run's
- * earlier work, which is not to be judged again.
+ * `github.pr_updated` after a rework). Until then the pull request on the code host shows the
+ * Run's earlier work, which is not to be judged again.
  */
 export function pullRequestPushPending(events: readonly RunEventLike[]): boolean {
   const pending = events.findLastIndex((e) => e.type === 'merge.pr_pending');

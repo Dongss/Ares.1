@@ -11,8 +11,9 @@
 // how long the raw output of agents is kept, which worktrees of failed or cancelled Runs of
 // issues are left over for the Master to remove, where a repo's requirements come from (GitHub,
 // GitLab or the local backlog) and how often that source is polled, whether a repo delivers
-// through pull requests (GitHub's) or merge requests (GitLab's), how many Runs may
-// execute across every repo (`concurrency.max_runs`), and the rules of iterations: how many
+// through pull requests (GitHub's) or merge requests (GitLab's) and what each is called, which
+// code host a Run goes with, how many Runs may execute across every repo
+// (`concurrency.max_runs`), and the rules of iterations: how many
 // children one plans at most, the kind auto-accept judges one by as a whole, which children a
 // child waits for, its progress and where it stands.
 // Pure logic (type imports, src/i18n.ts, src/store/types.ts and src/engine/discussion.ts only),
@@ -25,6 +26,7 @@ import {
   type Difficulty,
   type EventRow,
   FINISHED_RUN_STATUSES,
+  type HostPlatform,
   type Iteration,
   type IterationChild,
   type IterationStatus,
@@ -613,6 +615,63 @@ export function deliversByPr(master: RequirementSources, repoName: string): bool
         ? master.gitlab?.repos[repoName]
         : undefined;
   return repo !== undefined && repoDeliversByPr(repo);
+}
+
+/**
+ * The words for a code host and the change requests Runs deliver through there, in what the
+ * Master writes for people: GitHub's pull requests (PR #12), GitLab's merge requests (MR !12).
+ * Only the words differ: the `pr_open` status, the Run's `pr`, the `github.pr_*` events, labels
+ * and hidden markers are the same on both.
+ */
+export interface ChangeRequestTerms {
+  /** The platform as people know it, the same in every language. */
+  host: 'GitHub' | 'GitLab';
+  /** The short name, the same in every language: PR, MR. */
+  short: 'PR' | 'MR';
+  /** The long name English texts use: pull request, merge request. */
+  long: 'pull request' | 'merge request';
+  /** `long` at the start of a sentence: Pull request, Merge request. */
+  longCapital: 'Pull request' | 'Merge request';
+  /** The `deliver` setting that delivers through them: pr, mr. */
+  deliver: 'pr' | 'mr';
+  /** How a change request's number is written: #12 on GitHub, !12 on GitLab. */
+  number(n: number): string;
+}
+
+/** The words for `platform`, GitHub's when it is not given (`ChangeRequestTerms`). */
+export function changeRequestTerms(platform: HostPlatform | undefined): ChangeRequestTerms {
+  if (platform === 'gitlab') {
+    return {
+      host: 'GitLab',
+      short: 'MR',
+      long: 'merge request',
+      longCapital: 'Merge request',
+      deliver: 'mr',
+      number: (n) => `!${n}`,
+    };
+  }
+  return {
+    host: 'GitHub',
+    short: 'PR',
+    long: 'pull request',
+    longCapital: 'Pull request',
+    deliver: 'pr',
+    number: (n) => `#${n}`,
+  };
+}
+
+/**
+ * The code host a Run goes with, for the words of what is written about it: its issue's
+ * (`RunIssue.platform`); for a Run of no issue, such as one the Master created to merge the
+ * target branch's new commits, its repo's source of requirements (`source`, from
+ * `requirementSource`): GitLab for a repo of `gitlab.repos`, GitHub otherwise.
+ */
+export function runPlatform(
+  run: Pick<Run, 'issue'>,
+  source: RequirementSource | null | undefined,
+): HostPlatform {
+  if (run.issue) return run.issue.platform ?? 'github';
+  return source === 'gitlab' ? 'gitlab' : 'github';
 }
 
 /** Where a repo's requirements come from: GitHub issues, GitLab issues, or the local backlog. */

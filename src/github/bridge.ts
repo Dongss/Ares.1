@@ -1357,6 +1357,7 @@ export class IssueBridge {
       runId: run.id,
       issue: run.issue !== null,
       dashboardUrl: this.dashboardUrl(),
+      platform: this.platform.platform,
     });
     await gh.closeChangeRequest(full, pr.number, markComment(redactForGitHub(comment)));
     this.hostEvent(run.id, 'github.pr_closed_by_master', { ...ref, reason });
@@ -1428,7 +1429,11 @@ export class IssueBridge {
     // One a human opened from it into another branch is not how the Run delivers.
     if (open && open.baseRefName === target) pr = open;
     else {
-      const text = pullRequestText(run, { repo: full, dashboardUrl: this.dashboardUrl() });
+      const text = pullRequestText(run, {
+        repo: full,
+        dashboardUrl: this.dashboardUrl(),
+        platform: this.platform.platform,
+      });
       pr = await gh.createChangeRequest(full, {
         head: branch,
         base: target,
@@ -1449,6 +1454,7 @@ export class IssueBridge {
         targetBranch: target,
         runId: run.id,
         dashboardUrl: this.dashboardUrl(),
+        platform: this.platform.platform,
       }),
     );
   }
@@ -1484,6 +1490,7 @@ export class IssueBridge {
         url: pr.url,
         runId: run.id,
         dashboardUrl: this.dashboardUrl(),
+        platform: this.platform.platform,
       }),
     );
   }
@@ -1565,6 +1572,7 @@ export class IssueBridge {
       head: run.headCommit,
       master,
       done: reworksDone(events),
+      platform: this.platform.platform,
     });
     this.recordIgnoredReviews(run, pr, ignored);
     if (!rework) return;
@@ -1580,6 +1588,7 @@ export class IssueBridge {
         reason: rework.reason,
         runId: run.id,
         dashboardUrl: this.dashboardUrl(),
+        platform: this.platform.platform,
       }),
     );
   }
@@ -2288,7 +2297,7 @@ export class IssueBridge {
     const update = issueUpdate(run, {
       dashboardUrl: this.dashboardUrl(),
       targetBranch: repo.targetBranch,
-      host: this.platform.name,
+      platform: this.platform.platform,
       stageName,
       pushed,
       pr: merged,

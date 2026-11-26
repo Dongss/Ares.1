@@ -413,6 +413,71 @@ describe('judgePullRequest', () => {
     expect(single.rework?.reason).toBe('a failed check: build');
     expect(single.rework?.feedback).not.toMatch(CJK);
   });
+
+  describe('a merge request on GitLab', () => {
+    const MR_URL = 'https://gitlab.com/grp/sub/widgets/-/merge_requests/9';
+    const JOB_URL = 'https://gitlab.com/grp/sub/widgets/-/jobs/3';
+    const onGitLab = ctx({ platform: 'gitlab' });
+    /** Every kind at once, on a merge request: the pipeline's jobs are its checks. */
+    const mr = () =>
+      pull({
+        url: MR_URL,
+        mergeable: false,
+        reviews: [review({ body: '' })],
+        reviewComments: Array.from({ length: 31 }, (_, i) => lineComment({ line: i + 1 })),
+        checks: [failing({ name: 'test', conclusion: 'failed', url: JOB_URL })],
+      });
+    /** Nothing names GitHub, its pull requests or CI checks. */
+    const gitlabOnly = (text: string) => {
+      expect(text).not.toContain('GitHub');
+      expect(text).not.toMatch(/\bPR\b/);
+      expect(text).not.toContain('#9');
+      expect(text).not.toContain('CI');
+      expect(text).not.toContain('pull request');
+    };
+
+    it('says MR !N and the pipeline, judging as on GitHub', () => {
+      const rework = judgePullRequest(mr(), onGitLab).rework;
+      // The same judgement: only the words differ.
+      expect(rework).toMatchObject({
+        head: HEAD,
+        kinds: ['conflict', 'ci', 'review'],
+        reviewers: ['alice'],
+        checks: [{ name: 'test', url: JOB_URL }],
+      });
+      const feedback = rework?.feedback ?? '';
+      expect(feedback.startsWith(`MR !9 需要返工：${MR_URL}`)).toBe(true);
+      expect(feedback).toContain('与目标分支冲突：MR 和目标分支 `main` 有冲突。');
+      expect(feedback).toContain(`流水线没通过：\n- \`test\`（failed）：${JOB_URL}`);
+      expect(feedback).toContain('打不开 job 的日志时');
+      expect(feedback).toContain('@alice 要求修改（评审没有写正文）。');
+      expect(feedback).toContain('还有 1 条行内评论没有列出，见 MR。');
+      gitlabOnly(feedback);
+      expect(rework?.reason).toBe('与目标分支 `main` 冲突；流水线没通过：test；@alice 要求修改');
+      gitlabOnly(rework?.reason ?? '');
+      // GitHub's words, without the platform.
+      expect(judgePullRequest(mr(), ctx()).rework?.reason).toBe(
+        '与目标分支 `main` 冲突；CI 检查没通过：test；@alice 要求修改',
+      );
+    });
+
+    it('in English', () => {
+      setLang('en');
+      const rework = judgePullRequest(mr(), onGitLab).rework;
+      const feedback = rework?.feedback ?? '';
+      expect(feedback.startsWith(`Merge request !9 needs more work: ${MR_URL}`)).toBe(true);
+      expect(feedback).toContain('the merge request conflicts with `main`');
+      expect(feedback).toContain(`Failed pipeline jobs:\n- \`test\` (failed): ${JOB_URL}`);
+      expect(feedback).toContain('1 more line comment is not listed; see the merge request.');
+      expect(rework?.reason).toBe(
+        'a conflict with the target branch `main`; a failed pipeline job: test; changes requested by @alice',
+      );
+      for (const text of [feedback, rework?.reason ?? '']) {
+        expect(text).not.toMatch(CJK);
+        gitlabOnly(text);
+      }
+    });
+  });
 });
 
 describe('reworkReason', () => {
@@ -439,6 +504,18 @@ describe('reworkReason', () => {
       'a conflict with the target branch `main`; failed checks: build, lint; changes requested by @alice',
     );
     expect(reason).not.toMatch(CJK);
+  });
+
+  it("names the failed jobs of a GitLab merge request's pipeline", () => {
+    const jobs = Array.from({ length: 6 }, (_, i) => `job${i + 1}`);
+    const gitlab = (checks: string[]) =>
+      reworkReason({ kinds: ['ci'], base: 'main', checks, reviewers: [], platform: 'gitlab' });
+    expect(gitlab(['test'])).toBe('流水线没通过：test');
+    expect(gitlab(jobs)).toBe('流水线没通过：job1、job2、job3、job4、job5 等 6 个');
+    setLang('en');
+    expect(gitlab(['test'])).toBe('a failed pipeline job: test');
+    expect(gitlab(jobs)).toBe('failed pipeline jobs: job1, job2, job3, job4, job5 and 1 more');
+    expect(gitlab(jobs)).not.toMatch(CJK);
   });
 });
 

@@ -1,9 +1,9 @@
 // When a human needs to know: shared by the Master's system notifications and the
 // dashboard's browser notifications. Pure; the dashboard imports this file.
 
-import { SCOUT_FAILURE_NOTIFY_AFTER } from '../config/flow.js';
+import { changeRequestTerms, SCOUT_FAILURE_NOTIFY_AFTER } from '../config/flow.js';
 import { join, type Lang, t } from '../i18n.js';
-import type { BlockKind, EventRow } from '../store/types.js';
+import type { BlockKind, EventRow, HostPlatform } from '../store/types.js';
 
 /**
  * A record whose values are picked in the language in use each time they are read, so that a
@@ -34,9 +34,21 @@ export const BLOCK_KIND: Record<BlockKind, string> = localized<BlockKind, string
     en: 'Issue by a non-member: confirm the requirement',
   },
   environment: { zh: '运行环境缺少命令', en: 'Command missing from the environment' },
-  pr_open: { zh: '等 PR 合并', en: 'Waiting for the PR to merge' },
+  // Not knowing the Run: a pull request on GitHub, a merge request on GitLab.
+  pr_open: { zh: '等 PR/MR 合并', en: 'Waiting for the PR/MR to merge' },
   error: { zh: 'Master 内部错误', en: 'Master internal error' },
 });
+
+/**
+ * Why a Run is blocked (`BLOCK_KIND`), naming the change request a Run waiting for one is waiting
+ * for by the code host the Run goes with (`platform`, e.g. its issue's): 「等 PR 合并」 on GitHub,
+ * 「等 MR 合并」 on GitLab. Without the platform, PR/MR names either.
+ */
+export function blockKindText(kind: BlockKind, platform?: HostPlatform): string {
+  if (kind !== 'pr_open' || platform === undefined) return BLOCK_KIND[kind];
+  const { short } = changeRequestTerms(platform);
+  return t({ zh: `等 ${short} 合并`, en: `Waiting for the ${short} to merge` });
+}
 
 /**
  * Why a Run is blocked on the environment, naming the program that could not be found (the
@@ -102,11 +114,11 @@ export const NOTICE_KINDS: Record<NoticeKind, { label: string; when: string }> =
   failed: {
     zh: {
       label: 'Run 失败了',
-      when: 'Run 没做完就结束了，例如返工次数用完仍未通过、阶段回退次数用完（on_exhausted: fail），Agent 出错且重试、换 Agent 都用完，超出预算（on_budget_exceeded: abort，默认），或通过 PR 交付（deliver: pr）时 PR 没合并就被关掉；你自己终止的不通知',
+      when: 'Run 没做完就结束了，例如返工次数用完仍未通过、阶段回退次数用完（on_exhausted: fail），Agent 出错且重试、换 Agent 都用完，超出预算（on_budget_exceeded: abort，默认），或通过 PR/MR 交付（GitHub 的 deliver: pr、GitLab 的 deliver: mr）时 PR/MR 没合并就被关掉；你自己终止的不通知',
     },
     en: {
       label: 'Run failed',
-      when: 'A Run ended unfinished, e.g. still failing after all retries or past the stage loop limit (on_exhausted: fail), an agent error with every retry and agent used up, over budget (on_budget_exceeded: abort, the default), or its pull request closed unmerged when the repo delivers through pull requests (deliver: pr); Runs you cancel yourself are not notified',
+      when: 'A Run ended unfinished, e.g. still failing after all retries or past the stage loop limit (on_exhausted: fail), an agent error with every retry and agent used up, over budget (on_budget_exceeded: abort, the default), or its pull request or merge request closed unmerged when the repo delivers through them (deliver: pr on GitHub, deliver: mr on GitLab); Runs you cancel yourself are not notified',
     },
   },
   proposals: {
@@ -394,7 +406,8 @@ export function noticeFor(event: EventRow, goal: string | undefined): Notice | n
     case 'run.blocked':
       // Questions about the requirement are a conversation, not a breakdown.
       if (event.data.kind === 'discussion') return run('discussion');
-      // An open pull request is how deliver: pr goes, not a breakdown; GitHub tells its reviewers.
+      // An open pull request is how deliver: pr goes (a merge request, deliver: mr on GitLab), not
+      // a breakdown; the code host tells its reviewers.
       if (event.data.kind === 'pr_open') return null;
       if (event.data.kind === 'environment' && typeof event.data.missing === 'string') {
         return run('blocked', missingCommandText(event.data.missing));
@@ -518,8 +531,9 @@ export function noticeFor(event: EventRow, goal: string | undefined): Notice | n
     }
     case 'github.pr_closed_by_master':
     case 'github.pr_found_closed':
-      // The pull request of a Run that ended unfinished, closed or left as GitHub had it: the
-      // Run's end was told already (a failed Run notifies), and nobody has to act on this.
+      // The pull request (merge request) of a Run that ended unfinished, closed or left as its
+      // code host had it: the Run's end was told already (a failed Run notifies), and nobody has
+      // to act on this.
       return null;
     case 'github.pulled':
     case 'github.merged_remote':

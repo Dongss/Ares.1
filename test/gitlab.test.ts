@@ -1066,6 +1066,10 @@ gitlab:
     });
     expect(mr.title).toBe('#1 加 feature');
     expect(mr.body.endsWith('\n\nCloses #1')).toBe(true);
+    // In GitLab's words.
+    expect(mr.body).toContain('在 GitLab 上合并这个 MR 后 Run 会自动完成');
+    expect(mr.body).not.toContain('GitHub');
+    expect(mr.body).not.toMatch(/\bPR\b/);
     // The Run's branch is on GitLab as it was accepted; the target branch is fetched, never
     // pushed, and the local one has not moved.
     expect(run.headCommit).toBe(git(t.repoDir, 'rev-parse', branch));
@@ -1077,14 +1081,26 @@ gitlab:
     expect(t.master.store.listGlobalEventsOfType('github.pushed')).toEqual([]);
 
     expect(run).toMatchObject({ status: 'blocked', pr: ref });
+    // The engine's events of the merge request say GitLab, as the bridge's do.
     expect(runEvents(t, run.id, 'github.pr_opened')).toEqual([
-      { ...ref, head: branch, base: 'main' },
+      { ...ref, head: branch, base: 'main', platform: 'gitlab' },
     ]);
+    expect(run.blocked?.message).toContain(
+      '这个仓库通过 MR 交付（deliver: mr）：Run 的分支会推送到 GitLab，开一个合并到 main 的 MR；MR 在 GitLab 上合并后 Run 完成',
+    );
+    await expect(t.master.engine.retry(run.id)).rejects.toThrow(
+      'Run 在等 GitLab 上的 MR 合并，不能重试：在 GitLab 上合并 MR，Run 会完成；关掉 MR，Run 会结束为失败',
+    );
     // The issue gets the link and waits for a human, open.
     const issue = gl.get(1);
     const linked = issue.comments.filter((c) => c.includes(mr.url));
     expect(linked).toHaveLength(1);
-    expect(linked[0]).toContain(`已开 PR #${mr.number}，合并到 \`main\``);
+    expect(linked[0]).toContain(`已开 MR !${mr.number}，合并到 \`main\``);
+    expect(linked[0]).toContain(
+      '在 GitLab 上合并这个 MR 后，Run 会自动完成，这个 issue 也会自动关闭',
+    );
+    expect(linked[0]).not.toContain('GitHub');
+    expect(linked[0]).not.toMatch(/\bPR\b/);
     expect(isMasterComment(linked[0] ?? '')).toBe(true);
     expect(issue).toMatchObject({ state: 'open', labels: [LABELS.needsYou] });
 
@@ -1135,18 +1151,28 @@ gitlab:
         kinds: ['ci'],
         reviewers: [],
         checks: [{ name: 'test', url: JOB_URL }],
+        platform: 'gitlab',
       },
     ]);
+    // The merge stage's check names the merge request.
+    const mergeChecks = store.listChecks(run.id).filter((c) => c.kind === 'merge');
+    expect(mergeChecks.at(-1)).toMatchObject({
+      name: `通过 MR !${mr.number} 合并到 main`,
+      passed: false,
+      detail: `MR !${mr.number} 需要返工：流水线没通过：test\n${mr.url}`,
+    });
     // The issue hears why, from the Master, and is labelled running again.
     const reworked = gl.get(1).comments.filter((c) => c.includes('需要返工'));
     expect(reworked).toHaveLength(1);
-    expect(reworked[0]).toContain(`CI 检查没通过：test`);
-    expect(reworked[0]).toContain(mr.url);
+    expect(reworked[0]).toContain(`MR !${mr.number} 需要返工：流水线没通过：test`);
+    expect(reworked[0]).toContain(`改好后推送到同一个 MR：${mr.url}`);
+    expect(reworked[0]).not.toMatch(/\bPR\b|CI/);
     expect(isMasterComment(reworked[0] ?? '')).toBe(true);
 
     const again = await waitingAgain(t, run);
     expect(prompts).toHaveLength(2);
-    expect(prompts[1]).toContain(`- \`test\`（failed）：${JOB_URL}`);
+    expect(prompts[1]).toContain(`MR !${mr.number} 需要返工：${mr.url}`);
+    expect(prompts[1]).toContain(`流水线没通过：\n- \`test\`（failed）：${JOB_URL}`);
     expect(prompts[1]).not.toContain('`lint`');
     expect(again.headCommit).not.toBe(first);
     expect(again.pr).toEqual(ref);
@@ -1166,7 +1192,9 @@ gitlab:
     expect(gl.calls.filter((c) => c.startsWith('createPull'))).toHaveLength(1);
     expect(gl.calls.filter((c) => c === `push ${branch}`)).toHaveLength(2);
     expect(runEvents(t, run.id, 'github.pr_opened')).toHaveLength(1);
-    expect(runEvents(t, run.id, 'github.pr_updated')).toEqual([{ ...ref, head: again.headCommit }]);
+    expect(runEvents(t, run.id, 'github.pr_updated')).toEqual([
+      { ...ref, head: again.headCommit, platform: 'gitlab' },
+    ]);
     expect(store.getRun(run.id)).toMatchObject({
       status: 'blocked',
       blocked: again.blocked,
@@ -1174,7 +1202,7 @@ gitlab:
     });
     const updated = gl.get(1).comments.filter((c) => c.includes('返工后的提交已推送'));
     expect(updated).toHaveLength(1);
-    expect(updated[0]).toContain(mr.url);
+    expect(updated[0]).toContain(`返工后的提交已推送到 MR !${mr.number}：${mr.url}`);
     expect(isMasterComment(updated[0] ?? '')).toBe(true);
     expect(gl.get(1)).toMatchObject({ state: 'open', labels: [LABELS.needsYou] });
     // Never the target branch.
@@ -1233,11 +1261,18 @@ gitlab:
     });
     await t.master.gitlabIssues.poll();
     expect(runEvents(t, run.id, 'github.pr_rework')).toEqual([
-      { ...ref, head: run.headCommit, kinds: ['review'], reviewers: ['dev'], checks: [] },
+      {
+        ...ref,
+        head: run.headCommit,
+        kinds: ['review'],
+        reviewers: ['dev'],
+        checks: [],
+        platform: 'gitlab',
+      },
     ]);
     const again = await waitingAgain(t, run);
     expect(prompts).toHaveLength(2);
-    expect(prompts[1]).toContain(mr.url);
+    expect(prompts[1]).toContain(`MR !${mr.number} 需要返工：${mr.url}`);
     expect(prompts[1]).toContain('@dev 要求修改（评审没有写正文）');
     expect(prompts[1]).toContain('- `feature.txt:1`（@dev）：\n  > 这一行要写完整');
     expect(gl.get(1).comments.filter((c) => c.includes('需要返工'))).toHaveLength(1);
@@ -1246,7 +1281,9 @@ gitlab:
     await t.master.gitlabIssues.poll();
     expect(gl.pull(mr.number)).toMatchObject({ state: 'open', headRefOid: again.headCommit });
     expect(gl.pulls.size).toBe(1);
-    expect(runEvents(t, run.id, 'github.pr_updated')).toEqual([{ ...ref, head: again.headCommit }]);
+    expect(runEvents(t, run.id, 'github.pr_updated')).toEqual([
+      { ...ref, head: again.headCommit, platform: 'gitlab' },
+    ]);
     // The Reporter's words reached no agent, record or comment.
     for (const call of t.fake.calls) expect(call.prompt).not.toContain('evil.example');
     for (const sr of store.listStageRuns(run.id)) {
@@ -1279,13 +1316,20 @@ gitlab:
     // The round pulled GitLab's main before it looked at the merge request.
     expect(head(t)).toBe(theirs);
     expect(runEvents(t, run.id, 'github.pr_rework')).toEqual([
-      { ...ref, head: run.headCommit, kinds: ['conflict'], reviewers: [], checks: [] },
+      {
+        ...ref,
+        head: run.headCommit,
+        kinds: ['conflict'],
+        reviewers: [],
+        checks: [],
+        platform: 'gitlab',
+      },
     ]);
     expect(gl.get(1).comments.filter((c) => c.includes('需要返工'))[0]).toContain(
-      '与目标分支 `main` 冲突',
+      `MR !${mr.number} 需要返工：与目标分支 \`main\` 冲突`,
     );
     const again = await waitingAgain(t, run);
-    expect(prompts[1]).toContain('与目标分支冲突');
+    expect(prompts[1]).toContain('与目标分支冲突：MR 和目标分支 `main` 有冲突');
     // The round went back to merge main's new commit, and the coder resolved the conflict.
     expect(runEvents(t, run.id, 'merge.started').at(-1)).toMatchObject({
       source: 'target',
@@ -1323,7 +1367,12 @@ gitlab:
     expect(head(t)).toBe(squash);
     expect(readFileSync(join(t.repoDir, 'feature.txt'), 'utf8')).toBe('ok\n');
     expect(completed.pr).toEqual(ref);
-    expect(runEvents(t, run.id, 'github.pr_merged')).toEqual([{ ...ref, mergeCommit: squash }]);
+    expect(runEvents(t, run.id, 'github.pr_merged')).toEqual([
+      { ...ref, mergeCommit: squash, platform: 'gitlab' },
+    ]);
+    expect(
+      t.master.store.listChecks(run.id).filter((c) => c.kind === 'merge' && c.passed),
+    ).toMatchObject([{ name: `通过 MR !${mr.number} 合并到 main` }]);
     expect(runEvents(t, run.id, 'run.issue_closed')).toEqual([]);
     // The bridge closed the issue itself, as completed, once.
     expect(gl.calls.filter((c) => c.startsWith('close #'))).toEqual(['close #1 completed']);
@@ -1331,7 +1380,9 @@ gitlab:
     expect(issue).toMatchObject({ state: 'closed', stateReason: 'completed', labels: [] });
     const said = issue.comments.filter((c) => c.includes('已合并到'));
     expect(said).toHaveLength(1);
-    expect(said[0]).toContain(mr.url);
+    expect(said[0]).toContain(
+      `MR !${mr.number} 已合并到 \`main\`（\`${squash.slice(0, 7)}\`）：${mr.url}`,
+    );
     expect(isMasterComment(said[0] ?? '')).toBe(true);
     // Merged on GitLab: neither the target branch pushed nor the merge request closed.
     expect(gl.calls).not.toContain('push main');
@@ -1356,6 +1407,27 @@ gitlab:
     expect(gl.get(1)).toMatchObject({ state: 'closed', stateReason: 'completed' });
   });
 
+  it('fails the Run when the merge request is closed unmerged, naming it MR !N', async () => {
+    const t = await start(MR);
+    const store = t.master.store;
+    const { run, mr, ref } = await mrOpened(t);
+    gl.closePull(mr.number);
+    await t.master.gitlabIssues.poll();
+
+    const failed = store.getRun(run.id);
+    expect(failed.status).toBe('failed');
+    expect(failed.error).toContain(`MR !${mr.number} 没有合并就被关掉了：${mr.url}`);
+    expect(failed.error).not.toMatch(/\bPR\b/);
+    expect(runEvents(t, run.id, 'github.pr_closed')).toEqual([{ ...ref, platform: 'gitlab' }]);
+    expect(store.listChecks(run.id).filter((c) => c.kind === 'merge' && !c.passed)).toMatchObject([
+      { name: `通过 MR !${mr.number} 合并到 main` },
+    ]);
+    // The issue hears why, in GitLab's words; closed by a human, the merge request stays so.
+    await t.master.gitlabIssues.sync();
+    expect(gl.get(1).comments.at(-1)).toContain(`MR !${mr.number} 没有合并就被关掉了`);
+    expect(closes()).toEqual([]);
+  });
+
   it('closes the merge request of a Run terminated while it waited, the next round, saying why', async () => {
     const t = await start(MR);
     const store = t.master.store;
@@ -1366,7 +1438,8 @@ gitlab:
     expect(gl.pull(mr.number).state).toBe('closed');
     const said = gl.pull(mr.number).comments;
     expect(said).toHaveLength(1);
-    expect(said[0]).toContain(`Run \`${run.id}\` 被终止了`);
+    expect(said[0]).toContain(`Run \`${run.id}\` 被终止了，这个 MR 不会再更新`);
+    expect(said[0]).not.toMatch(/\bPR\b/);
     expect(said[0]).toContain(`#/runs/${run.id}`);
     expect(said[0]).not.toContain(homedir());
     expect(isMasterComment(said[0] ?? '')).toBe(true);
