@@ -9,6 +9,7 @@ import {
   conflictTarget,
   failTarget,
   REPO_WORKFLOWS_DIR,
+  type RequirementSource,
   resolveTemplate,
   runsAgent,
   stageAgentIds,
@@ -100,7 +101,9 @@ export interface LoadedConfig {
   /**
    * Problems keyed by "agents.yaml#<id>", "workflows/<file>", a repo's
    * "<repo>:.ares1/workflows/<file>", or a repo's requirements source in config.yaml
-   * (`githubConfigKey` / `backlogConfigKey`). Those items are disabled.
+   * (`githubConfigKey` / `gitlabConfigKey` / `backlogConfigKey`). Those items are disabled; a
+   * repo named in more than one source is an error of every source after the first in the order
+   * github, gitlab, backlog, so that only the first keeps it.
    */
   errors: Record<string, string[]>;
   /** Problems that disable nothing, keyed by "config.yaml" or a template file's key. */
@@ -290,15 +293,24 @@ export function loadConfig(
     });
   }
 
-  // GitHub and local backlog repos refer to templates and agents; a broken reference disables
-  // that repo only. Settings that work but likely not as meant only add to config.yaml's warnings.
+  // GitHub, GitLab and local backlog repos refer to templates and agents; a broken reference
+  // disables that repo only. Settings that work but likely not as meant only add to config.yaml's
+  // warnings.
   const repoWarnings: string[] = [];
   const checkSource = (name: string, repo: ProposalSourceConfig): string[] => {
     const checked = proposalSourceProblems(name, repo, { templates, repoTemplates }, agents);
     repoWarnings.push(...checked.warnings);
     return checked.problems;
   };
+  // Two sources would both scout and accept for the repo. The first in the order github, gitlab,
+  // backlog keeps working as it did, so adding an entry elsewhere by mistake stops nothing; the
+  // later entry itself is disabled, and only the conflict is told: its settings are not used
+  // either way.
   const githubRepos = master.github?.repos ?? {};
+  const gitlabRepos = master.gitlab?.repos ?? {};
+  const earlierRepos = { github: githubRepos, gitlab: gitlabRepos };
+  const keptSource = (name: string, earlier: readonly (keyof typeof earlierRepos)[]) =>
+    earlier.find((source) => Object.hasOwn(earlierRepos[source], name));
   for (const [name, repo] of Object.entries(githubRepos)) {
     const problems = checkSource(name, repo);
     // A pull request needs the Run's branch on GitHub and the target branch pulled back after
@@ -313,16 +325,19 @@ export function loadConfig(
     }
     if (problems.length > 0) errors[githubConfigKey(name)] = problems;
   }
+  for (const [name, repo] of Object.entries(gitlabRepos)) {
+    const kept = keptSource(name, ['github']);
+    if (kept) {
+      errors[gitlabConfigKey(name)] = [inTwoSources(name, kept, 'gitlab')];
+      continue;
+    }
+    const problems = checkSource(name, repo);
+    if (problems.length > 0) errors[gitlabConfigKey(name)] = problems;
+  }
   for (const [name, repo] of Object.entries(master.backlog?.repos ?? {})) {
-    // Two sources would both scout and accept for the repo. GitHub keeps working as it did, so
-    // adding a backlog entry by mistake stops nothing; the entry itself is disabled.
-    if (Object.hasOwn(githubRepos, name)) {
-      errors[backlogConfigKey(name)] = [
-        t({
-          zh: `仓库 ${name} 同时写在 github.repos 和 backlog.repos 里：一个仓库只能选一种需求来源，要么用 GitHub issue，要么用本地提案池。这里的设置没有生效，GitHub 一侧照常工作；不用 GitHub 的话，就把它从 github.repos 里删掉`,
-          en: `Repo ${name} is in both github.repos and backlog.repos: a repo takes its requirements from one source only, either GitHub issues or the local backlog. These settings are not in effect and GitHub keeps working as before; to work without GitHub, remove the repo from github.repos`,
-        }),
-      ];
+    const kept = keptSource(name, ['github', 'gitlab']);
+    if (kept) {
+      errors[backlogConfigKey(name)] = [inTwoSources(name, kept, 'backlog')];
       continue;
     }
     const problems = checkSource(name, repo);
@@ -513,8 +528,8 @@ function loadTemplateSource(
 }
 
 /**
- * What GitHub and local backlog repos share, checked against the templates and agents: problems
- * disable the repo; warnings are about settings that work, but likely not as meant.
+ * What GitHub, GitLab and local backlog repos share, checked against the templates and agents:
+ * problems disable the repo; warnings are about settings that work, but likely not as meant.
  */
 function proposalSourceProblems(
   name: string,
@@ -567,9 +582,51 @@ export function githubConfigKey(repoName: string): string {
   return `config.yaml#github.repos.${repoName}`;
 }
 
+/** Key of a GitLab repo's problems in `errors`. */
+export function gitlabConfigKey(repoName: string): string {
+  return `config.yaml#gitlab.repos.${repoName}`;
+}
+
 /** Key of a local backlog repo's problems in `errors`. */
 export function backlogConfigKey(repoName: string): string {
   return `config.yaml#backlog.repos.${repoName}`;
+}
+
+/**
+ * Why the entry of repo `name` in `dropped`'s repos is disabled: `kept`, a source before it in
+ * the order github, gitlab, backlog, has the repo too, and keeps it.
+ */
+function inTwoSources(name: string, kept: RequirementSource, dropped: RequirementSource): string {
+  const k = sourceWords(kept);
+  const d = sourceWords(dropped);
+  return t({
+    zh: `仓库 ${name} 同时写在 ${k.key} 和 ${d.key} 里：一个仓库只能选一种需求来源（GitHub issue、GitLab issue 或本地提案池）。${d.key} 里的设置没有生效，${k.side}照常工作；想${d.use}，就把它从 ${k.key} 里删掉`,
+    en: `Repo ${name} is in both ${k.key} and ${d.key}: a repo takes its requirements from one source only (GitHub issues, GitLab issues or the local backlog). The settings in ${d.key} are not in effect and ${k.side} keeps working as before; to ${d.use}, remove the repo from ${k.key}`,
+  });
+}
+
+/** How `inTwoSources` names a source: its key in config.yaml, its side, and switching to it. */
+function sourceWords(source: RequirementSource): { key: string; side: string; use: string } {
+  switch (source) {
+    case 'github':
+      return {
+        key: 'github.repos',
+        side: t({ zh: 'GitHub 一侧', en: 'GitHub' }),
+        use: t({ zh: '改用 GitHub issue', en: 'use GitHub issues instead' }),
+      };
+    case 'gitlab':
+      return {
+        key: 'gitlab.repos',
+        side: t({ zh: 'GitLab 一侧', en: 'GitLab' }),
+        use: t({ zh: '改用 GitLab issue', en: 'use GitLab issues instead' }),
+      };
+    case 'backlog':
+      return {
+        key: 'backlog.repos',
+        side: t({ zh: '本地提案池一侧', en: 'the local backlog' }),
+        use: t({ zh: '改用本地提案池', en: 'use the local backlog instead' }),
+      };
+  }
 }
 
 /** A string field of an unvalidated YAML mapping, or null. */
@@ -596,8 +653,9 @@ function parseMaster(file: string): { master: MasterConfig; warnings: string[] }
 
 /**
  * Keys of config.yaml the schema drops without a word: the top level and `defaults` are not
- * strict (unlike github, backlog, notify and upgrade), so a typo such as `upgarde:` would silently
- * leave a setting off. Only warned about, so an existing config.yaml still starts the Master.
+ * strict (unlike github, gitlab, backlog, notify and upgrade), so a typo such as `upgarde:` would
+ * silently leave a setting off. Only warned about, so an existing config.yaml still starts the
+ * Master.
  */
 function unknownMasterKeys(raw: unknown): string[] {
   const warnings: string[] = [];

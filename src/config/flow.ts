@@ -9,8 +9,9 @@
 // Run or a scout waits for an agent that is out of
 // quota or rate-limited,
 // how long the raw output of agents is kept, which worktrees of failed or cancelled Runs of
-// issues are left over for the Master to remove, where a repo's requirements come from (GitHub
-// or the local backlog), whether a repo delivers through pull requests, how many Runs may
+// issues are left over for the Master to remove, where a repo's requirements come from (GitHub,
+// GitLab or the local backlog) and how often that source is polled, whether a repo delivers
+// through pull requests, how many Runs may
 // execute across every repo (`concurrency.max_runs`), and the rules of iterations: how many
 // children one plans at most, the kind auto-accept judges one by as a whole, which children a
 // child waits for, its progress and where it stands.
@@ -38,6 +39,7 @@ import type {
   BacklogConfig,
   Escalate,
   GitHubConfig,
+  GitLabConfig,
   RunOverrides,
   StageDef,
   WorkflowTemplate,
@@ -584,30 +586,58 @@ export function runsAgent(kind: StageDef['kind']): boolean {
  * then leaves the local target branch alone and the Run waits for its pull request on GitHub
  * (`pr_open`). Goes by what config.yaml says, also when push is off, which disables the repo for
  * GitHub: its Runs then wait at the merge until the configuration is fixed, rather than merge
- * locally what was meant to go through a pull request.
+ * locally what was meant to go through a pull request. Only a repo whose requirements come from
+ * GitHub (`requirementSource`) does: a GitLab repo delivers by push only, and a name GitHub
+ * shares with another source is GitHub's.
  */
-export function deliversByPr(
-  github: Pick<GitHubConfig, 'repos'> | undefined,
-  repoName: string,
-): boolean {
-  return github?.repos[repoName]?.deliver === 'pr';
+export function deliversByPr(master: RequirementSources, repoName: string): boolean {
+  if (requirementSource(master, repoName) !== 'github') return false;
+  return master.github?.repos[repoName]?.deliver === 'pr';
+}
+
+/** Where a repo's requirements come from: GitHub issues, GitLab issues, or the local backlog. */
+export type RequirementSource = 'github' | 'gitlab' | 'backlog';
+
+/** The parts of config.yaml that say where repos' requirements come from. */
+export interface RequirementSources {
+  github?: Pick<GitHubConfig, 'repos'> | undefined;
+  gitlab?: Pick<GitLabConfig, 'repos'> | undefined;
+  backlog?: Pick<BacklogConfig, 'repos'> | undefined;
 }
 
 /**
- * Where a repo's requirements come from: GitHub issues (`github.repos`), the local backlog
- * (`backlog.repos`), or neither (null). A repo in both is a configuration error that disables
- * only its backlog entry, so GitHub keeps it.
+ * Where a repo's requirements come from: GitHub issues (`github.repos`), GitLab issues
+ * (`gitlab.repos`), the local backlog (`backlog.repos`), or none of them (null). A repo in more
+ * than one is a configuration error that disables all but the first of them in that order, which
+ * keeps the repo.
  */
 export function requirementSource(
-  master: {
-    github?: Pick<GitHubConfig, 'repos'> | undefined;
-    backlog?: Pick<BacklogConfig, 'repos'> | undefined;
-  },
+  master: RequirementSources,
   repoName: string,
-): 'github' | 'backlog' | null {
+): RequirementSource | null {
   if (master.github && Object.hasOwn(master.github.repos, repoName)) return 'github';
+  if (master.gitlab && Object.hasOwn(master.gitlab.repos, repoName)) return 'gitlab';
   if (master.backlog && Object.hasOwn(master.backlog.repos, repoName)) return 'backlog';
   return null;
+}
+
+/** `poll_minutes` when a source does not say. */
+const DEFAULT_POLL_MINUTES = 5;
+
+/**
+ * How often the Master polls where a repo's requirements come from (`requirementSource`): that
+ * source's `poll_minutes`; 5 for a repo of none of them. A failed Run's redo waits by it.
+ */
+export function sourcePollMinutes(
+  master: {
+    github?: Pick<GitHubConfig, 'repos' | 'poll_minutes'> | undefined;
+    gitlab?: Pick<GitLabConfig, 'repos' | 'poll_minutes'> | undefined;
+    backlog?: Pick<BacklogConfig, 'repos' | 'poll_minutes'> | undefined;
+  },
+  repoName: string,
+): number {
+  const source = requirementSource(master, repoName);
+  return (source && master[source]?.poll_minutes) ?? DEFAULT_POLL_MINUTES;
 }
 
 /**

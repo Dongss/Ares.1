@@ -155,8 +155,9 @@ test/
     proposals a human may start over (`proposalRestartable`), raw log retention (`runRawLogsExpired` /
     `scoutRawLogExpired`), leftover worktrees (`leftoverWorkspaces`), which template a repo's
     Runs get by id, the home directory's or the repo's own (`resolveTemplate`), where a repo's
-    requirements come from, GitHub or the local backlog (`requirementSource`), whether a repo
-    delivers through pull requests (`deliversByPr`), the limit on Runs executing across repos
+    requirements come from, GitHub, GitLab or the local backlog (`requirementSource`), and how
+    often that source is polled (`sourcePollMinutes`), whether a repo delivers through pull
+    requests (`deliversByPr`), the limit on Runs executing across repos
     and which queued Runs wait for it (`roomUnderMaxRuns` / `waitsForMaxRuns`), the paths a Run
     expects to change and whether two Runs' paths overlap (`normalizeTouches` /
     `touchesOverlap` / `conflictBlocker`), the rules of iterations: how many children one plans

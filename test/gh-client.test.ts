@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { GhCli, GhError } from '../src/github/client.js';
 import { isTrusted } from '../src/github/issues.js';
 import { judgePullRequest } from '../src/github/pr-rework.js';
+import { GlabCli } from '../src/gitlab/client.js';
 import { type CodeHostConfig, CodeHostFactory } from '../src/host/factory.js';
 import { setLang } from '../src/i18n.js';
 import { FakeGitHub, git, initRepo, tmpDir, writeFile } from './helpers.js';
@@ -1484,6 +1485,32 @@ describe('CodeHostFactory', () => {
     expect(otherAccount).toBeInstanceOf(GhCli);
     expect(otherAccount).not.toBe(otherBin);
     expect(hosts.get(settings('/opt/gh', 'ares1-bot'))).toBe(otherAccount);
+  });
+
+  it('gives GitHub gh and GitLab glab, each keeping its own client', () => {
+    const hosts = new CodeHostFactory();
+    const config = (labHost: string, hubAccount = 'hub-bot'): CodeHostConfig => ({
+      bins: { gh: '/opt/gh', glab: '/opt/glab' },
+      github: { account: hubAccount, poll_minutes: 5, repos: {} },
+      gitlab: { host: labHost, account: 'lab-bot', poll_minutes: 5, repos: {} },
+    });
+    const hub = hosts.get(config('gitlab.com'));
+    const lab = hosts.get(config('gitlab.com'), 'gitlab');
+
+    expect(hub).toBeInstanceOf(GhCli);
+    expect(hosts.get(config('gitlab.com'), 'github')).toBe(hub);
+    expect(lab).toBeInstanceOf(GlabCli);
+    // Asking for one platform leaves the other's client as it is.
+    expect(hosts.get(config('gitlab.com'))).toBe(hub);
+    expect(hosts.get(config('gitlab.com'), 'gitlab')).toBe(lab);
+    // Each goes by its own settings only.
+    const moved = hosts.get(config('gitlab.example.com'), 'gitlab');
+    expect(moved).toBeInstanceOf(GlabCli);
+    expect(moved).not.toBe(lab);
+    expect(hosts.get(config('gitlab.example.com'))).toBe(hub);
+    const otherHub = hosts.get(config('gitlab.example.com', 'other-bot'));
+    expect(otherHub).not.toBe(hub);
+    expect(hosts.get(config('gitlab.example.com', 'other-bot'), 'gitlab')).toBe(moved);
   });
 });
 

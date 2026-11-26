@@ -52,8 +52,8 @@ export type AutoAcceptConfig = z.infer<typeof AutoAcceptSchema>;
 
 /**
  * What a repo's requirements are worked with, wherever they come from: GitHub issues
- * (`github.repos`) or the local backlog (`backlog.repos`). Both spread its shape, so the fields
- * read and validate the same in either.
+ * (`github.repos`), GitLab issues (`gitlab.repos`) or the local backlog (`backlog.repos`). Each
+ * spreads its shape, so the fields read and validate the same in all of them.
  */
 export const ProposalSourceSchema = z.strictObject({
   /**
@@ -79,7 +79,7 @@ export const ProposalSourceSchema = z.strictObject({
    */
   max_run_attempts: z.number().int().min(1).default(3),
 });
-/** The settings GitHub and local backlog repos share, for what works with either. */
+/** The settings GitHub, GitLab and local backlog repos share, for what works with any of them. */
 export type ProposalSourceConfig = z.infer<typeof ProposalSourceSchema>;
 
 /** GitHub Issues as the backlog of one registered repo. */
@@ -115,10 +115,61 @@ export const GitHubSchema = z.strictObject({
 });
 export type GitHubConfig = z.infer<typeof GitHubSchema>;
 
+/** GitLab Issues as the backlog of one registered repo. */
+export const GitLabRepoSchema = z.strictObject({
+  /**
+   * The project's path on GitLab, "group/name" or "group/subgroup/.../name", as in its link.
+   * Required: unlike gh, nothing resolves it from the repo's remotes.
+   */
+  issues_repo: z.string().regex(/^[\w.-]+(?:\/[\w.-]+)+$/, {
+    error: () =>
+      t({
+        zh: '格式应为 group/name 或 group/subgroup/name',
+        en: 'should be group/name or group/subgroup/name',
+      }),
+  }),
+  ...ProposalSourceSchema.shape,
+  /** Push the target branch to the GitLab project after each merge. */
+  push: z.boolean().default(false),
+  /**
+   * How a Run's work reaches GitLab: push only, the merge stage fast-forwarding the local target
+   * branch, which is then pushed (with push: true). Merge requests (`mr`) are not supported yet.
+   */
+  deliver: z.enum(['push']).default('push'),
+});
+export type GitLabRepoConfig = z.infer<typeof GitLabRepoSchema>;
+
+export const GitLabSchema = z.strictObject({
+  /**
+   * The GitLab glab and git talk to: gitlab.com, or a self-hosted one's host name (with a port
+   * if it has one), without https://.
+   */
+  host: z
+    .string()
+    .regex(/^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::\d+)?$/, {
+      error: () =>
+        t({
+          zh: '应为主机名，如 gitlab.example.com，不带 https://',
+          en: 'should be a host name such as gitlab.example.com, without https://',
+        }),
+    })
+    .default('gitlab.com'),
+  /** The account glab must be logged in as on `host`; omitted = whichever it is logged in as. */
+  account: z.string().min(1).optional(),
+  /** How often to look for ares1:ready issues and catch up on issue updates. */
+  poll_minutes: z.number().positive().default(5),
+  /**
+   * Keyed by the repo name registered on the dashboard. A repo takes its requirements from one
+   * source only, so a name of `github.repos` is an error here.
+   */
+  repos: z.record(z.string(), GitLabRepoSchema).default({}),
+});
+export type GitLabConfig = z.infer<typeof GitLabSchema>;
+
 /**
  * The local backlog as the source of one registered repo's requirements: the scout's proposals
  * are kept by the Master, and accepted ones (on the dashboard, or by `auto_accept`) become Runs.
- * For repos without GitHub; nothing here calls GitHub.
+ * For repos on neither GitHub nor GitLab; nothing here calls either.
  */
 export const BacklogRepoSchema = z.strictObject({ ...ProposalSourceSchema.shape });
 export type BacklogRepoConfig = z.infer<typeof BacklogRepoSchema>;
@@ -128,7 +179,7 @@ export const BacklogSchema = z.strictObject({
   poll_minutes: z.number().positive().default(5),
   /**
    * Keyed by the repo name registered on the dashboard. A repo takes its requirements from one
-   * source only, so a name of `github.repos` is an error here.
+   * source only, so a name of `github.repos` or `gitlab.repos` is an error here.
    */
   repos: z.record(z.string(), BacklogRepoSchema).default({}),
 });
@@ -212,6 +263,8 @@ export const MasterConfigSchema = z.object({
     .prefault({}),
   /** Omitted = no GitHub integration. */
   github: GitHubSchema.optional(),
+  /** Omitted = no GitLab integration. */
+  gitlab: GitLabSchema.optional(),
   /** Omitted = no local backlog. */
   backlog: BacklogSchema.optional(),
   /** Notifications sent by the Master itself, when a human is needed. */

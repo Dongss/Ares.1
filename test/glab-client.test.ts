@@ -8,6 +8,7 @@ import { isTrusted, LABELS } from '../src/github/issues.js';
 import { judgePullRequest } from '../src/github/pr-rework.js';
 import { GlabCli, GlabError, gitlabAuthor } from '../src/gitlab/client.js';
 import type { ChangeRequest, ChangeRequestStatus, CodeHost } from '../src/host/code-host.js';
+import { type CodeHostConfig, CodeHostFactory } from '../src/host/factory.js';
 import { setLang } from '../src/i18n.js';
 import { git, initRepo, tmpDir, writeFile } from './helpers.js';
 
@@ -341,6 +342,62 @@ describe('GlabCli viewer', () => {
     expect(await new GlabCli(glab.bin, { account: 'Ares1-Bot' }).viewer()).toBe('ares1-bot');
     const err = await glabError(new GlabCli(glab.bin, { account: 'alice' }).viewer());
     expect(err.message).toBe('glab 登录的账号是 ares1-bot，不是配置的 alice');
+  });
+});
+
+describe('CodeHostFactory for GitLab', () => {
+  /** The settings of the Master's config a GitLab client is made with. */
+  const settings = (bin: string, host: string, account?: string): CodeHostConfig => ({
+    bins: { glab: bin },
+    gitlab: { host, ...(account ? { account } : {}), poll_minutes: 5, repos: {} },
+  });
+
+  it('makes glab with the configured binary, talking to the host as the account', async () => {
+    const glab = fakeGlab([get('user', { username: 'ares1-bot' })]);
+    const host = new CodeHostFactory().get(
+      settings(glab.bin, 'gitlab.example.com', 'ares1-bot'),
+      'gitlab',
+    );
+
+    expect(host).toBeInstanceOf(GlabCli);
+    expect(await host.viewer()).toBe('ares1-bot');
+    expect(glab.calls().map((c) => c.args)).toEqual([
+      apiArgs('GET', 'user', { host: 'gitlab.example.com' }),
+    ]);
+    // The account is checked against the login.
+    const other = fakeGlab([get('user', { username: 'alice' })]);
+    const err = await glabError(
+      new CodeHostFactory().get(settings(other.bin, 'gitlab.com', 'ares1-bot'), 'gitlab').viewer(),
+    );
+    expect(err.message).toBe('glab 登录的账号是 alice，不是配置的 ares1-bot');
+  });
+
+  it('gives the same client while its settings stay, and a new one once they change', () => {
+    const hosts = new CodeHostFactory();
+    const first = hosts.get(settings('glab', 'gitlab.com'), 'gitlab');
+
+    expect(hosts.get(settings('glab', 'gitlab.com'), 'gitlab')).toBe(first);
+    // Settings the client is not made with leave it as it is; glab is the default binary.
+    expect(
+      hosts.get(
+        { bins: { gh: '/opt/gh' }, gitlab: { host: 'gitlab.com', poll_minutes: 1, repos: {} } },
+        'gitlab',
+      ),
+    ).toBe(first);
+
+    const changes = [
+      settings('/opt/glab', 'gitlab.com'),
+      settings('/opt/glab', 'gitlab.example.com'),
+      settings('/opt/glab', 'gitlab.example.com', 'ares1-bot'),
+    ];
+    let previous = first;
+    for (const changed of changes) {
+      const next = hosts.get(changed, 'gitlab');
+      expect(next).toBeInstanceOf(GlabCli);
+      expect(next).not.toBe(previous);
+      expect(hosts.get(changed, 'gitlab')).toBe(next);
+      previous = next;
+    }
   });
 });
 

@@ -3882,7 +3882,7 @@ export class Engine {
 
     const newHead = await revParse(workdir, 'HEAD');
     this.checkAbort(signal);
-    if (deliversByPr(this.cfg.master.github, repo.name)) {
+    if (deliversByPr(this.cfg.master, repo.name)) {
       this.awaitPullRequest(run, sr, target, newHead);
       return;
     }

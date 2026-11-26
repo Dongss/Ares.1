@@ -9,6 +9,7 @@ import {
   redoDueAt,
   requirementSource,
   runRawLogsExpired,
+  sourcePollMinutes,
 } from '../config/flow.js';
 import type { LoadedConfig } from '../config/load.js';
 import type { ConfigStatus } from '../config/watch.js';
@@ -371,10 +372,11 @@ export function createApi(deps: ApiDeps): Hono {
   app.get('/api/runs/:id', async (c) => {
     const id = c.req.param('id');
     const run = store.getRun(id);
-    const redoAt = redoDueAt(run, config().master.github?.poll_minutes ?? 5);
+    const repo = store.getRepo(run.repoId);
+    const redoAt = redoDueAt(run, sourcePollMinutes(config().master, repo.name));
     return c.json({
       run,
-      repo: store.getRepo(run.repoId),
+      repo,
       stageRuns: store.listStageRuns(id),
       tasks: store.listRunTasks(id),
       attempts: store.listRunAttempts(id),

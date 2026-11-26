@@ -7,6 +7,7 @@ import {
   childReady,
   chooseStageAgent,
   conflictBlocker,
+  deliversByPr,
   discussionReplyWait,
   effectiveDependencies,
   holdsScout,
@@ -41,6 +42,7 @@ import {
   scoutBackoff,
   scoutFailureStreak,
   scoutLimitWait,
+  sourcePollMinutes,
   splitUnfinishedRuns,
   stageAgentIds,
   templateSplits,
@@ -53,6 +55,7 @@ import {
   ConfigError,
   findTemplate,
   githubConfigKey,
+  gitlabConfigKey,
   homePaths,
   initHome,
   type LoadedConfig,
@@ -66,6 +69,7 @@ import {
   effectiveStage,
   failTarget,
   GitHubRepoSchema,
+  GitLabRepoSchema,
   ProposalSourceSchema,
   replyTimeoutHours,
   rollbackTarget,
@@ -183,8 +187,8 @@ defaults:
     expect(cfg.master.notify.system).toBe(false);
     expect(cfg.master.defaults).toEqual({ timeout_minutes: 60, command_timeout_minutes: 10 });
     expect(cfg.warnings['config.yaml']).toEqual([
-      '未知的配置项 upgarde，已忽略（是不是写错了？可用：language、port、bins、defaults、concurrency、github、backlog、notify、upgrade）',
-      '未知的配置项 notfy，已忽略（是不是写错了？可用：language、port、bins、defaults、concurrency、github、backlog、notify、upgrade）',
+      '未知的配置项 upgarde，已忽略（是不是写错了？可用：language、port、bins、defaults、concurrency、github、gitlab、backlog、notify、upgrade）',
+      '未知的配置项 notfy，已忽略（是不是写错了？可用：language、port、bins、defaults、concurrency、github、gitlab、backlog、notify、upgrade）',
       '未知的配置项 defaults.timeout_minute，已忽略（是不是写错了？可用：timeout_minutes、command_timeout_minutes）',
     ]);
     expect(cfg.errors).toEqual({});
@@ -824,7 +828,7 @@ stages:
     }
     /** The reason told when a repo is in both github.repos and backlog.repos. */
     const BOTH =
-      '仓库 app 同时写在 github.repos 和 backlog.repos 里：一个仓库只能选一种需求来源，要么用 GitHub issue，要么用本地提案池。这里的设置没有生效，GitHub 一侧照常工作；不用 GitHub 的话，就把它从 github.repos 里删掉';
+      '仓库 app 同时写在 github.repos 和 backlog.repos 里：一个仓库只能选一种需求来源（GitHub issue、GitLab issue 或本地提案池）。backlog.repos 里的设置没有生效，GitHub 一侧照常工作；想改用本地提案池，就把它从 github.repos 里删掉';
 
     it('is off unless written, and reads its repos with the defaults of github.repos', () => {
       expect(load('port: 4870\n').master.backlog).toBeUndefined();
@@ -992,7 +996,7 @@ backlog:
 `);
         expect(cfg.errors).toEqual({
           [backlogConfigKey('app')]: [
-            'Repo app is in both github.repos and backlog.repos: a repo takes its requirements from one source only, either GitHub issues or the local backlog. These settings are not in effect and GitHub keeps working as before; to work without GitHub, remove the repo from github.repos',
+            'Repo app is in both github.repos and backlog.repos: a repo takes its requirements from one source only (GitHub issues, GitLab issues or the local backlog). The settings in backlog.repos are not in effect and GitHub keeps working as before; to use the local backlog instead, remove the repo from github.repos',
           ],
           [backlogConfigKey('local')]: [
             'Template nope does not exist or is invalid',
@@ -1001,6 +1005,284 @@ backlog:
         });
         for (const problem of Object.values(cfg.errors).flat()) {
           expect(problem).not.toMatch(/[一-鿿]/);
+        }
+      } finally {
+        // Back to the default language, zod's messages included, for the other tests.
+        load('port: 4870\n');
+      }
+    });
+  });
+
+  describe('gitlab', () => {
+    function load(config: string, sources: Record<string, RepoTemplateSource> = {}) {
+      const paths = home();
+      writeFile(paths.configFile, config);
+      return loadConfig(paths, ['claude-code'], ['claude-code'], {
+        repoSources: new Map(Object.entries(sources)),
+      });
+    }
+    const PATH_FORMAT = '格式应为 group/name 或 group/subgroup/name';
+    /** The reason told when repo `name` is in `kept`'s repos and also in `dropped`'s. */
+    function inBoth(name: string, kept: 'github' | 'gitlab', dropped: 'gitlab' | 'backlog') {
+      const side = kept === 'github' ? 'GitHub' : 'GitLab';
+      const use = dropped === 'gitlab' ? '改用 GitLab issue' : '改用本地提案池';
+      return `仓库 ${name} 同时写在 ${kept}.repos 和 ${dropped}.repos 里：一个仓库只能选一种需求来源（GitHub issue、GitLab issue 或本地提案池）。${dropped}.repos 里的设置没有生效，${side} 一侧照常工作；想${use}，就把它从 ${kept}.repos 里删掉`;
+    }
+
+    it('is off unless written, and reads its repos with the defaults of github.repos', () => {
+      expect(load('port: 4870\n').master.gitlab).toBeUndefined();
+      const empty = load('gitlab: {}\n');
+      expect(empty.master.gitlab).toEqual({ host: 'gitlab.com', poll_minutes: 5, repos: {} });
+      expect(empty.warnings).toEqual({});
+      const cfg = load(`gitlab:
+  host: gitlab.example.com:8443
+  account: ares1-bot
+  poll_minutes: 2
+  repos:
+    app: { issues_repo: acme/app, template: self-dev }
+    deep:
+      issues_repo: acme/platform/tools/deep
+      template: self-dev
+      scout: { agent: claude-reviewer, auto: false }
+      auto_accept: { max_risk: low, max_size: M, max_per_day: 2 }
+      auto_merge: true
+      daily_budget_usd: 4
+      max_run_attempts: 2
+      push: true
+      deliver: push
+`);
+      expect(cfg.errors).toEqual({});
+      expect(cfg.warnings).toEqual({});
+      expect(cfg.master.github).toBeUndefined();
+      expect(cfg.master.gitlab).toEqual({
+        host: 'gitlab.example.com:8443',
+        account: 'ares1-bot',
+        poll_minutes: 2,
+        repos: {
+          app: {
+            issues_repo: 'acme/app',
+            template: 'self-dev',
+            auto_accept: { max_risk: 'none', max_size: 'L' },
+            auto_merge: false,
+            max_run_attempts: 3,
+            push: false,
+            deliver: 'push',
+          },
+          deep: {
+            issues_repo: 'acme/platform/tools/deep',
+            template: 'self-dev',
+            scout: { agent: 'claude-reviewer', auto: false, interval_minutes: 0, max_proposals: 5 },
+            auto_accept: { max_risk: 'low', max_size: 'M', max_per_day: 2 },
+            auto_merge: true,
+            daily_budget_usd: 4,
+            max_run_attempts: 2,
+            push: true,
+            deliver: 'push',
+          },
+        },
+      });
+      expect(requirementSource(cfg.master, 'deep')).toBe('gitlab');
+    });
+
+    it('validates the fields it shares with github.repos the same way', () => {
+      const shared = {
+        template: 'x',
+        scout: { agent: 'a', interval_minutes: 30 },
+        auto_accept: { max_risk: 'mid' },
+        daily_budget_usd: 3,
+        max_run_attempts: 4,
+      };
+      expect(GitLabRepoSchema.parse({ issues_repo: 'acme/app', ...shared })).toEqual({
+        issues_repo: 'acme/app',
+        ...ProposalSourceSchema.parse(shared),
+        push: false,
+        deliver: 'push',
+      });
+      for (const bad of [
+        { template: '' },
+        { template: 'x', scout: { agent: 'a', max_proposals: 21 } },
+        { template: 'x', auto_accept: { max_size: 'XL' } },
+        { template: 'x', daily_budget_usd: 0 },
+        { template: 'x', max_run_attempts: 0 },
+        { template: 'x', push: 'yes' },
+      ]) {
+        const what = JSON.stringify(bad);
+        expect(GitLabRepoSchema.safeParse({ issues_repo: 'acme/app', ...bad }).success, what).toBe(
+          false,
+        );
+      }
+    });
+
+    it('needs the project path, with as many subgroups as it has', () => {
+      for (const path of ['acme/app', 'acme/sub/app', 'a/b/c/d/e', 'my-group/my.project_1']) {
+        expect(GitLabRepoSchema.parse({ issues_repo: path, template: 'x' }).issues_repo).toBe(path);
+      }
+      for (const bad of [
+        'app',
+        '',
+        '/app',
+        'acme/',
+        'acme//app',
+        'acme/app/',
+        'https://gitlab.com/acme/app',
+        'acme/my app',
+        'acme/app#1',
+      ]) {
+        const parsed = GitLabRepoSchema.safeParse({ issues_repo: bad, template: 'x' });
+        expect(
+          parsed.error?.issues.map((i) => i.message),
+          bad,
+        ).toEqual([PATH_FORMAT]);
+      }
+      // Nothing resolves it from the remotes, as gh does for GitHub.
+      expect(() => load('gitlab:\n  repos:\n    app: { template: self-dev }\n')).toThrow(
+        /gitlab\.repos\.app\.issues_repo/,
+      );
+      expect(() => load('gitlab:\n  repos:\n    app: { issues_repo: app, template: x }\n')).toThrow(
+        `gitlab.repos.app.issues_repo: ${PATH_FORMAT}`,
+      );
+    });
+
+    it('delivers by push only: merge requests are not supported yet', () => {
+      expect(GitLabRepoSchema.parse({ issues_repo: 'a/b', template: 'x' }).deliver).toBe('push');
+      for (const bad of ['mr', 'pr', 'merge', true, null]) {
+        const repo = { issues_repo: 'a/b', template: 'x', deliver: bad };
+        expect(GitLabRepoSchema.safeParse(repo).success, String(bad)).toBe(false);
+      }
+      expect(() =>
+        load('gitlab:\n  repos:\n    app: { issues_repo: a/b, template: self-dev, deliver: mr }\n'),
+      ).toThrow(/gitlab\.repos\.app\.deliver/);
+    });
+
+    it('takes a host name, with a port if it has one, and checks the rest of the section', () => {
+      for (const host of ['gitlab.com', 'gitlab.example.com', 'localhost:8080', 'git-lab.io']) {
+        expect(load(`gitlab: { host: ${host} }\n`).master.gitlab?.host).toBe(host);
+      }
+      for (const bad of [
+        '"https://gitlab.example.com"',
+        'gitlab.example.com/',
+        '""',
+        '"git lab"',
+        '-gitlab.com',
+        'gitlab.com:port',
+      ]) {
+        expect(() => load(`gitlab: { host: ${bad} }\n`), bad).toThrow(
+          'gitlab.host: 应为主机名，如 gitlab.example.com，不带 https://',
+        );
+      }
+      for (const bad of ['poll_minutes: 0', 'poll_minutes: -1', 'account: ""', 'acount: x']) {
+        expect(() => load(`gitlab: { ${bad} }\n`), bad).toThrow(ConfigError);
+      }
+    });
+
+    it('disables only the repo whose template or scout agent is missing', () => {
+      const X = `id: x
+stages:
+  - { id: implement, agent: claude-coder }
+  - { id: review, kind: review, agent: claude-reviewer }
+  - { id: merge, kind: merge }
+`;
+      const source = {
+        branch: 'main',
+        sha: '1'.repeat(40),
+        files: [{ file: 'x.yaml', source: X }],
+      };
+      const cfg = load(
+        `gitlab:
+  repos:
+    app: { issues_repo: acme/app, template: nope, scout: { agent: nobody } }
+    own: { issues_repo: acme/own, template: x, auto_accept: { max_risk: low } }
+    fine: { issues_repo: acme/fine, template: self-dev, scout: { agent: claude-reviewer } }
+`,
+        { own: source },
+      );
+      expect(cfg.errors).toEqual({
+        [gitlabConfigKey('app')]: [
+          '模板 nope 不存在或无效',
+          '侦察用的 Agent nobody 不存在或未启用',
+        ],
+      });
+      // The repo's own templates count, and what works but likely not as meant is warned about.
+      expect(cfg.warnings).toEqual({
+        'config.yaml': [expect.stringMatching(/^仓库 own 会自动采纳大小为 L 的提案/)],
+      });
+      expect(gitlabConfigKey('app')).toBe('config.yaml#gitlab.repos.app');
+    });
+
+    it('keeps a repo in two or three sources in the first of github, gitlab, backlog only', () => {
+      const cfg = load(`github:
+  repos:
+    hub: { template: self-dev }
+    all: { template: self-dev }
+gitlab:
+  repos:
+    hub: { issues_repo: acme/hub, template: nope }
+    all: { issues_repo: acme/all, template: self-dev }
+    lab: { issues_repo: acme/lab, template: self-dev }
+    labbed: { issues_repo: acme/labbed, template: self-dev }
+backlog:
+  repos:
+    all: { template: self-dev }
+    labbed: { template: nope, scout: { agent: nobody } }
+    local: { template: self-dev }
+`);
+      // Only the conflicts are told: the later entries' settings are not used either way.
+      expect(cfg.errors).toEqual({
+        [gitlabConfigKey('hub')]: [inBoth('hub', 'github', 'gitlab')],
+        [gitlabConfigKey('all')]: [inBoth('all', 'github', 'gitlab')],
+        [backlogConfigKey('all')]: [inBoth('all', 'github', 'backlog')],
+        [backlogConfigKey('labbed')]: [inBoth('labbed', 'gitlab', 'backlog')],
+      });
+      expect(cfg.warnings).toEqual({});
+      // The first source keeps each repo; the others' repos are fine.
+      const sources = ['hub', 'all', 'lab', 'labbed', 'local'].map((name) =>
+        requirementSource(cfg.master, name),
+      );
+      expect(sources).toEqual(['github', 'github', 'gitlab', 'gitlab', 'backlog']);
+    });
+
+    it('says so in English when config.yaml says so', () => {
+      try {
+        const cfg = load(`language: en
+github:
+  repos:
+    all: { template: self-dev }
+gitlab:
+  repos:
+    all: { issues_repo: acme/all, template: self-dev }
+    lab: { issues_repo: acme/lab, template: nope }
+backlog:
+  repos:
+    lab: { template: self-dev }
+`);
+        expect(cfg.errors).toEqual({
+          [gitlabConfigKey('all')]: [
+            'Repo all is in both github.repos and gitlab.repos: a repo takes its requirements from one source only (GitHub issues, GitLab issues or the local backlog). The settings in gitlab.repos are not in effect and GitHub keeps working as before; to use GitLab issues instead, remove the repo from github.repos',
+          ],
+          [gitlabConfigKey('lab')]: ['Template nope does not exist or is invalid'],
+          [backlogConfigKey('lab')]: [
+            'Repo lab is in both gitlab.repos and backlog.repos: a repo takes its requirements from one source only (GitHub issues, GitLab issues or the local backlog). The settings in backlog.repos are not in effect and GitLab keeps working as before; to use the local backlog instead, remove the repo from gitlab.repos',
+          ],
+        });
+        // An invalid config.yaml keeps the language in use: English, from the load above.
+        const bad = (config: string) => {
+          try {
+            load(`language: en\n${config}`);
+          } catch (err) {
+            return (err as Error).message;
+          }
+          return '';
+        };
+        const messages = [
+          bad('gitlab:\n  repos:\n    app: { issues_repo: app, template: x }\n'),
+          bad('gitlab: { host: "https://gitlab.example.com" }\n'),
+        ];
+        expect(messages[0]).toContain('gitlab.repos.app.issues_repo: should be group/name');
+        expect(messages[1]).toContain(
+          'gitlab.host: should be a host name such as gitlab.example.com, without https://',
+        );
+        for (const text of [...Object.values(cfg.errors).flat(), ...messages]) {
+          expect(text).not.toMatch(/[一-鿿]/);
         }
       } finally {
         // Back to the default language, zod's messages included, for the other tests.
@@ -3195,13 +3477,16 @@ describe('iterations', () => {
 });
 
 describe('requirementSource', () => {
-  const source = (github: string[] | null, backlog: string[] | null, name: string) => {
-    const repos = (names: string[]) => Object.fromEntries(names.map((n) => [n, {}]));
+  const source = (
+    github: string[] | null,
+    backlog: string[] | null,
+    name: string,
+    gitlab: string[] | null = null,
+  ) => {
+    const repos = (names: string[] | null) =>
+      names ? ({ repos: Object.fromEntries(names.map((n) => [n, {}])) } as never) : undefined;
     return requirementSource(
-      {
-        github: github ? ({ repos: repos(github) } as never) : undefined,
-        backlog: backlog ? ({ repos: repos(backlog) } as never) : undefined,
-      },
+      { github: repos(github), gitlab: repos(gitlab), backlog: repos(backlog) },
       name,
     );
   };
@@ -3216,6 +3501,58 @@ describe('requirementSource', () => {
     expect(source(null, null, 'a')).toBeNull();
     // Names of the object's prototype are no repos.
     expect(source([], [], 'constructor')).toBeNull();
+  });
+
+  it('tells GitLab issues apart, in the order github, gitlab, backlog', () => {
+    expect(source(['a'], ['b'], 'g', ['g'])).toBe('gitlab');
+    expect(source(null, null, 'g', ['g'])).toBe('gitlab');
+    expect(source(['a'], ['b'], 'b', ['g'])).toBe('backlog');
+    // In more than one: the first keeps it, the later entries are configuration errors.
+    expect(source(['a'], null, 'a', ['a'])).toBe('github');
+    expect(source(['a'], ['a'], 'a', ['a'])).toBe('github');
+    expect(source(null, ['g'], 'g', ['g'])).toBe('gitlab');
+    expect(source([], [], 'constructor', [])).toBeNull();
+  });
+});
+
+describe('deliversByPr', () => {
+  const github = {
+    repos: { pr: { deliver: 'pr' }, push: { deliver: 'push' }, both: { deliver: 'pr' } },
+  } as never;
+  const gitlab = { repos: { lab: { deliver: 'push' }, both: { deliver: 'push' } } } as never;
+
+  it('is true only for a repo of github.repos set to deliver: pr', () => {
+    expect(deliversByPr({ github, gitlab }, 'pr')).toBe(true);
+    expect(deliversByPr({ github, gitlab }, 'push')).toBe(false);
+    expect(deliversByPr({ github, gitlab }, 'lab')).toBe(false);
+    // GitHub keeps a repo GitLab names too.
+    expect(deliversByPr({ github, gitlab }, 'both')).toBe(true);
+    expect(deliversByPr({ github, gitlab }, 'nope')).toBe(false);
+    expect(deliversByPr({ github, gitlab }, 'constructor')).toBe(false);
+    expect(deliversByPr({}, 'pr')).toBe(false);
+  });
+
+  it('is false for a GitLab repo, which delivers by push only', () => {
+    const lab = { repos: { app: { deliver: 'pr' } } } as never;
+    expect(deliversByPr({ gitlab: lab }, 'app')).toBe(false);
+    // Nor does a backlog entry of a name GitHub does not have take GitHub's setting.
+    expect(deliversByPr({ github, backlog: { repos: { app: {} } } as never }, 'app')).toBe(false);
+  });
+});
+
+describe('sourcePollMinutes', () => {
+  it("polls by the poll_minutes of the source the repo's requirements come from", () => {
+    const master = {
+      github: { poll_minutes: 1, repos: { hub: {}, all: {} } },
+      gitlab: { poll_minutes: 2, repos: { lab: {}, all: {} } },
+      backlog: { poll_minutes: 3, repos: { local: {}, all: {} } },
+    } as never;
+    const minutes = ['hub', 'lab', 'local', 'all', 'none', 'constructor'].map((name) =>
+      sourcePollMinutes(master, name),
+    );
+    // A repo in more than one source is the first's; one in none waits the default.
+    expect(minutes).toEqual([1, 2, 3, 1, 5, 5]);
+    expect(sourcePollMinutes({}, 'hub')).toBe(5);
   });
 });
 
