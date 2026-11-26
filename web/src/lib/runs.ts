@@ -946,6 +946,14 @@ export function eventText(event: Pick<EventRow, 'type' | 'data'>, now = new Date
       });
     }
   }
+  if (event.type === 'run.iteration_closed') {
+    const { iteration } = event.data;
+    const which = typeof iteration === 'number' ? ` #${iteration}` : '';
+    return t({
+      zh: `所属迭代${which ? `${which} ` : ''}被人关掉了，这个 Run 随之终止，它的 issue 关成不做`,
+      en: `Its iteration${which} was closed by a human, so this Run was terminated and its issue closed as not planned`,
+    });
+  }
   const { newRun } = event.data;
   if (event.type === 'run.goal_changed' && typeof newRun === 'string') {
     return t({

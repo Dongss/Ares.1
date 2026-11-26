@@ -5,10 +5,13 @@ import { prepareAgentEnv } from '../adapters/process.js';
 import type { GitHubRepoStatus, GitHubStatus } from '../api/types.js';
 import { mayAutoAccept, overBudget } from '../backlog/guard.js';
 import {
+  type ChildOutcome,
   closeoutSuggestions,
   followChildren,
   iterationSummary,
   iterationTotals,
+  recordAdjustment,
+  recordCancelled,
 } from '../backlog/iterations.js';
 import {
   type FiledIteration,
@@ -22,10 +25,12 @@ import {
 import { brandName } from '../brand.js';
 import {
   effectiveDependencies,
+  ITERATION_OPEN_STATUSES,
   isAutoAcceptable,
   issueRunOverrides,
   iterationKind,
   iterationStatusOf,
+  MAX_ITERATION_CHILDREN,
   redoDueAt,
   replyTimeoutHours,
   unmetDependencies,
@@ -46,6 +51,7 @@ import {
   type EventRow,
   type FailedAttempt,
   FINISHED_RUN_STATUSES,
+  type IssueRef,
   type Iteration,
   type IterationChild,
   type IterationStatus,
@@ -81,8 +87,10 @@ import {
   type GitHub,
 } from './client.js';
 import {
+  type AddedStep,
   autoAcceptedComment,
   checkPlanItem,
+  closedWithIterationComment,
   discussionComment,
   type FailureOutcome,
   failedAttempt,
@@ -92,8 +100,10 @@ import {
   hasStatusLabel,
   type IterationText,
   isIterationSummaryComment,
+  isMasterCommentBy,
   issueUpdate,
   isTrusted,
+  iterationAdjustedComment,
   iterationAutoAcceptedComment,
   iterationBody,
   iterationChildBody,
@@ -111,8 +121,10 @@ import {
   pullRequestUpdatedComment,
   redoStartedComment,
   repliesAfterMaster,
+  revisedPlan,
   untrustedAuthor,
   untrustedGoalMessage,
+  withDependsOn,
   withReviewSuggestions,
   withStatusLabel,
 } from './issues.js';
@@ -125,6 +137,7 @@ import {
 import { redactForGitHub } from './redact.js';
 import {
   filedProposal,
+  type IterationUpdate,
   issueDigest,
   type PlannedIteration,
   plannedChildren,
@@ -364,15 +377,21 @@ const PR_SETTLED_EVENTS: readonly string[] = [
 /**
  * Why the Run ended without completing, for the comment the Master closes its pull request with:
  * failed, dropped by the requirement assessment, or terminated, as the bridge does it when its
- * issue was changed (`run.goal_changed`) or closed (`run.issue_closed`), else by a human.
+ * issue was changed (`run.goal_changed`) or closed, by a human (`run.issue_closed`) or with its
+ * iteration (`run.iteration_closed`), else by a human.
  */
 function prCloseReason(run: Run, events: readonly EventRow[]): PrCloseReason {
   if (run.status === 'failed') return 'failed';
   if (run.status === 'dropped') return 'dropped';
   if (events.some((e) => e.type === 'run.goal_changed')) return 'restarted';
-  if (events.some((e) => e.type === 'run.issue_closed')) return 'issue_closed';
+  if (events.some((e) => e.type === 'run.issue_closed' || e.type === 'run.iteration_closed')) {
+    return 'issue_closed';
+  }
   return 'cancelled';
 }
+
+/** Statuses of a step that is over: its issue is closed, nothing more to write on it. */
+const STEP_OVER: readonly IterationChild['status'][] = ['done', 'failed', 'dropped'];
 
 /** Whether every step of the iteration has its issue (its plan may still have to be written). */
 function writtenOut(iteration: Pick<Iteration, 'children'>): boolean {
@@ -390,21 +409,37 @@ function dependencyIssues(child: IterationChild, children: readonly IterationChi
   });
 }
 
-/** What the issue of an iteration says, as recorded: a step without its issue yet by title. */
+/**
+ * What the issue of an iteration says, as recorded: a step without its issue yet by title, a
+ * replaced one with the issue of the step that replaced it. Its kind is that of the steps not
+ * replaced.
+ */
 function iterationText(iteration: Iteration): IterationText {
+  const children = iteration.children;
   return {
     goal: iteration.goal,
     readmeGoal: iteration.readmeGoal,
     criteria: iteration.criteria,
     outOfScope: iteration.outOfScope,
-    kind: iterationKind(iteration.children),
-    plan: iteration.children.map((c) => ({
+    kind: iterationKind(children.filter((c) => c.replacedBy === undefined)),
+    plan: children.map((c) => ({
       number: c.issue?.number ?? null,
       title: c.title,
-      dependsOn: dependencyIssues(c, iteration.children),
+      dependsOn: dependencyIssues(c, children),
       done: c.status === 'done',
+      ...(c.replacedBy === undefined
+        ? {}
+        : {
+            replacedBy: children.find((r) => r.position === c.replacedBy)?.issue?.number ?? null,
+          }),
     })),
   };
+}
+
+/** Whether two lists of issue numbers name the same issues, whatever their order. */
+function sameIssues(a: readonly number[], b: readonly number[]): boolean {
+  const set = new Set(a);
+  return set.size === new Set(b).size && b.every((n) => set.has(n));
 }
 
 export interface BridgeDeps {
@@ -452,7 +487,10 @@ export interface BridgeDeps {
  * - iterations: a larger goal a scout planned becomes an issue labeled ares1:iteration whose
  *   plan lists its steps' issues; it is accepted as a whole (ares1:ready on it passes on to every
  *   step, auto-accept judges it by its riskiest and largest step), never becomes a Run itself,
- *   and a step gets its Run only once the issues it depends on are closed as completed.
+ *   and a step gets its Run only once the issues it depends on are closed as completed. A step
+ *   that failed for good or was closed by a human blocks it (notified) until it is reopened or a
+ *   scout replaces it; a human closing the iteration's issue terminates and closes its steps not
+ *   done; a scout's change to its plan is posted on it and its new steps filed.
  * Intake, auto-accept and automatic scouts only happen while the work switch is on.
  * GitHub is only a mirror: failures are reported and retried on the next poll, never block Runs.
  */
@@ -669,7 +707,8 @@ export class IssueBridge {
    * halfway, accept proposals the settings allow, start Runs for ready issues (the steps of an
    * iteration once their dependencies are done), terminate Runs whose issue a human closed and
    * start over those whose issue a human changed, catch issues up, follow the iterations under
-   * way (and sum up those done), pass on replies to the assessments' questions, start a scout
+   * way (blocked by a step that failed or was dropped, turned down when a human closed their
+   * issue, summed up once done), pass on replies to the assessments' questions, start a scout
    * where the repo is idle. With the work switch off only the pulling, the pull requests, the
    * terminating and the catching up happen: none of them starts new work.
    */
@@ -2402,6 +2441,8 @@ export class IssueBridge {
     known: (scout, repo) => this.knownIssues(scout, repo),
     file: (scout, repo, cfg, proposals) => this.fileProposals(scout, repo, cfg, proposals),
     fileIteration: (scout, repo, cfg, plan) => this.fileIteration(scout, repo, cfg, plan),
+    adjustIteration: (scout, repo, _cfg, iteration, update) =>
+      this.adjustIteration(scout, repo, iteration, update),
     // The auto-accepted issues are labeled ares1:ready: take them at once.
     completed: (_repo, filed) => {
       if (filed.auto > 0 || filed.iteration?.auto) void this.poll();
@@ -2571,11 +2612,12 @@ export class IssueBridge {
 
   /**
    * Finish the repo's pending iterations a scout left half written out: the Master stopped, or
-   * GitHub failed, before every issue was created and the plan written with them. Written out,
-   * an iteration's issue lists each step's issue in its plan (`planLists`); one whose issue is not
-   * open with ares1:proposal (a human closed or relabeled it) is left as it is. One whose own
-   * issue was never created is dropped, as fileIteration does. A failure fails the round and is
-   * tried again at the next one.
+   * GitHub failed, before every issue was created and the plan written with them (writeOutPlan).
+   * Written out, an iteration's issue lists each step's issue in its plan (`planLists`); one
+   * whose issue is not open with ares1:proposal (a human closed or relabeled it) is left as it
+   * is. One whose own issue was never created is dropped, as fileIteration does. A failure fails
+   * the round and is tried again at the next one. Accepted iterations are finished as they are
+   * followed (followIteration).
    */
   private async finishIterations(name: string): Promise<void> {
     const { repo, cfg } = this.repoSetup(name);
@@ -2600,9 +2642,11 @@ export class IssueBridge {
       if (!issue) continue;
       const numbers = iteration.children.flatMap((c) => (c.issue ? [c.issue.number] : []));
       if (writtenOut(iteration) && planLists(issue.body, numbers)) continue;
+      // A scout may have started to change its plan while the issues were listed.
+      if (this.writing.has(iteration.id)) continue;
       this.writing.add(iteration.id);
       try {
-        await this.writeOutIteration(iteration, false);
+        await this.writeOutPlan(this.deps.store.getIteration(iteration.id));
       } finally {
         this.writing.delete(iteration.id);
       }
@@ -2632,33 +2676,52 @@ export class IssueBridge {
       });
       store.updateIteration(iteration.id, { issue: own });
     }
-    for (const position of iteration.children.map((c) => c.position)) {
-      // As recorded now: each step created before this one has its issue.
-      const children = store.getIteration(iteration.id).children;
-      const child = children.find((c) => c.position === position);
-      if (!child || child.issue) continue;
-      const issue = await gh.createIssue(full, {
-        title: redactForGitHub(child.title),
-        body: redactForGitHub(
-          iterationChildBody(
-            child,
-            { iteration: own.number, dependsOn: dependencyIssues(child, children) },
-            scoutId,
-          ),
-        ),
-        labels: [LABELS.proposal],
-      });
-      // Read again: the record may have changed while the issue was created.
-      const latest = store.getIteration(iteration.id).children;
-      store.updateIteration(iteration.id, {
-        children: latest.map((c) => (c.position === position ? { ...c, issue } : c)),
-      });
-    }
+    await this.createStepIssues(iteration.id, own);
     const written = store.getIteration(iteration.id);
     await gh.editIssue(full, own.number, {
       body: redactForGitHub(iterationBody(iterationText(written), scoutId, auto)),
     });
     return written;
+  }
+
+  /**
+   * Create an issue for each step of the iteration (whose own issue is `own`) that has none yet,
+   * in the order of the plan, recording each at once: it names the issues of the steps it depends
+   * on, which come before it. Labeled ares1:proposal while the iteration waits to be accepted,
+   * which takes them with it; ares1:ready besides once it is accepted (and ares1:auto when it was
+   * without a human), so that intake takes them in the order of their dependencies.
+   */
+  private async createStepIssues(iterationId: string, own: IssueRef): Promise<void> {
+    const store = this.deps.store;
+    const gh = this.gh();
+    for (const position of store.getIteration(iterationId).children.map((c) => c.position)) {
+      // As recorded now: each step created before this one has its issue.
+      const iteration = store.getIteration(iterationId);
+      const children = iteration.children;
+      const child = children.find((c) => c.position === position);
+      if (!child || child.issue || child.replacedBy !== undefined) continue;
+      const labels: string[] = [LABELS.proposal];
+      if (iteration.status === 'active' || iteration.status === 'blocked') {
+        labels.push(LABELS.ready);
+        if (iteration.auto) labels.push(LABELS.auto);
+      }
+      const issue = await gh.createIssue(iteration.issuesRepo, {
+        title: redactForGitHub(child.title),
+        body: redactForGitHub(
+          iterationChildBody(
+            child,
+            { iteration: own.number, dependsOn: dependencyIssues(child, children) },
+            iteration.scoutId ?? '',
+          ),
+        ),
+        labels,
+      });
+      // Read again: the record may have changed while the issue was created.
+      const latest = store.getIteration(iterationId).children;
+      store.updateIteration(iterationId, {
+        children: latest.map((c) => (c.position === position ? { ...c, issue } : c)),
+      });
+    }
   }
 
   /**
@@ -2713,19 +2776,21 @@ export class IssueBridge {
   }
 
   /**
-   * Follow the repo's iterations under way (`followIteration`). Runs whatever the work switch:
-   * it starts no work. A failure of one iteration leaves the others to go on and fails the round
+   * Follow the repo's iterations that are not over (`followIteration`), but those a scout is
+   * writing out right now: the next round follows them. Runs whatever the work switch: it starts
+   * no work. A failure of one iteration leaves the others to go on and fails the round
    * afterwards; it is tried again the next round.
    */
   private async followIterations(name: string): Promise<void> {
     const repo = this.deps.store.findRepo(name);
     if (!repo) return;
-    const active = this.deps.store
-      .listIterations({ repoId: repo.id, status: 'active' })
+    const open = this.deps.store
+      .listIterations({ repoId: repo.id, status: ITERATION_OPEN_STATUSES })
       .filter((it) => it.source === 'github' && it.issue !== null);
     let failure: { err: unknown } | undefined;
-    for (const iteration of active) {
+    for (const iteration of open) {
       if (this.stopping) break;
+      if (this.writing.has(iteration.id)) continue;
       try {
         await this.followIteration(repo, iteration);
       } catch (err) {
@@ -2736,27 +2801,59 @@ export class IssueBridge {
   }
 
   /**
-   * Where each step of an iteration under way stands by its issue and its Runs (`followChildren`):
-   * done once its issue is closed as completed, running while a Run works on it, waiting while a
-   * step it depends on is not done, otherwise ready. A step whose issue was closed some other way
-   * keeps its status, and one done is not read again. Then each step done is checked in the plan
-   * on the iteration's issue (`checkPlanItem`), which is edited only when that changes it. Once
-   * every step is done the iteration is summed up and closed (completeIteration).
+   * Follow an iteration that is not over. Pending, only whether a human turned it down by closing
+   * its issue (cancelClosedIteration). Accepted, where each step stands by its issue and its Runs
+   * (`followChildren`): done once its issue is closed as completed; failed or dropped once it is
+   * closed some other way (blocking the iteration until it is reopened or replaced); running
+   * while a Run works on it, waiting while a step it depends on is not done, otherwise ready. A
+   * step done or replaced is not read again. Then:
+   * - its issue closed: summed up and done if every step is (the Master closed it after the
+   *   summary, or a human once nothing was left), otherwise turned down (cancelClosedIteration);
+   * - a change of its plan GitHub failed to take in full (a step without its issue, or the plan
+   *   not listing every step's): written out again (writeOutPlan), and followed the next round;
+   * - otherwise each step done is checked in the plan on its issue (`checkPlanItem`), which is
+   *   edited only when that changes it, and once every step is done the iteration is summed up
+   *   and closed (completeIteration).
    */
   private async followIteration(repo: Repo, iteration: Iteration): Promise<void> {
     const own = iteration.issue;
     if (!own) return;
     const gh = this.gh();
     const full = iteration.issuesRepo;
-    const done = new Map<number, boolean>();
-    for (const child of iteration.children) {
-      if (!child.issue || child.status === 'done') continue;
-      const issue = await gh.getIssue(full, child.issue.number);
-      if (issue.state === 'open') done.set(child.position, false);
-      else if (issue.stateReason === 'completed') done.set(child.position, true);
+    if (iteration.status === 'pending') {
+      const issue = await gh.getIssue(full, own.number);
+      if (issue.state === 'closed') await this.cancelClosedIteration(repo, iteration, issue);
+      return;
     }
-    const followed = followChildren(this.deps.store, iteration.id, repo.name, done);
+    const outcomes = new Map<number, ChildOutcome>();
+    for (const child of iteration.children) {
+      if (!child.issue || child.status === 'done' || child.replacedBy !== undefined) continue;
+      const issue = await gh.getIssue(full, child.issue.number);
+      outcomes.set(
+        child.position,
+        issue.state === 'open' ? 'open' : issue.stateReason === 'completed' ? 'done' : 'closed',
+      );
+    }
+    const followed = followChildren(this.deps.store, iteration.id, repo.name, outcomes);
     const issue = await gh.getIssue(full, own.number);
+    const allDone = iterationStatusOf(followed.children) === 'done';
+    if (issue.state === 'closed') {
+      if (allDone) await this.completeIteration(repo, followed, issue);
+      else await this.cancelClosedIteration(repo, followed, issue);
+      return;
+    }
+    const numbers = followed.children.flatMap((c) => (c.issue ? [c.issue.number] : []));
+    if (!writtenOut(followed) || !planLists(issue.body, numbers)) {
+      // A scout that changed the plan meanwhile writes it out itself.
+      if (this.writing.has(iteration.id)) return;
+      this.writing.add(iteration.id);
+      try {
+        await this.writeOutPlan(followed);
+      } finally {
+        this.writing.delete(iteration.id);
+      }
+      return;
+    }
     let body = issue.body;
     for (const child of followed.children) {
       if (child.status === 'done' && child.issue) body = checkPlanItem(body, child.issue.number);
@@ -2764,9 +2861,188 @@ export class IssueBridge {
     if (body !== issue.body) {
       await gh.editIssue(full, own.number, { body: redactForGitHub(body) });
     }
-    if (iterationStatusOf(followed.children) === 'done') {
-      await this.completeIteration(repo, followed, issue);
+    if (allDone) await this.completeIteration(repo, followed, issue);
+  }
+
+  /**
+   * A human closed the issue of an iteration that was not done (as not planned, or any other
+   * way: the Master closes it only once every step is done). Nobody wants the rest of it, so for
+   * each step neither done nor over nor replaced: its unfinished Run is terminated
+   * (`run.iteration_closed`, so that neither the Run's page nor the scout takes it for a
+   * failure), and its issue, if still open, gets a comment saying why (quoting the last comment
+   * a trusted human left on the iteration's issue, which the scout then reads as the reason) and
+   * is closed as not planned, its status label removed. Then the iteration is cancelled
+   * (`recordCancelled`). The iteration's issue stays as the human left it, their reason its last
+   * comment. A failure leaves it to the next round, which goes on with the steps still open.
+   */
+  private async cancelClosedIteration(
+    repo: Repo,
+    iteration: Iteration,
+    own: GhIssue,
+  ): Promise<void> {
+    const gh = this.gh();
+    const store = this.deps.store;
+    const full = iteration.issuesRepo;
+    const master = await this.masterLogin();
+    const reason =
+      (await gh.listComments(full, own.number)).findLast(
+        (c) => isTrusted(c, master) && !isMasterCommentBy(c, master),
+      )?.body ?? null;
+    for (const child of iteration.children) {
+      if (this.stopping) return;
+      if (!child.issue || child.replacedBy !== undefined || STEP_OVER.includes(child.status)) {
+        continue;
+      }
+      const number = child.issue.number;
+      const run = store.unfinishedRunForIssue(full, number);
+      const terminated = run
+        ? await this.cancelForClosedIteration(run.id, number, own.number)
+        : null;
+      const issue = await gh.getIssue(full, number);
+      if (issue.state !== 'open') continue;
+      await this.comment(
+        full,
+        number,
+        closedWithIterationComment({ iteration: own.number, runId: terminated, reason }),
+      );
+      const labels = withStatusLabel(issue.labels, null);
+      if (labels.length !== issue.labels.length) await gh.setLabels(full, number, labels);
+      await gh.close(full, number, 'not_planned');
     }
+    recordCancelled(store, iteration.id, repo.name);
+  }
+
+  /**
+   * Terminate the unfinished Run of step #`number` whose iteration (#`iteration`) a human closed,
+   * as cancelForClosedIssue does for a closed issue: caught up on the issue already (the Master
+   * closes the issue itself, with a comment saying why), and recorded as `run.iteration_closed`.
+   * Returns its id, or null when it finished meanwhile.
+   */
+  private async cancelForClosedIteration(
+    runId: string,
+    number: number,
+    iteration: number,
+  ): Promise<string | null> {
+    try {
+      await this.deps.engine.cancel(runId);
+    } catch (err) {
+      // It finished meanwhile; it is caught up on the issue as usual.
+      if (err instanceof InvalidStateError) return null;
+      throw err;
+    }
+    const store = this.deps.store;
+    store.tx(() => {
+      const run = store.getRun(runId);
+      store.setIssueSynced(runId, run.status);
+      store.setIssueDiscussionSynced(runId, run.discussion.length);
+      store.event(runId, 'run.iteration_closed', {
+        repo: run.issue?.repo ?? '',
+        issue: number,
+        iteration,
+      });
+    });
+    return runId;
+  }
+
+  /**
+   * Change the plan of the repo's iteration under way as a scout says (`recordAdjustment`): its
+   * steps added, the ones they replace marked, the closing step waiting for them, the note kept,
+   * all recorded first. Then GitHub follows: the new steps' issues, the dependencies of the steps
+   * whose changed, the plan on the iteration's issue (writeOutPlan), and a comment there with the
+   * note and the changes. Nothing is written on GitHub while a poll writes the iteration out; that
+   * poll's next round does it then. Failures are reported, not thrown: the scout keeps its
+   * result, and a later round finishes writing the plan out (followIteration).
+   */
+  private async adjustIteration(
+    scout: Scout,
+    repo: Repo,
+    iteration: Iteration,
+    update: IterationUpdate,
+  ): Promise<void> {
+    const own = iteration.issue;
+    if (iteration.source !== 'github' || !own) return;
+    const store = this.deps.store;
+    const { adjusted } = recordAdjustment(store, iteration.id, repo.name, update, scout.id);
+    if (!this.writing.has(iteration.id)) {
+      this.writing.add(iteration.id);
+      try {
+        await this.writeOutPlan(store.getIteration(iteration.id));
+      } catch (err) {
+        this.report(err);
+      } finally {
+        this.writing.delete(iteration.id);
+      }
+    }
+    const children = store.getIteration(iteration.id).children;
+    const byPosition = new Map(children.map((c) => [c.position, c]));
+    const added = adjusted.added.map((position): AddedStep => {
+      const child = byPosition.get(position);
+      const old = adjusted.replaced.find((r) => r.by === position);
+      return {
+        position,
+        number: child?.issue?.number ?? null,
+        title: child?.title ?? '',
+        ...(old
+          ? {
+              replaces: {
+                position: old.position,
+                number: byPosition.get(old.position)?.issue?.number ?? null,
+              },
+            }
+          : {}),
+      };
+    });
+    try {
+      await this.comment(
+        iteration.issuesRepo,
+        own.number,
+        iterationAdjustedComment({
+          note: update.note,
+          scoutId: scout.id,
+          added,
+          leftOut: adjusted.leftOut,
+          max: MAX_ITERATION_CHILDREN,
+        }),
+      );
+    } catch (err) {
+      this.report(err);
+    }
+  }
+
+  /**
+   * Bring an iteration's issues on GitHub in line with its plan after the plan changed: create
+   * the issues of the steps that have none (createStepIssues); rewrite the dependencies of each
+   * step not over whose issue names other ones than the plan now has (`withDependsOn`: a step it
+   * depends on was replaced, or the closing step waits for steps added); then write the plan on
+   * the iteration's issue: all of it again while it waits to be accepted, otherwise item by item
+   * (`revisedPlan`), keeping whatever else a human wrote. Returns the iteration as recorded then.
+   */
+  private async writeOutPlan(iteration: Iteration): Promise<Iteration> {
+    const own = iteration.issue;
+    if (!own) return iteration;
+    const store = this.deps.store;
+    const gh = this.gh();
+    const full = iteration.issuesRepo;
+    await this.createStepIssues(iteration.id, own);
+    const written = store.getIteration(iteration.id);
+    for (const child of written.children) {
+      if (!child.issue || child.replacedBy !== undefined || STEP_OVER.includes(child.status)) {
+        continue;
+      }
+      const deps = dependencyIssues(child, written.children);
+      const issue = await gh.getIssue(full, child.issue.number);
+      if (issue.state !== 'open' || sameIssues(parseDependsOn(issue.body), deps)) continue;
+      await gh.editIssue(full, issue.number, {
+        body: redactForGitHub(withDependsOn(issue.body, own.number, deps)),
+      });
+    }
+    const issue = await gh.getIssue(full, own.number);
+    const body =
+      written.status === 'pending'
+        ? iterationBody(iterationText(written), written.scoutId ?? '', false)
+        : revisedPlan(issue.body, iterationText(written));
+    if (body !== issue.body) await gh.editIssue(full, own.number, { body: redactForGitHub(body) });
+    return written;
   }
 
   /**

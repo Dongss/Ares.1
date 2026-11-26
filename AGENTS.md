@@ -65,8 +65,9 @@ src/
     scouting.ts       the AI scout's scheduling and runs, filing through a ProposalSource
     local.ts          the local backlog of repos without GitHub: polling, proposals, accepting
     guard.ts          the day's budget and auto-accept limits
-    iterations.ts     iterations whatever the source: where their children stand, cost and time,
-                      the summary once done, the review suggestions the closing step goes through
+    iterations.ts     iterations whatever the source: where their children stand, blocked or not,
+                      turned down, a scout's change to the plan, cost and time, the summary once
+                      done, the review suggestions the closing step goes through
   github/
     client.ts         GitHub through the gh CLI (FakeGitHub in tests)
     bridge.ts         polling, Runs from issues, progress on issues, auto-accept, push, auto-scout

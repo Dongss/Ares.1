@@ -386,6 +386,11 @@ export interface PlanItem {
   dependsOn: readonly number[];
   /** Closed as completed: its task list item is checked. */
   done?: boolean;
+  /**
+   * Replaced by another step after it failed or was dropped: the replacing step's issue, null
+   * while that has none yet. Its item stays in the plan, saying so.
+   */
+  replacedBy?: number | null;
 }
 
 /** What the issue of an iteration says. */
@@ -402,6 +407,86 @@ export interface IterationText {
 }
 
 /**
+ * One step in the plan of an iteration's issue: `- [ ] #N title`, checked once it is done, with
+ * the issues it depends on and, once replaced, which step replaced it; a step without its issue
+ * yet is a plain item with its title.
+ */
+function planItemLine(item: PlanItem): string {
+  if (item.number === null) return `- ${item.title}`;
+  const deps =
+    item.dependsOn.length > 0
+      ? t({
+          zh: `（依赖 ${issueList(item.dependsOn)}）`,
+          en: ` (depends on ${issueList(item.dependsOn)})`,
+        })
+      : '';
+  const replaced =
+    item.replacedBy === undefined
+      ? ''
+      : item.replacedBy === null
+        ? t({ zh: '（已被替换）', en: ' (replaced)' })
+        : t({ zh: `（已被 #${item.replacedBy} 替换）`, en: ` (replaced by #${item.replacedBy})` });
+  return `- [${item.done ? 'x' : ' '}] #${item.number} ${item.title}${deps}${replaced}`;
+}
+
+/**
+ * The line of an iteration's footer with how many steps it has (those replaced aside) and its
+ * kind as a whole; PLAN_STATS finds it again in either language.
+ */
+function planStatsLine(it: Pick<IterationText, 'plan' | 'kind'>): string {
+  const n = it.plan.filter((item) => item.replacedBy === undefined).length;
+  return t({
+    zh: `共 ${n} 个子 issue · 整体大小：${it.kind.size} · 整体风险：${riskText(it.kind.risk)}`,
+    en: `${n} sub-issue${n === 1 ? '' : 's'} · Overall size: ${it.kind.size} · Overall risk: ${riskText(it.kind.risk)}`,
+  });
+}
+
+const PLAN_STATS = /^(?:共 \d+ 个子 issue|\d+ sub-issues?) · .*$/m;
+
+/** Any checked or unchecked item of an iteration's plan that names an issue. */
+const PLAN_ITEM = /^[ \t]*[-*+] \[[ xX]\] #\d+/;
+
+/** The plan's item of issue `number`, checked or not. */
+const planItemOf = (number: number) => new RegExp(`^[ \\t]*[-*+] \\[[ xX]\\] #${number}(?!\\d)`);
+
+/**
+ * An iteration's body with its plan brought in line with `it` after the plan changed, keeping
+ * whatever else a human wrote: each item of a step that has its issue is written again (checked
+ * if it was, or if the step is done; deps and replacement as `it` has them), the items of steps
+ * the plan does not list yet go after its last item, in order, and the footer's line with the
+ * number of steps and the kind is written again. Items of steps without their issue are left
+ * out: they are added once their issue is created.
+ */
+export function revisedPlan(body: string, it: Pick<IterationText, 'plan' | 'kind'>): string {
+  const cut = body.indexOf(FOOTER_MARKER);
+  const lines = (cut >= 0 ? body.slice(0, cut) : body).split('\n');
+  let last = lines.findLastIndex((line) => PLAN_ITEM.test(line));
+  if (last < 0) {
+    // The plan's items were removed: the steps go at the end of the text, before the footer.
+    while (lines.length > 0 && lines.at(-1)?.trim() === '') lines.pop();
+    lines.push('');
+    last = lines.length - 1;
+    lines.push('', '');
+  }
+  for (const item of it.plan) {
+    if (item.number === null) continue;
+    const of = planItemOf(item.number);
+    const at = lines.findIndex((line) => of.test(line));
+    if (at >= 0) {
+      const checked = /^[ \t]*[-*+] \[[xX]\]/.test(lines[at] ?? '');
+      lines[at] = planItemLine({ ...item, done: item.done === true || checked });
+      continue;
+    }
+    lines.splice(last + 1, 0, planItemLine(item));
+    last++;
+  }
+  const head = lines.join('\n');
+  if (cut < 0) return head;
+  const footer = body.slice(cut).replace(PLAN_STATS, () => planStatsLine(it));
+  return head + footer;
+}
+
+/**
  * The body of an iteration's issue: its goal with the README goal it serves, the completion
  * criteria (numbered: children name them by number), the plan as a task list of its child issues
  * (`- [ ] #N title`, checked by `checkPlanItem` as they are done; a step without its issue yet is
@@ -409,17 +494,7 @@ export interface IterationText {
  * it down. `auto`: accepted under the auto-accept setting.
  */
 export function iterationBody(it: IterationText, scoutId: string, auto: boolean): string {
-  const plan = it.plan.map((item) => {
-    if (item.number === null) return `- ${item.title}`;
-    const deps =
-      item.dependsOn.length > 0
-        ? t({
-            zh: `（依赖 ${issueList(item.dependsOn)}）`,
-            en: ` (depends on ${issueList(item.dependsOn)})`,
-          })
-        : '';
-    return `- [${item.done ? 'x' : ' '}] #${item.number} ${item.title}${deps}`;
-  });
+  const plan = it.plan.map(planItemLine);
   const outOfScope =
     it.outOfScope.length > 0
       ? it.outOfScope.map((o) => `- ${o}`).join('\n')
@@ -447,10 +522,7 @@ export function iterationBody(it: IterationText, scoutId: string, auto: boolean)
     '',
     FOOTER_MARKER,
     '---',
-    t({
-      zh: `共 ${it.plan.length} 个子 issue · 整体大小：${it.kind.size} · 整体风险：${riskText(it.kind.risk)}`,
-      en: `${it.plan.length} sub-issue${it.plan.length === 1 ? '' : 's'} · Overall size: ${it.kind.size} · Overall risk: ${riskText(it.kind.risk)}`,
-    }),
+    planStatsLine(it),
     '',
     auto
       ? t({
@@ -475,19 +547,12 @@ export function iterationChildBody(
   at: { iteration: number; dependsOn: readonly number[] },
   scoutId: string,
 ): string {
-  const deps =
-    at.dependsOn.length > 0
-      ? t({
-          zh: `依赖：${issueList(at.dependsOn)}`,
-          en: `Depends on: ${issueList(at.dependsOn)}`,
-        })
-      : t({ zh: '没有依赖', en: 'No dependencies' });
   return [
     proposalSections(p),
     '',
     FOOTER_MARKER,
     '---',
-    `${t({ zh: `所属迭代：#${at.iteration}`, en: `Iteration: #${at.iteration}` })} · ${deps}`,
+    childPlaceLine(at.iteration, at.dependsOn),
     '',
     t({
       zh: `类别：${categoryText(p.category)} · 大小：${p.size} · 风险：${riskText(p.risk)}`,
@@ -502,6 +567,152 @@ export function iterationChildBody(
     iterationMarker(at.iteration),
     dependsOnMarker(at.dependsOn),
   ].join('\n');
+}
+
+/**
+ * The line for people in a child issue's footer: its iteration and the issues it depends on.
+ * CHILD_PLACE finds it again in either language.
+ */
+function childPlaceLine(iteration: number, dependsOn: readonly number[]): string {
+  const deps =
+    dependsOn.length > 0
+      ? t({ zh: `依赖：${issueList(dependsOn)}`, en: `Depends on: ${issueList(dependsOn)}` })
+      : t({ zh: '没有依赖', en: 'No dependencies' });
+  return `${t({ zh: `所属迭代：#${iteration}`, en: `Iteration: #${iteration}` })} · ${deps}`;
+}
+
+const CHILD_PLACE = /^(?:所属迭代：#\d+|Iteration: #\d+) · .*$/m;
+
+/**
+ * A child issue's body depending on `dependsOn` instead, after its iteration's plan changed (a
+ * step it depends on was replaced, or the closing step waits for steps added): the hidden
+ * marker the Master goes by (`parseDependsOn`) and the line for people beside it, both in the
+ * footer, so the Run's goal does not change. A footer without the marker gets it; a body without
+ * a footer gets one with the markers.
+ */
+export function withDependsOn(
+  body: string,
+  iteration: number,
+  dependsOn: readonly number[],
+): string {
+  const cut = body.indexOf(FOOTER_MARKER);
+  if (cut < 0) {
+    return [
+      body.trimEnd(),
+      '',
+      FOOTER_MARKER,
+      iterationMarker(iteration),
+      dependsOnMarker(dependsOn),
+    ].join('\n');
+  }
+  let footer = body.slice(cut).replace(CHILD_PLACE, () => childPlaceLine(iteration, dependsOn));
+  footer = DEPENDS_ON_MARKER.test(footer)
+    ? footer.replace(DEPENDS_ON_MARKER, () => dependsOnMarker(dependsOn))
+    : `${footer.trimEnd()}\n${dependsOnMarker(dependsOn)}`;
+  return body.slice(0, cut) + footer;
+}
+
+/** A step of an iteration a scout's change added, as the comment about it names it. */
+export interface AddedStep {
+  /** Its number in the plan. */
+  position: number;
+  /** Its issue; null when it could not be created yet. */
+  number: number | null;
+  title: string;
+  /** The step it replaces, if any: its number in the plan and its issue. */
+  replaces?: { position: number; number: number | null };
+}
+
+/**
+ * Posted on an iteration's issue when a scout changed its plan: why (the scout's note), each step
+ * added and the one it replaces, and the steps that could not be added (`reason` limit: the plan
+ * would have more than `max` steps; stale: the step to replace no longer needed it).
+ */
+export function iterationAdjustedComment(input: {
+  note: string;
+  scoutId: string;
+  added: readonly AddedStep[];
+  leftOut: readonly { title: string; reason: 'limit' | 'stale' }[];
+  max: number;
+}): string {
+  const ref = (number: number | null, title: string) =>
+    number === null ? `「${title}」` : `#${number} ${title}`;
+  const refEn = (number: number | null, title: string) =>
+    number === null ? `"${title}"` : `#${number} ${title}`;
+  const lines = input.added.map((step) => {
+    if (!step.replaces) {
+      return t({
+        zh: `- 补上第 ${step.position} 步：${ref(step.number, step.title)}`,
+        en: `- Added step ${step.position}: ${refEn(step.number, step.title)}`,
+      });
+    }
+    const old = step.replaces.number === null ? '' : `（#${step.replaces.number}）`;
+    const oldEn = step.replaces.number === null ? '' : ` (#${step.replaces.number})`;
+    return t({
+      zh: `- 第 ${step.position} 步 ${ref(step.number, step.title)} 替换第 ${step.replaces.position} 步${old}`,
+      en: `- Step ${step.position}, ${refEn(step.number, step.title)}, replaces step ${step.replaces.position}${oldEn}`,
+    });
+  });
+  for (const step of input.leftOut) {
+    lines.push(
+      step.reason === 'limit'
+        ? t({
+            zh: `- 没有补上「${step.title}」：迭代最多 ${input.max} 个子项`,
+            en: `- Not added: "${step.title}", as an iteration has at most ${input.max} steps`,
+          })
+        : t({
+            zh: `- 没有补上「${step.title}」：它要替换的那一步已经不需要替换了`,
+            en: `- Not added: "${step.title}", as the step it was to replace no longer needs it`,
+          }),
+    );
+  }
+  return [
+    t({ zh: '### 计划调整', en: '### Plan changed' }),
+    '',
+    input.note.trim(),
+    '',
+    ...lines,
+    '',
+    t({
+      zh: `_由${brandName()}侦察调整（${input.scoutId}）。新的子 issue 属于这个迭代，依赖的子 issue 都以完成关闭后才开工；收尾的子 issue 会等它们做完。_`,
+      en: `_Changed by the ${brandName()} scout (${input.scoutId}). The new sub-issues belong to this iteration and start once the sub-issues they depend on are closed as completed; the closing sub-issue waits for them._`,
+    }),
+  ].join('\n');
+}
+
+/**
+ * Posted on a child issue the Master closes as not planned because a human closed its iteration
+ * (#`iteration`) before it was done: says so, names its Run that was terminated, and quotes the
+ * reason the human left on the iteration's issue, if any, so that the scout reads it as the
+ * reason this one was not done.
+ */
+export function closedWithIterationComment(input: {
+  iteration: number;
+  runId: string | null;
+  reason: string | null;
+}): string {
+  const run = input.runId
+    ? t({
+        zh: `；它的 Run \`${input.runId}\` 已终止`,
+        en: `; its Run \`${input.runId}\` was terminated`,
+      })
+    : '';
+  const lines = [
+    t({
+      zh: `迭代 #${input.iteration} 被关掉了，这个子 issue 随之关成不做${run}。`,
+      en: `Iteration #${input.iteration} was closed, so this sub-issue is closed as not planned with it${run}.`,
+    }),
+  ];
+  const reason = input.reason?.trim();
+  if (reason) {
+    lines.push(
+      '',
+      t({ zh: '关掉迭代时留下的理由：', en: 'The reason given when the iteration was closed:' }),
+      '',
+      quote(reason),
+    );
+  }
+  return lines.join('\n');
 }
 
 /**

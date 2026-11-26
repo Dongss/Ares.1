@@ -1233,6 +1233,16 @@ const TERMINATION_REASONS: Record<string, (data: EventRow['data']) => string> = 
     }
     return t({ zh: 'issue 被人关闭', en: 'the issue was closed' });
   },
+  'run.iteration_closed': ({ iteration }) =>
+    typeof iteration === 'number'
+      ? t({
+          zh: `所属迭代 #${iteration} 被人关掉，issue 随之关成不做`,
+          en: `its iteration #${iteration} was closed, and the issue closed as not planned with it`,
+        })
+      : t({
+          zh: '所属迭代被人关掉，issue 随之关成不做',
+          en: 'its iteration was closed, and the issue closed as not planned with it',
+        }),
   'run.goal_changed': ({ newRun }) =>
     typeof newRun === 'string'
       ? t({

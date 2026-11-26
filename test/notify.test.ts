@@ -614,6 +614,102 @@ describe('proposals waiting for a human', () => {
   });
 });
 
+describe('an iteration that got blocked', () => {
+  afterEach(() => setLang('zh'));
+  const blocked = (data: Record<string, unknown> = {}, type = 'iteration.blocked') => ({
+    id: 11,
+    runId: null,
+    ts: '2026-11-19T00:00:00.000Z',
+    type,
+    data: {
+      repo: 'demo',
+      iterationId: 'iteration-1',
+      issue: 20,
+      position: 2,
+      child: 22,
+      reason: 'failed',
+      ...data,
+    },
+  });
+  /** As recorded without issues (the local backlog): no numbers but the step's. */
+  const local = { issue: undefined, child: undefined, proposalId: 'proposal-1' };
+
+  it('says which step held it up and what comes next, titled with the repo', () => {
+    expect(noticeFor(blocked(), undefined)).toEqual({
+      kind: 'iteration',
+      title: '迭代受阻：demo',
+      body: '迭代 #20 的第 2 步（#22）用完重做次数后失败了，依赖它的子 issue 开不了工。侦察下次会换个做法补一个子 issue 替换它；也可以重新打开它、加上 ares1:ready 重做，或者关掉迭代 issue，不做剩下的',
+      runId: null,
+      about: 'issues',
+    });
+    expect(noticeFor(blocked({ reason: 'dropped' }), undefined)?.body).toMatch(
+      /^迭代 #20 的第 2 步（#22）被人关成了不做，依赖它的子 issue 开不了工。/,
+    );
+    expect(noticeFor(blocked(local), undefined)?.body).toMatch(
+      /^迭代的第 2 步用完重做次数后失败了/,
+    );
+    expect(noticeFor(blocked({ position: undefined, ...local }), undefined)?.body).toMatch(
+      /^迭代的一个子项用完重做次数后失败了/,
+    );
+    // The rest of what happens to an iteration needs nobody: getting going again, being turned
+    // down by a human, a scout's change to its plan, a step's progress, being done.
+    for (const type of [
+      'iteration.unblocked',
+      'iteration.cancelled',
+      'iteration.adjusted',
+      'iteration.child_status',
+      'iteration.completed',
+      'iteration.accepted',
+      'iteration.auto_accepted',
+    ]) {
+      expect(noticeFor(blocked({}, type), undefined)).toBeNull();
+    }
+  });
+
+  it('is told in English without Chinese', () => {
+    setLang('en');
+    expect(noticeFor(blocked(), undefined)).toEqual({
+      kind: 'iteration',
+      title: 'Iteration blocked: demo',
+      body: 'Step 2 (#22) of iteration #20 failed after using up its attempts, so the sub-issues depending on it cannot start. The next scout adds a sub-issue replacing it with another approach; you can also reopen it and add ares1:ready to redo it, or close the iteration issue to drop the rest',
+      runId: null,
+      about: 'issues',
+    });
+    const others = [
+      noticeFor(blocked({ reason: 'dropped' }), undefined),
+      noticeFor(blocked({ position: undefined, ...local, reason: 'dropped' }), undefined),
+    ];
+    expect(others[0]?.body).toMatch(/^Step 2 \(#22\) of iteration #20 was closed as not planned/);
+    expect(others[1]?.body).toMatch(
+      /^A step of the iteration was closed as not planned by a human/,
+    );
+    for (const notice of others) {
+      expect(`${notice?.title}\n${notice?.body}`).not.toMatch(/[一-鿿]/);
+    }
+    expect(`${NOTICE_KINDS.iteration.label}\n${NOTICE_KINDS.iteration.when}`).not.toMatch(
+      /[一-鿿]/,
+    );
+  });
+
+  it('goes to the webhook like any other notification', async () => {
+    const hook = await startHook();
+    h = await harness({ config: webhookYaml(hook.url) });
+    const { store, webhook } = h.master;
+    store.event(null, 'iteration.unblocked', { repo: 'demo', iterationId: 'iteration-1' });
+    store.event(null, 'iteration.blocked', blocked().data);
+    await webhook.idle();
+    expect(hook.received.map((r) => JSON.parse(r.body))).toEqual([
+      expect.objectContaining({
+        kind: 'iteration',
+        title: '迭代受阻：demo',
+        runId: null,
+        about: 'issues',
+        eventType: 'iteration.blocked',
+      }),
+    ]);
+  });
+});
+
 describe('the target branch cannot take the commits on GitHub', () => {
   afterEach(() => setLang('zh'));
   const ev = (type: string, data: Record<string, unknown>) => ({

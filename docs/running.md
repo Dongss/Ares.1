@@ -715,9 +715,11 @@ Agent 出错且重试、换 Agent 都用完，Agent 不可用且没有可换的 
 
 ## 通知
 
-只在需要你做点什么时通知：Run 卡住或失败、等审批、提案等人决定、侦察连续失败、推送或升级失败、目标分支没能拉取 GitHub 上的新提交；Run 完成、侦察完成、拉取成功都不通知。通过 PR 交付（`deliver: pr`）时，等 PR 合并不通知（GitHub 会通知 PR 的评审者），PR 要求修改、CI 没过或冲突时 Run 回去返工也不通知（issue 上有评论），返工用完 `max_loops` 后按 `on_exhausted` 停下来或失败时照常通知，PR 没合并就被关掉按「Run 失败了」通知。
+只在需要你做点什么时通知：Run 卡住或失败、等审批、提案等人决定、迭代受阻、侦察连续失败、推送或升级失败、目标分支没能拉取 GitHub 上的新提交；Run 完成、侦察完成、迭代完成、拉取成功都不通知。通过 PR 交付（`deliver: pr`）时，等 PR 合并不通知（GitHub 会通知 PR 的评审者），PR 要求修改、CI 没过或冲突时 Run 回去返工也不通知（issue 上有评论），返工用完 `max_loops` 后按 `on_exhausted` 停下来或失败时照常通知，PR 没合并就被关掉按「Run 失败了」通知。
 
 侦察失败（Agent 出错或超时、输出不符合约定、建临时工作目录失败等）时，事件列表里记一条 `scout.failed`（看板「事件」页能看到，标成红色），数据里有 `scoutId`、`repo`、`message`（错误信息）和 `streak`：这个仓库从最近一次侦察往回数连续失败的次数（包括这一次；自动和手动触发的都算）。额度用尽或被限流的、被 Master 停止打断的、还在进行的侦察既不计数，也不打断计数；正常结束的侦察（哪怕没找到需求）让计数从头开始。`streak` 正好到 3 时通知一次「侦察连续失败：<仓库名>」，正文是错误信息的第一行，点开是「需求」页；之后接着失败不再通知，直到有侦察正常结束、又连续失败 3 次。被 Master 停止打断的侦察也记 `scout.failed`，但不带 `streak`，不通知。
+
+迭代的一个子 issue 用完重做次数后以失败关闭，或者被人关成不做，又没有别的子 issue 替换它时，迭代进入「受阻」，事件列表里记一条 `iteration.blocked`（看板「事件」页能看到，标成橙色），数据里有 `repo`、`iterationId`、`issue`（迭代 issue）、`position` 和 `child`（是计划里的第几步、哪个子 issue）、`reason`（`failed` 是用完重做次数，`dropped` 是被人关掉），并通知「迭代受阻：<仓库名>」，点开是「需求」页。每次进入受阻通知一次；那个子 issue 被重新打开、或者侦察换个做法补了一个子 issue 替换它之后，迭代回到进行中（`iteration.unblocked`），之后再受阻会再通知。
 
 访问 GitHub 失败（读写 issue、推送目标分支、侦察时搜索 issue 等）时，事件列表里记一条 `github.error`（数据是 `{ message }`，错误信息），并通知「GitHub 访问失败」，正文是错误信息的第一行，点开是「需求」页。一轮轮询要对每个登记的仓库做好几步，每一步都可能失败，所以按「一串连续失败」去重：从第一次失败起，到有一轮轮询对 GitHub 的访问全部成功为止，同一个错误只记一条、只通知一次，哪怕几种错误轮流出现（比如两个仓库一个返回 404、一个返回 502）也是每种各一条，不会每轮都通知。有一轮访问全部成功后重新开始，之后同样的错误再出现会再记、再通知。错误信息里可能带每次都变的内容（比如请求 id），所以一串失败最多记 20 种不同的错误，超过后这串失败不再记新的 `github.error`。看板「需求」页上的「GitHub 调用失败」不去重，始终显示最近一次失败的时间和信息，有一轮访问全部成功后消失。
 
@@ -775,7 +777,7 @@ notify:
   }
   ```
 
-  `kind` 是通知的种类（`approval`、`discussion`、`blocked`、`failed`、`proposals`、`scout`、`github`、`pull`、`upgrade`；只由脚本在 Master 停了、起不来时发的 `master_down`，见下面；以及人在看板上点「发一条测试通知」时发的 `test`，见下面的「测试通知」），`title`、`body` 是通知的标题和正文（按 `language` 的语言），`text` 是「标题\n正文」，`runId` 是相关的 Run（没有时为 `null`），`about` 说明点开该去哪里（`run` 是 Run 详情页，`issues` 是「需求」页，`master` 没有特定页面），`eventType` 是引起通知的事件类型，`at` 是事件发生的时间。Slack 的入站 webhook 会显示 `text`、忽略其他字段，可以直接接。
+  `kind` 是通知的种类（`approval`、`discussion`、`blocked`、`failed`、`proposals`、`iteration`、`scout`、`github`、`pull`、`upgrade`；只由脚本在 Master 停了、起不来时发的 `master_down`，见下面；以及人在看板上点「发一条测试通知」时发的 `test`，见下面的「测试通知」），`title`、`body` 是通知的标题和正文（按 `language` 的语言），`text` 是「标题\n正文」，`runId` 是相关的 Run（没有时为 `null`），`about` 说明点开该去哪里（`run` 是 Run 详情页，`issues` 是「需求」页，`master` 没有特定页面），`eventType` 是引起通知的事件类型，`at` 是事件发生的时间。Slack 的入站 webhook 会显示 `text`、忽略其他字段，可以直接接。
 - `format: text`：`Content-Type: text/plain; charset=utf-8`，正文就是「标题\n正文」，适合 ntfy 这类直接显示正文的服务。
 - 飞书、钉钉的机器人 webhook 要求固定的消息格式，不能直接接：要经过一层转发（自己的小服务把正文改成它们要的格式），或者先发到 ntfy 这类服务。
 - 发出去的标题、正文和 `text` 都先把用户目录下的路径换成 `~`（和发到 GitHub 的文字一样，见「发到 GitHub 的文字不带用户目录」），不把系统用户名发给外部服务。

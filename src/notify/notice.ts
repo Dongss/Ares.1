@@ -53,6 +53,7 @@ export type NoticeKind =
   | 'blocked'
   | 'failed'
   | 'proposals'
+  | 'iteration'
   | 'scout'
   | 'github'
   | 'pull'
@@ -116,6 +117,16 @@ export const NOTICE_KINDS: Record<NoticeKind, { label: string; when: string }> =
     en: {
       label: 'Proposals waiting for your decision',
       when: 'The scout proposed something that cannot be accepted automatically (too large, or above the auto-accept risk level)',
+    },
+  },
+  iteration: {
+    zh: {
+      label: '迭代受阻',
+      when: '迭代的一个子 issue 用完重做次数后以失败关闭，或者被人关成不做，又没有别的子 issue 替换它，依赖它的子 issue 开不了工，迭代停在「受阻」，标题后面写着仓库名。每次进入受阻通知一次；侦察下次会把它当作要先解决的问题，换个做法补一个子 issue 替换它',
+    },
+    en: {
+      label: 'Iteration blocked',
+      when: 'A sub-issue of an iteration was closed as failed after using up its attempts, or closed as not planned by a human, and nothing replaced it, so the sub-issues depending on it cannot start and the iteration is blocked, with the repo after the title. Notified once each time it gets blocked; the next scout takes it as a problem to solve first and adds a sub-issue that replaces it with another approach',
     },
   },
   scout: {
@@ -262,11 +273,55 @@ function pullNotice(event: EventRow, body: string): Notice {
   };
 }
 
+/** A positive whole number from event data, or null. */
+const count = (v: unknown): number | null =>
+  typeof v === 'number' && Number.isInteger(v) && v > 0 ? v : null;
+
+/**
+ * An iteration got blocked (`iteration.blocked`): which step held it up, failed after using up
+ * its attempts or closed as not planned by a human, and what comes next. Titled with the repo.
+ */
+function iterationBlockedNotice(event: EventRow): Notice {
+  const d = event.data;
+  const issue = count(d.issue);
+  const position = count(d.position);
+  const child = count(d.child);
+  const failed = d.reason === 'failed';
+  const zhStep =
+    position === null ? '一个子项' : `第 ${position} 步${child === null ? '' : `（#${child}）`}`;
+  const enStep =
+    position === null ? 'a step' : `step ${position}${child === null ? '' : ` (#${child})`}`;
+  const zhIteration = issue === null ? '迭代' : `迭代 #${issue} `;
+  const enIteration = issue === null ? 'the iteration' : `iteration #${issue}`;
+  const what = failed
+    ? t({
+        zh: `${zhIteration}的${zhStep}用完重做次数后失败了`,
+        en: `${capitalize(enStep)} of ${enIteration} failed after using up its attempts`,
+      })
+    : t({
+        zh: `${zhIteration}的${zhStep}被人关成了不做`,
+        en: `${capitalize(enStep)} of ${enIteration} was closed as not planned by a human`,
+      });
+  return {
+    kind: 'iteration',
+    title: titleOf('iteration', text(d.repo) ?? undefined),
+    body: t({
+      zh: `${what}，依赖它的子 issue 开不了工。侦察下次会换个做法补一个子 issue 替换它；也可以重新打开它、加上 ares1:ready 重做，或者关掉迭代 issue，不做剩下的`,
+      en: `${what}, so the sub-issues depending on it cannot start. The next scout adds a sub-issue replacing it with another approach; you can also reopen it and add ares1:ready to redo it, or close the iteration issue to drop the rest`,
+    }),
+    runId: null,
+    about: 'issues',
+  };
+}
+
+const capitalize = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+
 /**
  * The notification for an event, or null when nobody has to act. Only things that wait for a
- * human: approvals, stuck or failed Runs, proposals the Master may not accept by itself,
- * failures of the Master's own automation (GitHub, upgrades, a scout that keeps failing), and a
- * target branch that cannot take the new commits on GitHub by itself.
+ * human: approvals, stuck or failed Runs, proposals the Master may not accept by itself, an
+ * iteration blocked by a step that failed or was dropped, failures of the Master's own
+ * automation (GitHub, upgrades, a scout that keeps failing), and a target branch that cannot take
+ * the new commits on GitHub by itself.
  * Finished Runs are not announced.
  */
 export function noticeFor(event: EventRow, goal: string | undefined): Notice | null {
@@ -311,6 +366,8 @@ export function noticeFor(event: EventRow, goal: string | undefined): Notice | n
         about: 'issues',
       };
     }
+    case 'iteration.blocked':
+      return iterationBlockedNotice(event);
     case 'proposal.auto_accepted':
     case 'proposal.accepted':
     case 'proposal.rejected':

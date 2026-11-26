@@ -898,6 +898,11 @@ function noticeHandling(kind: NoticeKind): string {
         zh: '去 GitHub 看 ares1:proposal 的 issue：要做就加 ares1:ready，不做就关闭为 not planned 并写一句理由',
         en: 'Look at the ares1:proposal issues on GitHub: to do one, add ares1:ready; otherwise close it as not planned with a one-line reason',
       });
+    case 'iteration':
+      return t({
+        zh: '去 GitHub 看迭代 issue 和那个子 issue 为什么失败或被关掉：等下次侦察换个做法补一个子 issue 替换它，替换后迭代自动接着做；也可以修好原因后重新打开它、加上 ares1:ready 重做；不想做了就关掉迭代 issue，还没完成的子 issue 会一起终止并关成不做',
+        en: 'On GitHub, look at the iteration issue and why the sub-issue failed or was closed: the next scout adds a sub-issue that replaces it with another approach, and the iteration goes on once it is replaced; or fix the cause, reopen the sub-issue and add ares1:ready to redo it; to drop the rest, close the iteration issue, and the sub-issues not yet done are stopped and closed as not planned with it',
+      });
     case 'scout':
       return t({
         zh: '去「需求」页看这个仓库侦察的错误和日志，常见原因是 Agent 配置失效、超时或输出不符合约定；修好后自动侦察照常继续，也可以点「让 AI 找活」马上试一次',

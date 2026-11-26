@@ -1,13 +1,25 @@
 // Iterations, wherever their children come from (GitHub issues, or proposals of the local
-// backlog): where each child stands as its Runs go, what an iteration cost and how long it took,
-// the summary once every child is done, and the review suggestions its closing step goes
+// backlog): where each child stands as its Runs go, when the iteration is blocked and when it
+// goes on, a human turning it down, a scout's change to its plan, what it cost and how long it
+// took, the summary once every child is done, and the review suggestions its closing step goes
 // through. Reads and writes the store only: the sources (src/github/bridge.ts,
-// src/backlog/local.ts) find out whether each child's requirement is done and publish the texts
-// this gives them. No agent is asked: the summary is put together from the Runs' records.
+// src/backlog/local.ts) find out where each child's requirement is and publish the texts this
+// gives them. No agent is asked: the summary is put together from the Runs' records.
 
-import { unmetDependencies } from '../config/flow.js';
+import {
+  ITERATION_OPEN_STATUSES,
+  iterationStatusOf,
+  MAX_ITERATION_CHILDREN,
+  unmetDependencies,
+} from '../config/flow.js';
 import { minutes, storedRunTimes, workSwitchesOf } from '../engine/times.js';
-import { oneLine, passedReviews, statusText, trustedGoal } from '../github/scout.js';
+import {
+  type IterationUpdate,
+  oneLine,
+  passedReviews,
+  statusText,
+  trustedGoal,
+} from '../github/scout.js';
 import { join, t } from '../i18n.js';
 import type { Store } from '../store/store.js';
 import {
@@ -18,6 +30,7 @@ import {
   type Run,
   type RunStatus,
 } from '../store/types.js';
+import { nowIso } from '../util.js';
 
 /**
  * The Runs that worked on a child, oldest first: on GitHub every Run created from its issue
@@ -50,46 +63,72 @@ function worksOn(runs: readonly Run[]): boolean {
 }
 
 /**
+ * Whether a child's Runs used up every attempt: its latest Run failed and was not to be redone
+ * (`issue.redo` exhausted, recorded before its issue was closed, or its `issue.retries_exhausted`
+ * event). Only the latest counts: a human may have started the child over since.
+ */
+export function ranOutOfAttempts(store: Store, runs: readonly Run[]): boolean {
+  const latest = runs.at(-1);
+  if (latest?.status !== 'failed') return false;
+  if (latest.issue?.redo === 'exhausted') return true;
+  return store.listEvents(latest.id).some((e) => e.type === 'issue.retries_exhausted');
+}
+
+/**
+ * Where the source has a child's requirement: open, still to be done; done (on GitHub: its issue
+ * closed as completed); or closed without being done (on GitHub: closed as not planned, or any
+ * other way but completed).
+ */
+export type ChildOutcome = 'open' | 'done' | 'closed';
+
+/**
  * Record where the children of an accepted iteration stand now, each with the Runs that worked on
- * it (`childRuns`), and return the iteration as recorded then. `done` tells, by position, whether
- * the source has the child's requirement done (on GitHub: its issue closed as completed); a child
- * it says nothing about (no issue yet, or closed some other way) keeps its status. The others
- * are running while a Run works on them, else waiting while a child they depend on is not done
- * (`unmetDependencies`), else ready. Each status change records an `iteration.child_status` event
- * in the same transaction. Nothing is written when nothing changed.
+ * it (`childRuns`), and return the iteration as recorded then. `outcomes` tells, by position,
+ * where the source has each child's requirement; a child it says nothing about (no issue yet, or
+ * not read again) keeps its status. Done is done. Closed without being done is failed when its
+ * Runs used up their attempts (`ranOutOfAttempts`), otherwise dropped: a human turned it down.
+ * Open ones are running while a Run works on them, else waiting while a child they depend on is
+ * not done (`unmetDependencies`), else ready. Each status change records an
+ * `iteration.child_status` event, and the iteration's own status follows (`settleStatus`), in the
+ * same transaction. The children are not written when none changed.
  */
 export function followChildren(
   store: Store,
   iterationId: string,
   repo: string,
-  done: ReadonlyMap<number, boolean>,
+  outcomes: ReadonlyMap<number, ChildOutcome>,
 ): Iteration {
   return store.tx(() => {
     const latest = store.getIteration(iterationId);
     const runs = new Map(latest.children.map((c) => [c.position, childRuns(store, latest, c)]));
     const settled = new Map<number, IterationChildStatus>();
     for (const child of latest.children) {
-      const isDone = done.get(child.position);
-      if (isDone === undefined) continue;
-      if (isDone) settled.set(child.position, 'done');
-      else if (worksOn(runs.get(child.position) ?? [])) settled.set(child.position, 'running');
+      const outcome = outcomes.get(child.position);
+      const childRunsOf = runs.get(child.position) ?? [];
+      if (outcome === 'done') settled.set(child.position, 'done');
+      else if (outcome === 'closed') {
+        settled.set(child.position, ranOutOfAttempts(store, childRunsOf) ? 'failed' : 'dropped');
+      } else if (outcome === 'open' && worksOn(childRunsOf)) {
+        settled.set(child.position, 'running');
+      }
     }
-    // A child the source says is not done is not, whatever it was before: the ones it holds back
-    // wait for it.
+    // A child the source has open is not done, whatever it was before (a failed one reopened
+    // included): the ones it holds back wait for it.
+    const open = (c: IterationChild) =>
+      outcomes.get(c.position) === 'open' && !settled.has(c.position);
     const placed = latest.children.map((c) =>
-      done.get(c.position) === false && !settled.has(c.position)
+      open(c)
         ? { ...c, status: 'ready' as const }
         : { ...c, status: settled.get(c.position) ?? c.status },
     );
     const next: IterationChild[] = placed.map((c, i) => {
       const before = latest.children[i] as IterationChild;
       const runIds = (runs.get(c.position) ?? []).map((r) => r.id);
-      const status =
-        done.get(c.position) === false && !settled.has(c.position)
-          ? unmetDependencies(c, placed).length > 0
-            ? 'waiting'
-            : 'ready'
-          : c.status;
+      const status = open(c)
+        ? unmetDependencies(c, placed).length > 0
+          ? 'waiting'
+          : 'ready'
+        : c.status;
       return {
         ...before,
         status,
@@ -100,7 +139,7 @@ export function followChildren(
       const before = latest.children[i] as IterationChild;
       return c.status !== before.status || c.runIds.join() !== before.runIds.join();
     });
-    if (changed.length === 0) return latest;
+    if (changed.length === 0) return settleStatus(store, latest, repo);
     const updated = store.updateIteration(iterationId, { children: next });
     for (const [i, child] of next.entries()) {
       const before = latest.children[i] as IterationChild;
@@ -116,7 +155,235 @@ export function followChildren(
         previous: before.status,
       });
     }
+    return settleStatus(store, updated, repo);
+  });
+}
+
+/**
+ * An accepted iteration's status as its children have it now (`iterationStatusOf`), recorded with
+ * its event; call it within a transaction. Active becomes blocked once a child failed or was
+ * dropped and nothing replaced it, with an `iteration.blocked` event naming the first such child
+ * and why (failed or dropped), once each time it gets blocked. Blocked becomes active again once
+ * no child holds it back any more (reopened, or replaced), with `iteration.unblocked`. Done is
+ * left to the source, which sums the iteration up first. Any other status is a human's decision
+ * and stays.
+ */
+function settleStatus(store: Store, iteration: Iteration, repo: string): Iteration {
+  const was = iteration.status;
+  if (was !== 'active' && was !== 'blocked') return iteration;
+  const now = iterationStatusOf(iteration.children);
+  const where = {
+    repo,
+    iterationId: iteration.id,
+    ...(iteration.issue ? { issue: iteration.issue.number } : {}),
+  };
+  if (now === 'blocked' && was === 'active') {
+    const updated = store.updateIteration(iteration.id, { status: 'blocked' });
+    const cause = iteration.children.find(
+      (c) => c.replacedBy === undefined && (c.status === 'failed' || c.status === 'dropped'),
+    );
+    store.event(null, 'iteration.blocked', {
+      ...where,
+      ...(cause
+        ? {
+            position: cause.position,
+            ...(cause.issue ? { child: cause.issue.number } : {}),
+            ...(cause.proposalId ? { proposalId: cause.proposalId } : {}),
+            reason: cause.status,
+          }
+        : {}),
+    });
     return updated;
+  }
+  if (now !== 'blocked' && was === 'blocked') {
+    const updated = store.updateIteration(iteration.id, { status: 'active' });
+    store.event(null, 'iteration.unblocked', where);
+    return updated;
+  }
+  return iteration;
+}
+
+/**
+ * Record that a human turned the iteration down (on GitHub: closed its issue before it was done):
+ * cancelled, ended now (and decided now if it was still pending), each child that was neither
+ * done nor failed nor replaced dropped with it, and an `iteration.cancelled` event with the
+ * positions of those dropped and whether it was still pending, in one transaction. The source
+ * stops their Runs and closes their requirements. An iteration that is over already is returned
+ * as it is.
+ */
+export function recordCancelled(store: Store, iterationId: string, repo: string): Iteration {
+  return store.tx(() => {
+    const latest = store.getIteration(iterationId);
+    if (!ITERATION_OPEN_STATUSES.includes(latest.status)) return latest;
+    const dropped = latest.children.filter(
+      (c) => c.replacedBy === undefined && !['done', 'failed', 'dropped'].includes(c.status),
+    );
+    const at = nowIso();
+    const updated = store.updateIteration(iterationId, {
+      status: 'cancelled',
+      endedAt: at,
+      decidedAt: latest.decidedAt ?? at,
+      children: latest.children.map((c) =>
+        dropped.includes(c) ? { ...c, status: 'dropped' as const } : c,
+      ),
+    });
+    store.event(null, 'iteration.cancelled', {
+      repo,
+      iterationId,
+      ...(latest.issue ? { issue: latest.issue.number } : {}),
+      dropped: dropped.map((c) => c.position),
+      pending: latest.status === 'pending',
+    });
+    return updated;
+  });
+}
+
+/** A step a scout's change to the plan could not add, and why. */
+export interface LeftOutStep {
+  title: string;
+  /**
+   * limit: the plan would have more than MAX_ITERATION_CHILDREN steps; stale: the step it was to
+   * replace no longer needs replacing (it was replaced, or neither failed nor was dropped any
+   * more, since the scout saw the plan).
+   */
+  reason: 'limit' | 'stale';
+}
+
+/** What a scout's change made of an iteration's plan (`adjustedPlan`). */
+export interface AdjustedPlan {
+  /** The whole plan afterwards, in order of position. */
+  children: IterationChild[];
+  /** The positions of the steps added, in order. */
+  added: number[];
+  /** The steps replaced: `position` by the step added at `by`. */
+  replaced: { position: number; by: number }[];
+  leftOut: LeftOutStep[];
+}
+
+/** Statuses of a child that has not started: its dependencies may still change. */
+const NOT_STARTED: readonly IterationChildStatus[] = ['planned', 'waiting', 'ready'];
+
+/**
+ * The plan of `iteration` with a scout's change applied (checked against the plan the scout saw
+ * by `updateProblems`). Steps are added after the last position, in order, keeping the numbers the
+ * scout gave them for the dependencies between them; a step that replaces one marks it
+ * `replacedBy`. A step is left out when the plan would have more than MAX_ITERATION_CHILDREN steps
+ * not replaced, or when the one it was to replace no longer needs it; its number is then given to
+ * the next step added, and dependencies on it are dropped. The closing step, unless it started
+ * already, waits for the steps added too. The steps added are planned while the iteration is
+ * pending, otherwise waiting or ready by their dependencies. Pure.
+ */
+export function adjustedPlan(
+  iteration: Pick<Iteration, 'status' | 'children'>,
+  update: IterationUpdate,
+): AdjustedPlan {
+  const children = iteration.children.map((c) => ({ ...c, dependsOn: [...c.dependsOn] }));
+  const byPosition = new Map(children.map((c) => [c.position, c]));
+  const last = Math.max(0, ...children.map((c) => c.position));
+  // The scout's number of each step added that was kept, and its position.
+  const kept = new Map<number, number>();
+  let count = children.filter((c) => c.replacedBy === undefined).length;
+  const added: number[] = [];
+  const replaced: AdjustedPlan['replaced'] = [];
+  const leftOut: LeftOutStep[] = [];
+  for (const [i, step] of update.add.entries()) {
+    const old = step.replaces === undefined ? undefined : byPosition.get(step.replaces);
+    if (step.replaces !== undefined) {
+      const replaceable =
+        old !== undefined &&
+        !old.closeout &&
+        old.replacedBy === undefined &&
+        (old.status === 'failed' || old.status === 'dropped');
+      if (!replaceable) {
+        leftOut.push({ title: step.title, reason: 'stale' });
+        continue;
+      }
+    } else if (count >= MAX_ITERATION_CHILDREN) {
+      leftOut.push({ title: step.title, reason: 'limit' });
+      continue;
+    }
+    const position = last + added.length + 1;
+    kept.set(last + i + 1, position);
+    const child: IterationChild = {
+      title: step.title,
+      category: step.category,
+      size: step.size,
+      risk: step.risk,
+      why: step.why,
+      evidence: [...step.evidence],
+      what: step.what,
+      acceptance: [...step.acceptance],
+      position,
+      criteria: [...step.criteria],
+      dependsOn: step.dependsOn.flatMap((n) => {
+        if (n <= last) return [n];
+        const at = kept.get(n);
+        return at === undefined ? [] : [at];
+      }),
+      closeout: false,
+      status: 'planned',
+      runIds: [],
+    };
+    children.push(child);
+    byPosition.set(position, child);
+    added.push(position);
+    if (old) {
+      old.replacedBy = position;
+      replaced.push({ position: old.position, by: position });
+    } else {
+      count++;
+    }
+  }
+  const closing = children.find((c) => c.closeout && c.replacedBy === undefined);
+  if (closing && NOT_STARTED.includes(closing.status)) {
+    for (const position of added) {
+      if (!closing.dependsOn.includes(position)) closing.dependsOn.push(position);
+    }
+  }
+  if (iteration.status !== 'pending') {
+    for (const child of children) {
+      if (!added.includes(child.position) && child !== closing) continue;
+      if (child.status !== 'planned' && child.status !== 'waiting' && child.status !== 'ready') {
+        continue;
+      }
+      child.status = unmetDependencies(child, children).length > 0 ? 'waiting' : 'ready';
+    }
+  }
+  return { children, added, replaced, leftOut };
+}
+
+/**
+ * Apply a scout's change to the plan of an iteration under way (`adjustedPlan`) and record it:
+ * the plan, the scout's note with it, an `iteration.adjusted` event (the positions added, those
+ * replaced and how many were left out), and the iteration's status as its children have it now
+ * (`settleStatus`: replacing the step that blocked it lets it go on), in one transaction. The
+ * source writes the steps added out afterwards. Returns the iteration as recorded then, and what
+ * the change made of its plan.
+ */
+export function recordAdjustment(
+  store: Store,
+  iterationId: string,
+  repo: string,
+  update: IterationUpdate,
+  scoutId: string | null,
+): { iteration: Iteration; adjusted: AdjustedPlan } {
+  return store.tx(() => {
+    const latest = store.getIteration(iterationId);
+    const adjusted = adjustedPlan(latest, update);
+    const updated = store.updateIteration(iterationId, {
+      children: adjusted.children,
+      notes: [...latest.notes, { at: nowIso(), scoutId, text: update.note }],
+    });
+    store.event(null, 'iteration.adjusted', {
+      repo,
+      iterationId,
+      ...(latest.issue ? { issue: latest.issue.number } : {}),
+      ...(scoutId ? { scoutId } : {}),
+      added: adjusted.added,
+      replaced: adjusted.replaced,
+      leftOut: adjusted.leftOut.length,
+    });
+    return { iteration: settleStatus(store, updated, repo), adjusted };
   });
 }
 

@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AGENT_GH_TOKEN } from '../src/adapters/process.js';
 import type { RunDetail } from '../src/api/types.js';
 import {
+  adjustedPlan,
   closeoutSuggestions,
   durationText,
   iterationSummaryText,
@@ -13,6 +14,7 @@ import {
 import {
   acceptSplit,
   isAutoAcceptable,
+  MAX_ITERATION_CHILDREN,
   PROPOSAL_SIZES,
   type ProposalKind,
   type ProposalSize,
@@ -28,6 +30,7 @@ import {
   COMMENT_MARKER,
   checkPlanItem,
   clockText,
+  closedWithIterationComment,
   dependsOnMarker,
   discussionComment,
   FOOTER_MARKER,
@@ -42,6 +45,7 @@ import {
   isRetriesExhaustedComment,
   issueUpdate,
   isTrusted,
+  iterationAdjustedComment,
   iterationAutoAcceptedComment,
   iterationBody,
   iterationChildBody,
@@ -65,18 +69,27 @@ import {
   REVIEW_SUGGESTIONS_MARKER,
   redoStartedComment,
   repliesAfterMaster,
+  revisedPlan,
   stripMarker,
   untrustedGoalMessage,
+  withDependsOn,
   withReviewSuggestions,
   withStatusLabel,
 } from '../src/github/issues.js';
 import { type PrReworkKind, reworkReason } from '../src/github/pr-rework.js';
-import { filedProposal, issueDigest, proposalsHoldingScout } from '../src/github/scout.js';
+import {
+  filedProposal,
+  type IterationAddition,
+  issueDigest,
+  proposalsHoldingScout,
+  runDigest,
+} from '../src/github/scout.js';
 import { setLang } from '../src/i18n.js';
 import { noticeFor } from '../src/notify/notice.js';
 import {
   type AssessmentEntry,
   type BlockKind,
+  type IterationChild,
   PR_CLOSE_REASONS,
   type PrCloseReason,
   type Run,
@@ -2571,6 +2584,585 @@ describe('issues: iterations', () => {
     expect(gh.get(1).comments.filter((body) => body.includes('## 迭代完成'))).toEqual([]);
     expect(iterationOf(t)).toMatchObject({ status: 'done', summaryPosted: true });
     expect(gh.get(1).state).toBe('closed');
+  });
+
+  /**
+   * Coding → merge without approval; an agent error ends the Run as failed at once, so that a
+   * step whose coder errors fails within a round, and one whose coder writes completes.
+   */
+  const QUICK_WORKFLOW = `
+id: dev
+name: 测试流程
+defaults:
+  escalate:
+    max_retries: 0
+    on_agent_error: retry
+stages:
+  - id: implement
+    name: 编码
+    kind: agent
+    agent: coder
+  - id: merge
+    name: 合并
+    kind: merge
+`;
+
+  /**
+   * A coder that errors on the calls listed (counted from 1) and otherwise writes what the checks
+   * want, and a file of its own so that every Run has work to merge.
+   */
+  const coderFailingOn = (t: Harness, failing: number[]) => {
+    let calls = 0;
+    t.scripts.coder = (ctx) => {
+      calls++;
+      if (failing.includes(calls)) {
+        return { status: 'failed', error: `第 ${calls} 次：模型额度用完了` };
+      }
+      writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+      writeFile(join(ctx.input.workdir, `step-${calls}.txt`), 'ok\n');
+      return done(`写了 step-${calls}.txt`);
+    };
+  };
+
+  /**
+   * Plan the iteration, accept it, and let its first step use up its attempts: its Run fails and
+   * its issue is closed after the last attempt (max_run_attempts 1). Returns that Run.
+   */
+  async function failFirstStep(t: Harness) {
+    await planIteration(t);
+    gh.get(1).labels.push(LABELS.ready);
+    await t.master.issues.poll();
+    const run = runOfIssue(t, 2);
+    await t.waitStatus(run.id, 'failed');
+    await t.master.issues.poll();
+    expect(gh.get(2)).toMatchObject({ state: 'closed', stateReason: 'not_planned' });
+    return run;
+  }
+
+  const eventsOf = (t: Harness, type: string) =>
+    t.master.store.listEventsOfType(type, '1970-01-01T00:00:00.000Z');
+
+  it('blocks the iteration once a step used up its attempts, and notifies once', async () => {
+    const t = await start(config({ maxRisk: 'none', maxAttempts: 1 }), QUICK_WORKFLOW);
+    coderFailingOn(t, [1]);
+    const failed = await failFirstStep(t);
+    const iteration = iterationOf(t);
+    expect(iteration.status).toBe('blocked');
+    expect(iteration.children.map((c) => [c.status, c.runIds])).toEqual([
+      ['failed', [failed.id]],
+      ['waiting', []],
+      ['waiting', []],
+    ]);
+    const [blocked, ...more] = eventsOf(t, 'iteration.blocked');
+    if (!blocked) throw new Error('no iteration.blocked');
+    expect(more).toEqual([]);
+    expect(blocked.data).toEqual({
+      repo: 'demo',
+      iterationId: iteration.id,
+      issue: 1,
+      position: 1,
+      child: 2,
+      reason: 'failed',
+    });
+    expect(noticeFor(blocked, undefined)).toEqual({
+      kind: 'iteration',
+      title: '迭代受阻：demo',
+      body: '迭代 #1 的第 1 步（#2）用完重做次数后失败了，依赖它的子 issue 开不了工。侦察下次会换个做法补一个子 issue 替换它；也可以重新打开它、加上 ares1:ready 重做，或者关掉迭代 issue，不做剩下的',
+      runId: null,
+      about: 'issues',
+    });
+
+    // Told once; the steps after it never start, and the iteration stays blocked.
+    await t.master.issues.poll();
+    expect(eventsOf(t, 'iteration.blocked')).toHaveLength(1);
+    expect(t.master.store.listRuns().map((r) => r.issue?.number)).toEqual([2]);
+    expect(iterationOf(t).status).toBe('blocked');
+    expect(gh.get(1).state).toBe('open');
+  });
+
+  it('blocks the iteration when a human closes a step, and goes on once it is reopened', async () => {
+    const t = await start(config({ maxRisk: 'none' }));
+    await planIteration(t);
+    gh.get(1).labels.push(LABELS.ready);
+    await t.master.issues.poll();
+    // A human turns the second step down while the first one goes on.
+    gh.get(3).state = 'closed';
+    gh.get(3).stateReason = 'not_planned';
+    await t.master.issues.poll();
+    let iteration = iterationOf(t);
+    expect(iteration.status).toBe('blocked');
+    expect(iteration.children.map((c) => c.status)).toEqual(['running', 'dropped', 'waiting']);
+    const [blocked] = eventsOf(t, 'iteration.blocked');
+    if (!blocked) throw new Error('no iteration.blocked');
+    expect(blocked.data).toEqual({
+      repo: 'demo',
+      iterationId: iteration.id,
+      issue: 1,
+      position: 2,
+      child: 3,
+      reason: 'dropped',
+    });
+    expect(noticeFor(blocked, undefined)?.body).toMatch(/^迭代 #1 的第 2 步（#3）被人关成了不做，/);
+    // Closing a step is not closing the iteration: nothing else is closed.
+    expect([1, 2, 4].map((n) => gh.get(n).state)).toEqual(['open', 'open', 'open']);
+
+    // Reopened: it waits for the first step again, and the iteration goes on.
+    gh.get(3).state = 'open';
+    gh.get(3).stateReason = 'reopened';
+    await t.master.issues.poll();
+    iteration = iterationOf(t);
+    expect(iteration.status).toBe('active');
+    expect(iteration.children.map((c) => c.status)).toEqual(['running', 'waiting', 'waiting']);
+    expect(eventData(t, 'iteration.unblocked')).toEqual([
+      { repo: 'demo', iterationId: iteration.id, issue: 1 },
+    ]);
+    expect(eventsOf(t, 'iteration.blocked')).toHaveLength(1);
+  });
+
+  it('terminates and closes the steps not done when a human closes the iteration', async () => {
+    const t = await start(config({ maxRisk: 'none' }));
+    const signals: AbortSignal[] = [];
+    t.scripts.coder = (ctx) => {
+      signals.push(ctx.signal);
+      return new Promise(() => {});
+    };
+    await planIteration(t);
+    gh.get(1).labels.push(LABELS.ready);
+    await t.master.issues.poll();
+    const run = runOfIssue(t, 2);
+    await waitFor(() => signals.length === 1, 'the coder of the first step');
+
+    // A human turns the iteration down, saying why; a stranger's comment after it is no reason.
+    gh.get(1).comments.push('方向不对，先做 GitLab');
+    gh.commentAs(1, STRANGER, '我觉得应该继续');
+    gh.get(1).state = 'closed';
+    gh.get(1).stateReason = 'not_planned';
+    const own = structuredClone(gh.get(1));
+    const callsAt = gh.calls.length;
+    await t.master.issues.poll();
+
+    expect(t.master.store.getRun(run.id).status).toBe('cancelled');
+    expect(signals[0]?.aborted).toBe(true);
+    expect(
+      t.master.store
+        .listEvents(run.id)
+        .filter((e) => e.type === 'run.iteration_closed')
+        .map((e) => e.data),
+    ).toEqual([{ repo: 'me/demo', issue: 2, iteration: 1 }]);
+    for (const n of [2, 3, 4]) {
+      const issue = gh.get(n);
+      expect(issue).toMatchObject({
+        state: 'closed',
+        stateReason: 'not_planned',
+        labels: [LABELS.proposal],
+      });
+      const last = issue.comments.at(-1) ?? '';
+      expect(isMasterComment(last)).toBe(true);
+      expect(last).toContain('迭代 #1 被关掉了，这个子 issue 随之关成不做');
+      expect(last).toContain('关掉迭代时留下的理由：\n\n> 方向不对，先做 GitLab');
+      expect(last).not.toContain('应该继续');
+    }
+    expect(gh.get(2).comments.at(-1)).toContain(`它的 Run \`${run.id}\` 已终止`);
+    expect(gh.get(3).comments.at(-1)).not.toContain('Run');
+    // The scout reads why the Run was terminated: not a failure, nor a human on the dashboard.
+    expect(runDigest(t.master.store, t.repo.id, 1)).toContain(
+      '所属迭代 #1 被人关掉，issue 随之关成不做',
+    );
+    const iteration = iterationOf(t);
+    expect(iteration.status).toBe('cancelled');
+    expect(iteration.endedAt).not.toBeNull();
+    expect(iteration.children.map((c) => c.status)).toEqual(['dropped', 'dropped', 'dropped']);
+    expect(eventData(t, 'iteration.cancelled')).toEqual([
+      { repo: 'demo', iterationId: iteration.id, issue: 1, dropped: [1, 2, 3], pending: false },
+    ]);
+    // The iteration's issue stays as the human left it, their reason its last comment.
+    expect(gh.get(1)).toEqual(own);
+    const onOwn = /^(comment|setLabels|close|editIssue) #1( |$)/;
+    expect(gh.calls.slice(callsAt).filter((c) => onOwn.test(c))).toEqual([]);
+
+    // Over: later rounds write nothing more, and the Run is not caught up as failed.
+    await t.master.issues.sync();
+    await t.master.issues.poll();
+    for (const n of [2, 3, 4]) {
+      expect(gh.get(n).comments.filter((c) => c.includes('被关掉了'))).toHaveLength(1);
+      expect(gh.get(n).labels).toEqual([LABELS.proposal]);
+    }
+    expect(eventData(t, 'iteration.cancelled')).toHaveLength(1);
+    // The scout reads why each step was not done.
+    const closed = await gh.listIssues('me/demo', { state: 'closed', limit: 30, comments: true });
+    const digest = issueDigest([], closed, 'me');
+    expect(digest).toContain('- #1 不做：本地仓库也能永动\n  理由：方向不对，先做 GitLab');
+    expect(digest).toContain('- #3 不做：乙：看板上采纳\n  理由：迭代 #1 被关掉了');
+  });
+
+  it('closes the steps of an iteration a human turned down before accepting it', async () => {
+    const t = await start(config({ maxRisk: 'none' }));
+    await planIteration(t);
+    gh.get(1).comments.push('先不做这个');
+    gh.get(1).state = 'closed';
+    gh.get(1).stateReason = 'not_planned';
+    await t.master.issues.poll();
+    for (const n of [2, 3, 4]) {
+      expect(gh.get(n)).toMatchObject({
+        state: 'closed',
+        stateReason: 'not_planned',
+        labels: [LABELS.proposal],
+      });
+      expect(gh.get(n).comments).toEqual([
+        markComment(
+          closedWithIterationComment({ iteration: 1, runId: null, reason: '先不做这个' }),
+        ),
+      ]);
+    }
+    const iteration = iterationOf(t);
+    expect(iteration).toMatchObject({ status: 'cancelled', auto: false });
+    expect(iteration.decidedAt).not.toBeNull();
+    expect(iteration.children.map((c) => c.status)).toEqual(['dropped', 'dropped', 'dropped']);
+    expect(eventData(t, 'iteration.cancelled')).toEqual([
+      { repo: 'demo', iterationId: iteration.id, issue: 1, dropped: [1, 2, 3], pending: true },
+    ]);
+    expect(t.master.store.listRuns()).toEqual([]);
+    // No longer under way: the next scout may plan another.
+    t.scripts.scout = () => ({ structured: { gaps: GAPS, proposals: [] } });
+    await scoutDone(t, (await t.master.issues.startScout('demo', 'manual')).id);
+    expect(t.fake.calls.at(-1)?.prompt).not.toContain('## 进行中的迭代');
+  });
+
+  /** A step a scout adds to the plan under way, replacing the step numbered `replaces` if any. */
+  const addition = (
+    title: string,
+    replaces: number | null,
+    patch: Record<string, unknown> = {},
+  ) => {
+    const { closeout: _closeout, ...requirement } = step(title, patch);
+    return { ...requirement, replaces };
+  };
+
+  /** A scout that ends with `report` once; the scouts after it find nothing. */
+  async function scoutWith(t: Harness, report: Record<string, unknown>) {
+    let first = true;
+    t.scripts.scout = () => {
+      const structured = first ? report : { gaps: GAPS, proposals: [] };
+      first = false;
+      return { structured };
+    };
+    return scoutDone(t, (await t.master.issues.startScout('demo', 'manual')).id);
+  }
+
+  it('with an iteration under way, files only problems and changes its plan as the scout says', async () => {
+    const t = await start(config({ maxRisk: 'none', maxAttempts: 1 }), QUICK_WORKFLOW);
+    coderFailingOn(t, [1]);
+    await failFirstStep(t);
+    expect(iterationOf(t).status).toBe('blocked');
+
+    const note = '第 1 步用完了重做次数：换成先写解析、再接存储';
+    const scout = await scoutWith(t, {
+      gaps: GAPS,
+      proposals: [
+        proposal('修好卡住的合并', 'low'),
+        { ...proposal('支持 GitLab', 'low'), lead: 'gap' },
+        { ...proposal('文档和代码对不上', 'low'), lead: 'defect' },
+      ],
+      iteration: null,
+      iterationUpdate: {
+        note,
+        add: [
+          addition('甲二：换个做法做本地提案池', 1),
+          addition('丁：补上漏掉的迁移', null, { dependsOn: [4] }),
+        ],
+      },
+    });
+    expect(scout.status).toBe('completed');
+    // Only the problem becomes an issue: no capability outside the iteration, no polish.
+    expect(scout.proposals.map((p) => p.title)).toEqual(['修好卡住的合并']);
+    expect(gh.get(5)).toMatchObject({ title: '修好卡住的合并', labels: [LABELS.proposal] });
+    // The new steps, accepted with the iteration: #6 replaces the failed first step, #7 was
+    // missed and depends on it.
+    expect(gh.issues.size).toBe(7);
+    expect([6, 7].map((n) => gh.get(n).title)).toEqual([
+      '甲二：换个做法做本地提案池',
+      '丁：补上漏掉的迁移',
+    ]);
+    expect([6, 7].map((n) => gh.get(n).labels)).toEqual([
+      [LABELS.proposal, LABELS.ready],
+      [LABELS.proposal, LABELS.ready],
+    ]);
+    expect([6, 7].map((n) => parseIterationOf(gh.get(n).body))).toEqual([1, 1]);
+    expect([6, 7].map((n) => parseDependsOn(gh.get(n).body))).toEqual([[], [6]]);
+    // The step that waited for the failed one waits for its replacement now; the closing step
+    // for the steps added too. Their requirements stay as they were.
+    expect(parseDependsOn(gh.get(3).body)).toEqual([6]);
+    expect(gh.get(3).body).toContain('所属迭代：#1 · 依赖：#6');
+    expect(goalFromIssue(gh.get(3))).not.toContain('#6');
+    expect(parseDependsOn(gh.get(4).body)).toEqual([6, 3, 7]);
+
+    const iteration = iterationOf(t);
+    expect(iteration.status).toBe('active');
+    expect(
+      iteration.children.map((c) => [c.position, c.issue?.number, c.status, c.replacedBy]),
+    ).toEqual([
+      [1, 2, 'failed', 4],
+      [2, 3, 'waiting', undefined],
+      [3, 4, 'waiting', undefined],
+      [4, 6, 'ready', undefined],
+      [5, 7, 'waiting', undefined],
+    ]);
+    expect(iteration.children[2]?.dependsOn).toEqual([1, 2, 4, 5]);
+    expect(iteration.notes).toEqual([{ at: expect.any(String), scoutId: scout.id, text: note }]);
+    expect(eventData(t, 'iteration.adjusted')).toEqual([
+      {
+        repo: 'demo',
+        iterationId: iteration.id,
+        issue: 1,
+        scoutId: scout.id,
+        added: [4, 5],
+        replaced: [{ position: 1, by: 4 }],
+        leftOut: 0,
+      },
+    ]);
+    // Replacing the step that blocked it lets it go on.
+    expect(eventData(t, 'iteration.unblocked')).toEqual([
+      { repo: 'demo', iterationId: iteration.id, issue: 1 },
+    ]);
+
+    // On the iteration's issue: the plan with the new steps, and why it changed.
+    const own = gh.get(1);
+    expect(own.body).toContain(
+      [
+        '- [ ] #2 甲：本地提案池（已被 #6 替换）',
+        '- [ ] #3 乙：看板上采纳（依赖 #6）',
+        '- [ ] #4 丙：整理评审建议（依赖 #6、#3、#7）',
+        '- [ ] #6 甲二：换个做法做本地提案池',
+        '- [ ] #7 丁：补上漏掉的迁移（依赖 #6）',
+        '',
+        '### 不做',
+      ].join('\n'),
+    );
+    expect(own.body).toContain('共 4 个子 issue');
+    const comment = own.comments.at(-1) ?? '';
+    expect(isMasterComment(comment)).toBe(true);
+    expect(comment).toContain(`### 计划调整\n\n${note}`);
+    expect(comment).toContain('- 第 4 步 #6 甲二：换个做法做本地提案池 替换第 1 步（#2）');
+    expect(comment).toContain('- 补上第 5 步：#7 丁：补上漏掉的迁移');
+    expect(comment).toContain(scout.id);
+    // The plan is written out: the next round writes nothing more of it.
+    const edits = gh.calls.filter((c) => c.startsWith('editIssue')).length;
+
+    // The next round starts the replacement alone; the steps after it wait for it.
+    await t.master.issues.poll();
+    const numbers = () =>
+      t.master.store
+        .listRuns()
+        .map((r) => r.issue?.number ?? 0)
+        .sort((a, b) => a - b);
+    expect(numbers()).toEqual([2, 6]);
+    expect(gh.calls.filter((c) => c.startsWith('editIssue'))).toHaveLength(edits);
+    // Done: the steps that waited for it start; the closing step still waits for them.
+    const next = runOfIssue(t, 6);
+    await t.waitStatus(next.id, 'completed');
+    await waitFor(() => gh.get(6).state === 'closed', '#6 to close');
+    await t.master.issues.poll();
+    expect(numbers()).toEqual([2, 3, 6, 7]);
+    expect(iterationOf(t).children.map((c) => c.status)).toEqual([
+      'failed',
+      'running',
+      'waiting',
+      'done',
+      'running',
+    ]);
+    expect(gh.get(1).body).toContain('- [x] #6 甲二：换个做法做本地提案池');
+  });
+
+  it('adds a missed step to an auto-accepted iteration as accepted, the closing step waiting for it', async () => {
+    const t = await start(config({ maxRisk: 'low', maxPerDay: null }));
+    await planIteration(t);
+    await waitFor(() => gh.get(2).labels.includes(LABELS.running), 'Run of the first step');
+    await t.master.issues.poll();
+    expect(iterationOf(t)).toMatchObject({ status: 'active', auto: true });
+
+    await scoutWith(t, {
+      gaps: GAPS,
+      proposals: [],
+      iteration: null,
+      iterationUpdate: { note: '漏了迁移', add: [addition('丁：补上漏掉的迁移', null)] },
+    });
+    expect(gh.get(5).labels).toEqual([LABELS.proposal, LABELS.ready, LABELS.auto]);
+    expect(parseDependsOn(gh.get(4).body)).toEqual([2, 3, 5]);
+    const iteration = iterationOf(t);
+    expect(iteration.status).toBe('active');
+    expect(iteration.children.map((c) => [c.position, c.status])).toEqual([
+      [1, 'running'],
+      [2, 'waiting'],
+      [3, 'waiting'],
+      [4, 'ready'],
+    ]);
+    expect(gh.get(1).body).toContain('- [ ] #5 丁：补上漏掉的迁移');
+    expect(gh.get(1).comments.at(-1)).toContain('- 补上第 4 步：#5 丁：补上漏掉的迁移');
+    // It depends on nothing: the next round starts it beside the first step.
+    await t.master.issues.poll();
+    expect(t.master.store.latestRunForIssue('me/demo', 5)?.issue).toMatchObject({ auto: true });
+  });
+
+  it('finishes writing out a change to the plan where GitHub failed, at a later round', async () => {
+    const t = await start(config({ maxRisk: 'none', maxAttempts: 1 }), QUICK_WORKFLOW);
+    coderFailingOn(t, [1]);
+    await failFirstStep(t);
+    gh.failing.set('create 甲二：换个做法', 'GitHub 502');
+    const scout = await scoutWith(t, {
+      gaps: GAPS,
+      proposals: [],
+      iteration: null,
+      iterationUpdate: { note: '换个做法', add: [addition('甲二：换个做法', 1)] },
+    });
+    // The scout keeps its result; the change is recorded, and said on the iteration's issue.
+    expect(scout.status).toBe('completed');
+    let iteration = iterationOf(t);
+    expect(iteration.children.map((c) => [c.position, c.issue?.number, c.replacedBy])).toEqual([
+      [1, 2, 4],
+      [2, 3, undefined],
+      [3, 4, undefined],
+      [4, undefined, undefined],
+    ]);
+    expect(eventData(t, 'github.error').map((d) => d.message)).toEqual(['GitHub 502']);
+    expect(gh.get(1).comments.at(-1)).toContain('- 第 4 步 「甲二：换个做法」 替换第 1 步（#2）');
+    expect(parseDependsOn(gh.get(3).body)).toEqual([2]);
+
+    gh.failing.clear();
+    await t.master.issues.poll();
+    iteration = iterationOf(t);
+    expect(iteration.children[3]?.issue?.number).toBe(5);
+    expect(gh.get(5).labels).toEqual([LABELS.proposal, LABELS.ready]);
+    expect(parseDependsOn(gh.get(3).body)).toEqual([5]);
+    expect(parseDependsOn(gh.get(4).body)).toEqual([5, 3]);
+    expect(gh.get(1).body).toContain('- [ ] #2 甲：本地提案池（已被 #5 替换）');
+    expect(gh.get(1).body).toContain('- [ ] #5 甲二：换个做法');
+    // Written out once: the comment is not posted again.
+    expect(gh.get(1).comments.filter((c) => c.includes('### 计划调整'))).toHaveLength(1);
+    await t.master.issues.poll();
+    expect(t.master.store.latestRunForIssue('me/demo', 5)).toBeDefined();
+  });
+});
+
+describe('iterations: changing the plan', () => {
+  const child = (position: number, patch: Partial<IterationChild> = {}): IterationChild => ({
+    title: `第 ${position} 步`,
+    category: 'feature',
+    size: 'S',
+    risk: 'low',
+    why: 'w',
+    evidence: ['e'],
+    what: 'x',
+    acceptance: ['a'],
+    position,
+    criteria: [],
+    dependsOn: [],
+    closeout: false,
+    status: 'waiting',
+    runIds: [],
+    ...patch,
+  });
+  const addition = (title: string, patch: Partial<IterationAddition> = {}): IterationAddition => ({
+    title,
+    category: 'feature',
+    size: 'S',
+    risk: 'low',
+    why: 'w',
+    evidence: ['e'],
+    what: 'x',
+    acceptance: ['a'],
+    criteria: [],
+    dependsOn: [],
+    ...patch,
+  });
+  const shape = (children: IterationChild[]) =>
+    children.map((c) => [c.position, c.status, c.dependsOn, c.replacedBy]);
+
+  it('adds steps after the last one, replacing failed ones, the closing step waiting for them', () => {
+    const plan = [
+      child(1, { status: 'done' }),
+      child(2, { status: 'failed', dependsOn: [1] }),
+      child(3, { dependsOn: [2] }),
+      child(4, { closeout: true, dependsOn: [1, 2, 3] }),
+    ];
+    const adjusted = adjustedPlan(
+      { status: 'blocked', children: plan },
+      {
+        note: 'n',
+        add: [
+          addition('换个做法', { dependsOn: [1], replaces: 2 }),
+          addition('漏掉的', { dependsOn: [5] }),
+        ],
+      },
+    );
+    expect(adjusted.added).toEqual([5, 6]);
+    expect(adjusted.replaced).toEqual([{ position: 2, by: 5 }]);
+    expect(adjusted.leftOut).toEqual([]);
+    expect(shape(adjusted.children)).toEqual([
+      [1, 'done', [], undefined],
+      [2, 'failed', [1], 5],
+      [3, 'waiting', [2], undefined],
+      [4, 'waiting', [1, 2, 3, 5, 6], undefined],
+      [5, 'ready', [1], undefined],
+      [6, 'waiting', [5], undefined],
+    ]);
+    expect(adjusted.children[4]).toMatchObject({ title: '换个做法', closeout: false, runIds: [] });
+    // The plan it was given is left as it was.
+    expect(plan[1]?.replacedBy).toBeUndefined();
+    expect(plan[3]?.dependsOn).toEqual([1, 2, 3]);
+
+    // While the iteration waits to be accepted, the steps added wait with it.
+    const pending = adjustedPlan(
+      { status: 'pending', children: plan.map((c) => ({ ...c, status: 'planned' as const })) },
+      { note: 'n', add: [addition('漏掉的')] },
+    );
+    expect(pending.children.map((c) => c.status)).toEqual([
+      'planned',
+      'planned',
+      'planned',
+      'planned',
+      'planned',
+    ]);
+    expect(pending.children[3]?.dependsOn).toEqual([1, 2, 3, 5]);
+  });
+
+  it('leaves out steps past the limit and replacements no longer needed, numbering the rest on', () => {
+    const plan = Array.from({ length: MAX_ITERATION_CHILDREN }, (_, i) =>
+      child(i + 1, {
+        status: i === 1 ? 'dropped' : i === 2 ? 'running' : i === 0 ? 'done' : 'waiting',
+      }),
+    );
+    // The closing step started already: it waits for nothing more.
+    const last = plan.at(-1) as IterationChild;
+    last.closeout = true;
+    last.status = 'running';
+    last.dependsOn = [1, 2, 3, 4, 5, 6, 7];
+    const adjusted = adjustedPlan(
+      { status: 'active', children: plan },
+      {
+        note: 'n',
+        add: [
+          // Numbered 9 by the scout: one more step than the plan may have.
+          addition('多出来的'),
+          // Numbered 10: the step it replaces is under way again.
+          addition('换掉在做的', { replaces: 3 }),
+          // Numbered 11, depending on 9, which was left out: it gets 9.
+          addition('换掉不做的', { replaces: 2, dependsOn: [1, 9] }),
+        ],
+      },
+    );
+    expect(adjusted.leftOut).toEqual([
+      { title: '多出来的', reason: 'limit' },
+      { title: '换掉在做的', reason: 'stale' },
+    ]);
+    expect(adjusted.added).toEqual([9]);
+    expect(adjusted.replaced).toEqual([{ position: 2, by: 9 }]);
+    expect(shape(adjusted.children).slice(-2)).toEqual([
+      [8, 'running', [1, 2, 3, 4, 5, 6, 7], undefined],
+      [9, 'ready', [1], undefined],
+    ]);
+    expect(adjusted.children.filter((c) => c.replacedBy === undefined)).toHaveLength(
+      MAX_ITERATION_CHILDREN,
+    );
   });
 });
 
@@ -7714,6 +8306,165 @@ describe('issues: iteration texts', () => {
     expect(accepted).toContain('`ares1:ready` was added to this iteration and all its sub-issues');
     setLang('zh');
     expect(iterationAutoAcceptedComment()).toContain('已整批自动采纳');
+  });
+
+  it('revises the plan item by item after it changed, keeping what a human wrote and what was checked', () => {
+    const body = iterationBody(text(), 'scout_1', false).replace(
+      '### 不做',
+      '人加的一段话\n\n### 不做',
+    );
+    const done = checkPlanItem(body, 12);
+    const changed: Pick<IterationText, 'plan' | 'kind'> = {
+      kind: { risk: 'high', size: 'L' },
+      plan: [
+        { number: 12, title: '本地提案池', dependsOn: [] },
+        { number: 13, title: '看板上采纳', dependsOn: [12], replacedBy: 15 },
+        { number: 14, title: '收尾：整理评审建议', dependsOn: [12, 15, 16] },
+        { number: 15, title: '换个做法采纳', dependsOn: [12] },
+        { number: 16, title: '补上的一步', dependsOn: [15] },
+        // Not created yet: listed once it has its issue, counted already.
+        { number: null, title: '还没建的', dependsOn: [] },
+      ],
+    };
+    const revised = revisedPlan(done, changed);
+    expect(revised).toContain(
+      [
+        '### 计划',
+        '',
+        '- [x] #12 本地提案池',
+        '- [ ] #13 看板上采纳（依赖 #12）（已被 #15 替换）',
+        '- [ ] #14 收尾：整理评审建议（依赖 #12、#15、#16）',
+        '- [ ] #15 换个做法采纳（依赖 #12）',
+        '- [ ] #16 补上的一步（依赖 #15）',
+        '',
+        '人加的一段话',
+        '',
+        '### 不做',
+      ].join('\n'),
+    );
+    expect(revised).not.toContain('还没建的');
+    // The replaced step is not counted; the kind is the one given. The rest of the footer stays.
+    const foot = (b: string) => b.slice(b.indexOf(FOOTER_MARKER));
+    expect(foot(revised)).toBe(
+      foot(done).replace(
+        '共 3 个子 issue · 整体大小：L · 整体风险：中',
+        '共 5 个子 issue · 整体大小：L · 整体风险：高',
+      ),
+    );
+    expect(planLists(revised, [12, 13, 14, 15, 16])).toBe(true);
+    // Revising it again changes nothing.
+    expect(revisedPlan(revised, changed)).toBe(revised);
+    // A replacement without its issue yet; a body whose plan items a human removed.
+    const bare = `我自己写的正文\n\n${FOOTER_MARKER}\n---\n共 1 个子 issue · 整体大小：S · 整体风险：低`;
+    const added = revisedPlan(bare, {
+      kind: { risk: 'low', size: 'S' },
+      plan: [{ number: 12, title: '本地提案池', dependsOn: [], replacedBy: null }],
+    });
+    expect(added).toBe(
+      `我自己写的正文\n\n- [ ] #12 本地提案池（已被替换）\n\n${FOOTER_MARKER}\n---\n共 0 个子 issue · 整体大小：S · 整体风险：低`,
+    );
+  });
+
+  it("rewrites a child issue's dependencies in its footer, leaving the requirement alone", () => {
+    const body = iterationChildBody(proposal, { iteration: 7, dependsOn: [12] }, 'scout_1');
+    const changed = withDependsOn(body, 7, [15, 16]);
+    expect(parseDependsOn(changed)).toEqual([15, 16]);
+    expect(parseIterationOf(changed)).toBe(7);
+    expect(changed).toContain('所属迭代：#7 · 依赖：#15、#16');
+    expect(changed).not.toContain('依赖：#12');
+    expect(goalFromIssue({ number: 14, title: 't', body: changed })).toBe(
+      goalFromIssue({ number: 14, title: 't', body }),
+    );
+    expect(changed).toBe(
+      iterationChildBody(proposal, { iteration: 7, dependsOn: [15, 16] }, 'scout_1'),
+    );
+    // A footer without the marker gets it; a body without a footer gets one.
+    const lost = withDependsOn(`正文\n\n${FOOTER_MARKER}\n---\n人改过的页脚`, 7, [3]);
+    expect(lost).toBe(`正文\n\n${FOOTER_MARKER}\n---\n人改过的页脚\n${dependsOnMarker([3])}`);
+    const bare = withDependsOn('正文', 7, [3]);
+    expect(parseDependsOn(bare)).toEqual([3]);
+    expect(parseIterationOf(bare)).toBe(7);
+    expect(goalFromIssue({ number: 1, title: 't', body: bare })).toBe('#1 t\n\n正文');
+    // Written in the other language before: the line follows the language in use now.
+    setLang('en');
+    const english = withDependsOn(changed, 7, []);
+    expect(english).toContain('Iteration: #7 · No dependencies');
+    expect(parseDependsOn(english)).toEqual([]);
+  });
+
+  it('tells a change to the plan, and why a step is closed with its iteration, in both languages', () => {
+    const input = {
+      note: '第 1 步用完了重做次数：换个做法',
+      scoutId: 'scout_2',
+      added: [
+        { position: 4, number: 15, title: '换个做法', replaces: { position: 1, number: 12 } },
+        { position: 5, number: null, title: '补上的一步' },
+      ],
+      leftOut: [
+        { title: '太多了的一步', reason: 'limit' as const },
+        { title: '不用换了的一步', reason: 'stale' as const },
+      ],
+      max: 8,
+    };
+    expect(iterationAdjustedComment(input)).toBe(
+      [
+        '### 计划调整',
+        '',
+        '第 1 步用完了重做次数：换个做法',
+        '',
+        '- 第 4 步 #15 换个做法 替换第 1 步（#12）',
+        '- 补上第 5 步：「补上的一步」',
+        '- 没有补上「太多了的一步」：迭代最多 8 个子项',
+        '- 没有补上「不用换了的一步」：它要替换的那一步已经不需要替换了',
+        '',
+        '_由战神一号侦察调整（scout_2）。新的子 issue 属于这个迭代，依赖的子 issue 都以完成关闭后才开工；收尾的子 issue 会等它们做完。_',
+      ].join('\n'),
+    );
+    expect(
+      closedWithIterationComment({ iteration: 7, runId: 'run-1', reason: '方向不对\n先不做' }),
+    ).toBe(
+      '迭代 #7 被关掉了，这个子 issue 随之关成不做；它的 Run `run-1` 已终止。\n\n关掉迭代时留下的理由：\n\n> 方向不对\n> 先不做',
+    );
+    expect(closedWithIterationComment({ iteration: 7, runId: null, reason: '  ' })).toBe(
+      '迭代 #7 被关掉了，这个子 issue 随之关成不做。',
+    );
+
+    setLang('en');
+    const english = iterationAdjustedComment({
+      ...input,
+      note: 'Step 1 used up its attempts',
+      added: [
+        { position: 4, number: 15, title: 'Another way', replaces: { position: 1, number: 12 } },
+        { position: 5, number: null, title: 'A missed step' },
+      ],
+      leftOut: [
+        { title: 'One too many', reason: 'limit' },
+        { title: 'Not needed', reason: 'stale' },
+      ],
+    });
+    expect(english).not.toMatch(cjk);
+    expect(english).toContain('### Plan changed\n\nStep 1 used up its attempts');
+    expect(english).toContain('- Step 4, #15 Another way, replaces step 1 (#12)');
+    expect(english).toContain('- Added step 5: "A missed step"');
+    expect(english).toContain('- Not added: "One too many", as an iteration has at most 8 steps');
+    const closed = closedWithIterationComment({ iteration: 7, runId: 'run-1', reason: 'Not now' });
+    expect(closed).not.toMatch(cjk);
+    expect(closed).toBe(
+      'Iteration #7 was closed, so this sub-issue is closed as not planned with it; its Run `run-1` was terminated.\n\nThe reason given when the iteration was closed:\n\n> Not now',
+    );
+    const revised = revisedPlan(
+      iterationBody(
+        text({ goal: 'g', readmeGoal: 'r', criteria: ['c'], outOfScope: [] }),
+        's',
+        false,
+      ),
+      {
+        kind: { risk: 'low', size: 'S' },
+        plan: [{ number: 12, title: 'Local backlog', dependsOn: [], replacedBy: 15 }],
+      },
+    );
+    expect(revised).toContain('- [ ] #12 Local backlog (replaced by #15)');
+    expect(revised).toContain('0 sub-issues · Overall size: S · Overall risk: low');
   });
 });
 

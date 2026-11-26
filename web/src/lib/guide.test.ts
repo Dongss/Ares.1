@@ -682,6 +682,10 @@ describe('notifications', () => {
       ['blocked', ev('run.blocked', { kind: 'merge_conflict' })],
       ['failed', ev('run.status', { status: 'failed' })],
       ['proposals', ev('scout.completed', { pending: 2 }, null)],
+      [
+        'iteration',
+        ev('iteration.blocked', { repo: 'demo', issue: 1, child: 2, reason: 'failed' }, null),
+      ],
       ['scout', ev('scout.failed', { repo: 'demo', message: 'x', streak: 3 }, null)],
       ['github', ev('github.error', { message: 'x' }, null)],
       ['pull', ev('github.diverged', { repo: 'demo', local: 'a', remote: 'b' }, null)],

@@ -744,6 +744,26 @@ describe('workspaces of attempts before the last when an issue used up its attem
   });
 });
 
+describe('a Run terminated because its iteration was closed', () => {
+  afterEach(() => setLang('zh'));
+
+  it('says why, in both languages', () => {
+    const data = { repo: 'me/demo', issue: 22, iteration: 20 };
+    expect(eventText({ type: 'run.iteration_closed', data })).toBe(
+      '所属迭代 #20 被人关掉了，这个 Run 随之终止，它的 issue 关成不做',
+    );
+    expect(eventText({ type: 'run.iteration_closed', data: {} })).toBe(
+      '所属迭代被人关掉了，这个 Run 随之终止，它的 issue 关成不做',
+    );
+    setLang('en');
+    const english = eventText({ type: 'run.iteration_closed', data });
+    expect(english).toBe(
+      'Its iteration #20 was closed by a human, so this Run was terminated and its issue closed as not planned',
+    );
+    expect(english).not.toMatch(/[一-鿿]/);
+  });
+});
+
 describe('a Run started over because its issue changed', () => {
   afterEach(() => setLang('zh'));
   const changed = { repo: 'me/demo', issue: 7, newRun: 'run_new' };

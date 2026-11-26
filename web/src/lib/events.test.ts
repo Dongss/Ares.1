@@ -112,6 +112,34 @@ const SAMPLES: [string, Record<string, unknown>][] = [
     'iteration.completed',
     { repo: 'demo', iterationId: 'iteration-1', issue: 20, costUsd: 1.5, runs: 4 },
   ],
+  [
+    'iteration.blocked',
+    {
+      repo: 'demo',
+      iterationId: 'iteration-1',
+      issue: 20,
+      position: 2,
+      child: 22,
+      reason: 'failed',
+    },
+  ],
+  ['iteration.unblocked', { repo: 'demo', iterationId: 'iteration-1', issue: 20 }],
+  [
+    'iteration.cancelled',
+    { repo: 'demo', iterationId: 'iteration-1', issue: 20, dropped: [2, 3], pending: false },
+  ],
+  [
+    'iteration.adjusted',
+    {
+      repo: 'demo',
+      iterationId: 'iteration-1',
+      issue: 20,
+      scoutId: 's-1',
+      added: [5],
+      replaced: [{ position: 2, by: 5 }],
+      leftOut: 0,
+    },
+  ],
   ['proposal.auto_accepted', { repo: 'demo', proposalId: 'proposal-1', runId: 'run-1' }],
   ['proposal.accepted', { repo: 'demo', proposalId: 'proposal-1', runId: 'run-1' }],
   // The reason is a human's own words, kept as written: English here, so the check below holds.
@@ -515,6 +543,69 @@ describe('globalEventText', () => {
     );
     expect(text('iteration.completed', { repo: 'demo', runs: 1 })).toBe(
       'An iteration of demo is done: 1 Run',
+    );
+  });
+
+  it('says an iteration got blocked and by which step, and that it goes on again', () => {
+    const at = { repo: 'demo', iterationId: 'iteration-1', issue: 20 };
+    const step = { ...at, position: 2, child: 22 };
+    expect(text('iteration.blocked', { ...step, reason: 'failed' })).toBe(
+      'demo 的迭代 #20 受阻：第 2 步（#22）用完重做次数后失败了，依赖它的步骤开不了工；侦察下次会换个做法替换它',
+    );
+    expect(text('iteration.blocked', { ...step, reason: 'dropped' })).toBe(
+      'demo 的迭代 #20 受阻：第 2 步（#22）被人关成了不做，依赖它的步骤开不了工；侦察下次会换个做法替换它',
+    );
+    expect(text('iteration.unblocked', at)).toBe('demo 的迭代 #20 不再受阻，接着按依赖开工');
+    expect(globalEventTone(ev('iteration.blocked', step))).toBe('attention');
+    expect(globalEventTone(ev('iteration.unblocked', at))).toBe('neutral');
+    setLang('en');
+    expect(text('iteration.blocked', { ...step, reason: 'failed' })).toBe(
+      'Iteration #20 of demo is blocked: step 2 (#22) failed after using up its attempts, so the steps depending on it cannot start; the next scout replaces it with another approach',
+    );
+    expect(text('iteration.blocked', { repo: 'demo' })).toBe(
+      'Iteration of demo is blocked: a step was not done, so the steps depending on it cannot start; the next scout replaces it with another approach',
+    );
+    expect(text('iteration.unblocked', at)).toBe(
+      'Iteration #20 of demo is no longer blocked and goes on in the order of its dependencies',
+    );
+  });
+
+  it('says a human turned an iteration down, and a scout changed its plan', () => {
+    const at = { repo: 'demo', iterationId: 'iteration-1', issue: 20 };
+    expect(text('iteration.cancelled', { ...at, dropped: [2, 3], pending: false })).toBe(
+      'demo 的迭代 #20 被人关掉了，2 个没完成的子项随之关成不做',
+    );
+    expect(text('iteration.cancelled', { ...at, dropped: [1, 2, 3], pending: true })).toBe(
+      'demo 等采纳的迭代 #20 被人关掉了，3 个没完成的子项随之关成不做',
+    );
+    expect(text('iteration.cancelled', { ...at, dropped: [], pending: false })).toBe(
+      'demo 的迭代 #20 被人关掉了',
+    );
+    const changed = {
+      ...at,
+      scoutId: 'scout-1',
+      added: [5, 6],
+      replaced: [{ position: 2, by: 5 }],
+      leftOut: 1,
+    };
+    expect(text('iteration.adjusted', changed)).toBe(
+      '侦察调整了 demo 的迭代 #20 的计划：补上 2 步，其中 1 步替换没做成的步骤，1 步没能加上',
+    );
+    expect(text('iteration.adjusted', { ...at, added: [5], replaced: [], leftOut: 0 })).toBe(
+      '侦察调整了 demo 的迭代 #20 的计划：补上 1 步',
+    );
+    setLang('en');
+    expect(text('iteration.cancelled', { ...at, dropped: [3], pending: true })).toBe(
+      'Iteration #20 of demo, waiting to be accepted, was closed by a human; its 1 step not done was closed as not planned with it',
+    );
+    expect(text('iteration.cancelled', { ...at, dropped: [2, 3], pending: false })).toBe(
+      'Iteration #20 of demo was closed by a human; its 2 steps not done were closed as not planned with it',
+    );
+    expect(text('iteration.adjusted', changed)).toBe(
+      'A scout changed the plan of iteration #20 of demo: 2 steps added, 1 of them replacing a step that was not done; 1 step left out',
+    );
+    expect(text('iteration.adjusted', { repo: 'demo', added: [] })).toBe(
+      'A scout changed the plan of an iteration of demo',
     );
   });
 

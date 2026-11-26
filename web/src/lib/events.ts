@@ -17,6 +17,9 @@ function count(n: number, zh: string, one: string, many: string): string {
   return t({ zh: `${n} ${zh}`, en: `${n} ${n === 1 ? one : many}` });
 }
 
+/** "1 step" / "3 steps", for the English texts. */
+const steps = (n: number) => `${n} ${n === 1 ? 'step' : 'steps'}`;
+
 /** 「demo」 / "demo", or a stand-in when the event does not say which repo. */
 function repoOf(event: GlobalEvent): string {
   return str(event.data.repo) ?? t({ zh: '某个仓库', en: 'a repo' });
@@ -372,6 +375,89 @@ export function globalEventText(event: GlobalEvent, now = new Date()): string | 
       const changed = what ?? t({ zh: '状态变了', en: 'changed' });
       return t({ zh: `${iteration}：${step}${changed}`, en: `${iteration}: ${step} ${changed}` });
     }
+    case 'iteration.blocked': {
+      const issue = num(d.issue);
+      const position = num(d.position);
+      const child = num(d.child);
+      const step =
+        position === null
+          ? t({ zh: '一步', en: 'a step' })
+          : t({
+              zh: `第 ${position} 步${child === null ? '' : `（#${child}）`}`,
+              en: `step ${position}${child === null ? '' : ` (#${child})`}`,
+            });
+      const why =
+        d.reason === 'failed'
+          ? t({ zh: '用完重做次数后失败了', en: 'failed after using up its attempts' })
+          : d.reason === 'dropped'
+            ? t({ zh: '被人关成了不做', en: 'was closed as not planned' })
+            : t({ zh: '没有做成', en: 'was not done' });
+      return t({
+        zh: `${repoOf(event)} 的迭代${issue === null ? '' : ` #${issue} `}受阻：${step}${why}，依赖它的步骤开不了工；侦察下次会换个做法替换它`,
+        en: `Iteration${issue === null ? '' : ` #${issue}`} of ${repoOf(event)} is blocked: ${step} ${why}, so the steps depending on it cannot start; the next scout replaces it with another approach`,
+      });
+    }
+    case 'iteration.unblocked': {
+      const issue = num(d.issue);
+      return t({
+        zh: `${repoOf(event)} 的迭代${issue === null ? '' : ` #${issue} `}不再受阻，接着按依赖开工`,
+        en: `Iteration${issue === null ? '' : ` #${issue}`} of ${repoOf(event)} is no longer blocked and goes on in the order of its dependencies`,
+      });
+    }
+    case 'iteration.cancelled': {
+      const issue = num(d.issue);
+      const dropped = Array.isArray(d.dropped) ? d.dropped.length : null;
+      const which = issue === null ? '' : ` #${issue}`;
+      // A space between the number and the Chinese after it.
+      const zhWhich = issue === null ? '' : ` #${issue} `;
+      const iteration =
+        d.pending === true
+          ? t({
+              zh: `${repoOf(event)} 等采纳的迭代${zhWhich}`,
+              en: `Iteration${which} of ${repoOf(event)}, waiting to be accepted,`,
+            })
+          : t({
+              zh: `${repoOf(event)} 的迭代${zhWhich}`,
+              en: `Iteration${which} of ${repoOf(event)}`,
+            });
+      const closed =
+        dropped === null || dropped === 0
+          ? ''
+          : t({
+              zh: `，${dropped} 个没完成的子项随之关成不做`,
+              en: `; its ${steps(dropped)} not done ${dropped === 1 ? 'was' : 'were'} closed as not planned with it`,
+            });
+      return t({
+        zh: `${iteration}被人关掉了${closed}`,
+        en: `${iteration} was closed by a human${closed}`,
+      });
+    }
+    case 'iteration.adjusted': {
+      const issue = num(d.issue);
+      const added = Array.isArray(d.added) ? d.added.length : 0;
+      const replaced = Array.isArray(d.replaced) ? d.replaced.length : 0;
+      const leftOut = num(d.leftOut) ?? 0;
+      const parts: string[] = [];
+      if (added > 0) {
+        parts.push(
+          replaced > 0
+            ? t({
+                zh: `补上 ${added} 步，其中 ${replaced} 步替换没做成的步骤`,
+                en: `${steps(added)} added, ${replaced} of them replacing ${replaced === 1 ? 'a step that was' : 'steps that were'} not done`,
+              })
+            : t({ zh: `补上 ${added} 步`, en: `${steps(added)} added` }),
+        );
+      }
+      if (leftOut > 0) {
+        parts.push(t({ zh: `${leftOut} 步没能加上`, en: `${steps(leftOut)} left out` }));
+      }
+      const what =
+        parts.length > 0 ? t({ zh: `：${parts.join('，')}`, en: `: ${parts.join('; ')}` }) : '';
+      return t({
+        zh: `侦察调整了 ${repoOf(event)} 的迭代${issue === null ? '' : ` #${issue} `}的计划${what}`,
+        en: `A scout changed the plan of ${issue === null ? 'an iteration' : `iteration #${issue}`} of ${repoOf(event)}${what}`,
+      });
+    }
     case 'iteration.completed': {
       const issue = num(d.issue);
       const runs = num(d.runs);
@@ -573,6 +659,7 @@ export function globalEventTone(event: GlobalEvent): Tone {
     case 'store.backup_restored':
     case 'github.diverged':
     case 'github.pull_blocked':
+    case 'iteration.blocked':
       return 'attention';
     case 'config.reloaded':
       return (num(event.data.errors) ?? 0) > 0 ? 'attention' : 'neutral';
