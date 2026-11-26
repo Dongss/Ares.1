@@ -4,7 +4,6 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { strictOutputSchema } from '../src/adapters/codex.js';
 import { storedRunTimes } from '../src/engine/times.js';
-import type { GhIssue } from '../src/github/client.js';
 import {
   FOOTER_MARKER,
   markComment,
@@ -29,6 +28,7 @@ import {
   scoutReportJsonSchema,
   updateProblems,
 } from '../src/github/scout.js';
+import type { HostIssue } from '../src/host/code-host.js';
 import { setLang, t } from '../src/i18n.js';
 import type {
   AssessmentEntry,
@@ -77,7 +77,7 @@ const section = (text: string, heading: string) => {
 };
 
 /** A closed issue by the repo's owner "me", done unless `extra` says otherwise. */
-const issue = (number: number, title: string, extra: Partial<GhIssue> = {}): GhIssue => ({
+const issue = (number: number, title: string, extra: Partial<HostIssue> = {}): HostIssue => ({
   number,
   title,
   body: '',

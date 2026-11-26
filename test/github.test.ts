@@ -25,7 +25,6 @@ import {
 } from '../src/config/flow.js';
 import { findTemplate, githubConfigKey } from '../src/config/load.js';
 import { mergeRemoteGoal, mergeRemoteMessage } from '../src/github/bridge.js';
-import type { GhComment, GhIssue } from '../src/github/client.js';
 import {
   COMMENT_MARKER,
   checkPlanItem,
@@ -84,6 +83,7 @@ import {
   proposalsHoldingScout,
   runDigest,
 } from '../src/github/scout.js';
+import type { HostComment, HostIssue } from '../src/host/code-host.js';
 import { setLang } from '../src/i18n.js';
 import { noticeFor } from '../src/notify/notice.js';
 import {
@@ -4743,7 +4743,7 @@ describe('issues: delivering through pull requests (deliver: pr)', () => {
     const branch = run.branch as string;
     // Opened by an earlier Master that stopped before recording it, from an older commit.
     gh.remoteBranches.set(branch, run.baseCommit as string);
-    const earlier = await gh.createPullRequest('me/demo', {
+    const earlier = await gh.createChangeRequest('me/demo', {
       head: branch,
       base: 'main',
       title: 'earlier',
@@ -4765,7 +4765,7 @@ describe('issues: delivering through pull requests (deliver: pr)', () => {
     const run = await awaitingMerge(t);
     const branch = run.branch as string;
     gh.remoteBranches.set(branch, run.baseCommit as string);
-    const other = await gh.createPullRequest('me/demo', {
+    const other = await gh.createChangeRequest('me/demo', {
       head: branch,
       base: 'release',
       title: 'by a human',
@@ -7205,7 +7205,7 @@ describe('issues: texts', () => {
   const ctx = { dashboardUrl: 'http://127.0.0.1:4870', targetBranch: 'main' };
 
   /** A comment by the repo's owner, or by `author`. */
-  const by = (body: string, author = 'me', authorAssociation = 'OWNER'): GhComment => ({
+  const by = (body: string, author = 'me', authorAssociation = 'OWNER'): HostComment => ({
     body,
     author,
     authorAssociation,
@@ -7562,7 +7562,7 @@ describe('issues: texts', () => {
   });
 
   it('counts toward max_proposals only the proposals auto-accept would take, or all without it', () => {
-    const issue = (number: number, labels: string[] = [LABELS.proposal]): GhIssue => ({
+    const issue = (number: number, labels: string[] = [LABELS.proposal]): HostIssue => ({
       number,
       title: `#${number}`,
       body: '',
@@ -7935,7 +7935,7 @@ describe('issues: texts', () => {
         dashboardUrl: ctx.dashboardUrl,
       });
       expect(started).toContain('Run `run_2` (attempt 2 of 3, template "Self-development")');
-      const closed: GhIssue = {
+      const closed: HostIssue = {
         number: 4,
         title: 'Add a thing',
         body: '',

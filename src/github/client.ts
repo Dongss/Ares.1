@@ -1,179 +1,21 @@
 import { execFile } from 'node:child_process';
 import { z } from 'zod';
+import {
+  type ChangeRequest,
+  type ChangeRequestStatus,
+  type CodeHost,
+  forcePushable,
+  type HostAuthored,
+  type HostCheck,
+  type HostComment,
+  type HostIssue,
+  type HostReviewComment,
+  type LabelDef,
+  type ReviewDecision,
+} from '../host/code-host.js';
 import { t } from '../i18n.js';
 
-/** Who wrote an issue or a comment, which decides whether the Master trusts what it says. */
-export interface GhAuthored {
-  /** Login of the author; null when the account was deleted. */
-  author: string | null;
-  /**
-   * The author's relation to the repo, as GitHub gives it: OWNER, MEMBER, COLLABORATOR,
-   * CONTRIBUTOR, FIRST_TIME_CONTRIBUTOR, FIRST_TIMER, MANNEQUIN or NONE.
-   */
-  authorAssociation: string;
-}
-
-export interface GhComment extends GhAuthored {
-  body: string;
-}
-
-/** An issue as the Master needs it. */
-export interface GhIssue extends GhAuthored {
-  number: number;
-  title: string;
-  body: string;
-  state: 'open' | 'closed';
-  /** "completed" / "not_planned" for closed issues. */
-  stateReason: string | null;
-  labels: string[];
-  url: string;
-  /** The latest comments (up to 100), oldest first; only filled when asked for. */
-  comments: GhComment[];
-}
-
-export interface LabelDef {
-  name: string;
-  color: string;
-  description: string;
-}
-
-/** A pull request as the Master needs it, to deliver a Run through one. */
-export interface GhPullRequest {
-  number: number;
-  url: string;
-  /** merged: GitHub merged it into its base, whether by a merge, a squash or a rebase. */
-  state: 'open' | 'merged' | 'closed';
-  /** Whether it merges without conflicts; null while GitHub has not worked that out yet. */
-  mergeable: boolean | null;
-  /** The commit the merge put on the base branch; null unless merged. */
-  mergeCommit: string | null;
-  /** The branch with the changes. */
-  headRefName: string;
-  /** The branch it merges into. */
-  baseRefName: string;
-}
-
-/** A review of a pull request. */
-export interface GhReview extends GhAuthored {
-  /** As GitHub gives it: APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED or PENDING. */
-  state: string;
-  body: string;
-  /** The commit it reviewed; null when GitHub gives none. */
-  commit: string | null;
-  /** When it was submitted (ISO 8601); null while pending. */
-  submittedAt: string | null;
-}
-
-/** A review comment on a line of a pull request's changes. */
-export interface GhReviewComment extends GhAuthored {
-  body: string;
-  /** The file it is on. */
-  path: string;
-  /** The line it is on; null when the line is gone from the changes (outdated). */
-  line: number | null;
-  /** The commit it applies to; null when GitHub gives none. */
-  commit: string | null;
-}
-
-/** A check of a pull request's head commit: a check run (e.g. CI) or a commit status. */
-export interface GhCheck {
-  name: string;
-  /** Whether it has finished. */
-  done: boolean;
-  /**
-   * How it finished, as GitHub gives it: SUCCESS, FAILURE, TIMED_OUT, CANCELLED,
-   * ACTION_REQUIRED, STARTUP_FAILURE, ERROR, NEUTRAL, SKIPPED, ...; null while not done.
-   */
-  conclusion: string | null;
-  /** Where to see it; null when GitHub gives no link. */
-  url: string | null;
-}
-
-/** Where a pull request stands with the reviews its base branch requires. */
-export type GhReviewDecision = 'CHANGES_REQUESTED' | 'APPROVED' | 'REVIEW_REQUIRED';
-
-/** A pull request with what was said and checked on it: whether it needs more work. */
-export interface GhPullRequestStatus extends GhPullRequest {
-  /** The commit its head branch points at. */
-  headRefOid: string;
-  /** null when GitHub gives none, as when the base branch requires no reviews. */
-  reviewDecision: GhReviewDecision | null;
-  /** Oldest first. */
-  reviews: GhReview[];
-  /** The latest (up to 100), oldest first; always empty once merged or closed. */
-  reviewComments: GhReviewComment[];
-  /** The checks of its head commit. */
-  checks: GhCheck[];
-}
-
-/** Only the Runs' own branches may be force-pushed: never a target branch or anybody else's. */
-export function forcePushable(branch: string): boolean {
-  return branch.startsWith('ares1/');
-}
-
-/** What the Master does on GitHub. `repo` is always "owner/name". */
-export interface GitHub {
-  /** "owner/name" of the GitHub repo behind a local clone. */
-  resolveRepo(path: string): Promise<string>;
-  /** Login of the account the Master acts as. */
-  viewer(): Promise<string>;
-  /** Create the labels, or update their color and description. */
-  ensureLabels(repo: string, labels: readonly LabelDef[]): Promise<void>;
-  /** Newest first: one page, so at most `limit` and never more than 100. */
-  listIssues(
-    repo: string,
-    query: { state: 'open' | 'closed'; label?: string; limit: number; comments?: boolean },
-  ): Promise<GhIssue[]>;
-  /**
-   * Issues closed as not planned, newest first, with their comments: at most `limit`, over as
-   * many pages as that takes.
-   */
-  listNotPlannedIssues(repo: string, query: { limit: number }): Promise<GhIssue[]>;
-  createIssue(
-    repo: string,
-    issue: { title: string; body: string; labels: string[] },
-  ): Promise<{ number: number; url: string }>;
-  /** Replace the body of the issue. */
-  editIssue(repo: string, number: number, edit: { body: string }): Promise<void>;
-  /** The issue as it is now, without its comments. */
-  getIssue(repo: string, number: number): Promise<GhIssue>;
-  getLabels(repo: string, number: number): Promise<string[]>;
-  /** Replace all labels of the issue. */
-  setLabels(repo: string, number: number, labels: string[]): Promise<void>;
-  comment(repo: string, number: number, body: string): Promise<void>;
-  /** The latest comments of the issue (up to 100), oldest first. */
-  listComments(repo: string, number: number): Promise<GhComment[]>;
-  /** Close as completed (done) or as not planned. */
-  close(repo: string, number: number, reason: 'completed' | 'not_planned'): Promise<void>;
-  /**
-   * Push `branch` of the local clone at `path` to the GitHub repo, as the same account. `force`
-   * replaces what GitHub has even when it is not a fast-forward (a Run's branch whose history was
-   * rewritten, e.g. by a rollback); only for branches `forcePushable` allows, else a GhError.
-   */
-  push(path: string, repo: string, branch: string, opts?: { force?: boolean }): Promise<void>;
-  /** The open pull request from `head`, a branch of `repo` itself; null when there is none. */
-  findOpenPullRequest(repo: string, head: string): Promise<GhPullRequest | null>;
-  /** Open a pull request from `head` into `base`, both branches of `repo`. */
-  createPullRequest(
-    repo: string,
-    pr: { head: string; base: string; title: string; body: string },
-  ): Promise<{ number: number; url: string }>;
-  /** The pull request as it is now, with its reviews and the checks of its head commit. */
-  getPullRequest(repo: string, number: number): Promise<GhPullRequestStatus>;
-  /**
-   * Close the open pull request without merging it, with `comment` posted on it first, as it is:
-   * the caller marks and redacts it. One already closed stays as it is, with no comment; one
-   * already merged is a GhError.
-   */
-  closePullRequest(repo: string, number: number, comment: string): Promise<void>;
-  /**
-   * Fetch `branch` of the GitHub repo into the local clone at `path`, as the same account, and
-   * return the commit it points at. No ref of the clone moves; the commit's objects are in it.
-   * null: the GitHub repo has no such branch yet (e.g. a new, empty repo).
-   */
-  fetch(path: string, repo: string, branch: string): Promise<string | null>;
-}
-
+/** A failure of gh or of GitHub, or what gh printed that cannot be read. */
 export class GhError extends Error {}
 
 /** A comment as the GraphQL API returns it (see ISSUE_FRAGMENT). */
@@ -219,11 +61,11 @@ interface SearchPage {
 /** The most a GraphQL connection returns at once. */
 const MAX_PAGE = 100;
 
-function fromRawComment(c: RawComment): GhComment {
+function fromRawComment(c: RawComment): HostComment {
   return { body: c.body ?? '', ...authored(c.author?.login, c.authorAssociation) };
 }
 
-function fromRaw(i: RawIssue): GhIssue {
+function fromRaw(i: RawIssue): HostIssue {
   return {
     ...fromRawComment(i),
     number: i.number,
@@ -266,7 +108,7 @@ const RawPullRequest = z.object({
 });
 type RawPullRequest = z.infer<typeof RawPullRequest>;
 
-function fromRawPull(raw: RawPullRequest): GhPullRequest {
+function fromRawPull(raw: RawPullRequest): ChangeRequest {
   return {
     number: raw.number,
     url: raw.url,
@@ -286,7 +128,7 @@ function authored(login: string | null | undefined, association: string | null |
     author: login || null,
     // Unknown counts as unrelated to the repo: never trusted.
     authorAssociation: association || 'NONE',
-  } satisfies GhAuthored;
+  } satisfies HostAuthored;
 }
 
 /** What gh prints for a commit or an author that GitHub gave none of: null or empty fields. */
@@ -344,7 +186,7 @@ const RawRollupEntry = z.preprocess(
   RawCheck.nullable(),
 );
 
-/** The fields `getPullRequest` asks of `gh pr view --json` besides PR_FIELDS. */
+/** The fields `getChangeRequest` asks of `gh pr view --json` besides PR_FIELDS. */
 const PR_STATUS_FIELDS = 'headRefOid,reviewDecision,reviews,statusCheckRollup';
 
 /** A pull request as `gh pr view --json PR_FIELDS,PR_STATUS_FIELDS` prints it. */
@@ -368,7 +210,7 @@ const RawReviewComments = z.array(
   }),
 );
 
-function fromRawCheck(raw: RawCheck): GhCheck {
+function fromRawCheck(raw: RawCheck): HostCheck {
   if (raw.__typename === 'CheckRun') {
     const done = raw.status === 'COMPLETED';
     return {
@@ -391,9 +233,9 @@ const REVIEW_DECISIONS: readonly string[] = [
   'CHANGES_REQUESTED',
   'APPROVED',
   'REVIEW_REQUIRED',
-] satisfies GhReviewDecision[];
+] satisfies ReviewDecision[];
 
-function isReviewDecision(value: string | null | undefined): value is GhReviewDecision {
+function isReviewDecision(value: string | null | undefined): value is ReviewDecision {
   return typeof value === 'string' && REVIEW_DECISIONS.includes(value);
 }
 
@@ -446,7 +288,7 @@ const TOKEN_TTL_MS = 10 * 60_000;
  * With `account`, every call acts as that gh account (`gh auth token --user`), whichever
  * account is active in gh.
  */
-export class GhCli implements GitHub {
+export class GhCli implements CodeHost {
   private token: { value: string; at: number } | undefined;
 
   constructor(
@@ -521,7 +363,7 @@ export class GhCli implements GitHub {
     return res.data;
   }
 
-  private async issue(repo: string, number: number, withComments: boolean): Promise<GhIssue> {
+  private async issue(repo: string, number: number, withComments: boolean): Promise<HostIssue> {
     const data = await this.graphql<{ repository: { issue: RawIssue | null } | null }>(
       `query($owner: String!, $name: String!, $number: Int!, $withComments: Boolean!) {
         repository(owner: $owner, name: $name) { issue(number: $number) { ...issue } }
@@ -568,7 +410,7 @@ export class GhCli implements GitHub {
   async listIssues(
     repo: string,
     query: { state: 'open' | 'closed'; label?: string; limit: number; comments?: boolean },
-  ): Promise<GhIssue[]> {
+  ): Promise<HostIssue[]> {
     const data = await this.graphql<{ repository: { issues: { nodes: RawIssue[] } } | null }>(
       `query($owner: String!, $name: String!, $states: [IssueState!], $labels: [String!],
         $first: Int!, $withComments: Boolean!) {
@@ -589,12 +431,12 @@ export class GhCli implements GitHub {
     return (data.repository?.issues.nodes ?? []).map(fromRaw);
   }
 
-  async listNotPlannedIssues(repo: string, query: { limit: number }): Promise<GhIssue[]> {
+  async listNotPlannedIssues(repo: string, query: { limit: number }): Promise<HostIssue[]> {
     const { owner, name } = repoParts(repo);
     const limit = Math.max(query.limit, 0);
     // A search, so that only these issues come with their comments, not every closed one.
     const q = `repo:${owner}/${name} is:issue is:closed reason:"not planned" sort:created-desc`;
-    const found: GhIssue[] = [];
+    const found: HostIssue[] = [];
     let after: string | null = null;
     // The search returns only such issues, so the pages needed are known; one more covers the
     // few a stale search index may still list after they were reopened. Never page on and on.
@@ -651,7 +493,7 @@ export class GhCli implements GitHub {
     });
   }
 
-  async getIssue(repo: string, number: number): Promise<GhIssue> {
+  async getIssue(repo: string, number: number): Promise<HostIssue> {
     return this.issue(repo, number, false);
   }
 
@@ -673,7 +515,7 @@ export class GhCli implements GitHub {
     });
   }
 
-  async listComments(repo: string, number: number): Promise<GhComment[]> {
+  async listComments(repo: string, number: number): Promise<HostComment[]> {
     return (await this.issue(repo, number, true)).comments;
   }
 
@@ -682,7 +524,7 @@ export class GhCli implements GitHub {
     await this.gh(['issue', 'close', String(number), '-R', repo, '--reason', flag]);
   }
 
-  async findOpenPullRequest(repo: string, head: string): Promise<GhPullRequest | null> {
+  async findOpenChangeRequest(repo: string, head: string): Promise<ChangeRequest | null> {
     const out = await this.gh([
       'pr',
       'list',
@@ -703,7 +545,7 @@ export class GhCli implements GitHub {
     return own ? fromRawPull(own) : null;
   }
 
-  async createPullRequest(
+  async createChangeRequest(
     repo: string,
     pr: { head: string; base: string; title: string; body: string },
   ): Promise<{ number: number; url: string }> {
@@ -722,7 +564,7 @@ export class GhCli implements GitHub {
     return { number, url };
   }
 
-  async getPullRequest(repo: string, number: number): Promise<GhPullRequestStatus> {
+  async getChangeRequest(repo: string, number: number): Promise<ChangeRequestStatus> {
     const fields = `${PR_FIELDS},${PR_STATUS_FIELDS}`;
     const out = await this.gh(['pr', 'view', String(number), '-R', repo, '--json', fields]);
     const raw = parseOutput(out, RawPullRequestStatus, 'gh pr view');
@@ -744,7 +586,7 @@ export class GhCli implements GitHub {
     };
   }
 
-  async closePullRequest(repo: string, number: number, comment: string): Promise<void> {
+  async closeChangeRequest(repo: string, number: number, comment: string): Promise<void> {
     // gh posts the comment, then closes; it refuses a merged pull request, and leaves one
     // already closed as it is, without the comment.
     await this.gh(['pr', 'close', String(number), '-R', repo, '--comment', comment]);
@@ -754,7 +596,7 @@ export class GhCli implements GitHub {
    * The latest review comments (up to 100) of a pull request, oldest first. Through the REST
    * API: `gh pr view --json` has none of them.
    */
-  private async reviewComments(repo: string, number: number): Promise<GhReviewComment[]> {
+  private async reviewComments(repo: string, number: number): Promise<HostReviewComment[]> {
     const path = `repos/${repo}/pulls/${number}/comments`;
     const out = await this.gh(['api', `${path}?per_page=100&sort=created&direction=desc`]);
     return parseOutput(out, RawReviewComments, `gh api ${path}`)

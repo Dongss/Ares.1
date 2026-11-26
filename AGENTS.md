@@ -68,8 +68,11 @@ src/
     iterations.ts     iterations whatever the source: where their children stand, blocked or not,
                       turned down, a scout's change to the plan, cost and time, the summary once
                       done, the review suggestions the closing step goes through
+  host/               the code host, whatever the platform:
+    code-host.ts      the platform-neutral code host interface (CodeHost) and its types
+    factory.ts        the code host's client for the config, by platform
   github/
-    client.ts         GitHub through the gh CLI (FakeGitHub in tests)
+    client.ts         GitHub through the gh CLI, implementing CodeHost (FakeGitHub in tests)
     bridge.ts         polling, Runs from issues, progress on issues, auto-accept, push, auto-scout
     issues.ts         labels, issue texts, hidden comment markers, Run status ↔ issue (pure)
     pr-rework.ts      whether an open pull request needs rework (reviews, CI, conflict) and has the

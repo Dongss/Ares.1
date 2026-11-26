@@ -2,9 +2,14 @@
 // back to the coding agent. Pure logic: what GitHub reported on the pull request and what the Run
 // has already reworked go in, the judgement comes out.
 
+import type {
+  ChangeRequestStatus,
+  HostCheck,
+  HostReview,
+  HostReviewComment,
+} from '../host/code-host.js';
 import { join, t } from '../i18n.js';
 import { type EventRow, PR_REWORK_KINDS, type PrReworkKind } from '../store/types.js';
-import type { GhCheck, GhPullRequestStatus, GhReview, GhReviewComment } from './client.js';
 import { isTrusted, quote } from './issues.js';
 
 // Declared with the store's types, so that the dashboard reads the events by the same kinds.
@@ -30,7 +35,7 @@ export const FAILED_CHECK_CONCLUSIONS: readonly string[] = [
 ];
 
 /** Whether a check finished and failed. */
-export function checkFailed(check: GhCheck): boolean {
+export function checkFailed(check: HostCheck): boolean {
   return (
     check.done &&
     check.conclusion !== null &&
@@ -120,7 +125,7 @@ const MAX_REASON_CHECKS = 5;
  *
  * A kind already reworked on the same head (`ctx.done`) does not count again.
  */
-export function judgePullRequest(pr: GhPullRequestStatus, ctx: PrReworkContext): PrJudgement {
+export function judgePullRequest(pr: ChangeRequestStatus, ctx: PrReworkContext): PrJudgement {
   const head = pr.headRefOid;
   if (pr.state !== 'open' || ctx.head === null || head !== ctx.head) {
     return { rework: null, ignored: [] };
@@ -166,8 +171,8 @@ export function judgePullRequest(pr: GhPullRequestStatus, ctx: PrReworkContext):
 }
 
 /** Each reviewer's latest review that takes a stance, in the order of those reviews. */
-function latestStances(reviews: readonly GhReview[]): GhReview[] {
-  const latest = new Map<string, GhReview>();
+function latestStances(reviews: readonly HostReview[]): HostReview[] {
+  const latest = new Map<string, HostReview>();
   for (const review of reviews) {
     if (!STANCES.includes(review.state.toUpperCase())) continue;
     const key = review.author?.toLowerCase() ?? '';
@@ -192,11 +197,11 @@ function quoted(text: string, max: number, indent = ''): string {
 
 /** What the coding agent is told about the pull request, one part per kind. */
 function feedbackText(
-  pr: GhPullRequestStatus,
+  pr: ChangeRequestStatus,
   kinds: readonly PrReworkKind[],
-  checks: readonly GhCheck[],
-  reviews: readonly GhReview[],
-  comments: readonly GhReviewComment[],
+  checks: readonly HostCheck[],
+  reviews: readonly HostReview[],
+  comments: readonly HostReviewComment[],
 ): string {
   const base = `\`${pr.baseRefName}\``;
   const parts = [
@@ -240,7 +245,10 @@ function feedbackText(
 }
 
 /** The reviews that ask for changes, then their line comments by file and line. */
-function reviewText(reviews: readonly GhReview[], comments: readonly GhReviewComment[]): string {
+function reviewText(
+  reviews: readonly HostReview[],
+  comments: readonly HostReviewComment[],
+): string {
   const lines = [t({ zh: '评审要求修改：', en: 'Changes requested in review:' })];
   for (const review of reviews) {
     const name = who(review.author);
@@ -283,10 +291,10 @@ function reviewText(reviews: readonly GhReview[], comments: readonly GhReviewCom
 
 /** Why, in one line: the conflict, the failed checks by name, who asked for changes. */
 function reasonText(
-  pr: GhPullRequestStatus,
+  pr: ChangeRequestStatus,
   kinds: readonly PrReworkKind[],
-  checks: readonly GhCheck[],
-  reviews: readonly GhReview[],
+  checks: readonly HostCheck[],
+  reviews: readonly HostReview[],
 ): string {
   return reworkReason({
     kinds,

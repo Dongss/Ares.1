@@ -1,10 +1,4 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import type {
-  GhCheck,
-  GhPullRequestStatus,
-  GhReview,
-  GhReviewComment,
-} from '../src/github/client.js';
 import {
   checkFailed,
   FAILED_CHECK_CONCLUSIONS,
@@ -14,6 +8,12 @@ import {
   reworkReason,
   reworksDone,
 } from '../src/github/pr-rework.js';
+import type {
+  ChangeRequestStatus,
+  HostCheck,
+  HostReview,
+  HostReviewComment,
+} from '../src/host/code-host.js';
 import { setLang } from '../src/i18n.js';
 
 afterEach(() => setLang('zh'));
@@ -23,7 +23,7 @@ const HEAD = 'c0ffee0000000000000000000000000000000001';
 const OLD = 'c0ffee0000000000000000000000000000000000';
 const URL = 'https://github.com/acme/widgets/pull/9';
 
-function pull(over: Partial<GhPullRequestStatus> = {}): GhPullRequestStatus {
+function pull(over: Partial<ChangeRequestStatus> = {}): ChangeRequestStatus {
   return {
     number: 9,
     url: URL,
@@ -41,7 +41,7 @@ function pull(over: Partial<GhPullRequestStatus> = {}): GhPullRequestStatus {
   };
 }
 
-function review(over: Partial<GhReview> = {}): GhReview {
+function review(over: Partial<HostReview> = {}): HostReview {
   return {
     author: 'alice',
     authorAssociation: 'MEMBER',
@@ -53,7 +53,7 @@ function review(over: Partial<GhReview> = {}): GhReview {
   };
 }
 
-function lineComment(over: Partial<GhReviewComment> = {}): GhReviewComment {
+function lineComment(over: Partial<HostReviewComment> = {}): HostReviewComment {
   return {
     author: 'alice',
     authorAssociation: 'MEMBER',
@@ -65,7 +65,7 @@ function lineComment(over: Partial<GhReviewComment> = {}): GhReviewComment {
   };
 }
 
-function check(over: Partial<GhCheck> = {}): GhCheck {
+function check(over: Partial<HostCheck> = {}): HostCheck {
   return {
     name: 'build',
     done: true,

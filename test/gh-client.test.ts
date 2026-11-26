@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { GhCli, GhError } from '../src/github/client.js';
 import { isTrusted } from '../src/github/issues.js';
 import { judgePullRequest } from '../src/github/pr-rework.js';
+import { type CodeHostConfig, CodeHostFactory } from '../src/host/factory.js';
 import { setLang } from '../src/i18n.js';
 import { FakeGitHub, git, initRepo, tmpDir, writeFile } from './helpers.js';
 
@@ -691,7 +692,7 @@ function comments9(comments: unknown[]): Reply {
 }
 
 describe('GhCli pull requests', () => {
-  it('createPullRequest passes head, base and title as arguments and the body through stdin', async () => {
+  it('createChangeRequest passes head, base and title as arguments and the body through stdin', async () => {
     const body = '改动摘要\n\nCloses #7\n';
     const gh = fakeGh([
       {
@@ -699,7 +700,7 @@ describe('GhCli pull requests', () => {
         stdout: `\nCreating pull request for ares1/run-1 into main in acme/widgets\n\n${PULL_9}\n`,
       },
     ]);
-    const created = await new GhCli(gh.bin).createPullRequest('acme/widgets', {
+    const created = await new GhCli(gh.bin).createChangeRequest('acme/widgets', {
       head: 'ares1/run-1',
       base: 'main',
       title: 'A title',
@@ -727,7 +728,7 @@ describe('GhCli pull requests', () => {
     ]);
   });
 
-  it('createPullRequest fails when gh prints no pull request link', async () => {
+  it('createChangeRequest fails when gh prints no pull request link', async () => {
     const gh = fakeGh([
       { when: ['pr', 'create'], stdout: 'https://github.com/acme/widgets/issues/9\n' },
       {
@@ -738,15 +739,15 @@ describe('GhCli pull requests', () => {
     ]);
     const cli = new GhCli(gh.bin);
     const pr = { head: 'ares1/run-1', base: 'main', title: 't', body: 'b' };
-    expect((await ghError(cli.createPullRequest('acme/widgets', pr))).message).toBe(
+    expect((await ghError(cli.createChangeRequest('acme/widgets', pr))).message).toBe(
       'gh pr create 没有返回 PR 链接：https://github.com/acme/widgets/issues/9',
     );
-    expect((await ghError(cli.createPullRequest('acme/widgets', pr))).message).toBe(
+    expect((await ghError(cli.createChangeRequest('acme/widgets', pr))).message).toBe(
       'gh pr create 失败：a pull request for branch "ares1/run-1" into branch "main" already exists',
     );
   });
 
-  it("findOpenPullRequest finds the head branch's open pull request of the repo itself", async () => {
+  it("findOpenChangeRequest finds the head branch's open pull request of the repo itself", async () => {
     const gh = fakeGh([
       { when: ['pr', 'list'], stdout: '[]\n' },
       {
@@ -760,8 +761,8 @@ describe('GhCli pull requests', () => {
       { when: ['pr', 'list'], stdout: JSON.stringify([rawPull({ isCrossRepository: true })]) },
     ]);
     const cli = new GhCli(gh.bin);
-    expect(await cli.findOpenPullRequest('acme/widgets', 'ares1/run-1')).toBeNull();
-    expect(await cli.findOpenPullRequest('acme/widgets', 'ares1/run-1')).toEqual({
+    expect(await cli.findOpenChangeRequest('acme/widgets', 'ares1/run-1')).toBeNull();
+    expect(await cli.findOpenChangeRequest('acme/widgets', 'ares1/run-1')).toEqual({
       number: 9,
       url: PULL_9,
       state: 'open',
@@ -770,7 +771,7 @@ describe('GhCli pull requests', () => {
       headRefName: 'ares1/run-1',
       baseRefName: 'main',
     });
-    expect(await cli.findOpenPullRequest('acme/widgets', 'ares1/run-1')).toBeNull();
+    expect(await cli.findOpenChangeRequest('acme/widgets', 'ares1/run-1')).toBeNull();
     const args = [
       'pr',
       'list',
@@ -788,7 +789,7 @@ describe('GhCli pull requests', () => {
     expect(gh.calls().map((c) => c.args)).toEqual([args, args, args]);
   });
 
-  it('getPullRequest reads open, merged and closed pull requests', async () => {
+  it('getChangeRequest reads open, merged and closed pull requests', async () => {
     const merge = 'a'.repeat(40);
     const gh = fakeGh([
       {
@@ -818,18 +819,18 @@ describe('GhCli pull requests', () => {
       reviewComments: [],
       checks: [],
     };
-    expect(await cli.getPullRequest('acme/widgets', 9)).toEqual({
+    expect(await cli.getChangeRequest('acme/widgets', 9)).toEqual({
       ...pull,
       state: 'open',
       mergeable: null,
     });
-    expect(await cli.getPullRequest('acme/widgets', 9)).toEqual({
+    expect(await cli.getChangeRequest('acme/widgets', 9)).toEqual({
       ...pull,
       state: 'merged',
       mergeable: true,
       mergeCommit: merge,
     });
-    expect(await cli.getPullRequest('acme/widgets', 9)).toEqual({
+    expect(await cli.getChangeRequest('acme/widgets', 9)).toEqual({
       ...pull,
       state: 'closed',
       mergeable: true,
@@ -839,7 +840,7 @@ describe('GhCli pull requests', () => {
     expect(gh.calls().map((c) => c.args)).toEqual([view, ['api', COMMENTS_9], view, view]);
   });
 
-  it('getPullRequest reads check runs and commit statuses alike', async () => {
+  it('getChangeRequest reads check runs and commit statuses alike', async () => {
     const run = (name: string, status: string, conclusion: string, detailsUrl = '') => ({
       __typename: 'CheckRun',
       name,
@@ -880,7 +881,7 @@ describe('GhCli pull requests', () => {
         ),
       },
     ]);
-    const pr = await new GhCli(gh.bin).getPullRequest('acme/widgets', 9);
+    const pr = await new GhCli(gh.bin).getChangeRequest('acme/widgets', 9);
     expect(pr.checks).toEqual([
       { name: 'build', done: true, conclusion: 'FAILURE', url: 'https://ci/build' },
       { name: 'lint', done: true, conclusion: 'SUCCESS', url: null },
@@ -895,7 +896,7 @@ describe('GhCli pull requests', () => {
     ]);
   });
 
-  it('getPullRequest skips checks of kinds it does not know, and reads the rest', async () => {
+  it('getChangeRequest skips checks of kinds it does not know, and reads the rest', async () => {
     const merge = 'a'.repeat(40);
     const failed = {
       __typename: 'CheckRun',
@@ -933,17 +934,17 @@ describe('GhCli pull requests', () => {
     const build = { name: 'build', done: true, conclusion: 'FAILURE', url: 'https://ci/build' };
 
     // Merged is told as merged, whatever else came with the checks.
-    const merged = await cli.getPullRequest('acme/widgets', 9);
+    const merged = await cli.getChangeRequest('acme/widgets', 9);
     expect(merged).toMatchObject({ state: 'merged', mergeCommit: merge, checks: [build] });
 
     // Open, the failed check sends the Run back: the unknown ones keep nothing waiting.
-    const open = await cli.getPullRequest('acme/widgets', 9);
+    const open = await cli.getChangeRequest('acme/widgets', 9);
     expect(open).toMatchObject({ state: 'open', checks: [build] });
     const { rework } = judgePullRequest(open, { head: HEAD, master: 'me', done: [] });
     expect(rework).toMatchObject({ kinds: ['ci'], checks: [{ name: 'build' }] });
   });
 
-  it('closePullRequest closes it with the comment as gh takes it', async () => {
+  it('closeChangeRequest closes it with the comment as gh takes it', async () => {
     const gh = fakeGh([
       { when: ['pr', 'close'] },
       {
@@ -954,16 +955,16 @@ describe('GhCli pull requests', () => {
     ]);
     const cli = new GhCli(gh.bin);
     const comment = 'Run `run-1` 失败了。\n\n看板：http://127.0.0.1:4870/#/runs/run-1';
-    await cli.closePullRequest('acme/widgets', 9, comment);
+    await cli.closeChangeRequest('acme/widgets', 9, comment);
     expect(gh.calls().map((c) => c.args)).toEqual([
       ['pr', 'close', '9', '-R', 'acme/widgets', '--comment', comment],
     ]);
-    expect((await ghError(cli.closePullRequest('acme/widgets', 9, comment))).message).toBe(
+    expect((await ghError(cli.closeChangeRequest('acme/widgets', 9, comment))).message).toBe(
       "gh pr close 失败：X Pull request acme/widgets#9 (t) can't be closed because it was already merged",
     );
   });
 
-  it('getPullRequest reads the reviews and, oldest first, the review comments', async () => {
+  it('getChangeRequest reads the reviews and, oldest first, the review comments', async () => {
     const gh = fakeGh([
       {
         when: ['pr', 'view', '9'],
@@ -1042,7 +1043,7 @@ describe('GhCli pull requests', () => {
       comments9([]),
     ]);
     const cli = new GhCli(gh.bin);
-    const pr = await cli.getPullRequest('acme/widgets', 9);
+    const pr = await cli.getChangeRequest('acme/widgets', 9);
     expect(pr.reviewDecision).toBe('CHANGES_REQUESTED');
     expect(pr.reviews).toEqual([
       {
@@ -1110,7 +1111,7 @@ describe('GhCli pull requests', () => {
     expect(pr.reviewComments.map((c) => isTrusted(c, 'ares1-bot'))).toEqual([true, false, false]);
 
     // A decision GitHub may add later is none the Master knows.
-    expect((await cli.getPullRequest('acme/widgets', 9)).reviewDecision).toBeNull();
+    expect((await cli.getChangeRequest('acme/widgets', 9)).reviewDecision).toBeNull();
   });
 
   it('throws a GhError for what gh prints that it cannot read', async () => {
@@ -1120,7 +1121,7 @@ describe('GhCli pull requests', () => {
         when: ['pr', 'view'],
         stdout: JSON.stringify(rawPullStatus({ state: 'DRAFT', number: '9' })),
       },
-      // The fields getPullRequest asks for besides those of findOpenPullRequest are missing.
+      // The fields getChangeRequest asks for besides those of findOpenChangeRequest are missing.
       { when: ['pr', 'view'], stdout: JSON.stringify(rawPull()) },
       {
         when: ['pr', 'view'],
@@ -1142,26 +1143,26 @@ describe('GhCli pull requests', () => {
       { when: ['pr', 'list'], stdout: JSON.stringify(rawPull()) },
     ]);
     const cli = new GhCli(gh.bin);
-    expect((await ghError(cli.getPullRequest('acme/widgets', 9))).message).toBe(
+    expect((await ghError(cli.getChangeRequest('acme/widgets', 9))).message).toBe(
       'gh pr view 返回的不是 JSON：<html>proxy</html>',
     );
-    expect((await ghError(cli.getPullRequest('acme/widgets', 9))).message).toMatch(
+    expect((await ghError(cli.getChangeRequest('acme/widgets', 9))).message).toMatch(
       /^gh pr view 返回的数据无法识别（number, state）：/,
     );
-    expect((await ghError(cli.getPullRequest('acme/widgets', 9))).message).toMatch(
+    expect((await ghError(cli.getChangeRequest('acme/widgets', 9))).message).toMatch(
       /^gh pr view 返回的数据无法识别（headRefOid）：/,
     );
-    expect((await ghError(cli.getPullRequest('acme/widgets', 9))).message).toMatch(
+    expect((await ghError(cli.getChangeRequest('acme/widgets', 9))).message).toMatch(
       /^gh pr view 返回的数据无法识别（reviews\.0\.state, statusCheckRollup\.1\.name）：/,
     );
-    expect((await ghError(cli.getPullRequest('acme/widgets', 9))).message).toMatch(
+    expect((await ghError(cli.getChangeRequest('acme/widgets', 9))).message).toMatch(
       /^gh api repos\/acme\/widgets\/pulls\/9\/comments 返回的数据无法识别（\$）：/,
     );
-    expect((await ghError(cli.getPullRequest('acme/widgets', 9))).message).toMatch(
+    expect((await ghError(cli.getChangeRequest('acme/widgets', 9))).message).toMatch(
       /^gh api repos\/acme\/widgets\/pulls\/9\/comments 返回的数据无法识别（0\.path, 0\.line）：/,
     );
     // A list is expected, not one pull request.
-    expect((await ghError(cli.findOpenPullRequest('acme/widgets', 'b'))).message).toMatch(
+    expect((await ghError(cli.findOpenChangeRequest('acme/widgets', 'b'))).message).toMatch(
       /^gh pr list 返回的数据无法识别（\$）：/,
     );
   });
@@ -1217,6 +1218,51 @@ describe('GhCli with an account', () => {
       'gh auth token 失败：no oauth token found for github.com account ares1-bot',
     );
     expect(gh.calls().map((c) => c.args)).toEqual([['auth', 'token', '--user', 'ares1-bot']]);
+  });
+});
+
+describe('CodeHostFactory', () => {
+  /** The settings of the Master's config a client is made with. */
+  const settings = (bin: string, account?: string): CodeHostConfig => ({
+    bins: { gh: bin },
+    github: { ...(account ? { account } : {}), poll_minutes: 5, repos: {} },
+  });
+
+  it('makes gh with the configured binary, acting as the configured account', async () => {
+    const gh = fakeGh([
+      { when: ['auth', 'token', '--user', 'ares1-bot'], stdout: 'tok-1\n' },
+      { when: ['api', 'user'], stdout: 'ares1-bot\n' },
+    ]);
+    const host = new CodeHostFactory().get(settings(gh.bin, 'ares1-bot'));
+
+    expect(host).toBeInstanceOf(GhCli);
+    expect(await host.viewer()).toBe('ares1-bot');
+    expect(gh.calls().map((c) => [c.args.slice(0, 2).join(' '), c.token])).toEqual([
+      ['auth token', null],
+      ['api user', 'tok-1'],
+    ]);
+  });
+
+  it('gives the same client while its settings stay, and a new one once they change', () => {
+    const hosts = new CodeHostFactory();
+    const first = hosts.get(settings('gh'));
+
+    expect(hosts.get(settings('gh'))).toBe(first);
+    // Settings the client is not made with leave it as it is; gh is the default binary.
+    expect(
+      hosts.get({ bins: { 'claude-code': '/opt/claude' }, github: { poll_minutes: 1, repos: {} } }),
+    ).toBe(first);
+    expect(hosts.get({ bins: {} })).toBe(first);
+
+    const otherBin = hosts.get(settings('/opt/gh'));
+    expect(otherBin).toBeInstanceOf(GhCli);
+    expect(otherBin).not.toBe(first);
+    expect(hosts.get(settings('/opt/gh'))).toBe(otherBin);
+
+    const otherAccount = hosts.get(settings('/opt/gh', 'ares1-bot'));
+    expect(otherAccount).toBeInstanceOf(GhCli);
+    expect(otherAccount).not.toBe(otherBin);
+    expect(hosts.get(settings('/opt/gh', 'ares1-bot'))).toBe(otherAccount);
   });
 });
 
@@ -1501,9 +1547,9 @@ describe('GhCli in English', () => {
         .message,
       (await ghError(bot.push(tmpDir(), 'acme/widgets', 'b1'))).message,
       (await ghError(bot.fetch(tmpDir(), 'acme/widgets', 'b1'))).message,
-      (await ghError(cli.createPullRequest('acme/widgets', pr))).message,
-      (await ghError(cli.getPullRequest('acme/widgets', 9))).message,
-      (await ghError(cli.findOpenPullRequest('acme/widgets', 'ares1/run-1'))).message,
+      (await ghError(cli.createChangeRequest('acme/widgets', pr))).message,
+      (await ghError(cli.getChangeRequest('acme/widgets', 9))).message,
+      (await ghError(cli.findOpenChangeRequest('acme/widgets', 'ares1/run-1'))).message,
       (await ghError(cli.push(tmpDir(), 'acme/widgets', 'main', { force: true }))).message,
     ];
     expect(messages).toEqual([
@@ -1573,17 +1619,17 @@ describe('FakeGitHub pull requests', () => {
 
     // Only from a branch GitHub has, and one open pull request per branch.
     await expect(
-      gh.createPullRequest('me/demo', pr('ares1/run-1', `Closes #${issue.number}`)),
+      gh.createChangeRequest('me/demo', pr('ares1/run-1', `Closes #${issue.number}`)),
     ).rejects.toThrow(/no branch ares1\/run-1/);
     const head = commit(clone, 'ares1/run-1', 'a.txt');
     await gh.push(clone, 'me/demo', 'ares1/run-1');
-    expect(await gh.findOpenPullRequest('me/demo', 'ares1/run-1')).toBeNull();
-    const created = await gh.createPullRequest(
+    expect(await gh.findOpenChangeRequest('me/demo', 'ares1/run-1')).toBeNull();
+    const created = await gh.createChangeRequest(
       'me/demo',
       pr('ares1/run-1', `摘要\n\nCloses #${issue.number}\n`),
     );
     expect(created).toEqual({ number: 3, url: 'https://github.com/me/demo/pull/3' });
-    await expect(gh.createPullRequest('me/demo', pr('ares1/run-1', 'again'))).rejects.toThrow(
+    await expect(gh.createChangeRequest('me/demo', pr('ares1/run-1', 'again'))).rejects.toThrow(
       /already exists/,
     );
     const open = {
@@ -1595,8 +1641,8 @@ describe('FakeGitHub pull requests', () => {
       headRefName: 'ares1/run-1',
       baseRefName: 'main',
     };
-    expect(await gh.findOpenPullRequest('me/demo', 'ares1/run-1')).toEqual(open);
-    expect(await gh.getPullRequest('me/demo', 3)).toEqual({
+    expect(await gh.findOpenChangeRequest('me/demo', 'ares1/run-1')).toEqual(open);
+    expect(await gh.getChangeRequest('me/demo', 3)).toEqual({
       ...open,
       headRefOid: head,
       reviewDecision: null,
@@ -1609,11 +1655,11 @@ describe('FakeGitHub pull requests', () => {
 
     // Merged by a human: GitHub's main moves and the issue the body closes is completed.
     gh.mergePull(3, head);
-    expect(await gh.getPullRequest('me/demo', 3)).toMatchObject({
+    expect(await gh.getChangeRequest('me/demo', 3)).toMatchObject({
       state: 'merged',
       mergeCommit: head,
     });
-    expect(await gh.findOpenPullRequest('me/demo', 'ares1/run-1')).toBeNull();
+    expect(await gh.findOpenChangeRequest('me/demo', 'ares1/run-1')).toBeNull();
     expect(await gh.fetch(clone, 'me/demo', 'main')).toBe(head);
     expect(gh.get(issue.number)).toMatchObject({ state: 'closed', stateReason: 'completed' });
     expect(gh.get(other.number).state).toBe('open');
@@ -1621,18 +1667,18 @@ describe('FakeGitHub pull requests', () => {
     // Closed without merging: the issue it names stays open.
     commit(clone, 'ares1/run-2', 'b.txt');
     await gh.push(clone, 'me/demo', 'ares1/run-2');
-    const closed = await gh.createPullRequest(
+    const closed = await gh.createChangeRequest(
       'me/demo',
       pr('ares1/run-2', `Closes #${other.number}`),
     );
     gh.closePull(closed.number);
-    expect(await gh.getPullRequest('me/demo', closed.number)).toMatchObject({
+    expect(await gh.getChangeRequest('me/demo', closed.number)).toMatchObject({
       state: 'closed',
       mergeCommit: null,
     });
     expect(gh.get(other.number).state).toBe('open');
     // A new pull request from the same branch may be opened again.
-    await gh.createPullRequest('me/demo', pr('ares1/run-2', 'again'));
+    await gh.createChangeRequest('me/demo', pr('ares1/run-2', 'again'));
 
     expect(gh.calls.filter((c) => !c.startsWith('push') && !c.startsWith('fetch'))).toEqual([
       'createPull ares1/run-1',
@@ -1654,30 +1700,30 @@ describe('FakeGitHub pull requests', () => {
     const gh = new FakeGitHub();
     commit(clone, 'ares1/run-1', 'a.txt');
     await gh.push(clone, 'me/demo', 'ares1/run-1');
-    const open = await gh.createPullRequest('me/demo', {
+    const open = await gh.createChangeRequest('me/demo', {
       head: 'ares1/run-1',
       base: 'main',
       title: 't',
       body: '',
     });
-    await gh.closePullRequest('me/demo', open.number, 'why');
+    await gh.closeChangeRequest('me/demo', open.number, 'why');
     expect(gh.pull(open.number)).toMatchObject({ state: 'closed', comments: ['why'] });
-    expect(await gh.findOpenPullRequest('me/demo', 'ares1/run-1')).toBeNull();
+    expect(await gh.findOpenChangeRequest('me/demo', 'ares1/run-1')).toBeNull();
     // Closed already: nothing more, no comment.
-    await gh.closePullRequest('me/demo', open.number, 'again');
+    await gh.closeChangeRequest('me/demo', open.number, 'again');
     expect(gh.pull(open.number).comments).toEqual(['why']);
 
     // Merged: refused.
     const head = commit(clone, 'ares1/run-2', 'b.txt');
     await gh.push(clone, 'me/demo', 'ares1/run-2');
-    const merged = await gh.createPullRequest('me/demo', {
+    const merged = await gh.createChangeRequest('me/demo', {
       head: 'ares1/run-2',
       base: 'main',
       title: 't',
       body: '',
     });
     gh.mergePull(merged.number, head);
-    await expect(gh.closePullRequest('me/demo', merged.number, 'why')).rejects.toThrow(
+    await expect(gh.closeChangeRequest('me/demo', merged.number, 'why')).rejects.toThrow(
       /already merged/,
     );
     expect(gh.pull(merged.number)).toMatchObject({ state: 'merged', comments: [] });
@@ -1693,7 +1739,7 @@ describe('FakeGitHub pull requests', () => {
     const gh = new FakeGitHub();
     const first = commit(clone, 'ares1/run-1', 'a.txt');
     await gh.push(clone, 'me/demo', 'ares1/run-1');
-    const { number } = await gh.createPullRequest('me/demo', {
+    const { number } = await gh.createChangeRequest('me/demo', {
       head: 'ares1/run-1',
       base: 'main',
       title: 't',
@@ -1725,7 +1771,7 @@ describe('FakeGitHub pull requests', () => {
     const failed = { name: 'build', done: true, conclusion: 'FAILURE', url: 'https://ci/1' };
     gh.setChecks(number, [failed, { name: 'lint', done: false, conclusion: null, url: null }]);
 
-    const pr = await gh.getPullRequest('me/demo', number);
+    const pr = await gh.getChangeRequest('me/demo', number);
     expect(pr).toMatchObject({ headRefOid: first, reviewDecision: 'CHANGES_REQUESTED' });
     expect(pr.reviews).toEqual([
       {
@@ -1761,7 +1807,7 @@ describe('FakeGitHub pull requests', () => {
     if (pr.reviews[0]) pr.reviews[0].state = 'APPROVED';
     pr.checks.length = 0;
     pr.reviewComments.length = 0;
-    const again = await gh.getPullRequest('me/demo', number);
+    const again = await gh.getChangeRequest('me/demo', number);
     expect(again.reviews.map((r) => r.state)).toEqual(['CHANGES_REQUESTED', 'COMMENTED']);
     expect(again.checks).toHaveLength(2);
     expect(again.reviewComments).toHaveLength(1);
@@ -1771,7 +1817,7 @@ describe('FakeGitHub pull requests', () => {
 
     // A human dismisses the review.
     gh.setReviewDecision(number, null);
-    expect((await gh.getPullRequest('me/demo', number)).reviewDecision).toBeNull();
+    expect((await gh.getChangeRequest('me/demo', number)).reviewDecision).toBeNull();
 
     // A push of the branch moves the pull request's head; the checks were the old head's, and
     // whether it merges is not known yet. The reviews and comments stay on the commits they were
@@ -1779,7 +1825,7 @@ describe('FakeGitHub pull requests', () => {
     gh.pull(number).mergeable = false;
     const second = commit(clone, 'ares1/run-1', 'b.txt');
     await gh.push(clone, 'me/demo', 'ares1/run-1');
-    const pushed = await gh.getPullRequest('me/demo', number);
+    const pushed = await gh.getChangeRequest('me/demo', number);
     expect(pushed).toMatchObject({ headRefOid: second, checks: [], mergeable: null });
     expect(pushed.reviews.map((r) => r.commit)).toEqual([first, null]);
     expect(pushed.reviewComments.map((c) => c.commit)).toEqual([first]);
@@ -1790,7 +1836,7 @@ describe('FakeGitHub pull requests', () => {
       body: '',
       reviewDecision: 'APPROVED',
     });
-    expect((await gh.getPullRequest('me/demo', number)).reviews[2]).toEqual({
+    expect((await gh.getChangeRequest('me/demo', number)).reviews[2]).toEqual({
       author: 'bob',
       authorAssociation: 'MEMBER',
       state: 'PENDING',
@@ -1809,7 +1855,7 @@ describe('FakeGitHub pull requests', () => {
     // Once closed, the review comments are no longer read, as GhCli does; nor does a push move
     // its head any more.
     gh.closePull(number);
-    const closed = await gh.getPullRequest('me/demo', number);
+    const closed = await gh.getChangeRequest('me/demo', number);
     expect(closed.reviewComments).toEqual([]);
     expect(closed.reviews).toHaveLength(3);
     git(clone, 'checkout', '-q', 'ares1/run-1');
@@ -1821,11 +1867,16 @@ describe('FakeGitHub pull requests', () => {
   it('fails the calls a test asks it to', async () => {
     const gh = new FakeGitHub();
     gh.failing.set('getPull #1', 'boom');
-    await expect(gh.getPullRequest('me/demo', 1)).rejects.toThrow('boom');
+    await expect(gh.getChangeRequest('me/demo', 1)).rejects.toThrow('boom');
     gh.failWith = 'down';
-    await expect(gh.findOpenPullRequest('me/demo', 'ares1/run-1')).rejects.toThrow('down');
+    await expect(gh.findOpenChangeRequest('me/demo', 'ares1/run-1')).rejects.toThrow('down');
     await expect(
-      gh.createPullRequest('me/demo', { head: 'ares1/run-1', base: 'main', title: 't', body: 'b' }),
+      gh.createChangeRequest('me/demo', {
+        head: 'ares1/run-1',
+        base: 'main',
+        title: 't',
+        body: 'b',
+      }),
     ).rejects.toThrow('down');
     expect(gh.calls).toEqual(['getPull #1', 'findPull ares1/run-1', 'createPull ares1/run-1']);
   });

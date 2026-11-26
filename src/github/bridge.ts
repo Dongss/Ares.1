@@ -45,6 +45,8 @@ import {
 import type { GitHubRepoConfig, WorkflowTemplate } from '../config/schema.js';
 import { type Engine, InvalidStateError } from '../engine/engine.js';
 import { storedRunTimes } from '../engine/times.js';
+import type { ChangeRequest, ChangeRequestStatus, CodeHost, HostIssue } from '../host/code-host.js';
+import { CodeHostFactory } from '../host/factory.js';
 import { join as joinList, t } from '../i18n.js';
 import { NotFoundError, type Store } from '../store/store.js';
 import {
@@ -80,13 +82,6 @@ import {
   revParse,
   git as runGit,
 } from '../workspace/git.js';
-import {
-  GhCli,
-  type GhIssue,
-  type GhPullRequest,
-  type GhPullRequestStatus,
-  type GitHub,
-} from './client.js';
 import {
   type AddedStep,
   autoAcceptedComment,
@@ -345,7 +340,7 @@ function failedCheck(
 /** A Run waiting for its pull request (deliver: pr), and the pull request, merged on GitHub. */
 interface MergedPullRequest {
   run: Run;
-  pr: GhPullRequest;
+  pr: ChangeRequest;
 }
 
 /** The pull request a Run's work was merged through, as recorded (`github.pr_merged`). */
@@ -452,8 +447,8 @@ export interface BridgeDeps {
    * Runs the scouts, whose proposals the bridge files as issues; the Master starts and stops it.
    */
   scouting: Scouting;
-  /** Tests pass a fake; otherwise gh, as the configured account. */
-  github?: GitHub;
+  /** Tests pass a fake; otherwise the code host's client from the config: gh, as its account. */
+  github?: CodeHost;
   /**
    * Whether the node the Master runs on is gone: the checks of a merge of GitHub's commits then
    * wait, as they would fail for the environment, not for the code.
@@ -501,9 +496,9 @@ export class IssueBridge {
   /** Syncs when the earliest wait before redoing a failed Run ends. */
   private redoTimer: ReturnType<typeof setTimeout> | undefined;
   private chain: Promise<void> = Promise.resolve();
-  private client: { key: string; gh: GitHub } | undefined;
+  private readonly hosts = new CodeHostFactory();
   /** gh's active account, for the client it was asked with. */
-  private viewer: { gh: GitHub; login: string } | undefined;
+  private viewer: { gh: CodeHost; login: string } | undefined;
   private readonly labelsReady = new Set<string>();
   private readonly resolved = new Map<string, string>();
   /** Why no automatic scout started at the last poll, per repo name. */
@@ -561,13 +556,8 @@ export class IssueBridge {
     return this.cfg.master.github?.poll_minutes ?? 5;
   }
 
-  private gh(): GitHub {
-    if (this.deps.github) return this.deps.github;
-    const bin = this.cfg.master.bins.gh ?? 'gh';
-    const account = this.cfg.master.github?.account;
-    const key = `${bin}|${account ?? ''}`;
-    if (this.client?.key !== key) this.client = { key, gh: new GhCli(bin, account) };
-    return this.client.gh;
+  private gh(): CodeHost {
+    return this.deps.github ?? this.hosts.get(this.cfg.master);
   }
 
   /**
@@ -956,7 +946,7 @@ export class IssueBridge {
    * accepted once it is written out, at a later round; one the Master did not plan, or that is
    * over, is left as it is. Returns whether its steps were accepted now.
    */
-  private async takeIteration(repo: Repo, full: string, issue: GhIssue): Promise<boolean> {
+  private async takeIteration(repo: Repo, full: string, issue: HostIssue): Promise<boolean> {
     const iteration = this.iterationOfIssue(repo, full, issue.number);
     if (!iteration || iteration.status === 'done' || iteration.status === 'cancelled') {
       return false;
@@ -978,8 +968,8 @@ export class IssueBridge {
    */
   private async dependenciesMet(
     full: string,
-    issue: GhIssue,
-    ready: readonly GhIssue[],
+    issue: HostIssue,
+    ready: readonly HostIssue[],
     known: Map<number, boolean>,
   ): Promise<boolean> {
     for (const number of parseDependsOn(issue.body)) {
@@ -1009,8 +999,8 @@ export class IssueBridge {
   private async withIterationSuggestions(
     repo: Repo,
     full: string,
-    issue: GhIssue,
-  ): Promise<GhIssue> {
+    issue: HostIssue,
+  ): Promise<HostIssue> {
     if (hasReviewSuggestions(issue.body)) return issue;
     const store = this.deps.store;
     if (store.latestRunForIssue(full, issue.number)) return issue;
@@ -1183,7 +1173,7 @@ export class IssueBridge {
     const gh = this.gh();
     const store = this.deps.store;
     const ref = { number: pr.number, url: pr.url };
-    const latest = await gh.getPullRequest(full, pr.number);
+    const latest = await gh.getChangeRequest(full, pr.number);
     if (latest.state !== 'open') {
       store.event(run.id, 'github.pr_found_closed', { ...ref, state: latest.state });
       return;
@@ -1195,7 +1185,7 @@ export class IssueBridge {
       issue: run.issue !== null,
       dashboardUrl: this.dashboardUrl(),
     });
-    await gh.closePullRequest(full, pr.number, markComment(redactForGitHub(comment)));
+    await gh.closeChangeRequest(full, pr.number, markComment(redactForGitHub(comment)));
     store.event(run.id, 'github.pr_closed_by_master', { ...ref, reason });
   }
 
@@ -1260,13 +1250,13 @@ export class IssueBridge {
     const gh = this.gh();
     const target = repo.targetBranch;
     await gh.push(repo.path, full, branch, { force: true });
-    const open = await gh.findOpenPullRequest(full, branch);
+    const open = await gh.findOpenChangeRequest(full, branch);
     let pr: { number: number; url: string };
     // One a human opened from it into another branch is not how the Run delivers.
     if (open && open.baseRefName === target) pr = open;
     else {
       const text = pullRequestText(run, { repo: full, dashboardUrl: this.dashboardUrl() });
-      pr = await gh.createPullRequest(full, {
+      pr = await gh.createChangeRequest(full, {
         head: branch,
         base: target,
         title: redactForGitHub(text.title),
@@ -1307,7 +1297,7 @@ export class IssueBridge {
     branch: string,
   ): Promise<void> {
     const gh = this.gh();
-    const latest = await gh.getPullRequest(full, pr.number);
+    const latest = await gh.getChangeRequest(full, pr.number);
     if (latest.state !== 'open') return;
     await gh.push(repo.path, full, branch, { force: true });
     if (this.deps.engine.recordPullRequest(run, pr) !== 'updated') return;
@@ -1359,7 +1349,7 @@ export class IssueBridge {
       const number = run.pr?.number;
       if (number === undefined) continue;
       try {
-        const pr = await this.gh().getPullRequest(full, number);
+        const pr = await this.gh().getChangeRequest(full, number);
         if (pr.state === 'merged') merged.push({ run, pr });
         else if (pr.state === 'closed') {
           this.deps.engine.pullRequestClosed(run, { number: pr.number, url: pr.url });
@@ -1393,7 +1383,7 @@ export class IssueBridge {
    * not trust trigger nothing and reach no prompt: only who wrote them is recorded
    * (`recordIgnoredReviews`). The comment comes last, as in `openPullRequest`.
    */
-  private async reworkPullRequest(run: Run, pr: GhPullRequestStatus): Promise<void> {
+  private async reworkPullRequest(run: Run, pr: ChangeRequestStatus): Promise<void> {
     const master = await this.masterLogin();
     // Read after the last await, so that what the engine did meanwhile counts.
     const events = this.deps.store.listEvents(run.id);
@@ -1429,7 +1419,7 @@ export class IssueBridge {
    */
   private recordIgnoredReviews(
     run: Run,
-    pr: GhPullRequestStatus,
+    pr: ChangeRequestStatus,
     ignored: readonly IgnoredReview[],
   ): void {
     if (ignored.length === 0) return;
@@ -1516,7 +1506,7 @@ export class IssueBridge {
     const cfg = this.cfg.master.github?.repos[repo.name];
     // Nothing to ask GitHub with: the issue closed by a human ends the Run as before.
     if (!cfg) return false;
-    const latest = await this.gh().getPullRequest(await this.issuesRepo(repo, cfg), pr.number);
+    const latest = await this.gh().getChangeRequest(await this.issuesRepo(repo, cfg), pr.number);
     if (latest.state !== 'merged') return false;
     await this.completeMerged(repo.name, repo, [{ run, pr: latest }]);
     return true;
@@ -1937,7 +1927,7 @@ export class IssueBridge {
    * everything while the work switch is off (nothing new starts then; the first poll after it is
    * on does it).
    */
-  private async restartForChangedIssue(stale: Run, latest: GhIssue): Promise<void> {
+  private async restartForChangedIssue(stale: Run, latest: HostIssue): Promise<void> {
     const prev = stale.issue;
     if (!prev || prev.untrusted || !this.deps.store.working) return;
     const goal = goalFromIssue(latest);
@@ -2856,7 +2846,7 @@ export class IssueBridge {
   private async cancelClosedIteration(
     repo: Repo,
     iteration: Iteration,
-    own: GhIssue,
+    own: HostIssue,
   ): Promise<void> {
     const gh = this.gh();
     const store = this.deps.store;
@@ -3031,7 +3021,11 @@ export class IssueBridge {
    * GitHub failed or the Master stopped halfway, goes on from where it got (`summaryPosted`, and
    * the summary's marker among the issue's comments for a stop right after posting it).
    */
-  private async completeIteration(repo: Repo, iteration: Iteration, issue: GhIssue): Promise<void> {
+  private async completeIteration(
+    repo: Repo,
+    iteration: Iteration,
+    issue: HostIssue,
+  ): Promise<void> {
     const store = this.deps.store;
     const gh = this.gh();
     const full = iteration.issuesRepo;

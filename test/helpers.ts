@@ -4,16 +4,16 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { FakeAdapter, type FakeContext, type FakeOutcome } from '../src/adapters/fake.js';
 import {
+  type ChangeRequest,
+  type ChangeRequestStatus,
+  type CodeHost,
   forcePushable,
-  type GhCheck,
-  type GhComment,
-  type GhIssue,
-  type GhPullRequest,
-  type GhPullRequestStatus,
-  type GhReviewDecision,
-  type GitHub,
+  type HostCheck,
+  type HostComment,
+  type HostIssue,
   type LabelDef,
-} from '../src/github/client.js';
+  type ReviewDecision,
+} from '../src/host/code-host.js';
 import { Master, type MasterOptions } from '../src/master.js';
 import type { Repo, Run, RunStatus } from '../src/store/types.js';
 
@@ -228,7 +228,7 @@ export interface HarnessOptions {
   /** config.yaml content; omitted = the default written on first start. */
   config?: string;
   /** In-memory GitHub; the harness never polls it on a timer. */
-  github?: GitHub;
+  github?: CodeHost;
   /** More Master options (the harness never runs the upgrade timer). */
   master?: Partial<MasterOptions>;
 }
@@ -318,7 +318,7 @@ export const STRANGER: FakeAuthor = { login: 'stranger', association: 'NONE' };
  * An issue as FakeGitHub keeps it: the comment bodies as strings, so tests read and add them
  * directly, and who wrote each beside them.
  */
-export interface FakeIssue extends Omit<GhIssue, 'comments'> {
+export interface FakeIssue extends Omit<HostIssue, 'comments'> {
   comments: string[];
   /** Authors of `comments` by index; a comment without one was written by OWNER. */
   commentAuthors: (FakeAuthor | undefined)[];
@@ -328,10 +328,10 @@ export interface FakeIssue extends Omit<GhIssue, 'comments'> {
  * A pull request as FakeGitHub keeps it: what the client returns, with what it was opened with
  * and the comments posted on it.
  */
-export interface FakePull extends GhPullRequestStatus {
+export interface FakePull extends ChangeRequestStatus {
   title: string;
   body: string;
-  /** Comment bodies, oldest first: those `closePullRequest` posted. */
+  /** Comment bodies, oldest first: those `closeChangeRequest` posted. */
   comments: string[];
 }
 
@@ -347,7 +347,7 @@ export interface FakeReview {
   /** The commit reviewed; defaults to the pull request's head. */
   commit?: string | null;
   /** The pull request's reviewDecision afterwards; left as it is when omitted. */
-  reviewDecision?: GhReviewDecision | null;
+  reviewDecision?: ReviewDecision | null;
 }
 
 /** A review comment a human writes on a line of FakeGitHub's pull request (`commentPull`). */
@@ -365,7 +365,7 @@ export interface FakeReviewComment {
 const CLOSING_REFS = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)\b/gi;
 
 /** GitHub in memory: issues of one repo, "me/demo". */
-export class FakeGitHub implements GitHub {
+export class FakeGitHub implements CodeHost {
   readonly issues = new Map<number, FakeIssue>();
   readonly labelDefs = new Map<string, LabelDef>();
   /** Every call, e.g. "comment #3". */
@@ -419,7 +419,7 @@ export class FakeGitHub implements GitHub {
   }
 
   /** The issue as the GitHub client returns it, with or without its comments. */
-  private view(issue: FakeIssue, withComments: boolean): GhIssue {
+  private view(issue: FakeIssue, withComments: boolean): HostIssue {
     return {
       number: issue.number,
       title: issue.title,
@@ -434,7 +434,7 @@ export class FakeGitHub implements GitHub {
     };
   }
 
-  private commentsOf(issue: FakeIssue): GhComment[] {
+  private commentsOf(issue: FakeIssue): HostComment[] {
     return issue.comments.map((body, i) => {
       const author = issue.commentAuthors[i] ?? OWNER;
       return { body, author: author.login, authorAssociation: author.association };
@@ -460,7 +460,7 @@ export class FakeGitHub implements GitHub {
   async listIssues(
     _repo: string,
     q: { state: 'open' | 'closed'; label?: string; limit: number; comments?: boolean },
-  ): Promise<GhIssue[]> {
+  ): Promise<HostIssue[]> {
     this.call(`list ${q.state}${q.label ? ` ${q.label}` : ''}`);
     return [...this.issues.values()]
       .filter((i) => i.state === q.state && (!q.label || i.labels.includes(q.label)))
@@ -469,7 +469,7 @@ export class FakeGitHub implements GitHub {
       .map((i) => this.view(i, q.comments === true));
   }
 
-  async listNotPlannedIssues(_repo: string, q: { limit: number }): Promise<GhIssue[]> {
+  async listNotPlannedIssues(_repo: string, q: { limit: number }): Promise<HostIssue[]> {
     this.call('list not_planned');
     return [...this.issues.values()]
       .filter((i) => i.state === 'closed' && i.stateReason === 'not_planned')
@@ -492,7 +492,7 @@ export class FakeGitHub implements GitHub {
     this.get(number).body = edit.body;
   }
 
-  async getIssue(_repo: string, number: number): Promise<GhIssue> {
+  async getIssue(_repo: string, number: number): Promise<HostIssue> {
     this.call(`getIssue #${number}`);
     return this.view(this.get(number), false);
   }
@@ -578,7 +578,7 @@ export class FakeGitHub implements GitHub {
     return execFileSync('git', ['rev-parse', branch], { cwd: path, encoding: 'utf8' }).trim();
   }
 
-  async listComments(_repo: string, number: number): Promise<GhComment[]> {
+  async listComments(_repo: string, number: number): Promise<HostComment[]> {
     this.call(`listComments #${number}`);
     return this.commentsOf(this.get(number));
   }
@@ -599,13 +599,13 @@ export class FakeGitHub implements GitHub {
     return pull;
   }
 
-  async findOpenPullRequest(_repo: string, head: string): Promise<GhPullRequest | null> {
+  async findOpenChangeRequest(_repo: string, head: string): Promise<ChangeRequest | null> {
     this.call(`findPull ${head}`);
     const open = [...this.pulls.values()].find((p) => p.state === 'open' && p.headRefName === head);
     return open ? pullView(open) : null;
   }
 
-  async createPullRequest(
+  async createChangeRequest(
     _repo: string,
     pr: { head: string; base: string; title: string; body: string },
   ): Promise<{ number: number; url: string }> {
@@ -639,13 +639,13 @@ export class FakeGitHub implements GitHub {
     return { number, url };
   }
 
-  async getPullRequest(_repo: string, number: number): Promise<GhPullRequestStatus> {
+  async getChangeRequest(_repo: string, number: number): Promise<ChangeRequestStatus> {
     this.call(`getPull #${number}`);
     return pullStatusView(this.pull(number));
   }
 
   /** As gh does: refused once merged, nothing done once closed, else commented on and closed. */
-  async closePullRequest(_repo: string, number: number, comment: string): Promise<void> {
+  async closeChangeRequest(_repo: string, number: number, comment: string): Promise<void> {
     this.call(`closePull #${number}`);
     const pull = this.pull(number);
     if (pull.state === 'merged') throw new Error(`pull request #${number} was already merged`);
@@ -685,12 +685,12 @@ export class FakeGitHub implements GitHub {
   }
 
   /** The checks of the pull request's head commit, as CI reports them. */
-  setChecks(number: number, checks: readonly GhCheck[]): void {
+  setChecks(number: number, checks: readonly HostCheck[]): void {
     this.pull(number).checks = checks.map((c) => ({ ...c }));
   }
 
   /** What GitHub makes of the reviews, e.g. after a human dismissed one. */
-  setReviewDecision(number: number, value: GhReviewDecision | null): void {
+  setReviewDecision(number: number, value: ReviewDecision | null): void {
     this.pull(number).reviewDecision = value;
   }
 
@@ -722,7 +722,7 @@ export class FakeGitHub implements GitHub {
 }
 
 /** A pull request as the GitHub client returns it: a copy, without what FakeGitHub adds. */
-function pullView(pull: FakePull): GhPullRequest {
+function pullView(pull: FakePull): ChangeRequest {
   return {
     number: pull.number,
     url: pull.url,
@@ -735,10 +735,10 @@ function pullView(pull: FakePull): GhPullRequest {
 }
 
 /**
- * A pull request as `getPullRequest` returns it: a deep copy, without what FakeGitHub adds. Its
+ * A pull request as `getChangeRequest` returns it: a deep copy, without what FakeGitHub adds. Its
  * review comments are read only while it is open, as GhCli does.
  */
-function pullStatusView(pull: FakePull): GhPullRequestStatus {
+function pullStatusView(pull: FakePull): ChangeRequestStatus {
   return {
     ...pullView(pull),
     headRefOid: pull.headRefOid,

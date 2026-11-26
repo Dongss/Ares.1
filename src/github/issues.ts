@@ -4,6 +4,7 @@ import { brandName } from '../brand.js';
 import type { ProposalKind, Risk } from '../config/flow.js';
 import { conclusionLabel, waitText } from '../engine/discussion.js';
 import { groupedTimeParts, minutes, type RunTimes, timeParts } from '../engine/times.js';
+import type { HostAuthored, HostComment, LabelDef } from '../host/code-host.js';
 import { join, t } from '../i18n.js';
 import type {
   DiscussionEntry,
@@ -14,7 +15,6 @@ import type {
   ScoutProposal,
   UntrustedAuthor,
 } from '../store/types.js';
-import type { GhAuthored, GhComment, LabelDef } from './client.js';
 
 export const LABELS = {
   /** Proposed by an AI scout, waiting for a human. */
@@ -164,7 +164,7 @@ export const TRUSTED_ASSOCIATIONS: readonly string[] = ['OWNER', 'MEMBER', 'COLL
  * account the Master acts as (`master`: `github.account`, else gh's active account; null when
  * not known). Everybody else is not, contributors included.
  */
-export function isTrusted(item: GhAuthored, master: string | null): boolean {
+export function isTrusted(item: HostAuthored, master: string | null): boolean {
   if (TRUSTED_ASSOCIATIONS.includes(item.authorAssociation.toUpperCase())) return true;
   return (
     master !== null && item.author !== null && item.author.toLowerCase() === master.toLowerCase()
@@ -175,7 +175,7 @@ export function isTrusted(item: GhAuthored, master: string | null): boolean {
  * A comment the Master posted: its marker, written by someone it trusts. Anybody can copy the
  * marker into a comment of theirs; that does not make it the Master's.
  */
-export function isMasterCommentBy(comment: GhComment, master: string | null): boolean {
+export function isMasterCommentBy(comment: HostComment, master: string | null): boolean {
   return isMasterComment(comment.body) && isTrusted(comment, master);
 }
 
@@ -193,7 +193,7 @@ export interface IssueReplies {
  * (its questions are not posted).
  */
 export function repliesAfterMaster(
-  comments: readonly GhComment[],
+  comments: readonly HostComment[],
   master: string | null,
 ): IssueReplies {
   const last = comments.findLastIndex((c) => isMasterCommentBy(c, master));
@@ -204,7 +204,7 @@ export function repliesAfterMaster(
 }
 
 /** How a Run records the author of its issue whom the Master does not trust. */
-export function untrustedAuthor(issue: GhAuthored, confirmedAt: string | null): UntrustedAuthor {
+export function untrustedAuthor(issue: HostAuthored, confirmedAt: string | null): UntrustedAuthor {
   return { author: issue.author, association: issue.authorAssociation, confirmedAt };
 }
 
@@ -766,7 +766,7 @@ export function iterationSummaryComment(summary: string): string {
  * Whether a comment is the Master's summary of an iteration: its marker in a comment the Master
  * posted (`isMasterCommentBy`), so that nobody keeps the summary from being posted by copying it.
  */
-export function isIterationSummaryComment(comment: GhComment, master: string | null): boolean {
+export function isIterationSummaryComment(comment: HostComment, master: string | null): boolean {
   return isMasterCommentBy(comment, master) && comment.body.includes(ITERATION_SUMMARY_MARKER);
 }
 

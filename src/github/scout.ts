@@ -45,6 +45,7 @@ import {
   type WorkSwitch,
   workSwitchesOf,
 } from '../engine/times.js';
+import type { HostAuthored, HostIssue } from '../host/code-host.js';
 import { join, t } from '../i18n.js';
 import type { Store } from '../store/store.js';
 import {
@@ -66,7 +67,6 @@ import {
 } from '../store/types.js';
 import type { UpgradeFailure } from '../upgrade/upgrader.js';
 import { executionSlot } from '../util.js';
-import type { GhAuthored, GhIssue } from './client.js';
 import {
   FOOTER_MARKER,
   isRetriesExhaustedComment,
@@ -1546,15 +1546,15 @@ export function runDigest(store: Store, repoId: string, perRepo: number, limit =
  * next step of a large capability once the one before it is done.
  */
 export function issueDigest(
-  open: GhIssue[],
-  closed: GhIssue[],
+  open: HostIssue[],
+  closed: HostIssue[],
   master: string | null,
-  notPlanned: GhIssue[] | null = [],
+  notPlanned: HostIssue[] | null = [],
 ): string {
   const recent = new Set(closed.map((i) => i.number));
   const older = (notPlanned ?? []).filter((i) => !recent.has(i.number));
-  const trusted = <T extends GhAuthored>(items: T[]) => items.filter((i) => isTrusted(i, master));
-  const labels = (i: GhIssue) => {
+  const trusted = <T extends HostAuthored>(items: T[]) => items.filter((i) => isTrusted(i, master));
+  const labels = (i: HostIssue) => {
     const ours = i.labels.filter((l) => l.startsWith('ares1:'));
     return ours.length ? ` [${ours.join(', ')}]` : '';
   };
@@ -1595,7 +1595,7 @@ export function issueDigest(
  * A closed issue in the scout's list: done, rejected by a human with the reason, or closed by
  * the Master after every attempt failed. Only comments by people the Master trusts count.
  */
-function closedIssueLine(i: GhIssue, master: string | null): string {
+function closedIssueLine(i: HostIssue, master: string | null): string {
   const comments = i.comments.filter((c) => isTrusted(c, master)).map((c) => c.body);
   // Closed by the Master after every attempt failed: not a human's rejection.
   const exhausted = comments.findLast(isRetriesExhaustedComment);
@@ -2051,7 +2051,7 @@ export function proposalGoal(
 }
 
 /** Proposals a human still has to look at. */
-export function untriaged(open: GhIssue[]): GhIssue[] {
+export function untriaged(open: HostIssue[]): HostIssue[] {
   const decided: string[] = [LABELS.ready, LABELS.running, LABELS.needsYou, LABELS.failed];
   return open.filter(
     (i) => i.labels.includes(LABELS.proposal) && !i.labels.some((l) => decided.includes(l)),
@@ -2078,11 +2078,11 @@ export function filedProposal<S extends Pick<Scout, 'proposals'>>(
  * `iterations`: the repo's, with their issues and their children's.
  */
 export function proposalsHoldingScout(
-  open: GhIssue[],
+  open: HostIssue[],
   scouts: Pick<Scout, 'proposals'>[],
   limits: AutoAcceptLimits,
   iterations: readonly Pick<Iteration, 'issue' | 'children'>[] = [],
-): GhIssue[] {
+): HostIssue[] {
   const byIssue = new Map(
     iterations.flatMap((it) => (it.issue ? [[it.issue.number, it] as const] : [])),
   );

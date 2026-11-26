@@ -25,7 +25,7 @@ import { RepoWorkflows } from './config/repo-workflows.js';
 import { ConfigWatcher } from './config/watch.js';
 import { Engine } from './engine/engine.js';
 import { IssueBridge } from './github/bridge.js';
-import type { GitHub } from './github/client.js';
+import type { CodeHost } from './host/code-host.js';
 import { type Lang, lang, setLang, t } from './i18n.js';
 import { RawLogPruner } from './logs/prune.js';
 import { type ExecFile, type SendNotice, SystemNotifier } from './notify/system.js';
@@ -68,8 +68,8 @@ export interface MasterOptions {
   webDir?: string;
   /** Reload the configuration when its files change (default true). */
   watchConfig?: boolean;
-  /** Replace gh (tests use an in-memory GitHub). */
-  github?: GitHub;
+  /** Replace the code host's client, gh (tests use an in-memory GitHub). */
+  github?: CodeHost;
   /**
    * Poll GitHub and the local backlog on a timer (default true); tests call `issues.poll()` and
    * `backlog.poll()` themselves.
