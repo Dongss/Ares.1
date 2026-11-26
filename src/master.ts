@@ -307,7 +307,8 @@ export class Master {
       paths,
       config,
       scouting,
-      github: opts.github,
+      platform: 'github',
+      host: opts.github,
       nodeMissing,
       refreshTemplates,
     });

@@ -39,14 +39,15 @@ import {
 import {
   findTemplate,
   githubConfigKey,
+  gitlabConfigKey,
   type HomePaths,
   type LoadedConfig,
 } from '../config/load.js';
-import type { GitHubRepoConfig, WorkflowTemplate } from '../config/schema.js';
+import type { GitHubRepoConfig, GitLabRepoConfig, WorkflowTemplate } from '../config/schema.js';
 import { type Engine, InvalidStateError } from '../engine/engine.js';
 import { storedRunTimes } from '../engine/times.js';
 import type { ChangeRequest, ChangeRequestStatus, CodeHost, HostIssue } from '../host/code-host.js';
-import { CodeHostFactory } from '../host/factory.js';
+import { CodeHostFactory, type CodeHostPlatform } from '../host/factory.js';
 import { join as joinList, t } from '../i18n.js';
 import { NotFoundError, type Store } from '../store/store.js';
 import {
@@ -158,12 +159,15 @@ const MAX_REPORTED_ERRORS = 20;
  */
 const MERGE_DIR_PREFIX = 'ares1-merge-';
 
-/** Message of the commit that merges GitHub's new commits into the local target branch. */
-export function mergeRemoteMessage(branch: string): string {
+/**
+ * Message of the commit that merges the new commits of the code host (`host`, by the name people
+ * know it by: GitHub or GitLab) into the local target branch.
+ */
+export function mergeRemoteMessage(branch: string, host = 'GitHub'): string {
   return redactForGitHub(
     t({
-      zh: `合并 GitHub 上 ${branch} 的新提交`,
-      en: `Merge new commits from ${branch} on GitHub`,
+      zh: `合并 ${host} 上 ${branch} 的新提交`,
+      en: `Merge new commits from ${branch} on ${host}`,
     }),
   );
 }
@@ -223,43 +227,45 @@ function mergeFailureLines(why: RemoteMergeFailure): string {
 
 /**
  * The goal of the Run the Master creates for an agent to merge commit `remote` of the target
- * branch `branch` on GitHub into the local one, at `local`, when its own merge of the two did not
- * go through (`why`). Written in the Master's language and complete, so that the requirement
- * assessment goes ahead without asking: what to merge, what to keep, that the checks must pass
- * afterwards, and what the Master's merge ran into.
+ * branch `branch` on the code host (`host`: GitHub unless given) into the local one, at `local`,
+ * when its own merge of the two did not go through (`why`). Written in the Master's language and
+ * complete, so that the requirement assessment goes ahead without asking: what to merge, what to
+ * keep, that the checks must pass afterwards, and what the Master's merge ran into.
  */
 export function mergeRemoteGoal(input: {
   branch: string;
   local: string;
   remote: string;
   why: RemoteMergeFailure;
+  host?: string;
 }): string {
   const { branch, local, remote, why } = input;
+  const host = input.host ?? 'GitHub';
   const r = remote.slice(0, 7);
   const l = local.slice(0, 7);
   const title = t({
-    zh: `合并 GitHub 上 ${branch} 的提交 ${r}`,
-    en: `Merge commit ${r} from ${branch} on GitHub`,
+    zh: `合并 ${host} 上 ${branch} 的提交 ${r}`,
+    en: `Merge commit ${r} from ${branch} on ${host}`,
   });
   const trouble =
     'failed' in why
       ? t({ zh: '合并后检查没通过', en: 'failed the checks' })
       : t({ zh: '有冲突', en: 'conflicted' });
   const intro = t({
-    zh: `这是 Master 自动建的合并任务，不来自 issue。本地目标分支 ${branch} 和 GitHub 上的 ${branch} 已经分叉，各有对方没有的提交；Master 自己合并两边时${trouble}，所以交给这个 Run 处理。合并进来之前，Master 不会把 ${branch} 推送到 GitHub。`,
-    en: `The Master created this merge task by itself; it comes from no issue. The local target branch ${branch} and ${branch} on GitHub have diverged, each with commits the other lacks, and the Master's own merge of the two ${trouble}, so this Run takes it over. Until it is merged in, the Master pushes nothing of ${branch} to GitHub.`,
+    zh: `这是 Master 自动建的合并任务，不来自 issue。本地目标分支 ${branch} 和 ${host} 上的 ${branch} 已经分叉，各有对方没有的提交；Master 自己合并两边时${trouble}，所以交给这个 Run 处理。合并进来之前，Master 不会把 ${branch} 推送到 ${host}。`,
+    en: `The Master created this merge task by itself; it comes from no issue. The local target branch ${branch} and ${branch} on ${host} have diverged, each with commits the other lacks, and the Master's own merge of the two ${trouble}, so this Run takes it over. Until it is merged in, the Master pushes nothing of ${branch} to ${host}.`,
   });
   const task = t({
-    zh: `要做的：把 GitHub 上 ${branch} 的提交 ${r}（完整的是 ${remote}）合并进本地目标分支 ${branch}（Master 合并时在 ${l}，完整的是 ${local}）。编码阶段开始时，Master 会在工作目录里执行 git merge --no-ff --no-commit ${remote}，把冲突留在文件里交给编码 Agent；合并提交由 Master 完成。`,
-    en: `What to do: merge commit ${r} (in full, ${remote}) from ${branch} on GitHub into the local target branch ${branch} (at ${l} when the Master merged, in full ${local}). When the coding stage starts, the Master runs git merge --no-ff --no-commit ${remote} in the working directory and leaves the conflicts in the files for the coding agent; the Master makes the merge commit.`,
+    zh: `要做的：把 ${host} 上 ${branch} 的提交 ${r}（完整的是 ${remote}）合并进本地目标分支 ${branch}（Master 合并时在 ${l}，完整的是 ${local}）。编码阶段开始时，Master 会在工作目录里执行 git merge --no-ff --no-commit ${remote}，把冲突留在文件里交给编码 Agent；合并提交由 Master 完成。`,
+    en: `What to do: merge commit ${r} (in full, ${remote}) from ${branch} on ${host} into the local target branch ${branch} (at ${l} when the Master merged, in full ${local}). When the coding stage starts, the Master runs git merge --no-ff --no-commit ${remote} in the working directory and leaves the conflicts in the files for the coding agent; the Master makes the merge commit.`,
   });
   const rules = t({
     zh: `要求：
-- 冲突时两边的改动都要保留：本地 ${branch} 上的和 GitHub 上的都不能丢，把两边的意图合在一起，删掉所有冲突标记。
+- 冲突时两边的改动都要保留：本地 ${branch} 上的和 ${host} 上的都不能丢，把两边的意图合在一起，删掉所有冲突标记。
 - 合并后仓库的检查命令要能通过。
 - 只做这次合并需要的改动，不做别的需求。`,
     en: `Requirements:
-- Where the two conflict, keep the changes of both sides: nothing of the local ${branch} or of GitHub's may be lost; bring together what each side meant, and remove every conflict marker.
+- Where the two conflict, keep the changes of both sides: nothing of the local ${branch} or of ${host}'s may be lost; bring together what each side meant, and remove every conflict marker.
 - After the merge, the repo's check commands must pass.
 - Make only the changes this merge needs, nothing else.`,
   });
@@ -438,6 +444,121 @@ function sameIssues(a: readonly number[], b: readonly number[]): boolean {
   return set.size === new Set(b).size && b.every((n) => set.has(n));
 }
 
+/** The code hosts whose issues a bridge takes requirements from; each bridge works with one. */
+export type HostPlatform = CodeHostPlatform;
+
+/** A repo's settings in its platform's section of config.yaml (`github.repos` / `gitlab.repos`). */
+type HostRepoConfig = GitHubRepoConfig | GitLabRepoConfig;
+
+/** A platform's section of config.yaml (`github` / `gitlab`), as far as the bridge reads it. */
+interface HostSection {
+  account?: string | undefined;
+  poll_minutes: number;
+  repos: Record<string, HostRepoConfig>;
+}
+
+/** `poll_minutes` while the platform has no section. */
+const DEFAULT_POLL_MINUTES = 5;
+
+/**
+ * The platform a bridge works with, and all the bridge reads of it: the platform's section of
+ * config.yaml, the key of a repo's problems in the loaded config and where its settings are for
+ * messages, the platform's client, the account the Master acts as there, and the project a repo's
+ * issues are on.
+ */
+class BridgePlatform {
+  private readonly hosts = new CodeHostFactory();
+  /** The account the client acts as, for the client it was asked with. */
+  private viewer: { host: CodeHost; login: string } | undefined;
+  /** The projects resolved from the repos' remotes, per repo path. */
+  private readonly resolved = new Map<string, string>();
+
+  constructor(
+    readonly platform: HostPlatform,
+    private readonly config: () => LoadedConfig,
+    /** The client tests pass; otherwise the factory's for the config. */
+    private readonly injected: CodeHost | undefined,
+  ) {}
+
+  /** The platform's name as people know it, the same in every language. */
+  get name(): string {
+    return this.platform === 'github' ? 'GitHub' : 'GitLab';
+  }
+
+  /** The platform's section of config.yaml; undefined when config.yaml has none. */
+  section(): HostSection | undefined {
+    const master = this.config().master;
+    return this.platform === 'github' ? master.github : master.gitlab;
+  }
+
+  /** The repo's settings in the platform's section; undefined when it is not there. */
+  repoConfig(name: string): HostRepoConfig | undefined {
+    return this.section()?.repos[name];
+  }
+
+  /** How often the bridge looks at the platform (`poll_minutes`). */
+  pollMinutes(): number {
+    return this.section()?.poll_minutes ?? DEFAULT_POLL_MINUTES;
+  }
+
+  /** Key of the repo's problems in the loaded config's `errors`. */
+  configKey(name: string): string {
+    return this.platform === 'github' ? githubConfigKey(name) : gitlabConfigKey(name);
+  }
+
+  /** Where the repos' settings are in config.yaml, for messages: `github.repos`. */
+  reposPath(): string {
+    return `${this.platform}.repos`;
+  }
+
+  /** Where the repo's settings are in config.yaml, for messages: `github.repos.<name>`. */
+  configPath(name: string): string {
+    return `${this.reposPath()}.${name}`;
+  }
+
+  /** The platform's client: gh or glab, as the account the section names. */
+  client(): CodeHost {
+    return this.injected ?? this.hosts.get(this.config().master, this.platform);
+  }
+
+  /**
+   * Login of the account the Master acts as, which it trusts like a member of the repo: the
+   * section's `account`, else the account the client is logged in as, asked once per client.
+   */
+  async masterLogin(): Promise<string> {
+    const account = this.section()?.account;
+    if (account) return account;
+    const host = this.client();
+    if (this.viewer?.host !== host) this.viewer = { host, login: await host.viewer() };
+    return this.viewer.login;
+  }
+
+  /**
+   * The project the repo's issues are on, as the platform names it: `issues_repo`, which a GitLab
+   * repo always has; for a GitHub repo without it, resolved by gh from the repo's remotes, once.
+   */
+  async issuesRepo(repo: Repo, cfg: HostRepoConfig): Promise<string> {
+    if (cfg.issues_repo) return cfg.issues_repo;
+    let full = this.resolved.get(repo.path);
+    if (!full) {
+      full = await this.client().resolveRepo(repo.path);
+      this.resolved.set(repo.path, full);
+    }
+    return full;
+  }
+
+  /** `issuesRepo` as known without asking: null while it is still to be resolved. */
+  knownIssuesRepo(repo: Repo | undefined, cfg: HostRepoConfig): string | null {
+    return cfg.issues_repo ?? (repo ? (this.resolved.get(repo.path) ?? null) : null);
+  }
+
+  /** The host the platform's git remotes point at: github.com, or the GitLab's `host`. */
+  remoteHost(): string {
+    if (this.platform === 'github') return 'github.com';
+    return this.config().master.gitlab?.host ?? 'gitlab.com';
+  }
+}
+
 export interface BridgeDeps {
   store: Store;
   engine: Engine;
@@ -447,8 +568,16 @@ export interface BridgeDeps {
    * Runs the scouts, whose proposals the bridge files as issues; the Master starts and stops it.
    */
   scouting: Scouting;
-  /** Tests pass a fake; otherwise the code host's client from the config: gh, as its account. */
-  github?: CodeHost;
+  /**
+   * The platform whose repos, those of its section of config.yaml, the bridge works on; GitHub
+   * if omitted.
+   */
+  platform?: HostPlatform;
+  /**
+   * Tests pass a fake client of the platform; otherwise its client from the config: gh or glab,
+   * as the section's account.
+   */
+  host?: CodeHost;
   /**
    * Whether the node the Master runs on is gone: the checks of a merge of GitHub's commits then
    * wait, as they would fail for the environment, not for the code.
@@ -462,7 +591,10 @@ export interface BridgeDeps {
 }
 
 /**
- * GitHub Issues as the backlog:
+ * The issues of a code host as the backlog of the repos in its section of config.yaml: GitHub's
+ * (`github.repos`), or GitLab's (`gitlab.repos`), one platform per bridge (`BridgePlatform`), each
+ * polling on its own. The issue protocol is the same on both (labels, hidden markers, iterations,
+ * src/github/issues.ts); pull requests come only with deliver: pr, which only GitHub repos have.
  * - intake: an open issue labeled ares1:ready becomes a Run;
  * - sync: the Run's progress shows on the issue (labels, comments, closed when merged);
  * - stop: a human closing the issue terminates its unfinished Run, and the issue is left alone;
@@ -488,7 +620,8 @@ export interface BridgeDeps {
  *   scout replaces it; a human closing the iteration's issue terminates and closes its steps not
  *   done; a scout's change to its plan is posted on it and its new steps filed.
  * Intake, auto-accept and automatic scouts only happen while the work switch is on.
- * GitHub is only a mirror: failures are reported and retried on the next poll, never block Runs.
+ * The code host is only a mirror: failures are reported and retried on the next poll, never block
+ * Runs.
  */
 export class IssueBridge {
   private pollTimer: ReturnType<typeof setTimeout> | undefined;
@@ -496,11 +629,9 @@ export class IssueBridge {
   /** Syncs when the earliest wait before redoing a failed Run ends. */
   private redoTimer: ReturnType<typeof setTimeout> | undefined;
   private chain: Promise<void> = Promise.resolve();
-  private readonly hosts = new CodeHostFactory();
-  /** gh's active account, for the client it was asked with. */
-  private viewer: { gh: CodeHost; login: string } | undefined;
+  /** The platform the bridge works with, and what it reads of it. */
+  private readonly platform: BridgePlatform;
   private readonly labelsReady = new Set<string>();
-  private readonly resolved = new Map<string, string>();
   /** Why no automatic scout started at the last poll, per repo name. */
   private readonly scoutWaiting = new Map<string, ScoutWait | null>();
   private lastPollAt: string | null = null;
@@ -545,31 +676,27 @@ export class IssueBridge {
     if (e.type === 'master.working' && e.data.on === true) void this.poll();
   };
 
-  constructor(private readonly deps: BridgeDeps) {}
+  constructor(private readonly deps: BridgeDeps) {
+    this.platform = new BridgePlatform(deps.platform ?? 'github', deps.config, deps.host);
+  }
 
   private get cfg() {
     return this.deps.config();
   }
 
-  /** How often the Master looks at GitHub (`poll_minutes`). */
+  /** How often the Master looks at the platform (`poll_minutes`). */
   private get pollMinutes(): number {
-    return this.cfg.master.github?.poll_minutes ?? 5;
+    return this.platform.pollMinutes();
   }
 
-  private gh(): CodeHost {
-    return this.deps.github ?? this.hosts.get(this.cfg.master);
+  /** The platform's client. */
+  private host(): CodeHost {
+    return this.platform.client();
   }
 
-  /**
-   * Login of the account the Master acts as, which it trusts like a member of the repo:
-   * `github.account`, else gh's active account, asked once per client.
-   */
-  private async masterLogin(): Promise<string> {
-    const account = this.cfg.master.github?.account;
-    if (account) return account;
-    const gh = this.gh();
-    if (this.viewer?.gh !== gh) this.viewer = { gh, login: await gh.viewer() };
-    return this.viewer.login;
+  /** Login of the account the Master acts as on the platform (`BridgePlatform.masterLogin`). */
+  private masterLogin(): Promise<string> {
+    return this.platform.masterLogin();
   }
 
   // ---- lifecycle -------------------------------------------------------------
@@ -643,11 +770,11 @@ export class IssueBridge {
   private scheduleRedo(): void {
     clearTimeout(this.redoTimer);
     this.redoTimer = undefined;
-    const github = this.cfg.master.github;
-    if (!github || this.stopping || !this.deps.store.working) return;
+    const section = this.platform.section();
+    if (!section || this.stopping || !this.deps.store.working) return;
     const now = Date.now();
     let next: number | undefined;
-    for (const name of Object.keys(github.repos)) {
+    for (const name of Object.keys(section.repos)) {
       const repo = this.deps.store.findRepo(name);
       if (!repo) continue;
       for (const run of this.deps.store.runsAwaitingRedo(repo.id)) {
@@ -673,7 +800,7 @@ export class IssueBridge {
    * the user's home directory: it quotes error output and agents' words, which carry local paths.
    */
   private comment(repo: string, number: number, body: string): Promise<void> {
-    return this.gh().comment(repo, number, markComment(redactForGitHub(body)));
+    return this.host().comment(repo, number, markComment(redactForGitHub(body)));
   }
 
   /**
@@ -705,12 +832,12 @@ export class IssueBridge {
    */
   poll(): Promise<void> {
     return this.serial(async () => {
-      const github = this.cfg.master.github;
-      if (!github || this.stopping) return;
+      const section = this.platform.section();
+      if (!section || this.stopping) return;
       const working = this.deps.store.working;
       let failed = false;
       const each = async (step: (name: string) => Promise<void>) => {
-        for (const name of Object.keys(github.repos)) {
+        for (const name of Object.keys(section.repos)) {
           try {
             await step(name);
           } catch (err) {
@@ -760,7 +887,7 @@ export class IssueBridge {
       });
       if (working) await each((name) => this.maybeAutoScout(name));
       else {
-        for (const name of Object.keys(github.repos)) {
+        for (const name of Object.keys(section.repos)) {
           this.scoutWaiting.set(name, {
             reason: t({ zh: '工作开关已关闭', en: 'The work switch is off' }),
           });
@@ -783,11 +910,11 @@ export class IssueBridge {
    */
   sync(): Promise<void> {
     return this.serial(async () => {
-      const github = this.cfg.master.github;
-      if (!github || this.stopping) return;
+      const section = this.platform.section();
+      if (!section || this.stopping) return;
       // Before the issues are caught up, so the pull request's link is posted before the label
       // says the issue waits for a human; the left ones closed first, as in a poll.
-      for (const name of Object.keys(github.repos)) {
+      for (const name of Object.keys(section.repos)) {
         try {
           await this.closeLeftPullRequests(name);
         } catch (err) {
@@ -806,7 +933,7 @@ export class IssueBridge {
       }
       await this.syncRuns();
       if (this.deps.store.working) {
-        for (const name of Object.keys(github.repos)) {
+        for (const name of Object.keys(section.repos)) {
           try {
             await this.redoFailedRuns(name);
           } catch (err) {
@@ -818,22 +945,24 @@ export class IssueBridge {
     });
   }
 
-  private repoSetup(name: string): { repo: Repo; cfg: GitHubRepoConfig } {
-    const cfg = this.cfg.master.github?.repos[name];
+  private repoSetup(name: string): { repo: Repo; cfg: HostRepoConfig } {
+    const cfg = this.platform.repoConfig(name);
     if (!cfg) {
+      const repos = this.platform.reposPath();
       throw new NotFoundError(
         t({
-          zh: `config.yaml 的 github.repos 里没有 ${name}`,
-          en: `${name} is not in github.repos of config.yaml`,
+          zh: `config.yaml 的 ${repos} 里没有 ${name}`,
+          en: `${name} is not in ${repos} of config.yaml`,
         }),
       );
     }
-    const problems = this.cfg.errors[githubConfigKey(name)];
+    const problems = this.cfg.errors[this.platform.configKey(name)];
     if (problems) {
+      const path = this.platform.configPath(name);
       throw new InvalidStateError(
         t({
-          zh: `github.repos.${name} 配置有误：${problems.join('；')}`,
-          en: `github.repos.${name} is misconfigured: ${problems.join('; ')}`,
+          zh: `${path} 配置有误：${problems.join('；')}`,
+          en: `${path} is misconfigured: ${problems.join('; ')}`,
         }),
       );
     }
@@ -842,19 +971,14 @@ export class IssueBridge {
     return { repo, cfg };
   }
 
-  private async issuesRepo(repo: Repo, cfg: GitHubRepoConfig): Promise<string> {
-    if (cfg.issues_repo) return cfg.issues_repo;
-    let full = this.resolved.get(repo.path);
-    if (!full) {
-      full = await this.gh().resolveRepo(repo.path);
-      this.resolved.set(repo.path, full);
-    }
-    return full;
+  /** The project the repo's issues are on (`BridgePlatform.issuesRepo`). */
+  private issuesRepo(repo: Repo, cfg: HostRepoConfig): Promise<string> {
+    return this.platform.issuesRepo(repo, cfg);
   }
 
   private async ensureLabels(full: string): Promise<void> {
     if (this.labelsReady.has(full)) return;
-    await this.gh().ensureLabels(full, labelDefs());
+    await this.host().ensureLabels(full, labelDefs());
     this.labelsReady.add(full);
   }
 
@@ -870,7 +994,7 @@ export class IssueBridge {
     const { repo, cfg } = this.repoSetup(name);
     const full = await this.issuesRepo(repo, cfg);
     await this.ensureLabels(full);
-    const gh = this.gh();
+    const gh = this.host();
     const listReady = () => gh.listIssues(full, { state: 'open', label: LABELS.ready, limit: 50 });
     let ready = await listReady();
     let accepted = false;
@@ -956,7 +1080,7 @@ export class IssueBridge {
       if (!writtenOut(iteration) || this.writing.has(iteration.id)) return false;
       await this.acceptIteration(repo, iteration, false);
     }
-    await this.gh().setLabels(full, issue.number, withStatusLabel(issue.labels, LABELS.running));
+    await this.host().setLabels(full, issue.number, withStatusLabel(issue.labels, LABELS.running));
     return pending;
   }
 
@@ -978,7 +1102,7 @@ export class IssueBridge {
       if (done === undefined) {
         if (ready.some((i) => i.number === number)) done = false;
         else {
-          const dep = await this.gh().getIssue(full, number);
+          const dep = await this.host().getIssue(full, number);
           done = dep.state === 'closed' && dep.stateReason === 'completed';
         }
         known.set(number, done);
@@ -1012,7 +1136,7 @@ export class IssueBridge {
     const section = closeoutSuggestions(store, iteration, child);
     // The suggestions quote what reviewers wrote, with local paths in it.
     const body = redactForGitHub(withReviewSuggestions(issue.body, section));
-    await this.gh().editIssue(full, issue.number, { body });
+    await this.host().editIssue(full, issue.number, { body });
     return { ...issue, body };
   }
 
@@ -1023,7 +1147,7 @@ export class IssueBridge {
    */
   private createIssueRun(
     repo: Repo,
-    cfg: GitHubRepoConfig,
+    cfg: HostRepoConfig,
     goal: string,
     issue: RunIssue,
     confirmGoal?: string,
@@ -1042,12 +1166,12 @@ export class IssueBridge {
    * The template the repo's Runs get (`findTemplate`): the home directory's, else the one the
    * repo keeps; undefined when neither has it.
    */
-  private template(name: string, cfg: GitHubRepoConfig): WorkflowTemplate | undefined {
+  private template(name: string, cfg: HostRepoConfig): WorkflowTemplate | undefined {
     return findTemplate(this.cfg, name, cfg.template)?.template;
   }
 
   /** Name of the repo's template, as the comments on its issues give it. */
-  private templateName(name: string, cfg: GitHubRepoConfig): string {
+  private templateName(name: string, cfg: HostRepoConfig): string {
     return this.template(name, cfg)?.name ?? cfg.template;
   }
 
@@ -1060,7 +1184,7 @@ export class IssueBridge {
     const { repo, cfg } = this.repoSetup(name);
     if (cfg.auto_accept.max_risk === 'none') return;
     const full = await this.issuesRepo(repo, cfg);
-    const open = await this.gh().listIssues(full, {
+    const open = await this.host().listIssues(full, {
       state: 'open',
       label: LABELS.proposal,
       limit: 100,
@@ -1088,7 +1212,7 @@ export class IssueBridge {
         continue;
       }
       const { scout } = filed;
-      await this.gh().setLabels(full, issue.number, [
+      await this.host().setLabels(full, issue.number, [
         ...withStatusLabel(issue.labels, LABELS.ready),
         LABELS.auto,
       ]);
@@ -1116,7 +1240,7 @@ export class IssueBridge {
     const head = await revParse(repo.path, repo.targetBranch);
     if (this.pushed.get(repo.path) === head) return true;
     const full = await this.issuesRepo(repo, cfg);
-    await this.gh().push(repo.path, full, repo.targetBranch);
+    await this.host().push(repo.path, full, repo.targetBranch);
     this.pushed.set(repo.path, head);
     this.deps.store.event(null, 'github.pushed', { repo: name, branch: repo.targetBranch, head });
     await this.trackOrigin(repo, full, head);
@@ -1170,7 +1294,7 @@ export class IssueBridge {
   private async closeLeftPullRequest(full: string, run: Run): Promise<void> {
     const pr = run.pr;
     if (!pr) return;
-    const gh = this.gh();
+    const gh = this.host();
     const store = this.deps.store;
     const ref = { number: pr.number, url: pr.url };
     const latest = await gh.getChangeRequest(full, pr.number);
@@ -1247,7 +1371,7 @@ export class IssueBridge {
       await this.updatePullRequest(repo, full, run, run.pr, branch);
       return;
     }
-    const gh = this.gh();
+    const gh = this.host();
     const target = repo.targetBranch;
     await gh.push(repo.path, full, branch, { force: true });
     const open = await gh.findOpenChangeRequest(full, branch);
@@ -1296,7 +1420,7 @@ export class IssueBridge {
     pr: { number: number; url: string },
     branch: string,
   ): Promise<void> {
-    const gh = this.gh();
+    const gh = this.host();
     const latest = await gh.getChangeRequest(full, pr.number);
     if (latest.state !== 'open') return;
     await gh.push(repo.path, full, branch, { force: true });
@@ -1349,7 +1473,7 @@ export class IssueBridge {
       const number = run.pr?.number;
       if (number === undefined) continue;
       try {
-        const pr = await this.gh().getChangeRequest(full, number);
+        const pr = await this.host().getChangeRequest(full, number);
         if (pr.state === 'merged') merged.push({ run, pr });
         else if (pr.state === 'closed') {
           this.deps.engine.pullRequestClosed(run, { number: pr.number, url: pr.url });
@@ -1503,23 +1627,24 @@ export class IssueBridge {
     if (mergedPullRequestOf(this.deps.store, run.id)) return true;
     if (run.status !== 'blocked' || run.blocked?.kind !== 'pr_open') return false;
     const repo = this.deps.store.getRepo(run.repoId);
-    const cfg = this.cfg.master.github?.repos[repo.name];
-    // Nothing to ask GitHub with: the issue closed by a human ends the Run as before.
+    const cfg = this.platform.repoConfig(repo.name);
+    // Nothing to ask the platform with: the issue closed by a human ends the Run as before.
     if (!cfg) return false;
-    const latest = await this.gh().getChangeRequest(await this.issuesRepo(repo, cfg), pr.number);
+    const latest = await this.host().getChangeRequest(await this.issuesRepo(repo, cfg), pr.number);
     if (latest.state !== 'merged') return false;
     await this.completeMerged(repo.name, repo, [{ run, pr: latest }]);
     return true;
   }
 
   /**
-   * Keep `git status` in the clone honest when its origin is the GitHub repo `full`: its
-   * remote-tracking branch of the target branch is set to `head`, which GitHub has.
+   * Keep `git status` in the clone honest when its origin is the platform's project `full`: its
+   * remote-tracking branch of the target branch is set to `head`, which the platform has.
    */
   private async trackOrigin(repo: Repo, full: string, head: string): Promise<void> {
     try {
       const url = (await runGit(repo.path, ['remote', 'get-url', 'origin'])).replace(/\.git$/, '');
-      if (url.endsWith(`github.com:${full}`) || url.endsWith(`github.com/${full}`)) {
+      const host = this.platform.remoteHost();
+      if (url.endsWith(`${host}:${full}`) || url.endsWith(`${host}/${full}`)) {
         await runGit(repo.path, ['update-ref', `refs/remotes/origin/${repo.targetBranch}`, head]);
       }
     } catch {
@@ -1554,7 +1679,7 @@ export class IssueBridge {
     const store = this.deps.store;
     const branch = repo.targetBranch;
     const full = await this.issuesRepo(repo, cfg);
-    const remote = await this.gh().fetch(repo.path, full, branch);
+    const remote = await this.host().fetch(repo.path, full, branch);
     if (remote === null) {
       this.diverged.delete(repo.id);
       this.pullBlocked.delete(repo.id);
@@ -1730,7 +1855,7 @@ export class IssueBridge {
     // Only finished ones are left for `remote`: it ended without merging, a human merges now.
     if (store.runMergingRemote(repo.id, remote)) return null;
     // Looked at again: the config may have changed while the merge was checked.
-    const cfg = this.cfg.master.github?.repos[name];
+    const cfg = this.platform.repoConfig(name);
     if (!cfg?.push) return null;
     const template = this.template(name, cfg);
     if (!template?.stages.some((s) => s.kind === 'agent')) return null;
@@ -1738,7 +1863,13 @@ export class IssueBridge {
       const run = this.deps.engine.createRun({
         repo: repo.name,
         template: cfg.template,
-        goal: mergeRemoteGoal({ branch: repo.targetBranch, local, remote, why }),
+        goal: mergeRemoteGoal({
+          branch: repo.targetBranch,
+          local,
+          remote,
+          why,
+          host: this.platform.name,
+        }),
         overrides: issueRunOverrides(template, cfg.auto_merge),
         mergeRemote: remote,
       });
@@ -1837,7 +1968,8 @@ export class IssueBridge {
     const dir = mkdtempSync(join(tmpdir(), MERGE_DIR_PREFIX));
     try {
       await addDetachedWorktree(repo.path, dir, local);
-      const merged = await mergeOrAbort(dir, remote, mergeRemoteMessage(repo.targetBranch));
+      const message = mergeRemoteMessage(repo.targetBranch, this.platform.name);
+      const merged = await mergeOrAbort(dir, remote, message);
       if (!merged.ok) {
         if (merged.files.length === 0) throw new Error(merged.error);
         return { kind: 'failed', data: { conflict: true, files: merged.files } };
@@ -1899,7 +2031,7 @@ export class IssueBridge {
       const issue = run.issue;
       if (!issue) continue;
       try {
-        const latest = await this.gh().getIssue(issue.repo, issue.number);
+        const latest = await this.host().getIssue(issue.repo, issue.number);
         if (latest.state === 'closed') {
           if (await this.mergedThroughPullRequest(run)) continue;
           await this.cancelForClosedIssue(run.id, issue, latest.stateReason);
@@ -1935,9 +2067,13 @@ export class IssueBridge {
     if (goal.trim() === stale.goal) return;
     const store = this.deps.store;
     const repo = store.getRepo(stale.repoId);
-    const cfg = this.cfg.master.github?.repos[repo.name];
+    const cfg = this.platform.repoConfig(repo.name);
     // The new Run could not be created: the old one goes on rather than leave the issue without.
-    if (!cfg || this.cfg.errors[githubConfigKey(repo.name)] || !this.template(repo.name, cfg)) {
+    if (
+      !cfg ||
+      this.cfg.errors[this.platform.configKey(repo.name)] ||
+      !this.template(repo.name, cfg)
+    ) {
       return;
     }
     if (!isTrusted(latest, await this.masterLogin()) || this.stopping) return;
@@ -1987,7 +2123,7 @@ export class IssueBridge {
     try {
       await attempt(async () => {
         // The Run may have moved on already; the next sync reports where it is.
-        await this.gh().setLabels(
+        await this.host().setLabels(
           prev.repo,
           prev.number,
           withStatusLabel(latest.labels, LABELS.running),
@@ -2074,10 +2210,10 @@ export class IssueBridge {
     if (run.issueSynced === run.status) return;
     const repo = this.deps.store.getRepo(run.repoId);
     const stageName = this.stageNameOf(run);
-    // The issue closes once the code is on GitHub; a failed push is retried on the next poll.
-    // While the target branch has diverged from GitHub's, the issue waits as it is, open, until
-    // the two are merged (by the Master, or by a human when that failed) and the push goes through.
-    // A Run merged through its pull request (deliver: pr) is on GitHub already.
+    // The issue closes once the code is on the platform; a failed push is retried on the next
+    // poll. While the target branch has diverged from the platform's, the issue waits as it is,
+    // open, until the two are merged (by the Master, or by a human when that failed) and the push
+    // goes through. A Run merged through its pull request (deliver: pr) is on GitHub already.
     let pushed = false;
     const merged =
       run.status === 'completed' && run.pr
@@ -2085,7 +2221,7 @@ export class IssueBridge {
         : undefined;
     if (run.status === 'completed' && !merged) {
       const name = repo.name;
-      const cfg = this.cfg.master.github?.repos[name];
+      const cfg = this.platform.repoConfig(name);
       // With deliver: pr the target branch is never pushed: a Run merged locally (before the
       // repo was switched to it) is not on GitHub.
       if (cfg?.push && cfg.deliver !== 'pr') {
@@ -2104,7 +2240,7 @@ export class IssueBridge {
       times: run.status === 'completed' ? storedRunTimes(this.deps.store, run) : undefined,
       failure,
     });
-    const gh = this.gh();
+    const gh = this.host();
     const current = await gh.getLabels(issue.repo, issue.number);
     const wanted = withStatusLabel(current, update.label);
     if (wanted.length !== current.length || wanted.some((l) => !current.includes(l))) {
@@ -2171,12 +2307,12 @@ export class IssueBridge {
   /**
    * What follows a failed Run of an issue: redone while the issue has attempts left
    * (`max_run_attempts`), otherwise the issue is closed. Decided once and kept with the Run, so
-   * catching the issue up again after a GitHub error says the same. undefined when the repo is no
-   * longer configured for GitHub: the issue waits for a human then.
+   * catching the issue up again after an error of the platform says the same. undefined when the
+   * repo is no longer configured for the platform: the issue waits for a human then.
    */
   private failureOutcome(run: Run, repo: Repo, stage: string | null): FailureOutcome | undefined {
     const issue = run.issue;
-    const cfg = this.cfg.master.github?.repos[repo.name];
+    const cfg = this.platform.repoConfig(repo.name);
     if (!issue || !cfg) return undefined;
     const attempt = issue.attempt ?? 1;
     let redo = issue.redo;
@@ -2221,7 +2357,7 @@ export class IssueBridge {
       // Still waiting; the other issues' redos go on. A sync is set for when it ends.
       if ((redoDueAt(failed, this.pollMinutes) ?? 0) > Date.now()) continue;
       if (this.overBudget(repo, cfg)) return;
-      const gh = this.gh();
+      const gh = this.host();
       const issue = await gh.getIssue(prev.repo, prev.number);
       if (issue.state === 'closed') {
         // Nobody wants it any more; the issue stays as the human left it.
@@ -2343,7 +2479,7 @@ export class IssueBridge {
       const issue = run.issue;
       if (!issue || run.issueDiscussionSynced < run.discussion.length) continue;
       const master = await this.masterLogin();
-      const comments = await this.gh().listComments(issue.repo, issue.number);
+      const comments = await this.host().listComments(issue.repo, issue.number);
       const { replies, ignored } = repliesAfterMaster(comments, master);
       // Someone may have replied on the dashboard meanwhile; the next questions come first then.
       const now = this.deps.store.getRun(run.id);
@@ -2381,12 +2517,12 @@ export class IssueBridge {
   // ---- guardrails (src/backlog/guard.ts) ---------------------------------
 
   /** Today's spend reached the configured limit (none = never). */
-  private overBudget(repo: Repo, cfg: GitHubRepoConfig): boolean {
+  private overBudget(repo: Repo, cfg: HostRepoConfig): boolean {
     return overBudget(this.deps.store, repo, cfg);
   }
 
   /** Within today's auto-accept count and spend. */
-  private mayAutoAccept(repo: Repo, cfg: GitHubRepoConfig): boolean {
+  private mayAutoAccept(repo: Repo, cfg: HostRepoConfig): boolean {
     return mayAutoAccept(this.deps.store, repo, cfg);
   }
 
@@ -2409,7 +2545,7 @@ export class IssueBridge {
     return this.deps.scouting.running;
   }
 
-  /** Start a scout of a repo of github.repos; it runs in the background. */
+  /** Start a scout of a repo of the platform's section; it runs in the background. */
   async startScout(name: string, trigger: Scout['trigger']): Promise<Scout> {
     const { repo, cfg } = this.repoSetup(name);
     return this.deps.scouting.startScout(this.scoutSource, repo, cfg, trigger);
@@ -2419,9 +2555,9 @@ export class IssueBridge {
    * GitHub issues as where the scouts' proposals go: each proposal becomes an issue labeled
    * ares1:proposal, and the scout is shown the repo's issues by people the Master trusts.
    */
-  private readonly scoutSource: ProposalSource<GitHubRepoConfig> = {
+  private readonly scoutSource: ProposalSource<HostRepoConfig> = {
     kind: 'github',
-    configPath: (name) => `github.repos.${name}`,
+    configPath: (name) => this.platform.configPath(name),
     pollMinutes: () => this.pollMinutes,
     prepareScout: async (repo, cfg) => {
       const full = await this.issuesRepo(repo, cfg);
@@ -2439,7 +2575,7 @@ export class IssueBridge {
     },
     holdingProposals: async (repo, cfg, scouts) => {
       const full = await this.issuesRepo(repo, cfg);
-      const open = await this.gh().listIssues(full, {
+      const open = await this.host().listIssues(full, {
         state: 'open',
         label: LABELS.proposal,
         limit: 100,
@@ -2454,7 +2590,7 @@ export class IssueBridge {
    * as not planned however old (see issueDigest).
    */
   private async knownIssues(scout: Scout, repo: Repo): Promise<KnownRequirements> {
-    const gh = this.gh();
+    const gh = this.host();
     // Rejections stay counterexamples however long ago they were made. Only extra ones: the
     // latest closed issues hold the recent rejections already, so when the search fails (it
     // has rate limits and an index of its own) the scout goes on without them, not fails.
@@ -2499,7 +2635,7 @@ export class IssueBridge {
   private async fileProposals(
     scout: Scout,
     repo: Repo,
-    cfg: GitHubRepoConfig,
+    cfg: HostRepoConfig,
     proposals: ScoutProposal[],
   ): Promise<FiledProposals> {
     for (const p of proposals) {
@@ -2508,7 +2644,7 @@ export class IssueBridge {
       if (auto) labels.push(LABELS.ready, LABELS.auto);
       try {
         // The scout wrote them in a worktree under the user's home directory.
-        const issue = await this.gh().createIssue(scout.issuesRepo, {
+        const issue = await this.host().createIssue(scout.issuesRepo, {
           title: redactForGitHub(p.title),
           body: redactForGitHub(proposalBody(p, scout.id, auto)),
           labels,
@@ -2564,7 +2700,7 @@ export class IssueBridge {
   private async fileIteration(
     scout: Scout,
     repo: Repo,
-    cfg: GitHubRepoConfig,
+    cfg: HostRepoConfig,
     plan: PlannedIteration,
   ): Promise<FiledIteration | null> {
     const store = this.deps.store;
@@ -2616,7 +2752,7 @@ export class IssueBridge {
       (it) => !this.writing.has(it.id),
     );
     if (pending.length === 0) return;
-    const open = await this.gh().listIssues(full, {
+    const open = await this.host().listIssues(full, {
       state: 'open',
       label: LABELS.proposal,
       limit: 100,
@@ -2654,7 +2790,7 @@ export class IssueBridge {
    */
   private async writeOutIteration(iteration: Iteration, auto: boolean): Promise<Iteration> {
     const store = this.deps.store;
-    const gh = this.gh();
+    const gh = this.host();
     const full = iteration.issuesRepo;
     const scoutId = iteration.scoutId ?? '';
     let own = iteration.issue;
@@ -2683,7 +2819,7 @@ export class IssueBridge {
    */
   private async createStepIssues(iterationId: string, own: IssueRef): Promise<void> {
     const store = this.deps.store;
-    const gh = this.gh();
+    const gh = this.host();
     for (const position of store.getIteration(iterationId).children.map((c) => c.position)) {
       // As recorded now: each step created before this one has its issue.
       const iteration = store.getIteration(iterationId);
@@ -2724,7 +2860,7 @@ export class IssueBridge {
   private async acceptIteration(repo: Repo, iteration: Iteration, auto: boolean): Promise<void> {
     const own = iteration.issue;
     if (iteration.status !== 'pending' || !own) return;
-    const gh = this.gh();
+    const gh = this.host();
     const full = iteration.issuesRepo;
     const accepted = (labels: readonly string[]) => [
       ...new Set([...withStatusLabel(labels, LABELS.ready), ...(auto ? [LABELS.auto] : [])]),
@@ -2786,7 +2922,7 @@ export class IssueBridge {
   private async followIteration(repo: Repo, iteration: Iteration): Promise<void> {
     const own = iteration.issue;
     if (!own) return;
-    const gh = this.gh();
+    const gh = this.host();
     const full = iteration.issuesRepo;
     if (iteration.status === 'pending') {
       const issue = await gh.getIssue(full, own.number);
@@ -2848,7 +2984,7 @@ export class IssueBridge {
     iteration: Iteration,
     own: HostIssue,
   ): Promise<void> {
-    const gh = this.gh();
+    const gh = this.host();
     const store = this.deps.store;
     const full = iteration.issuesRepo;
     const master = await this.masterLogin();
@@ -2989,7 +3125,7 @@ export class IssueBridge {
     const own = iteration.issue;
     if (!own) return iteration;
     const store = this.deps.store;
-    const gh = this.gh();
+    const gh = this.host();
     const full = iteration.issuesRepo;
     await this.createStepIssues(iteration.id, own);
     const written = store.getIteration(iteration.id);
@@ -3027,7 +3163,7 @@ export class IssueBridge {
     issue: HostIssue,
   ): Promise<void> {
     const store = this.deps.store;
-    const gh = this.gh();
+    const gh = this.host();
     const full = iteration.issuesRepo;
     if (!iteration.summaryPosted) {
       const summary = iterationSummary(store, iteration);
@@ -3048,23 +3184,24 @@ export class IssueBridge {
 
   // ---- status ----------------------------------------------------------------------
 
+  /** The platform's section, its repos and the bridge's last poll, for the dashboard. */
   status(): GitHubStatus {
-    const github = this.cfg.master.github;
-    const repos: GitHubRepoStatus[] = Object.entries(github?.repos ?? {}).map(([name, cfg]) => {
+    const section = this.platform.section();
+    const repos: GitHubRepoStatus[] = Object.entries(section?.repos ?? {}).map(([name, cfg]) => {
       const repo = this.deps.store.findRepo(name);
-      const problems = [...(this.cfg.errors[githubConfigKey(name)] ?? [])];
+      const problems = [...(this.cfg.errors[this.platform.configKey(name)] ?? [])];
       if (!repo) problems.push(notRegistered(name));
       return {
         ...this.deps.scouting.sourceStatus(name, cfg, repo, problems, this.scoutWaiting.get(name)),
-        issuesRepo: cfg.issues_repo ?? (repo ? (this.resolved.get(repo.path) ?? null) : null),
+        issuesRepo: this.platform.knownIssuesRepo(repo, cfg),
         push: cfg.push,
         deliver: cfg.deliver,
       };
     });
     return {
-      enabled: github !== undefined,
-      account: github?.account ?? null,
-      pollMinutes: github?.poll_minutes ?? 5,
+      enabled: section !== undefined,
+      account: section?.account ?? null,
+      pollMinutes: this.platform.pollMinutes(),
       lastPollAt: this.lastPollAt,
       lastError: this.lastError,
       repos,

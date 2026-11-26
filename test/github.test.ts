@@ -4051,6 +4051,27 @@ stages:
     expect(mergeRemoteMessage(`${homedir()}/x`)).toBe('Merge new commits from ~/x on GitHub');
   });
 
+  it('names the code host the commits come from in the merge texts', () => {
+    const goal = () =>
+      mergeRemoteGoal({
+        branch: 'main',
+        local: 'a'.repeat(40),
+        remote: 'b'.repeat(40),
+        why: { conflict: true, files: ['README.md'] },
+        host: 'GitLab',
+      });
+    expect(mergeRemoteMessage('main', 'GitLab')).toBe('合并 GitLab 上 main 的新提交');
+    expect(goal().split('\n')[0]).toBe('合并 GitLab 上 main 的提交 bbbbbbb');
+    expect(goal()).toContain('Master 不会把 main 推送到 GitLab');
+    expect(goal()).not.toContain('GitHub');
+    setLang('en');
+    expect(mergeRemoteMessage('main', 'GitLab')).toBe('Merge new commits from main on GitLab');
+    expect(goal().split('\n')[0]).toBe('Merge commit bbbbbbb from main on GitLab');
+    expect(goal()).toContain('the Master pushes nothing of main to GitLab');
+    expect(goal()).not.toContain('GitHub');
+    expect(goal()).not.toMatch(/[一-鿿]/);
+  });
+
   it('keeps the target branch when the checks fail on the merge, hands it to a Run and does not try that again', async () => {
     const t = await start(config({ push: true }));
     // The Run stays in the queue, its setup commands not run.
