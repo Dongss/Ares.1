@@ -3,12 +3,16 @@ import { z } from 'zod';
 import { LABELS } from '../github/issues.js';
 import {
   type ChangeRequest,
+  type ChangeRequestStatus,
   type CodeHost,
   forcePushable,
   type HostAuthored,
+  type HostCheck,
   type HostComment,
   type HostIssue,
+  type HostReview,
   type LabelDef,
+  type ReviewVerdict,
 } from '../host/code-host.js';
 import { t } from '../i18n.js';
 
@@ -19,10 +23,14 @@ export class GlabError extends Error {}
 const MAX_PAGE = 100;
 
 /**
- * The most pages of a project's labels `ensureLabels` reads. A project has far fewer labels; the
- * limit only keeps a server that ignores `page` from being asked forever.
+ * The most pages of a list the client reads: a project's labels, a merge request's discussions,
+ * a pipeline's jobs. They have far fewer; the limit only keeps a server that ignores `page` from
+ * being asked forever.
  */
-const MAX_LABEL_PAGES = 20;
+const MAX_PAGES = 20;
+
+/** The most review comments of a merge request the client gives: the latest. */
+const MAX_REVIEW_COMMENTS = 100;
 
 /**
  * How long the client keeps what it learned of a member's access level. Long enough that a round
@@ -99,6 +107,21 @@ function parseOutput<T>(out: string, schema: z.ZodType<T>, command: string): T {
     );
   }
   return parsed.data;
+}
+
+/**
+ * An entry of a list, read with `schema`, or null for one that does not fit it: of a kind or a
+ * status GitLab added later, or without a field the client needs. One such entry must not make a
+ * whole merge request unreadable, which would keep its Run waiting for good, even once merged; it
+ * is skipped rather than guessed at (a job of a status the client does not know taken for one
+ * still running would keep a failed job from ever sending the Run back). Fields the schema does
+ * not name are left out.
+ */
+function skippable<T>(schema: z.ZodType<T>): z.ZodType<T | null> {
+  return z.preprocess(
+    (entry) => (schema.safeParse(entry).success ? entry : null),
+    schema.nullable(),
+  );
 }
 
 /** Whether `path` is a GitLab project's path: "group/name" or "group/sub/.../name". */
@@ -199,8 +222,11 @@ function sameLabel(raw: RawLabel, def: LabelDef): boolean {
   );
 }
 
-/** An account as GitLab names the author of an issue or a note; absent when it gave none. */
-const RawUser = z.object({ id: z.number().int(), username: z.string() }).nullish();
+/** An account as GitLab names it. */
+const RawAccount = z.object({ id: z.number().int(), username: z.string() });
+
+/** The author of an issue or a note; absent when GitLab gave none. */
+const RawUser = RawAccount.nullish();
 type RawUser = z.infer<typeof RawUser>;
 
 /** An issue as GitLab returns it. */
@@ -350,6 +376,130 @@ function fromRawMergeRequest(raw: RawMergeRequest): ChangeRequest {
   };
 }
 
+/** A merge request read alone, with what `getChangeRequest` needs besides the mapping. */
+const RawMergeRequestStatus = RawMergeRequest.extend({
+  /** The commit the source branch points at: the head. */
+  sha: z.string().min(1),
+  /**
+   * The pipeline of the head, merged-results pipelines included; none before one runs, and none
+   * when the project has no CI or the account may not see its pipelines.
+   */
+  head_pipeline: z.object({ id: z.number().int().positive() }).nullish(),
+});
+
+/** Who approved a merge request, as `merge_requests/:iid/approvals` lists them. */
+const RawApprover = z.object({ user: RawAccount, approved_at: z.string().nullish() });
+
+/**
+ * What `merge_requests/:iid/approvals` says of a merge request. approvals_required and
+ * approvals_left come with approval rules (GitLab Premium); without them nothing is required.
+ */
+const RawApprovals = z.object({
+  approved: z.boolean().nullish(),
+  approvals_required: z.number().int().nullish(),
+  approvals_left: z.number().int().nullish(),
+  approved_by: z.array(skippable(RawApprover)).nullish(),
+});
+type RawApprovals = z.infer<typeof RawApprovals>;
+
+/**
+ * A reviewer of a merge request as `merge_requests/:iid/reviewers` lists them. Their state:
+ * unreviewed, review_started, reviewed, requested_changes, approved, unapproved, ...
+ */
+const RawReviewer = z.object({ user: RawAccount, state: z.string() });
+
+/**
+ * A note of a merge request's discussions that is on a line of its changes. The position says
+ * where: new_path and new_line on the changed file, old_path and old_line on a line removed, and
+ * head_sha the head the note was written on.
+ */
+const RawDiffNote = z.object({
+  type: z.literal('DiffNote'),
+  body: z.string().nullish(),
+  author: RawUser,
+  created_at: z.string().refine((at) => !Number.isNaN(Date.parse(at))),
+  /** Written by GitLab itself, not by a person. */
+  system: z.boolean().nullish(),
+  /** Whether it can be resolved, and whether it was. */
+  resolvable: z.boolean().nullish(),
+  resolved: z.boolean().nullish(),
+  position: z
+    .object({
+      new_path: z.string().nullish(),
+      old_path: z.string().nullish(),
+      new_line: z.number().int().nullish(),
+      old_line: z.number().int().nullish(),
+      head_sha: z.string().nullish(),
+    })
+    .refine((p) => Boolean(p.new_path || p.old_path)),
+});
+type RawDiffNote = z.infer<typeof RawDiffNote>;
+
+/** A discussion of a merge request: a thread of notes, any note that is no DiffNote skipped. */
+const RawDiscussion = z.object({ notes: z.array(skippable(RawDiffNote)) });
+
+/** How a job of a pipeline stands, by its status. */
+type JobOutcome = 'running' | 'passed' | 'failed';
+
+/**
+ * GitLab's statuses of a job by how it stands. A manual job waiting for somebody to play it
+ * counts as done; a canceled one as failed, as its work was not done.
+ */
+const JOB_STATUSES: ReadonlyMap<string, JobOutcome> = new Map([
+  ['created', 'running'],
+  ['pending', 'running'],
+  ['running', 'running'],
+  ['preparing', 'running'],
+  ['waiting_for_resource', 'running'],
+  ['scheduled', 'running'],
+  ['canceling', 'running'],
+  ['waiting_for_callback', 'running'],
+  ['success', 'passed'],
+  ['skipped', 'passed'],
+  ['manual', 'passed'],
+  ['failed', 'failed'],
+  ['canceled', 'failed'],
+]);
+
+/** A job of a pipeline, of a status the client knows. */
+const RawJob = z.object({
+  name: z.string(),
+  status: z.string().refine((status) => JOB_STATUSES.has(status)),
+  /** A job that may fail: its failure fails nothing. */
+  allow_failure: z.boolean().nullish(),
+  web_url: z.string().nullish(),
+});
+type RawJob = z.infer<typeof RawJob>;
+
+/**
+ * A job as a check: GitLab's status kept, once it is done, as the conclusion. allow_failure
+ * excuses a failure only: a canceled job's work was not done either way.
+ */
+function fromRawJob(raw: RawJob): HostCheck {
+  const outcome = JOB_STATUSES.get(raw.status) ?? 'running';
+  const done = outcome !== 'running';
+  const allowed = raw.status === 'failed' && raw.allow_failure === true;
+  return {
+    name: raw.name,
+    done,
+    failed: outcome === 'failed' && !allowed,
+    conclusion: done ? raw.status : null,
+    url: raw.web_url || null,
+  };
+}
+
+/**
+ * Where the merge request stands with its approvals: changes requested by any reviewer first;
+ * else, when the project requires approvals, whether they were given; none required, no verdict.
+ */
+function reviewVerdict(approvals: RawApprovals, changesRequested: boolean): ReviewVerdict | null {
+  if (changesRequested) return 'changes_requested';
+  if ((approvals.approvals_required ?? 0) <= 0) return null;
+  return approvals.approvals_left === 0 || approvals.approved === true
+    ? 'approved'
+    : 'review_required';
+}
+
 type Method = 'GET' | 'POST' | 'PUT' | 'DELETE';
 
 /**
@@ -358,33 +508,11 @@ type Method = 'GET' | 'POST' | 'PUT' | 'DELETE';
  * "group/subgroup/name", and the number of an issue or a merge request is its iid, the one in
  * its link. With `host`, every call goes to that GitLab (a self-hosted one), else to the one glab
  * picks, and git pushes to and fetches from it over https, else from gitlab.com. With `account`,
- * the client checks it is the account glab is logged in as. Authors are trusted by their access
- * level to the project (`gitlabAuthor`), which the client asks GitLab for and keeps a few minutes.
+ * the client checks it is the account glab is logged in as. Authors (of issues, notes, approvals
+ * and reviews) are trusted by their access level to the project (`gitlabAuthor`), which the client
+ * asks GitLab for and keeps a few minutes.
  */
-export class GlabCli
-  implements
-    Pick<
-      CodeHost,
-      | 'resolveRepo'
-      | 'viewer'
-      | 'ensureLabels'
-      | 'listIssues'
-      | 'listNotPlannedIssues'
-      | 'getIssue'
-      | 'getLabels'
-      | 'setLabels'
-      | 'comment'
-      | 'listComments'
-      | 'close'
-      | 'createIssue'
-      | 'editIssue'
-      | 'push'
-      | 'fetch'
-      | 'findOpenChangeRequest'
-      | 'createChangeRequest'
-      | 'closeChangeRequest'
-    >
-{
+export class GlabCli implements CodeHost {
   private readonly host: string | undefined;
   private readonly account: string | undefined;
   /**
@@ -454,16 +582,23 @@ export class GlabCli
     return parseOutput(await this.api(method, path, body), schema, `glab api -X ${method} ${path}`);
   }
 
-  /** The labels the project can use, its groups' labels included. */
-  private async projectLabels(project: string): Promise<RawLabel[]> {
-    const labels: RawLabel[] = [];
-    for (let page = 1; page <= MAX_LABEL_PAGES; page++) {
-      const path = `projects/${project}/labels?per_page=${MAX_PAGE}&page=${page}`;
-      const found = await this.read(path, z.array(RawLabel));
-      labels.push(...found);
+  /**
+   * Every entry of the list at `path` (without a query), each read with `entry`: page after page
+   * of the most entries a page holds, until a page is not full (or MAX_PAGES).
+   */
+  private async pages<T>(path: string, entry: z.ZodType<T>): Promise<T[]> {
+    const all: T[] = [];
+    for (let page = 1; page <= MAX_PAGES; page++) {
+      const found = await this.read(`${path}?per_page=${MAX_PAGE}&page=${page}`, z.array(entry));
+      all.push(...found);
       if (found.length < MAX_PAGE) break;
     }
-    return labels;
+    return all;
+  }
+
+  /** The labels the project can use, its groups' labels included. */
+  private projectLabels(project: string): Promise<RawLabel[]> {
+    return this.pages(`projects/${project}/labels`, RawLabel);
   }
 
   /**
@@ -754,6 +889,91 @@ export class GlabCli
       z.object({ iid: z.number().int().positive(), web_url: z.string().min(1) }),
     );
     return { number: created.iid, url: created.web_url };
+  }
+
+  /**
+   * The merge request with its approvals, the reviewers who asked for changes, its unresolved line
+   * comments while it is open, and the jobs of its head pipeline. Approvals, reviewers, notes or
+   * jobs of a kind, a state or a status the client does not know, or without the fields it needs,
+   * are left out; the merge request itself must be read in full, and any call that fails fails
+   * the whole read.
+   */
+  async getChangeRequest(repo: string, number: number): Promise<ChangeRequestStatus> {
+    const project = projectId(repo);
+    const path = `projects/${project}/merge_requests/${number}`;
+    const raw = await this.read(path, RawMergeRequestStatus);
+    const mr = fromRawMergeRequest(raw);
+    const approvals = await this.read(`${path}/approvals`, RawApprovals);
+    const reviewers = await this.read(`${path}/reviewers`, z.array(skippable(RawReviewer)));
+    // What was said on the lines matters only while the work may still change.
+    const notes = mr.state === 'open' ? await this.diffNotes(path) : [];
+    // The jobs as they are now: a job retried counts by its latest run only (include_retried is
+    // off by default).
+    const jobs = raw.head_pipeline
+      ? await this.pages(
+          `projects/${project}/pipelines/${raw.head_pipeline.id}/jobs`,
+          skippable(RawJob),
+        )
+      : [];
+
+    const approvers = (approvals.approved_by ?? []).flatMap((a) => (a ? [a] : []));
+    const asking = reviewers.flatMap((r) => (r?.state === 'requested_changes' ? [r] : []));
+    // Everybody the merge request involves, asked about together.
+    const authors = await this.authors(project, [
+      ...approvers.map((a) => a.user),
+      ...asking.map((r) => r.user),
+      ...notes.map((n) => n.author),
+    ]);
+    const reviews: HostReview[] = [
+      ...approvers.map((a) => ({
+        ...authors(a.user),
+        state: 'approved' as const,
+        body: '',
+        commit: null,
+        submittedAt: a.approved_at || null,
+      })),
+      // GitLab gives a reviewer's state without the commit it was set on. It stands for the head
+      // as it is now: the state holds until the reviewer changes it, and judgePullRequest acts
+      // only on a request for changes on the head. A Run is sent back for it once per head; after
+      // it pushes a new head, a reviewer who still asks for changes sends it back once more.
+      ...asking.map((r) => ({
+        ...authors(r.user),
+        state: 'changes_requested' as const,
+        body: '',
+        commit: raw.sha,
+        submittedAt: null,
+      })),
+    ];
+    return {
+      ...mr,
+      headRefOid: raw.sha,
+      reviewVerdict: reviewVerdict(approvals, asking.length > 0),
+      reviews,
+      reviewComments: notes.map((n) => ({
+        ...authors(n.author),
+        body: n.body ?? '',
+        path: n.position.new_path || n.position.old_path || '',
+        line: n.position.new_line ?? n.position.old_line ?? null,
+        commit: n.position.head_sha || null,
+      })),
+      checks: jobs.flatMap((j) => (j ? [fromRawJob(j)] : [])),
+    };
+  }
+
+  /**
+   * The comments on lines of the merge request's changes still to be resolved, people's only: the
+   * latest (up to MAX_REVIEW_COMMENTS), oldest first. GitLab lists the discussions oldest first,
+   * a page at a time, so all of them are read.
+   */
+  private async diffNotes(mrPath: string): Promise<RawDiffNote[]> {
+    const discussions = await this.pages(`${mrPath}/discussions`, skippable(RawDiscussion));
+    return discussions
+      .flatMap((d) => d?.notes ?? [])
+      .flatMap((n) =>
+        n && n.resolvable === true && n.resolved !== true && n.system !== true ? [n] : [],
+      )
+      .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at))
+      .slice(-MAX_REVIEW_COMMENTS);
   }
 
   async closeChangeRequest(repo: string, number: number, comment: string): Promise<void> {
