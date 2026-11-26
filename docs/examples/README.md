@@ -35,8 +35,8 @@ cp docs/examples/workflows/*.yaml ~/.ares1/workflows/
 | 设置 | 在哪里 |
 |---|---|
 | 语言、端口、CLI 路径（`bins`）、Agent 执行和命令的超时、同一仓库同时执行几个 Run、系统通知、自动升级 | `config.yaml` |
-| 仓库接不接 GitHub、用哪个模板、侦察、自动采纳、自动合并、推送、每日预算、一个 issue 最多跑几次 | `config.yaml` 的 `github.repos.<仓库名>` |
-| 托管在 GitLab 上的仓库：在哪个项目读写 issue（必填）、用哪个模板、侦察、自动采纳、自动合并、推送、每日预算、一个 issue 最多跑几次；GitLab 的主机名和账号 | `config.yaml` 的 `gitlab.repos.<仓库名>`（不能和 `github.repos` 重名）；`gitlab.host`、`gitlab.account` |
+| 仓库接不接 GitHub、用哪个模板、侦察、自动采纳、自动合并、推送、推送还是开 PR 交付（`deliver`）、每日预算、一个 issue 最多跑几次 | `config.yaml` 的 `github.repos.<仓库名>` |
+| 托管在 GitLab 上的仓库：在哪个项目读写 issue（必填）、用哪个模板、侦察、自动采纳、自动合并、推送、推送还是开 MR 交付（`deliver`）、每日预算、一个 issue 最多跑几次；GitLab 的主机名和账号 | `config.yaml` 的 `gitlab.repos.<仓库名>`（不能和 `github.repos` 重名）；`gitlab.host`、`gitlab.account` |
 | 不接 GitHub 和 GitLab 的仓库用本地提案池：用哪个模板、侦察、自动采纳、自动合并、每日预算 | `config.yaml` 的 `backlog.repos.<仓库名>`（不能和 `github.repos`、`gitlab.repos` 重名） |
 | 有哪些 Agent：CLI、模型、effort、权限、档次、价格、超时、额外参数 | `agents.yaml` |
 | 流程：有哪些阶段、谁来做、返工和回退的次数、出错时怎么办、单个 Run 的预算、哪里要人审批、命令阶段运行什么 | `workflows/*.yaml` |

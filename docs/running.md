@@ -110,7 +110,7 @@ Master 第一次访问仓库时会自动创建这些标签：
 | `ares1:proposal` | AI 侦察提出的需求，等你决定。采纳就加 `ares1:ready`，不做就关闭为 not planned 并写一句理由 |
 | `ares1:ready` | 可以开工。你自己写的 issue 加上它也会被做 |
 | `ares1:running` | 正在做 |
-| `ares1:needs-you` | 等你处理：审批、卡住、需求待讨论（在 issue 下回复即可）、在看板上确认非仓库成员写的需求，或在 GitHub 上审 PR、合并（`deliver: pr`） |
+| `ares1:needs-you` | 等你处理：审批、卡住、需求待讨论（在 issue 下回复即可）、在看板上确认非仓库成员写的需求，或在 GitHub 上审 PR、在 GitLab 上审 MR 并合并（GitHub 的 `deliver: pr`、GitLab 的 `deliver: mr`） |
 | `ares1:failed` | 被终止，或失败次数达到上限后不再自动重做。重新加 `ares1:ready` 会再做一次 |
 | `ares1:auto` | 按 `auto_accept` 的设置自动采纳的 |
 | `ares1:iteration` | AI 侦察规划的迭代：一个大目标和按依赖排好的子 issue。给它加 `ares1:ready` 就整批采纳，关掉它就整批不做（见「迭代」）；它自己从不建 Run |
@@ -118,7 +118,7 @@ Master 第一次访问仓库时会自动创建这些标签：
 
 AI 侦察、自动采纳、自动合并、推送和每日预算的设置写在 `config.yaml` 的注释里；[`docs/examples/config.yaml`](examples/config.yaml) 有登记了多个仓库、各用不同设置的完整示例。
 
-`github.repos.<name>.deliver` 决定 Run 的代码怎么交到 GitHub 上：
+`github.repos.<name>.deliver` 决定 Run 的代码怎么交到 GitHub 上（GitLab 仓库对应的设置是 `deliver: mr`，走的是同一套流程，见「接入 GitLab」的「通过 MR 交付」）：
 
 - `push`（默认）：合并阶段把 Run 合并进本地目标分支，`push: true` 时之后推送目标分支。不写时就是这样。
 - `pr`：给目标分支受保护、只能走 PR 或要过 CI 的仓库用。合并阶段照常先把目标分支的新提交合进 Run 分支、跑检查，但不动本地目标分支，而是推送 Run 分支、开一个以目标分支为 base 的 PR，PR 在 GitHub 上合并后 Run 才完成；Master 不直接推送这个仓库的目标分支。`pr` 要求 `push: true`（推送 Run 分支、PR 合并后拉取目标分支都靠它），不满足时这个仓库停用，看板「配置」页在 `config.yaml#github.repos.<name>` 下写明原因；这期间它的 Run 检查通过后也不在本地合并，停在合并阶段等配置改好。`GET /api/github` 里每个仓库的 `deliver` 是这个设置。
@@ -437,7 +437,7 @@ GitLab 仓库按作者对项目的权限判断：Developer 及以上（Developer
 
 ## 接入 GitLab
 
-托管在 GitLab 上的仓库（gitlab.com 或自建的 GitLab）写在 `config.yaml` 的 `gitlab.repos` 里，Run 从 GitLab issue 来。做法和「接入 GitHub」一样，用的是同一份代码：标签和它们的含义、侦察和自动采纳、迭代（迭代 issue、子 issue 页脚的隐藏标记、计划里的任务列表）、依赖门、Run 失败后自动重做、Run 期间改了 issue、拉取目标分支上的新提交和分叉时自动合并、只信任能改仓库的人写的内容、Master 评论的隐藏标记和去掉用户目录，都按上面 GitHub 的说明。下面只写怎样登记，以及和 GitHub 不一样的地方。
+托管在 GitLab 上的仓库（gitlab.com 或自建的 GitLab）写在 `config.yaml` 的 `gitlab.repos` 里，Run 从 GitLab issue 来。做法和「接入 GitHub」一样，用的是同一份代码：标签和它们的含义、侦察和自动采纳、迭代（迭代 issue、子 issue 页脚的隐藏标记、计划里的任务列表）、依赖门、Run 失败后自动重做、Run 期间改了 issue、拉取目标分支上的新提交和分叉时自动合并、通过 PR 交付和 PR 返工（GitLab 上是 MR，见下面的「通过 MR 交付」）、只信任能改仓库的人写的内容、Master 评论的隐藏标记和去掉用户目录，都按上面 GitHub 的说明。下面只写怎样登记，以及和 GitHub 不一样的地方。
 
 ### 登记 GitLab 仓库
 
@@ -464,7 +464,7 @@ GitLab 仓库按作者对项目的权限判断：Developer 及以上（Developer
          push: true
    ```
 
-4. 给要做的 issue 加上 `ares1:ready` 标签。Master 每 `gitlab.poll_minutes` 分钟检查一次，把它建成 Run，进展回写到 issue 上，完成后关闭 issue，`push: true` 时把目标分支推送到 GitLab。Master 第一次访问项目时自动创建 `ares1:*` 标签（见「接入 GitHub」里的表格，另加下面说的 `ares1:not-planned`）；项目所属的组已经有同名标签时直接用组的。
+4. 给要做的 issue 加上 `ares1:ready` 标签。Master 每 `gitlab.poll_minutes` 分钟检查一次，把它建成 Run，进展回写到 issue 上，完成后关闭 issue，`push: true` 时把目标分支推送到 GitLab（`deliver: mr` 时不推送目标分支，而是开 MR，见下面的「通过 MR 交付」）。Master 第一次访问项目时自动创建 `ares1:*` 标签（见「接入 GitHub」里的表格，另加下面说的 `ares1:not-planned`）；项目所属的组已经有同名标签时直接用组的。
 
 改了保存后自动生效，不用重启（`bins` 除外）。不写 `gitlab` 就不接 GitLab。[`docs/examples/config.yaml`](examples/config.yaml) 里有一个 GitLab 仓库的完整示例（`my-gitlab-service`）。
 
@@ -476,8 +476,8 @@ GitLab 仓库按作者对项目的权限判断：Developer 及以上（Developer
 - `repos`：键是看板「仓库」页登记的仓库名，必须和那里的一模一样；写在这里但没登记的仓库什么都不做。每个仓库：
   - `issues_repo`：必填，项目在 GitLab 上的路径，写成 `group/name`；在子组里的要把子组写全：`group/subgroup/name`（几层都行），也就是项目链接 `https://<host>/` 后面那一段。Master 不从本地仓库的 remote 推断。少了它或格式不对时 `config.yaml` 校验不通过。
   - `template`、`scout`、`auto_accept`、`auto_merge`、`daily_budget_usd`、`max_run_attempts`：含义、默认值和校验都和 `github.repos` 里的同名字段一样（三种来源用同一份格式定义）；模板也一样先在数据目录的 `workflows/` 里找，再在仓库自带的 `.ares1/workflows/` 里找。
-  - `push`：默认 `false`。`true` 时合并后把目标分支推送到 GitLab，每轮检查时先从 GitLab 拉取目标分支，规则和「拉取 GitHub 上的新提交」一样（包括分叉时自动合并、交给 Run 合并）。`false` 时只合并到本地目标分支，也不拉取，issue 照样关闭并注明。
-  - `deliver`：目前只支持 `push`（默认）：合并进本地目标分支，`push: true` 时推送。还不支持 MR，写 `pr`、`mr` 或别的值时 `config.yaml` 校验不通过。
+  - `push`：默认 `false`。`true` 时合并后把目标分支推送到 GitLab（`deliver: mr` 时改为推送 Run 分支、开 MR），每轮检查时先从 GitLab 拉取目标分支，规则和「拉取 GitHub 上的新提交」一样（包括分叉时自动合并、交给 Run 合并）。`false` 时只合并到本地目标分支，也不拉取，issue 照样关闭并注明。
+  - `deliver`：Run 的代码怎么交到 GitLab 上，对应 GitHub 的 `deliver`。`push`（默认）：合并阶段把 Run 合并进本地目标分支，`push: true` 时之后推送目标分支。`mr`：给目标分支受保护、只能走 MR、要过流水线或审批的项目用，不动本地目标分支，推送 Run 分支、开 MR，MR 在 GitLab 上合并后 Run 才完成，见下面的「通过 MR 交付」；要求 `push: true`。GitLab 这里写 `mr`，不写 GitHub 的 `pr`；写 `pr` 或别的值时 `config.yaml` 校验不通过。
 
 `config.yaml` 校验不通过时，整个文件不生效：Master 运行中改坏的，继续用上一份有效的配置，事件列表里记一条 `config.reload_failed`，看板「配置」页写明原因；启动时就不通过的，Master 打印原因后退出。某个仓库配置有误（比如模板不存在、侦察用的 Agent 不存在或没启用）时只停用这个仓库，看板「配置」页在 `config.yaml#gitlab.repos.<仓库名>` 下写明原因，别的仓库照常工作。
 
@@ -487,14 +487,32 @@ GitLab 仓库按作者对项目的权限判断：Developer 及以上（Developer
 
 ### 权限
 
-- **glab 登录的账号**：Master 用它建标签、改 issue 的标签和正文、写评论、关闭 issue，这些项目的 Reporter 就能做；推送目标分支（`push: true`）要 Developer 及以上。目标分支受保护时（GitLab 默认保护项目的默认分支，只有 Maintainer 能推送），这个账号要在受保护分支的「允许推送」名单里，比如给它 Maintainer，或者把这个分支的「允许推送」放宽到 Developer。推送被拒、没登录、没有权限时记 `github.error`（数据带 `platform: 'gitlab'`），通知「GitLab 访问失败」，看板「需求」页的 GitLab 一节写明错误，修好后下一轮自动重试。
+- **glab 登录的账号**：Master 用它建标签、改 issue 的标签和正文、写评论、关闭 issue，这些项目的 Reporter 就能做；推送目标分支（`push: true`）要 Developer 及以上。目标分支受保护时（GitLab 默认保护项目的默认分支，只有 Maintainer 能推送），这个账号要在受保护分支的「允许推送」名单里，比如给它 Maintainer，或者把这个分支的「允许推送」放宽到 Developer。`deliver: mr` 时 Master 不推送目标分支，只推送 `ares1/` 开头的 Run 分支、开 MR、在 MR 上留言和关闭 MR，Developer 就够，目标分支可以只允许通过 MR 合并；Run 分支要强制推送，所以别把 `ares1/` 开头的分支设成受保护分支。推送被拒、没登录、没有权限时记 `github.error`（数据带 `platform: 'gitlab'`），通知「GitLab 访问失败」，看板「需求」页的 GitLab 一节写明错误，修好后下一轮自动重试。
 - **受信任的作者**：GitLab 没有 GitHub 的 `authorAssociation`，Master 按作者对这个项目的权限判断：Developer、Maintainer、Owner（从所属的组继承来的也算）受信任，他们本来就能改这个项目；Guest、Planner、Reporter、不是成员的人和被停用的账号都不受信任。Master 自己用的账号（`gitlab.account`，没写时是 glab 登录的账号）也受信任。成员的权限查一次记 5 分钟，所以改了项目成员后几分钟内生效。其余规则和「只信任仓库成员写的内容」一样：不受信任的人写的评论不进提示词；他们开的 issue 加上 `ares1:ready` 后照常建 Run，但 Run 一建好就停在「issue 作者不是仓库成员，等你确认需求」（`untrusted_issue`），issue 打上 `ares1:needs-you`，等你在 Run 详情页读过目标、点「确认并开始」。
 - **Agent 拿不到 glab 的凭据**：和 gh 一样，Agent 和准备命令、检查命令在去掉了 GitLab token 的环境里运行，见「Agent 拿不到 GitHub 和 GitLab 凭据」。
+
+### 通过 MR 交付（`deliver: mr`）
+
+目标分支受保护、只接受 MR、要过流水线或审批的项目，把 `gitlab.repos.<name>.deliver` 设成 `mr`。用的是和 GitHub 的 `deliver: pr` 同一份代码（见「接入 GitHub」里 `deliver: pr` 的说明），Run 的状态（`pr_open`）、事件、Run 数据里的 `pr` 和去重、重启后接着跟踪这些规则都一样，只是 PR 换成了 MR。下面写 GitLab 上具体怎么做：
+
+- **配置**：`mr` 要求 `push: true`（推送 Run 分支、MR 合并后拉取目标分支都靠它），不满足时这个仓库停用，看板「配置」页在 `config.yaml#gitlab.repos.<name>` 下写明「deliver: mr 要求 push: true」；这期间它的 Run 检查通过后也不在本地合并，停在合并阶段等配置改好。`GET /api/gitlab` 里每个仓库的 `deliver` 是这个设置。
+- **开 MR**：合并阶段照常先把目标分支的新提交合进 Run 分支、跑检查，但不动本地目标分支：记 `merge.pr_pending`，Run 进入「等 MR 合并」（状态是 `blocked`，`blocked.kind` 为 `pr_open`，不占执行名额，不发通知，不能在看板上重试）。随后 Master 把 Run 分支强制推送到 `issues_repo` 这个项目（只推 `ares1/` 开头的 Run 分支），再开一个从 Run 分支到目标分支的 MR；Master 不推送目标分支。这个分支上已经有开着、目标是目标分支的 MR 时直接用它，不开第二个；只认源分支在这个项目里的 MR，分叉项目里同名分支开的不算。MR 的标题是目标的第一行，描述是 Run 摘要；从 issue 来的 Run 在描述末尾写 `Closes #N`（issue 在别的项目时写 `Closes group/name#N`）。开好后记 `github.pr_opened`，issue 上发一条带 MR 链接的评论（「已开 MR !N」），标签换成 `ares1:needs-you`。推送或开 MR 失败时记 `github.error`（数据带 `platform: 'gitlab'`），Run 保持原样，下一轮再试。
+- **等着**：MR 等人审批、等流水线跑完、等人点合并时，Run 一直等，不算卡住。
+- **合并后**：MR 在 GitLab 上合并了（合并提交、squash、快进合并都算），Master 先把本地目标分支快进到 GitLab 上的提交（记 `github.pulled`），再记 `github.pr_merged` 和 `merge.done`，合并阶段通过，Run 完成，工作目录和分支随之删除；issue 上评论「MR !N 已合并到 `<目标分支>`」。GitLab 只在 MR 合进项目的默认分支、并且项目开着「自动关闭引用的 issue」时才按 `Closes #N` 关 issue，所以 issue 还开着时 Master 自己按完成关闭它（不加 `ares1:not-planned`）。本地目标分支暂时快进不了时（检出的地方有未提交的改动等），Run 接着等，下一轮再试。
+- **没合并就被关掉**：Run 结束为失败，记 `github.pr_closed`，按「Run 失败了」通知；从 issue 来的按「Run 失败后自动重做」处理，重做的 Run 用自己的分支开新的 MR，被关掉的 MR 保持关闭。
+- **返工**：MR 还开着时，Master 每轮检查（Run 状态变化后的同步也会）向 GitLab 查一遍 MR，只看 MR 当前的 head 提交，而且它要是 Run 推送上去的那个。下面三种情况任何一种出现，Run 就带着反馈回到合并阶段 `on_fail` 指向的阶段（默认是编码），和别的回退一样计入 `max_loops`，用完后按 `on_exhausted` 处理；一轮里出现几种时只返工一次，反馈里每种都写上；同一个 head 上的同一类问题只返工一次：
+  - 要求修改：MR 的评审人里有受信任的人（项目的 Developer 及以上，从组继承来的也算，以及 Master 自己用的账号）提交评审时选了「要求修改」（Request changes），评审人的状态是要求修改。GitLab 不记这个状态是在哪个提交上设的，Master 把它当作对当前 head 的：同一个 head 上只返工一次；返工后推送了新的 head，评审人的状态还是要求修改时会再返工一次；状态不再是要求修改（比如他批准了，或者 MR 的作者重新请求了评审）之后不再触发。反馈里有这些评审人，以及受信任的人在当前 head 上留下、还没解决的行内讨论（`文件:行` 和内容）。只有没解决的讨论、没有评审人要求修改时不触发返工。不受信任的人（Reporter、Guest、不是成员的人等）要求修改不触发返工，他们写的内容也不进提示词，只记一条 `github.pr_review_ignored`，`association` 是他在项目里的权限名（比如 `REPORTER`，不是成员时是 `NONE`）；同一个 head 上同一个人只记一次。
+  - 流水线没通过：MR 的 head 流水线（合并结果流水线也算）的 job 全部结束，并且至少一个失败或被取消。允许失败（`allow_failure`）的 job 失败了不算；等人手动触发的 job 和跳过的 job 算已结束、没失败；重试过的 job 只看最近一次。还有 job 在跑时等下一轮再看；没有流水线（项目没配 CI，或者 Master 的账号看不到流水线）时不触发。反馈里有每个失败 job 的名称、状态和链接，打不开日志时让 Agent 在工作目录里运行相应的命令复现。
+  - 和目标分支冲突：GitLab 说 MR 有冲突（`has_conflicts`，或者 `detailed_merge_status` 是 `conflict`、`broken_status`）才算；GitLab 还在计算（`checking`、`unchecked` 等）时等下一轮再看。只是在等审批、等流水线的不算冲突。有冲突、回到的又是 Agent 阶段时，那一轮先合并目标分支、解决冲突。
+  - 返工时合并阶段这一轮记为没通过（加一条 `merge` 检查，写明「MR !N 需要返工」和原因），记 `github.pr_rework`，issue 上评论「MR !N 需要返工：原因」（原因写冲突、没通过的 job 的名称和要求修改的人），说明改好后推送到同一个 MR；Run 回到队列后，issue 的标签由 `ares1:needs-you` 换回 `ares1:running`。返工不发通知，回退用完后停下来等人或失败时照常通知。
+- **推送到同一个 MR**：返工期间 Run 的 `pr` 不变。Run 改完、再次走到合并阶段并等 MR 合并时，Master 把 Run 分支强制推送上去，同一个 MR 随之更新，不开第二个；记 `github.pr_updated`，issue 上评论「返工后的提交已推送到 MR !N」。人直接推到 GitLab 上 Run 分支的提交会被覆盖，要改请在 MR 上要求修改、让 Run 返工。返工期间 MR 被关掉或合并了的，Run 再次等 MR 合并时不推送，按 MR 的状态失败或完成。
+- **Run 没做完就结束时**：记着 MR 的 Run 失败、被终止（在看板上终止，issue 被关掉，或 issue 的标题、正文改了而重新开始）或被需求评估放弃后，Master 在下一轮检查 GitLab 时（Run 状态变化后的同步也会）查这个 MR：还开着的，先在 MR 上留一条评论说明原因（Run 失败了、被终止了、issue 被关掉或改了，从 issue 来的 Run 失败时还说明重做时新的 Run 会开新的 MR；带 Master 评论的隐藏标记，用户主目录的路径换成 `~`），再把它关掉，记 `github.pr_closed_by_master`；已经合并或关掉的不动，记 `github.pr_found_closed`。这一步在每轮为新 Run 开 MR 之前，所以同一时刻一个 issue 只有一个开着的 MR。关 MR 或查 MR 失败时记 `github.error`，下一轮再试。不另发通知。
+- **事件**：和 PR 的一样（`merge.pr_pending`、`github.pr_opened`、`github.pr_merged`、`github.pr_closed`、`github.pr_rework`、`github.pr_updated`、`github.pr_review_ignored`、`github.pr_closed_by_master`、`github.pr_found_closed`），`github.pr_*` 的数据里多一个 `platform: 'gitlab'`，`number` 是 MR 在项目里的编号（`!N` 里的 N），`url` 是 MR 的链接；`github.pr_rework` 的 `checks` 是没通过的 job。事件页、Run 详情页、issue 上的评论和 MR 的描述都写 MR 和 `!N`，GitHub 仓库照旧写 PR 和 `#N`。
 
 ### 和 GitHub 不一样的地方
 
 - **关成「不做」靠标签**：GitLab 关闭 issue 时不带原因，Master 用 `ares1:not-planned` 标签区分。它自己把 issue 关成不做时（多次失败后放弃、迭代被关掉时随之不做的子 issue 等）同时加上这个标签，以完成关闭时去掉它；读 issue 时有这个标签的算关成不做，没有的一律算完成。所以你不做某个提案时，关闭的同时要加上这个标签并写一句理由，比如写一条评论：第一行写理由，下面两行分别是 GitLab 的快捷命令 `/label ~"ares1:not-planned"` 和 `/close`。只关闭不加标签的提案，侦察会当成已经做完的需求；迭代的子 issue 只关闭不加标签，会被当作完成，依赖它的子 issue 随之开工。迭代 issue 本身被关掉，不管有没有这个标签，都算人关掉了迭代。GitHub 上也会建这个标签，但不用它。
-- **只能推送交付**：没有 `deliver: pr`，上面「接入 GitHub」里开 PR、跟踪 PR、PR 返工的那些都不适用。
+- **MR 代替 PR**：通过合并请求交付时写 `deliver: mr`，不写 `pr`；编号写成 `!N`；「CI 检查」换成 MR 的 head 流水线的 job，「评审要求修改」看的是评审人的状态。细节见上面的「通过 MR 交付」。
 - **链接和编号**：issue 的编号是它在项目里的编号（链接里的那个），链接是 `https://<host>/<项目路径>/-/issues/<编号>`；评论、迭代计划里的 `#N` 照样指向同一个项目里的 issue。
 - **事件和通知**：事件类型和 GitHub 的一样（`github.error`、`github.pushed`、`github.pulled`、`github.diverged` 等，以及 `scout.completed`、`issue.auto_accepted`、`iteration.*`），GitLab 仓库的事件数据里多一个 `platform: 'gitlab'`。事件页、Run 详情页和通知都说 GitLab，比如「GitLab 访问失败」「没能拉取 GitLab 上的新提交」，「有提案等你决定」让你去 GitLab 上采纳或关闭；通知的种类不变。GitLab 访问失败和 GitHub 的分开去重：两边各有各的「一串连续失败」（见「通知」）。
 - **侦察**：提示词里列的是 GitLab 上已有的 issue（被关成不做的按 `ares1:not-planned` 标签找），说的也是 GitLab issue；建出的提案 issue、迭代 issue 和 GitHub 上的格式相同。
@@ -505,14 +523,15 @@ GitLab 仓库按作者对项目的权限判断：Developer 及以上（Developer
 - 「仓库」页每个仓库写明需求来源：GitHub、GitLab 和它的 host、本地提案池，或者未配置（不会建 Run）。
 - 「配置」页提到 `gitlab.repos`，并列出无效、已停用的配置项，比如 `gitlab.repos.<仓库名>`。
 - 迭代页按平台显示，GitLab 的迭代链到 GitLab 上的迭代 issue，在 GitLab 上采纳、关闭。
+- `deliver: mr` 的仓库：「需求」页仓库卡片的「交付方式」写 MR（没开 `push` 时写明这个仓库停用）；首页和 Run 详情页把等 MR 合并的 Run 标成「等 MR 合并」，写「MR !N」并链接到 MR，面板里写在 GitLab 上合并、要求修改、流水线没通过、冲突和关掉后会怎样；返工期间、事件列表里的各条 MR 事件也都写 MR。Run 是哪个平台的看它的 issue，没有 issue 的 Run（比如合并远端提交的 Run）看仓库的需求来源。
 
 ### GitLab 的 API
 
-- `GET /api/gitlab`：GitLab 一侧的状态，格式和 `GET /api/github` 相同：`platform` 是 `gitlab`，`host` 是 `gitlab.host`（GitHub 的 `platform` 是 `github`，`host` 为 `null`），`enabled` 表示 `config.yaml` 有 `gitlab` 一节，`account` 是 `gitlab.account`，`pollMinutes` 是 `gitlab.poll_minutes`，`lastPollAt`、`lastError` 是这一侧上一轮检查的时间和最近一次失败，`repos` 按 `gitlab.repos` 的顺序列出每个仓库（`issuesRepo` 是 `issues_repo`，`deliver` 总是 `push`，其余字段和 `GET /api/github` 的一样）。
+- `GET /api/gitlab`：GitLab 一侧的状态，格式和 `GET /api/github` 相同：`platform` 是 `gitlab`，`host` 是 `gitlab.host`（GitHub 的 `platform` 是 `github`，`host` 为 `null`），`enabled` 表示 `config.yaml` 有 `gitlab` 一节，`account` 是 `gitlab.account`，`pollMinutes` 是 `gitlab.poll_minutes`，`lastPollAt`、`lastError` 是这一侧上一轮检查的时间和最近一次失败，`repos` 按 `gitlab.repos` 的顺序列出每个仓库（`issuesRepo` 是 `issues_repo`，`deliver` 是 `push` 或 `mr`，其余字段和 `GET /api/github` 的一样）。
 - `POST /api/gitlab/poll`：马上检查一轮 GitLab，不等下一轮；返回检查后的状态，格式同上。
 - `GET /api/config` 的 `repoSources` 按仓库名给出需求来源：`{ source: 'github', issuesRepo }`（`issuesRepo` 没写时为 `null`）、`{ source: 'gitlab', host, issuesRepo }` 或 `{ source: 'backlog' }`；同一个仓库名出现在多个来源时取第一个（github → gitlab → backlog），不在其中的仓库没有需求来源。
 - `POST /api/scouts`：手动侦察，`gitlab.repos` 里的仓库在 GitLab 上建 issue（见「本地提案池的 API」）。
-- 从 GitLab issue 建的 Run，`issue` 里多一个 `platform: 'gitlab'`，`repo` 是项目路径；GitLab 的迭代 `source` 是 `gitlab`（GitHub 的是 `github`，本地提案池的是 `local`）。
+- 从 GitLab issue 建的 Run，`issue` 里多一个 `platform: 'gitlab'`，`repo` 是项目路径；`deliver: mr` 的 Run，`pr` 是它的 MR（`{ number, url }`，`number` 是 MR 在项目里的编号，也就是 `!N` 里的 N）。GitLab 的迭代 `source` 是 `gitlab`（GitHub 的是 `github`，本地提案池的是 `local`）。
 
 ## 不用 GitHub 时
 
@@ -545,7 +564,7 @@ backlog:
 - 一个仓库只能选一种需求来源：同一个仓库名同时写在 `github.repos` 或 `gitlab.repos` 和 `backlog.repos` 里是配置错误，看板「配置」页在 `config.yaml#backlog.repos.<仓库名>` 下写明原因。这时 `backlog.repos` 里的设置不生效，GitHub 或 GitLab 一侧照常工作，手动侦察也按那一侧侦察（见「接入 GitLab」的「一个仓库只能有一种需求来源」）。
 - 某个仓库配置有误（比如模板不存在、侦察用的 Agent 不存在或没启用）时只停用这个仓库，看板「配置」页同样在 `config.yaml#backlog.repos.<仓库名>` 下写明原因，别的仓库照常工作。
 - 和 `github`、`gitlab` 一样，改了保存后自动生效，不用重启。不写 `backlog` 就不用本地提案池。
-- 合并只合进本地的目标分支，Master 不推送；要推送到内网的服务器，自己 `git push`。托管在 GitLab 上的仓库改接 GitLab（`gitlab.repos`），Master 就能自己推送。
+- 合并只合进本地的目标分支，Master 不推送；要推送到内网的服务器，自己 `git push`。托管在 GitLab 上的仓库改接 GitLab（`gitlab.repos`），Master 就能自己推送，目标分支只收 MR 时也能开 MR 交付（`deliver: mr`）。
 
 [`docs/examples/config.yaml`](examples/config.yaml) 里也有一个用本地提案池的仓库（`my-intranet-tool`）。
 
@@ -889,8 +908,8 @@ concurrency:
 - `per_repo` 大于 1 时，预计改同一处的 Run 不同时往下做，免得在合并阶段冲突、返工：
   - 需求评估（`kind: assess`）给出 go 时会列出预计会改的文件或目录 `touches`：仓库内的相对路径，最多 20 条，拿不准具体文件时写到目录这一层。Master 先整理再记进讨论记录：去掉首尾空白，`\` 换成 `/`，去掉开头的 `./`、中间的 `.`、重复的 `/` 和末尾的 `/`；空项、绝对路径（`/` 或盘符开头）和含 `..` 的项被丢掉；重复的只留第一条；超过 20 条时只留前 20 条。这些都不算出错。ask、drop 时给了也不记；整理后一条不剩，就当作没给。
   - 两条路径相同，或者一条是另一条的上级目录，就算重叠。按 `/` 分段比较，不按字符串前缀：`src` 和 `src/engine` 重叠，`src/a` 和 `src/ab` 不重叠。
-  - 评估阶段通过、准备进入下一个阶段时（评估阶段要审批时，是审批通过之后），如果同一执行位（登记到同一路径的仓库共用一个，和 `per_repo` 的上限一样）里有另一个 Run 正在执行或者在等 PR 合并（`pr_open`），它的合并阶段还没通过，而且两边的 `touches` 重叠，这个 Run 就让出名额回到队首：评估保持通过，进度保留，再开始时直接进入下一个阶段，不重跑评估。同时记一条 `run.waiting_conflict` 事件，数据有当时的阶段（`stageId`）、等的 Run（`blockedBy`）和重叠的路径（`paths`，每对重叠的路径取更具体的那条）。排队、暂停、等审批或卡住等人的 Run 不挡别人：它们可能要等很久，谁先往下做谁先合并。
-  - 按队列顺序挑 Run 时，已经评估过、和执行中（或在等 PR 合并）的 Run 重叠的 Run 被跳过，后面不重叠的 Run 先开始；它等的 Run 换了时再记一条 `run.waiting_conflict`。挡它的 Run 合并阶段通过或者结束（完成、失败、终止或不做）后，Master 马上重新挑。
+  - 评估阶段通过、准备进入下一个阶段时（评估阶段要审批时，是审批通过之后），如果同一执行位（登记到同一路径的仓库共用一个，和 `per_repo` 的上限一样）里有另一个 Run 正在执行或者在等 PR 或 MR 合并（`pr_open`），它的合并阶段还没通过，而且两边的 `touches` 重叠，这个 Run 就让出名额回到队首：评估保持通过，进度保留，再开始时直接进入下一个阶段，不重跑评估。同时记一条 `run.waiting_conflict` 事件，数据有当时的阶段（`stageId`）、等的 Run（`blockedBy`）和重叠的路径（`paths`，每对重叠的路径取更具体的那条）。排队、暂停、等审批或卡住等人的 Run 不挡别人：它们可能要等很久，谁先往下做谁先合并。
+  - 按队列顺序挑 Run 时，已经评估过、和执行中（或在等 PR 或 MR 合并）的 Run 重叠的 Run 被跳过，后面不重叠的 Run 先开始；它等的 Run 换了时再记一条 `run.waiting_conflict`。挡它的 Run 合并阶段通过或者结束（完成、失败、终止或不做）后，Master 马上重新挑。
   - 为了不让排在前面的 Run 一直等：一个 Run 在队列里等某个 Run，等到对方合并阶段通过或者结束之后，对方就不能再挡它，比如对方合并后又被放回编码。这份记录在内存里，Master 重启后从 `run.waiting_conflict` 事件还原。
   - 没有评估阶段的模板、评估没给 `touches` 的 Run，不挡别人，也不被别人挡，和以前一样调度。`per_repo` 为 1 时不做这个判断，调度和以前完全一样。
   - 看板首页排队的卡片和 Run 详情页写明「等 Run X：预计改同一处（路径）」，详情页里可以点进 X；路径超过 3 条时只列前 3 条，后面写一共几处。Run 详情页的事件里也有这一条。API `GET /api/runs` 的各项和 `GET /api/runs/:id` 的 `waitingForConflict` 是 `{ runId, paths }`：这个 Run 在排队，在等 `runId` 合并或结束，`paths` 是重叠的路径；不在等时为 `null`。它不再等之后，照常等仓库和合计的名额。
@@ -920,7 +939,7 @@ Run 卡住（`blocked`）、已暂停或等审批时不算在正在执行的 Run
 - 审批：模板里设了 `gate` 的阶段（从 issue 来的 Run 和分叉时交给 Run 合并的 Run，在仓库打开 `auto_merge` 时，合并不等审批）。
 - 需求评估有疑问，等你回复，最多等 `reply_timeout_hours`（到时间评估自己决定，所以这种 Run 算作会自己往下走；设为 `null` 时一直等，算作只等人）；issue 作者不是仓库成员，等你确认需求。
 - 配置为等人时：`on_agent_error: human`（包括 Agent 不可用时）、`on_exhausted: human`、`on_budget_exceeded: pause`（超出预算）。
-- 仓库通过 PR 交付（`deliver: pr`）时，合并阶段检查通过后等 PR 在 GitHub 上合并（`pr_open`，看板上显示「等 PR 合并」）。这不是出了问题：不发「Run 卡住了」的通知，也没有可以重试的，PR 合并、被关掉或者需要返工时 Master 自己往下走（见上面的「接入 GitHub」）。要人在 GitHub 上审 PR、合并，所以算作只等人，计入 `scout.max_proposals`。
+- 仓库通过 PR 交付（GitHub 的 `deliver: pr`）或 MR 交付（GitLab 的 `deliver: mr`）时，合并阶段检查通过后等 PR 在 GitHub 上、MR 在 GitLab 上合并（`pr_open`，看板上显示「等 PR 合并」或「等 MR 合并」）。这不是出了问题：不发「Run 卡住了」的通知，也没有可以重试的，PR 或 MR 合并、被关掉或者需要返工时 Master 自己往下走（见上面的「接入 GitHub」和「接入 GitLab」的「通过 MR 交付」）。要人在 GitHub 上审 PR、在 GitLab 上审 MR 并合并，所以算作只等人，计入 `scout.max_proposals`。
 
 目标分支有未提交的改动时，Run 也会卡住（`target_dirty`），但不用你做任何决定：合并阶段要快进目标分支，而目标分支在某个目录里检出、且有已跟踪文件的改动没提交（未跟踪的文件不算），快进会动到这些改动，所以先停下，并照常发「Run 卡住了」的通知。之后 Master 大约每分钟复查一次，你提交或丢弃这些改动后，Run 会自己回到队首接着合并：重新同步目标分支，有新提交时重跑检查，再快进。不用去看板点重试（点了也行，会立刻继续）。改动还在时复查什么都不改，也不会重复通知；工作开关关着时不会自动继续，打开时马上查一次。自举时 Master 正是往开发仓库的 `main` 合并，在那里随手改了文件，处理掉就行。这种 Run 算作会自己往下走，不计入 `scout.max_proposals`。
 
@@ -947,7 +966,7 @@ Agent 出错且重试、换 Agent 都用完，Agent 不可用且没有可换的 
 
 ## 通知
 
-只在需要你做点什么时通知：Run 卡住或失败、等审批、提案等人决定、迭代受阻、侦察连续失败、推送或升级失败、目标分支没能拉取 GitHub 或 GitLab 上的新提交；Run 完成、侦察完成、迭代完成、拉取成功都不通知。通过 PR 交付（`deliver: pr`）时，等 PR 合并不通知（GitHub 会通知 PR 的评审者），PR 要求修改、CI 没过或冲突时 Run 回去返工也不通知（issue 上有评论），返工用完 `max_loops` 后按 `on_exhausted` 停下来或失败时照常通知，PR 没合并就被关掉按「Run 失败了」通知。
+只在需要你做点什么时通知：Run 卡住或失败、等审批、提案等人决定、迭代受阻、侦察连续失败、推送或升级失败、目标分支没能拉取 GitHub 或 GitLab 上的新提交；Run 完成、侦察完成、迭代完成、拉取成功都不通知。通过 PR 交付（GitHub 的 `deliver: pr`）或 MR 交付（GitLab 的 `deliver: mr`）时，等 PR 或 MR 合并不通知（GitHub、GitLab 会通知评审者），PR 或 MR 上要求修改、CI 或流水线没过、冲突时 Run 回去返工也不通知（issue 上有评论），返工用完 `max_loops` 后按 `on_exhausted` 停下来或失败时照常通知，PR 或 MR 没合并就被关掉按「Run 失败了」通知；Run 没做完就结束后 Master 关掉还开着的 PR 或 MR 也不另发通知。
 
 侦察失败（Agent 出错或超时、输出不符合约定、建临时工作目录失败等）时，事件列表里记一条 `scout.failed`（看板「事件」页能看到，标成红色），数据里有 `scoutId`、`repo`、`message`（错误信息）和 `streak`：这个仓库从最近一次侦察往回数连续失败的次数（包括这一次；自动和手动触发的都算）。额度用尽或被限流的、被 Master 停止打断的、还在进行的侦察既不计数，也不打断计数；正常结束的侦察（哪怕没找到需求）让计数从头开始。`streak` 正好到 3 时通知一次「侦察连续失败：<仓库名>」，正文是错误信息的第一行，点开是「需求」页；之后接着失败不再通知，直到有侦察正常结束、又连续失败 3 次。被 Master 停止打断的侦察也记 `scout.failed`，但不带 `streak`，不通知。
 
