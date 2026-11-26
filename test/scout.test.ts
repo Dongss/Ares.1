@@ -19,6 +19,7 @@ import {
   keptReport,
   localProposalDigest,
   nextSteps,
+  type ProposalIteration,
   type ProposalRun,
   parseScoutReport,
   proposalGoal,
@@ -2281,6 +2282,85 @@ describe('localProposalDigest', () => {
     expect(english).not.toMatch(/[一-鿿]/);
   });
 
+  it('leaves the failed steps of an iteration under way to its own digest', () => {
+    const iterations: ProposalIteration[] = (
+      [
+        ['iteration-4', 'active'],
+        ['iteration-3', 'blocked'],
+        ['iteration-2', 'done'],
+        ['iteration-1', 'cancelled'],
+      ] as const
+    ).map(([id, status]) => ({ id, title: id, status, children: [] }));
+    /** A proposal given up after its one Run failed with `error`, a step of `iterationId`. */
+    const givenUp = (id: string, iterationId: string | null, title: string, error: string) =>
+      localProposal(id, title, {
+        status: 'failed',
+        runId: `run-${id}`,
+        iterationId,
+        failures: [{ runId: `run-${id}`, attempt: 1, stage: null, error }],
+      });
+    const open = [
+      givenUp('proposal-5', 'iteration-4', '进行中迭代的子项', '超时'),
+      givenUp('proposal-4', 'iteration-3', '受阻迭代的子项', '测试没过'),
+    ];
+    const digest = localProposalDigest(
+      [
+        ...open,
+        givenUp('proposal-3', 'iteration-2', '已完成迭代的子项', '构建\n失败'),
+        givenUp('proposal-2', 'iteration-1', '被终止迭代的子项', '额度用完了'),
+        givenUp('proposal-1', null, '不属于迭代的', '准备命令失败'),
+      ],
+      undefined,
+      iterations,
+    );
+    expect(digest).toBe(
+      [
+        '### 等人决定',
+        '（无）',
+        '',
+        '### 已采纳',
+        '（无）',
+        '',
+        '### 被拒绝',
+        '（无）',
+        '',
+        '### 多次失败后放弃（不是人拒绝的）',
+        '- proposal-3 已完成迭代的子项（失败 1 次）',
+        '  第 1 次（Run run-proposal-3）：构建 失败',
+        '- proposal-2 被终止迭代的子项（失败 1 次）',
+        '  第 1 次（Run run-proposal-2）：额度用完了',
+        '- proposal-1 不属于迭代的（失败 1 次）',
+        '  第 1 次（Run run-proposal-1）：准备命令失败',
+      ].join('\n'),
+    );
+    // Only steps of iterations under way failed: no section for them at all.
+    expect(localProposalDigest(open, undefined, iterations)).not.toContain('多次失败后放弃');
+
+    setLang('en');
+    const english = localProposalDigest(
+      [
+        givenUp('proposal-5', 'iteration-4', 'Step under way', 'timed out'),
+        givenUp('proposal-4', 'iteration-3', 'Blocked step', 'tests failed'),
+        givenUp('proposal-3', 'iteration-2', 'Step of a done iteration', 'build failed'),
+        givenUp('proposal-1', null, 'Outside any iteration', 'setup failed'),
+      ],
+      undefined,
+      iterations,
+    );
+    expect(english).toContain(
+      [
+        '### Given up after repeated failures (not rejected by a human)',
+        '- proposal-3 Step of a done iteration (failed once)',
+        '  Attempt 1 (Run run-proposal-3): build failed',
+        '- proposal-1 Outside any iteration (failed once)',
+        '  Attempt 1 (Run run-proposal-1): setup failed',
+      ].join('\n'),
+    );
+    expect(english).not.toContain('Step under way');
+    expect(english).not.toContain('Blocked step');
+    expect(english).not.toMatch(/[一-鿿]/);
+  });
+
   it('names the Run without its status when it is not known', () => {
     const accepted = localProposal('proposal-1', '已采纳', { status: 'accepted', runId: 'run-1' });
     expect(localProposalDigest([accepted])).toContain('- proposal-1 已采纳（Run run-1）');
@@ -2510,6 +2590,10 @@ describe('scoutPrompt: the local backlog', () => {
       expect(section(prompt, '## Existing local proposals')).toContain(issues);
       expect(prompt).toContain('- proposal-1 Turned down\n  Reason: Not a goal of README');
       expect(prompt).toContain('Rejected proposals are counterexamples');
+      expect(prompt).toContain(
+        'Accepted proposals whose Run failed, and proposals "given up after repeated failures", are different: no human rejected them',
+      );
+      expect(prompt).toContain('do not propose them again as they were');
       expect(prompt).not.toMatch(/issue|GitHub/i);
       expect(prompt).not.toMatch(/[一-鿿]/);
     }
