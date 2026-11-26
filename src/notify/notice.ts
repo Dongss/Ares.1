@@ -280,9 +280,11 @@ const count = (v: unknown): number | null =>
 /**
  * An iteration got blocked (`iteration.blocked`): which step held it up, failed after using up
  * its attempts or closed as not planned by a human, and what comes next. Titled with the repo.
+ * One of the local backlog (`backlog: true`) is followed on the dashboard instead of GitHub.
  */
 function iterationBlockedNotice(event: EventRow): Notice {
   const d = event.data;
+  if (d.backlog === true) return localIterationBlockedNotice(event);
   const issue = count(d.issue);
   const position = count(d.position);
   const child = count(d.child);
@@ -308,6 +310,28 @@ function iterationBlockedNotice(event: EventRow): Notice {
     body: t({
       zh: `${what}，依赖它的子 issue 开不了工。侦察下次会换个做法补一个子 issue 替换它；也可以重新打开它、加上 ares1:ready 重做，或者关掉迭代 issue，不做剩下的`,
       en: `${what}, so the sub-issues depending on it cannot start. The next scout adds a sub-issue replacing it with another approach; you can also reopen it and add ares1:ready to redo it, or close the iteration issue to drop the rest`,
+    }),
+    runId: null,
+    about: 'issues',
+  };
+}
+
+/**
+ * An iteration of the local backlog got blocked: the Run of one of its steps failed, was
+ * terminated or dropped by its assessment (a Run of the local backlog is never redone), and what
+ * comes next, on the dashboard.
+ */
+function localIterationBlockedNotice(event: EventRow): Notice {
+  const d = event.data;
+  const position = count(d.position);
+  const zhStep = position === null ? '一个子项' : `第 ${position} 步`;
+  const enStep = position === null ? 'a step' : `step ${position}`;
+  return {
+    kind: 'iteration',
+    title: titleOf('iteration', text(d.repo) ?? undefined),
+    body: t({
+      zh: `迭代的${zhStep}没有做成（Run 失败、被终止，或需求评估结论为不做），依赖它的子项开不了工。侦察下次会换个做法补一个子项替换它；也可以在看板上终止这个迭代，不做剩下的`,
+      en: `${capitalize(enStep)} of the iteration was not done (its Run failed, was terminated, or its assessment dropped it), so the steps depending on it cannot start. The next scout adds a step replacing it with another approach; you can also cancel the iteration on the dashboard to drop the rest`,
     }),
     runId: null,
     about: 'issues',

@@ -609,6 +609,42 @@ describe('globalEventText', () => {
     );
   });
 
+  it('tells an iteration of the local backlog by its steps being proposals, decided on the dashboard', () => {
+    const at = { repo: 'demo', iterationId: 'iteration-1', backlog: true };
+    expect(text('iteration.auto_accepted', at)).toBe(
+      '整批自动采纳了 demo 的一个本地迭代，子项按依赖顺序开工',
+    );
+    expect(text('iteration.accepted', at)).toBe(
+      'demo 的一个本地迭代已整批采纳，子项按依赖顺序开工',
+    );
+    expect(text('iteration.blocked', { ...at, position: 2, reason: 'failed' })).toBe(
+      'demo 的迭代受阻：第 2 步没有做成（Run 失败、被终止，或需求评估结论为不做），依赖它的步骤开不了工；侦察下次会换个做法替换它',
+    );
+    const rejected = { ...at, dropped: [1, 2], pending: true, reason: '现在不做' };
+    expect(text('iteration.cancelled', rejected)).toBe(
+      '拒绝了 demo 的一个本地迭代，它的子项随之拒绝，理由：现在不做；之后的侦察会看到这条理由',
+    );
+    expect(text('iteration.cancelled', { ...at, dropped: [2, 3], pending: false })).toBe(
+      'demo 的一个本地迭代被人在看板上终止了，2 个没完成的子项随之不做',
+    );
+    setLang('en');
+    const english = [
+      text('iteration.auto_accepted', at),
+      text('iteration.accepted', at),
+      text('iteration.blocked', { ...at, position: 2, reason: 'failed' }),
+      text('iteration.cancelled', { ...rejected, reason: 'not now' }),
+      text('iteration.cancelled', { ...at, dropped: [3], pending: false }),
+    ];
+    expect(english).toEqual([
+      'Accepted a local iteration of demo automatically as a whole; its steps start in the order of their dependencies',
+      'A local iteration of demo was accepted as a whole; its steps start in the order of their dependencies',
+      'Iteration of demo is blocked: step 2 was not done (its Run failed, was terminated, or its assessment dropped it), so the steps depending on it cannot start; the next scout replaces it with another approach',
+      'Rejected a local iteration of demo, its steps with it, because: not now; later scouts are shown the reason',
+      'A local iteration of demo was cancelled on the dashboard; its 1 step not done was dropped with it',
+    ]);
+    expect(english.join('\n')).not.toMatch(/[一-鿿]/);
+  });
+
   it('says a local proposal was accepted, by a human or not, or rejected and why', () => {
     const accepted = { repo: 'demo', proposalId: 'proposal-1', runId: 'run-7' };
     expect(text('proposal.auto_accepted', accepted)).toBe(

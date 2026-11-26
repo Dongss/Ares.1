@@ -5,9 +5,9 @@ import { InvalidStateError } from '../src/engine/engine.js';
 import type { IterationUpdate, PlannedIteration } from '../src/github/scout.js';
 import { setLang } from '../src/i18n.js';
 import { noticeFor } from '../src/notify/notice.js';
-import { NotFoundError } from '../src/store/store.js';
+import { ConflictError, NotFoundError } from '../src/store/store.js';
 import type { IterationChild, Proposal, Run } from '../src/store/types.js';
-import { FakeGitHub, type Harness, harness, TEST_AGENTS_YAML, waitFor } from './helpers.js';
+import { FakeGitHub, type Harness, harness, review, TEST_AGENTS_YAML, waitFor } from './helpers.js';
 
 const AGENTS = `${TEST_AGENTS_YAML}
   scout:
@@ -19,15 +19,19 @@ interface ConfigOptions {
   /** Automatic scouting; off unless a test is about it. */
   auto?: boolean;
   maxRisk?: 'none' | 'low' | 'mid' | 'high';
+  /** max_size; omitted = the default (L). */
+  maxSize?: 'S' | 'M' | 'L';
   /** null = no daily limit. */
   maxPerDay?: number | null;
   /** daily_budget_usd; omitted = no limit. */
   budget?: number;
+  /** auto_merge, on unless a test waits at the merge gate to hold Runs back. */
+  autoMerge?: boolean;
 }
 
 /**
- * Only backlog.repos, no github section. auto_merge, so that the Runs of the test template
- * complete on their own.
+ * Only backlog.repos, no github section. auto_merge by default, so that the Runs of the test
+ * template complete on their own.
  */
 const config = (opts: ConfigOptions = {}) => {
   const maxPerDay = opts.maxPerDay === undefined ? null : opts.maxPerDay;
@@ -42,8 +46,9 @@ backlog:
         max_proposals: 3
       auto_accept:
         max_risk: ${opts.maxRisk ?? 'low'}
+${opts.maxSize === undefined ? '' : `        max_size: ${opts.maxSize}`}
 ${maxPerDay === null ? '' : `        max_per_day: ${maxPerDay}`}
-      auto_merge: true
+      auto_merge: ${opts.autoMerge ?? true}
 ${opts.budget === undefined ? '' : `      daily_budget_usd: ${opts.budget}`}
 `;
 };
@@ -633,15 +638,553 @@ describe('scouting with iterations', () => {
     expect(filed).toEqual([]);
     expect(changes).toEqual([]);
   });
+});
 
-  it('leaves the iteration aside in a source that cannot file one yet', async () => {
-    const t = await start();
-    t.scripts.scout = () => ({
-      structured: { gaps: [], proposals: LEADS.slice(0, 1), iteration: ITERATION },
-    });
+describe('iterations of the local backlog', () => {
+  type Kind = { risk: 'low' | 'mid' | 'high'; size: 'S' | 'M' | 'L' };
+  /** A step of a planned iteration as a scout writes it: a requirement, without a lead. */
+  const step = (title: string, patch: Record<string, unknown> = {}) => ({
+    title,
+    size: 'M',
+    risk: 'low',
+    evidence: ['run_abc 返工了 3 轮'],
+    acceptance: ['测试通过'],
+    category: 'feature',
+    why: `${title}的原因`,
+    what: `${title}的做法`,
+    criteria: [1],
+    dependsOn: [],
+    closeout: false,
+    ...patch,
+  });
+  /** An iteration as a scout plans it: `steps` in order. */
+  const plan = (steps: ReturnType<typeof step>[]) => ({
+    title: '本地仓库也能永动',
+    goal: '没有接 GitHub 的仓库，也能自己提需求、自己做完',
+    readmeGoal: '永动',
+    criteria: ['本地仓库能自己跑完一轮'],
+    outOfScope: ['GitLab'],
+    children: steps,
+  });
+  /** Three steps: the second waits for the first, the closing one for both. */
+  const THREE = plan([
+    step('第一步'),
+    step('第二步', { dependsOn: [1] }),
+    step('收尾', { criteria: [], dependsOn: [1, 2], closeout: true }),
+  ]);
+
+  /** A scout of demo by hand whose agent plans `iteration`; the iteration once filed. */
+  async function planned(t: Harness, iteration: unknown, proposals: unknown[] = []) {
+    t.scripts.scout = () => ({ structured: { gaps: [], proposals, iteration } });
     const scout = await scoutByHand(t);
     expect(scout.status).toBe('completed');
-    expect(proposalsOf(t).map((p) => p.title)).toEqual(['卡住的 Run']);
-    expect(t.master.store.listIterations({ repoId: t.repo.id })).toEqual([]);
+    const [filed] = t.master.store.listIterations({ repoId: t.repo.id });
+    if (!filed) throw new Error('no iteration');
+    return filed;
+  }
+
+  const iterationOf = (t: Harness, id: string) => t.master.store.getIteration(id);
+  /** The proposal of each step, in the order of the plan. */
+  const stepProposals = (t: Harness, id: string) =>
+    iterationOf(t, id).children.map((c) => t.master.store.getProposal(c.proposalId ?? ''));
+  const statuses = (t: Harness, id: string) => iterationOf(t, id).children.map((c) => c.status);
+  /** The Run of a step's proposal; throws when it has none. */
+  const runOfStep = (t: Harness, id: string, position: number) => {
+    const runId = stepProposals(t, id)[position - 1]?.runId;
+    if (!runId) throw new Error(`step ${position} has no Run`);
+    return t.master.store.getRun(runId);
+  };
+
+  it('files the iteration a scout plans: a proposal per step with its dependencies, decided as a whole', async () => {
+    // The closing step is of mid risk: the iteration waits for a human.
+    const t = await start();
+    const mid = plan([
+      step('第一步'),
+      step('第二步', { dependsOn: [1] }),
+      step('收尾', { risk: 'mid', criteria: [], dependsOn: [1, 2], closeout: true }),
+    ]);
+    const filed = await planned(t, mid, [proposal('卡住的 Run', 'high')]);
+    expect(filed).toMatchObject({
+      source: 'local',
+      issuesRepo: '',
+      issue: null,
+      status: 'pending',
+      auto: false,
+      title: '本地仓库也能永动',
+      criteria: ['本地仓库能自己跑完一轮'],
+      outOfScope: ['GitLab'],
+    });
+    const [first, second, closing] = stepProposals(t, filed.id);
+    if (!first || !second || !closing) throw new Error('no proposals');
+    expect(filed.children.map((c) => [c.position, c.dependsOn, c.status, c.proposalId])).toEqual([
+      [1, [], 'planned', first.id],
+      [2, [1], 'planned', second.id],
+      [3, [1, 2], 'planned', closing.id],
+    ]);
+    // Each step a pending proposal of the iteration, depending on the proposals of its steps.
+    expect([first, second, closing].map((p) => [p.title, p.status, p.iterationId])).toEqual([
+      ['第一步', 'pending', filed.id],
+      ['第二步', 'pending', filed.id],
+      ['收尾', 'pending', filed.id],
+    ]);
+    expect([first.dependsOn, second.dependsOn, closing.dependsOn]).toEqual([
+      [],
+      [first.id],
+      [first.id, second.id],
+    ]);
+    expect(t.master.store.listRuns()).toEqual([]);
+    // Waiting for a human as one, beside the proposal of its own; its steps do not count.
+    expect(eventData(t, 'scout.completed')[0]).toMatchObject({
+      created: 1,
+      auto: 0,
+      pending: 2,
+      iteration: { id: filed.id, auto: false },
+      backlog: true,
+    });
+    expect(demoStatus(t)?.pendingProposals).toBe(2);
+    // Auto-accept leaves it: its riskiest step is beyond max_risk.
+    await t.master.backlog.poll();
+    expect(iterationOf(t, filed.id).status).toBe('pending');
+
+    // A step is never decided on its own.
+    const whole = `提案 ${second.id} 是迭代 ${filed.id} 的子项，要和迭代一起整体采纳或拒绝`;
+    expect(() => t.master.backlog.accept(second.id)).toThrow(ConflictError);
+    expect(() => t.master.backlog.accept(second.id)).toThrow(whole);
+    expect(() => t.master.backlog.reject(second.id, '不要')).toThrow(whole);
+    // Nor cancelled before it is accepted.
+    await expect(t.master.backlog.cancelIteration(filed.id)).rejects.toThrow(
+      `迭代 ${filed.id} 还没有采纳，要拒绝它（填写理由），而不是终止`,
+    );
+
+    // The next scout follows it, its steps listed once, in the iteration's digest.
+    t.scripts.scout = () => ({ structured: { gaps: [], proposals: [] } });
+    await scoutByHand(t);
+    const prompt = lastScoutPrompt(t);
+    expect(prompt).toContain('## 进行中的迭代');
+    expect(prompt).toContain(`  1. ${first.id} 第一步（等迭代被采纳；推进完成标准 1）`);
+    expect(prompt.split(second.id)).toHaveLength(2);
+
+    // A human accepts it: every step with it, only the first one becomes a Run.
+    const accepted = t.master.backlog.acceptIteration(filed.id);
+    expect(accepted).toMatchObject({
+      status: 'active',
+      auto: false,
+      decidedAt: expect.any(String),
+    });
+    expect(stepProposals(t, filed.id).map((p) => [p.status, p.auto])).toEqual([
+      ['accepted', false],
+      ['accepted', false],
+      ['accepted', false],
+    ]);
+    expect(statuses(t, filed.id)).toEqual(['running', 'waiting', 'waiting']);
+    expect(t.master.store.listRuns()).toHaveLength(1);
+    expect(runOfStep(t, filed.id, 1).goal.startsWith('第一步\n\n### 为什么\n\n第一步的原因')).toBe(
+      true,
+    );
+    expect(eventData(t, 'iteration.accepted')).toEqual([
+      { repo: 'demo', iterationId: filed.id, backlog: true },
+    ]);
+    // Not an auto-accept: today's count stays.
+    expect(demoStatus(t)?.autoAccept.usedToday).toBe(0);
+    expect(() => t.master.backlog.acceptIteration(filed.id)).toThrow(
+      `迭代 ${filed.id} 已经采纳过了`,
+    );
+    expect(() => t.master.backlog.rejectIteration(filed.id, '不要了')).toThrow(
+      `迭代 ${filed.id} 已经采纳了，不能再拒绝；不想做剩下的，就终止它`,
+    );
+    expect(() => t.master.backlog.acceptIteration('iteration_none')).toThrow(NotFoundError);
+    expect(gh.calls).toEqual([]);
+  });
+
+  it.each<{ steps: Kind[]; auto: boolean }>([
+    // The riskiest step is mid and the largest M: within max_risk mid and max_size M.
+    {
+      steps: [
+        { risk: 'low', size: 'S' },
+        { risk: 'mid', size: 'M' },
+      ],
+      auto: true,
+    },
+    // A step of size L, of low risk.
+    {
+      steps: [
+        { risk: 'low', size: 'S' },
+        { risk: 'low', size: 'L' },
+      ],
+      auto: false,
+    },
+    // A step of high risk, of size S.
+    {
+      steps: [
+        { risk: 'high', size: 'S' },
+        { risk: 'low', size: 'S' },
+      ],
+      auto: false,
+    },
+  ])(
+    'auto-accepts an iteration as a whole by its riskiest and largest step: $steps.0.risk $steps.0.size, $steps.1.risk $steps.1.size → $auto',
+    async ({ steps, auto }) => {
+      const t = await start(config({ maxRisk: 'mid', maxSize: 'M' }));
+      const filed = await planned(
+        t,
+        plan(steps.map((k, i) => step(`第 ${i + 1} 步`, { ...k }))),
+        // A proposal of its own within the limits is taken either way.
+        [proposal('卡住的 Run', 'low')],
+      );
+      expect(filed.status).toBe(auto ? 'active' : 'pending');
+      expect(filed.auto).toBe(auto);
+      expect(stepProposals(t, filed.id).map((p) => [p.status, p.auto])).toEqual(
+        auto
+          ? [
+              ['accepted', true],
+              ['accepted', true],
+            ]
+          : [
+              ['pending', false],
+              ['pending', false],
+            ],
+      );
+      // Counted once however many steps it has.
+      expect(eventData(t, 'iteration.auto_accepted')).toEqual(
+        auto ? [{ repo: 'demo', iterationId: filed.id, backlog: true }] : [],
+      );
+      expect(demoStatus(t)?.autoAccept.usedToday).toBe(auto ? 2 : 1);
+      // Both steps are independent: both became Runs.
+      expect(t.master.store.listRuns()).toHaveLength(auto ? 3 : 1);
+      expect(eventData(t, 'scout.completed')[0]).toMatchObject({
+        pending: auto ? 0 : 1,
+        iteration: { id: filed.id, auto },
+      });
+      // A poll judges it the same way.
+      await t.master.backlog.poll();
+      expect(iterationOf(t, filed.id).status).toBe(auto ? 'active' : 'pending');
+    },
+  );
+
+  it('auto-accepts an iteration left waiting while the work switch was off, once it is on', async () => {
+    const t = await start();
+    t.master.store.setWorking(false);
+    const filed = await planned(t, THREE);
+    expect(filed.status).toBe('pending');
+    expect(eventData(t, 'scout.completed')[0]).toMatchObject({ pending: 1 });
+    await t.master.backlog.poll();
+    expect(iterationOf(t, filed.id).status).toBe('pending');
+    expect(t.master.store.listRuns()).toEqual([]);
+    t.master.store.setWorking(true);
+    await t.master.backlog.poll();
+    expect(iterationOf(t, filed.id)).toMatchObject({ status: 'active', auto: true });
+    expect(stepProposals(t, filed.id).map((p) => [p.status, p.auto])).toEqual([
+      ['accepted', true],
+      ['accepted', true],
+      ['accepted', true],
+    ]);
+    expect(eventData(t, 'iteration.auto_accepted')).toHaveLength(1);
+    // Only the first step: the others wait for it.
+    expect(t.master.store.listRuns()).toHaveLength(1);
+  });
+
+  it('starts each step once the steps it depends on completed, and sums the iteration up', async () => {
+    // Runs wait at the merge gate until approved, so that each step's Run ends when told.
+    const t = await start(config({ autoMerge: false }));
+    t.scripts.reviewer = () =>
+      review([{ severity: 'suggestion', description: '把魔法数字提成常量' }]);
+    const filed = await planned(t, THREE);
+    expect(filed).toMatchObject({ status: 'active', auto: true });
+    expect(statuses(t, filed.id)).toEqual(['running', 'waiting', 'waiting']);
+    const first = runOfStep(t, filed.id, 1);
+    await t.waitStatus(first.id, 'waiting_approval');
+    // The first has not completed: no Run for the others.
+    await t.master.backlog.poll();
+    expect(stepProposals(t, filed.id).map((p) => p.runId)).toEqual([first.id, null, null]);
+    expect(t.master.store.listRuns()).toHaveLength(1);
+
+    t.master.engine.approve(first.id);
+    await t.waitStatus(first.id, 'completed');
+    await t.master.backlog.poll();
+    expect(statuses(t, filed.id)).toEqual(['done', 'running', 'waiting']);
+    const second = runOfStep(t, filed.id, 2);
+    await t.waitStatus(second.id, 'waiting_approval');
+    t.master.engine.approve(second.id);
+    await t.waitStatus(second.id, 'completed');
+
+    // The closing step gets the suggestions the other steps' reviews left, before its Run.
+    await t.master.backlog.poll();
+    expect(statuses(t, filed.id)).toEqual(['done', 'done', 'running']);
+    const closing = stepProposals(t, filed.id)[2] as Proposal;
+    expect(closing.what).toContain('收尾的做法\n\n### 本迭代评审留下的建议');
+    expect(closing.what).toContain(`- 第一步（${first.id}，评审第 1 轮）\n  - 把魔法数字提成常量`);
+    expect(closing.what).toContain(`- 第二步（${second.id}，评审第 1 轮）`);
+    const third = runOfStep(t, filed.id, 3);
+    expect(third.goal).toContain('### 本迭代评审留下的建议');
+    await t.waitStatus(third.id, 'waiting_approval');
+    t.master.engine.approve(third.id);
+    await t.waitStatus(third.id, 'completed');
+
+    // Every step done: summed up and done.
+    t.master.store.updateRun(first.id, { costUsd: 1.5 });
+    await t.master.backlog.poll();
+    const done = iterationOf(t, filed.id);
+    expect(done).toMatchObject({
+      status: 'done',
+      summaryPosted: true,
+      endedAt: expect.any(String),
+    });
+    expect(done.children.map((c) => [c.status, c.runIds])).toEqual([
+      ['done', [first.id]],
+      ['done', [second.id]],
+      ['done', [third.id]],
+    ]);
+    expect(done.summary).toContain('## 迭代完成');
+    expect(done.summary).toContain('完成了全部 3 个子项');
+    expect(done.summary).toContain(`   - 第一步：${first.id}，评审结论：有问题`);
+    expect(done.summary).toContain('- 总费用：$1.50，共 3 个 Run');
+    expect(eventData(t, 'iteration.completed')).toEqual([
+      { repo: 'demo', iterationId: filed.id, backlog: true, costUsd: 1.5, runs: 3 },
+    ]);
+    // The scouts follow every step's change.
+    expect(
+      eventData(t, 'iteration.child_status').map((d) => [d.position, d.status, d.backlog]),
+    ).toContainEqual([3, 'done', true]);
+    // Polled again: nothing more.
+    await t.master.backlog.poll();
+    expect(eventData(t, 'iteration.completed')).toHaveLength(1);
+
+    // The next scout plans a new one; the steps are listed as accepted, with how it ended.
+    t.scripts.scout = () => ({ structured: { gaps: [], proposals: [] } });
+    await scoutByHand(t);
+    const prompt = lastScoutPrompt(t);
+    expect(prompt).toContain('## 规划迭代');
+    const firstProposal = stepProposals(t, filed.id)[0] as Proposal;
+    expect(prompt).toContain(
+      `- ${firstProposal.id} 第一步（Run ${first.id}：已完成，自动采纳，所属迭代 ${filed.id} 已完成）`,
+    );
+    expect(gh.calls).toEqual([]);
+  });
+
+  it('blocks the iteration once a step’s Run does not complete, notified once; a scout replaces the step', async () => {
+    const t = await start(config({ autoMerge: false }));
+    const two = plan([step('第一步'), step('第二步', { dependsOn: [1] })]);
+    const filed = await planned(t, two);
+    const first = runOfStep(t, filed.id, 1);
+    await t.waitStatus(first.id, 'waiting_approval');
+    await t.master.engine.cancel(first.id);
+    await t.master.backlog.poll();
+    expect(iterationOf(t, filed.id).status).toBe('blocked');
+    expect(statuses(t, filed.id)).toEqual(['failed', 'waiting']);
+    const [firstProposal, secondProposal] = stepProposals(t, filed.id);
+    const blocked = t.master.store.listGlobalEventsOfType('iteration.blocked');
+    expect(blocked.map((e) => e.data)).toEqual([
+      {
+        repo: 'demo',
+        iterationId: filed.id,
+        backlog: true,
+        position: 1,
+        proposalId: firstProposal?.id,
+        reason: 'failed',
+      },
+    ]);
+    const notice = noticeFor(blocked[0] as (typeof blocked)[number], undefined);
+    expect(notice).toMatchObject({ kind: 'iteration', title: '迭代受阻：demo', about: 'issues' });
+    expect(notice?.body).toBe(
+      '迭代的第 1 步没有做成（Run 失败、被终止，或需求评估结论为不做），依赖它的子项开不了工。侦察下次会换个做法补一个子项替换它；也可以在看板上终止这个迭代，不做剩下的',
+    );
+    // Once each time it gets blocked; the step depending on it waits.
+    await t.master.backlog.poll();
+    expect(t.master.store.listGlobalEventsOfType('iteration.blocked')).toHaveLength(1);
+    expect(secondProposal?.runId).toBeNull();
+
+    // The next scout replaces the step that failed: the new one starts at once, the second step
+    // waits for it instead.
+    const { lead: _lead, ...requirement } = proposal('换个做法的第一步', 'low');
+    t.scripts.scout = () => ({
+      structured: {
+        gaps: [],
+        proposals: [],
+        iterationUpdate: {
+          note: '第一步的 Run 被终止了，换个做法',
+          add: [{ ...requirement, criteria: [1], dependsOn: [], replaces: 1 }],
+        },
+      },
+    });
+    await scoutByHand(t);
+    const adjusted = iterationOf(t, filed.id);
+    expect(adjusted.status).toBe('active');
+    expect(adjusted.notes.map((n) => n.text)).toEqual(['第一步的 Run 被终止了，换个做法']);
+    expect(adjusted.children.map((c) => [c.position, c.status, c.replacedBy, c.dependsOn])).toEqual(
+      [
+        [1, 'failed', 3, []],
+        [2, 'waiting', undefined, [1]],
+        [3, 'running', undefined, []],
+      ],
+    );
+    const replacing = stepProposals(t, filed.id)[2] as Proposal;
+    expect(replacing).toMatchObject({
+      title: '换个做法的第一步',
+      status: 'accepted',
+      auto: true,
+      iterationId: filed.id,
+      runId: expect.any(String),
+    });
+    // The second step's proposal now depends on the step that replaced the first.
+    expect(t.master.store.getProposal(secondProposal?.id ?? '').dependsOn).toEqual([replacing.id]);
+    expect(eventData(t, 'iteration.unblocked')).toEqual([
+      { repo: 'demo', iterationId: filed.id, backlog: true },
+    ]);
+    expect(eventData(t, 'iteration.adjusted')).toEqual([
+      expect.objectContaining({
+        iterationId: filed.id,
+        added: [3],
+        replaced: [{ position: 1, by: 3 }],
+      }),
+    ]);
+    const third = runOfStep(t, filed.id, 3);
+    await t.waitStatus(third.id, 'waiting_approval');
+    t.master.engine.approve(third.id);
+    await t.waitStatus(third.id, 'completed');
+    await t.master.backlog.poll();
+    expect(statuses(t, filed.id)).toEqual(['failed', 'running', 'done']);
+  });
+
+  it('rejects a pending iteration as a whole with a reason the next scouts are shown', async () => {
+    const t = await start(config({ maxRisk: 'none' }));
+    const filed = await planned(t, THREE);
+    expect(() => t.master.backlog.rejectIteration(filed.id, ' \n ')).toThrow(
+      '拒绝迭代时必须填写理由',
+    );
+    const rejected = t.master.backlog.rejectIteration(filed.id, ' 现在不做本地仓库 \n');
+    expect(rejected).toMatchObject({
+      status: 'cancelled',
+      decidedAt: expect.any(String),
+      endedAt: expect.any(String),
+    });
+    expect(rejected.children.map((c) => c.status)).toEqual(['dropped', 'dropped', 'dropped']);
+    expect(stepProposals(t, filed.id).map((p) => [p.status, p.rejectReason])).toEqual([
+      ['rejected', '现在不做本地仓库'],
+      ['rejected', '现在不做本地仓库'],
+      ['rejected', '现在不做本地仓库'],
+    ]);
+    expect(eventData(t, 'iteration.cancelled')).toEqual([
+      {
+        repo: 'demo',
+        iterationId: filed.id,
+        backlog: true,
+        dropped: [1, 2, 3],
+        pending: true,
+        reason: '现在不做本地仓库',
+      },
+    ]);
+    expect(t.master.store.listRuns()).toEqual([]);
+    expect(demoStatus(t)?.pendingProposals).toBe(0);
+    expect(() => t.master.backlog.acceptIteration(filed.id)).toThrow(`迭代 ${filed.id} 已经不做了`);
+    expect(() => t.master.backlog.rejectIteration(filed.id, '再拒')).toThrow(InvalidStateError);
+    await expect(t.master.backlog.cancelIteration(filed.id)).rejects.toThrow(
+      `迭代 ${filed.id} 已经不做了`,
+    );
+
+    // The next scout plans anew, shown the iteration once, with the reason.
+    t.scripts.scout = () => ({ structured: { gaps: [], proposals: [] } });
+    await scoutByHand(t);
+    const prompt = lastScoutPrompt(t);
+    expect(prompt).toContain('## 规划迭代');
+    const rejectedPart = prompt.slice(prompt.indexOf('### 被拒绝'));
+    expect(rejectedPart).toContain(
+      `- ${filed.id} 迭代「本地仓库也能永动」（子项：第一步、第二步、收尾）\n  理由：现在不做本地仓库`,
+    );
+    expect(rejectedPart).not.toContain(stepProposals(t, filed.id)[0]?.id ?? '');
+  });
+
+  it('cancels an accepted iteration: the Runs of its steps not done are terminated, the steps dropped', async () => {
+    const t = await start(config({ autoMerge: false }));
+    const filed = await planned(t, THREE);
+    const first = runOfStep(t, filed.id, 1);
+    await t.waitStatus(first.id, 'waiting_approval');
+    const cancelled = await t.master.backlog.cancelIteration(filed.id);
+    expect(cancelled).toMatchObject({ status: 'cancelled', endedAt: expect.any(String) });
+    expect(cancelled.children.map((c) => c.status)).toEqual(['dropped', 'dropped', 'dropped']);
+    expect(t.master.store.getRun(first.id).status).toBe('cancelled');
+    expect(t.master.store.listEvents(first.id).map((e) => e.type)).toContain(
+      'run.iteration_cancelled',
+    );
+    expect(eventData(t, 'iteration.cancelled')).toEqual([
+      {
+        repo: 'demo',
+        iterationId: filed.id,
+        backlog: true,
+        dropped: [1, 2, 3],
+        pending: false,
+      },
+    ]);
+    // Polls neither take the Run's end for a failure nor start the other steps.
+    await t.master.backlog.poll();
+    expect(t.master.store.listGlobalEventsOfType('iteration.blocked')).toEqual([]);
+    expect(stepProposals(t, filed.id).map((p) => p.runId)).toEqual([first.id, null, null]);
+    expect(statuses(t, filed.id)).toEqual(['dropped', 'dropped', 'dropped']);
+    await expect(t.master.backlog.cancelIteration(filed.id)).rejects.toThrow(
+      `迭代 ${filed.id} 已经不做了`,
+    );
+    // The next scout reads the steps as ended with it.
+    t.scripts.scout = () => ({ structured: { gaps: [], proposals: [] } });
+    await scoutByHand(t);
+    expect(lastScoutPrompt(t)).toContain(`所属迭代 ${filed.id} 已被人终止`);
+    expect(lastScoutPrompt(t)).toContain('终止：所属迭代被人在看板上终止，没做完的子项随之不做');
+  });
+
+  it('speaks English without Chinese left', async () => {
+    const t = await start(`language: en\n${config({ maxRisk: 'none' })}`);
+    const english = (title: string, patch: Record<string, unknown> = {}) =>
+      step(title, {
+        why: `Why: ${title}`,
+        evidence: ['run_abc was reworked 3 times'],
+        what: `How: ${title}`,
+        acceptance: ['Tests pass'],
+        ...patch,
+      });
+    const filed = await planned(t, {
+      ...plan([english('First'), english('Second', { dependsOn: [1] })]),
+      title: 'Local repos run on their own',
+      goal: 'A repo without GitHub proposes and finishes its own work',
+      readmeGoal: 'Perpetual motion',
+      criteria: ['A local repo finishes a round by itself'],
+      outOfScope: [],
+    });
+    const [, second] = stepProposals(t, filed.id);
+    const errors: string[] = [];
+    const caught = async (fn: () => unknown) => {
+      try {
+        await fn();
+      } catch (err) {
+        errors.push((err as Error).message);
+      }
+    };
+    await caught(() => t.master.backlog.accept(second?.id ?? ''));
+    await caught(() => t.master.backlog.cancelIteration(filed.id));
+    await caught(() => t.master.backlog.rejectIteration(filed.id, ' '));
+    t.master.backlog.rejectIteration(filed.id, 'Not now');
+    await caught(() => t.master.backlog.acceptIteration(filed.id));
+    expect(errors).toEqual([
+      `Proposal ${second?.id} is a step of iteration ${filed.id}: accept or reject the iteration as a whole`,
+      `Iteration ${filed.id} is not accepted yet: reject it, with a reason, rather than cancel it`,
+      'Rejecting an iteration needs a reason',
+      `Iteration ${filed.id} was turned down already`,
+    ]);
+    t.scripts.scout = () => ({ structured: { gaps: [], proposals: [] } });
+    await scoutByHand(t);
+    const prompt = lastScoutPrompt(t);
+    expect(prompt).toContain(
+      `- ${filed.id} iteration "Local repos run on their own" (steps: First, Second)\n  Reason: Not now`,
+    );
+    const notice = noticeFor(
+      {
+        id: 1,
+        runId: null,
+        type: 'iteration.blocked',
+        data: { repo: 'demo', iterationId: filed.id, backlog: true, position: 2, reason: 'failed' },
+        ts: new Date().toISOString(),
+      },
+      undefined,
+    );
+    expect(notice?.body).toContain('Step 2 of the iteration was not done');
+    const text = [prompt, notice?.title, notice?.body, ...errors].join('\n');
+    expect(text).not.toMatch(/[一-鿿]/);
   });
 });

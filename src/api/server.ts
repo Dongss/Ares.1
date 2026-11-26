@@ -20,7 +20,13 @@ import { type ExecFile, systemNoticeSupported } from '../notify/system.js';
 import { sendTestNotice } from '../notify/test-notice.js';
 import type { WebhookNotifier } from '../notify/webhook.js';
 import { ConflictError, NotFoundError, type Store } from '../store/store.js';
-import { type EventRow, PROPOSAL_STATUSES, type Proposal, type RunStatus } from '../store/types.js';
+import {
+  type EventRow,
+  type Iteration,
+  PROPOSAL_STATUSES,
+  type Proposal,
+  type RunStatus,
+} from '../store/types.js';
 import type { Upgrader } from '../upgrade/upgrader.js';
 import { branchExists, currentBranch, isGitRepo } from '../workspace/git.js';
 import { agentSummaries } from './agents.js';
@@ -120,6 +126,14 @@ const reasonNeeded = () =>
   t({ zh: '拒绝提案时必须填写理由', en: 'Rejecting a proposal needs a reason' });
 const RejectProposalInput = z.strictObject({
   reason: z.string({ error: reasonNeeded }).trim().min(1, { error: reasonNeeded }),
+});
+const iterationReasonNeeded = () =>
+  t({ zh: '拒绝迭代时必须填写理由', en: 'Rejecting an iteration needs a reason' });
+const RejectIterationInput = z.strictObject({
+  reason: z
+    .string({ error: iterationReasonNeeded })
+    .trim()
+    .min(1, { error: iterationReasonNeeded }),
 });
 const WorkingInput = z.strictObject({ on: z.boolean() });
 const StatsQuery = z.strictObject({
@@ -501,7 +515,8 @@ export function createApi(deps: ApiDeps): Hono {
     );
   });
 
-  // Accepting creates a Run whose goal is the proposal's text.
+  // Accepting creates a Run whose goal is the proposal's text. A step of an iteration is decided
+  // with its iteration (409).
   app.post('/api/proposals/:id/accept', (c) => {
     const proposal = backlog.accept(c.req.param('id'));
     const run = store.getRun(proposal.runId ?? '');
@@ -511,13 +526,31 @@ export function createApi(deps: ApiDeps): Hono {
     } satisfies ProposalAccepted);
   });
 
-  // Rejecting needs a reason, which the repo's next scouts are shown.
+  // Rejecting needs a reason, which the repo's next scouts are shown. A step of an iteration is
+  // decided with its iteration (409).
   app.post('/api/proposals/:id/reject', async (c) => {
     const { reason } = await body(c, RejectProposalInput);
     return c.json(
       proposalView(store, backlog.reject(c.req.param('id'), reason)) satisfies ProposalView,
     );
   });
+
+  // Iterations of the local backlog are decided as a whole here; those of GitHub on GitHub (409).
+  // Accepting accepts every step, and the steps whose dependencies are done become Runs.
+  app.post('/api/iterations/:id/accept', (c) =>
+    c.json(backlog.acceptIteration(c.req.param('id')) satisfies Iteration),
+  );
+
+  // Rejecting a pending one needs a reason, which the repo's next scouts are shown.
+  app.post('/api/iterations/:id/reject', async (c) => {
+    const { reason } = await body(c, RejectIterationInput);
+    return c.json(backlog.rejectIteration(c.req.param('id'), reason) satisfies Iteration);
+  });
+
+  // Cancelling an accepted one terminates the Runs of its steps not done.
+  app.post('/api/iterations/:id/cancel', async (c) =>
+    c.json((await backlog.cancelIteration(c.req.param('id'))) satisfies Iteration),
+  );
 
   // ---- logs ----------------------------------------------------------------
   app.get('/api/attempts/:id/log', (c) => {

@@ -954,6 +954,12 @@ export function eventText(event: Pick<EventRow, 'type' | 'data'>, now = new Date
       en: `Its iteration${which} was closed by a human, so this Run was terminated and its issue closed as not planned`,
     });
   }
+  if (event.type === 'run.iteration_cancelled') {
+    return t({
+      zh: '所属迭代被人在看板上终止了，这个 Run 随之终止',
+      en: 'Its iteration was cancelled on the dashboard, so this Run was terminated',
+    });
+  }
   const { newRun } = event.data;
   if (event.type === 'run.goal_changed' && typeof newRun === 'string') {
     return t({

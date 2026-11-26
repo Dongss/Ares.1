@@ -28,7 +28,16 @@ import { setLang } from '../src/i18n.js';
 import { type ExecFile, noticeScript } from '../src/notify/system.js';
 import { testNoticeText } from '../src/notify/test-notice.js';
 import type { Fetch } from '../src/notify/webhook.js';
-import type { Attempt, EventRow, Proposal, Run, RunStatus, Scout } from '../src/store/types.js';
+import type {
+  Attempt,
+  EventRow,
+  Iteration,
+  IterationChild,
+  Proposal,
+  Run,
+  RunStatus,
+  Scout,
+} from '../src/store/types.js';
 import {
   ASSESS_AGENTS_YAML,
   ASSESS_WORKFLOW_YAML,
@@ -1685,6 +1694,167 @@ backlog:
       (await call('POST', '/api/proposals/proposal_none/reject', { reason: '没有' })).status,
     ).toBe(404);
     expect(t.master.store.listRuns()).toHaveLength(1);
+    expect(gh.calls).toEqual([]);
+  });
+
+  /**
+   * A pending iteration of the repo as the local backlog keeps it: a proposal per step, the
+   * second depending on the first. Of `source` github, the same without proposals.
+   */
+  function planIteration(t: Harness, source: Iteration['source'] = 'local'): Iteration {
+    const store = t.master.store;
+    const iteration = store.createIteration({
+      repoId: t.repo.id,
+      scoutId: null,
+      source,
+      issuesRepo: source === 'github' ? 'me/demo' : '',
+      title: '本地迭代',
+      goal: '本地仓库也能永动',
+      readmeGoal: '永动',
+      criteria: ['能演示'],
+      outOfScope: [],
+      children: [],
+      ...(source === 'github' ? { issue: { number: 1, url: 'https://github.com/me/demo/1' } } : {}),
+    });
+    const child = (title: string, position: number, dependsOn: number[]): IterationChild => ({
+      title,
+      category: 'feature',
+      size: 'M',
+      risk: 'high',
+      why: `${title}的原因`,
+      evidence: ['run_abc 返工了 3 轮'],
+      what: `${title}的做法`,
+      acceptance: ['测试通过'],
+      position,
+      criteria: [1],
+      dependsOn,
+      closeout: false,
+      status: 'planned',
+      runIds: [],
+    });
+    const children = [child('第一步', 1, []), child('第二步', 2, [1])];
+    if (source === 'github') return store.updateIteration(iteration.id, { children });
+    const first = propose(t.repo.id, '第一步');
+    const second = propose(t.repo.id, '第二步');
+    store.updateProposal(first.id, { iterationId: iteration.id });
+    store.updateProposal(second.id, { iterationId: iteration.id, dependsOn: [first.id] });
+    return store.updateIteration(iteration.id, {
+      children: [
+        { ...(children[0] as IterationChild), proposalId: first.id },
+        { ...(children[1] as IterationChild), proposalId: second.id },
+      ],
+    });
+  }
+
+  /** The proposal of each step of an iteration, in the order of its plan. */
+  const stepsOf = (t: Harness, id: string) =>
+    t.master.store
+      .getIteration(id)
+      .children.map((c) => t.master.store.getProposal(c.proposalId ?? ''));
+
+  it('accepts and cancels a local iteration as a whole, its steps never on their own', async () => {
+    const t = await start();
+    const iteration = planIteration(t);
+    const [first, second] = stepsOf(t, iteration.id);
+    if (!first || !second) throw new Error('no steps');
+
+    // A step is decided with its iteration.
+    const whole = `提案 ${second.id} 是迭代 ${iteration.id} 的子项，要和迭代一起整体采纳或拒绝`;
+    expect(await call('POST', `/api/proposals/${second.id}/accept`)).toMatchObject({
+      status: 409,
+      json: { error: whole },
+    });
+    expect(
+      await call('POST', `/api/proposals/${second.id}/reject`, { reason: '不要' }),
+    ).toMatchObject({ status: 409, json: { error: whole } });
+    // Nor is a pending one cancelled.
+    expect(await call('POST', `/api/iterations/${iteration.id}/cancel`)).toMatchObject({
+      status: 409,
+      json: { error: `迭代 ${iteration.id} 还没有采纳，要拒绝它（填写理由），而不是终止` },
+    });
+
+    const accepted = await call('POST', `/api/iterations/${iteration.id}/accept`);
+    expect(accepted.status).toBe(200);
+    expect(accepted.json as Iteration).toMatchObject({
+      id: iteration.id,
+      status: 'active',
+      auto: false,
+      decidedAt: expect.any(String),
+    });
+    // Every step accepted; only the first, which waits for nothing, became a Run.
+    const [acceptedFirst, acceptedSecond] = stepsOf(t, iteration.id);
+    expect([acceptedFirst?.status, acceptedSecond?.status]).toEqual(['accepted', 'accepted']);
+    expect(acceptedFirst?.runId).toEqual(expect.any(String));
+    expect(acceptedSecond?.runId).toBeNull();
+    expect((accepted.json as Iteration).children.map((c) => c.status)).toEqual([
+      'running',
+      'waiting',
+    ]);
+    expect(await call('POST', `/api/iterations/${iteration.id}/accept`)).toMatchObject({
+      status: 409,
+      json: { error: `迭代 ${iteration.id} 已经采纳过了` },
+    });
+    expect(
+      (await call('POST', `/api/iterations/${iteration.id}/reject`, { reason: '不要' })).status,
+    ).toBe(409);
+
+    const cancelled = await call('POST', `/api/iterations/${iteration.id}/cancel`);
+    expect(cancelled.status).toBe(200);
+    expect(cancelled.json as Iteration).toMatchObject({ id: iteration.id, status: 'cancelled' });
+    const run = t.master.store.getRun(acceptedFirst?.runId ?? '');
+    // Its Run had either been terminated or completed by then.
+    expect(['cancelled', 'completed']).toContain(run.status);
+    expect((await call('POST', `/api/iterations/${iteration.id}/cancel`)).status).toBe(409);
+    expect((await call('POST', '/api/iterations/iteration_none/accept')).status).toBe(404);
+    expect((await call('POST', '/api/iterations/iteration_none/cancel')).status).toBe(404);
+    expect(gh.calls).toEqual([]);
+  });
+
+  it('rejects a pending local iteration only with a reason, its steps with it', async () => {
+    const t = await start();
+    const iteration = planIteration(t);
+    for (const input of [{ reason: ' \n ' }, { reason: '' }, {}, undefined]) {
+      const res = await call('POST', `/api/iterations/${iteration.id}/reject`, input);
+      expect(res.status).toBe(400);
+      expect(res.json.error).toContain('拒绝迭代时必须填写理由');
+    }
+    expect(
+      (await call('POST', `/api/iterations/${iteration.id}/reject`, { reason: 'x', why: 'y' }))
+        .status,
+    ).toBe(400);
+    expect(t.master.store.getIteration(iteration.id).status).toBe('pending');
+
+    const rejected = await call('POST', `/api/iterations/${iteration.id}/reject`, {
+      reason: ' 现在不做 \n',
+    });
+    expect(rejected.status).toBe(200);
+    expect(rejected.json as Iteration).toMatchObject({ id: iteration.id, status: 'cancelled' });
+    expect(stepsOf(t, iteration.id).map((p) => [p.status, p.rejectReason])).toEqual([
+      ['rejected', '现在不做'],
+      ['rejected', '现在不做'],
+    ]);
+    expect(await call('POST', `/api/iterations/${iteration.id}/accept`)).toMatchObject({
+      status: 409,
+      json: { error: `迭代 ${iteration.id} 已经不做了` },
+    });
+    expect(t.master.store.listRuns()).toEqual([]);
+  });
+
+  it('leaves an iteration of GitHub to GitHub', async () => {
+    const t = await start();
+    const iteration = planIteration(t, 'github');
+    const onGitHub = `迭代 ${iteration.id} 在 GitHub 上：给迭代 issue 加上 ares1:ready 来采纳，关掉迭代 issue 来拒绝或终止`;
+    for (const [path, input] of [
+      ['accept', undefined],
+      ['reject', { reason: '不要' }],
+      ['cancel', undefined],
+    ] as const) {
+      expect(await call('POST', `/api/iterations/${iteration.id}/${path}`, input)).toMatchObject({
+        status: 409,
+        json: { error: onGitHub },
+      });
+    }
+    expect(t.master.store.getIteration(iteration.id).status).toBe('pending');
     expect(gh.calls).toEqual([]);
   });
 

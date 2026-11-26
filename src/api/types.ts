@@ -397,7 +397,10 @@ export interface GitHubStatus {
 
 /** One repo whose requirements come from the local backlog (backlog.repos). */
 export interface BacklogRepoStatus extends ProposalSourceStatus {
-  /** Proposals waiting for a human or for the automatic acceptance. */
+  /**
+   * Proposals waiting for a human or for the automatic acceptance; an iteration waiting counts
+   * as one, accepted or rejected as a whole, and its steps not at all.
+   */
   pendingProposals: number;
 }
 

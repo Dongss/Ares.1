@@ -329,6 +329,18 @@ export function globalEventText(event: GlobalEvent, now = new Date()): string | 
     case 'iteration.accepted': {
       const issue = num(d.issue);
       const which = issue === null ? '' : ` #${issue}`;
+      // An iteration of the local backlog: its steps are proposals, not issues.
+      if (d.backlog === true) {
+        return event.type === 'iteration.auto_accepted'
+          ? t({
+              zh: `整批自动采纳了 ${repoOf(event)} 的一个本地迭代，子项按依赖顺序开工`,
+              en: `Accepted a local iteration of ${repoOf(event)} automatically as a whole; its steps start in the order of their dependencies`,
+            })
+          : t({
+              zh: `${repoOf(event)} 的一个本地迭代已整批采纳，子项按依赖顺序开工`,
+              en: `A local iteration of ${repoOf(event)} was accepted as a whole; its steps start in the order of their dependencies`,
+            });
+      }
       return event.type === 'iteration.auto_accepted'
         ? t({
             zh: `整批自动采纳了 ${repoOf(event)} 的迭代${which}，子 issue 按依赖顺序开工`,
@@ -386,12 +398,18 @@ export function globalEventText(event: GlobalEvent, now = new Date()): string | 
               zh: `第 ${position} 步${child === null ? '' : `（#${child}）`}`,
               en: `step ${position}${child === null ? '' : ` (#${child})`}`,
             });
+      // A Run of the local backlog is never redone: its step failed with it.
       const why =
-        d.reason === 'failed'
-          ? t({ zh: '用完重做次数后失败了', en: 'failed after using up its attempts' })
-          : d.reason === 'dropped'
-            ? t({ zh: '被人关成了不做', en: 'was closed as not planned' })
-            : t({ zh: '没有做成', en: 'was not done' });
+        d.reason === 'failed' && d.backlog === true
+          ? t({
+              zh: '没有做成（Run 失败、被终止，或需求评估结论为不做）',
+              en: 'was not done (its Run failed, was terminated, or its assessment dropped it)',
+            })
+          : d.reason === 'failed'
+            ? t({ zh: '用完重做次数后失败了', en: 'failed after using up its attempts' })
+            : d.reason === 'dropped'
+              ? t({ zh: '被人关成了不做', en: 'was closed as not planned' })
+              : t({ zh: '没有做成', en: 'was not done' });
       return t({
         zh: `${repoOf(event)} 的迭代${issue === null ? '' : ` #${issue} `}受阻：${step}${why}，依赖它的步骤开不了工；侦察下次会换个做法替换它`,
         en: `Iteration${issue === null ? '' : ` #${issue}`} of ${repoOf(event)} is blocked: ${step} ${why}, so the steps depending on it cannot start; the next scout replaces it with another approach`,
@@ -407,6 +425,33 @@ export function globalEventText(event: GlobalEvent, now = new Date()): string | 
     case 'iteration.cancelled': {
       const issue = num(d.issue);
       const dropped = Array.isArray(d.dropped) ? d.dropped.length : null;
+      // An iteration of the local backlog: rejected before it was accepted, cancelled after.
+      if (d.backlog === true) {
+        if (d.pending === true) {
+          const reason = str(d.reason);
+          const rejected = t({
+            zh: `拒绝了 ${repoOf(event)} 的一个本地迭代，它的子项随之拒绝`,
+            en: `Rejected a local iteration of ${repoOf(event)}, its steps with it`,
+          });
+          return reason
+            ? t({
+                zh: `${rejected}，理由：${reason}；之后的侦察会看到这条理由`,
+                en: `${rejected}, because: ${reason}; later scouts are shown the reason`,
+              })
+            : rejected;
+        }
+        const stopped =
+          dropped === null || dropped === 0
+            ? ''
+            : t({
+                zh: `，${dropped} 个没完成的子项随之不做`,
+                en: `; its ${steps(dropped)} not done ${dropped === 1 ? 'was' : 'were'} dropped with it`,
+              });
+        return t({
+          zh: `${repoOf(event)} 的一个本地迭代被人在看板上终止了${stopped}`,
+          en: `A local iteration of ${repoOf(event)} was cancelled on the dashboard${stopped}`,
+        });
+      }
       const which = issue === null ? '' : ` #${issue}`;
       // A space between the number and the Chinese after it.
       const zhWhich = issue === null ? '' : ` #${issue} `;

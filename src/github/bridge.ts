@@ -9,9 +9,10 @@ import {
   closeoutSuggestions,
   followChildren,
   iterationSummary,
-  iterationTotals,
+  recordAccepted,
   recordAdjustment,
   recordCancelled,
+  recordDone,
 } from '../backlog/iterations.js';
 import {
   type FiledIteration,
@@ -33,7 +34,6 @@ import {
   MAX_ITERATION_CHILDREN,
   redoDueAt,
   replyTimeoutHours,
-  unmetDependencies,
 } from '../config/flow.js';
 import {
   findTemplate,
@@ -2750,29 +2750,7 @@ export class IssueBridge {
       const issue = await gh.getIssue(full, own.number);
       await gh.setLabels(full, own.number, accepted(issue.labels));
     }
-    const store = this.deps.store;
-    store.tx(() => {
-      const latest = store.getIteration(iteration.id);
-      if (latest.status !== 'pending') return;
-      store.updateIteration(iteration.id, {
-        status: 'active',
-        auto,
-        decidedAt: nowIso(),
-        children: latest.children.map((c) =>
-          c.status === 'planned'
-            ? {
-                ...c,
-                status: unmetDependencies(c, latest.children).length > 0 ? 'waiting' : 'ready',
-              }
-            : c,
-        ),
-      });
-      store.event(null, auto ? 'iteration.auto_accepted' : 'iteration.accepted', {
-        repo: repo.name,
-        iterationId: iteration.id,
-        issue: own.number,
-      });
-    });
+    recordAccepted(this.deps.store, iteration.id, repo.name, auto);
   }
 
   /**
@@ -3071,19 +3049,7 @@ export class IssueBridge {
       if (labels.length !== issue.labels.length) await gh.setLabels(full, issue.number, labels);
       await gh.close(full, issue.number, 'completed');
     }
-    store.tx(() => {
-      const latest = store.getIteration(iteration.id);
-      if (latest.status !== 'active') return;
-      const ended = store.updateIteration(iteration.id, { status: 'done', endedAt: nowIso() });
-      const totals = iterationTotals(store, ended);
-      store.event(null, 'iteration.completed', {
-        repo: repo.name,
-        iterationId: iteration.id,
-        issue: issue.number,
-        costUsd: totals.costUsd,
-        runs: totals.runs,
-      });
-    });
+    recordDone(store, iteration.id, repo.name);
   }
 
   // ---- status ----------------------------------------------------------------------

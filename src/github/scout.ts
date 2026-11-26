@@ -5,6 +5,7 @@ import { brandName } from '../brand.js';
 import {
   type AutoAcceptLimits,
   holdsScout,
+  ITERATION_OPEN_STATUSES,
   iterationKind,
   iterationProgress,
   MAX_ITERATION_CHILDREN,
@@ -1243,6 +1244,11 @@ const TERMINATION_REASONS: Record<string, (data: EventRow['data']) => string> = 
           zh: '所属迭代被人关掉，issue 随之关成不做',
           en: 'its iteration was closed, and the issue closed as not planned with it',
         }),
+  'run.iteration_cancelled': () =>
+    t({
+      zh: '所属迭代被人在看板上终止，没做完的子项随之不做',
+      en: 'its iteration was cancelled on the dashboard, and its steps not done dropped with it',
+    }),
   'run.goal_changed': ({ newRun }) =>
     typeof newRun === 'string'
       ? t({
@@ -1669,17 +1675,37 @@ function digestSection(heading: string, lines: string[], max: number): string {
   return `${heading}\n${shown.join('\n')}`;
 }
 
+/** What the scout's list of local proposals reads of the iteration a proposal is a step of. */
+export type ProposalIteration = Pick<Iteration, 'id' | 'title' | 'status'>;
+
 /**
  * An accepted proposal: the Run it became and how that stands, whether it was accepted without a
- * human; why the Run failed or why its assessment dropped the requirement, which the Run digest
- * no longer shows once the Run is old; and its next steps.
+ * human, the iteration it was a step of once that ended (done, or cancelled by a human, when a
+ * step without a Run never got one); why the Run failed or why its assessment dropped the
+ * requirement, which the Run digest no longer shows once the Run is old; and its next steps.
  */
-function acceptedProposalLine(p: Proposal, run: ProposalRun | undefined): string {
+function acceptedProposalLine(
+  p: Proposal,
+  run: ProposalRun | undefined,
+  iteration: ProposalIteration | undefined,
+): string {
   const parts: string[] = [];
   if (p.runId) {
     parts.push(run ? `Run ${p.runId}${colon()}${statusText(run.status)}` : `Run ${p.runId}`);
   }
   if (p.auto) parts.push(t({ zh: '自动采纳', en: 'accepted automatically' }));
+  if (iteration?.status === 'done') {
+    parts.push(
+      t({ zh: `所属迭代 ${iteration.id} 已完成`, en: `its iteration ${iteration.id} is done` }),
+    );
+  } else if (iteration?.status === 'cancelled') {
+    parts.push(
+      t({
+        zh: `所属迭代 ${iteration.id} 已被人终止`,
+        en: `its iteration ${iteration.id} was cancelled by a human`,
+      }),
+    );
+  }
   const about = parts.length
     ? t({ zh: `（${parts.join('，')}）`, en: ` (${parts.join('; ')})` })
     : '';
@@ -1706,25 +1732,55 @@ function acceptedProposalLine(p: Proposal, run: ProposalRun | undefined): string
  * proposals carry their next steps (see nextSteps), so that the scout proposes the next step of a
  * large capability once the one before it is done. `proposals` are newest first; every one was
  * written by a scout of the Master and decided on its dashboard, so all of them are trusted.
+ * `iterations` are the repo's: the steps of the one under way are left out, as the iteration's
+ * own digest lists them (`iterationDigest`); the steps of one rejected as a whole make one entry,
+ * the iteration with the titles of its steps and the reason; the steps of one that ended are
+ * listed as the accepted proposals they are, with how it ended.
  */
 export function localProposalDigest(
   proposals: readonly Proposal[],
   runOf?: (runId: string) => ProposalRun | undefined,
+  iterations: readonly ProposalIteration[] = [],
 ): string {
-  const of = (status: Proposal['status']) => proposals.filter((p) => p.status === status);
+  const byId = new Map(iterations.map((it) => [it.id, it]));
+  const iterationOf = (p: Proposal) => (p.iterationId ? byId.get(p.iterationId) : undefined);
+  const listed = proposals.filter((p) => {
+    const it = iterationOf(p);
+    return !it || !ITERATION_OPEN_STATUSES.includes(it.status);
+  });
+  const of = (status: Proposal['status']) => listed.filter((p) => p.status === status);
   const pending = of('pending').map(
     (p) => `- ${p.id} ${oneLine(p.title, 120)}${nextStepsLines(p.what)}`,
   );
   const accepted = of('accepted').map((p) =>
-    acceptedProposalLine(p, p.runId ? runOf?.(p.runId) : undefined),
+    acceptedProposalLine(p, p.runId ? runOf?.(p.runId) : undefined, iterationOf(p)),
   );
-  const rejected = of('rejected').map((p) => {
-    const reason = p.rejectReason?.trim();
-    const why = reason
-      ? `\n  ${t({ zh: '理由', en: 'Reason' })}${colon()}${oneLine(reason, 300)}`
-      : '';
-    return `- ${p.id} ${oneLine(p.title, 120)}${why}`;
-  });
+  const reasonLine = (reason: string | null | undefined) => {
+    const why = reason?.trim();
+    return why ? `\n  ${t({ zh: '理由', en: 'Reason' })}${colon()}${oneLine(why, 300)}` : '';
+  };
+  const rejected: string[] = [];
+  const rejectedIterations = new Set<string>();
+  for (const p of of('rejected')) {
+    const it = iterationOf(p);
+    if (!it) {
+      rejected.push(`- ${p.id} ${oneLine(p.title, 120)}${reasonLine(p.rejectReason)}`);
+      continue;
+    }
+    // Rejected as a whole: one entry, where its newest step would be.
+    if (rejectedIterations.has(it.id)) continue;
+    rejectedIterations.add(it.id);
+    const steps = proposals
+      .filter((s) => s.iterationId === it.id)
+      .reverse()
+      .map((s) => oneLine(s.title, 80));
+    rejected.push(
+      `- ${it.id} ${t({
+        zh: `迭代「${oneLine(it.title, 120)}」（子项：${join(steps)}）`,
+        en: `iteration "${oneLine(it.title, 120)}" (steps: ${join(steps)})`,
+      })}${reasonLine(p.rejectReason)}`,
+    );
+  }
   return [
     digestSection(
       t({ zh: '### 等人决定', en: '### Waiting for a human' }),

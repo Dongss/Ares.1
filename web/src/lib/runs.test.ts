@@ -762,6 +762,19 @@ describe('a Run terminated because its iteration was closed', () => {
     );
     expect(english).not.toMatch(/[一-鿿]/);
   });
+
+  it('says a local iteration was cancelled on the dashboard, in both languages', () => {
+    const data = { repo: 'demo', iterationId: 'iteration-1' };
+    expect(eventText({ type: 'run.iteration_cancelled', data })).toBe(
+      '所属迭代被人在看板上终止了，这个 Run 随之终止',
+    );
+    setLang('en');
+    const english = eventText({ type: 'run.iteration_cancelled', data });
+    expect(english).toBe(
+      'Its iteration was cancelled on the dashboard, so this Run was terminated',
+    );
+    expect(english).not.toMatch(/[一-鿿]/);
+  });
 });
 
 describe('a Run started over because its issue changed', () => {

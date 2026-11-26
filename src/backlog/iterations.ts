@@ -76,17 +76,36 @@ export function ranOutOfAttempts(store: Store, runs: readonly Run[]): boolean {
 
 /**
  * Where the source has a child's requirement: open, still to be done; done (on GitHub: its issue
- * closed as completed); or closed without being done (on GitHub: closed as not planned, or any
- * other way but completed).
+ * closed as completed; in the local backlog: its Run completed); closed without being done (on
+ * GitHub: closed as not planned, or any other way but completed), which is failed or dropped by
+ * its Runs; or failed outright (in the local backlog, where a Run is never redone: its Run failed,
+ * was terminated, or its assessment dropped the requirement).
  */
-export type ChildOutcome = 'open' | 'done' | 'closed';
+export type ChildOutcome = 'open' | 'done' | 'closed' | 'failed';
+
+/**
+ * What every event about an iteration starts with: its repo and id, its issue on GitHub, and
+ * `backlog: true` for one of the local backlog, whose texts point to the dashboard instead.
+ */
+export function iterationEventData(
+  iteration: Pick<Iteration, 'id' | 'issue' | 'source'>,
+  repo: string,
+): Record<string, unknown> {
+  return {
+    repo,
+    iterationId: iteration.id,
+    ...(iteration.issue ? { issue: iteration.issue.number } : {}),
+    ...(iteration.source === 'local' ? { backlog: true } : {}),
+  };
+}
 
 /**
  * Record where the children of an accepted iteration stand now, each with the Runs that worked on
  * it (`childRuns`), and return the iteration as recorded then. `outcomes` tells, by position,
  * where the source has each child's requirement; a child it says nothing about (no issue yet, or
- * not read again) keeps its status. Done is done. Closed without being done is failed when its
- * Runs used up their attempts (`ranOutOfAttempts`), otherwise dropped: a human turned it down.
+ * not read again) keeps its status. Done is done, failed is failed. Closed without being done is
+ * failed when its Runs used up their attempts (`ranOutOfAttempts`), otherwise dropped: a human
+ * turned it down.
  * Open ones are running while a Run works on them, else waiting while a child they depend on is
  * not done (`unmetDependencies`), else ready. Each status change records an
  * `iteration.child_status` event, and the iteration's own status follows (`settleStatus`), in the
@@ -106,6 +125,7 @@ export function followChildren(
       const outcome = outcomes.get(child.position);
       const childRunsOf = runs.get(child.position) ?? [];
       if (outcome === 'done') settled.set(child.position, 'done');
+      else if (outcome === 'failed') settled.set(child.position, 'failed');
       else if (outcome === 'closed') {
         settled.set(child.position, ranOutOfAttempts(store, childRunsOf) ? 'failed' : 'dropped');
       } else if (outcome === 'open' && worksOn(childRunsOf)) {
@@ -145,9 +165,7 @@ export function followChildren(
       const before = latest.children[i] as IterationChild;
       if (child.status === before.status) continue;
       store.event(null, 'iteration.child_status', {
-        repo,
-        iterationId,
-        ...(latest.issue ? { issue: latest.issue.number } : {}),
+        ...iterationEventData(latest, repo),
         position: child.position,
         ...(child.issue ? { child: child.issue.number } : {}),
         ...(child.proposalId ? { proposalId: child.proposalId } : {}),
@@ -172,11 +190,7 @@ function settleStatus(store: Store, iteration: Iteration, repo: string): Iterati
   const was = iteration.status;
   if (was !== 'active' && was !== 'blocked') return iteration;
   const now = iterationStatusOf(iteration.children);
-  const where = {
-    repo,
-    iterationId: iteration.id,
-    ...(iteration.issue ? { issue: iteration.issue.number } : {}),
-  };
+  const where = iterationEventData(iteration, repo);
   if (now === 'blocked' && was === 'active') {
     const updated = store.updateIteration(iteration.id, { status: 'blocked' });
     const cause = iteration.children.find(
@@ -204,14 +218,78 @@ function settleStatus(store: Store, iteration: Iteration, repo: string): Iterati
 }
 
 /**
- * Record that a human turned the iteration down (on GitHub: closed its issue before it was done):
- * cancelled, ended now (and decided now if it was still pending), each child that was neither
- * done nor failed nor replaced dropped with it, and an `iteration.cancelled` event with the
- * positions of those dropped and whether it was still pending, in one transaction. The source
- * stops their Runs and closes their requirements. An iteration that is over already is returned
- * as it is.
+ * Accept a pending iteration as a whole, by a human or without one (`auto`): active, decided now,
+ * each child planned so far waiting for the children it depends on or ready, and an
+ * `iteration.accepted` or `iteration.auto_accepted` event (which counts once toward today's
+ * auto-accepts), in one transaction. The source starts its children in the order of their
+ * dependencies. Returns the iteration as recorded then, or null when it was no longer pending.
  */
-export function recordCancelled(store: Store, iterationId: string, repo: string): Iteration {
+export function recordAccepted(
+  store: Store,
+  iterationId: string,
+  repo: string,
+  auto: boolean,
+): Iteration | null {
+  return store.tx(() => {
+    const latest = store.getIteration(iterationId);
+    if (latest.status !== 'pending') return null;
+    const updated = store.updateIteration(iterationId, {
+      status: 'active',
+      auto,
+      decidedAt: nowIso(),
+      children: latest.children.map((c) =>
+        c.status === 'planned'
+          ? {
+              ...c,
+              status: unmetDependencies(c, latest.children).length > 0 ? 'waiting' : 'ready',
+            }
+          : c,
+      ),
+    });
+    store.event(
+      null,
+      auto ? 'iteration.auto_accepted' : 'iteration.accepted',
+      iterationEventData(latest, repo),
+    );
+    return updated;
+  });
+}
+
+/**
+ * Record that an accepted iteration is done, once its source summed it up: done, ended now, and
+ * an `iteration.completed` event with what it cost over how many Runs (`iterationTotals`), in one
+ * transaction. An iteration no longer active is returned as it is.
+ */
+export function recordDone(store: Store, iterationId: string, repo: string): Iteration {
+  return store.tx(() => {
+    const latest = store.getIteration(iterationId);
+    if (latest.status !== 'active') return latest;
+    const ended = store.updateIteration(iterationId, { status: 'done', endedAt: nowIso() });
+    const totals = iterationTotals(store, ended);
+    store.event(null, 'iteration.completed', {
+      ...iterationEventData(latest, repo),
+      costUsd: totals.costUsd,
+      runs: totals.runs,
+    });
+    return ended;
+  });
+}
+
+/**
+ * Record that a human turned the iteration down (on GitHub: closed its issue before it was done;
+ * in the local backlog: rejected it, or cancelled it once accepted): cancelled, ended now (and
+ * decided now if it was still pending), each child that was neither done nor failed nor replaced
+ * dropped with it, and an `iteration.cancelled` event with the positions of those dropped,
+ * whether it was still pending and `extra` (the reason a human gave), in one transaction. The
+ * source stops their Runs and closes their requirements. An iteration that is over already is
+ * returned as it is.
+ */
+export function recordCancelled(
+  store: Store,
+  iterationId: string,
+  repo: string,
+  extra: Record<string, unknown> = {},
+): Iteration {
   return store.tx(() => {
     const latest = store.getIteration(iterationId);
     if (!ITERATION_OPEN_STATUSES.includes(latest.status)) return latest;
@@ -228,11 +306,10 @@ export function recordCancelled(store: Store, iterationId: string, repo: string)
       ),
     });
     store.event(null, 'iteration.cancelled', {
-      repo,
-      iterationId,
-      ...(latest.issue ? { issue: latest.issue.number } : {}),
+      ...iterationEventData(latest, repo),
       dropped: dropped.map((c) => c.position),
       pending: latest.status === 'pending',
+      ...extra,
     });
     return updated;
   });
@@ -375,9 +452,7 @@ export function recordAdjustment(
       notes: [...latest.notes, { at: nowIso(), scoutId, text: update.note }],
     });
     store.event(null, 'iteration.adjusted', {
-      repo,
-      iterationId,
-      ...(latest.issue ? { issue: latest.issue.number } : {}),
+      ...iterationEventData(latest, repo),
       ...(scoutId ? { scoutId } : {}),
       added: adjusted.added,
       replaced: adjusted.replaced,
