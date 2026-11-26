@@ -401,10 +401,10 @@ export interface GitHubRepoStatus extends ProposalSourceStatus {
   push: boolean;
   /**
    * How Runs deliver (`deliver`): push = merged into the local target branch, which is pushed;
-   * pr = the Run's branch is pushed and a pull request opened, the Run completes once it merges
-   * (GitHub only).
+   * pr (GitHub) / mr (GitLab) = the Run's branch is pushed and a pull request (a merge request
+   * on GitLab) opened, the Run completes once it merges.
    */
-  deliver: 'push' | 'pr';
+  deliver: 'push' | 'pr' | 'mr';
 }
 
 /** GET /api/github and GET /api/gitlab: a code host's section of config.yaml and its bridge. */

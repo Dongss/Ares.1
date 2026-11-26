@@ -114,7 +114,8 @@ github:
 #   glab auth login                                # gitlab.com
 #   glab auth login --hostname gitlab.example.com  # 自建的 GitLab，--hostname 和下面的 host 一样
 # 登录的账号要能建标签、改 issue、写评论（项目的 Reporter 就行），push: true 时要能推送目标分支
-# （Developer 及以上；受保护分支要在「允许推送」里）。作者对项目的权限在 Developer 及以上才算受信任，
+# （Developer 及以上；受保护分支要在「允许推送」里）；deliver: mr 时只推送 Run 的分支、开 MR，Developer 就够，
+# 目标分支可以只允许通过 MR 合并。作者对项目的权限在 Developer 及以上才算受信任，
 # 其他人开的 issue 建出的 Run 先等你在看板上确认需求。不写 gitlab 就不接入
 gitlab:
   host: gitlab.example.com     # GitLab 的主机名，默认 gitlab.com；自建的写它的主机名（有端口就带上），不带 https://
@@ -139,7 +140,10 @@ gitlab:
         max_per_day: 2
       auto_merge: false        # strict 模板的合并阶段设了 gate: true，合并前等人审批
       push: true               # true = 合并后把目标分支推送到 GitLab，每轮检查时也把 GitLab 上的新提交快进到本地；默认 false
-      deliver: push            # 目前只支持 push（默认）；还不支持 MR，写别的值 config.yaml 校验不通过
+      deliver: push            # 怎么交付：push（默认）= 合并进本地目标分支后直接推送；
+                               # mr = 不动目标分支，推送 Run 的分支并开 MR，MR 在 GitLab 上合并后 Run 才完成，
+                               # 适合目标分支受保护、要走 MR、流水线或审批的项目。mr 要求 push: true，否则这个仓库停用、
+                               # 看板「配置」页报错。GitLab 这里写 mr，不写 GitHub 的 pr，写错 config.yaml 校验不通过
       daily_budget_usd: 15
       max_run_attempts: 3
 

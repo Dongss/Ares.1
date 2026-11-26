@@ -132,10 +132,14 @@ export const GitLabRepoSchema = z.strictObject({
   /** Push the target branch to the GitLab project after each merge. */
   push: z.boolean().default(false),
   /**
-   * How a Run's work reaches GitLab: push only, the merge stage fast-forwarding the local target
-   * branch, which is then pushed (with push: true). Merge requests (`mr`) are not supported yet.
+   * How a Run's work reaches GitLab. push: the merge stage fast-forwards the local target branch
+   * and the target branch is pushed (with push: true). mr: for target branches that only take
+   * merge requests (protected, or guarded by pipelines and approvals): the merge stage pushes the
+   * Run's branch and opens a merge request to the target branch instead, and the Run completes
+   * once it is merged on GitLab; the target branch itself is never pushed. mr needs push: true.
+   * GitHub's repos say `pr` for the same: each platform takes its own word only.
    */
-  deliver: z.enum(['push']).default('push'),
+  deliver: z.enum(['push', 'mr']).default('push'),
 });
 export type GitLabRepoConfig = z.infer<typeof GitLabRepoSchema>;
 

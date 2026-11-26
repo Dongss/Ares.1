@@ -37,6 +37,7 @@ import {
   redoDelayMs,
   redoDueAfter,
   redoDueAt,
+  repoDeliversByPr,
   requirementSource,
   resolveTemplate,
   roomUnderMaxRuns,
@@ -1167,15 +1168,63 @@ backlog:
       );
     });
 
-    it('delivers by push only: merge requests are not supported yet', () => {
-      expect(GitLabRepoSchema.parse({ issues_repo: 'a/b', template: 'x' }).deliver).toBe('push');
-      for (const bad of ['mr', 'pr', 'merge', true, null]) {
-        const repo = { issues_repo: 'a/b', template: 'x', deliver: bad };
-        expect(GitLabRepoSchema.safeParse(repo).success, String(bad)).toBe(false);
-      }
-      expect(() =>
-        load('gitlab:\n  repos:\n    app: { issues_repo: a/b, template: self-dev, deliver: mr }\n'),
-      ).toThrow(/gitlab\.repos\.app\.deliver/);
+    describe('deliver', () => {
+      const MR_NEEDS_PUSH =
+        'deliver: mr 要求 push: true：开 MR 要先把 Run 的分支推送到 GitLab，MR 合并后还要从 GitLab 拉取目标分支';
+      const repo = (fields: string) =>
+        `gitlab:\n  repos:\n    app: { issues_repo: a/b, template: self-dev${fields} }\n`;
+
+      it("delivers by push unless mr is written, and takes no other value, GitHub's pr neither", () => {
+        expect(GitLabRepoSchema.parse({ issues_repo: 'a/b', template: 'x' }).deliver).toBe('push');
+        const mr = { issues_repo: 'a/b', template: 'x', deliver: 'mr' };
+        expect(GitLabRepoSchema.parse(mr).deliver).toBe('mr');
+        for (const bad of ['pr', 'MR', 'merge', true, null]) {
+          const parsed = { issues_repo: 'a/b', template: 'x', deliver: bad };
+          expect(GitLabRepoSchema.safeParse(parsed).success, String(bad)).toBe(false);
+        }
+        // Nor does GitHub take GitLab's word.
+        expect(GitHubRepoSchema.safeParse({ template: 'x', deliver: 'mr' }).success).toBe(false);
+        expect(() => load(repo(', deliver: pr, push: true'))).toThrow(
+          /gitlab\.repos\.app\.deliver/,
+        );
+        for (const fields of ['', ', deliver: push', ', deliver: push, push: true']) {
+          const cfg = load(repo(fields));
+          expect(cfg.errors, fields).toEqual({});
+          expect(cfg.warnings, fields).toEqual({});
+        }
+        const cfg = load(repo(', deliver: mr, push: true'));
+        expect(cfg.errors).toEqual({});
+        expect(cfg.warnings).toEqual({});
+        expect(cfg.master.gitlab?.repos.app).toMatchObject({ deliver: 'mr', push: true });
+      });
+
+      it('disables a repo delivering by merge request without push, and says why', () => {
+        for (const fields of [', deliver: mr', ', deliver: mr, push: false']) {
+          const cfg = load(repo(fields));
+          expect(cfg.errors, fields).toEqual({ [gitlabConfigKey('app')]: [MR_NEEDS_PUSH] });
+          expect(cfg.warnings, fields).toEqual({});
+        }
+        // Told together with the repo's other problems.
+        expect(
+          load('gitlab:\n  repos:\n    app: { issues_repo: a/b, template: nope, deliver: mr }\n')
+            .errors,
+        ).toEqual({ [gitlabConfigKey('app')]: ['模板 nope 不存在或无效', MR_NEEDS_PUSH] });
+      });
+
+      it('says so in English when config.yaml says so', () => {
+        try {
+          const problems = load(`language: en\n${repo(', deliver: mr')}`).errors[
+            gitlabConfigKey('app')
+          ];
+          expect(problems).toEqual([
+            "deliver: mr needs push: true: a merge request needs the Run's branch pushed to GitLab, and the target branch pulled from GitLab once it is merged",
+          ]);
+          for (const problem of problems ?? []) expect(problem).not.toMatch(/[一-鿿]/);
+        } finally {
+          // Back to the default language, zod's messages included, for the other tests.
+          load('port: 4870\n');
+        }
+      });
     });
 
     it('takes a host name, with a port if it has one, and checks the rest of the section', () => {
@@ -3541,26 +3590,51 @@ describe('requirementSource', () => {
 
 describe('deliversByPr', () => {
   const github = {
-    repos: { pr: { deliver: 'pr' }, push: { deliver: 'push' }, both: { deliver: 'pr' } },
+    repos: {
+      pr: { deliver: 'pr' },
+      push: { deliver: 'push' },
+      both: { deliver: 'pr' },
+      hub: { deliver: 'push' },
+    },
   } as never;
-  const gitlab = { repos: { lab: { deliver: 'push' }, both: { deliver: 'push' } } } as never;
+  const gitlab = {
+    repos: {
+      lab: { deliver: 'push' },
+      mr: { deliver: 'mr' },
+      both: { deliver: 'push' },
+      hub: { deliver: 'mr' },
+    },
+  } as never;
 
-  it('is true only for a repo of github.repos set to deliver: pr', () => {
+  it('is true for a repo of github.repos set to deliver: pr', () => {
     expect(deliversByPr({ github, gitlab }, 'pr')).toBe(true);
     expect(deliversByPr({ github, gitlab }, 'push')).toBe(false);
-    expect(deliversByPr({ github, gitlab }, 'lab')).toBe(false);
-    // GitHub keeps a repo GitLab names too.
-    expect(deliversByPr({ github, gitlab }, 'both')).toBe(true);
     expect(deliversByPr({ github, gitlab }, 'nope')).toBe(false);
     expect(deliversByPr({ github, gitlab }, 'constructor')).toBe(false);
     expect(deliversByPr({}, 'pr')).toBe(false);
   });
 
-  it('is false for a GitLab repo, which delivers by push only', () => {
-    const lab = { repos: { app: { deliver: 'pr' } } } as never;
-    expect(deliversByPr({ gitlab: lab }, 'app')).toBe(false);
-    // Nor does a backlog entry of a name GitHub does not have take GitHub's setting.
-    expect(deliversByPr({ github, backlog: { repos: { app: {} } } as never }, 'app')).toBe(false);
+  it('is true for a repo of gitlab.repos set to deliver: mr', () => {
+    expect(deliversByPr({ github, gitlab }, 'mr')).toBe(true);
+    expect(deliversByPr({ github, gitlab }, 'lab')).toBe(false);
+    expect(deliversByPr({ gitlab }, 'mr')).toBe(true);
+    expect(deliversByPr({ github }, 'mr')).toBe(false);
+  });
+
+  it('goes by the settings of the source that keeps the repo', () => {
+    // GitHub keeps a repo GitLab names too, whichever way either delivers.
+    expect(deliversByPr({ github, gitlab }, 'both')).toBe(true);
+    expect(deliversByPr({ github, gitlab }, 'hub')).toBe(false);
+    // A backlog repo has no code host, whatever a name it shares says elsewhere.
+    const backlog = { repos: { app: {} } } as never;
+    expect(deliversByPr({ github, backlog }, 'app')).toBe(false);
+    expect(deliversByPr({ backlog }, 'app')).toBe(false);
+  });
+
+  it('tells a repo that delivers through a pull request or merge request by its settings', () => {
+    expect(repoDeliversByPr({ deliver: 'pr' })).toBe(true);
+    expect(repoDeliversByPr({ deliver: 'mr' })).toBe(true);
+    expect(repoDeliversByPr({ deliver: 'push' })).toBe(false);
   });
 });
 

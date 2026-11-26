@@ -332,6 +332,16 @@ export function loadConfig(
       continue;
     }
     const problems = checkSource(name, repo);
+    // As with GitHub's pull requests: the Run's branch goes to GitLab, and the target branch is
+    // pulled back once the merge request is merged, which only repos with push do.
+    if (repo.deliver === 'mr' && !repo.push) {
+      problems.push(
+        t({
+          zh: 'deliver: mr 要求 push: true：开 MR 要先把 Run 的分支推送到 GitLab，MR 合并后还要从 GitLab 拉取目标分支',
+          en: "deliver: mr needs push: true: a merge request needs the Run's branch pushed to GitLab, and the target branch pulled from GitLab once it is merged",
+        }),
+      );
+    }
     if (problems.length > 0) errors[gitlabConfigKey(name)] = problems;
   }
   for (const [name, repo] of Object.entries(master.backlog?.repos ?? {})) {

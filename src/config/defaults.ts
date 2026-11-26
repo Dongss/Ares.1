@@ -57,7 +57,7 @@ defaults:
 
 # 托管在 GitLab 上的仓库（gitlab.com 或自建的）用 GitLab Issues 管理需求，规则和 github 的一样（说明见${brandName()}仓库的
 # docs/running.md「接入 GitLab」）：需要安装 glab 并登录（glab auth login，自建的加 --hostname，和下面的 host 一样）。
-# 登录的账号要能改 issue 和标签，push: true 时还要能推送目标分支（Developer 及以上，受保护分支要允许它推送）；
+# 登录的账号要能改 issue 和标签，push: true 时还要能推送目标分支（Developer 及以上，受保护分支要允许它推送；deliver: mr 时只推送 Run 的分支、开 MR）；
 # 作者对项目的权限在 Developer 及以上才受信任，其他人开的 issue 建出的 Run 先等你确认需求
 # gitlab:
 #   host: gitlab.com             # GitLab 的主机名，默认 gitlab.com；自建的写它的主机名，不带 https://
@@ -68,7 +68,7 @@ defaults:
 #       issues_repo: my-group/my-gitlab-repo  # 必填：项目在 GitLab 上的路径，在子组里就写全：group/subgroup/name
 #       template: self-dev       # 从 issue 建 Run 用的模板；scout、auto_accept、auto_merge、daily_budget_usd、max_run_attempts 和 github.repos 里的一样
 #       push: false              # true = 合并后把目标分支推送到 GitLab，每轮检查时也把 GitLab 上的新提交快进到本地目标分支
-#       deliver: push            # 目前只支持 push：合并进本地目标分支后推送；还不支持 MR
+#       deliver: push            # push（默认）= 合并进本地目标分支后推送；mr = 推送 Run 分支并开 MR，MR 在 GitLab 上合并后 Run 才完成，适合目标分支受保护、要走 MR、流水线或审批的项目；mr 要求 push: true
 
 # 没有 GitHub 或 GitLab issue 可用的仓库（只在本机的仓库、没有这两种账号、托管在内网其他服务上）用本地提案池：
 # 侦察的提案存在 Master 里，在看板上采纳，或按 auto_accept 自动采纳后直接建 Run；不需要 gh 或 glab。字段的含义和 github.repos
@@ -146,7 +146,7 @@ defaults:
 
 # Repos hosted on GitLab (gitlab.com or a self-hosted one) take requirements as GitLab Issues, by the same rules as github (see the GitLab section of
 # docs/running.md in the ${brandName()} repo); needs glab installed and logged in (glab auth login, with --hostname set to the host below for a self-hosted one).
-# The account must be able to edit issues and labels, and with push: true to push the target branch (Developer or above; a protected branch must let it push).
+# The account must be able to edit issues and labels, and with push: true to push the target branch (Developer or above; a protected branch must let it push; with deliver: mr it pushes only the Runs' branches and opens merge requests).
 # Authors are trusted from Developer up on the project; a Run from anybody else's issue waits for you to confirm its goal
 # gitlab:
 #   host: gitlab.com             # the GitLab's host name, gitlab.com by default; a self-hosted one's own, without https://
@@ -157,7 +157,7 @@ defaults:
 #       issues_repo: my-group/my-gitlab-repo  # required: the project's path on GitLab, subgroups included: group/subgroup/name
 #       template: self-dev       # template of the Runs created from issues; scout, auto_accept, auto_merge, daily_budget_usd and max_run_attempts as in github.repos
 #       push: false              # true = push the target branch to GitLab after merging, and fast-forward it to new commits on GitLab at every check
-#       deliver: push            # push only for now: merge into the local target branch, then push it; no merge requests yet
+#       deliver: push            # push (default) = merge into the local target branch, then push it; mr = push the Run's branch and open a merge request, and the Run completes once it is merged on GitLab: for target branches that are protected or need an MR, pipelines or approvals; mr needs push: true
 
 # Repos with neither GitHub nor GitLab issues (local only, no such account, hosted on another intranet service) use the local backlog: the scout's
 # proposals are kept by the Master, and become Runs once accepted on the dashboard or automatically by auto_accept; no gh or glab needed. The fields

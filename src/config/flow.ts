@@ -11,7 +11,7 @@
 // how long the raw output of agents is kept, which worktrees of failed or cancelled Runs of
 // issues are left over for the Master to remove, where a repo's requirements come from (GitHub,
 // GitLab or the local backlog) and how often that source is polled, whether a repo delivers
-// through pull requests, how many Runs may
+// through pull requests (GitHub's) or merge requests (GitLab's), how many Runs may
 // execute across every repo (`concurrency.max_runs`), and the rules of iterations: how many
 // children one plans at most, the kind auto-accept judges one by as a whole, which children a
 // child waits for, its progress and where it stands.
@@ -39,7 +39,9 @@ import type {
   BacklogConfig,
   Escalate,
   GitHubConfig,
+  GitHubRepoConfig,
   GitLabConfig,
+  GitLabRepoConfig,
   RunOverrides,
   StageDef,
   WorkflowTemplate,
@@ -582,17 +584,35 @@ export function runsAgent(kind: StageDef['kind']): boolean {
 }
 
 /**
- * Whether the repo delivers its Runs' work through pull requests (`deliver: pr`): the merge stage
- * then leaves the local target branch alone and the Run waits for its pull request on GitHub
- * (`pr_open`). Goes by what config.yaml says, also when push is off, which disables the repo for
- * GitHub: its Runs then wait at the merge until the configuration is fixed, rather than merge
- * locally what was meant to go through a pull request. Only a repo whose requirements come from
- * GitHub (`requirementSource`) does: a GitLab repo delivers by push only, and a name GitHub
- * shares with another source is GitHub's.
+ * Whether a repo's settings in its code host's section (`github.repos` / `gitlab.repos`) deliver
+ * its Runs' work through a pull request: GitHub's `deliver: pr`, or GitLab's `deliver: mr`, its
+ * merge request. Each platform's schema takes its own word only, so either word is the platform's.
+ */
+export function repoDeliversByPr(repo: {
+  deliver: GitHubRepoConfig['deliver'] | GitLabRepoConfig['deliver'];
+}): boolean {
+  return repo.deliver === 'pr' || repo.deliver === 'mr';
+}
+
+/**
+ * Whether the repo delivers its Runs' work through pull requests: `deliver: pr` on GitHub, or
+ * merge requests, `deliver: mr` on GitLab (`repoDeliversByPr`). The merge stage then leaves the
+ * local target branch alone and the Run waits for its pull request on the code host (`pr_open`).
+ * Goes by what config.yaml says, also when push is off, which disables the repo for its code
+ * host: its Runs then wait at the merge until the configuration is fixed, rather than merge
+ * locally what was meant to go through a pull request. Goes by the settings of the source the
+ * repo's requirements come from (`requirementSource`): a name GitHub shares with GitLab is
+ * GitHub's, and a repo of the local backlog has no code host to open one on.
  */
 export function deliversByPr(master: RequirementSources, repoName: string): boolean {
-  if (requirementSource(master, repoName) !== 'github') return false;
-  return master.github?.repos[repoName]?.deliver === 'pr';
+  const source = requirementSource(master, repoName);
+  const repo =
+    source === 'github'
+      ? master.github?.repos[repoName]
+      : source === 'gitlab'
+        ? master.gitlab?.repos[repoName]
+        : undefined;
+  return repo !== undefined && repoDeliversByPr(repo);
 }
 
 /** Where a repo's requirements come from: GitHub issues, GitLab issues, or the local backlog. */

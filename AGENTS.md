@@ -162,8 +162,8 @@ test/
     requirements come from, GitHub, GitLab or the local backlog (`requirementSource`: a name in
     more than one of `github.repos`, `gitlab.repos`, `backlog.repos` is the first's), and how
     often that source is polled (`sourcePollMinutes`), whether a repo delivers through pull
-    requests (`deliversByPr`: GitHub repos with `deliver: pr` only; GitLab repos deliver by push
-    only), the limit on Runs executing across repos
+    requests (`deliversByPr` / `repoDeliversByPr`: GitHub repos with `deliver: pr`, GitLab repos
+    with `deliver: mr`, their merge requests), the limit on Runs executing across repos
     and which queued Runs wait for it (`roomUnderMaxRuns` / `waitsForMaxRuns`), the paths a Run
     expects to change and whether two Runs' paths overlap (`normalizeTouches` /
     `touchesOverlap` / `conflictBlocker`), the rules of iterations: how many children one plans

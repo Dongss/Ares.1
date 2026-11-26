@@ -35,6 +35,7 @@ import {
   MAX_ITERATION_CHILDREN,
   redoDueAt,
   replyTimeoutHours,
+  repoDeliversByPr,
 } from '../config/flow.js';
 import {
   findTemplate,
@@ -616,7 +617,8 @@ export interface BridgeDeps {
  * The issues of a code host as the backlog of the repos in its section of config.yaml: GitHub's
  * (`github.repos`), or GitLab's (`gitlab.repos`), one platform per bridge (`BridgePlatform`), each
  * polling on its own. The issue protocol is the same on both (labels, hidden markers, iterations,
- * src/github/issues.ts); pull requests come only with deliver: pr, which only GitHub repos have.
+ * src/github/issues.ts), and so are pull requests: a GitHub repo's with deliver: pr, a GitLab
+ * repo's merge requests with deliver: mr (`repoDeliversByPr`).
  * - intake: an open issue labeled ares1:ready becomes a Run;
  * - sync: the Run's progress shows on the issue (labels, comments, closed when merged);
  * - stop: a human closing the issue terminates its unfinished Run, and the issue is left alone;
@@ -625,10 +627,11 @@ export interface BridgeDeps {
  *   budget; then the issue is closed with every failure's reason;
  * - discussion: the requirement assessment's questions and conclusion are posted on the issue,
  *   and a human's replies there go back to the Run;
- * - pull requests (deliver: pr): a Run whose checks passed pushes its branch and opens a pull
- *   request into the target branch; once it is merged on GitHub the target branch is pulled and
- *   the Run completes, once it is closed unmerged the Run fails; a Run that ends without
- *   completing has the pull request it left open closed, so that its redo's is the only one;
+ * - pull requests (deliver: pr, or mr on GitLab): a Run whose checks passed pushes its branch and
+ *   opens a pull request into the target branch; once it is merged on the code host the target
+ *   branch is pulled and the Run completes, once it is closed unmerged the Run fails; a Run that
+ *   ends without completing has the pull request it left open closed, so that its redo's is the
+ *   only one;
  * - scout: an AI reads the repo and its Run history and proposes issues, on demand or by itself
  *   whenever no Run of the repo goes on by itself (backing off while scouts find nothing or
  *   fail, waiting for the quota when its agent ran out of it, and capping the proposals and
@@ -1278,9 +1281,10 @@ export class IssueBridge {
   private async pushTarget(name: string): Promise<boolean> {
     const { repo, cfg } = this.repoSetup(name);
     if (!cfg.push) return true;
-    // The work reaches GitHub through pull requests (openPullRequests); the target branch there
-    // only takes them, and the local one moves only by pulling GitHub's (syncTarget).
-    if (cfg.deliver === 'pr') return true;
+    // The work reaches the code host through pull requests (openPullRequests), merge requests on
+    // GitLab; the target branch there only takes them, and the local one moves only by pulling
+    // the code host's (syncTarget).
+    if (repoDeliversByPr(cfg)) return true;
     if (this.diverged.has(repo.id)) return false;
     const head = await revParse(repo.path, repo.targetBranch);
     if (this.pushed.get(repo.path) === head) return true;
@@ -2262,7 +2266,8 @@ export class IssueBridge {
     // The issue closes once the code is on the platform; a failed push is retried on the next
     // poll. While the target branch has diverged from the platform's, the issue waits as it is,
     // open, until the two are merged (by the Master, or by a human when that failed) and the push
-    // goes through. A Run merged through its pull request (deliver: pr) is on GitHub already.
+    // goes through. A Run merged through its pull request (deliver: pr, or mr on GitLab) is on the
+    // code host already.
     let pushed = false;
     const merged =
       run.status === 'completed' && run.pr
@@ -2271,9 +2276,9 @@ export class IssueBridge {
     if (run.status === 'completed' && !merged) {
       const name = repo.name;
       const cfg = this.platform.repoConfig(name);
-      // With deliver: pr the target branch is never pushed: a Run merged locally (before the
-      // repo was switched to it) is not on GitHub.
-      if (cfg?.push && cfg.deliver !== 'pr') {
+      // With deliver: pr (mr on GitLab) the target branch is never pushed: a Run merged locally
+      // (before the repo was switched to it) is not on the code host.
+      if (cfg?.push && !repoDeliversByPr(cfg)) {
         if (!(await this.pushTarget(name))) return;
         pushed = true;
       }
