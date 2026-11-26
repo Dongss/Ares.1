@@ -1,12 +1,13 @@
 import { execFile } from 'node:child_process';
 import { z } from 'zod';
 import { LABELS } from '../github/issues.js';
-import type {
-  CodeHost,
-  HostAuthored,
-  HostComment,
-  HostIssue,
-  LabelDef,
+import {
+  type CodeHost,
+  forcePushable,
+  type HostAuthored,
+  type HostComment,
+  type HostIssue,
+  type LabelDef,
 } from '../host/code-host.js';
 import { t } from '../i18n.js';
 
@@ -105,11 +106,8 @@ function isProjectPath(path: string): boolean {
   return parts.length >= 2 && parts.every((p) => p !== '');
 }
 
-/**
- * The project `repo` ("group/subgroup/.../name") as an API path takes it: one segment, every /
- * encoded. A path that is no project's fails here, before glab is called.
- */
-function projectId(repo: string): string {
+/** `repo` when it is a project's path; else a GlabError, before glab or git is called. */
+function projectPath(repo: string): string {
   if (!isProjectPath(repo)) {
     throw new GlabError(
       t({
@@ -118,7 +116,28 @@ function projectId(repo: string): string {
       }),
     );
   }
-  return encodeURIComponent(repo);
+  return repo;
+}
+
+/**
+ * The project `repo` ("group/subgroup/.../name") as an API path takes it: one segment, every /
+ * encoded. A path that is no project's fails here, before glab is called.
+ */
+function projectId(repo: string): string {
+  return encodeURIComponent(projectPath(repo));
+}
+
+/** The GitLab git talks to when the client is given no host: glab's own default. */
+const DEFAULT_HOST = 'gitlab.com';
+
+/** A GlabError for a force push of a branch `forcePushable` does not allow. */
+function forceRefused(branch: string): GlabError {
+  return new GlabError(
+    t({
+      zh: `只能强制推送 ares1/ 开头的 Run 分支，不能强制推送 ${branch}`,
+      en: `Only a Run's branch (ares1/...) may be force-pushed, not ${branch}`,
+    }),
+  );
 }
 
 /** Schemes of the remote URLs a GitLab project is cloned from. */
@@ -258,9 +277,9 @@ type Method = 'GET' | 'POST' | 'PUT' | 'DELETE';
  * Everything goes through `glab api` and GitLab's REST API; `repo` is a project's path, as
  * "group/subgroup/name", and the number of an issue or a merge request is its iid, the one in
  * its link. With `host`, every call goes to that GitLab (a self-hosted one), else to the one glab
- * picks. With `account`, the client checks it is the account glab is logged in as. Authors are
- * trusted by their access level to the project (`gitlabAuthor`), which the client asks GitLab
- * for and keeps a few minutes.
+ * picks, and git pushes to and fetches from it over https, else from gitlab.com. With `account`,
+ * the client checks it is the account glab is logged in as. Authors are trusted by their access
+ * level to the project (`gitlabAuthor`), which the client asks GitLab for and keeps a few minutes.
  */
 export class GlabCli
   implements
@@ -279,6 +298,8 @@ export class GlabCli
       | 'close'
       | 'createIssue'
       | 'editIssue'
+      | 'push'
+      | 'fetch'
     >
 {
   private readonly host: string | undefined;
@@ -613,5 +634,88 @@ export class GlabCli
     await this.api('PUT', `projects/${projectId(repo)}/issues/${number}`, {
       description: edit.body,
     });
+  }
+
+  /** The https URL git reaches the project at. A path that is no project's fails here. */
+  private gitUrl(repo: string): string {
+    return `https://${this.host ?? DEFAULT_HOST}/${projectPath(repo)}.git`;
+  }
+
+  /**
+   * git in the clone at `path`, talking to GitLab with glab as its only credential helper, so it
+   * acts as the login glab keeps for the host and needs no SSH key. The empty helper first drops
+   * every helper git's config names (an older login in the keychain would answer before glab);
+   * the path of glab is quoted for the shell git runs the helper with. Of the two ways to give git
+   * a token without writing it into its config, the helper rather than the token in GIT_CONFIG_*
+   * variables: the token goes from glab to git through a pipe and never passes the Master, so it
+   * is in no argument, environment, config file or error. No terminal prompt: without glab's
+   * login git fails rather than waits for somebody to type a password. `failed`: the error's
+   * text, before what git wrote to stderr.
+   */
+  private gitWithGlab(
+    path: string,
+    args: string[],
+    failed: (detail: string) => string,
+  ): Promise<string> {
+    const all = [
+      '-c',
+      'credential.helper=',
+      '-c',
+      `credential.helper=!'${this.bin.replace(/'/g, `'\\''`)}' auth git-credential`,
+      ...args,
+    ];
+    const env = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
+    return new Promise<string>((resolve, reject) => {
+      execFile('git', all, { cwd: path, env }, (err, stdout, stderr) => {
+        if (err) reject(new GlabError(failed(stderr.trim() || err.message)));
+        else resolve(stdout.trim());
+      });
+    });
+  }
+
+  async push(
+    path: string,
+    repo: string,
+    branch: string,
+    opts: { force?: boolean } = {},
+  ): Promise<void> {
+    if (opts.force && !forcePushable(branch)) throw forceRefused(branch);
+    const url = this.gitUrl(repo);
+    // A leading + lets this one ref replace what GitLab has; --force-with-lease would need a
+    // remote-tracking ref, which a push to a URL does not have.
+    const refspec = `${opts.force ? '+' : ''}refs/heads/${branch}:refs/heads/${branch}`;
+    await this.gitWithGlab(path, ['push', '-q', url, refspec], (detail) =>
+      t({
+        zh: `推送 ${branch} 到 ${repo} 失败：${detail}`,
+        en: `Pushing ${branch} to ${repo} failed: ${detail}`,
+      }),
+    );
+  }
+
+  async fetch(path: string, repo: string, branch: string): Promise<string | null> {
+    const url = this.gitUrl(repo);
+    const failed = (detail: string) =>
+      t({
+        zh: `从 ${repo} 拉取 ${branch} 失败：${detail}`,
+        en: `Fetching ${branch} from ${repo} failed: ${detail}`,
+      });
+    const ref = `refs/heads/${branch}`;
+    try {
+      // Into FETCH_HEAD only: no ref of the clone changes, the caller decides what to move.
+      await this.gitWithGlab(path, ['fetch', '-q', '--no-tags', url, ref], failed);
+    } catch (err) {
+      // Whether GitLab lacks the branch is asked of ls-remote rather than read from fetch's
+      // message, which git may write in the system's language; only after a failure, so a
+      // round still costs one request.
+      let heads: string;
+      try {
+        heads = await this.gitWithGlab(path, ['ls-remote', '--heads', url, ref], failed);
+      } catch {
+        throw err;
+      }
+      if (heads === '') return null;
+      throw err;
+    }
+    return this.gitWithGlab(path, ['rev-parse', '--verify', 'FETCH_HEAD^{commit}'], failed);
   }
 }

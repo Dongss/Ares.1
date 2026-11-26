@@ -1,10 +1,13 @@
-import { chmodSync, existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { delimiter, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { isTrusted, LABELS } from '../src/github/issues.js';
 import { GlabCli, GlabError, gitlabAuthor } from '../src/gitlab/client.js';
 import { setLang } from '../src/i18n.js';
-import { git, tmpDir, writeFile } from './helpers.js';
+import { git, initRepo, tmpDir, writeFile } from './helpers.js';
 
 // A stand-in `glab` that records every call (arguments, stdin, working directory and the GitLab
 // variables of its environment) in calls.jsonl next to it and answers from responses.json: the
@@ -50,8 +53,8 @@ const answer = (stdin) => {
   process.stderr.write(r.stderr ?? '');
   process.exitCode = r.code ?? 0;
 };
-// Like glab, read stdin only when the request body comes from it.
-if (flag('--input') === '-') {
+// Like glab, read stdin only when the request body comes from it, or git asks it for credentials.
+if (flag('--input') === '-' || (args[0] === 'auth' && args[1] === 'git-credential')) {
   let input = '';
   process.stdin.setEncoding('utf8');
   process.stdin.on('data', (d) => (input += d));
@@ -59,6 +62,24 @@ if (flag('--input') === '-') {
 } else {
   answer(null);
 }
+`;
+
+// A stand-in `git` that records how it was called (arguments, working directory and the
+// variables of its environment the client may set) and fails the way a refused push does, for
+// the URL it was given.
+const FAKE_GIT = `#!/usr/bin/env node
+const fs = require('node:fs');
+const path = require('node:path');
+const call = {
+  args: process.argv.slice(2),
+  cwd: process.cwd(),
+  token: process.env.GITLAB_TOKEN ?? null,
+  prompt: process.env.GIT_TERMINAL_PROMPT ?? null,
+};
+fs.appendFileSync(path.join(__dirname, 'git-calls.jsonl'), JSON.stringify(call) + '\\n');
+const url = call.args.find((a) => a.startsWith('https://')) ?? '';
+process.stderr.write("fatal: Authentication failed for '" + url + "/'\\n");
+process.exitCode = 128;
 `;
 
 interface Reply {
@@ -83,8 +104,8 @@ interface GlabCall {
   host: string | null;
 }
 
-function fakeGlab(replies: Reply[]) {
-  const dir = tmpDir('ares1-glab-');
+function fakeGlab(replies: Reply[], prefix = 'ares1-glab-') {
+  const dir = tmpDir(prefix);
   const bin = join(dir, 'glab');
   writeFile(bin, FAKE_GLAB);
   chmodSync(bin, 0o755);
@@ -1169,6 +1190,341 @@ describe('GlabCli failures', () => {
   });
 });
 
+interface GitCall {
+  args: string[];
+  cwd: string;
+  token: string | null;
+  prompt: string | null;
+}
+
+/** A fake `git` first on PATH that always fails; returns the calls it got so far, in order. */
+function fakeGit(): () => GitCall[] {
+  const dir = tmpDir('ares1-git-');
+  writeFile(join(dir, 'git'), FAKE_GIT);
+  chmodSync(join(dir, 'git'), 0o755);
+  setEnv('PATH', `${dir}${delimiter}${process.env.PATH ?? ''}`);
+  const record = join(dir, 'git-calls.jsonl');
+  return () =>
+    existsSync(record)
+      ? readFileSync(record, 'utf8')
+          .split('\n')
+          .filter(Boolean)
+          .map((line) => JSON.parse(line) as GitCall)
+      : [];
+}
+
+/** The self-hosted GitLab and its project of nested groups that pushes and fetches go to. */
+const SELF_HOST = 'gitlab.example.com';
+const SUB_PROJECT = 'group/sub/widgets';
+const SUB_URL = `https://${SELF_HOST}/${SUB_PROJECT}.git`;
+
+/** Point URLs starting with `prefix` at `target` instead, through git's environment. */
+function redirectGit(prefix: string, target: string): void {
+  setEnv('GIT_CONFIG_COUNT', '1');
+  setEnv('GIT_CONFIG_KEY_0', `url.${target}.insteadOf`);
+  setEnv('GIT_CONFIG_VALUE_0', prefix);
+}
+
+/**
+ * Point the self-hosted GitLab's group/sub/ at a local directory, so no push or fetch reaches
+ * the network; returns the directory, where widgets.git stands for the project.
+ */
+function localGitLab(): string {
+  const remotes = tmpDir('ares1-remotes-');
+  redirectGit(`https://${SELF_HOST}/group/sub/`, `${remotes}/`);
+  return remotes;
+}
+
+/** An empty bare repo as the project group/sub/widgets on the self-hosted GitLab. */
+function localProject(): string {
+  const bare = join(localGitLab(), 'widgets.git');
+  mkdirSync(bare);
+  git(bare, 'init', '-q', '--bare');
+  return bare;
+}
+
+/** A commit on a new branch of the clone. */
+function commitOnBranch(clone: string, branch: string, file: string): void {
+  git(clone, 'checkout', '-q', '-b', branch);
+  writeFile(join(clone, file), `${file}\n`);
+  git(clone, 'add', '-A');
+  git(clone, 'commit', '-q', '-m', file);
+}
+
+describe('GlabCli push', () => {
+  it('uses glab as the only credential helper, quoting its path, and reports a failed push', async () => {
+    // A quote in the path of glab must survive the shell git runs the helper with.
+    const glab = fakeGlab(
+      [{ when: ['auth', 'git-credential'], stdout: 'username=oauth2\npassword=glpat-secret\n' }],
+      "ares1-glab-it's-",
+    );
+    expect(glab.bin).toContain("'");
+    const calls = fakeGit();
+    const clone = tmpDir('ares1-clone-');
+
+    const err = await glabError(new GlabCli(glab.bin).push(clone, 'acme/widgets', 'ares1/run-1'));
+    expect(err.message).toBe(
+      "推送 ares1/run-1 到 acme/widgets 失败：fatal: Authentication failed for 'https://gitlab.com/acme/widgets.git/'",
+    );
+
+    const quoted = `'${glab.bin.split("'").join("'\\''")}'`;
+    expect(calls()).toEqual([
+      {
+        args: [
+          '-c',
+          'credential.helper=',
+          '-c',
+          `credential.helper=!${quoted} auth git-credential`,
+          'push',
+          '-q',
+          // gitlab.com, as no host was given.
+          'https://gitlab.com/acme/widgets.git',
+          'refs/heads/ares1/run-1:refs/heads/ares1/run-1',
+        ],
+        cwd: realpathSync(clone),
+        // No token in the environment, and no prompt git would wait at for a password.
+        token: null,
+        prompt: '0',
+      },
+    ]);
+    // The client asks glab for nothing itself: git does, when it needs credentials.
+    expect(glab.calls()).toEqual([]);
+
+    // git runs the helper through the shell with the operation appended: it reaches this glab,
+    // which reads what git asks for on stdin.
+    const helper = (calls()[0]?.args[3] ?? '').slice('credential.helper=!'.length);
+    const input = `protocol=https\nhost=${SELF_HOST}\n\n`;
+    const out = execFileSync('sh', ['-c', `${helper} get`], { input, encoding: 'utf8' });
+    expect(out).toBe('username=oauth2\npassword=glpat-secret\n');
+    expect(glab.calls()).toMatchObject([{ args: ['auth', 'git-credential', 'get'], stdin: input }]);
+  });
+
+  it('pushes the branch to a project of nested groups on a self-hosted GitLab', async () => {
+    const clone = initRepo();
+    commitOnBranch(clone, 'ares1/run-2', 'a.txt');
+    const bare = localProject();
+    const glab = fakeGlab([]);
+
+    await new GlabCli(glab.bin, { host: SELF_HOST }).push(clone, SUB_PROJECT, 'ares1/run-2');
+    expect(git(bare, 'rev-parse', 'refs/heads/ares1/run-2')).toBe(git(clone, 'rev-parse', 'HEAD'));
+    // A local remote needs no credentials; none were written into the clone's config.
+    expect(glab.calls()).toEqual([]);
+    expect(git(clone, 'config', '--local', '--list')).not.toMatch(/credential|glab/);
+  });
+
+  it("force-pushes a Run's branch whose history was rewritten, and no other branch", async () => {
+    const clone = initRepo();
+    commitOnBranch(clone, 'ares1/run-3', 'a.txt');
+    const bare = localProject();
+    const cli = new GlabCli(fakeGlab([]).bin, { host: SELF_HOST });
+    await cli.push(clone, SUB_PROJECT, 'ares1/run-3');
+
+    // Rolled back and done again: no longer a fast-forward of what GitLab has.
+    git(clone, 'reset', '-q', '--hard', 'HEAD~1');
+    writeFile(join(clone, 'b.txt'), 'b\n');
+    git(clone, 'add', '-A');
+    git(clone, 'commit', '-q', '-m', 'b');
+    const refused = await glabError(cli.push(clone, SUB_PROJECT, 'ares1/run-3'));
+    expect(refused.message).toMatch(/^推送 ares1\/run-3 到 group\/sub\/widgets 失败：/);
+    await cli.push(clone, SUB_PROJECT, 'ares1/run-3', { force: true });
+    expect(git(bare, 'rev-parse', 'refs/heads/ares1/run-3')).toBe(git(clone, 'rev-parse', 'HEAD'));
+
+    // Never a target branch, nor any branch that is not a Run's: refused before git runs.
+    const calls = fakeGit();
+    for (const branch of ['main', 'feature/ares1/x', 'ares1']) {
+      const err = await glabError(cli.push(clone, SUB_PROJECT, branch, { force: true }));
+      expect(err.message).toBe(`只能强制推送 ares1/ 开头的 Run 分支，不能强制推送 ${branch}`);
+    }
+    expect(calls()).toEqual([]);
+  });
+
+  it('adds + to the refspec of a force push', async () => {
+    const calls = fakeGit();
+    const cli = new GlabCli(fakeGlab([]).bin, { host: SELF_HOST });
+    await glabError(cli.push(tmpDir(), SUB_PROJECT, 'ares1/run-4', { force: true }));
+    await glabError(cli.push(tmpDir(), SUB_PROJECT, 'ares1/run-4', { force: false }));
+    expect(calls().map((c) => c.args.slice(4))).toEqual([
+      ['push', '-q', SUB_URL, '+refs/heads/ares1/run-4:refs/heads/ares1/run-4'],
+      ['push', '-q', SUB_URL, 'refs/heads/ares1/run-4:refs/heads/ares1/run-4'],
+    ]);
+  });
+
+  it('reports what git wrote to stderr when the push fails', async () => {
+    const clone = initRepo();
+    git(localGitLab(), 'init', '-q', '--bare', 'widgets.git');
+
+    const cli = new GlabCli(fakeGlab([]).bin, { host: SELF_HOST });
+    const err = await glabError(cli.push(clone, SUB_PROJECT, 'no-such'));
+    expect(err.message).toMatch(/^推送 no-such 到 group\/sub\/widgets 失败：/);
+    expect(err.message).toContain('refs/heads/no-such');
+  });
+
+  it('rejects a path that is no project before calling git', async () => {
+    const calls = fakeGit();
+    const cli = new GlabCli(fakeGlab([]).bin);
+    for (const repo of ['widgets', 'acme//widgets', '/acme/widgets']) {
+      const message = `GitLab 项目路径应为 group/name 或 group/subgroup/name：${repo}`;
+      expect((await glabError(cli.push(tmpDir(), repo, 'ares1/run-5'))).message).toBe(message);
+      expect((await glabError(cli.fetch(tmpDir(), repo, 'main'))).message).toBe(message);
+    }
+    expect(calls()).toEqual([]);
+  });
+});
+
+describe('GlabCli fetch', () => {
+  it('uses glab as the only credential helper, and asks ls-remote only after a failed fetch', async () => {
+    const glab = fakeGlab([]);
+    const calls = fakeGit();
+    const clone = tmpDir('ares1-clone-');
+
+    const cli = new GlabCli(glab.bin, { host: SELF_HOST });
+    const err = await glabError(cli.fetch(clone, SUB_PROJECT, 'main'));
+    expect(err.message).toBe(
+      `从 group/sub/widgets 拉取 main 失败：fatal: Authentication failed for '${SUB_URL}/'`,
+    );
+    const helper = [
+      '-c',
+      'credential.helper=',
+      '-c',
+      `credential.helper=!'${glab.bin}' auth git-credential`,
+    ];
+    // After the failed fetch it asks whether GitLab has the branch; that fails too, so the
+    // fetch's error stands.
+    expect(calls().map((c) => c.args)).toEqual([
+      [...helper, 'fetch', '-q', '--no-tags', SUB_URL, 'refs/heads/main'],
+      [...helper, 'ls-remote', '--heads', SUB_URL, 'refs/heads/main'],
+    ]);
+    for (const call of calls()) {
+      expect(call).toMatchObject({ cwd: realpathSync(clone), token: null, prompt: '0' });
+    }
+    expect(glab.calls()).toEqual([]);
+  });
+
+  it("returns the commit of GitLab's branch and moves no local ref", async () => {
+    const bare = localProject();
+    const theirs = initRepo();
+    writeFile(join(theirs, 'b.txt'), 'b\n');
+    git(theirs, 'add', '-A');
+    git(theirs, 'commit', '-q', '-m', 'b');
+    git(theirs, 'push', '-q', bare, 'main');
+    const remote = git(theirs, 'rev-parse', 'main');
+
+    const clone = initRepo();
+    const local = git(clone, 'rev-parse', 'main');
+    const refs = git(clone, 'for-each-ref');
+    const cli = new GlabCli(fakeGlab([]).bin, { host: SELF_HOST });
+    expect(await cli.fetch(clone, SUB_PROJECT, 'main')).toBe(remote);
+    // The commit is in the clone now, and no branch or tag moved.
+    expect(git(clone, 'cat-file', '-t', remote)).toBe('commit');
+    expect(git(clone, 'rev-parse', 'main')).toBe(local);
+    expect(git(clone, 'for-each-ref')).toBe(refs);
+  });
+
+  it('returns null when GitLab has no such branch, as in a new, empty project', async () => {
+    const bare = localProject();
+    const clone = initRepo();
+    const refs = git(clone, 'for-each-ref');
+    const cli = new GlabCli(fakeGlab([]).bin, { host: SELF_HOST });
+
+    expect(await cli.fetch(clone, SUB_PROJECT, 'main')).toBeNull();
+    // Other branches on GitLab do not count.
+    git(initRepo(), 'push', '-q', bare, 'main:other');
+    expect(await cli.fetch(clone, SUB_PROJECT, 'main')).toBeNull();
+    expect(git(clone, 'for-each-ref')).toBe(refs);
+  });
+
+  it('reports what git wrote to stderr when GitLab cannot be reached', async () => {
+    const clone = initRepo();
+    // No project there: neither the fetch nor the question whether the branch exists gets
+    // through.
+    localGitLab();
+
+    const cli = new GlabCli(fakeGlab([]).bin, { host: SELF_HOST });
+    const err = await glabError(cli.fetch(clone, SUB_PROJECT, 'main'));
+    expect(err.message).toMatch(/^从 group\/sub\/widgets 拉取 main 失败：/);
+    expect(err.message).toContain('widgets.git');
+  });
+});
+
+/**
+ * A GitLab stand-in on 127.0.0.1 that asks for credentials over http and turns down whatever
+ * comes: `auth` holds the Authorization header of each request that had one.
+ */
+async function refusingGitLab() {
+  const auth: string[] = [];
+  const server = createServer((req, res) => {
+    if (req.headers.authorization) auth.push(req.headers.authorization);
+    res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="GitLab"' });
+    res.end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as AddressInfo;
+  return {
+    host: `127.0.0.1:${port}`,
+    auth,
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+  };
+}
+
+describe('GlabCli credentials with git', () => {
+  it("gives git glab's token alone, keeping it out of the arguments, config and errors", async () => {
+    // git's own messages follow the system's language; no proxy may stand in between.
+    setEnv('LC_ALL', 'C');
+    setEnv('LANGUAGE', undefined);
+    setEnv('NO_PROXY', '*');
+    setEnv('no_proxy', '*');
+    const glab = fakeGlab(
+      [
+        {
+          when: ['auth', 'git-credential'],
+          stdout: 'username=oauth2\npassword=glpat-secret\n',
+          keep: true,
+        },
+      ],
+      "ares1-glab-it's-",
+    );
+    const server = await refusingGitLab();
+    try {
+      redirectGit(`https://${SELF_HOST}/`, `http://${server.host}/`);
+      const clone = initRepo();
+      // A helper of the clone's own config, as a keychain's would be: git never asks it.
+      const asked = join(tmpDir('ares1-helper-'), 'asked');
+      git(
+        clone,
+        'config',
+        'credential.helper',
+        `!f() { touch '${asked}'; echo username=me; echo password=other; }; f`,
+      );
+      const cli = new GlabCli(glab.bin, { host: SELF_HOST });
+
+      const pushed = await glabError(cli.push(clone, SUB_PROJECT, 'main'));
+      const fetched = await glabError(cli.fetch(clone, SUB_PROJECT, 'main'));
+      expect(pushed.message).toMatch(/^推送 main 到 group\/sub\/widgets 失败：.*Authentication/);
+      expect(fetched.message).toMatch(/^从 group\/sub\/widgets 拉取 main 失败：.*Authentication/);
+
+      // git sent what glab answered for the host it named, and nothing else.
+      const basic = `Basic ${Buffer.from('oauth2:glpat-secret').toString('base64')}`;
+      expect(server.auth.length).toBeGreaterThan(0);
+      expect(new Set(server.auth)).toEqual(new Set([basic]));
+      const calls = glab.calls();
+      expect(calls[0]?.args).toEqual(['auth', 'git-credential', 'get']);
+      expect(calls[0]?.stdin).toContain(`host=${server.host}\n`);
+      for (const call of calls) expect(call.args.slice(0, 2)).toEqual(['auth', 'git-credential']);
+      expect(existsSync(asked)).toBe(false);
+
+      // The token is in no error, and nothing was written into the clone's config.
+      for (const err of [pushed, fetched]) expect(err.message).not.toContain('glpat-secret');
+      expect(git(clone, 'config', '--local', '--list')).not.toMatch(/glpat-secret|glab/);
+    } finally {
+      await server.close();
+    }
+  });
+});
+
 describe('GlabCli in English', () => {
   it('writes its errors without Chinese', async () => {
     setLang('en');
@@ -1206,6 +1562,20 @@ describe('GlabCli in English', () => {
       'The origin URL names no GitLab project: /srv/git/widgets.git',
     ]);
     expect(messages[7]?.startsWith(`Reading the origin URL of ${noOrigin} failed: `)).toBe(true);
-    for (const message of messages) expect(message).not.toMatch(CJK);
+
+    // After resolveRepo, which reads the clones with the real git.
+    fakeGit();
+    const selfHosted = new GlabCli(glab.bin, { host: SELF_HOST });
+    const gitMessages = [
+      (await glabError(selfHosted.push(tmpDir(), SUB_PROJECT, 'b1'))).message,
+      (await glabError(selfHosted.fetch(tmpDir(), SUB_PROJECT, 'b1'))).message,
+      (await glabError(selfHosted.push(tmpDir(), SUB_PROJECT, 'main', { force: true }))).message,
+    ];
+    expect(gitMessages).toEqual([
+      `Pushing b1 to group/sub/widgets failed: fatal: Authentication failed for '${SUB_URL}/'`,
+      `Fetching b1 from group/sub/widgets failed: fatal: Authentication failed for '${SUB_URL}/'`,
+      "Only a Run's branch (ares1/...) may be force-pushed, not main",
+    ]);
+    for (const message of [...messages, ...gitMessages]) expect(message).not.toMatch(CJK);
   });
 });
