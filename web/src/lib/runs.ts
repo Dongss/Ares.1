@@ -1,6 +1,7 @@
 import type {
   ConflictWait,
   RateLimitedWait,
+  RepoSourceView,
   RunDetail,
   RunSummary,
 } from '../../../src/api/types.js';
@@ -31,6 +32,7 @@ import {
   type DiscussionEntry,
   type EventRow,
   FINISHED_RUN_STATUSES,
+  type HostPlatform,
   PR_CLOSE_REASONS,
   PR_REWORK_KINDS,
   type PrCloseReason,
@@ -46,6 +48,7 @@ import {
   shortSha,
   type Tone,
 } from './format.js';
+import { platformName } from './issues.js';
 
 export interface HomeGroups {
   /** Waiting for a human: approvals and blocked Runs, oldest first. */
@@ -860,9 +863,14 @@ function pullRequestEventText(event: Pick<EventRow, 'type' | 'data'>): string | 
 
 /**
  * The event in words, for the events list, from its structured data; null for events that only
- * show their data.
+ * show their data. `platform`: the code host the Run goes with (`runPlatform`), named where an
+ * event is about its commits.
  */
-export function eventText(event: Pick<EventRow, 'type' | 'data'>, now = new Date()): string | null {
+export function eventText(
+  event: Pick<EventRow, 'type' | 'data'>,
+  now = new Date(),
+  platform: HostPlatform = 'github',
+): string | null {
   if (event.type === 'agent.selected') return agentSelectedText(event.data);
   if (event.type === 'task.rate_limited') {
     const { agentId, retryAt } = event.data;
@@ -912,10 +920,11 @@ export function eventText(event: Pick<EventRow, 'type' | 'data'>, now = new Date
   if (pr !== null) return pr;
   if (event.type === 'run.merge_remote_obsolete') {
     const { remote, target } = event.data;
+    const host = platformName(platform);
     if (typeof remote === 'string' && typeof target === 'string') {
       return t({
-        zh: `${target} 已经有了这个 Run 要合并的 GitHub 提交 ${shortSha(remote)}（Master 自己合并了，或者别的 Run 合并了进去），没什么要合并的了：不再启动 Agent，Run 直接完成`,
-        en: `${target} has the commit ${shortSha(remote)} from GitHub this Run was to merge already (the Master merged it by itself, or another Run did), so nothing is left to merge: the Run completed without starting another agent`,
+        zh: `${target} 已经有了这个 Run 要合并的 ${host} 提交 ${shortSha(remote)}（Master 自己合并了，或者别的 Run 合并了进去），没什么要合并的了：不再启动 Agent，Run 直接完成`,
+        en: `${target} has the commit ${shortSha(remote)} from ${host} this Run was to merge already (the Master merged it by itself, or another Run did), so nothing is left to merge: the Run completed without starting another agent`,
       });
     }
   }
@@ -1007,6 +1016,25 @@ export interface DiscussionItem {
   at: string;
   /** What else happened to it, e.g. comments on the issue that were not taken as replies. */
   note?: string;
+}
+
+/**
+ * The code host a Run goes with: its issue's (`RunIssue.platform`); for a Run of no issue, such as
+ * one the Master created to merge the target branch's new commits, its repo's source of
+ * requirements (`source`, from `repoSourceOf`); GitHub otherwise.
+ */
+export function runPlatform(run: Pick<Run, 'issue'>, source: RepoSourceView | null): HostPlatform {
+  if (run.issue) return run.issue.platform ?? 'github';
+  return source?.source === 'gitlab' ? 'gitlab' : 'github';
+}
+
+/** How to answer the assessment's questions on the Run's issue, on the code host it is on. */
+export function issueReplyHint(platform: HostPlatform): string {
+  const host = platformName(platform);
+  return t({
+    zh: `可以直接在 issue 上回复（只认仓库成员的回复），Master 下次检查 ${host} 时会带着回复重新评估；也可以在这里回复。`,
+    en: `You can reply on the issue (only replies by members of the repo count): the Master reassesses with your reply the next time it checks ${host}. Or reply here.`,
+  });
 }
 
 /**

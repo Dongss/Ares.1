@@ -18,12 +18,17 @@ import { formatCost, formatTime, RUN_STATUS } from '../lib/format.js';
 import { useAction, useReloadOn, useResource } from '../lib/hooks.js';
 import {
   autoAcceptText,
+  backlogExample,
   budgetText,
   CATEGORY,
   deliveryText,
   gapsByGoal,
   gapsHeading,
+  githubExample,
+  gitlabExample,
+  hostLabel,
   issuesUrl,
+  platformName,
   pollText,
   RISK,
   SCOUT_STATUS,
@@ -61,23 +66,27 @@ async function loadProposals(): Promise<ProposalView[]> {
 }
 
 /**
- * Where requirements come from and the AI scouts that propose them: GitHub issues, and the local
- * backlog of the repos without GitHub. `config`: the configuration in use (reloaded by the app),
- * for where each repo's template comes from.
+ * Where requirements come from and the AI scouts that propose them: the issues of GitHub and of
+ * GitLab, each platform with its own section, and the local backlog of the repos on neither.
+ * `config`: the configuration in use (reloaded by the app), for where each repo's template comes
+ * from.
  */
 export function IssuesPage({ config }: { config: ConfigView | undefined }) {
   const github = useResource(() => api.github(), 'github');
+  const gitlab = useResource(() => api.gitlab(), 'gitlab');
   const backlog = useResource(() => api.backlog(), 'backlog');
   const proposals = useResource(loadProposals, 'proposals');
   const upgrade = useResource(() => api.upgrade(), 'upgrade');
   useReloadOn(upgrade.reload, (e) => e.type.startsWith('upgrade.') || e.type === 'run.status');
   const scouts = useResource(() => api.scouts(), 'scouts');
+  // Both platforms' bridges record `github.*` events (GitLab's with `platform: 'gitlab'`).
   const relevant = (type: string) =>
     type.startsWith('scout.') ||
     type.startsWith('github.') ||
     type.startsWith('config.') ||
     type === 'run.created';
   useReloadOn(github.reload, (e) => relevant(e.type));
+  useReloadOn(gitlab.reload, (e) => relevant(e.type));
   useReloadOn(backlog.reload, (e) => backlogOutdatedBy(e.type));
   useReloadOn(proposals.reload, (e) => backlogOutdatedBy(e.type));
   useReloadOn(scouts.reload, (e) => e.type.startsWith('scout.'));
@@ -86,25 +95,39 @@ export function IssuesPage({ config }: { config: ConfigView | undefined }) {
     proposals.reload();
   };
 
-  if (!github.data) {
-    return github.error ? (
-      <ErrorBox>{github.error}</ErrorBox>
+  if (!github.data || !gitlab.data) {
+    const error = github.error ?? gitlab.error;
+    return error ? (
+      <ErrorBox>{error}</ErrorBox>
     ) : (
       <Empty>{t({ zh: '加载中…', en: 'Loading…' })}</Empty>
     );
   }
+  const sources = {
+    github: github.data.enabled,
+    gitlab: gitlab.data.enabled,
+    backlog: backlog.data?.enabled ?? false,
+  };
+  const none = !sources.github && !sources.gitlab && !sources.backlog;
+  const hosts = [
+    { status: github.data, reload: github.reload },
+    { status: gitlab.data, reload: gitlab.reload },
+  ].filter((h) => h.status.enabled);
   return (
     <div className="issues">
       <h1>{t({ zh: '需求', en: 'Issues' })}</h1>
-      {github.data.enabled ? (
-        <Overview status={github.data} onPolled={github.reload} />
-      ) : (
-        <NotConfigured backlog={backlog.data?.enabled ?? false} />
-      )}
+      {none && <NotConfigured />}
       {upgrade.data && <UpgradeCard status={upgrade.data} onChecked={upgrade.reload} />}
-      {github.data.repos.map((r) => (
-        <RepoIssues key={r.name} repo={r} config={config} onStarted={scouts.reload} />
+      {hosts.map(({ status, reload }) => (
+        <HostSection
+          key={status.platform}
+          status={status}
+          config={config}
+          onPolled={reload}
+          onScoutStarted={scouts.reload}
+        />
       ))}
+      {!none && <OtherSources github={sources.github} gitlab={sources.gitlab} />}
       <BacklogSection
         status={backlog.data}
         error={backlog.error ?? proposals.error}
@@ -141,15 +164,44 @@ export function IssuesPage({ config }: { config: ConfigView | undefined }) {
   );
 }
 
+/** One code host's section of config.yaml (`github` or `gitlab`): how it goes, then its repos. */
+function HostSection(props: {
+  status: GitHubStatus;
+  config: ConfigView | undefined;
+  onPolled: () => void;
+  onScoutStarted: () => void;
+}) {
+  const { status } = props;
+  return (
+    <>
+      <h2>{hostLabel(status)}</h2>
+      <Overview status={status} onPolled={props.onPolled} />
+      {status.repos.map((r) => (
+        <RepoIssues
+          key={r.name}
+          host={status}
+          repo={r}
+          config={props.config}
+          onStarted={props.onScoutStarted}
+        />
+      ))}
+    </>
+  );
+}
+
 function Overview({ status, onPolled }: { status: GitHubStatus; onPolled: () => void }) {
   const action = useAction();
+  const name = platformName(status.platform);
+  const section = `${status.platform}.repos`;
+  const cli = status.platform === 'gitlab' ? 'glab' : 'gh';
+  const poll = status.platform === 'gitlab' ? api.gitlabPoll : api.githubPoll;
   return (
     <section className="card">
       <p>
         {t({
           zh: (
             <>
-              <code>github.repos</code> 里的仓库用 GitHub Issues 管理需求，Run 只从 issue 来。带{' '}
+              <code>{section}</code> 里的仓库用 {name} Issues 管理需求，Run 只从 issue 来。带{' '}
               <code>ares1:ready</code> 标签的 issue 会自动变成 Run，进展会回写到 issue
               上，合并后关闭 issue。AI 侦察会读代码、文档和 Run 记录，把值得做的事提成带{' '}
               <code>ares1:proposal</code> 标签的 issue，等你采纳。
@@ -157,7 +209,7 @@ function Overview({ status, onPolled }: { status: GitHubStatus; onPolled: () => 
           ),
           en: (
             <>
-              The repos of <code>github.repos</code> keep their backlog in GitHub Issues, and their
+              The repos of <code>{section}</code> keep their backlog in {name} Issues, and their
               Runs only come from issues. An issue labeled <code>ares1:ready</code> becomes a Run by
               itself; progress is written back to the issue, and the issue is closed after the
               merge. The AI scout reads the code, the docs and the Run records, and proposes what is
@@ -169,7 +221,10 @@ function Overview({ status, onPolled }: { status: GitHubStatus; onPolled: () => 
       <div className="issues-poll">
         <span className="muted">
           {status.account
-            ? t({ zh: `gh 账号 ${status.account} · `, en: `gh account ${status.account} · ` })
+            ? t({
+                zh: `${cli} 账号 ${status.account} · `,
+                en: `${cli} account ${status.account} · `,
+              })
             : ''}
           {pollText(status.pollMinutes, status.lastPollAt)}
         </span>
@@ -177,7 +232,7 @@ function Overview({ status, onPolled }: { status: GitHubStatus; onPolled: () => 
           type="button"
           disabled={action.busy}
           onClick={async () => {
-            if ((await action.run(() => api.githubPoll())) !== undefined) onPolled();
+            if ((await action.run(() => poll())) !== undefined) onPolled();
           }}
         >
           {action.busy
@@ -189,8 +244,8 @@ function Overview({ status, onPolled }: { status: GitHubStatus; onPolled: () => 
       {status.lastError && (
         <ErrorBox>
           {t({
-            zh: `GitHub 调用失败（${formatTime(status.lastError.at)}），下次检查时重试：`,
-            en: `GitHub call failed (${formatTime(status.lastError.at)}); retrying at the next check: `,
+            zh: `${name} 调用失败（${formatTime(status.lastError.at)}），下次检查时重试：`,
+            en: `${name} call failed (${formatTime(status.lastError.at)}); retrying at the next check: `,
           })}
           {status.lastError.message}
         </ErrorBox>
@@ -234,131 +289,113 @@ function UpgradeCard({ status, onChecked }: { status: UpgradeStatus; onChecked: 
   );
 }
 
-function githubExample(): string {
-  return t({
-    zh: `github:
-  account: my-account        # 可选：用 gh 的哪个账号
-  repos:
-    my-repo:                 # 看板上登记的仓库名
-      template: self-dev     # 从 issue 建 Run 用的模板
-      scout:
-        agent: claude-reviewer
-        auto: true           # 没有在进行中的 Run 时自动侦察（只等人的 Run 不挡）；false = 只手动触发
-      auto_accept:
-        max_risk: none       # 自动采纳到哪个风险等级：none / low / mid / high
-        max_size: L          # 自动采纳到哪个大小：S / M / L
-      auto_merge: false      # 从 issue 来的 Run 合并前不再等你审批
-      push: false            # 合并后自动推送到 GitHub
-      # deliver: pr          # 目标分支受保护时：推送 Run 的分支、开 PR，合并后 Run 完成（要配 push: true）
-      # daily_budget_usd: 20 # 每天自动花费的上限，不写 = 不限
-      max_run_attempts: 3    # 一个 issue 最多跑几次 Run（含第一次），失败后自动重做`,
-    en: `github:
-  account: my-account        # optional: which gh account to use
-  repos:
-    my-repo:                 # the repo name registered on the dashboard
-      template: self-dev     # template of the Runs created from issues
-      scout:
-        agent: claude-reviewer
-        auto: true           # scout by itself when no Run is in progress (Runs waiting only for you do not hold it back); false = by hand only
-      auto_accept:
-        max_risk: none       # highest risk accepted automatically: none / low / mid / high
-        max_size: L          # largest size accepted automatically: S / M / L
-      auto_merge: false      # Runs from issues merge without waiting for your approval
-      push: false            # push to GitHub after merging
-      # deliver: pr          # protected target branch: push the Run's branch, open a PR, done once merged (needs push: true)
-      # daily_budget_usd: 20 # daily limit of automatic spend; omitted = no limit
-      max_run_attempts: 3    # Runs an issue gets at most, the first included; failed ones are redone`,
-  });
-}
-
-function backlogExample(): string {
-  return t({
-    zh: `backlog:
-  poll_minutes: 5            # 多久检查一次本地提案池
-  repos:
-    my-local-repo:           # 看板上登记的仓库名，不能和 github.repos 里的重名
-      template: self-dev     # 采纳的提案建 Run 用的模板
-      scout:                 # 不写 = 不侦察，这个仓库就没有提案
-        agent: claude-reviewer
-        auto: true           # 没有在进行中的 Run 时自动侦察（只等人的 Run 不挡）；false = 只手动触发
-      auto_accept:
-        max_risk: low        # 自动采纳到哪个风险等级：none / low / mid / high
-        max_size: M          # 自动采纳到哪个大小：S / M / L
-      auto_merge: false      # 采纳的提案建出的 Run 合并前不再等你审批
-      # daily_budget_usd: 20 # 每天自动花费的上限，不写 = 不限
-      max_run_attempts: 3    # 一条提案最多跑几次 Run（含第一次），失败后自动重做`,
-    en: `backlog:
-  poll_minutes: 5            # how often to go over the local backlog
-  repos:
-    my-local-repo:           # the repo name registered on the dashboard; not one of github.repos
-      template: self-dev     # template of the Runs created from accepted proposals
-      scout:                 # omitted = no scout, so the repo gets no proposals
-        agent: claude-reviewer
-        auto: true           # scout by itself when no Run is in progress (Runs waiting only for you do not hold it back); false = by hand only
-      auto_accept:
-        max_risk: low        # highest risk accepted automatically: none / low / mid / high
-        max_size: M          # largest size accepted automatically: S / M / L
-      auto_merge: false      # Runs from accepted proposals merge without waiting for your approval
-      # daily_budget_usd: 20 # daily limit of automatic spend; omitted = no limit
-      max_run_attempts: 3    # Runs a proposal gets at most, the first included; failed ones are redone`,
-  });
+/** A section of config.yaml to copy, folded under its name. */
+function ExampleSection(props: { section: 'github' | 'gitlab'; example: string }) {
+  return (
+    <details className="config-example">
+      <summary>
+        {t({ zh: `${props.section} 配置示例`, en: `Example ${props.section} section` })}
+      </summary>
+      <pre className="pre">{props.example}</pre>
+    </details>
+  );
 }
 
 /**
- * No `github` section. With the local backlog configured, Runs come from it, so this only says
- * how to add GitHub; without either, nothing can create a Run yet, and both ways are shown.
+ * Some source of requirements is configured, but not both code hosts: how to add the one missing
+ * (or both, when only the local backlog is), with its example. Nothing when both are configured.
  */
-function NotConfigured({ backlog }: { backlog: boolean }) {
-  if (backlog) {
-    return (
-      <section className="card">
-        <p>
-          {t({
-            zh: (
-              <>
-                没有接入 GitHub：下面「本地提案」里的仓库，需求来自 Master
-                自己保存的本地提案池。想让仓库改用 GitHub issue 管理需求，在{' '}
-                <code>config.yaml</code> 里加上 <code>github</code> 配置（需要先安装并登录
-                gh），把仓库从 <code>backlog.repos</code> 移到 <code>github.repos</code>
-                ：一个仓库只能用一种需求来源。
-              </>
-            ),
-            en: (
-              <>
-                GitHub is not connected: the requirements of the repos under Local backlog below
-                come from the local backlog the Master keeps. To have a repo use GitHub issues
-                instead, add a <code>github</code> section to <code>config.yaml</code> (install gh
-                and log in first) and move the repo from <code>backlog.repos</code> to{' '}
-                <code>github.repos</code>: a repo has one source of requirements only.
-              </>
-            ),
-          })}
-        </p>
-        <details className="config-example">
-          <summary>{t({ zh: 'github 配置示例', en: 'Example github section' })}</summary>
-          <pre className="pre">{githubExample()}</pre>
-        </details>
-      </section>
-    );
+function OtherSources({ github, gitlab }: { github: boolean; gitlab: boolean }) {
+  if (github && gitlab) return null;
+  let text: ReactNode;
+  if (!github && !gitlab) {
+    text = t({
+      zh: (
+        <>
+          没有接入 GitHub 或 GitLab：下面「本地提案」里的仓库，需求来自 Master
+          自己保存的本地提案池。想让仓库改用 GitHub 或 GitLab 的 issue 管理需求，在{' '}
+          <code>config.yaml</code> 里加上 <code>github</code> 或 <code>gitlab</code>{' '}
+          配置（需要先安装并登录 gh 或 glab），把仓库从 <code>backlog.repos</code> 移到{' '}
+          <code>github.repos</code> 或 <code>gitlab.repos</code>：一个仓库只能用一种需求来源。
+        </>
+      ),
+      en: (
+        <>
+          Neither GitHub nor GitLab is connected: the requirements of the repos under Local backlog
+          below come from the local backlog the Master keeps. To have a repo use GitHub or GitLab
+          issues instead, add a <code>github</code> or <code>gitlab</code> section to{' '}
+          <code>config.yaml</code> (install gh or glab and log in first) and move the repo from{' '}
+          <code>backlog.repos</code> to <code>github.repos</code> or <code>gitlab.repos</code>: a
+          repo has one source of requirements only.
+        </>
+      ),
+    });
+  } else if (!gitlab) {
+    text = t({
+      zh: (
+        <>
+          托管在 GitLab（gitlab.com 或自建的）上的项目也能这样用 issue 管理需求：在{' '}
+          <code>config.yaml</code> 里加上 <code>gitlab</code> 配置（需要先安装并登录
+          glab），把仓库登记到 <code>gitlab.repos</code>；一个仓库只能用一种需求来源。
+        </>
+      ),
+      en: (
+        <>
+          Projects hosted on GitLab (gitlab.com or a self-hosted one) can keep their backlog in
+          issues too: add a <code>gitlab</code> section to <code>config.yaml</code> (install glab
+          and log in first) and list the repo under <code>gitlab.repos</code>; a repo has one source
+          of requirements only.
+        </>
+      ),
+    });
+  } else {
+    text = t({
+      zh: (
+        <>
+          托管在 GitHub 上的项目也能这样用 issue 管理需求：在 <code>config.yaml</code> 里加上{' '}
+          <code>github</code> 配置（需要先安装并登录 gh），把仓库登记到 <code>github.repos</code>
+          ；一个仓库只能用一种需求来源。
+        </>
+      ),
+      en: (
+        <>
+          Projects hosted on GitHub can keep their backlog in issues too: add a <code>github</code>{' '}
+          section to <code>config.yaml</code> (install gh and log in first) and list the repo under{' '}
+          <code>github.repos</code>; a repo has one source of requirements only.
+        </>
+      ),
+    });
   }
+  return (
+    <section className="card">
+      <p className={github || gitlab ? 'muted' : undefined}>{text}</p>
+      {!github && <ExampleSection section="github" example={githubExample()} />}
+      {!gitlab && <ExampleSection section="gitlab" example={gitlabExample()} />}
+    </section>
+  );
+}
+
+/** No source of requirements at all: nothing can create a Run yet, so every way is shown. */
+function NotConfigured() {
   return (
     <section className="card">
       <p>
         {t({
           zh: (
             <>
-              还没有需求来源，现在建不了 Run：Run 只从 GitHub issue 或本地提案池来，看板不提供手动建
-              Run。在 <code>config.yaml</code>{' '}
-              里加上下面两种配置之一，保存后自动生效；一个仓库只能用一种，只有列在{' '}
+              还没有需求来源，现在建不了 Run：Run 只从 GitHub 或 GitLab 的 issue、或本地提案池来，
+              看板不提供手动建 Run。在 <code>config.yaml</code>{' '}
+              里加上下面三种配置之一，保存后自动生效；一个仓库只能用一种，只有列在{' '}
               <code>repos</code> 里的仓库才会建 Run。
             </>
           ),
           en: (
             <>
-              No source of requirements yet, so no Run can be created: Runs only come from GitHub
-              issues or the local backlog, and the dashboard does not create Runs by hand. Add one
-              of the two sections below to <code>config.yaml</code> and it takes effect by itself; a
-              repo uses one of them only, and only repos listed under <code>repos</code> get Runs.
+              No source of requirements yet, so no Run can be created: Runs only come from GitHub or
+              GitLab issues or the local backlog, and the dashboard does not create Runs by hand.
+              Add one of the three sections below to <code>config.yaml</code> and it takes effect by
+              itself; a repo uses one of them only, and only repos listed under <code>repos</code>{' '}
+              get Runs.
             </>
           ),
         })}
@@ -381,8 +418,27 @@ function NotConfigured({ backlog }: { backlog: boolean }) {
       <pre className="pre">{githubExample()}</pre>
       <p>
         {t({
-          zh: '不用 GitHub（只在本机的仓库、没有 GitHub 账号、托管在 GitLab 或内网的项目）：AI 侦察把提案写进本地提案池，自动采纳范围内的直接建成 Run，其余的在这一页采纳或拒绝。',
-          en: 'Without GitHub (a repo only on this machine, no GitHub account, or hosted on GitLab or an intranet): the AI scout writes proposals into the local backlog; those within auto-accept become Runs right away, and you accept or reject the others on this page.',
+          zh: (
+            <>
+              接 GitLab（gitlab.com 或自建的，需要先安装并登录 glab）：同样是带{' '}
+              <code>ares1:ready</code> 标签的 issue 建成 Run，项目路径写在 <code>issues_repo</code>{' '}
+              里。
+            </>
+          ),
+          en: (
+            <>
+              With GitLab (gitlab.com or a self-hosted one; install glab and log in first): issues
+              labeled <code>ares1:ready</code> become Runs as well, with the project's path in{' '}
+              <code>issues_repo</code>.
+            </>
+          ),
+        })}
+      </p>
+      <pre className="pre">{gitlabExample()}</pre>
+      <p>
+        {t({
+          zh: '不接代码托管（只在本机的仓库，或托管在别处的项目）：AI 侦察把提案写进本地提案池，自动采纳范围内的直接建成 Run，其余的在这一页采纳或拒绝。',
+          en: 'Without a code host (a repo only on this machine, or hosted elsewhere): the AI scout writes proposals into the local backlog; those within auto-accept become Runs right away, and you accept or reject the others on this page.',
         })}
       </p>
       <pre className="pre">{backlogExample()}</pre>
@@ -515,22 +571,32 @@ function ScoutAction({ repo, onStarted }: { repo: ProposalSourceStatus; onStarte
   );
 }
 
+/** A repo whose issues are on a code host: `host` is the platform's status it is listed in. */
 function RepoIssues(props: {
+  host: GitHubStatus;
   repo: GitHubRepoStatus;
   config: ConfigView | undefined;
   onStarted: () => void;
 }) {
-  const { repo, config, onStarted } = props;
+  const { host, repo, config, onStarted } = props;
   return (
     <section className="card repo">
       <div className="repo-head">
         <h2>{repo.name}</h2>
+        <span className="muted">
+          {hostLabel(host)}
+          {repo.issuesRepo && ` · ${repo.issuesRepo}`}
+        </span>
         {repo.issuesRepo && (
           <span className="issues-links">
-            <a href={issuesUrl(repo.issuesRepo, 'ares1:proposal')} target="_blank" rel="noreferrer">
+            <a
+              href={issuesUrl(host, repo.issuesRepo, 'ares1:proposal')}
+              target="_blank"
+              rel="noreferrer"
+            >
               {t({ zh: '待审提案', en: 'Proposals to review' })}
             </a>
-            <a href={issuesUrl(repo.issuesRepo)} target="_blank" rel="noreferrer">
+            <a href={issuesUrl(host, repo.issuesRepo)} target="_blank" rel="noreferrer">
               {t({ zh: '全部 issue', en: 'All issues' })}
             </a>
           </span>
@@ -553,9 +619,9 @@ function RepoIssues(props: {
 }
 
 /**
- * The local backlog of the repos without GitHub (backlog.repos): a card per repo with its
- * settings and its proposals, pending ones first. Also shown, without the settings, for repos
- * taken out of backlog.repos that still have proposals, so that pending ones can be rejected.
+ * The local backlog of the repos on neither GitHub nor GitLab (backlog.repos): a card per repo
+ * with its settings and its proposals, pending ones first. Also shown, without the settings, for
+ * repos taken out of backlog.repos that still have proposals, so that pending ones can be rejected.
  */
 function BacklogSection(props: {
   status: BacklogStatus | undefined;
@@ -596,7 +662,8 @@ function BacklogOverview({ status, onPolled }: { status: BacklogStatus; onPolled
         {t({
           zh: (
             <>
-              <code>backlog.repos</code> 里的仓库不接 GitHub，需求来自 Master
+              <code>backlog.repos</code> 里的仓库不接 GitHub 或 GitLab（不能同时列在{' '}
+              <code>github.repos</code> 或 <code>gitlab.repos</code> 里），需求来自 Master
               自己保存的本地提案池：AI 侦察读代码、文档和 Run
               记录，把值得做的事写成提案；在自动采纳范围内的直接建成
               Run，其余的等你在下面采纳，或者填上理由拒绝。拒绝的理由会交给这个仓库之后的侦察，免得换个说法再提。
@@ -604,12 +671,13 @@ function BacklogOverview({ status, onPolled }: { status: BacklogStatus; onPolled
           ),
           en: (
             <>
-              The repos of <code>backlog.repos</code> have no GitHub: their requirements come from
-              the local backlog the Master keeps. The AI scout reads the code, the docs and the Run
-              records and writes down what is worth doing as proposals; those within auto-accept
-              become Runs right away, and the others wait for you to accept them below or reject
-              them with a reason. The reason goes to the repo's later scouts, so that they do not
-              propose the same thing in other words.
+              The repos of <code>backlog.repos</code> use neither GitHub nor GitLab (they cannot be
+              listed under <code>github.repos</code> or <code>gitlab.repos</code> as well): their
+              requirements come from the local backlog the Master keeps. The AI scout reads the
+              code, the docs and the Run records and writes down what is worth doing as proposals;
+              those within auto-accept become Runs right away, and the others wait for you to accept
+              them below or reject them with a reason. The reason goes to the repo's later scouts,
+              so that they do not propose the same thing in other words.
             </>
           ),
         })}

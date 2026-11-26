@@ -142,21 +142,21 @@ export const NOTICE_KINDS: Record<NoticeKind, { label: string; when: string }> =
   github: {
     zh: {
       label: 'GitHub 访问失败',
-      when: '读写 issue 或推送目标分支失败。同一串连续失败里，同一个错误只通知一次；有一轮访问全部成功后重新开始',
+      when: '在 GitHub 或 GitLab 上读写 issue、推送目标分支失败，GitLab 的标题写作「GitLab 访问失败」。同一串连续失败里，同一个错误只通知一次；有一轮访问全部成功后重新开始',
     },
     en: {
       label: 'GitHub access failed',
-      when: 'Reading or writing issues, or pushing the target branch, failed. Within a streak of failures each error is notified once; the streak ends, and errors are notified again, after a round in which every GitHub call succeeds',
+      when: 'Reading or writing issues, or pushing the target branch, failed on GitHub or GitLab, titled "GitLab access failed" for GitLab. Within a streak of failures each error is notified once; the streak ends, and errors are notified again, after a round in which every call to that host succeeds',
     },
   },
   pull: {
     zh: {
       label: '没能拉取 GitHub 上的新提交',
-      when: 'GitHub 上的目标分支有本地没有的提交，但 Master 没能把本地目标分支更新过去，标题后面写着仓库名：两边已经分叉（各有对方没有的提交），Master 自动合并时有冲突或者合并后检查没通过，于是交给一个 Run，由编码 Agent 合并，评审并合并后自动推送，点开就是这个 Run；建不了 Run，或者这个 Run 被终止、失败了，就要你手动合并；合并前都不推送。或者检查要用的程序找不到；或者目标分支检出的工作目录里有未提交的改动。同一次分叉里，交给同一个 Run、要你手动合并、同一种原因都只通知一次',
+      when: 'GitHub 或 GitLab 上的目标分支有本地没有的提交，但 Master 没能把本地目标分支更新过去，标题后面写着仓库名（GitLab 的标题写作「没能拉取 GitLab 上的新提交」）：两边已经分叉（各有对方没有的提交），Master 自动合并时有冲突或者合并后检查没通过，于是交给一个 Run，由编码 Agent 合并，评审并合并后自动推送，点开就是这个 Run；建不了 Run，或者这个 Run 被终止、失败了，就要你手动合并；合并前都不推送。或者检查要用的程序找不到；或者目标分支检出的工作目录里有未提交的改动。同一次分叉里，交给同一个 Run、要你手动合并、同一种原因都只通知一次',
     },
     en: {
       label: 'Could not pull new commits from GitHub',
-      when: "The target branch on GitHub has commits the local one lacks, but the Master could not bring the local branch up to them, with the repo after the title: the two have diverged (each has commits the other lacks) and the Master's merge of the two conflicts or fails the checks, so a Run takes it over, whose coding agent merges them, pushed once the Run is reviewed and merged (a click opens the Run); when no Run can be created, or the Run is terminated or fails, you need to merge them; nothing is pushed until they are merged. Or a program the checks start is missing; or the target branch is checked out with uncommitted changes. Within a divergence, handing it to a Run, asking you to merge, and each reason are each notified once",
+      when: "The target branch on GitHub or GitLab has commits the local one lacks, but the Master could not bring the local branch up to them, with the repo after the title (which says GitLab for GitLab): the two have diverged (each has commits the other lacks) and the Master's merge of the two conflicts or fails the checks, so a Run takes it over, whose coding agent merges them, pushed once the Run is reviewed and merged (a click opens the Run); when no Run can be created, or the Run is terminated or fails, you need to merge them; nothing is pushed until they are merged. Or a program the checks start is missing; or the target branch is checked out with uncommitted changes. Within a divergence, handing it to a Run, asking you to merge, and each reason are each notified once",
     },
   },
   upgrade: {
@@ -181,11 +181,35 @@ export interface Notice {
   about: 'run' | 'issues' | 'master';
 }
 
+/** A label, then the detail if any. */
+const withDetail = (label: string, detail?: string) =>
+  detail ? `${label}${t({ zh: '：', en: ': ' })}${detail}` : label;
+
 /** A notification's title: its kind's label, then the detail if any. */
-const titleOf = (kind: NoticeKind, detail?: string) =>
-  detail
-    ? `${NOTICE_KINDS[kind].label}${t({ zh: '：', en: ': ' })}${detail}`
-    : NOTICE_KINDS[kind].label;
+const titleOf = (kind: NoticeKind, detail?: string) => withDetail(NOTICE_KINDS[kind].label, detail);
+
+/** A code host as people know it. */
+type HostName = 'GitHub' | 'GitLab';
+
+/**
+ * The code host a `github.*` event or a scout's is about: the GitLab bridge records its own with
+ * `platform: 'gitlab'`, GitHub's go without.
+ */
+const hostOf = (data: Record<string, unknown>): HostName =>
+  data.platform === 'gitlab' ? 'GitLab' : 'GitHub';
+
+/**
+ * The title of a notification about a code host (kind `github` or `pull`): its kind's label, which
+ * names GitHub, naming GitLab instead for GitLab's events. The kind stays the same either way.
+ */
+function hostTitleOf(kind: 'github' | 'pull', host: HostName, detail?: string): string {
+  if (host === 'GitHub') return titleOf(kind, detail);
+  const label =
+    kind === 'github'
+      ? t({ zh: 'GitLab 访问失败', en: 'GitLab access failed' })
+      : t({ zh: '没能拉取 GitLab 上的新提交', en: 'Could not pull new commits from GitLab' });
+  return withDetail(label, detail);
+}
 
 /** The first line of `text` without its surrounding blanks, cut to `max` characters with "…". */
 export const firstLine = (text: string, max: number) => {
@@ -200,8 +224,8 @@ const text = (v: unknown): string | null => (typeof v === 'string' && v !== '' ?
 const FILES_SHOWN = 5;
 
 /**
- * Why the Master could not merge GitHub's commits into a diverged target branch by itself, from
- * the data of a github.diverged event: `conflict` (the merge conflicted in `files`), `failed`
+ * Why the Master could not merge the code host's commits into a diverged target branch by itself,
+ * from the data of a github.diverged event: `conflict` (the merge conflicted in `files`), `failed`
  * (a check failed on the merge) or `environment` (a check could not find a program it starts,
  * tried again each round), with a clause that says so. null for an event without any, as
  * recorded before the Master merged by itself. Shared by the notification and the dashboard.
@@ -261,12 +285,12 @@ export function divergedCause(
   };
 }
 
-/** The target branch could not take GitHub's new commits: titled with the repo. */
+/** The target branch could not take the code host's new commits: titled with the repo. */
 function pullNotice(event: EventRow, body: string): Notice {
   const repo = text(event.data.repo);
   return {
     kind: 'pull',
-    title: titleOf('pull', repo ?? undefined),
+    title: hostTitleOf('pull', hostOf(event.data), repo ?? undefined),
     body,
     runId: null,
     about: 'issues',
@@ -280,7 +304,8 @@ const count = (v: unknown): number | null =>
 /**
  * An iteration got blocked (`iteration.blocked`): which step held it up, failed after using up
  * its attempts or closed as not planned by a human, and what comes next. Titled with the repo.
- * One of the local backlog (`backlog: true`) is followed on the dashboard instead of GitHub.
+ * One of the local backlog (`backlog: true`) is followed on the dashboard instead of on the
+ * code host.
  */
 function iterationBlockedNotice(event: EventRow): Notice {
   const d = event.data;
@@ -341,7 +366,7 @@ function localIterationBlockedNotice(event: EventRow): Notice {
 const capitalize = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
 /** Where to decide the proposals a scout left for a human, on the code host its issues are on. */
-function proposalsOnHostText(host: 'GitHub' | 'GitLab'): string {
+function proposalsOnHostText(host: HostName): string {
   return t({
     zh: `这些提案不能自动采纳（太大或超出自动采纳的风险），去 ${host} 上采纳或关闭`,
     en: `These proposals cannot be accepted automatically (too large or above the auto-accept risk); accept or close them on ${host}`,
@@ -352,8 +377,8 @@ function proposalsOnHostText(host: 'GitHub' | 'GitLab'): string {
  * The notification for an event, or null when nobody has to act. Only things that wait for a
  * human: approvals, stuck or failed Runs, proposals the Master may not accept by itself, an
  * iteration blocked by a step that failed or was dropped, failures of the Master's own
- * automation (GitHub, upgrades, a scout that keeps failing), and a target branch that cannot take
- * the new commits on GitHub by itself.
+ * automation (GitHub or GitLab, upgrades, a scout that keeps failing), and a target branch that
+ * cannot take the new commits on its code host by itself.
  * Finished Runs are not announced.
  */
 export function noticeFor(event: EventRow, goal: string | undefined): Notice | null {
@@ -391,7 +416,7 @@ export function noticeFor(event: EventRow, goal: string | undefined): Notice | n
                 zh: '这些提案没有自动采纳（太大、超出自动采纳的风险，或今天的自动采纳额度用完了），去看板的需求页上采纳或拒绝',
                 en: "These proposals were not accepted automatically (too large, above the auto-accept risk, or past today's auto-accept limit); accept or reject them on the dashboard's Issues page",
               })
-            : proposalsOnHostText(event.data.platform === 'gitlab' ? 'GitLab' : 'GitHub'),
+            : proposalsOnHostText(hostOf(event.data)),
         runId: null,
         about: 'issues',
       };
@@ -425,7 +450,7 @@ export function noticeFor(event: EventRow, goal: string | undefined): Notice | n
     case 'github.error':
       return {
         kind: 'github',
-        title: titleOf('github'),
+        title: hostTitleOf('github', hostOf(event.data)),
         body: firstLine(String(event.data.message ?? ''), 200),
         runId: null,
         about: 'issues',
@@ -433,14 +458,15 @@ export function noticeFor(event: EventRow, goal: string | undefined): Notice | n
     case 'github.diverged': {
       // The same divergence, after a Run merged or more was pushed: told the first time.
       if (event.data.repeated === true) return null;
+      const host = hostOf(event.data);
       const branch = text(event.data.branch) ?? t({ zh: '目标分支', en: 'The target branch' });
       const local = text(event.data.local);
       const remote = text(event.data.remote);
       const at =
         local && remote
           ? t({
-              zh: `（本地 ${local.slice(0, 7)}，GitHub ${remote.slice(0, 7)}）`,
-              en: ` (local ${local.slice(0, 7)}, GitHub ${remote.slice(0, 7)})`,
+              zh: `（本地 ${local.slice(0, 7)}，${host} ${remote.slice(0, 7)}）`,
+              en: ` (local ${local.slice(0, 7)}, ${host} ${remote.slice(0, 7)})`,
             })
           : '';
       const until = t({
@@ -456,8 +482,8 @@ export function noticeFor(event: EventRow, goal: string | undefined): Notice | n
           ...pullNotice(
             event,
             t({
-              zh: `${branch} 和 GitHub 上的已经分叉${at}${why}；已交给 Run ${handedTo} 处理：编码 Agent 合并两边，评审并合并后自动推送。${until}`,
-              en: `${branch} has diverged from GitHub's${at}${why}. Run ${handedTo} takes it over: its coding agent merges the two, and once reviewed and merged it is pushed by itself; ${until}`,
+              zh: `${branch} 和 ${host} 上的已经分叉${at}${why}；已交给 Run ${handedTo} 处理：编码 Agent 合并两边，评审并合并后自动推送。${until}`,
+              en: `${branch} has diverged from ${host}'s${at}${why}. Run ${handedTo} takes it over: its coding agent merges the two, and once reviewed and merged it is pushed by itself; ${until}`,
             }),
           ),
           runId: handedTo,
@@ -468,8 +494,8 @@ export function noticeFor(event: EventRow, goal: string | undefined): Notice | n
         return pullNotice(
           event,
           t({
-            zh: `${branch} 和 GitHub 上的已经分叉${at}，${cause.text}；装好后下一轮检查会自动再合并，${until}`,
-            en: `${branch} has diverged from GitHub's${at}, and ${cause.text}. Once it is installed, the next check merges by itself; ${until}`,
+            zh: `${branch} 和 ${host} 上的已经分叉${at}，${cause.text}；装好后下一轮检查会自动再合并，${until}`,
+            en: `${branch} has diverged from ${host}'s${at}, and ${cause.text}. Once it is installed, the next check merges by itself; ${until}`,
           }),
         );
       }
@@ -477,16 +503,16 @@ export function noticeFor(event: EventRow, goal: string | undefined): Notice | n
         return pullNotice(
           event,
           t({
-            zh: `${branch} 和 GitHub 上的已经分叉${at}，${cause.text}，要你手动合并后推送；${until}`,
-            en: `${branch} has diverged from GitHub's${at}, and ${cause.text}. Merge the two by hand and push; ${until}`,
+            zh: `${branch} 和 ${host} 上的已经分叉${at}，${cause.text}，要你手动合并后推送；${until}`,
+            en: `${branch} has diverged from ${host}'s${at}, and ${cause.text}. Merge the two by hand and push; ${until}`,
           }),
         );
       }
       return pullNotice(
         event,
         t({
-          zh: `${branch} 和 GitHub 上的已经分叉${at}，要你手动合并后推送；${until}`,
-          en: `${branch} has diverged from GitHub's${at}; merge the two by hand and push. Until then the Master pushes nothing and the issues of completed Runs stay open`,
+          zh: `${branch} 和 ${host} 上的已经分叉${at}，要你手动合并后推送；${until}`,
+          en: `${branch} has diverged from ${host}'s${at}; merge the two by hand and push. Until then the Master pushes nothing and the issues of completed Runs stay open`,
         }),
       );
     }
@@ -511,11 +537,12 @@ export function noticeFor(event: EventRow, goal: string | undefined): Notice | n
       const branch = text(event.data.branch) ?? t({ zh: '目标分支', en: 'The target branch' });
       const worktree = text(event.data.worktree);
       const where = worktree ? t({ zh: `在 ${worktree} `, en: ` in ${worktree}` }) : '';
+      const host = hostOf(event.data);
       return pullNotice(
         event,
         t({
-          zh: `${branch} 检出${where}有未提交的改动，不能快进到 GitHub 上的新提交；提交或丢弃这些改动后，下一轮检查会自动拉取`,
-          en: `${branch} is checked out${where} with uncommitted changes, so it cannot be fast-forwarded to the new commits on GitHub; once they are committed or discarded, the next check pulls by itself`,
+          zh: `${branch} 检出${where}有未提交的改动，不能快进到 ${host} 上的新提交；提交或丢弃这些改动后，下一轮检查会自动拉取`,
+          en: `${branch} is checked out${where} with uncommitted changes, so it cannot be fast-forwarded to the new commits on ${host}; once they are committed or discarded, the next check pulls by itself`,
         }),
       );
     }

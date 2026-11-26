@@ -241,6 +241,12 @@ export interface ConfigView {
    * directory's (`resolveTemplate`).
    */
   repoTemplates: RepoTemplatesView[];
+  /**
+   * Where each repo named under config.yaml's `github.repos`, `gitlab.repos` or `backlog.repos`
+   * takes its requirements from, by repo name (`requirementSource`: a name in more than one is
+   * the first's). A registered repo missing here has no source, so no Run is created for it.
+   */
+  repoSources: Record<string, RepoSourceView>;
   /** When the configuration in use was loaded (it reloads when the files change). */
   loadedAt: string;
   /** The last reload failed; the previous configuration is still in use. */
@@ -248,6 +254,16 @@ export interface ConfigView {
   /** Changed settings that need a Master restart to take effect. */
   restartNeeded: string[];
 }
+
+/**
+ * Where a repo's requirements come from (`requirementSource`): GitHub issues of `issuesRepo`
+ * ("owner/name" as configured; null = resolved by gh from the repo's remotes), GitLab issues of the
+ * project at `issuesRepo` ("group/subgroup/name") on `host`, or the local backlog.
+ */
+export type RepoSourceView =
+  | { source: 'github'; issuesRepo: string | null }
+  | { source: 'gitlab'; host: string; issuesRepo: string }
+  | { source: 'backlog' };
 
 /** A CLI the Master has an adapter for. */
 export interface CliInfo {

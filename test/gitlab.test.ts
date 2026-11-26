@@ -575,11 +575,16 @@ describe('gitlab: scout', () => {
       { repo: 'demo', issue: 5, platform: 'gitlab' },
       { repo: 'demo', issue: 6, platform: 'gitlab' },
     ]);
-    const runs = t.master.store.listRuns();
-    expect(runs.map((r) => [r.issue?.number, r.issue?.platform, r.issue?.auto])).toEqual([
-      [6, 'gitlab', true],
-      [5, 'gitlab', true],
+    // The Runs of 5 and 6 come from the same poll, maybe within the same millisecond, so they are
+    // compared by issue rather than in the order listRuns gives them.
+    const runs = t.master.store
+      .listRuns()
+      .map((r) => [r.issue?.number, r.issue?.platform, r.issue?.auto] as const)
+      .sort((a, b) => (a[0] ?? 0) - (b[0] ?? 0));
+    expect(runs).toEqual([
       [4, 'gitlab', true],
+      [5, 'gitlab', true],
+      [6, 'gitlab', true],
     ]);
     expect(t.master.gitlabIssues.status().repos[0]?.autoAccept.usedToday).toBe(3);
     expectMarkedComments();

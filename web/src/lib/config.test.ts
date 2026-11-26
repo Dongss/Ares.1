@@ -6,9 +6,12 @@ import {
   AGENT_STATE,
   agentRows,
   cliNote,
+  configEntryErrors,
   configFileWarnings,
   findRepoTemplate,
   REPO_TEMPLATE_STATE,
+  repoSourceInfo,
+  repoSourceOf,
   repoTemplateBadges,
   repoTemplateChoice,
   repoTemplateGroups,
@@ -36,6 +39,7 @@ const view: ConfigView = {
   templates: [dev],
   errors: { 'workflows/bad.yaml': ['stages: 至少一个'], 'agents.yaml#typo': ['tierr: 多余'] },
   warnings: {},
+  repoSources: {},
   loadedAt: '2026-11-19T00:00:00.000Z',
   reloadError: null,
   restartNeeded: [],
@@ -401,6 +405,89 @@ describe('configFileWarnings', () => {
       },
     };
     expect(configFileWarnings(warned)).toEqual(['未知的配置项 upgarde，已忽略']);
+  });
+});
+
+describe('configEntryErrors', () => {
+  it("lists the disabled entries of config.yaml by where they are, GitLab's among them", () => {
+    expect(configEntryErrors(view)).toEqual([]);
+    const errors = {
+      ...view.errors,
+      'config.yaml#gitlab.repos.app': ['app 已经在 github.repos 里，这里的配置不生效'],
+      'config.yaml#backlog.repos.local': ['模板 nope 不存在'],
+      'config.yaml#github.repos.hub': ['deliver: pr 要求 push: true'],
+    };
+    expect(configEntryErrors({ errors })).toEqual([
+      { entry: 'backlog.repos.local', errors: ['模板 nope 不存在'] },
+      { entry: 'github.repos.hub', errors: ['deliver: pr 要求 push: true'] },
+      { entry: 'gitlab.repos.app', errors: ['app 已经在 github.repos 里，这里的配置不生效'] },
+    ]);
+  });
+});
+
+describe('where a repo gets its requirements', () => {
+  afterEach(() => setLang('zh'));
+  const sources: Pick<ConfigView, 'repoSources'> = {
+    repoSources: {
+      hub: { source: 'github', issuesRepo: 'me/hub' },
+      guessed: { source: 'github', issuesRepo: null },
+      lab: { source: 'gitlab', host: 'gitlab.example.com', issuesRepo: 'grp/sub/lab' },
+      local: { source: 'backlog' },
+    },
+  };
+
+  it('names the code host, with the GitLab host, and links to the issues there', () => {
+    expect(repoSourceInfo(sources, 'hub')).toEqual({
+      label: 'GitHub',
+      issuesRepo: 'me/hub',
+      url: 'https://github.com/me/hub/issues?q=is%3Aissue%20is%3Aopen',
+      hint: null,
+    });
+    expect(repoSourceInfo(sources, 'guessed')).toEqual({
+      label: 'GitHub',
+      issuesRepo: null,
+      url: null,
+      hint: null,
+    });
+    expect(repoSourceInfo(sources, 'lab')).toEqual({
+      label: 'GitLab（gitlab.example.com）',
+      issuesRepo: 'grp/sub/lab',
+      url: 'https://gitlab.example.com/grp/sub/lab/-/issues?state=opened',
+      hint: null,
+    });
+    expect(repoSourceInfo(sources, 'local')).toMatchObject({ label: '本地提案池', url: null });
+  });
+
+  it('tells a repo of no source, also one named like an object property', () => {
+    for (const name of ['nowhere', 'constructor', 'toString']) {
+      expect(repoSourceOf(sources, name)).toBeNull();
+      expect(repoSourceInfo(sources, name)).toEqual({
+        label: '未配置',
+        issuesRepo: null,
+        url: null,
+        hint: '不在 config.yaml 的 github.repos、gitlab.repos 和 backlog.repos 里，不会建 Run',
+      });
+    }
+    expect(repoSourceOf(sources, 'lab')).toEqual(sources.repoSources.lab);
+  });
+
+  it('in English', () => {
+    setLang('en');
+    const texts = ['hub', 'lab', 'local', 'nowhere'].flatMap((name) => {
+      const info = repoSourceInfo(sources, name);
+      return [info.label, info.hint ?? ''];
+    });
+    expect(texts).toEqual([
+      'GitHub',
+      '',
+      'GitLab (gitlab.example.com)',
+      '',
+      'Local backlog',
+      '',
+      'None',
+      'In none of github.repos, gitlab.repos and backlog.repos of config.yaml, so it gets no Runs',
+    ]);
+    for (const text of texts) expect(text).not.toMatch(/[一-鿿]/);
   });
 });
 

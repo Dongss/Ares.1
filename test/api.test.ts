@@ -1518,6 +1518,36 @@ gitlab:
     expect(gh.calls).toEqual([]);
   });
 
+  it("tells on GET /api/config where each repo's requirements come from", async () => {
+    const config = `
+github:
+  repos:
+    hub: { issues_repo: me/hub, template: dev }
+    guessed: { template: dev }
+gitlab:
+  host: gitlab.example.com:8443
+  repos:
+    lab: { issues_repo: grp/sub/lab, template: dev }
+    hub: { issues_repo: grp/hub, template: dev }
+backlog:
+  repos:
+    local: { template: dev }
+    lab: { template: dev }
+`;
+    h = await harness({ config, gitlab: new FakeGitLab(), github: new FakeGitHub() });
+    const { json } = (await call('GET', '/api/config')) as { json: ConfigView };
+    // A name in two sources is the first's, as requirementSource has it; the later one is an error.
+    expect(json.repoSources).toEqual({
+      guessed: { source: 'github', issuesRepo: null },
+      hub: { source: 'github', issuesRepo: 'me/hub' },
+      lab: { source: 'gitlab', host: 'gitlab.example.com:8443', issuesRepo: 'grp/sub/lab' },
+      local: { source: 'backlog' },
+    });
+    expect(Object.keys(json.errors)).toEqual(
+      expect.arrayContaining(['config.yaml#gitlab.repos.hub', 'config.yaml#backlog.repos.lab']),
+    );
+  });
+
   it('starts the scout of a GitLab repo through GitLab', async () => {
     const gl = new FakeGitLab();
     const gh = new FakeGitHub();

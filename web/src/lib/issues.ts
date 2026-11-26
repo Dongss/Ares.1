@@ -1,4 +1,4 @@
-import type { GitHubRepoStatus, UpgradeStatus } from '../../../src/api/types.js';
+import type { GitHubRepoStatus, GitHubStatus, UpgradeStatus } from '../../../src/api/types.js';
 import {
   type AutoAcceptRule,
   acceptSplit,
@@ -9,11 +9,17 @@ import {
   type Risk,
 } from '../../../src/config/flow.js';
 import { join, t } from '../../../src/i18n.js';
-import type { RunIssue, ScoutGap, ScoutProposal, ScoutStatus } from '../../../src/store/types.js';
+import type {
+  HostPlatform,
+  RunIssue,
+  ScoutGap,
+  ScoutProposal,
+  ScoutStatus,
+} from '../../../src/store/types.js';
 import { formatCost, formatMinutes, formatTime, type Tone } from './format.js';
 
-// Display helpers for GitHub issues and AI scouts. Labels are getters, so they are picked in
-// the language in use when read, not when this module is imported.
+// Display helpers for the issues of a code host (GitHub or GitLab) and AI scouts. Labels are
+// getters, so they are picked in the language in use when read, not when this module is imported.
 
 /** A badge whose label is picked in the language in use when read. */
 export function badge(zh: string, en: string, tone: Tone): { readonly label: string; tone: Tone } {
@@ -102,15 +108,62 @@ export function gapsHeading(gaps: readonly ScoutGap[] | null): string | null {
   });
 }
 
-/** Open issues of the repo on GitHub, optionally with one label. */
-export function issuesUrl(repo: string, label?: string): string {
+/**
+ * The code host issues are on, as GET /api/github and GET /api/gitlab give it: GitHub, or GitLab
+ * on `host` (gitlab.com or a self-hosted one; gitlab.com when not given).
+ */
+export type IssueHost = Pick<GitHubStatus, 'platform' | 'host'>;
+
+/** GitHub as an `IssueHost`. */
+export const GITHUB: IssueHost = { platform: 'github', host: null };
+
+/** The code host as people know it. */
+export function platformName(platform: HostPlatform): 'GitHub' | 'GitLab' {
+  return platform === 'gitlab' ? 'GitLab' : 'GitHub';
+}
+
+/** 「GitHub」, or 「GitLab（gitlab.example.com）」 with the GitLab's host. */
+export function hostLabel(at: IssueHost): string {
+  if (at.platform !== 'gitlab') return platformName(at.platform);
+  const host = gitlabHost(at);
+  return t({ zh: `GitLab（${host}）`, en: `GitLab (${host})` });
+}
+
+function gitlabHost(at: IssueHost): string {
+  return at.host ?? 'gitlab.com';
+}
+
+/**
+ * Open issues of the repo ("owner/name", or a GitLab project's path) on its host, optionally with
+ * one label.
+ */
+export function issuesUrl(at: IssueHost, repo: string, label?: string): string {
+  if (at.platform === 'gitlab') {
+    const filter = label ? `&label_name[]=${encodeURIComponent(label)}` : '';
+    return `https://${gitlabHost(at)}/${repo}/-/issues?state=opened${filter}`;
+  }
   const q = ['is:issue', 'is:open', ...(label ? [`label:"${label}"`] : [])].join(' ');
   return `https://github.com/${repo}/issues?q=${encodeURIComponent(q)}`;
 }
 
-/** A new issue on GitHub with the label already filled in. */
-export function newIssueUrl(repo: string, label: string): string {
+/**
+ * A new issue on the repo's host with the label already filled in. GitLab takes no label by name
+ * in the link, so the description starts with the quick action that adds it, which GitLab runs
+ * and removes when the issue is created.
+ */
+export function newIssueUrl(at: IssueHost, repo: string, label: string): string {
+  if (at.platform === 'gitlab') {
+    const labelAction = encodeURIComponent(`/label ~"${label}"`);
+    return `https://${gitlabHost(at)}/${repo}/-/issues/new?issue[description]=${labelAction}`;
+  }
   return `https://github.com/${repo}/issues/new?labels=${encodeURIComponent(label)}`;
+}
+
+/** One issue of the repo on its host, by number. */
+export function issueUrl(at: IssueHost, repo: string, number: number): string {
+  return at.platform === 'gitlab'
+    ? `https://${gitlabHost(at)}/${repo}/-/issues/${number}`
+    : `https://github.com/${repo}/issues/${number}`;
 }
 
 /** "#12" for a Run created from an issue. */
@@ -348,5 +401,119 @@ export function autoAcceptText(auto: GitHubRepoStatus['autoAccept']): string {
   return t({
     zh: `${range}；${limit}，今天 ${auto.usedToday} 条`,
     en: `${range}; ${limit}, ${auto.usedToday} today`,
+  });
+}
+
+/** The `github` section of config.yaml, as an example to copy. */
+export function githubExample(): string {
+  return t({
+    zh: `github:
+  account: my-account        # 可选：用 gh 的哪个账号
+  repos:
+    my-repo:                 # 看板上登记的仓库名
+      template: self-dev     # 从 issue 建 Run 用的模板
+      scout:
+        agent: claude-reviewer
+        auto: true           # 没有在进行中的 Run 时自动侦察（只等人的 Run 不挡）；false = 只手动触发
+      auto_accept:
+        max_risk: none       # 自动采纳到哪个风险等级：none / low / mid / high
+        max_size: L          # 自动采纳到哪个大小：S / M / L
+      auto_merge: false      # 从 issue 来的 Run 合并前不再等你审批
+      push: false            # 合并后自动推送到 GitHub
+      # deliver: pr          # 目标分支受保护时：推送 Run 的分支、开 PR，合并后 Run 完成（要配 push: true）
+      # daily_budget_usd: 20 # 每天自动花费的上限，不写 = 不限
+      max_run_attempts: 3    # 一个 issue 最多跑几次 Run（含第一次），失败后自动重做`,
+    en: `github:
+  account: my-account        # optional: which gh account to use
+  repos:
+    my-repo:                 # the repo name registered on the dashboard
+      template: self-dev     # template of the Runs created from issues
+      scout:
+        agent: claude-reviewer
+        auto: true           # scout by itself when no Run is in progress (Runs waiting only for you do not hold it back); false = by hand only
+      auto_accept:
+        max_risk: none       # highest risk accepted automatically: none / low / mid / high
+        max_size: L          # largest size accepted automatically: S / M / L
+      auto_merge: false      # Runs from issues merge without waiting for your approval
+      push: false            # push to GitHub after merging
+      # deliver: pr          # protected target branch: push the Run's branch, open a PR, done once merged (needs push: true)
+      # daily_budget_usd: 20 # daily limit of automatic spend; omitted = no limit
+      max_run_attempts: 3    # Runs an issue gets at most, the first included; failed ones are redone`,
+  });
+}
+
+/** The `gitlab` section of config.yaml, as an example to copy. */
+export function gitlabExample(): string {
+  return t({
+    zh: `gitlab:
+  host: gitlab.com           # GitLab 的主机名；自建的写它自己的，如 gitlab.example.com（不带 https://）
+  # account: my-account      # 可选：glab 在这个 host 上应登录的账号，不写 = 当前登录的账号
+  poll_minutes: 5            # 多久检查一次 issue
+  repos:
+    my-repo:                 # 看板上登记的仓库名，不能和 github.repos、backlog.repos 里的重名
+      issues_repo: my-group/my-repo  # 项目在 GitLab 上的路径（必填），有子组就写全：group/subgroup/name
+      template: self-dev     # 从 issue 建 Run 用的模板
+      scout:
+        agent: claude-reviewer
+        auto: true           # 没有在进行中的 Run 时自动侦察（只等人的 Run 不挡）；false = 只手动触发
+      auto_accept:
+        max_risk: none       # 自动采纳到哪个风险等级：none / low / mid / high
+        max_size: L          # 自动采纳到哪个大小：S / M / L
+      auto_merge: false      # 从 issue 来的 Run 合并前不再等你审批
+      push: false            # 合并后自动推送到 GitLab（只支持推送，还不支持 MR）
+      # daily_budget_usd: 20 # 每天自动花费的上限，不写 = 不限
+      max_run_attempts: 3    # 一个 issue 最多跑几次 Run（含第一次），失败后自动重做`,
+    en: `gitlab:
+  host: gitlab.com           # the GitLab's host name; a self-hosted one's own, e.g. gitlab.example.com (no https://)
+  # account: my-account      # optional: the account glab must be logged in as on this host; omitted = whichever it is
+  poll_minutes: 5            # how often to check the issues
+  repos:
+    my-repo:                 # the repo name registered on the dashboard; not one of github.repos or backlog.repos
+      issues_repo: my-group/my-repo  # the project's path on GitLab (required), subgroups included: group/subgroup/name
+      template: self-dev     # template of the Runs created from issues
+      scout:
+        agent: claude-reviewer
+        auto: true           # scout by itself when no Run is in progress (Runs waiting only for you do not hold it back); false = by hand only
+      auto_accept:
+        max_risk: none       # highest risk accepted automatically: none / low / mid / high
+        max_size: L          # largest size accepted automatically: S / M / L
+      auto_merge: false      # Runs from issues merge without waiting for your approval
+      push: false            # push to GitLab after merging (push only: no merge requests yet)
+      # daily_budget_usd: 20 # daily limit of automatic spend; omitted = no limit
+      max_run_attempts: 3    # Runs an issue gets at most, the first included; failed ones are redone`,
+  });
+}
+
+/** The `backlog` section of config.yaml, as an example to copy. */
+export function backlogExample(): string {
+  return t({
+    zh: `backlog:
+  poll_minutes: 5            # 多久检查一次本地提案池
+  repos:
+    my-local-repo:           # 看板上登记的仓库名，不能和 github.repos、gitlab.repos 里的重名
+      template: self-dev     # 采纳的提案建 Run 用的模板
+      scout:                 # 不写 = 不侦察，这个仓库就没有提案
+        agent: claude-reviewer
+        auto: true           # 没有在进行中的 Run 时自动侦察（只等人的 Run 不挡）；false = 只手动触发
+      auto_accept:
+        max_risk: low        # 自动采纳到哪个风险等级：none / low / mid / high
+        max_size: M          # 自动采纳到哪个大小：S / M / L
+      auto_merge: false      # 采纳的提案建出的 Run 合并前不再等你审批
+      # daily_budget_usd: 20 # 每天自动花费的上限，不写 = 不限
+      max_run_attempts: 3    # 一条提案最多跑几次 Run（含第一次），失败后自动重做`,
+    en: `backlog:
+  poll_minutes: 5            # how often to go over the local backlog
+  repos:
+    my-local-repo:           # the repo name registered on the dashboard; not one of github.repos or gitlab.repos
+      template: self-dev     # template of the Runs created from accepted proposals
+      scout:                 # omitted = no scout, so the repo gets no proposals
+        agent: claude-reviewer
+        auto: true           # scout by itself when no Run is in progress (Runs waiting only for you do not hold it back); false = by hand only
+      auto_accept:
+        max_risk: low        # highest risk accepted automatically: none / low / mid / high
+        max_size: M          # largest size accepted automatically: S / M / L
+      auto_merge: false      # Runs from accepted proposals merge without waiting for your approval
+      # daily_budget_usd: 20 # daily limit of automatic spend; omitted = no limit
+      max_run_attempts: 3    # Runs a proposal gets at most, the first included; failed ones are redone`,
   });
 }

@@ -260,6 +260,21 @@ describe('decisions', () => {
     expect(hostName('github')).toBe('GitHub');
     expect(hostName('local')).toBeNull();
   });
+
+  it('tells it in English for an iteration on GitLab, with no Chinese left', () => {
+    setLang('en');
+    const gitlab = iteration({ source: 'gitlab', status: 'pending' });
+    const pending = pendingHint(gitlab);
+    expect(pending).toBe(
+      'Waiting to be accepted: add ares1:ready to the iteration issue on GitLab to accept it as a whole, or close it to drop it',
+    );
+    const texts = [githubHint(gitlab), pending, blockedHint(iteration({ source: 'gitlab' }))];
+    for (const text of texts) {
+      expect(text).not.toContain('GitHub');
+      expect(text).not.toMatch(/[一-鿿]/);
+    }
+    expect(githubHint(gitlab)).toContain('This iteration is on GitLab');
+  });
 });
 
 describe('steps', () => {

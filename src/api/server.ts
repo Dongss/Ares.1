@@ -12,6 +12,7 @@ import {
   sourcePollMinutes,
 } from '../config/flow.js';
 import type { LoadedConfig } from '../config/load.js';
+import type { MasterConfig } from '../config/schema.js';
 import type { ConfigStatus } from '../config/watch.js';
 import { type Engine, InvalidStateError, readAttemptEvents } from '../engine/engine.js';
 import { storedRunTimes } from '../engine/times.js';
@@ -52,6 +53,7 @@ import type {
   ProposalRestarted,
   ProposalView,
   RawLogMissing,
+  RepoSourceView,
   RunDetail,
   RunSummary,
   StatsView,
@@ -293,6 +295,7 @@ export function createApi(deps: ApiDeps): Hono {
           templates: [...r.templates.values()],
           files: r.files,
         })),
+      repoSources: repoSourceViews(cfg.master),
       ...status(),
     } satisfies ConfigView);
   });
@@ -699,6 +702,40 @@ export function createApi(deps: ApiDeps): Hono {
 
   mountDashboard(app, webDir);
   return app;
+}
+
+/**
+ * Where each repo named in config.yaml's sources of requirements takes them from, by name: the
+ * source `requirementSource` picks, with what the dashboard needs to show and link to it.
+ */
+function repoSourceViews(master: MasterConfig): Record<string, RepoSourceView> {
+  const names = new Set([
+    ...Object.keys(master.github?.repos ?? {}),
+    ...Object.keys(master.gitlab?.repos ?? {}),
+    ...Object.keys(master.backlog?.repos ?? {}),
+  ]);
+  const view = (name: string): RepoSourceView | null => {
+    switch (requirementSource(master, name)) {
+      case 'github':
+        return { source: 'github', issuesRepo: master.github?.repos[name]?.issues_repo ?? null };
+      case 'gitlab': {
+        const repo = master.gitlab?.repos[name];
+        if (!master.gitlab || !repo) return null;
+        return { source: 'gitlab', host: master.gitlab.host, issuesRepo: repo.issues_repo };
+      }
+      case 'backlog':
+        return { source: 'backlog' };
+      default:
+        return null;
+    }
+  };
+  // Built as entries, so that any repo name becomes a key of its own.
+  return Object.fromEntries(
+    [...names]
+      .sort()
+      .map((name) => [name, view(name)] as const)
+      .filter((entry): entry is readonly [string, RepoSourceView] => entry[1] !== null),
+  );
 }
 
 function summarizeRun(store: Store, engine: Engine, run: ReturnType<Store['getRun']>): RunSummary {

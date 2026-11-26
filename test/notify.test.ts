@@ -853,6 +853,88 @@ describe('the target branch cannot take the commits on GitHub', () => {
   });
 });
 
+describe("the code host of GitLab's events", () => {
+  afterEach(() => setLang('zh'));
+  // The GitLab bridge records the same github.* events, with platform: 'gitlab'.
+  const ev = (type: string, data: Record<string, unknown>) => ({
+    id: 9,
+    runId: null,
+    ts: '2026-11-19T00:00:00.000Z',
+    type,
+    data: { repo: 'demo', branch: 'main', platform: 'gitlab', ...data },
+  });
+  const pair = { local: 'aaaaaaaa1111', remote: 'bbbbbbbb2222' };
+  const error = ev('github.error', { message: 'glab: 401 Unauthorized' });
+  const diverged = ev('github.diverged', pair);
+  const conflict = ev('github.diverged', { ...pair, conflict: true, files: ['a.ts'] });
+  const handed = ev('github.diverged', { ...pair, conflict: true, files: ['a.ts'], runId: 'r1' });
+  const blocked = ev('github.pull_blocked', { reason: 'dirty', worktree: '/w/demo' });
+
+  it('names GitLab in the title and the body, of the same kinds as for GitHub', () => {
+    expect(noticeFor(error, undefined)).toEqual({
+      kind: 'github',
+      title: 'GitLab 访问失败',
+      body: 'glab: 401 Unauthorized',
+      runId: null,
+      about: 'issues',
+    });
+    expect(noticeFor(diverged, undefined)).toEqual({
+      kind: 'pull',
+      title: '没能拉取 GitLab 上的新提交：demo',
+      body: 'main 和 GitLab 上的已经分叉（本地 aaaaaaa，GitLab bbbbbbb），要你手动合并后推送；在此之前 Master 不推送，已完成 Run 的 issue 保持打开',
+      runId: null,
+      about: 'issues',
+    });
+    expect(noticeFor(handed, undefined)).toMatchObject({
+      kind: 'pull',
+      title: '没能拉取 GitLab 上的新提交：demo',
+      runId: 'r1',
+      about: 'run',
+    });
+    expect(noticeFor(blocked, undefined)).toEqual({
+      kind: 'pull',
+      title: '没能拉取 GitLab 上的新提交：demo',
+      body: 'main 检出在 /w/demo 有未提交的改动，不能快进到 GitLab 上的新提交；提交或丢弃这些改动后，下一轮检查会自动拉取',
+      runId: null,
+      about: 'issues',
+    });
+    for (const e of [error, diverged, conflict, handed, blocked]) {
+      const notice = noticeFor(e, undefined);
+      expect(`${notice?.title}\n${notice?.body}`, e.type).not.toContain('GitHub');
+    }
+    // What is not told for GitHub is not told for GitLab either.
+    expect(noticeFor(ev('github.pulled', { from: 'a', to: 'b' }), undefined)).toBeNull();
+    expect(noticeFor(ev('github.merged_remote', { ...pair, merge: 'c' }), undefined)).toBeNull();
+    expect(noticeFor({ ...diverged, data: { ...diverged.data, repeated: true } }, undefined)).toBe(
+      null,
+    );
+  });
+
+  it('is told in English without Chinese', () => {
+    setLang('en');
+    const notices = [error, diverged, conflict, handed, blocked].map((e) =>
+      noticeFor(e, undefined),
+    );
+    expect(notices.map((n) => n?.title)).toEqual([
+      'GitLab access failed',
+      'Could not pull new commits from GitLab: demo',
+      'Could not pull new commits from GitLab: demo',
+      'Could not pull new commits from GitLab: demo',
+      'Could not pull new commits from GitLab: demo',
+    ]);
+    expect(notices[2]?.body).toBe(
+      "main has diverged from GitLab's (local aaaaaaa, GitLab bbbbbbb), and the Master's merge conflicts in a.ts. Merge the two by hand and push; until then the Master pushes nothing and the issues of completed Runs stay open",
+    );
+    for (const notice of notices) {
+      const text = `${notice?.title}\n${notice?.body}`;
+      expect(text).not.toContain('GitHub');
+      expect(text).not.toMatch(/[一-鿿]/);
+    }
+    expect(NOTICE_KINDS.github.when).toContain('GitLab');
+    expect(NOTICE_KINDS.github.when).not.toMatch(/[一-鿿]/);
+  });
+});
+
 describe('notifications in English', () => {
   afterEach(() => setLang('zh'));
 

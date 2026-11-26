@@ -1,13 +1,77 @@
-import type { CliInfo, ConfigView, RepoTemplatesView } from '../../../src/api/types.js';
+import type {
+  CliInfo,
+  ConfigView,
+  RepoSourceView,
+  RepoTemplatesView,
+} from '../../../src/api/types.js';
 import { agentEffort } from '../../../src/config/effort.js';
 import { resolveTemplate, type TemplateSource } from '../../../src/config/flow.js';
 import type { AgentEntry, TemplateFile, WorkflowTemplate } from '../../../src/config/schema.js';
 import { join, t } from '../../../src/i18n.js';
 import { shortSha, type Tone } from './format.js';
+import { GITHUB, hostLabel, type IssueHost, issuesUrl } from './issues.js';
 
 // The read-only config page: templates with their source files (the home directory's and those
-// the repos keep), and every agent entry; also which template a repo's Runs get, for the pages
-// that show a repo.
+// the repos keep), and every agent entry; also which template a repo's Runs get and where its
+// requirements come from, for the pages that show a repo.
+
+/** Where a repo's requirements come from, as the Repos page shows it. */
+export interface RepoSourceInfo {
+  /** 「GitHub」, 「GitLab（gitlab.example.com）」, 「本地提案池」 or 「未配置」. */
+  label: string;
+  /** "owner/name", or a GitLab project's path, when config.yaml names it. */
+  issuesRepo: string | null;
+  /** The repo's open issues on its code host; null without a known `issuesRepo`. */
+  url: string | null;
+  /** What it means for the repo, for a repo of no source; null otherwise. */
+  hint: string | null;
+}
+
+/** The source of a repo's requirements in the configuration in use (`repoSources`), if any. */
+export function repoSourceOf(
+  view: Pick<ConfigView, 'repoSources'>,
+  repo: string,
+): RepoSourceView | null {
+  return Object.hasOwn(view.repoSources, repo) ? (view.repoSources[repo] ?? null) : null;
+}
+
+/** Where a registered repo's requirements come from: the code host and its issues, or none. */
+export function repoSourceInfo(
+  view: Pick<ConfigView, 'repoSources'>,
+  repo: string,
+): RepoSourceInfo {
+  const source = repoSourceOf(view, repo);
+  switch (source?.source) {
+    case 'github':
+    case 'gitlab': {
+      const at: IssueHost =
+        source.source === 'gitlab' ? { platform: 'gitlab', host: source.host } : GITHUB;
+      return {
+        label: hostLabel(at),
+        issuesRepo: source.issuesRepo,
+        url: source.issuesRepo ? issuesUrl(at, source.issuesRepo) : null,
+        hint: null,
+      };
+    }
+    case 'backlog':
+      return {
+        label: t({ zh: '本地提案池', en: 'Local backlog' }),
+        issuesRepo: null,
+        url: null,
+        hint: null,
+      };
+    default:
+      return {
+        label: t({ zh: '未配置', en: 'None' }),
+        issuesRepo: null,
+        url: null,
+        hint: t({
+          zh: '不在 config.yaml 的 github.repos、gitlab.repos 和 backlog.repos 里，不会建 Run',
+          en: 'In none of github.repos, gitlab.repos and backlog.repos of config.yaml, so it gets no Runs',
+        }),
+      };
+  }
+}
 
 export interface TemplateCard {
   /** "workflows/<file>", or "<repo>:.ares1/workflows/<file>" for a repo's. */
@@ -270,6 +334,22 @@ function byId(templates: readonly WorkflowTemplate[]): Map<string, WorkflowTempl
  */
 export function configFileWarnings(view: ConfigView): string[] {
   return view.warnings['config.yaml'] ?? [];
+}
+
+/** Key prefix of the problems of config.yaml's entries, as in "config.yaml#gitlab.repos.app". */
+const CONFIG_ENTRY = 'config.yaml#';
+
+/**
+ * Entries of config.yaml that are disabled, each by where it is in the file (e.g.
+ * "gitlab.repos.app": a repo of GitHub, GitLab or the local backlog), with why, in key order.
+ */
+export function configEntryErrors(
+  view: Pick<ConfigView, 'errors'>,
+): { entry: string; errors: string[] }[] {
+  return Object.entries(view.errors)
+    .filter(([key]) => key.startsWith(CONFIG_ENTRY))
+    .map(([key, errors]) => ({ entry: key.slice(CONFIG_ENTRY.length), errors }))
+    .sort((a, b) => (a.entry < b.entry ? -1 : a.entry > b.entry ? 1 : 0));
 }
 
 /** DOM id of a template's card, the target of 「查看全部模板」. */

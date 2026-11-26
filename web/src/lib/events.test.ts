@@ -422,6 +422,46 @@ describe('globalEventText', () => {
     expect(globalEventTone(ev('github.pulled'))).toBe('neutral');
   });
 
+  it("names GitLab in the events of GitLab's bridge (platform: gitlab), tones and links alike", () => {
+    const gitlab = { platform: 'gitlab' };
+    const pair = { repo: 'demo', branch: 'main', local: 'aaaaaaaa1111', remote: 'cccc33334444' };
+    const samples: [string, Record<string, unknown>][] = [
+      ['github.error', { ...gitlab, message: 'HTTP 502' }],
+      ['github.pushed', { ...gitlab, repo: 'demo', branch: 'main', head: 'abcdef1234567890' }],
+      ['github.pulled', { ...gitlab, repo: 'demo', branch: 'main', from: 'aaaa1111', to: 'bbbb' }],
+      ['github.diverged', { ...gitlab, ...pair }],
+      ['github.diverged', { ...gitlab, ...pair, conflict: true, files: ['a.ts'] }],
+      ['github.diverged', { ...gitlab, ...pair, runId: 'run-m1' }],
+      ['github.diverged_run', { ...gitlab, ...pair, runId: 'run-m1' }],
+      ['github.merged_remote', { ...gitlab, ...pair, merge: 'dddddddd5555' }],
+      ['github.pull_blocked', { ...gitlab, repo: 'demo', branch: 'main', worktree: '/w/demo' }],
+    ];
+    expect(text('github.error', samples[0]?.[1])).toBe('访问 GitLab 出错：HTTP 502');
+    expect(text('github.diverged', samples[3]?.[1])).toBe(
+      'demo 的 main 和 GitLab 上的已经分叉（本地 aaaaaaaa，GitLab cccc3333），两边各有对方没有的提交，不会自动合并，要你手动合并；在此之前不推送，已完成 Run 的 issue 保持打开',
+    );
+    for (const [type, data] of samples) {
+      const zh = text(type, data);
+      expect(zh, type).toContain('GitLab');
+      expect(zh, type).not.toContain('GitHub');
+      // The same tone and link as GitHub's.
+      const { platform: _, ...github } = data;
+      expect(globalEventTone(ev(type, data)), type).toBe(globalEventTone(ev(type, github)));
+      expect(globalEventLink(ev(type, data)), type).toEqual(globalEventLink(ev(type, github)));
+    }
+    setLang('en');
+    expect(text('github.pushed', samples[1]?.[1])).toBe('Pushed main of demo to GitLab (abcdef12)');
+    expect(text('github.pull_blocked', samples[8]?.[1])).toBe(
+      'GitLab has new commits, but main of demo is checked out in /w/demo with uncommitted changes and could not be fast-forwarded; once they are committed or discarded, the next check pulls by itself',
+    );
+    for (const [type, data] of samples) {
+      const en = text(type, data);
+      expect(en, type).toContain('GitLab');
+      expect(en, type).not.toContain('GitHub');
+      expect(en, type).not.toMatch(/[一-鿿]/);
+    }
+  });
+
   it("says how the Master's merge of a divergence went", () => {
     const pair = { repo: 'demo', branch: 'main', local: 'aaaaaaaa1111', remote: 'cccc33334444' };
     const conflict = { ...pair, conflict: true, files: ['a.ts', 'b.ts'] };

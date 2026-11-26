@@ -9,6 +9,7 @@ import type {
   Attempt,
   BlockKind,
   CheckResult,
+  HostPlatform,
   StageRun,
   Task,
 } from '../../../src/store/types.js';
@@ -18,6 +19,7 @@ import { FlowChart } from '../components/FlowChart.js';
 import { Badge, Collapsible, ConfirmButton, Empty, ErrorBox, Pre } from '../components/ui.js';
 import { api, urls } from '../lib/api.js';
 import { newBudget, suggestedBudget } from '../lib/budget.js';
+import { repoSourceOf } from '../lib/config.js';
 import { buildFlow, stageProgress } from '../lib/flow.js';
 import {
   ATTEMPT_OUTCOME,
@@ -53,6 +55,7 @@ import {
   discussionItems,
   eventText,
   ignoredCommentsText,
+  issueReplyHint,
   type LatestPrRework,
   latestPrRework,
   maxRunsWaitText,
@@ -64,6 +67,7 @@ import {
   rawLogPrunedText,
   redoText,
   replyDeadlineOf,
+  runPlatform,
   runStatusBadge,
   sizeText,
   untrustedIssueText,
@@ -173,7 +177,12 @@ export function RunDetailPage(props: {
       {tab === 'diff' && (
         <DiffPanel runId={id} commit={commit} onShowAll={() => setCommit(undefined)} />
       )}
-      {tab === 'events' && <EventsPanel runId={id} />}
+      {tab === 'events' && (
+        <EventsPanel
+          runId={id}
+          platform={runPlatform(d.run, config ? repoSourceOf(config, d.repo.name) : null)}
+        />
+      )}
     </div>
   );
 }
@@ -685,10 +694,7 @@ function DiscussionPanel({ detail, onChanged }: { detail: RunDetail; onChanged: 
       {ignored > 0 && <p className="warn-box">{ignoredCommentsText(ignored)}</p>}
       <p className="hint">
         {run.issue
-          ? t({
-              zh: '可以直接在 issue 上回复（只认仓库成员的回复），Master 下次检查 GitHub 时会带着回复重新评估；也可以在这里回复。',
-              en: 'You can reply on the issue (only replies by members of the repo count): the Master reassesses with your reply the next time it checks GitHub. Or reply here. ',
-            })
+          ? `${issueReplyHint(run.issue.platform ?? 'github')}${t({ zh: '', en: ' ' })}`
           : t({
               zh: '回复后评估会带着讨论重新进行，讨论可以有多轮。',
               en: 'After your reply the assessment runs again with the discussion, which can take several rounds. ',
@@ -1281,7 +1287,8 @@ function ApprovalLine({ approval }: { approval: Approval }) {
   );
 }
 
-function EventsPanel({ runId }: { runId: string }) {
+/** `platform`: the code host the Run goes with, named by the events about its commits. */
+function EventsPanel({ runId, platform }: { runId: string; platform: HostPlatform }) {
   const events = useResource(() => api.runEvents(runId), runId);
   useReloadOn(events.reload, (e) => e.runId === runId, 500);
   if (events.error) return <ErrorBox>{events.error}</ErrorBox>;
@@ -1291,7 +1298,7 @@ function EventsPanel({ runId }: { runId: string }) {
       <table className="events">
         <tbody>
           {events.data.map((e) => {
-            const text = eventText(e);
+            const text = eventText(e, undefined, platform);
             return (
               <tr key={e.id}>
                 <td className="muted">{formatTime(e.ts)}</td>

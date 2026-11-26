@@ -5,6 +5,7 @@ import {
   type AssessmentEntry,
   type DiscussionEntry,
   PR_CLOSE_REASONS,
+  type RunIssue,
 } from '../../../src/store/types.js';
 import {
   assessmentDifficulty,
@@ -20,6 +21,7 @@ import {
   executingOfMaxText,
   groupRuns,
   ignoredCommentsText,
+  issueReplyHint,
   latestPrRework,
   maxRunsWaitText,
   pageTitle,
@@ -35,6 +37,7 @@ import {
   rawLogPrunedText,
   redoText,
   replyDeadlineOf,
+  runPlatform,
   runStatusBadge,
   sizeText,
   splitPatch,
@@ -841,6 +844,55 @@ describe('a merge Run whose commit the target branch had already', () => {
     const text = eventText({ type: 'run.merge_remote_obsolete', data: obsolete });
     expect(text).toBe(
       'main has the commit 01234567 from GitHub this Run was to merge already (the Master merged it by itself, or another Run did), so nothing is left to merge: the Run completed without starting another agent',
+    );
+    expect(text).not.toMatch(/[一-鿿]/);
+  });
+
+  it("names GitLab for a Run of a GitLab repo's", () => {
+    const event = { type: 'run.merge_remote_obsolete', data: obsolete };
+    expect(eventText(event, undefined, 'gitlab')).toBe(
+      'main 已经有了这个 Run 要合并的 GitLab 提交 01234567（Master 自己合并了，或者别的 Run 合并了进去），没什么要合并的了：不再启动 Agent，Run 直接完成',
+    );
+    setLang('en');
+    const text = eventText(event, undefined, 'gitlab');
+    expect(text).toContain('from GitLab this Run was to merge');
+    expect(text).not.toMatch(/[一-鿿]/);
+  });
+});
+
+describe('the code host a Run goes with', () => {
+  afterEach(() => setLang('zh'));
+  const issue = (platform?: 'gitlab'): RunIssue => ({
+    repo: platform ? 'grp/sub/demo' : 'me/demo',
+    number: 7,
+    url: '',
+    auto: false,
+    ...(platform ? { platform } : {}),
+  });
+  const gitlab = { source: 'gitlab', host: 'gitlab.example.com', issuesRepo: 'grp/demo' } as const;
+
+  it("is its issue's, else its repo's source, else GitHub", () => {
+    expect(runPlatform({ issue: issue('gitlab') }, null)).toBe('gitlab');
+    // The issue decides, whatever the repo's source says now.
+    expect(runPlatform({ issue: issue() }, gitlab)).toBe('github');
+    // A Run of no issue, such as one merging the target branch's new commits, goes by its repo.
+    expect(runPlatform({ issue: null }, gitlab)).toBe('gitlab');
+    expect(runPlatform({ issue: null }, { source: 'github', issuesRepo: null })).toBe('github');
+    expect(runPlatform({ issue: null }, { source: 'backlog' })).toBe('github');
+    expect(runPlatform({ issue: null }, null)).toBe('github');
+  });
+
+  it('says where to reply to the assessment, on GitHub or GitLab', () => {
+    expect(issueReplyHint('github')).toBe(
+      '可以直接在 issue 上回复（只认仓库成员的回复），Master 下次检查 GitHub 时会带着回复重新评估；也可以在这里回复。',
+    );
+    expect(issueReplyHint('gitlab')).toBe(
+      '可以直接在 issue 上回复（只认仓库成员的回复），Master 下次检查 GitLab 时会带着回复重新评估；也可以在这里回复。',
+    );
+    setLang('en');
+    const text = issueReplyHint('gitlab');
+    expect(text).toBe(
+      'You can reply on the issue (only replies by members of the repo count): the Master reassesses with your reply the next time it checks GitLab. Or reply here.',
     );
     expect(text).not.toMatch(/[一-鿿]/);
   });

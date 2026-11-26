@@ -40,7 +40,7 @@ import {
   stopCommand,
 } from '../lib/guide.js';
 import { useAction, useReloadOn, useResource } from '../lib/hooks.js';
-import { acceptRanges, deliveryText, issuesUrl, newIssueUrl } from '../lib/issues.js';
+import { acceptRanges, deliveryText, GITHUB, issuesUrl, newIssueUrl } from '../lib/issues.js';
 import { href } from '../lib/router.js';
 import { attentionCount } from '../lib/runs.js';
 
@@ -477,12 +477,12 @@ function YouSection(props: { input: GuideInput; home: string; working: boolean }
   const issuesRepo = input.github?.issuesRepo ?? null;
   const upgrade = input.upgrade;
   const newIssue = issuesRepo && (
-    <a href={newIssueUrl(issuesRepo, 'ares1:ready')} target="_blank" rel="noreferrer">
+    <a href={newIssueUrl(GITHUB, issuesRepo, 'ares1:ready')} target="_blank" rel="noreferrer">
       {t({ zh: '新建 issue', en: 'new issue' })}
     </a>
   );
   const proposals = issuesRepo && (
-    <a href={issuesUrl(issuesRepo, 'ares1:proposal')} target="_blank" rel="noreferrer">
+    <a href={issuesUrl(GITHUB, issuesRepo, 'ares1:proposal')} target="_blank" rel="noreferrer">
       {t({ zh: '待审提案', en: 'proposals to triage' })}
     </a>
   );

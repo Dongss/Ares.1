@@ -10,6 +10,7 @@ import {
   type AgentRow,
   agentRows,
   cliNote,
+  configEntryErrors,
   configFileWarnings,
   type RepoTemplateCard,
   type RepoTemplateGroup,
@@ -52,6 +53,9 @@ export function ConfigPage(props: {
   const clis = cliNote(config.clis);
   const fileErrors = config.errors['agents.yaml'];
   const configWarnings = configFileWarnings(config);
+  // Entries of config.yaml, such as a repo of github.repos, gitlab.repos or backlog.repos; the
+  // app's banner lists them on the other pages.
+  const entryErrors = configEntryErrors(config);
 
   return (
     <div className="config-page">
@@ -121,7 +125,8 @@ export function ConfigPage(props: {
                 登记的仓库可以在目标分支的 <code>{REPO_WORKFLOWS_DIR}/*.yaml</code>{' '}
                 里放模板，格式和数据目录的一样，跟着代码一起演进。
                 {`只读目标分支上已提交的内容，分支前进后自动重新加载；只有这个仓库的 Run 能用。`}
-                仓库用的模板（<code>github.repos</code> 的 <code>template</code>
+                仓库用的模板（<code>github.repos</code>、<code>gitlab.repos</code> 或{' '}
+                <code>backlog.repos</code> 里的 <code>template</code>
                 ）先在数据目录里找，找不到才用仓库自带的，所以两边有同一个 id
                 时用数据目录的。文件加载失败时继续用上次加载成功的版本。
               </>
@@ -132,10 +137,10 @@ export function ConfigPage(props: {
                 its target branch, written as in the home directory, so that they evolve with the
                 code. Only what is committed on the target branch is read, again whenever the branch
                 moves; only that repo's Runs can use them. The template a repo uses (
-                <code>template</code> under <code>github.repos</code>) is looked up in the home
-                directory first, and in the repo's own only when it is not there, so the home
-                directory's wins when both have the same id. A file that fails to load keeps the
-                version that last loaded.
+                <code>template</code> under <code>github.repos</code>, <code>gitlab.repos</code> or{' '}
+                <code>backlog.repos</code>) is looked up in the home directory first, and in the
+                repo's own only when it is not there, so the home directory's wins when both have
+                the same id. A file that fails to load keeps the version that last loaded.
               </>
             ),
           })}
@@ -188,6 +193,21 @@ export function ConfigPage(props: {
               en: `Language (language): ${LANG_NAMES[config.language]}. The Master writes issue comments, notifications and prompts to agents in it, and it is the dashboard's default; the switch at the top right changes the dashboard for this browser only.`,
             })}
           </p>
+          {entryErrors.length > 0 && (
+            <ErrorBox>
+              {t({
+                zh: '这些配置项无效，已停用：',
+                en: 'These entries are invalid and disabled:',
+              })}
+              {entryErrors.map(({ entry, errors }) => (
+                <div key={entry}>
+                  <code>{entry}</code>
+                  {t({ zh: '：', en: ': ' })}
+                  {errors.join(t({ zh: '；', en: '; ' }))}
+                </div>
+              ))}
+            </ErrorBox>
+          )}
           {configWarnings.length > 0 && (
             <div className="warn-box">
               {configWarnings.map((w) => (

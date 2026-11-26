@@ -1,15 +1,25 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import { parse as parseYaml } from 'yaml';
 import type { ProposalSize, Risk } from '../../../src/config/flow.js';
+import { BacklogSchema, GitHubSchema, GitLabSchema } from '../../../src/config/schema.js';
 import { setLang } from '../../../src/i18n.js';
 import {
   acceptRanges,
   autoAcceptText,
+  backlogExample,
   budgetText,
   CATEGORY,
   deliveryText,
+  GITHUB,
   gapsByGoal,
   gapsHeading,
+  githubExample,
+  gitlabExample,
+  hostLabel,
   issuesUrl,
+  issueUrl,
+  newIssueUrl,
+  platformName,
   proposalKindsText,
   RISK,
   SCOUT_STATUS,
@@ -18,14 +28,89 @@ import {
   upgradeText,
 } from './issues.js';
 
-describe('issues display', () => {
-  it('links to open issues with a label', () => {
-    expect(issuesUrl('me/demo')).toBe('https://github.com/me/demo/issues?q=is%3Aissue%20is%3Aopen');
-    expect(issuesUrl('me/demo', 'ares1:proposal')).toBe(
+describe('links to a code host', () => {
+  afterEach(() => setLang('zh'));
+  const gitlab = { platform: 'gitlab', host: 'gitlab.example.com:8443' } as const;
+
+  it('links to open issues on GitHub, with a label', () => {
+    expect(issuesUrl(GITHUB, 'me/demo')).toBe(
+      'https://github.com/me/demo/issues?q=is%3Aissue%20is%3Aopen',
+    );
+    expect(issuesUrl(GITHUB, 'me/demo', 'ares1:proposal')).toBe(
       'https://github.com/me/demo/issues?q=is%3Aissue%20is%3Aopen%20label%3A%22ares1%3Aproposal%22',
+    );
+    expect(newIssueUrl(GITHUB, 'me/demo', 'ares1:ready')).toBe(
+      'https://github.com/me/demo/issues/new?labels=ares1%3Aready',
+    );
+    expect(issueUrl(GITHUB, 'me/demo', 12)).toBe('https://github.com/me/demo/issues/12');
+  });
+
+  it('links to open issues on GitLab, by its host and the project path with subgroups', () => {
+    expect(issuesUrl(gitlab, 'grp/sub/demo')).toBe(
+      'https://gitlab.example.com:8443/grp/sub/demo/-/issues?state=opened',
+    );
+    expect(issuesUrl(gitlab, 'grp/sub/demo', 'ares1:proposal')).toBe(
+      'https://gitlab.example.com:8443/grp/sub/demo/-/issues?state=opened&label_name[]=ares1%3Aproposal',
+    );
+    expect(issueUrl(gitlab, 'grp/sub/demo', 12)).toBe(
+      'https://gitlab.example.com:8443/grp/sub/demo/-/issues/12',
+    );
+    // gitlab.com when the status gives no host.
+    expect(issueUrl({ platform: 'gitlab', host: null }, 'grp/demo', 3)).toBe(
+      'https://gitlab.com/grp/demo/-/issues/3',
     );
   });
 
+  it('opens a new GitLab issue with the label added by a quick action', () => {
+    const url = newIssueUrl(gitlab, 'grp/sub/demo', 'ares1:ready');
+    expect(url).toBe(
+      'https://gitlab.example.com:8443/grp/sub/demo/-/issues/new?issue[description]=%2Flabel%20~%22ares1%3Aready%22',
+    );
+    expect(new URL(url).searchParams.get('issue[description]')).toBe('/label ~"ares1:ready"');
+  });
+
+  it('names the platform, GitLab with its host, in both languages', () => {
+    expect(platformName('github')).toBe('GitHub');
+    expect(platformName('gitlab')).toBe('GitLab');
+    expect(hostLabel(GITHUB)).toBe('GitHub');
+    expect(hostLabel(gitlab)).toBe('GitLab（gitlab.example.com:8443）');
+    expect(hostLabel({ platform: 'gitlab', host: null })).toBe('GitLab（gitlab.com）');
+    setLang('en');
+    expect(hostLabel(gitlab)).toBe('GitLab (gitlab.example.com:8443)');
+  });
+});
+
+describe('config.yaml examples', () => {
+  afterEach(() => setLang('zh'));
+
+  it('are valid sections of config.yaml in both languages', () => {
+    for (const lang of ['zh', 'en'] as const) {
+      setLang(lang);
+      const github = GitHubSchema.parse(parseYaml(githubExample()).github);
+      expect(github.repos['my-repo']).toMatchObject({ template: 'self-dev', push: false });
+      const gitlab = GitLabSchema.parse(parseYaml(gitlabExample()).gitlab);
+      expect(gitlab).toMatchObject({ host: 'gitlab.com', poll_minutes: 5 });
+      expect(gitlab.repos['my-repo']).toMatchObject({
+        issues_repo: 'my-group/my-repo',
+        template: 'self-dev',
+        deliver: 'push',
+      });
+      const backlog = BacklogSchema.parse(parseYaml(backlogExample()).backlog);
+      expect(Object.keys(backlog.repos)).toEqual(['my-local-repo']);
+    }
+  });
+
+  it('say in English that a repo has one source, with no Chinese left', () => {
+    setLang('en');
+    expect(gitlabExample()).toContain('not one of github.repos or backlog.repos');
+    expect(backlogExample()).toContain('not one of github.repos or gitlab.repos');
+    for (const text of [githubExample(), gitlabExample(), backlogExample()]) {
+      expect(text).not.toMatch(/[一-鿿]/);
+    }
+  });
+});
+
+describe('issues display', () => {
   it('describes the scout plan and why it waits', () => {
     const scout = {
       agent: 'a',

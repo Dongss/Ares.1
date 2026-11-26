@@ -43,8 +43,8 @@ export function EventsPage() {
       <h1>{t({ zh: '事件', en: 'Events' })}</h1>
       <p className="hint">
         {t({
-          zh: 'Master 记下的不属于任何 Run 的事：异常重启、日志清理、恢复数据库备份、升级、配置重新加载、GitHub 出错、侦察等，最新的在前。每个 Run 自己的事件在它的详情页里。',
-          en: "What the Master recorded outside any Run, newest first: unexpected restarts, pruned logs, a restored database backup, upgrades, configuration reloads, GitHub errors, scouts and so on. Each Run's own events are on its page.",
+          zh: 'Master 记下的不属于任何 Run 的事：异常重启、日志清理、恢复数据库备份、升级、配置重新加载、GitHub 或 GitLab 出错、侦察等，最新的在前。每个 Run 自己的事件在它的详情页里。',
+          en: "What the Master recorded outside any Run, newest first: unexpected restarts, pruned logs, a restored database backup, upgrades, configuration reloads, GitHub or GitLab errors, scouts and so on. Each Run's own events are on its page.",
         })}
       </p>
       <ErrorBox>{latest.error}</ErrorBox>

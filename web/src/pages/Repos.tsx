@@ -5,7 +5,12 @@ import { t } from '../../../src/i18n.js';
 import type { Repo } from '../../../src/store/types.js';
 import { Badge, ConfirmButton, Empty, ErrorBox, TemplateProblems } from '../components/ui.js';
 import { api } from '../lib/api.js';
-import { repoTemplateBadges, repoTemplateGroups, repoTemplateProblems } from '../lib/config.js';
+import {
+  repoSourceInfo,
+  repoTemplateBadges,
+  repoTemplateGroups,
+  repoTemplateProblems,
+} from '../lib/config.js';
 import { parseLines, shortSha } from '../lib/format.js';
 import { useAction } from '../lib/hooks.js';
 import { href } from '../lib/router.js';
@@ -62,6 +67,14 @@ function RepoCard(props: { repo: Repo; config: ConfigView | undefined; onChanged
             <code>{repo.targetBranch}</code>
           </dd>
         </div>
+        {config && (
+          <div>
+            <dt>{t({ zh: '需求来源', en: 'Requirements from' })}</dt>
+            <dd>
+              <RequirementSource repo={repo.name} config={config} />
+            </dd>
+          </div>
+        )}
         <div className="wide">
           <dt>{t({ zh: '检查命令', en: 'Verify commands' })}</dt>
           <dd>{commandList(repo.verifyCommands)}</dd>
@@ -94,6 +107,31 @@ function RepoCard(props: { repo: Repo; config: ConfigView | undefined; onChanged
       </div>
       <ErrorBox>{action.error}</ErrorBox>
     </section>
+  );
+}
+
+/**
+ * Where the repo's requirements come from by config.yaml: GitHub or GitLab (with its host) and a
+ * link to the issues there, the local backlog, or none, which keeps it from getting Runs.
+ */
+function RequirementSource({ repo, config }: { repo: string; config: ConfigView }) {
+  const source = repoSourceInfo(config, repo);
+  return (
+    <>
+      <a href={href.issues}>{source.label}</a>
+      {source.issuesRepo &&
+        (source.url ? (
+          <>
+            {' · '}
+            <a href={source.url} target="_blank" rel="noreferrer">
+              {source.issuesRepo}
+            </a>
+          </>
+        ) : (
+          ` · ${source.issuesRepo}`
+        ))}
+      {source.hint && <div className="hint">{source.hint}</div>}
+    </>
   );
 }
 

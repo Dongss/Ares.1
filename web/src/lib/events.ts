@@ -2,10 +2,12 @@ import { join, t } from '../../../src/i18n.js';
 import { divergedCause } from '../../../src/notify/notice.js';
 import type { EventRow } from '../../../src/store/types.js';
 import { formatBytes, formatTime, shortSha, type Tone } from './format.js';
+import { platformName } from './issues.js';
 import { href } from './router.js';
 
 // The Events page: events the Master records outside any Run (restarts, pruned logs, a restored
-// database, upgrades, configuration reloads, GitHub errors, failed notifications, scouts...).
+// database, upgrades, configuration reloads, GitHub and GitLab errors, failed notifications,
+// scouts...).
 
 type GlobalEvent = Pick<EventRow, 'type' | 'data'>;
 
@@ -40,6 +42,14 @@ function commits(from: unknown, to: unknown): string | null {
   return a && b ? `${shortSha(a)} → ${shortSha(b)}` : null;
 }
 
+/**
+ * The code host a `github.*` event is about: the GitLab bridge records its own with
+ * `platform: 'gitlab'`, GitHub's go without.
+ */
+function hostOf(event: GlobalEvent): 'GitHub' | 'GitLab' {
+  return platformName(event.data.platform === 'gitlab' ? 'gitlab' : 'github');
+}
+
 /** "：message" / ": message", or nothing without one. */
 function withMessage(message: unknown): string {
   const m = str(message);
@@ -53,6 +63,7 @@ function withMessage(message: unknown): string {
  */
 export function globalEventText(event: GlobalEvent, now = new Date()): string | null {
   const d = event.data;
+  const host = hostOf(event);
   switch (event.type) {
     case 'master.restarted': {
       const pid = num(d.pid);
@@ -200,8 +211,8 @@ export function globalEventText(event: GlobalEvent, now = new Date()): string | 
       });
     case 'github.error':
       return t({
-        zh: `访问 GitHub 出错${withMessage(d.message)}`,
-        en: `GitHub request failed${withMessage(d.message)}`,
+        zh: `访问 ${host} 出错${withMessage(d.message)}`,
+        en: `${host} request failed${withMessage(d.message)}`,
       });
     case 'notify.webhook_failed':
       return t({
@@ -220,16 +231,16 @@ export function globalEventText(event: GlobalEvent, now = new Date()): string | 
       const head = str(d.head);
       const at = head ? t({ zh: `（${shortSha(head)}）`, en: ` (${shortSha(head)})` }) : '';
       return t({
-        zh: `把 ${branchOf(event)} 推送到了 GitHub${at}`,
-        en: `Pushed ${branchOf(event)} to GitHub${at}`,
+        zh: `把 ${branchOf(event)} 推送到了 ${host}${at}`,
+        en: `Pushed ${branchOf(event)} to ${host}${at}`,
       });
     }
     case 'github.pulled': {
       const range = commits(d.from, d.to);
       const at = range ? t({ zh: `（${range}）`, en: ` (${range})` }) : '';
       return t({
-        zh: `从 GitHub 拉取了新提交，${branchOf(event)} 快进了过去${at}；之后的 Run 以它为基础`,
-        en: `Pulled new commits from GitHub and fast-forwarded ${branchOf(event)} to them${at}; later Runs build on them`,
+        zh: `从 ${host} 拉取了新提交，${branchOf(event)} 快进了过去${at}；之后的 Run 以它为基础`,
+        en: `Pulled new commits from ${host} and fast-forwarded ${branchOf(event)} to them${at}; later Runs build on them`,
       });
     }
     case 'github.diverged': {
@@ -238,34 +249,34 @@ export function globalEventText(event: GlobalEvent, now = new Date()): string | 
       const at =
         local && remote
           ? t({
-              zh: `（本地 ${shortSha(local)}，GitHub ${shortSha(remote)}）`,
-              en: ` (local ${shortSha(local)}, GitHub ${shortSha(remote)})`,
+              zh: `（本地 ${shortSha(local)}，${host} ${shortSha(remote)}）`,
+              en: ` (local ${shortSha(local)}, ${host} ${shortSha(remote)})`,
             })
           : '';
       const cause = divergedCause(d);
       const runId = str(d.runId);
       if (runId) {
-        // Handed to a Run the Master created to merge GitHub's commit: nothing for a human yet.
+        // Handed to a Run the Master created to merge the host's commit: nothing for a human yet.
         return t({
-          zh: `${branchOf(event)} 和 GitHub 上的已经分叉${at}，${cause?.text ?? '两边各有对方没有的提交'}；已交给 Run ${runId} 处理，不用你手动合并：编码 Agent 合并两边，评审并合并后推送；在此之前不推送，已完成 Run 的 issue 保持打开`,
-          en: `Diverged from GitHub: ${branchOf(event)}${at} and the one on GitHub each have commits the other lacks${cause ? `, and ${cause.text}` : ''}. Run ${runId} takes it over, with nothing to merge by hand: its coding agent merges the two, pushed once the Run is reviewed and merged; until then nothing is pushed and the issues of completed Runs stay open`,
+          zh: `${branchOf(event)} 和 ${host} 上的已经分叉${at}，${cause?.text ?? '两边各有对方没有的提交'}；已交给 Run ${runId} 处理，不用你手动合并：编码 Agent 合并两边，评审并合并后推送；在此之前不推送，已完成 Run 的 issue 保持打开`,
+          en: `Diverged from ${host}: ${branchOf(event)}${at} and the one on ${host} each have commits the other lacks${cause ? `, and ${cause.text}` : ''}. Run ${runId} takes it over, with nothing to merge by hand: its coding agent merges the two, pushed once the Run is reviewed and merged; until then nothing is pushed and the issues of completed Runs stay open`,
         });
       }
       if (cause?.kind === 'environment') {
         return t({
-          zh: `${branchOf(event)} 和 GitHub 上的已经分叉${at}，${cause.text}；装好后下一轮检查会自动再合并，在此之前不推送，已完成 Run 的 issue 保持打开`,
-          en: `Diverged from GitHub: ${branchOf(event)}${at} and the one on GitHub each have commits the other lacks, and ${cause.text}. Once it is installed, the next check merges by itself; until then nothing is pushed and the issues of completed Runs stay open`,
+          zh: `${branchOf(event)} 和 ${host} 上的已经分叉${at}，${cause.text}；装好后下一轮检查会自动再合并，在此之前不推送，已完成 Run 的 issue 保持打开`,
+          en: `Diverged from ${host}: ${branchOf(event)}${at} and the one on ${host} each have commits the other lacks, and ${cause.text}. Once it is installed, the next check merges by itself; until then nothing is pushed and the issues of completed Runs stay open`,
         });
       }
       if (cause) {
         return t({
-          zh: `${branchOf(event)} 和 GitHub 上的已经分叉${at}，${cause.text}，要你手动合并；在此之前不推送，已完成 Run 的 issue 保持打开`,
-          en: `Diverged from GitHub: ${branchOf(event)}${at} and the one on GitHub each have commits the other lacks, and ${cause.text}. Merge them by hand; until then nothing is pushed and the issues of completed Runs stay open`,
+          zh: `${branchOf(event)} 和 ${host} 上的已经分叉${at}，${cause.text}，要你手动合并；在此之前不推送，已完成 Run 的 issue 保持打开`,
+          en: `Diverged from ${host}: ${branchOf(event)}${at} and the one on ${host} each have commits the other lacks, and ${cause.text}. Merge them by hand; until then nothing is pushed and the issues of completed Runs stay open`,
         });
       }
       return t({
-        zh: `${branchOf(event)} 和 GitHub 上的已经分叉${at}，两边各有对方没有的提交，不会自动合并，要你手动合并；在此之前不推送，已完成 Run 的 issue 保持打开`,
-        en: `Diverged from GitHub: ${branchOf(event)}${at} and the one on GitHub each have commits the other lacks, and they are not merged by themselves. Merge them by hand; until then nothing is pushed and the issues of completed Runs stay open`,
+        zh: `${branchOf(event)} 和 ${host} 上的已经分叉${at}，两边各有对方没有的提交，不会自动合并，要你手动合并；在此之前不推送，已完成 Run 的 issue 保持打开`,
+        en: `Diverged from ${host}: ${branchOf(event)}${at} and the one on ${host} each have commits the other lacks, and they are not merged by themselves. Merge them by hand; until then nothing is pushed and the issues of completed Runs stay open`,
       });
     }
     case 'github.diverged_run': {
@@ -275,8 +286,8 @@ export function globalEventText(event: GlobalEvent, now = new Date()): string | 
       const at =
         local && remote
           ? t({
-              zh: `（本地 ${shortSha(local)}，GitHub ${shortSha(remote)}）`,
-              en: ` (local ${shortSha(local)}, GitHub ${shortSha(remote)})`,
+              zh: `（本地 ${shortSha(local)}，${host} ${shortSha(remote)}）`,
+              en: ` (local ${shortSha(local)}, ${host} ${shortSha(remote)})`,
             })
           : '';
       const run = runId
@@ -284,13 +295,13 @@ export function globalEventText(event: GlobalEvent, now = new Date()): string | 
         : t({ zh: '一个 Run', en: 'a Run' });
       const commit = remote
         ? t({
-            zh: `GitHub 上的提交 ${shortSha(remote)}`,
-            en: `commit ${shortSha(remote)} from GitHub`,
+            zh: `${host} 上的提交 ${shortSha(remote)}`,
+            en: `commit ${shortSha(remote)} from ${host}`,
           })
-        : t({ zh: 'GitHub 上的新提交', en: 'the new commits from GitHub' });
+        : t({ zh: `${host} 上的新提交`, en: `the new commits from ${host}` });
       return t({
-        zh: `${branchOf(event)} 和 GitHub 上的分叉了${at}，Master 自己没能合并，建了${run}：由编码 Agent 合并 ${commit}，评审并合并后推送到 GitHub`,
-        en: `Diverged from GitHub: the Master could not merge ${branchOf(event)}${at} by itself, so it created ${run}, whose coding agent merges ${commit}; pushed to GitHub once the Run is reviewed and merged`,
+        zh: `${branchOf(event)} 和 ${host} 上的分叉了${at}，Master 自己没能合并，建了${run}：由编码 Agent 合并 ${commit}，评审并合并后推送到 ${host}`,
+        en: `Diverged from ${host}: the Master could not merge ${branchOf(event)}${at} by itself, so it created ${run}, whose coding agent merges ${commit}; pushed to ${host} once the Run is reviewed and merged`,
       });
     }
     case 'github.merged_remote': {
@@ -300,21 +311,21 @@ export function globalEventText(event: GlobalEvent, now = new Date()): string | 
       const at =
         merge && local && remote
           ? t({
-              zh: `（本地 ${shortSha(local)} 和 GitHub ${shortSha(remote)} → ${shortSha(merge)}）`,
-              en: ` (local ${shortSha(local)} and GitHub ${shortSha(remote)} → ${shortSha(merge)})`,
+              zh: `（本地 ${shortSha(local)} 和 ${host} ${shortSha(remote)} → ${shortSha(merge)}）`,
+              en: ` (local ${shortSha(local)} and ${host} ${shortSha(remote)} → ${shortSha(merge)})`,
             })
           : '';
       return t({
-        zh: `${branchOf(event)} 和 GitHub 上的分叉了，Master 自己合并了 GitHub 上的新提交，仓库的检查通过后把分支快进到合并提交${at}，随后推送到 GitHub`,
-        en: `${branchOf(event)} had diverged from GitHub: the Master merged the new commits from GitHub, and with the repo's checks passing, fast-forwarded the branch to the merge${at}, to be pushed to GitHub`,
+        zh: `${branchOf(event)} 和 ${host} 上的分叉了，Master 自己合并了 ${host} 上的新提交，仓库的检查通过后把分支快进到合并提交${at}，随后推送到 ${host}`,
+        en: `${branchOf(event)} had diverged from ${host}: the Master merged the new commits from ${host}, and with the repo's checks passing, fast-forwarded the branch to the merge${at}, to be pushed to ${host}`,
       });
     }
     case 'github.pull_blocked': {
       const worktree = str(d.worktree);
       const where = worktree ? t({ zh: `在 ${worktree} `, en: ` in ${worktree}` }) : '';
       return t({
-        zh: `GitHub 上有新提交，但 ${branchOf(event)} 检出${where}有未提交的改动，没能快进；提交或丢弃这些改动后，下一轮检查会自动拉取`,
-        en: `GitHub has new commits, but ${branchOf(event)} is checked out${where} with uncommitted changes and could not be fast-forwarded; once they are committed or discarded, the next check pulls by itself`,
+        zh: `${host} 上有新提交，但 ${branchOf(event)} 检出${where}有未提交的改动，没能快进；提交或丢弃这些改动后，下一轮检查会自动拉取`,
+        en: `${host} has new commits, but ${branchOf(event)} is checked out${where} with uncommitted changes and could not be fast-forwarded; once they are committed or discarded, the next check pulls by itself`,
       });
     }
     case 'issue.auto_accepted': {
