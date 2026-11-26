@@ -73,6 +73,9 @@ describe('noticeFor automation', () => {
     // Out of quota passes on its own: the automatic scout waits for it, nobody needs to act.
     const limited = { scoutId: 's', repo: 'demo', retryAt: '2026-11-19T01:00:00.000Z' };
     expect(noticeFor(ev('scout.rate_limited', limited, null), undefined)).toBeNull();
+    // A change to the plan dropped: the iteration, blocked, is told of when it blocks.
+    const dropped = { scoutId: 's', repo: 'demo', problems: ['它是收尾子项'] };
+    expect(noticeFor(ev('scout.update_dropped', dropped, null), undefined)).toBeNull();
   });
 
   it('sends proposals of the local backlog to the Issues page, and not their decisions', () => {

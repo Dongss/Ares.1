@@ -573,14 +573,16 @@ describe('scouting with iterations', () => {
     expect(scout.status).toBe('completed');
     expect(lastScoutPrompt(t)).toContain('## 规划迭代');
     expect(lastScoutPrompt(t)).not.toContain('## 进行中的迭代');
-    // Every lead, up to max_proposals; the steps of the iteration do not count toward it.
-    expect(filed).toEqual([['卡住的 Run', '能力缺口', '明显的缺陷']]);
-    expect(scout.proposals.map((p) => p.lead)).toEqual(['problem', 'gap', 'defect']);
+    // Problems and defects, up to max_proposals: a gap is planned as an iteration, not proposed
+    // on its own. The steps of the iteration do not count toward max_proposals.
+    expect(filed).toEqual([['卡住的 Run', '明显的缺陷', '又一个卡住的']]);
+    expect(scout.proposals.map((p) => p.lead)).toEqual(['problem', 'defect', 'problem']);
     expect(planned.map((p) => [p.title, p.children.length])).toEqual([
       ['不接 GitHub 的仓库也能永动', 2],
     ]);
-    // No plan to change.
+    // No plan to change: the change is dropped as a rule, not as one that does not fit.
     expect(changes).toEqual([]);
+    expect(eventData(t, 'scout.update_dropped')).toEqual([]);
     const [iteration] = t.master.store.listIterations({ repoId: t.repo.id });
     expect(eventData(t, 'scout.completed')).toEqual([
       expect.objectContaining({
@@ -620,9 +622,11 @@ describe('scouting with iterations', () => {
     expect(eventData(t, 'scout.completed')).toEqual([
       expect.not.objectContaining({ iteration: expect.anything() }),
     ]);
+    // The change fits the plan: nothing dropped.
+    expect(eventData(t, 'scout.update_dropped')).toEqual([]);
   });
 
-  it('fails a scout whose change does not fit the plan, filing nothing', async () => {
+  it('drops a change that does not fit the plan, saying why, and files the problems all the same', async () => {
     const t = await start();
     underWay(t);
     const { source, filed, changes } = recordingSource(t);
@@ -631,12 +635,21 @@ describe('scouting with iterations', () => {
       structured: { gaps: [], proposals: LEADS, iteration: null, iterationUpdate: update },
     });
     const scout = await scoutWith(t, source);
-    expect(scout.status).toBe('failed');
-    expect(scout.error).toBe(
-      '侦察结果不符合约定：iterationUpdate: 追加的第 1 个子项（序号 3）不能替换第 2 个子项：它是收尾子项',
-    );
-    expect(filed).toEqual([]);
+    expect(scout.status).toBe('completed');
+    expect(scout.error).toBeNull();
+    expect(filed).toEqual([['卡住的 Run', '又一个卡住的']]);
     expect(changes).toEqual([]);
+    expect(eventData(t, 'scout.update_dropped')).toEqual([
+      {
+        scoutId: scout.id,
+        repo: 'demo',
+        problems: ['追加的第 1 个子项（序号 3）不能替换第 2 个子项：它是收尾子项'],
+      },
+    ]);
+    expect(eventData(t, 'scout.completed')).toEqual([
+      expect.objectContaining({ scoutId: scout.id, created: 2 }),
+    ]);
+    expect(eventData(t, 'scout.failed')).toEqual([]);
   });
 });
 

@@ -46,12 +46,12 @@ Agent CLI 的原始输出（stream-json）带着工具调用的完整结果：�
 
 ### 全局事件
 
-Master 把不属于任何 Run 的事记成全局事件（事件的 Run 为空）：上一个 Master 异常退出（`master.restarted`）、清理原始日志（`logs.pruned`）、恢复数据库备份（`store.backup_restored`）、node 不见了（`master.node_missing`）、打开或关闭工作开关（`master.working`）、配置重新加载（`config.reloaded`、`config.reload_failed`）、访问 GitHub 出错（`github.error`，同一串连续失败里同一个错误只记一次，见「通知」）、webhook 通知发送失败（`notify.webhook_failed`）、系统通知发送失败（`notify.system_failed`）、推送目标分支（`github.pushed`）、从 GitHub 拉取目标分支（`github.pulled`、`github.merged_remote`、`github.diverged`、`github.diverged_run`、`github.pull_blocked`，见「拉取 GitHub 上的新提交」）、自动采纳提案（`issue.auto_accepted`）、本地提案的采纳和拒绝（`proposal.auto_accepted`、`proposal.accepted`、`proposal.rejected`，见「不用 GitHub 时」）、迭代（`iteration.auto_accepted`、`iteration.accepted`、`iteration.child_status`、`iteration.blocked`、`iteration.unblocked`、`iteration.adjusted`、`iteration.completed`、`iteration.cancelled`，见「迭代」）、侦察（`scout.started`、`scout.completed`、`scout.failed`、`scout.rate_limited`）和升级（`upgrade.started`、`upgrade.done`、`upgrade.failed`）。这篇文档里说「事件列表里记一条」这些事件的地方，都指这里。
+Master 把不属于任何 Run 的事记成全局事件（事件的 Run 为空）：上一个 Master 异常退出（`master.restarted`）、清理原始日志（`logs.pruned`）、恢复数据库备份（`store.backup_restored`）、node 不见了（`master.node_missing`）、打开或关闭工作开关（`master.working`）、配置重新加载（`config.reloaded`、`config.reload_failed`）、访问 GitHub 出错（`github.error`，同一串连续失败里同一个错误只记一次，见「通知」）、webhook 通知发送失败（`notify.webhook_failed`）、系统通知发送失败（`notify.system_failed`）、推送目标分支（`github.pushed`）、从 GitHub 拉取目标分支（`github.pulled`、`github.merged_remote`、`github.diverged`、`github.diverged_run`、`github.pull_blocked`，见「拉取 GitHub 上的新提交」）、自动采纳提案（`issue.auto_accepted`）、本地提案的采纳和拒绝（`proposal.auto_accepted`、`proposal.accepted`、`proposal.rejected`，见「不用 GitHub 时」）、迭代（`iteration.auto_accepted`、`iteration.accepted`、`iteration.child_status`、`iteration.blocked`、`iteration.unblocked`、`iteration.adjusted`、`iteration.completed`、`iteration.cancelled`，见「迭代」）、侦察（`scout.started`、`scout.completed`、`scout.failed`、`scout.rate_limited`、`scout.update_dropped`）和升级（`upgrade.started`、`upgrade.done`、`upgrade.failed`）。这篇文档里说「事件列表里记一条」这些事件的地方，都指这里。
 
 Master 大部分时间没人看着，人回来时在看板的「事件」页查这段时间发生过什么：
 
 - 最新的在前，每页 200 条，底部「加载更早的」往前翻；有新的全局事件时自动刷新。
-- 每条有时间、类型和一句说明：比如删了几个原始日志、多大，上一个 Master 的 pid 和启动时间，恢复了哪个备份、较新的库移到了哪里。出错的（`github.error`、`notify.webhook_failed`、`notify.system_failed`、`config.reload_failed`、`upgrade.failed`、`scout.failed`）标成红色，值得留意的（`master.restarted`、`master.node_missing`、`store.backup_restored`、`github.diverged`、`github.pull_blocked`、`iteration.blocked`，有无效配置项的 `config.reloaded`）标成橙色，其余的（包括建了合并 Run 的 `github.diverged_run`：要留意的分叉由同时记的 `github.diverged` 标出）不标颜色。分叉交给 Run 处理时，`github.diverged` 的说明写「已交给 Run <id> 处理」，不再要你手动合并。升级失败带着脚本输出末尾时可以展开看。鼠标悬停在说明上能看到原始数据。
+- 每条有时间、类型和一句说明：比如删了几个原始日志、多大，上一个 Master 的 pid 和启动时间，恢复了哪个备份、较新的库移到了哪里。出错的（`github.error`、`notify.webhook_failed`、`notify.system_failed`、`config.reload_failed`、`upgrade.failed`、`scout.failed`）标成红色，值得留意的（`master.restarted`、`master.node_missing`、`store.backup_restored`、`github.diverged`、`github.pull_blocked`、`iteration.blocked`、`scout.update_dropped`，有无效配置项的 `config.reloaded`）标成橙色，其余的（包括建了合并 Run 的 `github.diverged_run`：要留意的分叉由同时记的 `github.diverged` 标出）不标颜色。分叉交给 Run 处理时，`github.diverged` 的说明写「已交给 Run <id> 处理」，不再要你手动合并。升级失败带着脚本输出末尾时可以展开看。鼠标悬停在说明上能看到原始数据。
 - 迭代的事件带着去这个迭代的页面（`#/iterations/<id>`）的链接；侦察、自动采纳和拒绝本地提案的事件带着去「需求」页的链接；交给 Run 的 `github.diverged` 和 `github.diverged_run`，以及采纳本地提案建出了 Run 的 `proposal.accepted`、`proposal.auto_accepted` 带着去这个 Run 的链接。
 - 看板还不认识的事件类型（以后新加的）照样列出，显示类型名和原始数据。
 - 每个 Run 自己的事件不在这里，在 Run 详情页。
@@ -188,8 +188,10 @@ stages:
   3. 明显的缺陷和测试缺口，文档和代码不一致的地方，代码里的 TODO；
   4. 评审通过时给的建议和对最近改动的修饰：不单独提案，由迭代最后的「收尾」子项统一整理（见下面「迭代」的「收尾」）。
 - **产出**：结果里除了 `gaps`，还有 `iteration`（新规划的迭代）、`iterationUpdate`（对进行中迭代的计划调整）和 `proposals`（迭代之外的提案，每条用 `lead` 写明属于哪类线索：`problem` 是第 1 类，`gap` 是第 2 类，`defect` 是第 3 类）。按仓库有没有进行中的迭代（等采纳、进行中或受阻的；一个仓库同时最多一个），要求不同：
-  - 没有时：主要产出是一个新迭代，围绕差距分析里最重要的缺口一次规划好（见下面的「迭代」）；差距分析里没有值得规划成迭代的缺口时 `iteration` 为 `null`。迭代之外的提案只放第 1 类问题和第 3 类明显的缺陷，最多 `max_proposals` 条，第 1 类优先；迭代的子项不算在 `max_proposals` 里。这时没有能调整的计划，`iterationUpdate` 被丢掉。
-  - 有时：不规划新迭代，不提迭代之外的能力需求，只做两件事：把第 1 类问题写成提案（最多 `max_proposals` 条），判断迭代的计划要不要调整（见下面「迭代」的「迭代进行中的侦察」）。差距分析照常做，留给下一个迭代。Master 按侦察开始时仓库有没有进行中的迭代取结果：有的话丢掉 `iteration` 和 `lead` 不是 `problem` 的提案，侦察写了别的也不会建出来。
+  - 没有时：主要产出是一个新迭代，围绕差距分析里最重要的缺口一次规划好（见下面的「迭代」）；差距分析里没有值得规划成迭代的缺口时 `iteration` 为 `null`。迭代之外的提案只放第 1 类问题和第 3 类明显的缺陷，最多 `max_proposals` 条，第 1 类优先；迭代的子项不算在 `max_proposals` 里。这时没有能调整的计划，`iterationUpdate` 被丢掉（这是规则，不记事件）。
+  - 有时：不规划新迭代，不提迭代之外的能力需求，只做两件事：把第 1 类问题写成提案（最多 `max_proposals` 条），判断迭代的计划要不要调整（见下面「迭代」的「迭代进行中的侦察」）。差距分析照常做，留给下一个迭代。
+
+  Master 按侦察开始时仓库有没有进行中的迭代取结果，侦察写了别的也不会建出来：没有的话只留 `lead` 为 `problem` 或 `defect` 的提案（`gap` 的缺口该规划进迭代，不单独建），再取前 `max_proposals` 条；有的话丢掉 `iteration` 和 `lead` 不是 `problem` 的提案，再取前 `max_proposals` 条。有进行中的迭代时，`iterationUpdate` 不合计划的规则（见「迭代进行中的侦察」）只丢掉这份调整，不算侦察失败：侦察照常记为完成，问题提案照常建出来，事件列表里记一条 `scout.update_dropped`（看板「事件」页标成橙色，点开是「需求」页；数据里有 `scoutId`、`repo` 和 `problems`：调整哪里不合规，用 Master 的语言写成，看板原样显示），不发通知。
 - **证据**：补能力的子项不需要有出错的 Run，README 的目标加上限制这个能力的代码位置就是证据。
 - **风险**：`low` 只涉及文档、测试、看板展示或不改变行为的重构；`mid` 改变行为，但影响范围清楚；`high` 涉及数据库迁移、合并或回滚等 git 操作、Agent 权限、配置格式、对外发布，或者改动 `.ares1/` 下的文件（仓库自己的开发流程，见「仓库自带的流程模板」）。`auto_accept.max_risk` 按它决定自动采纳哪些。
 - **子项多大**：提示词写明这个仓库用的模板能不能拆分大需求（有没有一个 Agent 阶段是 `planning: auto` 或 `llm`；模板找不到时当作不能），以及有 L 子项的迭代会不会被自动采纳（迭代按整体采纳，取子项里最高的风险和最大的大小：`max_risk` 不是 `none`、`max_size` 是 `L` 时，风险在范围内的也会被自动采纳；否则如实写明有一个子项是 L，整个迭代就要等人采纳）。按模板能不能拆分，要求不同：
@@ -270,7 +272,7 @@ stages:
 - 根据已经做完的子项和它们的 Run，判断计划要不要调整；不用调整就写 `null`，不为调整而调整。要调整就写在结果的 `iterationUpdate` 里：`note` 是为什么调整，`add` 是要加的子项，写法和规划时一样，接在计划里现有的最大序号后面编号。
   - 受阻时，换个做法重新安排失败或被关掉的那一步：新子项的 `replaces` 写被换掉的子项的序号，新做法要针对失败原因（拆小、先补上缺的能力、换一种做法），在 why 里说明和上次的不同。
   - 做完的子项暴露出计划漏掉的一步时，补上它，`replaces` 写 `null`。
-  - 新子项只能依赖排在它前面、不是收尾的子项；只能替换失败或被关掉、还没被替换过的子项，不能替换收尾子项；加上新子项、去掉被换掉的之后，计划里最多 8 个子项。不合这些规则，按「侦察结果不符合约定」算侦察失败。
+  - 新子项只能依赖排在它前面、不是收尾的子项；只能替换失败或被关掉、还没被替换过的子项，不能替换收尾子项；加上新子项、去掉被换掉的之后，计划里最多 8 个子项。不合这些规则的，Master 丢掉整份调整，计划不变，事件列表里记一条 `scout.update_dropped` 写明原因；侦察不算失败，它提的问题照常建出来（见上面「侦察」的「产出」）。
 
 Master 收到调整后：
 

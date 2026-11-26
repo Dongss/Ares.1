@@ -153,6 +153,15 @@ const SAMPLES: [string, Record<string, unknown>][] = [
   ['scout.completed', { scoutId: 's-1', repo: 'demo', created: 3, auto: 1, pending: 2 }],
   ['scout.completed', { scoutId: 's-1', repo: 'demo', created: 0, auto: 0, pending: 0 }],
   ['scout.failed', { scoutId: 's-1', repo: 'demo', message: 'timeout', streak: 3 }],
+  // The problems are in the Master's language: English here, so the check below holds.
+  [
+    'scout.update_dropped',
+    {
+      scoutId: 's-1',
+      repo: 'demo',
+      problems: ['step 3 cannot replace step 2: it is the closing step'],
+    },
+  ],
   ['scout.rate_limited', { scoutId: 's-1', repo: 'demo', retryAt: '2026-11-23T13:00:00Z' }],
   ['scout.rate_limited', { scoutId: 's-1', repo: 'demo' }],
   ['upgrade.started', { from: 'aaaaaaaa1111', to: 'bbbbbbbb2222' }],
@@ -482,6 +491,38 @@ describe('globalEventText', () => {
     );
   });
 
+  it('says a change to the plan was dropped and why, the rest of the scout taken', () => {
+    const data = {
+      scoutId: 's-1',
+      repo: 'demo',
+      problems: [
+        '追加的第 1 个子项（序号 3）不能替换第 2 个子项：它是收尾子项',
+        '计划最多 8 个子项',
+      ],
+    };
+    expect(text('scout.update_dropped', data)).toBe(
+      '侦察 demo 时提出的计划调整不符合进行中迭代的计划，丢掉了这份调整，其余结果照常采用：追加的第 1 个子项（序号 3）不能替换第 2 个子项：它是收尾子项；计划最多 8 个子项',
+    );
+    // Without the problems, or with something else in their place, it still says what happened.
+    expect(text('scout.update_dropped', { repo: 'demo', problems: 'x' })).toBe(
+      '侦察 demo 时提出的计划调整不符合进行中迭代的计划，丢掉了这份调整，其余结果照常采用',
+    );
+    setLang('en');
+    const en = {
+      ...data,
+      problems: [
+        'step 3 cannot replace step 2: it is the closing step',
+        'the plan would have 9 steps',
+      ],
+    };
+    expect(text('scout.update_dropped', en)).toBe(
+      'Scouting demo gave a change that does not fit the plan of the iteration under way; the change was dropped and the rest of the result taken as usual: step 3 cannot replace step 2: it is the closing step; the plan would have 9 steps',
+    );
+    expect(text('scout.update_dropped', { repo: 'demo' })).toBe(
+      'Scouting demo gave a change that does not fit the plan of the iteration under way; the change was dropped and the rest of the result taken as usual',
+    );
+  });
+
   it('says a scout of the local backlog wrote proposals there rather than issues', () => {
     const data = { repo: 'demo', created: 3, auto: 1, pending: 2, backlog: true };
     expect(text('scout.completed', data)).toBe(
@@ -724,7 +765,12 @@ describe('globalEventTone', () => {
     ]) {
       expect(globalEventTone(ev(type)), type).toBe('danger');
     }
-    for (const type of ['master.restarted', 'master.node_missing', 'store.backup_restored']) {
+    for (const type of [
+      'master.restarted',
+      'master.node_missing',
+      'store.backup_restored',
+      'scout.update_dropped',
+    ]) {
       expect(globalEventTone(ev(type)), type).toBe('attention');
     }
     expect(globalEventTone(ev('config.reloaded', { errors: 1 }))).toBe('attention');
@@ -740,6 +786,7 @@ describe('globalEventLink', () => {
     const issues = { href: '#/issues', label: '查看需求' };
     expect(globalEventLink(ev('scout.completed'))).toEqual(issues);
     expect(globalEventLink(ev('scout.failed'))).toEqual(issues);
+    expect(globalEventLink(ev('scout.update_dropped'))).toEqual(issues);
     expect(globalEventLink(ev('issue.auto_accepted'))).toEqual(issues);
     expect(globalEventLink(ev('iteration.auto_accepted'))).toEqual(issues);
     expect(globalEventLink(ev('iteration.accepted'))).toEqual(issues);

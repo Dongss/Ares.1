@@ -3041,6 +3041,47 @@ stages:
     await t.master.issues.poll();
     expect(t.master.store.latestRunForIssue('me/demo', 5)).toBeDefined();
   });
+
+  it('drops a change that does not fit the plan, saying why, and still files the problems', async () => {
+    const t = await start(config({ maxRisk: 'none', maxAttempts: 1 }), QUICK_WORKFLOW);
+    coderFailingOn(t, [1]);
+    await failFirstStep(t);
+    const plan = iterationOf(t).children;
+    const scout = await scoutWith(t, {
+      gaps: GAPS,
+      proposals: [
+        proposal('修好卡住的合并', 'low'),
+        { ...proposal('支持 GitLab', 'low'), lead: 'gap' },
+      ],
+      iteration: null,
+      // The closing step cannot be replaced.
+      iterationUpdate: { note: '换掉收尾', add: [addition('丙二：换个收尾', 3)] },
+    });
+    // The scout did its work: it completed, and the problem it found is an issue.
+    expect(scout.status).toBe('completed');
+    expect(scout.error).toBeNull();
+    expect(scout.proposals.map((p) => p.title)).toEqual(['修好卡住的合并']);
+    expect(gh.issues.size).toBe(5);
+    expect(gh.get(5)).toMatchObject({ title: '修好卡住的合并', labels: [LABELS.proposal] });
+    expect(eventData(t, 'scout.completed')).toContainEqual(
+      expect.objectContaining({ scoutId: scout.id, created: 1 }),
+    );
+    expect(eventData(t, 'scout.failed')).toEqual([]);
+    // Why the change was dropped is in the events; the plan stays as it was.
+    expect(eventData(t, 'scout.update_dropped')).toEqual([
+      {
+        scoutId: scout.id,
+        repo: 'demo',
+        problems: ['追加的第 1 个子项（序号 4）不能替换第 3 个子项：它是收尾子项'],
+      },
+    ]);
+    const iteration = iterationOf(t);
+    expect(iteration.status).toBe('blocked');
+    expect(iteration.children).toEqual(plan);
+    expect(iteration.notes).toEqual([]);
+    expect(eventsOf(t, 'iteration.adjusted')).toEqual([]);
+    expect(gh.get(1).comments.filter((c) => c.includes('### 计划调整'))).toEqual([]);
+  });
 });
 
 describe('iterations: changing the plan', () => {

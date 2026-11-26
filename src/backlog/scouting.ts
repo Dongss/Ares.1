@@ -744,8 +744,10 @@ export class Scouting {
         );
       }
       // Taken by the rules of what the scout was shown: with an iteration under way, only
-      // problems and a change to its plan; without one, a new iteration and no change.
-      const report = keptReport(
+      // problems and a change to its plan that fits it; without one, a new iteration, problems
+      // and defects, and no change. A change that does not fit is dropped, not the scout: the
+      // problems it found are filed all the same, and the event says why the change was not.
+      const { report, updateProblems: dropped } = keptReport(
         parseScoutReport(result.structured, result.finalMessage),
         open,
         scoutCfg.max_proposals,
@@ -771,6 +773,14 @@ export class Scouting {
       const iteration = filed.iteration;
       store.tx(() => {
         store.updateScout(scout.id, { status: 'completed', proposals, endedAt: nowIso() });
+        if (dropped.length > 0) {
+          store.event(null, 'scout.update_dropped', {
+            scoutId: scout.id,
+            repo: repo.name,
+            // In the Master's language, like the message of scout.failed.
+            problems: dropped,
+          });
+        }
         store.event(null, 'scout.completed', {
           scoutId: scout.id,
           repo: repo.name,

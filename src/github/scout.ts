@@ -722,33 +722,51 @@ export function updateProblems(
   return problems;
 }
 
+/** The scout's report as the Master takes it (see keptReport). */
+export interface KeptReport {
+  report: ScoutReport;
+  /**
+   * What is wrong with the change to the plan the scout gave, which was dropped for it; empty
+   * when the change fits the plan, when there is none, or when there is no plan to change.
+   */
+  updateProblems: string[];
+}
+
 /**
  * The scout's report as the Master takes it, by whether the repo has an iteration under way
  * (`open`: pending, active or blocked, see ITERATION_OPEN_STATUSES). While one is, no other is
  * planned and only problems that stop the system are proposed (lead `problem`), so a new
- * iteration and every other proposal are dropped; a change to its plan must fit the plan
- * (`updateProblems`), or the report breaks the contract. Without one there is no plan to change,
- * so a change is dropped. Either way at most `max` proposals are kept (`max_proposals`); the
- * steps of an iteration do not count toward it.
+ * iteration and every other proposal are dropped. A change to its plan that does not fit the plan
+ * (`updateProblems`) is dropped too, and why is returned; the rest of the report still holds, so
+ * the problems it found are filed all the same (a blocked iteration gets out only through a
+ * change, and a scout failing for a bad one would leave it and those problems waiting). Without
+ * one, gaps are what the scout plans an iteration for and polish waits for an iteration's closing
+ * step, so only problems and obvious defects (leads `problem` and `defect`) are proposed; there
+ * is no plan to change, so a change is dropped as a rule, not reported. Either way at most `max`
+ * proposals are kept (`max_proposals`), out of those of the leads kept; the steps of an iteration
+ * do not count toward it.
  */
 export function keptReport(
   report: ScoutReport,
   open: Pick<Iteration, 'criteria' | 'children'> | null,
   max: number,
-): ScoutReport {
+): KeptReport {
   if (!open) {
-    return { ...report, proposals: report.proposals.slice(0, max), iterationUpdate: null };
+    const proposals = report.proposals.filter((p) => p.lead === 'problem' || p.lead === 'defect');
+    return {
+      report: { ...report, proposals: proposals.slice(0, max), iterationUpdate: null },
+      updateProblems: [],
+    };
   }
-  if (report.iterationUpdate) {
-    const problems = updateProblems(report.iterationUpdate, open);
-    if (problems.length > 0) {
-      throw contractError(`iterationUpdate: ${problems.join(t({ zh: '；', en: '; ' }))}`);
-    }
-  }
+  const problems = report.iterationUpdate ? updateProblems(report.iterationUpdate, open) : [];
   return {
-    ...report,
-    proposals: report.proposals.filter((p) => p.lead === 'problem').slice(0, max),
-    iteration: null,
+    report: {
+      ...report,
+      proposals: report.proposals.filter((p) => p.lead === 'problem').slice(0, max),
+      iteration: null,
+      iterationUpdate: problems.length > 0 ? null : report.iterationUpdate,
+    },
+    updateProblems: problems,
   };
 }
 

@@ -634,6 +634,20 @@ export function globalEventText(event: GlobalEvent, now = new Date()): string | 
         en: `Scouting ${repoOf(event)} failed${times}${withMessage(d.message)}`,
       });
     }
+    case 'scout.update_dropped': {
+      // In the Master's language, as it found them.
+      const problems = Array.isArray(d.problems)
+        ? d.problems.map(str).filter((p): p is string => p !== null)
+        : [];
+      const why =
+        problems.length > 0
+          ? t({ zh: `：${problems.join('；')}`, en: `: ${problems.join('; ')}` })
+          : '';
+      return t({
+        zh: `侦察 ${repoOf(event)} 时提出的计划调整不符合进行中迭代的计划，丢掉了这份调整，其余结果照常采用${why}`,
+        en: `Scouting ${repoOf(event)} gave a change that does not fit the plan of the iteration under way; the change was dropped and the rest of the result taken as usual${why}`,
+      });
+    }
     case 'scout.rate_limited': {
       const retryAt = str(d.retryAt);
       return retryAt
@@ -705,6 +719,8 @@ export function globalEventTone(event: GlobalEvent): Tone {
     case 'github.diverged':
     case 'github.pull_blocked':
     case 'iteration.blocked':
+    // The plan stays as it was: a blocked iteration waits for the next scout to change it.
+    case 'scout.update_dropped':
       return 'attention';
     case 'config.reloaded':
       return (num(event.data.errors) ?? 0) > 0 ? 'attention' : 'neutral';

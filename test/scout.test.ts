@@ -2750,7 +2750,7 @@ describe('keptReport', () => {
 
   it('keeps only problems and the change to the plan while an iteration is under way', () => {
     const update = change(addedStep('换个做法的第 2 步', { replaces: 2, dependsOn: [1] }));
-    const kept = keptReport(
+    const { report: kept, updateProblems: dropped } = keptReport(
       parsedReport({ proposals, iteration, iterationUpdate: update }),
       underWay(),
       3,
@@ -2758,33 +2758,55 @@ describe('keptReport', () => {
     expect(kept.proposals.map((p) => p.title)).toEqual(['卡住的 Run', '又一个卡住的']);
     expect(kept.iteration).toBeNull();
     expect(kept.iterationUpdate).toBe(update);
+    expect(dropped).toEqual([]);
     // max_proposals still holds.
     const one = keptReport(parsedReport({ proposals }), underWay(), 1);
-    expect(one.proposals.map((p) => p.title)).toEqual(['卡住的 Run']);
+    expect(one.report.proposals.map((p) => p.title)).toEqual(['卡住的 Run']);
+    expect(one.updateProblems).toEqual([]);
   });
 
-  it('drops a change to the plan without an iteration under way, keeping the new one and every lead', () => {
-    const kept = keptReport(
+  it('drops a change to the plan without an iteration under way, keeping the new one, problems and defects', () => {
+    const { report: kept, updateProblems: dropped } = keptReport(
       parsedReport({ proposals, iteration, iterationUpdate: change(addedStep('多余的')) }),
       null,
       3,
     );
-    expect(kept.proposals.map((p) => p.lead)).toEqual(['problem', 'gap', 'defect']);
+    // A gap is what an iteration is planned for, not a proposal of its own; the limit is taken
+    // out of the leads kept, so the second problem fits in the gap's place.
+    expect(kept.proposals.map((p) => [p.title, p.lead])).toEqual([
+      ['卡住的 Run', 'problem'],
+      ['明显的缺陷', 'defect'],
+      ['又一个卡住的', 'problem'],
+    ]);
     // The steps of an iteration do not count toward max_proposals.
     expect(kept.iteration).toBe(iteration);
     expect(kept.iterationUpdate).toBeNull();
+    // No plan to change: dropping the change is the rule, nothing wrong with it to tell.
+    expect(dropped).toEqual([]);
+    // max_proposals still holds.
+    const one = keptReport(parsedReport({ proposals }), null, 1);
+    expect(one.report.proposals.map((p) => p.title)).toEqual(['卡住的 Run']);
+    const gaps = keptReport(parsedReport({ proposals: proposals.slice(1, 2) }), null, 3);
+    expect(gaps.report.proposals).toEqual([]);
   });
 
-  it('breaks the contract with a change that does not fit the plan', () => {
-    expect(() =>
-      keptReport(
-        parsedReport({ iterationUpdate: change(addedStep('换掉做完的', { replaces: 1 })) }),
-        underWay(),
-        3,
-      ),
-    ).toThrow(
-      '侦察结果不符合约定：iterationUpdate: 追加的第 1 个子项（序号 5）不能替换第 1 个子项：它没有失败，也没有被关成不做',
+  it('drops a change that does not fit the plan, saying why, and keeps the problems', () => {
+    const { report: kept, updateProblems: dropped } = keptReport(
+      parsedReport({
+        proposals,
+        iteration,
+        iterationUpdate: change(addedStep('换掉做完的', { replaces: 1 })),
+      }),
+      underWay(),
+      3,
     );
+    expect(kept.iterationUpdate).toBeNull();
+    expect(dropped).toEqual([
+      '追加的第 1 个子项（序号 5）不能替换第 1 个子项：它没有失败，也没有被关成不做',
+    ]);
+    // The rest of the report is taken as it would be with a change that fits.
+    expect(kept.proposals.map((p) => p.title)).toEqual(['卡住的 Run', '又一个卡住的']);
+    expect(kept.iteration).toBeNull();
   });
 });
 
