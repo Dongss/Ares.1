@@ -1,5 +1,5 @@
 import type { BacklogRepoStatus, BacklogStatus, ProposalView } from '../../../src/api/types.js';
-import { isAutoAcceptable } from '../../../src/config/flow.js';
+import { authorDecides, isAutoAcceptable } from '../../../src/config/flow.js';
 import { join, t } from '../../../src/i18n.js';
 import type { FailedAttempt, ProposalStatus, ScoutProposal } from '../../../src/store/types.js';
 import { formatTime, type Tone } from './format.js';
@@ -106,16 +106,28 @@ export function canReject(p: Pick<ProposalView, 'status'>, reason: string): bool
   return p.status === 'pending' && reason.trim() !== '';
 }
 
+/** The mark of a proposal a human wrote (POST /api/proposals), beside its status. */
+export function humanMark(p: Pick<ProposalView, 'author'>): string | null {
+  return p.author === 'human' ? t({ zh: '人写的', en: 'Human-written' }) : null;
+}
+
 /**
  * What a pending proposal waits for: auto-accept takes it at a later poll (it was left today
- * because the count or the budget was used up, or the work switch was off), or a human decides.
- * null for decided proposals, and without auto-accept settings (the repo left backlog.repos).
+ * because the count or the budget was used up, or the work switch was off), or a human decides;
+ * a human's own draft (`authorDecides`) waits for them whatever its kind. null for decided
+ * proposals, and without auto-accept settings (the repo left backlog.repos).
  */
 export function pendingText(
-  p: Pick<ProposalView, 'status' | 'risk' | 'size'>,
+  p: Pick<ProposalView, 'status' | 'risk' | 'size' | 'author'>,
   auto: AcceptLimits | null,
 ): string | null {
   if (p.status !== 'pending' || !auto) return null;
+  if (authorDecides(p)) {
+    return t({
+      zh: '你写下先存着的需求：不会自动采纳，也不挡自动侦察；想开工就采纳，不做了就拒绝',
+      en: 'A requirement you wrote and kept for later: it is never accepted automatically and does not hold the automatic scout back; accept it to start, or reject it',
+    });
+  }
   return isAutoAcceptable(p, { max_risk: auto.maxRisk, max_size: auto.maxSize })
     ? t({
         zh: '在自动采纳范围内，还没采纳（今天的自动采纳条数或预算用完了，或者工作开关关着），之后的检查会自动采纳；也可以现在就采纳',

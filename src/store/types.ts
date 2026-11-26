@@ -360,10 +360,23 @@ export type ScoutStatus = 'running' | 'completed' | 'failed' | 'interrupted' | '
 export const SCOUT_LEADS = ['problem', 'gap', 'defect'] as const;
 export type ScoutLead = (typeof SCOUT_LEADS)[number];
 
+/**
+ * What kind of change a requirement is, as a scout or a human files it. Part of the protocol
+ * (the scout's output, the API), the same in every language.
+ */
+export const PROPOSAL_CATEGORIES = [
+  'bug',
+  'feature',
+  'improvement',
+  'docs',
+  'test',
+  'refactor',
+] as const;
+
 /** One issue proposed by a scout. */
 export interface ScoutProposal {
   title: string;
-  category: 'bug' | 'feature' | 'improvement' | 'docs' | 'test' | 'refactor';
+  category: (typeof PROPOSAL_CATEGORIES)[number];
   size: 'S' | 'M' | 'L';
   risk: 'low' | 'mid' | 'high';
   /** The lead it follows; missing in proposals recorded before scouts gave one. */
@@ -402,14 +415,26 @@ export type ProposalStatus = (typeof PROPOSAL_STATUSES)[number];
 export type ProposalRedo = 'pending' | 'exhausted';
 
 /**
+ * Who wrote a local proposal: scout, a scout proposed it (every proposal recorded before humans
+ * could write one included); human, a human wrote it (POST /api/proposals). A human's proposal
+ * left pending is the human's to start: auto-accept does not take it, and it does not hold the
+ * automatic scout back (`authorDecides` in src/config/flow.ts). Part of the API, the same in
+ * every language.
+ */
+export const PROPOSAL_AUTHORS = ['scout', 'human'] as const;
+export type ProposalAuthor = (typeof PROPOSAL_AUTHORS)[number];
+
+/**
  * A proposal in the local backlog of a repo without GitHub (backlog.repos): what a scout
- * proposed, kept in the Master instead of as an issue, and what became of it.
+ * proposed or a human wrote, kept in the Master instead of as an issue, and what became of it.
  */
 export interface Proposal {
   id: string;
   repoId: string;
-  /** The scout that proposed it. */
+  /** The scout that proposed it; null for one a human wrote. */
   scoutId: string | null;
+  /** Who wrote it (`PROPOSAL_AUTHORS`). */
+  author: ProposalAuthor;
   title: string;
   category: ScoutProposal['category'];
   size: ScoutProposal['size'];

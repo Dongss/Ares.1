@@ -2108,6 +2108,7 @@ const localProposal = (id: string, title: string, extra: Partial<Proposal> = {})
   id,
   repoId: 'repo-1',
   scoutId: 'scout-1',
+  author: 'scout',
   title,
   category: 'feature',
   size: 'M',

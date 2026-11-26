@@ -1,8 +1,10 @@
 // The local backlog: where the requirements of a repo without GitHub come from (backlog.repos).
 // The scout's proposals are kept in the Master (the proposals table) instead of as issues; those
 // within the repo's auto_accept become Runs right away, the others wait for a human, who accepts
-// them on the dashboard or rejects them with a reason the next scouts are shown. A proposal of its
-// own whose Run failed is redone, told why, until max_run_attempts is used up, as an issue is.
+// them on the dashboard or rejects them with a reason the next scouts are shown. A human writes
+// requirements of their own into it too (POST /api/proposals), started at once or kept pending
+// until they accept them. A proposal of its own whose Run failed is redone, told why, until
+// max_run_attempts is used up, as an issue is.
 // An iteration a scout plans is kept the same way: its record (source local) and one proposal per
 // step, accepted or rejected as a whole, its steps started in the order of their dependencies,
 // redone the same way when their Runs fail, and the iteration summed up once every step is done
@@ -11,6 +13,7 @@
 import type { BacklogStatus } from '../api/types.js';
 import {
   attemptsAllowed,
+  authorDecides,
   childReady,
   effectiveDependencies,
   holdsScout,
@@ -24,12 +27,13 @@ import {
   proposalRedoAllowed,
   proposalRedoDueAt,
   proposalRestartable,
+  requirementSource,
 } from '../config/flow.js';
 import { backlogConfigKey, findTemplate, type LoadedConfig } from '../config/load.js';
 import type { BacklogRepoConfig } from '../config/schema.js';
 import { type Engine, InvalidStateError } from '../engine/engine.js';
 import { goalWithEarlierAttempts } from '../engine/prompts.js';
-import { failedAttempt } from '../github/issues.js';
+import { failedAttempt, LABELS } from '../github/issues.js';
 import {
   type IterationUpdate,
   localProposalDigest,
@@ -85,6 +89,49 @@ export interface LocalBacklogDeps {
    * moved (`RepoWorkflows.refresh`); never rejects. Each poll does it before it creates Runs.
    */
   refreshTemplates?: () => Promise<void>;
+}
+
+/** A requirement a human writes into a repo's local backlog (`LocalBacklog.write`). */
+export interface HumanRequirement {
+  /** One line; whitespace is folded. */
+  title: string;
+  what: string;
+  why?: string;
+  evidence?: string[];
+  acceptance?: string[];
+  /** feature unless said. */
+  category?: ScoutProposal['category'];
+  /** M unless said. */
+  size?: ScoutProposal['size'];
+  /** mid unless said. */
+  risk?: ScoutProposal['risk'];
+  /**
+   * Accept it at once, a Run created from it (the default); false keeps it pending until the
+   * human accepts it.
+   */
+  start?: boolean;
+}
+
+/** The items of a list a human wrote, each trimmed, the empty ones left out. */
+const items = (list: readonly string[] | undefined): string[] =>
+  (list ?? []).map((s) => s.trim()).filter((s) => s !== '');
+
+/**
+ * What a human who wrote a requirement to start at once is told when its Run could not be
+ * created: the requirement is kept, pending, under its id. An error the API answers with a
+ * conflict (it says why the Run could not be created, and the proposal can be accepted later)
+ * becomes one again; any other keeps answering as an internal error.
+ */
+function notStarted(p: Proposal, err: unknown): Error {
+  const message = t({
+    zh: `需求已经写成提案 ${p.id}，留在待处理；但没能建 Run：${errorMessage(err)}`,
+    en: `The requirement was written as proposal ${p.id} and left pending, but its Run could not be created: ${errorMessage(err)}`,
+  });
+  const known =
+    err instanceof NotFoundError ||
+    err instanceof InvalidStateError ||
+    err instanceof ConflictError;
+  return known ? new InvalidStateError(message) : new Error(message);
 }
 
 /** Why a proposal cannot be decided again. */
@@ -165,6 +212,9 @@ const CHILD_OVER: readonly IterationChildStatus[] = ['done', 'failed', 'dropped'
  *   on, within today's count and budget (`mayAutoAccept`); the others wait for a human, who
  *   accepts or rejects them on the dashboard. An accepted proposal becomes a Run whose goal is the
  *   proposal's text;
+ * - write: a human writes a requirement of their own (`write`), accepted at once as on the
+ *   dashboard or kept pending for them to accept later; such a draft is never auto-accepted and
+ *   does not hold the automatic scout back (`authorDecides`);
  * - redo: a proposal whose Run failed, of its own or a step of an iteration that still wants it
  *   (`proposalRedoAllowed`), is redone as a new Run whose goal tells why the earlier attempts
  *   failed, after the wait an issue's redo waits (`proposalRedoDueAt`), up to `max_run_attempts`
@@ -347,7 +397,8 @@ export class LocalBacklog {
    * today's count and spend allow: those left when the work switch was off or the day's count was
    * used up, and those the settings take since they were loosened. Uses the risk and size the
    * scout gave them; an iteration goes by its riskiest and largest step (`iterationKind`), and is
-   * accepted as a whole, counting once. The steps of an iteration are not proposals of their own.
+   * accepted as a whole, counting once. The steps of an iteration are not proposals of their own,
+   * and a human's draft is theirs to start (`authorDecides`).
    */
   private acceptWithinLimits(repo: Repo, cfg: BacklogRepoConfig): void {
     if (cfg.auto_accept.max_risk === 'none') return;
@@ -356,7 +407,7 @@ export class LocalBacklog {
       // Newest first as listed.
       ...store
         .listProposals({ repoId: repo.id, status: 'pending' })
-        .filter((p) => p.iterationId === null)
+        .filter((p) => p.iterationId === null && !authorDecides(p))
         .reverse()
         .map((p) => ({
           at: p.createdAt,
@@ -390,6 +441,98 @@ export class LocalBacklog {
     const waiting = await this.deps.scouting.autoScoutWaiting(this.source, repo, cfg);
     this.scoutWaiting.set(repo.name, waiting);
     if (waiting === null) await this.deps.scouting.startScout(this.source, repo, cfg, 'auto');
+  }
+
+  // ---- requirements a human writes -----------------------------------------------
+
+  /**
+   * The repo a human writes a requirement into, with its settings: its requirements must come from
+   * the local backlog (`requirementSource`). One of GitHub or GitLab is refused (ConflictError),
+   * saying where its requirements are written; one of no source is not found. Then as repoSetup:
+   * its settings without problems (InvalidStateError), registered on the dashboard (NotFoundError).
+   */
+  private writable(name: string): { repo: Repo; cfg: BacklogRepoConfig } {
+    switch (requirementSource(this.cfg.master, name)) {
+      case 'backlog':
+        return this.repoSetup(name);
+      case 'github':
+        throw new ConflictError(
+          t({
+            zh: `仓库 ${name} 的需求来自 GitHub（config.yaml 的 github.repos）：在它的 GitHub issue 里写需求，加上标签 ${LABELS.ready} 开工`,
+            en: `The requirements of ${name} come from GitHub (github.repos of config.yaml): write them as GitHub issues and add the ${LABELS.ready} label to start one`,
+          }),
+        );
+      case 'gitlab':
+        throw new ConflictError(
+          t({
+            zh: `仓库 ${name} 的需求来自 GitLab（config.yaml 的 gitlab.repos）：在它的 GitLab issue 里写需求，加上标签 ${LABELS.ready} 开工`,
+            en: `The requirements of ${name} come from GitLab (gitlab.repos of config.yaml): write them as GitLab issues and add the ${LABELS.ready} label to start one`,
+          }),
+        );
+      default:
+        throw new NotFoundError(
+          t({
+            zh: `config.yaml 的 github.repos、gitlab.repos 和 backlog.repos 里都没有 ${name}`,
+            en: `${name} is in none of github.repos, gitlab.repos and backlog.repos of config.yaml`,
+          }),
+        );
+    }
+  }
+
+  /**
+   * Write a human's requirement into the local backlog of repo `name` (see `writable` for the
+   * repos that take one): a proposal of author human and no scout, recorded with a
+   * `proposal.created` event in one transaction (`started`: whether the human asked to start it).
+   * With `start` (the default) it is then accepted as a human accepts one on the dashboard
+   * (acceptProposal, in its own transaction: neither today's auto-accepts nor the day's automatic
+   * spending count it), a Run created whose goal is its text (`proposalGoal`); a failed Run is
+   * redone up to `max_run_attempts` as any proposal's. When the Run cannot be created, the
+   * proposal stays pending, kept, and the error says so (`notStarted`). Without `start` it stays
+   * pending until the human accepts it: never auto-accepted, and not counted among the proposals
+   * that hold the automatic scout back (`authorDecides`). Returns the proposal as recorded then.
+   */
+  write(name: string, input: HumanRequirement): Proposal {
+    const { repo, cfg } = this.writable(name);
+    const title = input.title.replace(/\s+/g, ' ').trim();
+    const what = input.what.trim();
+    if (!title || !what) {
+      throw new InvalidStateError(
+        t({
+          zh: '需求的标题和要做什么都不能为空',
+          en: 'A requirement needs a title and what to do',
+        }),
+      );
+    }
+    const start = input.start ?? true;
+    const store = this.deps.store;
+    const written = store.tx(() => {
+      const p = store.createProposal({
+        repoId: repo.id,
+        scoutId: null,
+        author: 'human',
+        title,
+        category: input.category ?? 'feature',
+        size: input.size ?? 'M',
+        risk: input.risk ?? 'mid',
+        why: input.why?.trim() ?? '',
+        evidence: items(input.evidence),
+        what,
+        acceptance: items(input.acceptance),
+      });
+      store.event(null, 'proposal.created', {
+        repo: repo.name,
+        proposalId: p.id,
+        author: p.author,
+        started: start,
+      });
+      return p;
+    });
+    if (!start) return written;
+    try {
+      return this.acceptProposal(written, repo, cfg, false);
+    } catch (err) {
+      throw notStarted(written, err);
+    }
   }
 
   // ---- deciding proposals --------------------------------------------------------
@@ -1193,12 +1336,15 @@ export class LocalBacklog {
   /**
    * How many proposals waiting for a human hold the automatic scout back (`holdsScout`): those of
    * their own, and each iteration waiting as a whole, as the kind auto-accept judges it by
-   * (`iterationKind`). The steps of an iteration go with it and do not count.
+   * (`iterationKind`). The steps of an iteration go with it and do not count, nor do the drafts
+   * a human keeps (`authorDecides`).
    */
   private waitingForHuman(repo: Repo, cfg: BacklogRepoConfig): number {
     const proposals = this.deps.store
       .listProposals({ repoId: repo.id, status: 'pending' })
-      .filter((p) => p.iterationId === null && holdsScout(p, cfg.auto_accept)).length;
+      .filter(
+        (p) => p.iterationId === null && !authorDecides(p) && holdsScout(p, cfg.auto_accept),
+      ).length;
     const iterations = this.localIterations(repo, 'pending').filter((it) =>
       holdsScout(iterationKind(it.children), cfg.auto_accept),
     ).length;

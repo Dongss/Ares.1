@@ -56,6 +56,7 @@ import {
   type IterationChild,
   type IterationChildStatus,
   type IterationStatus,
+  PROPOSAL_CATEGORIES,
   type Proposal,
   type Run,
   SCOUT_LEADS,
@@ -77,7 +78,7 @@ import {
 } from './issues.js';
 import { redactForGitHub } from './redact.js';
 
-const CATEGORIES = ['bug', 'feature', 'improvement', 'docs', 'test', 'refactor'] as const;
+const CATEGORIES = PROPOSAL_CATEGORIES;
 
 /** What every requirement the scout writes is made of: a proposal, or a step of an iteration. */
 const RequirementSchema = z.object({

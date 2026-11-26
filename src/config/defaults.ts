@@ -71,7 +71,8 @@ defaults:
 #       deliver: push            # push（默认）= 合并进本地目标分支后推送；mr = 推送 Run 分支并开 MR，MR 在 GitLab 上合并后 Run 才完成，适合目标分支受保护、要走 MR、流水线或审批的项目；mr 要求 push: true
 
 # 没有 GitHub 或 GitLab issue 可用的仓库（只在本机的仓库、没有这两种账号、托管在内网其他服务上）用本地提案池：
-# 侦察的提案存在 Master 里，在看板上采纳，或按 auto_accept 自动采纳后直接建 Run；不需要 gh 或 glab。字段的含义和 github.repos
+# 侦察的提案存在 Master 里，在看板上采纳，或按 auto_accept 自动采纳后直接建 Run；人也可以用 POST /api/proposals 写自己的需求，
+# 马上开工或先存着（先存着的不会自动采纳，也不计入挡住自动侦察的 max_proposals）；不需要 gh 或 glab。字段的含义和 github.repos
 # 里的同名字段一样（说明见${brandName()}仓库的 docs/running.md「不用 GitHub 时」）。一个仓库只能写在 github.repos、gitlab.repos、
 # backlog.repos 中的一处，按这个顺序检查，后出现的不生效
 # backlog:
@@ -79,7 +80,7 @@ defaults:
 #   repos:
 #     my-local-repo:             # 看板上登记的仓库名，不能和 github.repos、gitlab.repos 里的重名
 #       template: self-dev       # 采纳的提案建 Run 用的模板
-#       scout:
+#       scout:                   # 不写 = 不侦察，这个仓库只做人写的需求
 #         agent: claude-reviewer # 以只读方式运行，要用支持只读的 CLI（claude-code、codex）的 Agent
 #         auto: true             # 仓库没有会自己往下走的 Run 时自动侦察；false = 只在看板上手动触发
 #       auto_accept:
@@ -160,7 +161,9 @@ defaults:
 #       deliver: push            # push (default) = merge into the local target branch, then push it; mr = push the Run's branch and open a merge request, and the Run completes once it is merged on GitLab: for target branches that are protected or need an MR, pipelines or approvals; mr needs push: true
 
 # Repos with neither GitHub nor GitLab issues (local only, no such account, hosted on another intranet service) use the local backlog: the scout's
-# proposals are kept by the Master, and become Runs once accepted on the dashboard or automatically by auto_accept; no gh or glab needed. The fields
+# proposals are kept by the Master, and become Runs once accepted on the dashboard or automatically by auto_accept. You can write requirements of your
+# own with POST /api/proposals, started at once or kept for later (those kept are never accepted automatically, and do not count toward the
+# max_proposals that hold the automatic scout back). No gh or glab needed. The fields
 # mean what they mean in github.repos (see the local backlog section of docs/running.md in the ${brandName()} repo). A repo can be in only one of github.repos,
 # gitlab.repos and backlog.repos; they are checked in that order, and a later one does not take effect
 # backlog:
@@ -168,7 +171,7 @@ defaults:
 #   repos:
 #     my-local-repo:             # the repo name registered on the dashboard; not one of github.repos or gitlab.repos
 #       template: self-dev       # template of the Runs created from accepted proposals
-#       scout:
+#       scout:                   # omitted = no scouting: the repo works on the requirements humans write
 #         agent: claude-reviewer # runs read-only, so it needs an agent of a CLI that supports that (claude-code, codex)
 #         auto: true             # scout whenever no Run of the repo goes on by itself; false = only from the dashboard
 #       auto_accept:

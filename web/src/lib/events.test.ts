@@ -140,6 +140,8 @@ const SAMPLES: [string, Record<string, unknown>][] = [
       leftOut: 0,
     },
   ],
+  ['proposal.created', { repo: 'demo', proposalId: 'proposal-1', author: 'human', started: true }],
+  ['proposal.created', { repo: 'demo', proposalId: 'proposal-1', author: 'human', started: false }],
   ['proposal.auto_accepted', { repo: 'demo', proposalId: 'proposal-1', runId: 'run-1' }],
   ['proposal.accepted', { repo: 'demo', proposalId: 'proposal-1', runId: 'run-1' }],
   // The reason is a human's own words, kept as written: English here, so the check below holds.
@@ -808,6 +810,25 @@ describe('globalEventText', () => {
     );
     expect(text('proposal.rejected', { repo: 'demo' })).toBe(
       'Rejected a local proposal of demo; later scouts are shown it with the reason',
+    );
+  });
+
+  it('says a human wrote a requirement, started at once or kept for later', () => {
+    const written = { repo: 'demo', proposalId: 'proposal-1', author: 'human' };
+    expect(text('proposal.created', { ...written, started: true })).toBe(
+      '有人给 demo 写了一条需求，马上开工',
+    );
+    expect(text('proposal.created', { ...written, started: false })).toBe(
+      '有人给 demo 写了一条需求，先存在本地提案里，等人采纳后开工',
+    );
+    expect(text('proposal.created', {})).toBe('有人给 某个仓库 写了一条需求，存进了本地提案');
+    expect(globalEventLink(ev('proposal.created', written))?.href).toBe('#/issues');
+    setLang('en');
+    expect(text('proposal.created', { ...written, started: true })).toBe(
+      'A human wrote a requirement for demo, to start at once',
+    );
+    expect(text('proposal.created', { ...written, started: false })).toBe(
+      'A human wrote a requirement for demo, kept in the local backlog until a human accepts it',
     );
   });
 

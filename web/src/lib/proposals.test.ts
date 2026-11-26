@@ -13,6 +13,7 @@ import {
   failureLabel,
   failureLabels,
   failuresHeading,
+  humanMark,
   mergeProposals,
   PROPOSAL_STATUS,
   pendingText,
@@ -37,6 +38,7 @@ function proposal(over: Partial<ProposalView> & Pick<ProposalView, 'id'>): Propo
     repoId: 'repo-1',
     repo: 'demo',
     scoutId: 'scout-1',
+    author: 'scout',
     title: `Proposal ${over.id}`,
     category: 'feature',
     size: 'M',
@@ -186,6 +188,24 @@ describe('deciding a proposal', () => {
     expect(pendingText({ ...within, size: 'L' }, auto)).toBe(
       'Beyond auto-accept, so it waits for you to accept or reject it',
     );
+  });
+
+  it('leaves the draft a human wrote to them, within auto-accept or not, and marks it', () => {
+    const auto = { maxRisk: 'high', maxSize: 'L' } as const;
+    const draft = proposal({ id: 'p', author: 'human', scoutId: null, risk: 'low', size: 'S' });
+    expect(pendingText(draft, auto)).toBe(
+      '你写下先存着的需求：不会自动采纳，也不挡自动侦察；想开工就采纳，不做了就拒绝',
+    );
+    expect(pendingText({ ...draft, status: 'accepted' }, auto)).toBeNull();
+    expect(humanMark(draft)).toBe('人写的');
+    // Marked whatever became of it.
+    expect(humanMark(proposal({ id: 'r', author: 'human', status: 'accepted' }))).toBe('人写的');
+    expect(humanMark(proposal({ id: 'q' }))).toBeNull();
+    setLang('en');
+    expect(pendingText(draft, auto)).toBe(
+      'A requirement you wrote and kept for later: it is never accepted automatically and does not hold the automatic scout back; accept it to start, or reject it',
+    );
+    expect(humanMark(draft)).toBe('Human-written');
   });
 
   it('says how and when a proposal was decided', () => {

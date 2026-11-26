@@ -156,6 +156,16 @@ export function holdsScout(p: ProposalKind | null, limits: AutoAcceptLimits): bo
 }
 
 /**
+ * Whether a local proposal is left for its author to start: one a human wrote and kept pending
+ * (POST /api/proposals with `start: false`) is the human's draft. Auto-accept does not take it,
+ * whatever its risk and size, and it does not count among the proposals that hold the automatic
+ * scout back (`holdsScout`, max_proposals): that limit is for the scouts' proposals piling up.
+ */
+export function authorDecides(p: Pick<Proposal, 'author' | 'status'>): boolean {
+  return p.author === 'human' && p.status === 'pending';
+}
+
+/**
  * Every kind of proposal (risk × size), split into those the Master accepts by itself under
  * `limits` and those left to a human. `rule` is the auto-accept rule; tests may pass another.
  */

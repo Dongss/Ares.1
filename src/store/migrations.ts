@@ -265,4 +265,9 @@ export const MIGRATIONS: readonly string[] = [
   ALTER TABLE proposals ADD COLUMN failures TEXT NOT NULL DEFAULT '[]';
   ALTER TABLE proposals ADD COLUMN redo TEXT;
   `,
+  // v14: who wrote a local proposal: a scout, or a human through POST /api/proposals. Those
+  // recorded before were all a scout's.
+  `
+  ALTER TABLE proposals ADD COLUMN author TEXT NOT NULL DEFAULT 'scout';
+  `,
 ];

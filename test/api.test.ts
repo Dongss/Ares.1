@@ -19,12 +19,14 @@ import type {
   ProposalAccepted,
   ProposalRestarted,
   ProposalView,
+  ProposalWritten,
   RawLogMissing,
   RunSummary,
   StatsView,
 } from '../src/api/types.js';
 import { SCOUT_FAILURE_NOTIFY_AFTER } from '../src/config/flow.js';
 import { findTemplate, githubConfigKey, gitlabConfigKey } from '../src/config/load.js';
+import { InvalidStateError } from '../src/engine/engine.js';
 import { storedRunTimes } from '../src/engine/times.js';
 import { setLang } from '../src/i18n.js';
 import { type ExecFile, noticeScript } from '../src/notify/system.js';
@@ -2083,6 +2085,273 @@ backlog:
       ]),
     ).toEqual([[first.id, false]]);
     expect(gh.calls).toEqual([]);
+  });
+
+  it('writes a requirement of a human: started at once into a Run, or kept pending', async () => {
+    const t = await start();
+    const store = t.master.store;
+
+    const started = await call('POST', '/api/proposals', {
+      repo: 'demo',
+      title: '  导出 Run 列表 \n 成 CSV ',
+      what: '\n在 Run 列表页加一个导出按钮，导出成 CSV\n',
+      acceptance: ['能导出', '  ', ' 有测试 '],
+    });
+    expect(started.status).toBe(201);
+    const { proposal, run } = started.json as ProposalWritten;
+    if (!run) throw new Error('no Run');
+    expect(proposal).toMatchObject({
+      repo: 'demo',
+      repoId: t.repo.id,
+      scoutId: null,
+      author: 'human',
+      title: '导出 Run 列表 成 CSV',
+      category: 'feature',
+      size: 'M',
+      risk: 'mid',
+      why: '',
+      evidence: [],
+      what: '在 Run 列表页加一个导出按钮，导出成 CSV',
+      acceptance: ['能导出', '有测试'],
+      status: 'accepted',
+      auto: false,
+      runId: run.id,
+      runStatus: run.status,
+      attempt: 1,
+      maxAttempts: 3,
+      decidedAt: expect.any(String),
+    });
+    expect(run).toMatchObject({ repoId: t.repo.id, templateName: '测试流程' });
+    // The goal is the requirement's text, as for any proposal; the sections left empty are left out.
+    expect(run.goal).toBe(
+      [
+        '导出 Run 列表 成 CSV',
+        '',
+        '### 要做什么',
+        '',
+        '在 Run 列表页加一个导出按钮，导出成 CSV',
+        '',
+        '### 验收标准',
+        '',
+        '- [ ] 能导出',
+        '- [ ] 有测试',
+      ].join('\n'),
+    );
+    const events = (type: string) => store.listGlobalEventsOfType(type).map((e) => e.data);
+    expect(events('proposal.created')).toEqual([
+      { repo: 'demo', proposalId: proposal.id, author: 'human', started: true },
+    ]);
+    // Accepted as a human accepts one: not among today's auto-accepts.
+    expect(events('proposal.accepted')).toEqual([
+      { repo: 'demo', proposalId: proposal.id, runId: run.id },
+    ]);
+    expect(events('proposal.auto_accepted')).toEqual([]);
+    await t.waitStatus(run.id, 'completed');
+
+    // Kept for later: pending, without a Run, with every field it was given.
+    const kept = await call('POST', '/api/proposals', {
+      repo: 'demo',
+      title: '加个暗色主题',
+      what: '看板跟随系统的暗色模式',
+      why: ' 晚上看着刺眼 ',
+      evidence: ['web/src/styles.css'],
+      category: 'improvement',
+      size: 'S',
+      risk: 'low',
+      start: false,
+    });
+    expect(kept.status).toBe(201);
+    const draft = (kept.json as ProposalWritten).proposal;
+    expect(kept.json).not.toHaveProperty('run');
+    expect(draft).toMatchObject({
+      repo: 'demo',
+      author: 'human',
+      status: 'pending',
+      runId: null,
+      runStatus: null,
+      why: '晚上看着刺眼',
+      evidence: ['web/src/styles.css'],
+      acceptance: [],
+      category: 'improvement',
+      size: 'S',
+      risk: 'low',
+      decidedAt: null,
+    });
+    expect(events('proposal.created').at(-1)).toEqual({
+      repo: 'demo',
+      proposalId: draft.id,
+      author: 'human',
+      started: false,
+    });
+    expect(store.listRuns()).toHaveLength(1);
+    // Listed with the others, its author told.
+    expect(
+      ((await call('GET', '/api/proposals?repo=demo')).json as ProposalView[]).map((p) => [
+        p.title,
+        p.author,
+        p.status,
+      ]),
+    ).toEqual([
+      ['加个暗色主题', 'human', 'pending'],
+      ['导出 Run 列表 成 CSV', 'human', 'accepted'],
+    ]);
+    // Within auto-accept (low, up to M), yet a poll leaves it to its author.
+    await call('POST', '/api/backlog/poll');
+    expect(store.getProposal(draft.id).status).toBe('pending');
+    // The human starts it when they want.
+    const accepted = await call('POST', `/api/proposals/${draft.id}/accept`);
+    expect(accepted.status).toBe(200);
+    expect((accepted.json as ProposalAccepted).run.goal).toContain('### 为什么\n\n晚上看着刺眼');
+    expect(gh.calls).toEqual([]);
+  });
+
+  it('refuses a requirement for a repo whose requirements are written elsewhere, saying where', async () => {
+    const gl = new FakeGitLab('grp/lab');
+    gh = new FakeGitHub();
+    h = await harness({
+      agents: AGENTS,
+      github: gh,
+      gitlab: gl,
+      config: `
+github:
+  repos:
+    hub:
+      template: dev
+gitlab:
+  repos:
+    lab:
+      issues_repo: grp/lab
+      template: dev
+backlog:
+  repos:
+    demo:
+      template: dev
+    hub:
+      template: dev
+    other:
+      template: dev
+    broken:
+      template: missing
+`,
+    });
+    const write = (repo: unknown, extra: Record<string, unknown> = {}) =>
+      call('POST', '/api/proposals', { repo, title: '一个需求', what: '要做的事', ...extra });
+
+    // In github.repos too: its requirements come from GitHub.
+    expect(await write('hub')).toMatchObject({
+      status: 409,
+      json: {
+        error:
+          '仓库 hub 的需求来自 GitHub（config.yaml 的 github.repos）：在它的 GitHub issue 里写需求，加上标签 ares1:ready 开工',
+      },
+    });
+    expect(await write('lab')).toMatchObject({
+      status: 409,
+      json: {
+        error:
+          '仓库 lab 的需求来自 GitLab（config.yaml 的 gitlab.repos）：在它的 GitLab issue 里写需求，加上标签 ares1:ready 开工',
+      },
+    });
+    expect(await write('nowhere')).toMatchObject({
+      status: 404,
+      json: {
+        error: 'config.yaml 的 github.repos、gitlab.repos 和 backlog.repos 里都没有 nowhere',
+      },
+    });
+    expect(await write('other')).toMatchObject({
+      status: 404,
+      json: { error: '仓库 other 没有在看板上登记' },
+    });
+    expect(await write('broken')).toMatchObject({
+      status: 409,
+      json: { error: 'backlog.repos.broken 配置有误：模板 missing 不存在或无效' },
+    });
+
+    // Without a title or what to do, or with what the API does not take.
+    for (const input of [
+      { title: '  ' },
+      { title: '' },
+      { title: undefined },
+      { title: 'x'.repeat(201) },
+      { what: ' \n ' },
+      { what: undefined },
+      { what: 'x'.repeat(20_001) },
+      { category: 'chore' },
+      { size: 'XL' },
+      { risk: 'none' },
+      { start: 'yes' },
+      { evidence: 'one line' },
+      { extra: 1 },
+    ]) {
+      const res = await write('demo', input);
+      expect(res.status, JSON.stringify(input).slice(0, 80)).toBe(400);
+    }
+    expect((await write('demo', { title: ' ' })).json.error).toContain('需求的标题不能为空');
+    expect((await write('demo', { what: '' })).json.error).toContain('需求要写清楚要做什么');
+    expect((await write('demo', { title: 'x'.repeat(201) })).json.error).toContain('最多 200 个字');
+    expect((await write(undefined)).status).toBe(400);
+    expect(h.master.store.listProposals()).toEqual([]);
+    expect(h.master.store.listRuns()).toHaveLength(0);
+    // The longest title taken.
+    expect((await write('demo', { title: 'x'.repeat(200), start: false })).status).toBe(201);
+    expect(gh.calls).toEqual([]);
+  });
+
+  it('keeps the requirement pending when its Run cannot be created, saying so', async () => {
+    const t = await start();
+    // The template's file gone after the config was loaded: no Run can be created from it.
+    const engine = t.master.engine;
+    const createRun = engine.createRun.bind(engine);
+    engine.createRun = () => {
+      throw new InvalidStateError('模板 dev 不存在');
+    };
+    const res = await call('POST', '/api/proposals', {
+      repo: 'demo',
+      title: '要开工的',
+      what: '做点什么',
+    });
+    const [kept] = t.master.store.listProposals();
+    if (!kept) throw new Error('not kept');
+    expect(res).toMatchObject({
+      status: 409,
+      json: {
+        error: `需求已经写成提案 ${kept.id}，留在待处理；但没能建 Run：模板 dev 不存在`,
+      },
+    });
+    expect(kept).toMatchObject({ author: 'human', status: 'pending', runId: null });
+    expect(t.master.store.listGlobalEventsOfType('proposal.created').map((e) => e.data)).toEqual([
+      { repo: 'demo', proposalId: kept.id, author: 'human', started: true },
+    ]);
+    // Accepted by hand once the Run can be created.
+    engine.createRun = createRun;
+    expect((await call('POST', `/api/proposals/${kept.id}/accept`)).status).toBe(200);
+  });
+
+  it('writes a requirement in English, without Chinese left', async () => {
+    setLang('en');
+    await start(`language: en\n${CONFIG}`);
+    const started = await call('POST', '/api/proposals', {
+      repo: 'demo',
+      title: 'Export runs',
+      what: 'Add a CSV export',
+    });
+    expect(started.status).toBe(201);
+    const run = (started.json as ProposalWritten).run;
+    expect(run?.goal).toBe('Export runs\n\n### What to do\n\nAdd a CSV export');
+    const errors = [
+      (await call('POST', '/api/proposals', { repo: 'nowhere', title: 'a', what: 'b' })).json.error,
+      (await call('POST', '/api/proposals', { repo: 'other', title: 'a', what: 'b' })).json.error,
+      (await call('POST', '/api/proposals', { repo: 'demo', title: ' ', what: '' })).json.error,
+      (await call('POST', '/api/proposals', { repo: 'demo', title: 'x'.repeat(201), what: 'b' }))
+        .json.error,
+    ];
+    expect(errors).toEqual([
+      'nowhere is in none of github.repos, gitlab.repos and backlog.repos of config.yaml',
+      'Repo other is not registered on the dashboard',
+      'title: A requirement needs a title; what: A requirement needs what to do',
+      'title: at most 200 characters',
+    ]);
+    expect(errors.join('\n')).not.toMatch(/[一-鿿]/);
   });
 
   it('accepts a proposal into a Run, and rejects one only with a reason', async () => {

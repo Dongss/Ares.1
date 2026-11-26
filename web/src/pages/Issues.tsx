@@ -42,6 +42,7 @@ import {
   backlogOutdatedBy,
   canReject,
   decidedText,
+  humanMark,
   mergeProposals,
   PROPOSAL_STATUS,
   type ProposalGroup,
@@ -782,6 +783,7 @@ function ProposalItem(props: {
   const status = PROPOSAL_STATUS[p.status];
   const blocker = acceptBlocker(p, group.status);
   const waiting = pendingText(p, group.status?.autoAccept ?? null);
+  const human = humanMark(p);
   const decided = decidedText(p);
   const attempts = attemptsText(p);
   const redo = proposalRedoText(p);
@@ -800,6 +802,11 @@ function ProposalItem(props: {
       <details>
         <summary>
           <Badge tone={status.tone}>{status.label}</Badge>{' '}
+          {human && (
+            <>
+              <Badge tone="neutral">{human}</Badge>{' '}
+            </>
+          )}
           <span className="proposal-title">{p.title}</span>{' '}
           <Badge tone={RISK[p.risk].tone}>{RISK[p.risk].label}</Badge>{' '}
           <span className="muted">
@@ -905,8 +912,12 @@ function ProposalBody({ proposal: p }: { proposal: ProposalView }) {
   );
   return (
     <div className="proposal-body">
-      <h4>{t({ zh: '为什么', en: 'Why' })}</h4>
-      <p>{p.why}</p>
+      {p.why.trim() !== '' && (
+        <>
+          <h4>{t({ zh: '为什么', en: 'Why' })}</h4>
+          <p>{p.why}</p>
+        </>
+      )}
       {p.evidence.length > 0 && (
         <>
           <h4>{t({ zh: '证据', en: 'Evidence' })}</h4>

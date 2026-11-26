@@ -149,8 +149,9 @@ gitlab:
 
 # 本地提案池：给没有 GitHub 或 GitLab issue 可用的仓库用（只在本机的仓库、没有这两种账号、托管在内网其他服务上的项目）。
 # 侦察的提案存在 Master 里，在看板上采纳，或填理由拒绝（理由会作为反例写进下一次侦察的提示词）；
-# 在 auto_accept 范围内的提案自动采纳，直接用提案正文作为目标建 Run。不需要 gh 或 glab，全程不调用 GitHub 和 GitLab。
-# 不写 backlog 就不用本地提案池
+# 在 auto_accept 范围内的提案自动采纳，直接用提案正文作为目标建 Run。人也可以用 POST /api/proposals 写自己要做的需求：
+# 马上开工，或者先存着等自己在看板上采纳（先存着的不会自动采纳，也不计入挡住自动侦察的 max_proposals）。
+# 不需要 gh 或 glab，全程不调用 GitHub 和 GitLab。不写 backlog 就不用本地提案池
 backlog:
   poll_minutes: 5              # 多久检查一次本地提案池：自动采纳范围内的提案、该侦察时侦察，默认 5
 
@@ -160,10 +161,10 @@ backlog:
     # 内网的命令行工具：不接 GitHub 或 GitLab，靠侦察和自动采纳自己转起来
     my-intranet-tool:
       template: cross-review   # 采纳的提案建 Run 用的模板
-      scout:                   # 各项的含义和默认值和 github.repos 里的一样；不写 = 不侦察，这个仓库就没有提案、不会有 Run
+      scout:                   # 各项的含义和默认值和 github.repos 里的一样；不写 = 不侦察，这个仓库只做人写的需求
         agent: claude-reviewer
         interval_minutes: 120
-        max_proposals: 3
+        max_proposals: 3       # 等你处理的侦察提案加上卡住的 Run 达到这个数就不再自动侦察；人写下先存着的需求不算
       auto_accept:             # 范围内的提案不经过人，直接建 Run；范围外的留在提案池里等你采纳或拒绝
         max_risk: low
         max_size: M            # cross-review 模板不拆分 L 的需求，L 留给人

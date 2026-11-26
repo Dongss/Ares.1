@@ -536,6 +536,23 @@ export function globalEventText(event: GlobalEvent, now = new Date()): string | 
             en: `Iteration #${issue} of ${repoOf(event)} is done${used}; its summary is posted on the iteration issue`,
           });
     }
+    case 'proposal.created': {
+      // Only a human's requirement is recorded so; a scout's proposals are told by scout.completed.
+      const written = t({
+        zh: `有人给 ${repoOf(event)} 写了一条需求`,
+        en: `A human wrote a requirement for ${repoOf(event)}`,
+      });
+      if (d.started === true) {
+        return t({ zh: `${written}，马上开工`, en: `${written}, to start at once` });
+      }
+      if (d.started === false) {
+        return t({
+          zh: `${written}，先存在本地提案里，等人采纳后开工`,
+          en: `${written}, kept in the local backlog until a human accepts it`,
+        });
+      }
+      return t({ zh: `${written}，存进了本地提案`, en: `${written}, kept in the local backlog` });
+    }
     case 'proposal.auto_accepted':
     case 'proposal.accepted': {
       const runId = str(d.runId);

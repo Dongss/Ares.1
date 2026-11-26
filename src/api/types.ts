@@ -446,7 +446,10 @@ export interface BacklogStatus {
   repos: BacklogRepoStatus[];
 }
 
-/** GET /api/proposals: a proposal of the local backlog, newest first. */
+/**
+ * GET /api/proposals: a proposal of the local backlog, newest first. `author` says whether a
+ * scout proposed it or a human wrote it (POST /api/proposals).
+ */
 export interface ProposalView extends Proposal {
   /** Name of its repo as registered on the dashboard. */
   repo: string;
@@ -484,6 +487,16 @@ export interface ProposalAccepted {
  * the Run created for it.
  */
 export type ProposalRestarted = ProposalAccepted;
+
+/**
+ * POST /api/proposals: the requirement a human wrote, as a proposal of author human. Started
+ * (`start` true, the default): accepted, with the Run created from it; otherwise pending, without
+ * `run`.
+ */
+export interface ProposalWritten {
+  proposal: ProposalView;
+  run?: RunSummary;
+}
 
 /** One Run that worked on a step of an iteration. */
 export interface IterationRunView {

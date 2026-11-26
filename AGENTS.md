@@ -156,7 +156,9 @@ test/
     `src/engine/discussion.ts`), rate-limit waits of Runs and scouts,
     the redo wait of issues and local proposals (`redoDelayMs` / `redoDueAfter` / `redoDueAt` /
     `proposalRedoDueAt`), how many Runs a requirement gets (`attemptsAllowed`), which local
-    proposals a human may start over (`proposalRestartable`), raw log retention (`runRawLogsExpired` /
+    proposals a human may start over (`proposalRestartable`), which local proposals are a
+    human's own drafts, never auto-accepted nor holding the scout back (`authorDecides`), raw log
+    retention (`runRawLogsExpired` /
     `scoutRawLogExpired`), leftover worktrees (`leftoverWorkspaces`), which template a repo's
     Runs get by id, the home directory's or the repo's own (`resolveTemplate`), where a repo's
     requirements come from, GitHub, GitLab or the local backlog (`requirementSource`: a name in

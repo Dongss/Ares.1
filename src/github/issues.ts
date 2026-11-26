@@ -274,29 +274,23 @@ const categoryText = (category: ScoutProposal['category']) =>
 /**
  * What a proposal asks for, as Markdown sections: why, the evidence, what to do and the acceptance
  * criteria. The text of a proposal's issue (`proposalBody`) and the goal of a Run from a local
- * proposal (`proposalGoal`) both open with it.
+ * proposal (`proposalGoal`) both open with it. A section with nothing in it is left out: a
+ * requirement a human wrote may say only what to do.
  */
 export function proposalSections(
   p: Pick<ScoutProposal, 'why' | 'evidence' | 'what' | 'acceptance'>,
 ): string {
   const list = (items: string[], prefix: string) => items.map((i) => `${prefix}${i}`).join('\n');
-  return [
-    t({ zh: '### 为什么', en: '### Why' }),
-    '',
-    p.why,
-    '',
-    t({ zh: '### 证据', en: '### Evidence' }),
-    '',
-    list(p.evidence, '- '),
-    '',
-    t({ zh: '### 要做什么', en: '### What to do' }),
-    '',
-    p.what,
-    '',
-    t({ zh: '### 验收标准', en: '### Acceptance criteria' }),
-    '',
-    list(p.acceptance, '- [ ] '),
-  ].join('\n');
+  const sections: [heading: string, body: string][] = [
+    [t({ zh: '### 为什么', en: '### Why' }), p.why],
+    [t({ zh: '### 证据', en: '### Evidence' }), list(p.evidence, '- ')],
+    [t({ zh: '### 要做什么', en: '### What to do' }), p.what],
+    [t({ zh: '### 验收标准', en: '### Acceptance criteria' }), list(p.acceptance, '- [ ] ')],
+  ];
+  return sections
+    .filter(([, body]) => body.trim() !== '')
+    .map(([heading, body]) => `${heading}\n\n${body}`)
+    .join('\n\n');
 }
 
 export function proposalBody(p: ScoutProposal, scoutId: string, auto: boolean): string {

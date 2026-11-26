@@ -86,9 +86,11 @@ describe('noticeFor automation', () => {
       href: '#/issues',
       tag: 'ares1-event-42',
     });
-    // Accepted by auto-accept or a human, rejected or started over by a human: nobody has to act.
+    // Written by a human, accepted by auto-accept or a human, rejected or started over by a human:
+    // nobody has to act.
     const decided = { repo: 'demo', proposalId: 'proposal-1', runId: 'run-1', reason: 'x' };
     for (const type of [
+      'proposal.created',
       'proposal.auto_accepted',
       'proposal.accepted',
       'proposal.rejected',

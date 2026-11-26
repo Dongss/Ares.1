@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { defaultConfigYaml } from '../src/config/defaults.js';
 import {
   attemptsAllowed,
+  authorDecides,
   budgetPauses,
   childReady,
   chooseStageAgent,
@@ -3423,6 +3424,18 @@ describe('holdsScout', () => {
     expect(holding('high', 'L')).toEqual(kinds.map((k) => `${k.risk}/${k.size}`));
     // Without a scout record its kind is not known: it counts, to stay safe.
     expect(holdsScout(null, { max_risk: 'low', max_size: 'S' })).toBe(true);
+  });
+});
+
+describe('authorDecides', () => {
+  it("leaves only a human's pending proposal to its author", () => {
+    expect(authorDecides({ author: 'human', status: 'pending' })).toBe(true);
+    for (const status of ['accepted', 'rejected', 'failed'] as const) {
+      expect(authorDecides({ author: 'human', status })).toBe(false);
+    }
+    for (const status of ['pending', 'accepted', 'rejected', 'failed'] as const) {
+      expect(authorDecides({ author: 'scout', status })).toBe(false);
+    }
   });
 });
 

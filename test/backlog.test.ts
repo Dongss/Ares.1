@@ -326,6 +326,95 @@ describe('local backlog', () => {
     expect(t.master.store.listRuns()).toHaveLength(1);
   });
 
+  it('never auto-accepts the draft a human keeps, within auto-accept or not', async () => {
+    const t = await start(config({ maxRisk: 'high' }));
+    const store = t.master.store;
+    const draft = t.master.backlog.write('demo', {
+      title: '人存着的',
+      what: '以后再做',
+      risk: 'low',
+      size: 'S',
+      start: false,
+    });
+    expect(draft).toMatchObject({ author: 'human', scoutId: null, status: 'pending' });
+    // A scout's proposal of the same kind, left while the work switch was off.
+    const scouts = store.createProposal({
+      ...proposal('侦察提的', 'low'),
+      category: 'improvement',
+      repoId: t.repo.id,
+      scoutId: null,
+    });
+    await t.master.backlog.poll();
+    expect(store.getProposal(scouts.id)).toMatchObject({ status: 'accepted', auto: true });
+    expect(store.getProposal(draft.id)).toMatchObject({ status: 'pending', runId: null });
+    expect(eventData(t, 'proposal.auto_accepted').map((d) => d.proposalId)).toEqual([scouts.id]);
+    expect(store.listRuns()).toHaveLength(1);
+    // Still waiting for its author on the dashboard.
+    expect(demoStatus(t)?.pendingProposals).toBe(1);
+    // Started when its author accepts it.
+    expect(t.master.backlog.accept(draft.id)).toMatchObject({ status: 'accepted', auto: false });
+    expect(eventData(t, 'proposal.accepted').map((d) => d.proposalId)).toEqual([draft.id]);
+    expect(demoStatus(t)?.autoAccept.usedToday).toBe(1);
+    expect(gh.calls).toEqual([]);
+  });
+
+  it('does not count the drafts a human keeps among the proposals that hold the automatic scout back', async () => {
+    // Without auto-accept every proposal of a scout left pending holds it back.
+    const t = await start(config({ auto: true, maxRisk: 'none' }));
+    const store = t.master.store;
+    for (const title of ['一', '二', '三']) {
+      t.master.backlog.write('demo', { title: `人写的${title}`, what: '以后再做', start: false });
+    }
+    t.scripts.scout = () => ({
+      structured: {
+        gaps: [],
+        proposals: [proposal('甲', 'high'), proposal('乙', 'high'), proposal('丙', 'high')],
+      },
+    });
+    // Three drafts, max_proposals 3: the scout starts all the same.
+    await t.master.backlog.poll();
+    const [scout] = store.listScouts();
+    if (!scout) throw new Error('the drafts held the scout back');
+    await scoutDone(t, scout.id);
+    // The scout was shown them, so that it does not propose them again.
+    const pendingPart = lastScoutPrompt(t).slice(lastScoutPrompt(t).indexOf('### 等人决定'));
+    expect(pendingPart).toContain('人写的一');
+    expect(store.listProposals({ repoId: t.repo.id, status: 'pending' })).toHaveLength(6);
+    // The scout's three hold it back now; the drafts are not counted with them.
+    await t.master.backlog.poll();
+    expect(store.listScouts()).toHaveLength(1);
+    expect(demoStatus(t)?.scout?.waiting?.reason).toBe('有 3 条提案等你处理');
+    expect(demoStatus(t)?.pendingProposals).toBe(6);
+    expect(store.listRuns()).toHaveLength(0);
+    expect(gh.calls).toEqual([]);
+  });
+
+  it("refuses a human's requirement for a repo it cannot take, without writing it", async () => {
+    const t = await start(`
+github:
+  repos:
+    hub:
+      template: dev
+${config()}
+    other:
+      template: dev
+`);
+    const write = (name: string) => () =>
+      t.master.backlog.write(name, { title: '一个需求', what: '要做的事' });
+    expect(write('hub')).toThrow(ConflictError);
+    expect(write('hub')).toThrow('仓库 hub 的需求来自 GitHub');
+    expect(write('nowhere')).toThrow(NotFoundError);
+    expect(write('other')).toThrow('仓库 other 没有在看板上登记');
+    expect(() => t.master.backlog.write('demo', { title: ' \n', what: '要做的事' })).toThrow(
+      '需求的标题和要做什么都不能为空',
+    );
+    expect(() => t.master.backlog.write('demo', { title: '一个需求', what: ' ' })).toThrow(
+      InvalidStateError,
+    );
+    expect(t.master.store.listProposals()).toEqual([]);
+    expect(eventData(t, 'proposal.created')).toEqual([]);
+  });
+
   it("stops auto-accepting once the day's budget is spent, the auto-accepted Runs counted", async () => {
     const t = await start(config({ budget: 5 }));
     t.scripts.scout = () => ({
@@ -653,6 +742,45 @@ describe('local backlog: redo after a failure', () => {
     expect(demoStatus(t)?.budget.spentToday).toBe(2);
     // Nothing is left to redo.
     expect(store.proposalsWithFailedRun(t.repo.id)).toEqual([]);
+    expect(gh.calls).toEqual([]);
+  });
+
+  it('redoes the Run of a requirement a human wrote until max_run_attempts is used up', async () => {
+    const t = await startRedo(config({ maxAttempts: 2 }), [1, 2]);
+    const store = t.master.store;
+    const p = t.master.backlog.write('demo', {
+      title: '人写的需求',
+      what: '写一个 feature.txt',
+      acceptance: ['有 feature.txt'],
+    });
+    expect(p).toMatchObject({ author: 'human', status: 'accepted', auto: false, attempt: 1 });
+    const first = await t.waitStatus(p.runId ?? '', 'failed');
+    expect(first.goal).toBe(proposalGoal(p));
+    await t.master.backlog.poll();
+    expect(store.getProposal(p.id)).toMatchObject({ status: 'accepted', redo: 'pending' });
+    expect(eventData(t, 'proposal.redo_scheduled')).toMatchObject([
+      { proposalId: p.id, attempt: 2, maxAttempts: 2 },
+    ]);
+
+    elapseRedoWait(t);
+    await t.master.backlog.poll();
+    const second = latestRun(t, p.id);
+    expect(second.id).not.toBe(first.id);
+    expect(second.goal.startsWith(proposalGoal(p))).toBe(true);
+    expect(second.goal).toContain('第 1 次：模型额度用完了');
+    expect(store.getProposal(p.id)).toMatchObject({ attempt: 2, redo: null });
+    await t.waitStatus(second.id, 'failed');
+    // No attempts left: the requirement failed, with every reason.
+    await t.master.backlog.poll();
+    expect(store.getProposal(p.id)).toMatchObject({
+      author: 'human',
+      status: 'failed',
+      redo: 'exhausted',
+      attempt: 2,
+    });
+    expect(store.getProposal(p.id).failures.map((f) => f.runId)).toEqual([first.id, second.id]);
+    expect(eventData(t, 'proposal.failed')).toMatchObject([{ proposalId: p.id, attempts: 2 }]);
+    expect(store.listRuns()).toHaveLength(2);
     expect(gh.calls).toEqual([]);
   });
 

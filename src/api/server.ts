@@ -5,7 +5,9 @@ import { streamSSE } from 'hono/streaming';
 import { z } from 'zod';
 import type { LocalBacklog } from '../backlog/local.js';
 import {
+  PROPOSAL_SIZES,
   RAW_LOG_KEEP_DAYS,
+  RISKS,
   redoDueAt,
   requirementSource,
   runRawLogsExpired,
@@ -26,6 +28,7 @@ import {
   type EventRow,
   ITERATION_STATUSES,
   type Iteration,
+  PROPOSAL_CATEGORIES,
   PROPOSAL_STATUSES,
   type RunStatus,
 } from '../store/types.js';
@@ -52,6 +55,7 @@ import type {
   ProposalAccepted,
   ProposalRestarted,
   ProposalView,
+  ProposalWritten,
   RawLogMissing,
   RepoSourceView,
   RunDetail,
@@ -130,6 +134,41 @@ const ProposalsQuery = z.strictObject({
   repo: z.string().min(1).optional(),
   status: z.enum(PROPOSAL_STATUSES).optional(),
   limit: z.coerce.number().int().min(1).max(PROPOSALS_MAX).optional(),
+});
+/** Longest title of a requirement a human writes: one line, as a Run's title shows it. */
+const REQUIREMENT_TITLE_MAX = 200;
+/** Longest text of each other field of a requirement a human writes, and of each list item. */
+const REQUIREMENT_TEXT_MAX = 20_000;
+/** Most items of a list (evidence, acceptance criteria) of a requirement a human writes. */
+const REQUIREMENT_ITEMS_MAX = 50;
+const tooLong = (max: number) => () =>
+  t({ zh: `最多 ${max} 个字`, en: `at most ${max} characters` });
+const titleNeeded = () => t({ zh: '需求的标题不能为空', en: 'A requirement needs a title' });
+const whatNeeded = () => t({ zh: '需求要写清楚要做什么', en: 'A requirement needs what to do' });
+const requirementText = () =>
+  z
+    .string()
+    .trim()
+    .max(REQUIREMENT_TEXT_MAX, { error: tooLong(REQUIREMENT_TEXT_MAX) });
+const WriteProposalInput = z.strictObject({
+  repo: z.string().trim().min(1),
+  title: z
+    .string({ error: titleNeeded })
+    .trim()
+    .min(1, { error: titleNeeded })
+    .max(REQUIREMENT_TITLE_MAX, { error: tooLong(REQUIREMENT_TITLE_MAX) }),
+  what: z
+    .string({ error: whatNeeded })
+    .trim()
+    .min(1, { error: whatNeeded })
+    .max(REQUIREMENT_TEXT_MAX, { error: tooLong(REQUIREMENT_TEXT_MAX) }),
+  why: requirementText().optional(),
+  evidence: z.array(requirementText()).max(REQUIREMENT_ITEMS_MAX).optional(),
+  acceptance: z.array(requirementText()).max(REQUIREMENT_ITEMS_MAX).optional(),
+  category: z.enum(PROPOSAL_CATEGORIES).optional(),
+  size: z.enum(PROPOSAL_SIZES).optional(),
+  risk: z.enum(RISKS).optional(),
+  start: z.boolean().optional(),
 });
 const reasonNeeded = () =>
   t({ zh: '拒绝提案时必须填写理由', en: 'Rejecting a proposal needs a reason' });
@@ -364,8 +403,9 @@ export function createApi(deps: ApiDeps): Hono {
   // ---- runs ----------------------------------------------------------------
   // There is no endpoint for creating a Run from an arbitrary goal: Runs come from requirements,
   // either GitHub or GitLab issues (IssueBridge) or proposals of the local backlog accepted on the
-  // dashboard (POST /api/proposals/:id/accept) or by auto-accept (LocalBacklog); besides those,
-  // the Master only creates the Runs that merge the code host's commits it could not merge itself.
+  // dashboard (POST /api/proposals/:id/accept), written by a human and started at once
+  // (POST /api/proposals) or accepted by auto-accept (LocalBacklog); besides those, the Master
+  // only creates the Runs that merge the code host's commits it could not merge itself.
   app.get('/api/runs', (c) => {
     const status = c.req.query('status') as RunStatus | undefined;
     const repo = c.req.query('repo');
@@ -551,6 +591,25 @@ export function createApi(deps: ApiDeps): Hono {
       store
         .listProposals({ repoId, status, limit })
         .map((p) => proposalView(store, p, using, names)) satisfies ProposalView[],
+    );
+  });
+
+  // A requirement a human writes into the local backlog of a repo of backlog.repos, as a proposal
+  // of author human: started at once (`start`, the default) as accepting one does, the Run in the
+  // answer; or kept pending until accepted, never auto-accepted. A repo of GitHub or GitLab is
+  // refused saying where to write it (409); one of no source or not registered, 404; one with
+  // problems, 409. When the Run cannot be created, the proposal stays pending and the error says
+  // so.
+  app.post('/api/proposals', async (c) => {
+    const { repo, ...requirement } = await body(c, WriteProposalInput);
+    const proposal = backlog.write(repo, requirement);
+    const run = proposal.runId ? store.getRun(proposal.runId) : null;
+    return c.json(
+      {
+        proposal: proposalView(store, proposal, settings()),
+        ...(run ? { run: summarizeRun(store, engine, run) } : {}),
+      } satisfies ProposalWritten,
+      201,
     );
   });
 

@@ -481,6 +481,43 @@ describe('proposals of the local backlog', () => {
     expect(readdirSync(dir).filter((f) => f.includes('.bak-v10-'))).toHaveLength(1);
   });
 
+  it('migrates a v13 database: its proposals were all written by scouts', () => {
+    const dir = tmpDir('ares1-db-');
+    const file = join(dir, 'ares1.db');
+    const old = new DatabaseSync(file);
+    for (const m of MIGRATIONS.slice(0, 13)) old.exec(m);
+    old.exec('PRAGMA user_version = 13');
+    old.exec(`
+      INSERT INTO repos (id, name, path, target_branch, created_at) VALUES ('r', 'r', '/r', 'main', 't');
+      INSERT INTO proposals (id, repo_id, scout_id, title, category, size, risk, why, what, created_at)
+        VALUES ('old', 'r', 's', 'a', 'feature', 'M', 'low', 'w', 'x', 't');
+      INSERT INTO proposals (id, repo_id, scout_id, title, category, size, risk, why, what, status, created_at)
+        VALUES ('kept', 'r', NULL, 'b', 'bug', 'S', 'mid', 'w', 'x', 'accepted', 't');
+    `);
+    old.close();
+
+    const store = new Store(file);
+    expect(
+      (store.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+    ).toBe(MIGRATIONS.length);
+    expect(store.getProposal('old')).toMatchObject({ title: 'a', author: 'scout' });
+    expect(store.getProposal('kept')).toMatchObject({
+      title: 'b',
+      scoutId: null,
+      author: 'scout',
+      status: 'accepted',
+    });
+    const written = store.createProposal({
+      ...proposed('c'),
+      repoId: 'r',
+      scoutId: null,
+      author: 'human',
+    });
+    expect(store.getProposal(written.id).author).toBe('human');
+    store.close();
+    expect(readdirSync(dir).filter((f) => f.includes('.bak-v13-'))).toHaveLength(1);
+  });
+
   it('creates, reads back, decides and lists them by repo and status, newest first', () => {
     const store = new Store(':memory:');
     const { repo, mk } = seed(store);
@@ -507,6 +544,7 @@ describe('proposals of the local backlog', () => {
       id: a.id,
       repoId: repo.id,
       scoutId: 'scout-1',
+      author: 'scout',
       title: 'a',
       category: 'feature',
       size: 'M',
@@ -538,13 +576,21 @@ describe('proposals of the local backlog', () => {
     });
     expect(store.getProposal(b.id)).toMatchObject({
       scoutId: null,
+      author: 'scout',
       category: 'bug',
       size: 'L',
       risk: 'high',
       evidence: [],
       acceptance: [],
     });
-    const c = store.createProposal({ ...proposed('c'), repoId: other.id, scoutId: null });
+    const c = store.createProposal({
+      ...proposed('c'),
+      repoId: other.id,
+      scoutId: null,
+      author: 'human',
+    });
+    expect(store.getProposal(c.id)).toEqual(c);
+    expect(c).toMatchObject({ scoutId: null, author: 'human', status: 'pending' });
     const d = store.createProposal({ ...proposed('d'), repoId: repo.id, scoutId: 'scout-2' });
 
     const run = mk('做 a');

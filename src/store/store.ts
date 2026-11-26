@@ -1319,15 +1319,18 @@ export class Store {
   /**
    * A new pending proposal. Takes only the proposal's own fields, so a ScoutProposal can be
    * passed as it is: its `issue`, `local` and `error` are not columns. Without `iterationId` it
-   * belongs to no iteration, without `dependsOn` it depends on nothing.
+   * belongs to no iteration, without `dependsOn` it depends on nothing, without `author` a scout
+   * wrote it.
    */
   createProposal(
-    input: Pick<Proposal, ProposalInputKey> & Partial<Pick<Proposal, 'iterationId' | 'dependsOn'>>,
+    input: Pick<Proposal, ProposalInputKey> &
+      Partial<Pick<Proposal, 'iterationId' | 'dependsOn' | 'author'>>,
   ): Proposal {
     const proposal: Proposal = {
       id: newId('proposal'),
       repoId: input.repoId,
       scoutId: input.scoutId,
+      author: input.author ?? 'scout',
       title: input.title,
       category: input.category,
       size: input.size,
