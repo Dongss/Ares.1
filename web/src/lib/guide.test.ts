@@ -23,6 +23,7 @@ import {
   idleReasons,
   isGuideSection,
   issueFlow,
+  iterationGuide,
   labelHelp,
   mergeNeedsApproval,
   noticeRows,
@@ -173,6 +174,10 @@ describe('the cycle', () => {
       'claude-reviewer 只读地看代码、文档和最近的 Run 记录，找值得做的事',
     );
     expect(steps.propose?.text).toContain('一次最多 5 条');
+    // The scout's main output is an iteration, with at most MAX_ITERATION_CHILDREN steps.
+    expect(steps.propose?.text).toContain(
+      '没有进行中的迭代时，把最重要的能力缺口规划成一个迭代：一个带 ares1:iteration 的 issue（目标、完成标准、计划、不做）和最多 8 个按依赖排好的子 issue',
+    );
     // max_risk high with the default max_size L: no proposal waits for a human.
     expect(steps.accept?.actors).toEqual(['master']);
     expect(steps.accept?.text).toBe(
@@ -721,12 +726,42 @@ describe('notifications', () => {
     expect(auto(null)).toContain('由 max_risk 和 max_size 决定');
     expect(labelHelp(null).map(([label]) => label)).toEqual([
       'ares1:proposal',
+      'ares1:iteration',
       'ares1:ready',
       'ares1:running',
       'ares1:needs-you',
       'ares1:failed',
       'ares1:auto',
     ]);
+  });
+
+  it('explains ares1:iteration: accepted and closed as a whole, never a Run itself', () => {
+    const iteration = labelHelp(null).find(([label]) => label === 'ares1:iteration')?.[1];
+    expect(iteration).toContain('给它加 ares1:ready 就整批采纳，子 issue 按依赖顺序开工');
+    expect(iteration).toContain('关掉它，还没完成的子 issue 一起终止并关成不做');
+    expect(iteration).toContain('它自己从不建 Run，子 issue 都完成后 Master 发总结并关掉它');
+  });
+
+  it('says how iterations go in the scout section', () => {
+    const lines = iterationGuide();
+    expect(lines).toHaveLength(5);
+    const all = lines.join('\n');
+    // Planning: the most important gap, at most MAX_ITERATION_CHILDREN steps, closing step last.
+    expect(all).toContain('从差距分析里选最重要的一个缺口');
+    expect(all).toContain('最多 8 个，最后一个是整理评审建议的「收尾」');
+    expect(all).toContain('带 ares1:iteration 的 issue');
+    // Accepted as a whole, counted once.
+    expect(all).toContain(
+      '自动采纳取子项里最高的风险和最大的大小来判断，在每天的自动采纳条数里只算一次',
+    );
+    // The dependency gate, the summary, blocked and cancelled.
+    expect(all).toContain('一个子项依赖的子项都以完成关闭后，才为它建 Run');
+    expect(all).toContain('Master 发一份总结（对照完成标准、用了哪些 Run、总费用和用时）');
+    expect(all).toContain('迭代就停在「受阻」并通知你');
+    expect(all).toContain('还没完成的子项一起终止');
+    // The scout while one is under way.
+    expect(all).toContain('只提让系统停转或空耗的问题');
+    expect(all).toContain('评审通过时留下的建议不单独成 issue');
   });
 
   it('says which channel sends them', () => {
@@ -1278,6 +1313,13 @@ describe('in English', () => {
     expect(autoLabel(autoRepo.autoAccept)).toContain(
       'now all proposals (max_risk: high, max_size: L)',
     );
+    expect(labelHelp(null).find(([label]) => label === 'ares1:iteration')?.[1]).toContain(
+      'Add ares1:ready to it to accept it as a whole',
+    );
+    const iterations = iterationGuide();
+    expect(iterations).toHaveLength(5);
+    for (const line of iterations) expect(line).not.toMatch(CJK);
+    expect(iterations.join('\n')).toContain('at most 8, the last one the closing step');
     for (const row of noticeRows()) expect(row.handle).not.toMatch(CJK);
     expect(notifyChannel(true)).not.toMatch(CJK);
     expect(notifyChannel(false)).not.toMatch(CJK);

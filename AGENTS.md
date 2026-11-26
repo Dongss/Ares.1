@@ -155,6 +155,12 @@ test/
     which children a child waits for (`effectiveDependencies` / `unmetDependencies` /
     `childReady`), its progress and where it stands (`iterationProgress` / `iterationStatusOf`),
     and the like: `src/config/flow.ts`
+  - what both sources of requirements (the GitHub bridge and the local backlog) do with an
+    iteration once its children's outcomes are known: each child's status, blocked or not, a
+    scout's change to the plan, cost and time, the summary and the closing step's review
+    suggestions: `src/backlog/iterations.ts`; the iteration protocol on GitHub (the
+    `ares1:iteration` label, the hidden markers in a child's footer, the plan's task list):
+    `src/github/issues.ts`
   - notification rules: `src/notify/notice.ts`
   - assessment conclusion rules: `src/engine/discussion.ts`
   - how a Run's time is split, and the names and groups of the parts: `src/engine/times.ts`

@@ -28,6 +28,7 @@ import {
   idleReasons,
   isGuideSection,
   issueFlow,
+  iterationGuide,
   labelHelp,
   noticeRows,
   notifyChannel,
@@ -444,6 +445,29 @@ function ScoutSection({ input }: { input: GuideInput }) {
           })}
         </p>
       )}
+      <h3>{t({ zh: '迭代', en: 'Iterations' })}</h3>
+      <ul className="guide-list">
+        {iterationGuide().map((line) => (
+          <li key={line}>{line}</li>
+        ))}
+      </ul>
+      <p className="muted">
+        {t({
+          zh: (
+            <>
+              每个迭代的目标、完成标准、进度、各步的状态、费用和用时在
+              <a href={href.iterations}>「迭代」页</a>；首页列出没结束的迭代。
+            </>
+          ),
+          en: (
+            <>
+              The goal, completion criteria, progress, the state of each step, cost and time of
+              every iteration are on the <a href={href.iterations}>Iterations page</a>; the home
+              page lists the iterations not over yet.
+            </>
+          ),
+        })}
+      </p>
     </>
   );
 }

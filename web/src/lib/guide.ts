@@ -10,6 +10,7 @@ import {
   budgetPauses,
   effectiveBudget,
   issueRunOverrides,
+  MAX_ITERATION_CHILDREN,
   MAX_SCOUT_BACKOFF_HOURS,
   RATE_LIMIT_WAIT,
   RAW_LOG_KEEP_DAYS,
@@ -414,8 +415,8 @@ export function cycleSteps(input: GuideInput, rule?: AutoAcceptRule): CycleStep[
           proposeName,
           ['ai'],
           t({
-            zh: `每条提案建一个带 ares1:proposal 的 issue，写明为什么、证据、风险和大小；一次最多 ${scout.maxProposals} 条`,
-            en: `Each proposal becomes an issue labeled ares1:proposal, with the reason, evidence, risk and size; at most ${scout.maxProposals} at a time`,
+            zh: `没有进行中的迭代时，把最重要的能力缺口规划成一个迭代：一个带 ares1:iteration 的 issue（目标、完成标准、计划、不做）和最多 ${MAX_ITERATION_CHILDREN} 个按依赖排好的子 issue；要马上处理的问题另提单条 issue，带 ares1:proposal，写明为什么、证据、风险和大小，一次最多 ${scout.maxProposals} 条`,
+            en: `With no iteration under way, it plans the most important capability gap as an iteration: an issue labeled ares1:iteration (goal, completion criteria, plan, out of scope) and at most ${MAX_ITERATION_CHILDREN} sub-issues ordered by their dependencies; problems that need attention right away become issues of their own, labeled ares1:proposal, with the reason, evidence, risk and size, at most ${scout.maxProposals} at a time`,
           }),
         );
 
@@ -868,6 +869,37 @@ export function scoutGuide(
   };
 }
 
+/**
+ * How the scout's iterations go, in short, for the guide's section on the scout: what one is,
+ * accepting it as a whole, the dependencies, being done or blocked, and what the scout does while
+ * one is under way. The same rules on GitHub and in the local backlog.
+ */
+export function iterationGuide(): string[] {
+  const max = MAX_ITERATION_CHILDREN;
+  return [
+    t({
+      zh: `仓库没有进行中的迭代时，侦察的主要产出是一个迭代：从差距分析里选最重要的一个缺口，一次规划好目标、完成标准、不做的事和按依赖排好的子项（最多 ${max} 个，最后一个是整理评审建议的「收尾」）。接了 GitHub 的仓库建成一个带 ares1:iteration 的 issue 和每步一个子 issue，本地提案池里是一个迭代和每步一条提案`,
+      en: `When the repo has no iteration under way, the scout's main output is an iteration: it takes the most important gap from its gap analysis and plans, in one go, the goal, completion criteria, what is left out, and steps ordered by their dependencies (at most ${max}, the last one the closing step that goes through review suggestions). On GitHub it becomes an issue labeled ares1:iteration and one sub-issue per step; in the local backlog, an iteration with one proposal per step`,
+    }),
+    t({
+      zh: '迭代整批采纳：自动采纳取子项里最高的风险和最大的大小来判断，在每天的自动采纳条数里只算一次；人来采纳就给迭代 issue 加 ares1:ready（本地提案池在「迭代」页上采纳）',
+      en: "An iteration is accepted as a whole: auto-accept judges it by its riskiest and largest step, and it counts once toward the day's auto-accept limit; to accept it yourself, add ares1:ready to the iteration issue (in the local backlog, accept it on the Iterations page)",
+    }),
+    t({
+      zh: '一个子项依赖的子项都以完成关闭后，才为它建 Run；没有依赖关系的同时开工。子项完成后在迭代 issue 的计划里打勾；全部完成后，Master 发一份总结（对照完成标准、用了哪些 Run、总费用和用时），然后关掉迭代',
+      en: 'A step gets its Run only once every step it depends on is closed as completed; steps that do not depend on each other start side by side. Each step done is checked in the plan on the iteration issue; once all are done, the Master posts a summary (against the completion criteria, the Runs used, total cost and time) and closes the iteration',
+    }),
+    t({
+      zh: '一个子项用完重做次数后失败，或者被人关成不做，迭代就停在「受阻」并通知你；侦察下次换个做法补一个子项替换它。关掉迭代 issue（本地提案池在「迭代」页上终止），还没完成的子项一起终止，不做了',
+      en: 'When a step fails after using up its attempts, or is closed as not planned by a human, the iteration is blocked and you are notified; the next scout adds a step that replaces it with another approach. Close the iteration issue (in the local backlog, cancel it on the Iterations page), and the steps not yet done are stopped and dropped with it',
+    }),
+    t({
+      zh: '迭代进行中（包括等采纳和受阻时），侦察不规划新的迭代，也不提迭代之外的能力需求和评审建议，只提让系统停转或空耗的问题，并判断计划要不要调整：补一个漏掉的子项，或替换失败的子项，理由写在迭代上。评审通过时留下的建议不单独成 issue，由迭代最后的收尾子项统一整理',
+      en: 'While an iteration is under way (waiting to be accepted or blocked included), the scout plans no other and proposes no capability outside it and no review suggestions; it proposes only problems that stop the system or make it spin, and judges whether the plan needs to change: a step the plan missed, or one replacing a step that failed, with the reason recorded on the iteration. Suggestions reviews leave when they pass become no issues of their own: the closing step at the end of the iteration goes through them',
+    }),
+  ];
+}
+
 // ---- notifications and labels ------------------------------------------------------
 
 /** What to do about each notification, in the language in use. */
@@ -1065,6 +1097,13 @@ export function labelHelp(autoAccept: GitHubRepoStatus['autoAccept'] | null): [s
       t({
         zh: 'AI 提出的需求。采纳就加 ares1:ready；不做就关闭为 not planned，留一句理由，AI 下次会避开',
         en: 'A requirement proposed by the AI. To accept it, add ares1:ready; otherwise close it as not planned with a one-line reason, and the AI avoids it next time',
+      }),
+    ],
+    [
+      'ares1:iteration',
+      t({
+        zh: 'AI 规划的迭代：一个大目标，正文写着目标、完成标准、计划（子 issue 的任务列表）和不做的事。给它加 ares1:ready 就整批采纳，子 issue 按依赖顺序开工；关掉它，还没完成的子 issue 一起终止并关成不做。它自己从不建 Run，子 issue 都完成后 Master 发总结并关掉它',
+        en: 'An iteration planned by the AI: one larger goal, its body stating the goal, completion criteria, plan (a task list of its sub-issues) and what it leaves out. Add ares1:ready to it to accept it as a whole, and its sub-issues start in the order of their dependencies; close it, and the sub-issues not yet done are stopped and closed as not planned with it. It never becomes a Run itself; once every sub-issue is done, the Master posts a summary and closes it',
       }),
     ],
     [
