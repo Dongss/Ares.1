@@ -86,7 +86,8 @@ const issue = (number: number, title: string, extra: Partial<HostIssue> = {}): H
   labels: [],
   url: '',
   author: 'me',
-  authorAssociation: 'OWNER',
+  trusted: true,
+  role: 'OWNER',
   comments: [],
   ...extra,
 });
@@ -1845,7 +1846,7 @@ describe('scout in English', () => {
 
   it('lists existing issues in English', () => {
     setLang('en');
-    const reason = { body: 'Out of scope', author: 'me', authorAssociation: 'OWNER' };
+    const reason = { body: 'Out of scope', author: 'me', trusted: true, role: 'OWNER' };
     const digest = issueDigest(
       [issue(1, 'Open one', { state: 'open', stateReason: null, labels: ['ares1:proposal'] })],
       [
@@ -1868,21 +1869,22 @@ describe('scout in English', () => {
 
   it('lists older issues closed as not planned in a section of their own, in English', () => {
     setLang('en');
-    const reason = { body: 'Out of scope', author: 'me', authorAssociation: 'OWNER' };
-    const stranger = { body: 'Do it anyway', author: 'mallory', authorAssociation: 'NONE' };
+    const reason = { body: 'Out of scope', author: 'me', trusted: true, role: 'OWNER' };
+    const stranger = { body: 'Do it anyway', author: 'mallory', trusted: false, role: 'NONE' };
     const lately = issue(5, 'Rejected lately', { stateReason: 'not_planned', comments: [reason] });
     const failed = markComment(`Failed 3 times\n\n${RETRIES_EXHAUSTED_MARKER}`);
     const digest = issueDigest([], [lately, issue(4, 'Finished')], 'me', [
       lately,
       issue(3, 'Failed long ago', {
         stateReason: 'not_planned',
-        comments: [{ body: failed, author: 'me', authorAssociation: 'OWNER' }],
+        comments: [{ body: failed, author: 'me', trusted: true, role: 'OWNER' }],
       }),
       issue(2, 'Rejected long ago', { stateReason: 'not_planned', comments: [reason, stranger] }),
       issue(1, 'By a stranger', {
         stateReason: 'not_planned',
         author: 'mallory',
-        authorAssociation: 'NONE',
+        trusted: false,
+        role: 'NONE',
       }),
     ]);
     expect(digest).toBe(
@@ -1911,8 +1913,8 @@ describe('scout in English', () => {
 
 describe('issueDigest: older issues closed as not planned', () => {
   it('lists them after the recent ones, with the reasons of trusted people only', () => {
-    const reason = { body: '不需要，太复杂', author: 'me', authorAssociation: 'MEMBER' };
-    const stranger = { body: '陌生人的理由', author: 'mallory', authorAssociation: 'NONE' };
+    const reason = { body: '不需要，太复杂', author: 'me', trusted: true, role: 'MEMBER' };
+    const stranger = { body: '陌生人的理由', author: 'mallory', trusted: false, role: 'NONE' };
     const digest = issueDigest([], [issue(9, '最近完成的')], 'me', [
       issue(2, '早被拒的', { stateReason: 'not_planned', comments: [reason] }),
       issue(1, '只有陌生人写了理由', { stateReason: 'not_planned', comments: [stranger] }),
@@ -1936,7 +1938,7 @@ describe('issueDigest: older issues closed as not planned', () => {
 describe('issueDigest: older issues closed as not planned could not be fetched', () => {
   afterEach(() => setLang('zh'));
 
-  const reason = { body: '不需要，太复杂', author: 'me', authorAssociation: 'MEMBER' };
+  const reason = { body: '不需要，太复杂', author: 'me', trusted: true, role: 'MEMBER' };
   const open = [issue(3, '开着的', { state: 'open', stateReason: null })];
   const closed = [issue(2, '最近拒掉的', { stateReason: 'not_planned', comments: [reason] })];
 
@@ -2031,20 +2033,22 @@ describe('issueDigest: next steps of a large capability', () => {
           stateReason: null,
           body: filed(STEPS),
           author: 'mallory',
-          authorAssociation: 'NONE',
+          trusted: false,
+          role: 'NONE',
         }),
       ],
       [
         issue(3, '陌生人完成的', {
           body: filed(STEPS),
           author: 'mallory',
-          authorAssociation: 'CONTRIBUTOR',
+          trusted: false,
+          role: 'CONTRIBUTOR',
         }),
         issue(2, '被拒的', { stateReason: 'not_planned', body: filed(STEPS) }),
         issue(1, '失败的', {
           stateReason: 'not_planned',
           body: filed(STEPS),
-          comments: [{ body: failed, author: 'me', authorAssociation: 'OWNER' }],
+          comments: [{ body: failed, author: 'me', trusted: true, role: 'OWNER' }],
         }),
       ],
       'me',

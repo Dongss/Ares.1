@@ -53,7 +53,10 @@ const STANCES: readonly string[] = ['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'
 export interface IgnoredReview {
   /** Login; null when the account was deleted. */
   author: string | null;
-  /** The author's relation to the repo as GitHub gives it, e.g. NONE or CONTRIBUTOR. */
+  /**
+   * The author's relation to the repo as the code host words it (the review's `role`), e.g.
+   * NONE or CONTRIBUTOR on GitHub.
+   */
   association: string;
   /** The commit it reviewed. */
   commit: string | null;
@@ -139,7 +142,7 @@ export function judgePullRequest(pr: ChangeRequestStatus, ctx: PrReworkContext):
   const reviews = asking.filter((r) => isTrusted(r, ctx.master));
   const ignored = asking
     .filter((r) => !isTrusted(r, ctx.master))
-    .map((r) => ({ author: r.author, association: r.authorAssociation, commit: r.commit }));
+    .map((r) => ({ author: r.author, association: r.role, commit: r.commit }));
   const finished = pr.checks.length > 0 && pr.checks.every((c) => c.done);
   const failed = finished ? pr.checks.filter(checkFailed) : [];
 

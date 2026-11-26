@@ -62,7 +62,7 @@ interface SearchPage {
 const MAX_PAGE = 100;
 
 function fromRawComment(c: RawComment): HostComment {
-  return { body: c.body ?? '', ...authored(c.author?.login, c.authorAssociation) };
+  return { body: c.body ?? '', ...githubAuthor(c.author?.login, c.authorAssociation) };
 }
 
 function fromRaw(i: RawIssue): HostIssue {
@@ -121,14 +121,30 @@ function fromRawPull(raw: RawPullRequest): ChangeRequest {
   };
 }
 
-/** Who wrote something, from the login and the relation to the repo GitHub gave. */
-function authored(login: string | null | undefined, association: string | null | undefined) {
+/**
+ * Relations to the repo (GitHub's authorAssociation) whose holders can change the repo anyway:
+ * its owner, the members of its organization and its collaborators. Everybody else is not,
+ * contributors included.
+ */
+const TRUSTED_ASSOCIATIONS: readonly string[] = ['OWNER', 'MEMBER', 'COLLABORATOR'];
+
+/**
+ * Who wrote something, from the login and the relation to the repo (authorAssociation) GitHub
+ * gave: trusted by TRUSTED_ASSOCIATIONS, whatever the case; the relation kept as it is for people
+ * to read.
+ */
+export function githubAuthor(
+  login: string | null | undefined,
+  association: string | null | undefined,
+): HostAuthored {
+  // Unknown counts as unrelated to the repo: never trusted.
+  const role = association || 'NONE';
   return {
     // gh prints a deleted account as an empty login.
     author: login || null,
-    // Unknown counts as unrelated to the repo: never trusted.
-    authorAssociation: association || 'NONE',
-  } satisfies HostAuthored;
+    trusted: TRUSTED_ASSOCIATIONS.includes(role.toUpperCase()),
+    role,
+  };
 }
 
 /** What gh prints for a commit or an author that GitHub gave none of: null or empty fields. */
@@ -574,7 +590,7 @@ export class GhCli implements CodeHost {
       headRefOid: raw.headRefOid,
       reviewDecision: isReviewDecision(raw.reviewDecision) ? raw.reviewDecision : null,
       reviews: (raw.reviews ?? []).map((r) => ({
-        ...authored(r.author?.login, r.authorAssociation),
+        ...githubAuthor(r.author?.login, r.authorAssociation),
         state: r.state,
         body: r.body ?? '',
         commit: r.commit?.oid || null,
@@ -601,7 +617,7 @@ export class GhCli implements CodeHost {
     const out = await this.gh(['api', `${path}?per_page=100&sort=created&direction=desc`]);
     return parseOutput(out, RawReviewComments, `gh api ${path}`)
       .map((c) => ({
-        ...authored(c.user?.login, c.author_association),
+        ...githubAuthor(c.user?.login, c.author_association),
         body: c.body ?? '',
         path: c.path,
         line: c.line ?? null,

@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { FakeAdapter, type FakeContext, type FakeOutcome } from '../src/adapters/fake.js';
+import { githubAuthor } from '../src/github/client.js';
 import {
   type ChangeRequest,
   type ChangeRequestStatus,
@@ -301,7 +302,10 @@ export async function harness(opts: HarnessOptions = {}): Promise<Harness> {
   };
 }
 
-/** Who wrote an issue or a comment on FakeGitHub. */
+/**
+ * Who wrote an issue or a comment on FakeGitHub. FakeGitHub works out `trusted` and `role` from
+ * it as the GitHub client does (`githubAuthor`).
+ */
 export interface FakeAuthor {
   login: string | null;
   /** GitHub's authorAssociation, e.g. OWNER or NONE. */
@@ -396,8 +400,7 @@ export class FakeGitHub implements CodeHost {
       stateReason: null,
       labels: issue.labels ?? [],
       url: `https://github.com/me/demo/issues/${number}`,
-      author: author.login,
-      authorAssociation: author.association,
+      ...githubAuthor(author.login, author.association),
       comments: [],
       commentAuthors: [],
     };
@@ -429,7 +432,8 @@ export class FakeGitHub implements CodeHost {
       labels: [...issue.labels],
       url: issue.url,
       author: issue.author,
-      authorAssociation: issue.authorAssociation,
+      trusted: issue.trusted,
+      role: issue.role,
       comments: withComments ? this.commentsOf(issue) : [],
     };
   }
@@ -437,7 +441,7 @@ export class FakeGitHub implements CodeHost {
   private commentsOf(issue: FakeIssue): HostComment[] {
     return issue.comments.map((body, i) => {
       const author = issue.commentAuthors[i] ?? OWNER;
-      return { body, author: author.login, authorAssociation: author.association };
+      return { body, ...githubAuthor(author.login, author.association) };
     });
   }
 
@@ -661,8 +665,7 @@ export class FakeGitHub implements CodeHost {
   reviewPull(number: number, review: FakeReview): void {
     const pull = this.pull(number);
     pull.reviews.push({
-      author: review.author,
-      authorAssociation: review.association,
+      ...githubAuthor(review.author, review.association),
       state: review.state,
       body: review.body,
       commit: review.commit === undefined ? pull.headRefOid : review.commit,
@@ -675,8 +678,7 @@ export class FakeGitHub implements CodeHost {
   commentPull(number: number, comment: FakeReviewComment): void {
     const pull = this.pull(number);
     pull.reviewComments.push({
-      author: comment.author,
-      authorAssociation: comment.association,
+      ...githubAuthor(comment.author, comment.association),
       path: comment.path,
       line: comment.line,
       body: comment.body,

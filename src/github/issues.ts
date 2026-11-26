@@ -154,18 +154,16 @@ export function stripMarker(body: string): string {
   return body.replaceAll(COMMENT_MARKER, '').replaceAll(RETRIES_EXHAUSTED_MARKER, '').trim();
 }
 
-/** Relations to the repo whose holders the Master trusts: they can change the repo anyway. */
-export const TRUSTED_ASSOCIATIONS: readonly string[] = ['OWNER', 'MEMBER', 'COLLABORATOR'];
-
 /**
  * Whether the Master trusts what an issue or comment says: anybody can write on a public repo,
  * and what reaches an agent's prompt steers an agent that runs commands on the Master's machine.
- * Trusted are the repo's owner, the members of its organization, its collaborators, and the
- * account the Master acts as (`master`: `github.account`, else gh's active account; null when
- * not known). Everybody else is not, contributors included.
+ * Trusted are the people the code host's client counts as able to change the repo anyway
+ * (`trusted`: on GitHub its owner, the members of its organization and its collaborators), and
+ * the account the Master acts as (`master`: `github.account`, else gh's active account; null
+ * when not known), whatever the case of its login. Everybody else is not, contributors included.
  */
 export function isTrusted(item: HostAuthored, master: string | null): boolean {
-  if (TRUSTED_ASSOCIATIONS.includes(item.authorAssociation.toUpperCase())) return true;
+  if (item.trusted) return true;
   return (
     master !== null && item.author !== null && item.author.toLowerCase() === master.toLowerCase()
   );
@@ -205,7 +203,7 @@ export function repliesAfterMaster(
 
 /** How a Run records the author of its issue whom the Master does not trust. */
 export function untrustedAuthor(issue: HostAuthored, confirmedAt: string | null): UntrustedAuthor {
-  return { author: issue.author, association: issue.authorAssociation, confirmedAt };
+  return { author: issue.author, association: issue.role, confirmedAt };
 }
 
 /** 「@login（NONE）」, who wrote an issue the Master does not trust. */
@@ -221,9 +219,9 @@ export function authorText(author: string | null, association: string): string {
 export function untrustedGoalMessage(issue: {
   number: number;
   author: string | null;
-  authorAssociation: string;
+  role: string;
 }): string {
-  const who = authorText(issue.author, issue.authorAssociation);
+  const who = authorText(issue.author, issue.role);
   return t({
     zh: `issue #${issue.number} 的作者 ${who}不是这个仓库的成员。任何人都能在公开仓库发 issue，内容可能是用来操纵 Agent 的（Agent 会在这台机器上执行命令）。Run 的目标是建 Run 时 issue 的内容，之后 issue 再怎么改也不会变。请读一遍上面的目标，确认可以交给 Agent 后点「确认并开始」；不想做就终止这个 Run，或关闭 issue。`,
     en: `The author of issue #${issue.number}, ${who}, is not a member of this repo. Anybody can open an issue on a public repo, and its text may be meant to steer the agents (which run commands on this machine). The Run's goal is the issue as it was when the Run was created; later edits of the issue do not change it. Read the goal above, and once you are sure it can go to the agents, click "Confirm and start"; if not, cancel this Run or close the issue.`,

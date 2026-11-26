@@ -215,7 +215,10 @@ export interface RunIssue {
 export interface UntrustedAuthor {
   /** GitHub login; null when the account was deleted. */
   author: string | null;
-  /** The author's relation to the repo as GitHub gives it, e.g. NONE or CONTRIBUTOR. */
+  /**
+   * The author's relation to the repo as the code host words it (the client's `role`), e.g.
+   * NONE or CONTRIBUTOR on GitHub.
+   */
   association: string;
   /** When a human confirmed the goal on the dashboard; null while nobody has. */
   confirmedAt: string | null;

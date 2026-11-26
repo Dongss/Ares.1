@@ -3,15 +3,24 @@
 // requests) it delivers Runs through, and the pushes and fetches of the repo's branches. Each
 // platform's client implements CodeHost; the bridge and the scout depend on nothing else.
 
-/** Who wrote an issue or a comment, which decides whether the Master trusts what it says. */
+/**
+ * Who wrote an issue, a comment or a review, which decides whether the Master trusts what it
+ * says (`isTrusted`).
+ */
 export interface HostAuthored {
   /** Login of the author; null when the account was deleted. */
   author: string | null;
   /**
-   * The author's relation to the repo, as GitHub gives it: OWNER, MEMBER, COLLABORATOR,
-   * CONTRIBUTOR, FIRST_TIME_CONTRIBUTOR, FIRST_TIMER, MANNEQUIN or NONE.
+   * Whether the platform counts the author among the people who can change the repo anyway (on
+   * GitHub: its owner, the members of its organization, its collaborators). Each client works it
+   * out by its platform's rules; false when the platform does not say.
    */
-  authorAssociation: string;
+  trusted: boolean;
+  /**
+   * The author's relation to the repo as the platform words it, to show to people (on GitHub
+   * e.g. OWNER, CONTRIBUTOR or NONE); NONE when the platform gives none.
+   */
+  role: string;
 }
 
 export interface HostComment extends HostAuthored {
