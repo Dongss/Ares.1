@@ -10,12 +10,34 @@ import { createInterface } from 'node:readline';
  */
 export const AGENT_GH_TOKEN = 'ares1-agent-no-github-access';
 
+/**
+ * The GitLab token agents and their commands get: invalid on purpose. glab takes GITLAB_TOKEN
+ * before the token it keeps in its own config (`~/.config/glab-cli`), so it fails instead of
+ * falling back to that one.
+ */
+export const AGENT_GITLAB_TOKEN = 'ares1-agent-no-gitlab-access';
+
 /** Variables that hand GitHub credentials to gh and other tools. */
 const GITHUB_TOKEN_VARS = [
   'GH_TOKEN',
   'GITHUB_TOKEN',
   'GH_ENTERPRISE_TOKEN',
   'GITHUB_ENTERPRISE_TOKEN',
+] as const;
+
+/**
+ * Variables that hand GitLab credentials to glab and other tools: glab reads the first three as
+ * its token and CI_JOB_TOKEN when it logs in by itself in CI; python-gitlab reads the
+ * GITLAB_PRIVATE_TOKEN and GITLAB_OAUTH_TOKEN ones.
+ */
+const GITLAB_TOKEN_VARS = [
+  'GITLAB_TOKEN',
+  'GITLAB_ACCESS_TOKEN',
+  'OAUTH_TOKEN',
+  'GLAB_TOKEN',
+  'CI_JOB_TOKEN',
+  'GITLAB_PRIVATE_TOKEN',
+  'GITLAB_OAUTH_TOKEN',
 ] as const;
 
 /**
@@ -26,20 +48,25 @@ const ASKPASS_VARS = ['GIT_ASKPASS', 'SSH_ASKPASS'] as const;
 
 /**
  * The environment of agent CLIs and of the commands run on their work (setup and verify
- * commands, which execute code the agents wrote): the Master's own without its GitHub access.
- * The Master reads issues and pushes by itself, so agents need no GitHub credentials; with them
- * they could read what people the Master does not trust wrote, and act as every GitHub account
- * logged in on this machine.
+ * commands, which execute code the agents wrote): the Master's own without its access to the
+ * code hosts (GitHub, GitLab). The Master reads issues and pushes by itself, so agents need no
+ * such credentials; with them they could read what people the Master does not trust wrote, and
+ * act as every account logged in on this machine.
  * - GitHub tokens are dropped and GH_TOKEN is an invalid one;
  * - gh's config directory is `ghConfigDir`, meant to be an empty directory: gh has no login;
+ * - GitLab tokens are dropped and GITLAB_TOKEN is an invalid one, which glab takes over its
+ *   stored login;
  * - git has no credential helper (keychain, gh) or askpass program and never prompts.
  * Everything else stays as it is, PATH, HOME and the agent CLIs' own logins included.
  */
 export function agentEnv(base: NodeJS.ProcessEnv, ghConfigDir: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
-  for (const name of [...GITHUB_TOKEN_VARS, ...ASKPASS_VARS]) delete env[name];
+  for (const name of [...GITHUB_TOKEN_VARS, ...GITLAB_TOKEN_VARS, ...ASKPASS_VARS]) {
+    delete env[name];
+  }
   env.GH_TOKEN = AGENT_GH_TOKEN;
   env.GH_CONFIG_DIR = ghConfigDir;
+  env.GITLAB_TOKEN = AGENT_GITLAB_TOKEN;
   env.GIT_TERMINAL_PROMPT = '0';
   // git reads config from the environment after every config file, and an empty helper empties
   // the list of helpers set before it, URL-specific ones included. Added after any such config

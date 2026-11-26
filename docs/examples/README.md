@@ -70,7 +70,7 @@ cp docs/examples/workflows/*.yaml ~/.ares1/workflows/
 
 - **装出来的目录要被 git 忽略**。Master 提交时会把工作目录里所有没被忽略的改动都提交上去（`git add -A`），所以 `node_modules`、`.venv`、`target` 这类目录要写在仓库的 `.gitignore` 里。
 - **命令要在 Master 的 PATH 上**。`pnpm`、`uv`、`go`、`cargo` 都要能从启动 Master 的环境里找到；用保活脚本的定时任务启动时 PATH 很短，见 `docs/running.md` 的「保活」。
-- **没有 GitHub 凭据**。准备命令和检查命令在去掉了 GitHub 凭据的环境里运行（见 `docs/running.md` 的「Agent 拿不到 GitHub 凭据」），通过 https 装 GitHub 上的私有依赖会失败。
+- **没有 GitHub 和 GitLab 凭据**。准备命令和检查命令在去掉了 GitHub 和 GitLab 凭据的环境里运行（见 `docs/running.md` 的「Agent 拿不到 GitHub 和 GitLab 凭据」），通过 https 装 GitHub、GitLab 上的私有依赖会失败。
 - **环境变量**：命令运行时设了 `CI=1`、`NO_COLOR=1`，测试框架会按 CI 环境运行（比如不进入 watch 模式）。每条命令的超时是 `config.yaml` 的 `defaults.command_timeout_minutes`。
 - **E2E 要的东西也在准备命令里装**。用 `workflows/with-e2e.yaml` 跑 playwright 时，在准备命令里加上 `npx playwright install chromium`；Linux 上浏览器需要的系统库要先在机器上用 `npx playwright install-deps` 装一次（需要 root）。
 

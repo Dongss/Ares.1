@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { FakeAdapter, type FakeContext, type FakeOutcome } from '../src/adapters/fake.js';
-import { AGENT_GH_TOKEN } from '../src/adapters/process.js';
+import { AGENT_GH_TOKEN, AGENT_GITLAB_TOKEN } from '../src/adapters/process.js';
 import type { AgentAdapter } from '../src/adapters/types.js';
 import {
   backoffMs,
@@ -652,11 +652,13 @@ agents:
     await h.waitStatus(h.run('下一个').id, 'waiting_approval');
   });
 
-  it('gives agents and the setup and verify commands no GitHub credentials', async () => {
+  it('gives agents and the setup and verify commands no GitHub or GitLab credentials', async () => {
     vi.stubEnv('GH_TOKEN', 'gho_master');
     vi.stubEnv('GITHUB_TOKEN', 'ghp_master');
     vi.stubEnv('GH_ENTERPRISE_TOKEN', 'ghe_master');
     vi.stubEnv('GITHUB_ENTERPRISE_TOKEN', 'ghe_master2');
+    vi.stubEnv('GITLAB_TOKEN', 'glpat-master');
+    vi.stubEnv('GLAB_TOKEN', 'glpat-glab');
     vi.stubEnv('ARES1_TEST_KEEP', 'kept');
     const out = tmpDir('ares1-env-');
     h = await harness({
@@ -674,24 +676,27 @@ agents:
     const run = h.run();
     await h.waitStatus(run.id, 'waiting_approval');
 
-    const expectNoGitHub = (env: Record<string, string | undefined>) => {
+    const expectNoCredentials = (env: Record<string, string | undefined>) => {
       expect(env.GH_TOKEN).toBe(AGENT_GH_TOKEN);
       expect(env.GITHUB_TOKEN).toBeUndefined();
       expect(env.GH_ENTERPRISE_TOKEN).toBeUndefined();
       expect(env.GITHUB_ENTERPRISE_TOKEN).toBeUndefined();
       expect(env.GH_CONFIG_DIR).toBe(ghDir);
+      expect(env.GITLAB_TOKEN).toBe(AGENT_GITLAB_TOKEN);
+      expect(env.GLAB_TOKEN).toBeUndefined();
       expect(env.GIT_TERMINAL_PROMPT).toBe('0');
       expect(env.ARES1_TEST_KEEP).toBe('kept');
       expect(env.PATH).toBe(process.env.PATH);
     };
     // The coder and the reviewer.
     expect(h.fake.calls.map((c) => c.model)).toEqual(['coder', 'reviewer']);
-    for (const call of h.fake.calls) expectNoGitHub(call.env);
-    expectNoGitHub(readEnvFile(join(out, 'setup.env')));
-    expectNoGitHub(readEnvFile(join(out, 'verify.env')));
+    for (const call of h.fake.calls) expectNoCredentials(call.env);
+    expectNoCredentials(readEnvFile(join(out, 'setup.env')));
+    expectNoCredentials(readEnvFile(join(out, 'verify.env')));
     expect(seen).toEqual([[]]);
     // The Master keeps its own credentials.
     expect(process.env.GH_TOKEN).toBe('gho_master');
+    expect(process.env.GITLAB_TOKEN).toBe('glpat-master');
   });
 });
 

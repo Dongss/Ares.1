@@ -1826,10 +1826,11 @@ export class IssueBridge {
    * Merge GitHub's commit `remote` into the target branch's `local` (`git merge --no-ff`, with
    * `mergeRemoteMessage`) in a temporary worktree in the system's temp directory, and run the
    * repo's setup and verify commands there on the result, as the Run's checks would: with the
-   * environment agents get (no GitHub credentials), their output in `github-merge-<repo>.log`
-   * under the logs directory, ended when the Master stops. The worktree is deleted whatever
-   * comes of it; the merge commit stays in the repo, to fast-forward the branch to. A merge git
-   * cannot even start is thrown, to be reported like other failures and tried again next round.
+   * environment agents get (no GitHub or GitLab credentials), their output in
+   * `github-merge-<repo>.log` under the logs directory, ended when the Master stops. The worktree
+   * is deleted whatever comes of it; the merge commit stays in the repo, to fast-forward the
+   * branch to. A merge git cannot even start is thrown, to be reported like other failures and
+   * tried again next round.
    */
   private async mergeRemote(repo: Repo, local: string, remote: string): Promise<RemoteMerge> {
     const commands = [...repo.setupCommands, ...repo.verifyCommands];

@@ -23,7 +23,7 @@ export interface StartInput {
   extraArgs: string[];
   /**
    * Environment of the CLI process. The engine and the scout pass `prepareAgentEnv` (see
-   * `src/adapters/process.ts`): no GitHub credentials.
+   * `src/adapters/process.ts`): no GitHub or GitLab credentials.
    */
   env: Record<string, string | undefined>;
   /** Raw CLI output is appended here (one line per event for stream-json CLIs). */

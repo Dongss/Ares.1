@@ -28,7 +28,7 @@ export interface CommandOptions {
   logPath: string;
   /**
    * Environment of the command. These commands run code the agents wrote, so the engine passes
-   * `prepareAgentEnv` (see `src/adapters/process.ts`): no GitHub credentials.
+   * `prepareAgentEnv` (see `src/adapters/process.ts`): no GitHub or GitLab credentials.
    */
   env: NodeJS.ProcessEnv;
   signal?: AbortSignal;

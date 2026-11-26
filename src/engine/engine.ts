@@ -4919,7 +4919,10 @@ export class Engine {
     return this.cfg.master.defaults.command_timeout_minutes * 60_000;
   }
 
-  /** Environment of agents and of the commands run on their work: no GitHub credentials. */
+  /**
+   * Environment of agents and of the commands run on their work: no GitHub or GitLab
+   * credentials.
+   */
   private agentEnv(): NodeJS.ProcessEnv {
     return prepareAgentEnv(this.deps.paths.agentGhConfigDir);
   }

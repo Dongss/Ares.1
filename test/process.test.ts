@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { afterAll, afterEach, describe, expect, it } from 'vitest';
 import {
   AGENT_GH_TOKEN,
+  AGENT_GITLAB_TOKEN,
   agentEnv,
   isOurProcess,
   killProcessGroup,
@@ -364,6 +365,7 @@ describe('agentEnv', () => {
       CURSOR_API_KEY: 'cursor',
       GH_TOKEN: AGENT_GH_TOKEN,
       GH_CONFIG_DIR: '/data/agent-gh-config',
+      GITLAB_TOKEN: AGENT_GITLAB_TOKEN,
       GIT_TERMINAL_PROMPT: '0',
       GIT_CONFIG_COUNT: '1',
       GIT_CONFIG_KEY_0: 'credential.helper',
@@ -371,6 +373,32 @@ describe('agentEnv', () => {
     });
     // The Master's own environment is left alone.
     expect(base.GH_TOKEN).toBe('gho_master');
+  });
+
+  it('drops GitLab credentials and gives glab an invalid token over its stored login', () => {
+    const tokens = {
+      GITLAB_TOKEN: 'glpat-master',
+      GITLAB_ACCESS_TOKEN: 'glpat-access',
+      OAUTH_TOKEN: 'oauth-master',
+      GLAB_TOKEN: 'glpat-glab',
+      CI_JOB_TOKEN: 'glcbt-job',
+      GITLAB_PRIVATE_TOKEN: 'glpat-private',
+      GITLAB_OAUTH_TOKEN: 'gloas-oauth',
+    };
+    // Which GitLab glab talks to is not a credential and stays.
+    const base = { PATH: '/usr/bin:/bin', GITLAB_HOST: 'gitlab.example.com', ...tokens };
+    const before = { ...base };
+    const env = agentEnv(base, '/gh');
+    expect(env).toMatchObject({ PATH: '/usr/bin:/bin', GITLAB_HOST: 'gitlab.example.com' });
+    expect(env.GITLAB_TOKEN).toBe(AGENT_GITLAB_TOKEN);
+    for (const name of Object.keys(tokens).filter((name) => name !== 'GITLAB_TOKEN')) {
+      expect(env).not.toHaveProperty(name);
+    }
+    // No real token is left under any name.
+    const values = Object.values(env);
+    for (const token of Object.values(tokens)) expect(values).not.toContain(token);
+    // The Master's own environment is left alone.
+    expect(base).toEqual(before);
   });
 
   it('adds the empty credential helper after the git config the environment already has', () => {
