@@ -80,6 +80,9 @@ src/
                       status) and has the rework pushed, and the feedback for the coding agent (pure)
     redact.ts         text before it is published on GitHub: the user's home directory → ~
     scout.ts          the AI scout's prompt, output format and Run summary
+  gitlab/
+    client.ts         GitLab through the glab CLI (`glab api`), implementing CodeHost: projects by
+                      their group/subgroup/name path, issues and merge requests by iid
   notify/
     notice.ts         which events notify people (shared by every channel and the dashboard)
     system.ts         system notification channel: sending on each platform, recording failures
