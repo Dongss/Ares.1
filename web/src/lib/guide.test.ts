@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import type { GitHubRepoStatus, NotifyTestResult } from '../../../src/api/types.js';
+import type { GitHubRepoStatus, GitHubStatus, NotifyTestResult } from '../../../src/api/types.js';
 import { TemplateSchema } from '../../../src/config/schema.js';
 import { setLang } from '../../../src/i18n.js';
 import {
@@ -20,6 +20,7 @@ import {
   GUIDE_SECTIONS,
   type GuideInput,
   guardrails,
+  guideRepos,
   idleReasons,
   isGuideSection,
   issueFlow,
@@ -36,6 +37,7 @@ import {
   startCommand,
   stopCommand,
 } from './guide.js';
+import { GITHUB, type IssueHost } from './issues.js';
 
 const template = TemplateSchema.parse({
   id: 'self-dev',
@@ -111,6 +113,7 @@ const on: GuideInput['upgrade'] = { auto: true, installDir: '/Users/me/ares1-sta
 function input(github: GitHubRepoStatus | null, upgrade = off): GuideInput {
   return {
     github,
+    host: GITHUB,
     pollMinutes: 5,
     perRepo: 1,
     maxRuns: null,
@@ -217,18 +220,65 @@ describe('the cycle', () => {
     expect(steps.upgrade?.text).toContain('不是从稳定副本的构建（dist/cli.js）启动的');
   });
 
-  it('works without GitHub', () => {
+  it('works without GitHub or GitLab', () => {
     const steps = byId(input(null));
-    expect(steps.scout?.text).toContain('还没有接入 GitHub');
+    expect(steps.scout?.text).toContain('还没有接入 GitHub 或 GitLab');
     expect(steps.propose?.text).toContain('提不了 issue');
-    expect(steps.propose?.text).toContain('配置 github');
-    // Repos without GitHub have the local backlog, so neither says requirements need GitHub.
+    expect(steps.propose?.text).toContain('配置 github 或 gitlab');
+    // Repos with neither have the local backlog, so none says requirements need GitHub.
     expect(steps.propose?.text).toContain('本地提案池');
     expect(steps.propose?.text).not.toContain('需求只从 GitHub issue 来');
-    expect(steps.run?.text).toContain('建不了 Run');
+    expect(steps.accept?.text).toBe(
+      '由你来做：接入 GitHub 或 GitLab 后，给要做的 issue 加 ares1:ready',
+    );
+    expect(steps.run?.text).toContain('还没有接入 GitHub 或 GitLab，从 issue 建不了 Run');
     expect(steps.run?.text).toContain('本地提案池');
     expect(steps.push?.text).toBe('由你来做：合并只到本地的目标分支（main），需要时自己 git push');
     expect(runStages(input(null))).toBeNull();
+  });
+
+  it('names GitLab for a repo on GitLab', () => {
+    const gitlab: IssueHost = { platform: 'gitlab', host: 'gitlab.example.com' };
+    const onGitLab = (repo: GitHubRepoStatus): GuideInput => ({ ...input(repo), host: gitlab });
+    const steps = byId(onGitLab(partialRepo));
+    expect(steps.push?.name).toBe('推送到 GitLab');
+    expect(steps.push?.text).toContain('合并后 Master 把目标分支（main）推送到 GitLab');
+    const manual = byId(onGitLab({ ...manualRepo, scout: null }));
+    expect(manual.propose?.text).toBe('你在 GitLab 上写 issue');
+    // GitLab closes issues without a reason: the label marks the ones not planned.
+    expect(manual.accept?.text).toBe(
+      '所有提案都由你来做：给要做的 issue 加 ares1:ready；不做的加上 ares1:not-planned 标签后关闭，并写一句理由',
+    );
+    expect(autonomy(onGitLab(partialRepo)).auto).toContain('推送到 GitLab');
+    expect(autonomy(onGitLab(manualRepo)).you).toContain('推送到 GitLab');
+    for (const step of cycleSteps(onGitLab(autoRepo))) expect(step.text).not.toContain('GitHub');
+  });
+
+  it('chooses among the repos of both code hosts, GitHub first', () => {
+    const status = (
+      platform: 'github' | 'gitlab',
+      repos: GitHubRepoStatus[],
+      enabled = true,
+    ): GitHubStatus => ({
+      platform,
+      host: platform === 'gitlab' ? 'gitlab.example.com' : null,
+      enabled,
+      account: null,
+      pollMinutes: platform === 'gitlab' ? 2 : 5,
+      lastPollAt: null,
+      lastError: null,
+      repos,
+    });
+    const web = { ...manualRepo, name: 'web' };
+    const api = { ...partialRepo, name: 'api', issuesRepo: 'grp/sub/api' };
+    const choices = guideRepos([status('github', [web]), status('gitlab', [api])]);
+    expect(choices.map((c) => [c.key, c.status.name, c.host, c.pollMinutes])).toEqual([
+      ['github:web', 'web', GITHUB, 5],
+      ['gitlab:api', 'api', { platform: 'gitlab', host: 'gitlab.example.com' }, 2],
+    ]);
+    // A code host config.yaml has no section for offers nothing.
+    expect(guideRepos([status('github', [web], false), status('gitlab', [api])])).toHaveLength(1);
+    expect(guideRepos([status('github', []), status('gitlab', [], false)])).toEqual([]);
   });
 
   it('says when the template of the issues is missing', () => {
@@ -662,7 +712,7 @@ describe('scoutGuide', () => {
       now: '这个仓库没有配置侦察（scout），不会自己找活。',
       waiting: true,
     });
-    expect(scoutGuide(input(null), now).now).toBe('还没有接入 GitHub，不会自己找活。');
+    expect(scoutGuide(input(null), now).now).toBe('还没有接入 GitHub 或 GitLab，不会自己找活。');
   });
 });
 
@@ -731,8 +781,16 @@ describe('notifications', () => {
       'ares1:running',
       'ares1:needs-you',
       'ares1:failed',
+      'ares1:not-planned',
       'ares1:auto',
     ]);
+    // GitLab closes issues without a reason: the label tells not planned from done.
+    const notPlanned = labelHelp(null).find(([label]) => label === 'ares1:not-planned')?.[1];
+    expect(notPlanned).toContain('GitLab 关闭 issue 时不带原因');
+    expect(notPlanned).toContain('只关闭不加的会被当成已经完成');
+    expect(labelHelp(null).find(([label]) => label === 'ares1:proposal')?.[1]).toContain(
+      'GitLab 上关闭时加上 ares1:not-planned',
+    );
   });
 
   it('explains ares1:iteration: accepted and closed as a whole, never a Run itself', () => {
@@ -1205,9 +1263,15 @@ describe('in English', () => {
 
   it('words the loop, its stages and what is left to you without Chinese', () => {
     setLang('en');
+    const gitlab: IssueHost = { platform: 'gitlab', host: 'gitlab.example.com' };
     for (const github of repos) {
-      for (const upgrade of [off, on, { auto: true, installDir: null }]) {
-        const i = inputEn(github, upgrade);
+      for (const [upgrade, host] of [
+        [off, GITHUB],
+        [on, GITHUB],
+        [{ auto: true, installDir: null }, GITHUB],
+        [off, gitlab],
+      ] as const) {
+        const i = { ...inputEn(github, upgrade), host };
         for (const step of cycleSteps(i)) {
           expect(step.name).not.toMatch(CJK);
           expect(step.text).not.toMatch(CJK);
@@ -1226,6 +1290,15 @@ describe('in English', () => {
       'Accepted automatically: low-risk proposals of size S or M (labeled ares1:ready and ares1:auto); once 3 proposals are accepted in a day, it pauses for the rest of the day and accepts the backlog by itself the next day. Up to you: size L proposals and medium- or high-risk proposals; add ares1:ready or close them',
     );
     expect(steps.push?.text).toContain('pushes the target branch (main) to GitHub');
+    const onGitLab = byId({ ...inputEn(manualRepo), host: gitlab });
+    expect(onGitLab.push?.name).toBe('Push to GitLab');
+    expect(onGitLab.propose?.text).toBe('You write issues on GitLab');
+    expect(onGitLab.accept?.text).toBe(
+      'All proposals are up to you: label the issues to do with ares1:ready; close the others with the ares1:not-planned label and a one-line reason',
+    );
+    expect(byId(inputEn(null)).scout?.text).toBe(
+      'Neither GitHub nor GitLab is set up yet, so there is no AI scout: you decide what to do',
+    );
     expect(steps.run?.text).toContain(
       'each repo executes one Run at a time (concurrency.per_repo: 1), while Runs of different repos can execute side by side',
     );

@@ -15,11 +15,12 @@ language: ${lang()}
 
 port: 4870
 
-# 某个 CLI 不在 PATH 上时，在这里指定可执行文件路径
+# 某个 CLI 不在 PATH 上时，在这里指定可执行文件路径（Master 自己用的 gh、glab 也一样）
 # bins:
 #   claude-code: /usr/local/bin/claude
 #   cursor-agent: /usr/local/bin/cursor-agent
 #   codex: /usr/local/bin/codex
+#   glab: /usr/local/bin/glab
 
 defaults:
   timeout_minutes: 60          # 单次 Agent 执行的超时
@@ -54,13 +55,29 @@ defaults:
 #       daily_budget_usd: 20     # 可选：当天侦察、自动采纳的 Run 和自动重做的 Run 花费达到后停止自动行为；不写 = 不限
 #       max_run_attempts: 3      # 一个 issue 最多跑几次 Run（含第一次）：失败后自动重做，带上失败原因；用完就关闭 issue 并写明每次的原因；1 = 不重做
 
-# 不接 GitHub 的仓库（本地仓库、没有 GitHub 账号、托管在 GitLab 或内网）用本地提案池：侦察的提案存在 Master 里，
-# 在看板上采纳，或按 auto_accept 自动采纳后直接建 Run；不需要 gh。字段的含义和 github.repos 里的同名字段一样
-# （说明见${brandName()}仓库的 docs/running.md「不用 GitHub 时」）。同一个仓库不能同时写在 github.repos 和 backlog.repos 里
+# 托管在 GitLab 上的仓库（gitlab.com 或自建的）用 GitLab Issues 管理需求，规则和 github 的一样（说明见${brandName()}仓库的
+# docs/running.md「接入 GitLab」）：需要安装 glab 并登录（glab auth login，自建的加 --hostname，和下面的 host 一样）。
+# 登录的账号要能改 issue 和标签，push: true 时还要能推送目标分支（Developer 及以上，受保护分支要允许它推送）；
+# 作者对项目的权限在 Developer 及以上才受信任，其他人开的 issue 建出的 Run 先等你确认需求
+# gitlab:
+#   host: gitlab.com             # GitLab 的主机名，默认 gitlab.com；自建的写它的主机名，不带 https://
+#   # account: my-account        # 可选：Master 在 GitLab 上用的账号，要和 glab 登录的一致；不写则问 glab 当前登录的账号
+#   poll_minutes: 5              # 多久查一次带 ares1:ready 标签的 issue
+#   repos:
+#     my-gitlab-repo:            # 看板上登记的仓库名，不能和 github.repos 里的重名
+#       issues_repo: my-group/my-gitlab-repo  # 必填：项目在 GitLab 上的路径，在子组里就写全：group/subgroup/name
+#       template: self-dev       # 从 issue 建 Run 用的模板；scout、auto_accept、auto_merge、daily_budget_usd、max_run_attempts 和 github.repos 里的一样
+#       push: false              # true = 合并后把目标分支推送到 GitLab，每轮检查时也把 GitLab 上的新提交快进到本地目标分支
+#       deliver: push            # 目前只支持 push：合并进本地目标分支后推送；还不支持 MR
+
+# 没有 GitHub 或 GitLab issue 可用的仓库（只在本机的仓库、没有这两种账号、托管在内网其他服务上）用本地提案池：
+# 侦察的提案存在 Master 里，在看板上采纳，或按 auto_accept 自动采纳后直接建 Run；不需要 gh 或 glab。字段的含义和 github.repos
+# 里的同名字段一样（说明见${brandName()}仓库的 docs/running.md「不用 GitHub 时」）。一个仓库只能写在 github.repos、gitlab.repos、
+# backlog.repos 中的一处，按这个顺序检查，后出现的不生效
 # backlog:
 #   poll_minutes: 5              # 多久检查一次本地提案池：自动采纳范围内的提案、该侦察时侦察
 #   repos:
-#     my-local-repo:             # 看板上登记的仓库名，不能和 github.repos 里的重名
+#     my-local-repo:             # 看板上登记的仓库名，不能和 github.repos、gitlab.repos 里的重名
 #       template: self-dev       # 采纳的提案建 Run 用的模板
 #       scout:
 #         agent: claude-reviewer # 以只读方式运行，要用支持只读的 CLI（claude-code、codex）的 Agent
@@ -88,11 +105,12 @@ language: ${lang()}
 
 port: 4870
 
-# The executable of a CLI that is not on PATH
+# The executable of a CLI that is not on PATH (also of gh and glab, which the Master uses itself)
 # bins:
 #   claude-code: /usr/local/bin/claude
 #   cursor-agent: /usr/local/bin/cursor-agent
 #   codex: /usr/local/bin/codex
+#   glab: /usr/local/bin/glab
 
 defaults:
   timeout_minutes: 60          # timeout of a single agent execution
@@ -126,13 +144,29 @@ defaults:
 #       daily_budget_usd: 20     # optional: stop automatic actions once the day's scouts, auto-accepted Runs and automatic redos cost this much; omitted = no limit
 #       max_run_attempts: 3      # Runs an issue gets at most, the first included: a failed Run is redone automatically with its reason; once they are used up, the issue is closed with every reason; 1 = never redone
 
-# Repos without GitHub (local only, no GitHub account, hosted on GitLab or an intranet) use the local backlog: the scout's proposals are kept by
-# the Master, and become Runs once accepted on the dashboard or automatically by auto_accept; no gh needed. The fields mean what they mean in
-# github.repos (see "Without GitHub" in docs/running.md of the ${brandName()} repo). A repo cannot be in both github.repos and backlog.repos
+# Repos hosted on GitLab (gitlab.com or a self-hosted one) take requirements as GitLab Issues, by the same rules as github (see the GitLab section of
+# docs/running.md in the ${brandName()} repo); needs glab installed and logged in (glab auth login, with --hostname set to the host below for a self-hosted one).
+# The account must be able to edit issues and labels, and with push: true to push the target branch (Developer or above; a protected branch must let it push).
+# Authors are trusted from Developer up on the project; a Run from anybody else's issue waits for you to confirm its goal
+# gitlab:
+#   host: gitlab.com             # the GitLab's host name, gitlab.com by default; a self-hosted one's own, without https://
+#   # account: my-account        # optional: the account the Master acts as on GitLab, the one glab is logged in as; omitted = asked of glab
+#   poll_minutes: 5              # how often to look for issues labeled ares1:ready
+#   repos:
+#     my-gitlab-repo:            # the repo name registered on the dashboard; not one of github.repos
+#       issues_repo: my-group/my-gitlab-repo  # required: the project's path on GitLab, subgroups included: group/subgroup/name
+#       template: self-dev       # template of the Runs created from issues; scout, auto_accept, auto_merge, daily_budget_usd and max_run_attempts as in github.repos
+#       push: false              # true = push the target branch to GitLab after merging, and fast-forward it to new commits on GitLab at every check
+#       deliver: push            # push only for now: merge into the local target branch, then push it; no merge requests yet
+
+# Repos with neither GitHub nor GitLab issues (local only, no such account, hosted on another intranet service) use the local backlog: the scout's
+# proposals are kept by the Master, and become Runs once accepted on the dashboard or automatically by auto_accept; no gh or glab needed. The fields
+# mean what they mean in github.repos (see the local backlog section of docs/running.md in the ${brandName()} repo). A repo can be in only one of github.repos,
+# gitlab.repos and backlog.repos; they are checked in that order, and a later one does not take effect
 # backlog:
 #   poll_minutes: 5              # how often to go over the local backlog: auto-accept proposals within range, scout when it is time
 #   repos:
-#     my-local-repo:             # the repo name registered on the dashboard; not one of github.repos
+#     my-local-repo:             # the repo name registered on the dashboard; not one of github.repos or gitlab.repos
 #       template: self-dev       # template of the Runs created from accepted proposals
 #       scout:
 #         agent: claude-reviewer # runs read-only, so it needs an agent of a CLI that supports that (claude-code, codex)

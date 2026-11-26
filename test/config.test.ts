@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { defaultConfigYaml } from '../src/config/defaults.js';
 import {
   attemptsAllowed,
   budgetPauses,
@@ -1028,6 +1029,29 @@ backlog:
       const use = dropped === 'gitlab' ? '改用 GitLab issue' : '改用本地提案池';
       return `仓库 ${name} 同时写在 ${kept}.repos 和 ${dropped}.repos 里：一个仓库只能选一种需求来源（GitHub issue、GitLab issue 或本地提案池）。${dropped}.repos 里的设置没有生效，${side} 一侧照常工作；想${use}，就把它从 ${kept}.repos 里删掉`;
     }
+
+    it('is shown, commented out, in the default config.yaml, and loads once uncommented', () => {
+      for (const language of ['zh', 'en'] as const) {
+        setLang(language);
+        const text = defaultConfigYaml();
+        if (language === 'en') expect(text).not.toMatch(/[一-鿿]/);
+        const lines = text.split('\n');
+        const start = lines.indexOf('# gitlab:');
+        expect(start, language).toBeGreaterThan(-1);
+        const end = lines.findIndex((line, i) => i > start && line === '');
+        const section = lines.slice(start, end).map((line) => line.replace(/^# ?/, ''));
+        const cfg = load(`language: ${language}\n${section.join('\n')}\n`);
+        expect(cfg.errors, language).toEqual({});
+        expect(cfg.warnings, language).toEqual({});
+        expect(cfg.master.gitlab?.host).toBe('gitlab.com');
+        expect(cfg.master.gitlab?.repos['my-gitlab-repo']).toMatchObject({
+          issues_repo: 'my-group/my-gitlab-repo',
+          template: 'self-dev',
+          push: false,
+          deliver: 'push',
+        });
+      }
+    });
 
     it('is off unless written, and reads its repos with the defaults of github.repos', () => {
       expect(load('port: 4870\n').master.gitlab).toBeUndefined();

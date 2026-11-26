@@ -1,6 +1,7 @@
 import type {
   ConfigView,
   GitHubRepoStatus,
+  GitHubStatus,
   NotifyTestResult,
   UpgradeStatus,
 } from '../../../src/api/types.js';
@@ -26,7 +27,15 @@ import type { BlockKind } from '../../../src/store/types.js';
 import { findRepoTemplate } from './config.js';
 import { buildFlow, type FlowStage } from './flow.js';
 import { formatCost, formatMinutes, type Tone } from './format.js';
-import { acceptRanges, afterChinese, beforeChinese, scoutWaitText } from './issues.js';
+import {
+  acceptRanges,
+  afterChinese,
+  beforeChinese,
+  GITHUB,
+  type IssueHost,
+  platformName,
+  scoutWaitText,
+} from './issues.js';
 import { webhookNote } from './notify.js';
 
 // The guide page: how the self-hosting loop works under the current configuration.
@@ -111,11 +120,16 @@ export function isGuideSection(id: string): id is GuideSection {
   return GUIDE_SECTIONS.some((s) => s.id === id);
 }
 
-/** What the guide is about: one repo of the `github` section, as configured now. */
+/** What the guide is about: one repo of the `github` or the `gitlab` section, as configured now. */
 export interface GuideInput {
-  /** The repo whose issues the Master works on; null when GitHub is not set up (or has no repo). */
+  /**
+   * The repo whose issues the Master works on, on GitHub or GitLab (`host`); null when neither is
+   * set up (or has no repo).
+   */
   github: GitHubRepoStatus | null;
-  /** `github.poll_minutes`. */
+  /** The code host the repo's issues are on; GitHub when there is no repo. */
+  host: IssueHost;
+  /** `poll_minutes` of the repo's code host (`github.poll_minutes` / `gitlab.poll_minutes`). */
   pollMinutes: number;
   /** `concurrency.per_repo`: how many Runs of a repo execute at the same time. */
   perRepo: number;
@@ -126,6 +140,33 @@ export interface GuideInput {
   /** The registered repo's target branch; null when not known. */
   targetBranch: string | null;
   upgrade: Pick<UpgradeStatus, 'auto' | 'installDir'>;
+}
+
+/** A repo the guide can be about, with the code host its issues are on. */
+export interface GuideRepo {
+  /** Tells the repo apart among the choices: its platform and name. */
+  key: string;
+  status: GitHubRepoStatus;
+  host: IssueHost;
+  /** `poll_minutes` of its code host. */
+  pollMinutes: number;
+}
+
+/**
+ * The repos the guide can be about, from GET /api/github and GET /api/gitlab in that order: each
+ * code host's repos in config.yaml's order, none of a host whose section config.yaml lacks.
+ */
+export function guideRepos(hosts: readonly GitHubStatus[]): GuideRepo[] {
+  return hosts.flatMap((h) =>
+    h.enabled
+      ? h.repos.map((status) => ({
+          key: `${h.platform}:${status.name}`,
+          status,
+          host: { platform: h.platform, host: h.host },
+          pollMinutes: h.pollMinutes,
+        }))
+      : [],
+  );
 }
 
 /** How a Run created from an issue goes: the template with the `auto_merge` override applied. */
@@ -226,10 +267,31 @@ function canUpgradeItself(upgrade: GuideInput['upgrade']): boolean {
 }
 
 /**
- * The accept step: which proposals the Master accepts by itself and which are left to you, by the
- * auto-accept rule (`rule`; tests may pass another). Only marked "up to you" when some are.
+ * How you close the issues you will not do on the code host, lowercase: GitHub keeps the reason,
+ * while GitLab closes without one, so the ares1:not-planned label tells it apart from done.
  */
-export function acceptStep(github: GitHubRepoStatus | null, rule?: AutoAcceptRule): CycleStep {
+function closeOthers(host: IssueHost): string {
+  return host.platform === 'gitlab'
+    ? t({
+        zh: '不做的加上 ares1:not-planned 标签后关闭，并写一句理由',
+        en: 'close the others with the ares1:not-planned label and a one-line reason',
+      })
+    : t({
+        zh: '不做的关闭为 not planned 并写一句理由',
+        en: 'close the others as not planned with a one-line reason',
+      });
+}
+
+/**
+ * The accept step: which proposals the Master accepts by itself and which are left to you, by the
+ * auto-accept rule (`rule`; tests may pass another), on the code host of the repo's issues
+ * (`host`). Only marked "up to you" when some are.
+ */
+export function acceptStep(
+  github: GitHubRepoStatus | null,
+  rule?: AutoAcceptRule,
+  host: IssueHost = GITHUB,
+): CycleStep {
   const id = 'accept';
   const name = t({ zh: '采纳', en: 'Accept' });
   if (!github) {
@@ -238,8 +300,8 @@ export function acceptStep(github: GitHubRepoStatus | null, rule?: AutoAcceptRul
       name,
       actors: ['human'],
       text: t({
-        zh: '由你来做：接入 GitHub 后，给要做的 issue 加 ares1:ready',
-        en: 'Up to you: once GitHub is set up, label the issues to do with ares1:ready',
+        zh: '由你来做：接入 GitHub 或 GitLab 后，给要做的 issue 加 ares1:ready',
+        en: 'Up to you: once GitHub or GitLab is set up, label the issues to do with ares1:ready',
       }),
     };
   }
@@ -252,8 +314,8 @@ export function acceptStep(github: GitHubRepoStatus | null, rule?: AutoAcceptRul
       name,
       actors: ['human'],
       text: t({
-        zh: `${all}都由你来做：给要做的 issue 加 ares1:ready；不做的关闭为 not planned 并写一句理由`,
-        en: `${capitalize(all)} are up to you: label the issues to do with ares1:ready; close the others as not planned with a one-line reason`,
+        zh: `${all}都由你来做：给要做的 issue 加 ares1:ready；${closeOthers(host)}`,
+        en: `${capitalize(all)} are up to you: label the issues to do with ares1:ready; ${closeOthers(host)}`,
       }),
     };
   }
@@ -347,6 +409,7 @@ export function concurrencyText(perRepo: number, maxRuns: number | null = null):
 export function cycleSteps(input: GuideInput, rule?: AutoAcceptRule): CycleStep[] {
   const { github, pollMinutes } = input;
   const scout = github?.scout ?? null;
+  const hostName = platformName(input.host.platform);
   const step = (id: CycleStepId, name: string, actors: Actor[], text: string): CycleStep => ({
     id,
     name,
@@ -355,7 +418,7 @@ export function cycleSteps(input: GuideInput, rule?: AutoAcceptRule): CycleStep[
   });
   const scoutName = t({ zh: '侦察', en: 'Scout' });
   const proposeName = t({ zh: '提 issue', en: 'File issues' });
-  const pushName = t({ zh: '推送到 GitHub', en: 'Push to GitHub' });
+  const pushName = t({ zh: `推送到 ${hostName}`, en: `Push to ${hostName}` });
   const upgradeName = t({ zh: 'Master 升级自己', en: 'Master upgrades itself' });
   const rescoutName = t({ zh: '空闲时再侦察', en: 'Scout again when idle' });
 
@@ -365,8 +428,8 @@ export function cycleSteps(input: GuideInput, rule?: AutoAcceptRule): CycleStep[
         scoutName,
         ['human'],
         t({
-          zh: '还没有接入 GitHub，没有 AI 侦察：做什么由你决定',
-          en: 'GitHub is not set up yet, so there is no AI scout: you decide what to do',
+          zh: '还没有接入 GitHub 或 GitLab，没有 AI 侦察：做什么由你决定',
+          en: 'Neither GitHub nor GitLab is set up yet, so there is no AI scout: you decide what to do',
         }),
       )
     : !scout
@@ -399,8 +462,8 @@ export function cycleSteps(input: GuideInput, rule?: AutoAcceptRule): CycleStep[
         proposeName,
         ['human'],
         t({
-          zh: '还没有接入 GitHub，提不了 issue：先在 config.yaml 里配置 github（不接 GitHub 的仓库用本地提案池，见「需求」页）',
-          en: 'GitHub is not set up yet, so no issue can be filed: configure github in config.yaml first (repos without GitHub use the local backlog, see the Issues page)',
+          zh: '还没有接入 GitHub 或 GitLab，提不了 issue：先在 config.yaml 里配置 github 或 gitlab（两者都不接的仓库用本地提案池，见「需求」页）',
+          en: 'Neither GitHub nor GitLab is set up yet, so no issue can be filed: configure github or gitlab in config.yaml first (repos with neither use the local backlog, see the Issues page)',
         }),
       )
     : !scout
@@ -408,7 +471,7 @@ export function cycleSteps(input: GuideInput, rule?: AutoAcceptRule): CycleStep[
           'propose',
           proposeName,
           ['human'],
-          t({ zh: '你在 GitHub 上写 issue', en: 'You write issues on GitHub' }),
+          t({ zh: `你在 ${hostName} 上写 issue`, en: `You write issues on ${hostName}` }),
         )
       : step(
           'propose',
@@ -420,7 +483,7 @@ export function cycleSteps(input: GuideInput, rule?: AutoAcceptRule): CycleStep[
           }),
         );
 
-  const accept = acceptStep(github, rule);
+  const accept = acceptStep(github, rule, input.host);
 
   const stages = runStages(input);
   const runActors: Actor[] = ['ai', 'master'];
@@ -433,8 +496,8 @@ export function cycleSteps(input: GuideInput, rule?: AutoAcceptRule): CycleStep[
         'Run',
         runActors,
         t({
-          zh: '还没有接入 GitHub，从 issue 建不了 Run；不接 GitHub 的仓库从本地提案池建 Run，见「需求」页',
-          en: 'GitHub is not set up yet, so no Run comes from issues; repos without GitHub get Runs from the local backlog, see the Issues page',
+          zh: '还没有接入 GitHub 或 GitLab，从 issue 建不了 Run；两者都不接的仓库从本地提案池建 Run，见「需求」页',
+          en: 'Neither GitHub nor GitLab is set up yet, so no Run comes from issues; repos with neither get Runs from the local backlog, see the Issues page',
         }),
       )
     : step(
@@ -467,8 +530,8 @@ export function cycleSteps(input: GuideInput, rule?: AutoAcceptRule): CycleStep[
             pushName,
             ['master'],
             t({
-              zh: `合并后 Master 把${target}推送到 GitHub，再在 issue 上留言并关闭它；推送失败会通知你，从不强推`,
-              en: `After a merge the Master pushes ${target} to GitHub, then comments on the issue and closes it; a failed push notifies you, and it never force-pushes`,
+              zh: `合并后 Master 把${target}推送到 ${hostName}，再在 issue 上留言并关闭它；推送失败会通知你，从不强推`,
+              en: `After a merge the Master pushes ${target} to ${hostName}, then comments on the issue and closes it; a failed push notifies you, and it never force-pushes`,
             }),
           )
         : step(
@@ -733,7 +796,8 @@ export function autonomy(
     t({ zh: '合并', en: 'Merging' }),
     t({ zh: '合并前审批', en: 'Approving merges' }),
   );
-  add(github?.push === true, t({ zh: '推送到 GitHub', en: 'Pushing to GitHub' }));
+  const hostName = platformName(input.host.platform);
+  add(github?.push === true, t({ zh: `推送到 ${hostName}`, en: `Pushing to ${hostName}` }));
   if (github?.deliver === 'pr') {
     you.push(t({ zh: '在 GitHub 上合并 PR', en: 'Merging pull requests on GitHub' }));
   }
@@ -778,8 +842,8 @@ export function scoutGuide(
     return {
       conditions: [],
       now: t({
-        zh: '还没有接入 GitHub，不会自己找活。',
-        en: 'GitHub is not set up yet, so it does not find work by itself.',
+        zh: '还没有接入 GitHub 或 GitLab，不会自己找活。',
+        en: 'Neither GitHub nor GitLab is set up yet, so it does not find work by itself.',
       }),
       waiting: true,
     };
@@ -872,14 +936,14 @@ export function scoutGuide(
 /**
  * How the scout's iterations go, in short, for the guide's section on the scout: what one is,
  * accepting it as a whole, the dependencies, being done or blocked, and what the scout does while
- * one is under way. The same rules on GitHub and in the local backlog.
+ * one is under way. The same rules on GitHub, on GitLab and in the local backlog.
  */
 export function iterationGuide(): string[] {
   const max = MAX_ITERATION_CHILDREN;
   return [
     t({
-      zh: `仓库没有进行中的迭代时，侦察的主要产出是一个迭代：从差距分析里选最重要的一个缺口，一次规划好目标、完成标准、不做的事和按依赖排好的子项（最多 ${max} 个，最后一个是整理评审建议的「收尾」）。接了 GitHub 的仓库建成一个带 ares1:iteration 的 issue 和每步一个子 issue，本地提案池里是一个迭代和每步一条提案`,
-      en: `When the repo has no iteration under way, the scout's main output is an iteration: it takes the most important gap from its gap analysis and plans, in one go, the goal, completion criteria, what is left out, and steps ordered by their dependencies (at most ${max}, the last one the closing step that goes through review suggestions). On GitHub it becomes an issue labeled ares1:iteration and one sub-issue per step; in the local backlog, an iteration with one proposal per step`,
+      zh: `仓库没有进行中的迭代时，侦察的主要产出是一个迭代：从差距分析里选最重要的一个缺口，一次规划好目标、完成标准、不做的事和按依赖排好的子项（最多 ${max} 个，最后一个是整理评审建议的「收尾」）。接了 GitHub 或 GitLab 的仓库建成一个带 ares1:iteration 的 issue 和每步一个子 issue，本地提案池里是一个迭代和每步一条提案`,
+      en: `When the repo has no iteration under way, the scout's main output is an iteration: it takes the most important gap from its gap analysis and plans, in one go, the goal, completion criteria, what is left out, and steps ordered by their dependencies (at most ${max}, the last one the closing step that goes through review suggestions). On GitHub or GitLab it becomes an issue labeled ares1:iteration and one sub-issue per step; in the local backlog, an iteration with one proposal per step`,
     }),
     t({
       zh: '迭代整批采纳：自动采纳取子项里最高的风险和最大的大小来判断，在每天的自动采纳条数里只算一次；人来采纳就给迭代 issue 加 ares1:ready（本地提案池在「迭代」页上采纳）',
@@ -927,13 +991,13 @@ function noticeHandling(kind: NoticeKind): string {
       });
     case 'proposals':
       return t({
-        zh: '去 GitHub 看 ares1:proposal 的 issue：要做就加 ares1:ready，不做就关闭为 not planned 并写一句理由',
-        en: 'Look at the ares1:proposal issues on GitHub: to do one, add ares1:ready; otherwise close it as not planned with a one-line reason',
+        zh: '去 GitHub 或 GitLab（通知里写着是哪个）看 ares1:proposal 的 issue：要做就加 ares1:ready，不做就关闭为 not planned 并写一句理由（GitLab 关闭时不带原因，要同时加上 ares1:not-planned 标签）',
+        en: 'Look at the ares1:proposal issues on GitHub or GitLab (the notification says which): to do one, add ares1:ready; otherwise close it as not planned with a one-line reason (GitLab closes without a reason, so add the ares1:not-planned label as you close it)',
       });
     case 'iteration':
       return t({
-        zh: '去 GitHub 看迭代 issue 和那个子 issue 为什么失败或被关掉：等下次侦察换个做法补一个子 issue 替换它，替换后迭代自动接着做；也可以修好原因后重新打开它、加上 ares1:ready 重做；不想做了就关掉迭代 issue，还没完成的子 issue 会一起终止并关成不做',
-        en: 'On GitHub, look at the iteration issue and why the sub-issue failed or was closed: the next scout adds a sub-issue that replaces it with another approach, and the iteration goes on once it is replaced; or fix the cause, reopen the sub-issue and add ares1:ready to redo it; to drop the rest, close the iteration issue, and the sub-issues not yet done are stopped and closed as not planned with it',
+        zh: '去 GitHub 或 GitLab 看迭代 issue 和那个子 issue 为什么失败或被关掉：等下次侦察换个做法补一个子 issue 替换它，替换后迭代自动接着做；也可以修好原因后重新打开它、加上 ares1:ready 重做；不想做了就关掉迭代 issue，还没完成的子 issue 会一起终止并关成不做',
+        en: 'On GitHub or GitLab, look at the iteration issue and why the sub-issue failed or was closed: the next scout adds a sub-issue that replaces it with another approach, and the iteration goes on once it is replaced; or fix the cause, reopen the sub-issue and add ares1:ready to redo it; to drop the rest, close the iteration issue, and the sub-issues not yet done are stopped and closed as not planned with it',
       });
     case 'scout':
       return t({
@@ -942,13 +1006,13 @@ function noticeHandling(kind: NoticeKind): string {
       });
     case 'github':
       return t({
-        zh: '看「需求」页的错误信息，多半是 gh 没登录、网络不通或推送不能快进；修好后下次检查会自动重试',
-        en: 'See the error on the Issues page; usually gh is not logged in, the network is down or a push cannot fast-forward. Once fixed, the next check retries by itself',
+        zh: '看「需求」页 GitHub 或 GitLab 一节的错误信息，多半是 gh 或 glab 没登录、账号没有权限（比如推送受保护的分支）、网络不通或推送不能快进；修好后下次检查会自动重试',
+        en: 'See the error in the GitHub or GitLab section of the Issues page; usually gh or glab is not logged in, the account lacks a permission (such as pushing to a protected branch), the network is down or a push cannot fast-forward. Once fixed, the next check retries by itself',
       });
     case 'pull':
       return t({
-        zh: '分叉后自动合并有冲突或检查没通过时，在仓库里把 GitHub 上的目标分支合并进本地目标分支（比如 git fetch 后 git merge origin/<分支>），下次检查 Master 会推送上去，已完成 Run 的 issue 随之关闭。检查要用的程序找不到时装好它，下次检查会自动再合并。有未提交的改动时提交或丢弃它们，下次检查会自动拉取',
-        en: "When the Master's merge of the diverged branches conflicts or fails the checks, merge the target branch on GitHub into the local one in the repo (e.g. git fetch, then git merge origin/<branch>); the next check pushes it and the issues of completed Runs close. When a program the checks start is missing, install it; the next check merges by itself. For uncommitted changes, commit or discard them; the next check pulls by itself",
+        zh: '分叉后自动合并有冲突或检查没通过时，在仓库里把 GitHub 或 GitLab 上的目标分支合并进本地目标分支（比如 git fetch 后 git merge origin/<分支>），下次检查 Master 会推送上去，已完成 Run 的 issue 随之关闭。检查要用的程序找不到时装好它，下次检查会自动再合并。有未提交的改动时提交或丢弃它们，下次检查会自动拉取',
+        en: "When the Master's merge of the diverged branches conflicts or fails the checks, merge the target branch on GitHub or GitLab into the local one in the repo (e.g. git fetch, then git merge origin/<branch>); the next check pushes it and the issues of completed Runs close. When a program the checks start is missing, install it; the next check merges by itself. For uncommitted changes, commit or discard them; the next check pulls by itself",
       });
     case 'upgrade':
       return t({
@@ -1095,8 +1159,8 @@ export function labelHelp(autoAccept: GitHubRepoStatus['autoAccept'] | null): [s
     [
       'ares1:proposal',
       t({
-        zh: 'AI 提出的需求。采纳就加 ares1:ready；不做就关闭为 not planned，留一句理由，AI 下次会避开',
-        en: 'A requirement proposed by the AI. To accept it, add ares1:ready; otherwise close it as not planned with a one-line reason, and the AI avoids it next time',
+        zh: 'AI 提出的需求。采纳就加 ares1:ready；不做就关闭为 not planned（GitLab 上关闭时加上 ares1:not-planned），留一句理由，AI 下次会避开',
+        en: 'A requirement proposed by the AI. To accept it, add ares1:ready; otherwise close it as not planned (on GitLab, closing it with ares1:not-planned) with a one-line reason, and the AI avoids it next time',
       }),
     ],
     [
@@ -1132,6 +1196,13 @@ export function labelHelp(autoAccept: GitHubRepoStatus['autoAccept'] | null): [s
       t({
         zh: 'Run 被终止，或失败次数达到 max_run_attempts 后不再自动重做；重新加 ares1:ready 会重做',
         en: 'The Run was cancelled, or failed max_run_attempts times and is not redone again; add ares1:ready again to redo it',
+      }),
+    ],
+    [
+      'ares1:not-planned',
+      t({
+        zh: '关成不做。GitLab 关闭 issue 时不带原因，靠这个标签区分「不做」和「完成」：Master 关成不做时会加上它；你不做的提案关闭时也要加上，只关闭不加的会被当成已经完成。GitHub 自己记着关闭的原因，用不到它',
+        en: 'Closed as not planned. GitLab closes an issue without a reason, so this label tells "not planned" from "done": the Master adds it when it closes an issue as not planned, and so should you when you close a proposal you will not do, or it counts as done. GitHub keeps the reason itself and has no use for it',
       }),
     ],
     ['ares1:auto', auto],

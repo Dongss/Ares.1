@@ -70,15 +70,18 @@ src/
                       done, the review suggestions the closing step goes through
   host/               the code host, whatever the platform:
     code-host.ts      the platform-neutral code host interface (CodeHost) and its types
-    factory.ts        the code host's client for the config, by platform
+    factory.ts        the code host's client for the config, by platform: GhCli for GitHub, GlabCli
+                      for GitLab
   github/
     client.ts         GitHub through the gh CLI, implementing CodeHost: GitHub's fields turned into
                       the neutral ones (trust, review verdict, failed checks) (FakeGitHub in tests)
-    bridge.ts         polling, Runs from issues, progress on issues, auto-accept, push, auto-scout
-    issues.ts         labels, issue texts, hidden comment markers, Run status ↔ issue (pure)
+    bridge.ts         polling, Runs from issues, progress on issues, auto-accept, push, auto-scout;
+                      one instance per code host (GitHub's repos, GitLab's)
+    issues.ts         labels, issue texts, hidden comment markers, Run status ↔ issue (pure), on
+                      GitHub and GitLab alike
     pr-rework.ts      whether an open pull request needs rework (reviews, CI, conflict; by the neutral
                       status) and has the rework pushed, and the feedback for the coding agent (pure)
-    redact.ts         text before it is published on GitHub: the user's home directory → ~
+    redact.ts         text before it is published on GitHub or GitLab: the user's home directory → ~
     scout.ts          the AI scout's prompt, output format and Run summary
   gitlab/
     client.ts         GitLab through the glab CLI (`glab api`), implementing CodeHost: projects by
@@ -119,7 +122,8 @@ web/                  dashboard (React + Vite)
 docs/                 documents for people besides the README (in Chinese)
   examples/           configuration examples laid out like a data directory
 test/
-  helpers.ts          temp dirs and repos, a Master with fake agents (harness), FakeGitHub
+  helpers.ts          temp dirs and repos, a Master with fake agents (harness), FakeGitHub and
+                      FakeGitLab
   *.test.ts           tests run by npm test
   real/               tests that call the real CLIs (npm run test:real)
 ```
@@ -155,9 +159,11 @@ test/
     proposals a human may start over (`proposalRestartable`), raw log retention (`runRawLogsExpired` /
     `scoutRawLogExpired`), leftover worktrees (`leftoverWorkspaces`), which template a repo's
     Runs get by id, the home directory's or the repo's own (`resolveTemplate`), where a repo's
-    requirements come from, GitHub, GitLab or the local backlog (`requirementSource`), and how
+    requirements come from, GitHub, GitLab or the local backlog (`requirementSource`: a name in
+    more than one of `github.repos`, `gitlab.repos`, `backlog.repos` is the first's), and how
     often that source is polled (`sourcePollMinutes`), whether a repo delivers through pull
-    requests (`deliversByPr`), the limit on Runs executing across repos
+    requests (`deliversByPr`: GitHub repos with `deliver: pr` only; GitLab repos deliver by push
+    only), the limit on Runs executing across repos
     and which queued Runs wait for it (`roomUnderMaxRuns` / `waitsForMaxRuns`), the paths a Run
     expects to change and whether two Runs' paths overlap (`normalizeTouches` /
     `touchesOverlap` / `conflictBlocker`), the rules of iterations: how many children one plans
@@ -181,9 +187,9 @@ test/
     the curl config file `webhookCurlConfig` (`src/notify/webhook.ts`) writes
   - the display name and slogan: `brandName()` / `brandSlogan()` / `brandTitle()` in `src/brand.ts`. Never write them as literals elsewhere. The exception is the `<title>` of `web/index.html`, a static file that keeps the Chinese title; a test keeps the two in sync.
 - Every comment the Master posts on an issue goes through `markComment` (`src/github/issues.ts`), which adds the hidden marker that tells it apart from human replies.
-- Every text the Master publishes on GitHub goes through `redactForGitHub` (`src/github/redact.ts`), which turns paths under the user's home directory into `~` so the system user name stays private: comments (in the bridge's `comment()`), the issues it creates, and the commit messages it makes (they may be pushed). The notifications it POSTs to a webhook (`src/notify/webhook.ts`) go through it too, and `scripts/webhook.sh` does the same in bash (`webhook_tilde`) for what the scripts send. Store the original text: the dashboard and logs keep the full paths.
-- Anybody can write on a public repo. Text read from GitHub (issues, comments, reviews) goes into an agent's prompt only when its author is trusted. Two places decide it together: the code host's client says whether the platform counts the author among the people who can change the repo (`trusted` on `HostAuthored`; the GitHub client, `githubAuthor` in `src/github/client.ts`, counts the repo's owner, members and collaborators), and `isTrusted` (`src/github/issues.ts`) adds only the account the Master acts as. A Run from an issue by anyone else waits for a human to confirm its goal (`untrusted_issue`).
-- Agents and the commands run on their work (setup and verify commands) get no GitHub or GitLab credentials, so they cannot read untrusted comments themselves or act as the accounts logged in on the machine. Start them only with `prepareAgentEnv` (`src/adapters/process.ts`), the one place that defines their environment; the Master's own GitHub and git calls keep the credentials.
+- Every text the Master publishes on GitHub or GitLab goes through `redactForGitHub` (`src/github/redact.ts`), which turns paths under the user's home directory into `~` so the system user name stays private: comments (in the bridge's `comment()`), the issues it creates, and the commit messages it makes (they may be pushed). The notifications it POSTs to a webhook (`src/notify/webhook.ts`) go through it too, and `scripts/webhook.sh` does the same in bash (`webhook_tilde`) for what the scripts send. Store the original text: the dashboard and logs keep the full paths.
+- Anybody can write on a public repo. Text read from GitHub or GitLab (issues, comments, reviews) goes into an agent's prompt only when its author is trusted. Two places decide it together: the code host's client says whether the platform counts the author among the people who can change the repo (`trusted` on `HostAuthored`; the GitHub client, `githubAuthor` in `src/github/client.ts`, counts the repo's owner, members and collaborators; the GitLab client, `gitlabAuthor` in `src/gitlab/client.ts`, counts members of the project from Developer up, inherited from its groups too), and `isTrusted` (`src/github/issues.ts`) adds only the account the Master acts as on that platform (`github.account` / `gitlab.account`, else the account gh or glab is logged in as). A Run from an issue by anyone else waits for a human to confirm its goal (`untrusted_issue`).
+- Agents and the commands run on their work (setup and verify commands) get no GitHub or GitLab credentials (neither gh's nor glab's login, nor a token in the environment), so they cannot read untrusted comments themselves or act as the accounts logged in on the machine. Start them only with `prepareAgentEnv` (`src/adapters/process.ts`), the one place that defines their environment; the Master's own gh, glab and git calls keep the credentials.
 - No natively compiled dependencies (e.g. better-sqlite3): keep `npm install` simple.
 - Dashboard:
   - Import API data types from `src/api/types.ts` and `src/store/types.ts`; don't redefine them in `web/`. These two files hold type declarations only and must not import Node modules.
@@ -195,7 +201,7 @@ test/
 ## Test conventions
 
 - New features and bug fixes come with tests. Engine behavior goes in `test/engine.e2e.test.ts` where possible, using `harness()` and fake agent scripts.
-- `npm test` must not call real agent CLIs or network services; GitHub uses `FakeGitHub` from `test/helpers.ts`. Tests of real CLI behavior go under `test/real/`.
+- `npm test` must not call real agent CLIs or network services; GitHub uses `FakeGitHub` and GitLab `FakeGitLab` from `test/helpers.ts`. Tests of real CLI behavior go under `test/real/`.
 - Pure dashboard logic (`web/src/lib/`) has a `*.test.ts` next to it. API changes are tested in `test/api.test.ts`.
 - Tests run in Chinese by default. To test English, call `setLang('en')` and reset it with `afterEach(() => setLang('zh'))`. Check that English output has no Chinese characters left.
 - Temporary directories go in the system temp directory (`tmpDir()`), never in the repository.

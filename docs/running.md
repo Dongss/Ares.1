@@ -18,7 +18,7 @@ node dist/cli.js      # 数据目录 ~/.ares1（或 $ARES1_HOME），端口 4870
 
 | 路径 | 内容 |
 |---|---|
-| `config.yaml` | 全局配置：语言、端口、同时执行几个 Run、GitHub、本地提案池、通知、自动升级 |
+| `config.yaml` | 全局配置：语言、端口、同时执行几个 Run、GitHub、GitLab、本地提案池、通知、自动升级 |
 | `agents.yaml` | Agent 定义（CLI + 模型 + 运行参数） |
 | `workflows/` | 流程模板（仓库也可以自带，见「仓库自带的流程模板」） |
 | `data/ares1.db` | 运行状态（SQLite），升级迁移前自动备份成 `ares1.db.bak-v<版本>-<时间>`，只保留最近 5 份，更早的在迁移成功后自动删掉；旧版本遇到比自己新的库时恢复备份，较新的库改名成 `ares1.db.newer-v<版本>-<时间>` 留着（见「稳定副本和自动升级」） |
@@ -68,8 +68,8 @@ Ares.1 自己的仓库就带着 [`.ares1/workflows/self-dev.yaml`](../.ares1/wor
 
 - **放在哪**：仓库目标分支上的 `.ares1/workflows/*.yaml`（`.yml` 也行），格式和数据目录里的模板完全一样，id 是文件里写的 `id`。只看这个目录里的文件，不看子目录和符号链接。
 - **只读已提交的**：Master 读目标分支所在的那个提交里的文件（`git ls-tree`、`git cat-file`），不碰工作目录。目标分支检出的目录里没提交的改动、别的分支上的改动都不算。目标分支指 Master 在本地合并 Run 用的那个分支（看板「仓库」页登记的）。
-- **什么时候重新读**：Master 启动时（在恢复 Run 和检查 GitHub 之前）；Run 合并进目标分支之后；从 GitHub 拉取到新提交（`github.pulled`、`github.merged_remote`）之后；每轮检查 GitHub（每 `github.poll_minutes` 分钟）或本地提案池（每 `backlog.poll_minutes` 分钟）开始时，人直接提交到本地目标分支的改动在这时读到；在看板「仓库」页增加、修改或删除仓库之后。目标分支还在同一个提交时不重新读。文件内容变了时，配置重新加载，事件列表里记一条 `config.reloaded`；只是提交变了、文件没变时只更新记下的提交，不记事件。目标分支读不出来（目录或分支没了、git 出错）时，沿用之前从同一路径、同一分支读到的文件，在 Master 的输出（`master.out`）里记一行原因，同样的错误连着出现只记一次。
-- **怎么找**：`config.yaml` 里 `github.repos.<仓库>.template`（或 `backlog.repos.<仓库>.template`）写的 id，先在数据目录的 `workflows/` 里找，找不到再在这个仓库自带的模板里找。数据目录里的算这台机器的覆盖，由在这台机器上的人说了算。两边有同一个 id 时用数据目录那份，看板「配置」页在仓库那个文件（键是 `<仓库名>:.ares1/workflows/<文件>`）的警告里写明仓库里这份没有生效、数据目录里是哪个文件，以及想改用仓库里的就删掉数据目录里那个文件。两边都没有时，和以前一样在 `config.yaml` 下报「模板不存在或无效」，不建 Run。
+- **什么时候重新读**：Master 启动时（在恢复 Run 和检查 GitHub 之前）；Run 合并进目标分支之后；从 GitHub 或 GitLab 拉取到新提交（`github.pulled`、`github.merged_remote`）之后；每轮检查 GitHub（每 `github.poll_minutes` 分钟）、GitLab（每 `gitlab.poll_minutes` 分钟）或本地提案池（每 `backlog.poll_minutes` 分钟）开始时，人直接提交到本地目标分支的改动在这时读到；在看板「仓库」页增加、修改或删除仓库之后。目标分支还在同一个提交时不重新读。文件内容变了时，配置重新加载，事件列表里记一条 `config.reloaded`；只是提交变了、文件没变时只更新记下的提交，不记事件。目标分支读不出来（目录或分支没了、git 出错）时，沿用之前从同一路径、同一分支读到的文件，在 Master 的输出（`master.out`）里记一行原因，同样的错误连着出现只记一次。
+- **怎么找**：`config.yaml` 里 `github.repos.<仓库>.template`（或 `gitlab.repos.<仓库>.template`、`backlog.repos.<仓库>.template`）写的 id，先在数据目录的 `workflows/` 里找，找不到再在这个仓库自带的模板里找。数据目录里的算这台机器的覆盖，由在这台机器上的人说了算。两边有同一个 id 时用数据目录那份，看板「配置」页在仓库那个文件（键是 `<仓库名>:.ares1/workflows/<文件>`）的警告里写明仓库里这份没有生效、数据目录里是哪个文件，以及想改用仓库里的就删掉数据目录里那个文件。两边都没有时，和以前一样在 `config.yaml` 下报「模板不存在或无效」，不建 Run。
 - **只对本仓库可见**：仓库自带的模板只给这个仓库的 Run 用，别的仓库写同一个 id 也找不到它。它们的 id 只和同一个仓库里的其他文件比，不和数据目录、别的仓库比。
 - **坏了会怎样**：目标分支上的模板改坏了（YAML 不合法、不符合格式、引用了不存在或没启用的 Agent 等），仓库也不会停转：继续用这个文件上次加载成功的版本，「配置」页在这个文件的警告里写明这次为什么失败、在用的是哪个提交上的版本。上次成功的版本只记在内存里，所以 Master 重启时目标分支上的文件还是坏的，就没有能用的版本：这个文件记为错误，按模板不存在处理，用它的仓库不建新的 Run。改好并提交到目标分支，下次重新读时就恢复。已经建好的 Run 用的是建 Run 时存下的模板，都不受影响。
 - **合并前先试加载**：Run 的分支改了 `.ares1/workflows/`（和合入后的目标分支不一样）时，合并阶段在合入目标分支的最新代码之后、重跑检查命令之前，用当前配置里的 Agent，把 Run 分支上已提交的这些文件试加载一遍；这里没有「上次成功的版本」兜底。有文件加载失败就不合并，和检查命令没通过一样：合并阶段标为没通过，合并阶段的检查里记一条「流程模板（.ares1/workflows/）」，回退到合并阶段 `on_fail` 指向的阶段（默认是它前面最近的 Agent 阶段，通常是编码）返工，反馈里逐个列出文件和加载错误，要求改好或撤回这些改动；和别的回退一样受 `max_loops` 限制，用完后按 `on_exhausted` 处理（默认 Run 结束、标为失败）。所以坏模板进不了目标分支。Run 没动这个目录时不试加载。
@@ -87,7 +87,7 @@ Master 只在数据目录里还没有 `workflows/` 目录时（第一次启动�
 
 ## 接入 GitHub
 
-接了 GitHub 的仓库（`github.repos`），Run 从 GitHub issue 来。例外只有一种：目标分支和 GitHub 上的分叉、Master 自己合并不了时，它自动建一个不关联 issue 的 Run 来合并（见「交给 Run 合并」）。不接 GitHub 的仓库从本地提案池建 Run，见下面的「不用 GitHub 时」。
+接了 GitHub 的仓库（`github.repos`），Run 从 GitHub issue 来。例外只有一种：目标分支和 GitHub 上的分叉、Master 自己合并不了时，它自动建一个不关联 issue 的 Run 来合并（见「交给 Run 合并」）。托管在 GitLab 上的仓库从 GitLab issue 建 Run，做法相同，见下面的「接入 GitLab」；两者都不接的仓库从本地提案池建 Run，见「不用 GitHub 时」。
 
 1. 安装并登录 [gh](https://cli.github.com/)。登录了多个账号时，在 `config.yaml` 的 `github.account` 里指定用哪个。
 2. 在看板的「仓库」页登记本地仓库：填仓库名、绝对路径、目标分支和检查命令。常见语言的项目怎么填检查命令和准备命令，见 [`docs/examples/`](examples/README.md#在看板上登记仓库)。
@@ -114,6 +114,7 @@ Master 第一次访问仓库时会自动创建这些标签：
 | `ares1:failed` | 被终止，或失败次数达到上限后不再自动重做。重新加 `ares1:ready` 会再做一次 |
 | `ares1:auto` | 按 `auto_accept` 的设置自动采纳的 |
 | `ares1:iteration` | AI 侦察规划的迭代：一个大目标和按依赖排好的子 issue。给它加 `ares1:ready` 就整批采纳，关掉它就整批不做（见「迭代」）；它自己从不建 Run |
+| `ares1:not-planned` | 关成不做。GitHub 自己记着关闭的原因，用不到它；GitLab 关闭 issue 不带原因，靠它区分「不做」和「完成」（见「接入 GitLab」） |
 
 AI 侦察、自动采纳、自动合并、推送和每日预算的设置写在 `config.yaml` 的注释里；[`docs/examples/config.yaml`](examples/config.yaml) 有登记了多个仓库、各用不同设置的完整示例。
 
@@ -406,6 +407,8 @@ github:
 - GitHub 的 `authorAssociation` 为 `OWNER`、`MEMBER`、`COLLABORATOR` 的人，也就是仓库所有者、所属组织的成员和协作者；
 - Master 自己用的账号：`github.account`，没配时是 gh 当前登录的账号（启动后第一次需要时查一次）。
 
+GitLab 仓库按作者对项目的权限判断：Developer 及以上（Developer、Maintainer、Owner）和 Master 自己用的账号受信任，见「接入 GitLab」的「权限」；下面的规则两边一样。
+
 其余的人一律不信任，包括提过 PR 的 `CONTRIBUTOR`、`FIRST_TIME_CONTRIBUTOR` 和 `NONE`。Master 自己的评论仍然靠隐藏标记识别，但只认受信任的人写的：别人照抄标记也不算 Master 的。具体是：
 
 - **需求评估的回复**：只把受信任的人的评论当作回复。陌生人的评论不交给 Agent，只在看板的讨论记录里记下「issue 上有 N 条非仓库成员的评论，没有当作回复」。只有陌生人回复时，就当作还没人回复，照常等待或按 `reply_timeout_hours` 超时。
@@ -430,11 +433,90 @@ github:
 
 ### 发到 GitHub 的文字不带用户目录
 
-错误输出和 Agent 写的总结常带着本机的绝对路径，比如 `/Users/<用户名>/.ares1/worktrees/run-…`，发到公开仓库就会把系统用户名和目录结构公开出去。所以 Master 发到 GitHub 的文字（issue 评论、侦察提案 issue 的标题和正文、Master 提交的提交信息）里，以用户目录开头的路径都换成 `~`，比如 `~/.ares1/worktrees/run-…`；不在用户目录下的路径保持原样。看板和本地日志照旧显示完整路径，方便排查。提交信息是提交时就替换好的，所以看板上看到的提交信息也是 `~`。
+错误输出和 Agent 写的总结常带着本机的绝对路径，比如 `/Users/<用户名>/.ares1/worktrees/run-…`，发到公开仓库就会把系统用户名和目录结构公开出去。所以 Master 发到 GitHub 的文字（issue 评论、侦察提案 issue 的标题和正文、Master 提交的提交信息）里，以用户目录开头的路径都换成 `~`，比如 `~/.ares1/worktrees/run-…`；不在用户目录下的路径保持原样。看板和本地日志照旧显示完整路径，方便排查。提交信息是提交时就替换好的，所以看板上看到的提交信息也是 `~`。发到 GitLab 的文字也一样。
+
+## 接入 GitLab
+
+托管在 GitLab 上的仓库（gitlab.com 或自建的 GitLab）写在 `config.yaml` 的 `gitlab.repos` 里，Run 从 GitLab issue 来。做法和「接入 GitHub」一样，用的是同一份代码：标签和它们的含义、侦察和自动采纳、迭代（迭代 issue、子 issue 页脚的隐藏标记、计划里的任务列表）、依赖门、Run 失败后自动重做、Run 期间改了 issue、拉取目标分支上的新提交和分叉时自动合并、只信任能改仓库的人写的内容、Master 评论的隐藏标记和去掉用户目录，都按上面 GitHub 的说明。下面只写怎样登记，以及和 GitHub 不一样的地方。
+
+### 登记 GitLab 仓库
+
+1. 安装 GitLab 的命令行工具 [glab](https://gitlab.com/gitlab-org/cli)（比如 `brew install glab`），然后登录：
+
+   ```bash
+   glab auth login                                 # gitlab.com
+   glab auth login --hostname gitlab.example.com   # 自建的 GitLab：--hostname 写 gitlab.host 的值
+   glab auth status                                # 看登录了哪些主机、各是哪个账号
+   ```
+
+   用 token 登录时，token 至少要有 `api` 和 `write_repository` 两个权限范围（glab 登录时提示的最小范围就是这两个）。Master 不保存 token：读写 issue 都通过 `glab api`；推送和拉取让 git 用 glab 作凭据助手（`glab auth git-credential`），走 `https://<host>/<项目路径>.git`，不需要 SSH 密钥。glab 不在 PATH 上时，在 `config.yaml` 的 `bins` 里写它的路径（`bins.glab`；gh 是 `bins.gh`），改了要重启 Master。
+2. 在看板的「仓库」页登记本地仓库，和接 GitHub 时一样。
+3. 在 `config.yaml` 里加上 `gitlab`，把登记的仓库名写进 `repos`：
+
+   ```yaml
+   gitlab:
+     host: gitlab.example.com              # 不写就是 gitlab.com
+     poll_minutes: 5
+     repos:
+       my-repo:
+         issues_repo: my-group/backend/my-repo
+         template: self-dev
+         push: true
+   ```
+
+4. 给要做的 issue 加上 `ares1:ready` 标签。Master 每 `gitlab.poll_minutes` 分钟检查一次，把它建成 Run，进展回写到 issue 上，完成后关闭 issue，`push: true` 时把目标分支推送到 GitLab。Master 第一次访问项目时自动创建 `ares1:*` 标签（见「接入 GitHub」里的表格，另加下面说的 `ares1:not-planned`）；项目所属的组已经有同名标签时直接用组的。
+
+改了保存后自动生效，不用重启（`bins` 除外）。不写 `gitlab` 就不接 GitLab。[`docs/examples/config.yaml`](examples/config.yaml) 里有一个 GitLab 仓库的完整示例（`my-gitlab-service`）。
+
+### gitlab 段的字段
+
+- `host`：GitLab 的主机名，默认 `gitlab.com`。自建的写它自己的主机名，有端口时带上端口（如 `gitlab.example.com:8443`），不带 `https://`；格式不对时 `config.yaml` 校验不通过。Master 调用 `glab api` 时带上 `--hostname <host>`，推送和拉取也连这个主机，所以它要和 `glab auth login --hostname` 登录的主机一致。
+- `account`：可选，Master 在 GitLab 上用的账号名。glab 在每个主机上只记一个登录，也不能换着用别的账号，所以这里选不了账号，只是告诉 Master 它以谁的身份操作：写了就把这个账号当作 Master 自己的（受信任，它写的隐藏标记算 Master 的），要和 `glab auth status` 显示的账号一致；不写时 Master 第一次需要时问 glab 当前登录的是谁。一般不用写。
+- `poll_minutes`：多久检查一次 GitLab，默认 5，可以写小数。GitLab 有自己的定时器，和 `github.poll_minutes` 互不影响；GitLab 仓库失败后的重做等待（见「Run 失败后自动重做」）和自动侦察的退避都按它算。
+- `repos`：键是看板「仓库」页登记的仓库名，必须和那里的一模一样；写在这里但没登记的仓库什么都不做。每个仓库：
+  - `issues_repo`：必填，项目在 GitLab 上的路径，写成 `group/name`；在子组里的要把子组写全：`group/subgroup/name`（几层都行），也就是项目链接 `https://<host>/` 后面那一段。Master 不从本地仓库的 remote 推断。少了它或格式不对时 `config.yaml` 校验不通过。
+  - `template`、`scout`、`auto_accept`、`auto_merge`、`daily_budget_usd`、`max_run_attempts`：含义、默认值和校验都和 `github.repos` 里的同名字段一样（三种来源用同一份格式定义）；模板也一样先在数据目录的 `workflows/` 里找，再在仓库自带的 `.ares1/workflows/` 里找。
+  - `push`：默认 `false`。`true` 时合并后把目标分支推送到 GitLab，每轮检查时先从 GitLab 拉取目标分支，规则和「拉取 GitHub 上的新提交」一样（包括分叉时自动合并、交给 Run 合并）。`false` 时只合并到本地目标分支，也不拉取，issue 照样关闭并注明。
+  - `deliver`：目前只支持 `push`（默认）：合并进本地目标分支，`push: true` 时推送。还不支持 MR，写 `pr`、`mr` 或别的值时 `config.yaml` 校验不通过。
+
+`config.yaml` 校验不通过时，整个文件不生效：Master 运行中改坏的，继续用上一份有效的配置，事件列表里记一条 `config.reload_failed`，看板「配置」页写明原因；启动时就不通过的，Master 打印原因后退出。某个仓库配置有误（比如模板不存在、侦察用的 Agent 不存在或没启用）时只停用这个仓库，看板「配置」页在 `config.yaml#gitlab.repos.<仓库名>` 下写明原因，别的仓库照常工作。
+
+### 一个仓库只能有一种需求来源
+
+同一个仓库名只能写在 `github.repos`、`gitlab.repos`、`backlog.repos` 中的一处，否则两边都会侦察、采纳，同一个需求可能做两遍。Master 按 github → gitlab → backlog 的顺序检查：第一处照常工作，后出现的那一处报配置错误、整个不生效，看板「配置」页在它的键下（比如 `config.yaml#backlog.repos.<仓库名>`）写明仓库同时写在哪两处、哪一侧照常工作，想换来源就把它从前一处删掉。手动侦察、看板显示的需求来源也都按第一处。
+
+### 权限
+
+- **glab 登录的账号**：Master 用它建标签、改 issue 的标签和正文、写评论、关闭 issue，这些项目的 Reporter 就能做；推送目标分支（`push: true`）要 Developer 及以上。目标分支受保护时（GitLab 默认保护项目的默认分支，只有 Maintainer 能推送），这个账号要在受保护分支的「允许推送」名单里，比如给它 Maintainer，或者把这个分支的「允许推送」放宽到 Developer。推送被拒、没登录、没有权限时记 `github.error`（数据带 `platform: 'gitlab'`），通知「GitLab 访问失败」，看板「需求」页的 GitLab 一节写明错误，修好后下一轮自动重试。
+- **受信任的作者**：GitLab 没有 GitHub 的 `authorAssociation`，Master 按作者对这个项目的权限判断：Developer、Maintainer、Owner（从所属的组继承来的也算）受信任，他们本来就能改这个项目；Guest、Planner、Reporter、不是成员的人和被停用的账号都不受信任。Master 自己用的账号（`gitlab.account`，没写时是 glab 登录的账号）也受信任。成员的权限查一次记 5 分钟，所以改了项目成员后几分钟内生效。其余规则和「只信任仓库成员写的内容」一样：不受信任的人写的评论不进提示词；他们开的 issue 加上 `ares1:ready` 后照常建 Run，但 Run 一建好就停在「issue 作者不是仓库成员，等你确认需求」（`untrusted_issue`），issue 打上 `ares1:needs-you`，等你在 Run 详情页读过目标、点「确认并开始」。
+- **Agent 拿不到 glab 的凭据**：和 gh 一样，Agent 和准备命令、检查命令在去掉了 GitLab token 的环境里运行，见「Agent 拿不到 GitHub 和 GitLab 凭据」。
+
+### 和 GitHub 不一样的地方
+
+- **关成「不做」靠标签**：GitLab 关闭 issue 时不带原因，Master 用 `ares1:not-planned` 标签区分。它自己把 issue 关成不做时（多次失败后放弃、迭代被关掉时随之不做的子 issue 等）同时加上这个标签，以完成关闭时去掉它；读 issue 时有这个标签的算关成不做，没有的一律算完成。所以你不做某个提案时，关闭的同时要加上这个标签并写一句理由，比如写一条评论：第一行写理由，下面两行分别是 GitLab 的快捷命令 `/label ~"ares1:not-planned"` 和 `/close`。只关闭不加标签的提案，侦察会当成已经做完的需求；迭代的子 issue 只关闭不加标签，会被当作完成，依赖它的子 issue 随之开工。迭代 issue 本身被关掉，不管有没有这个标签，都算人关掉了迭代。GitHub 上也会建这个标签，但不用它。
+- **只能推送交付**：没有 `deliver: pr`，上面「接入 GitHub」里开 PR、跟踪 PR、PR 返工的那些都不适用。
+- **链接和编号**：issue 的编号是它在项目里的编号（链接里的那个），链接是 `https://<host>/<项目路径>/-/issues/<编号>`；评论、迭代计划里的 `#N` 照样指向同一个项目里的 issue。
+- **事件和通知**：事件类型和 GitHub 的一样（`github.error`、`github.pushed`、`github.pulled`、`github.diverged` 等，以及 `scout.completed`、`issue.auto_accepted`、`iteration.*`），GitLab 仓库的事件数据里多一个 `platform: 'gitlab'`。事件页、Run 详情页和通知都说 GitLab，比如「GitLab 访问失败」「没能拉取 GitLab 上的新提交」，「有提案等你决定」让你去 GitLab 上采纳或关闭；通知的种类不变。GitLab 访问失败和 GitHub 的分开去重：两边各有各的「一串连续失败」（见「通知」）。
+- **侦察**：提示词里列的是 GitLab 上已有的 issue（被关成不做的按 `ares1:not-planned` 标签找），说的也是 GitLab issue；建出的提案 issue、迭代 issue 和 GitHub 上的格式相同。
+
+### 看板
+
+- 「需求」页给 GitHub 和 GitLab 各一节，GitLab 那一节的标题带上 host，各有概况、「立即检查」按钮和仓库卡片；「待审提案」「全部 issue」链接到 GitLab 上的 issue 列表（`https://<host>/<项目路径>/-/issues`），「新建 issue」用描述里的快捷命令带上 `ares1:ready`。没配 `gitlab` 时给出配置示例。
+- 「仓库」页每个仓库写明需求来源：GitHub、GitLab 和它的 host、本地提案池，或者未配置（不会建 Run）。
+- 「配置」页提到 `gitlab.repos`，并列出无效、已停用的配置项，比如 `gitlab.repos.<仓库名>`。
+- 迭代页按平台显示，GitLab 的迭代链到 GitLab 上的迭代 issue，在 GitLab 上采纳、关闭。
+
+### GitLab 的 API
+
+- `GET /api/gitlab`：GitLab 一侧的状态，格式和 `GET /api/github` 相同：`platform` 是 `gitlab`，`host` 是 `gitlab.host`（GitHub 的 `platform` 是 `github`，`host` 为 `null`），`enabled` 表示 `config.yaml` 有 `gitlab` 一节，`account` 是 `gitlab.account`，`pollMinutes` 是 `gitlab.poll_minutes`，`lastPollAt`、`lastError` 是这一侧上一轮检查的时间和最近一次失败，`repos` 按 `gitlab.repos` 的顺序列出每个仓库（`issuesRepo` 是 `issues_repo`，`deliver` 总是 `push`，其余字段和 `GET /api/github` 的一样）。
+- `POST /api/gitlab/poll`：马上检查一轮 GitLab，不等下一轮；返回检查后的状态，格式同上。
+- `GET /api/config` 的 `repoSources` 按仓库名给出需求来源：`{ source: 'github', issuesRepo }`（`issuesRepo` 没写时为 `null`）、`{ source: 'gitlab', host, issuesRepo }` 或 `{ source: 'backlog' }`；同一个仓库名出现在多个来源时取第一个（github → gitlab → backlog），不在其中的仓库没有需求来源。
+- `POST /api/scouts`：手动侦察，`gitlab.repos` 里的仓库在 GitLab 上建 issue（见「本地提案池的 API」）。
+- 从 GitLab issue 建的 Run，`issue` 里多一个 `platform: 'gitlab'`，`repo` 是项目路径；GitLab 的迭代 `source` 是 `gitlab`（GitHub 的是 `github`，本地提案池的是 `local`）。
 
 ## 不用 GitHub 时
 
-不是每个仓库都能接 GitHub：只在本机的仓库、没有 GitHub 账号的环境，以及托管在 GitLab 或内网的项目，都没有 GitHub issue 可用。这些仓库写在 `config.yaml` 的 `backlog.repos` 里，需求来自 Master 自己保存的本地提案池：AI 侦察的提案存在 Master 的数据库里，在自动采纳范围内的直接建成 Run，其余的等人在看板上采纳，或者填上理由拒绝。整个过程不调用 GitHub，也不需要装 gh，仓库照样能自己侦察、自己采纳、自己建 Run，一直转下去。
+不是每个仓库都有 issue 可用：只在本机的仓库、没有 GitHub 或 GitLab 账号的环境，以及托管在内网其他服务上的项目，都没有 GitHub 或 GitLab 的 issue。（托管在 GitLab 上的仓库可以直接接 GitLab，见上面的「接入 GitLab」。）这些仓库写在 `config.yaml` 的 `backlog.repos` 里，需求来自 Master 自己保存的本地提案池：AI 侦察的提案存在 Master 的数据库里，在自动采纳范围内的直接建成 Run，其余的等人在看板上采纳，或者填上理由拒绝。整个过程不调用 GitHub 和 GitLab，也不需要装 gh 或 glab，仓库照样能自己侦察、自己采纳、自己建 Run，一直转下去。
 
 ### 配置
 
@@ -459,11 +541,11 @@ backlog:
 ```
 
 - `repos` 的键是看板「仓库」页登记的仓库名，必须和那里的一模一样。写在这里但没登记的仓库什么都不做，看板上写明「没有在看板上登记」。
-- `template`、`scout`、`auto_accept`、`auto_merge`、`daily_budget_usd`、`max_run_attempts` 的含义、默认值和校验都和 `github.repos` 里的同名字段一样（两边用同一份格式定义），模板也一样先在数据目录的 `workflows/` 里找，再在仓库自带的 `.ares1/workflows/` 里找（见「仓库自带的流程模板」）。`max_run_attempts` 在这里管的是一条提案最多跑几次 Run，见下面的「本地提案失败后自动重做」。`issues_repo`、`push`、`deliver` 是 GitHub 才有的，写在这里和写错的键一样，`config.yaml` 校验不通过。
-- 一个仓库只能选一种需求来源：同一个仓库名同时写在 `github.repos` 和 `backlog.repos` 里是配置错误，看板「配置」页在 `config.yaml#backlog.repos.<仓库名>` 下写明原因。这时 `backlog.repos` 里的设置不生效，GitHub 一侧照常工作，手动侦察也按 GitHub 侦察。
+- `template`、`scout`、`auto_accept`、`auto_merge`、`daily_budget_usd`、`max_run_attempts` 的含义、默认值和校验都和 `github.repos`、`gitlab.repos` 里的同名字段一样（三种来源用同一份格式定义），模板也一样先在数据目录的 `workflows/` 里找，再在仓库自带的 `.ares1/workflows/` 里找（见「仓库自带的流程模板」）。`max_run_attempts` 在这里管的是一条提案最多跑几次 Run，见下面的「本地提案失败后自动重做」。`issues_repo`、`push`、`deliver` 是 GitHub 和 GitLab 才有的，写在这里和写错的键一样，`config.yaml` 校验不通过。
+- 一个仓库只能选一种需求来源：同一个仓库名同时写在 `github.repos` 或 `gitlab.repos` 和 `backlog.repos` 里是配置错误，看板「配置」页在 `config.yaml#backlog.repos.<仓库名>` 下写明原因。这时 `backlog.repos` 里的设置不生效，GitHub 或 GitLab 一侧照常工作，手动侦察也按那一侧侦察（见「接入 GitLab」的「一个仓库只能有一种需求来源」）。
 - 某个仓库配置有误（比如模板不存在、侦察用的 Agent 不存在或没启用）时只停用这个仓库，看板「配置」页同样在 `config.yaml#backlog.repos.<仓库名>` 下写明原因，别的仓库照常工作。
-- 和 `github` 一样，改了保存后自动生效，不用重启。不写 `backlog` 就不用本地提案池。
-- 合并只合进本地的目标分支，Master 不推送；要推送到 GitLab 或内网的服务器，自己 `git push`。
+- 和 `github`、`gitlab` 一样，改了保存后自动生效，不用重启。不写 `backlog` 就不用本地提案池。
+- 合并只合进本地的目标分支，Master 不推送；要推送到内网的服务器，自己 `git push`。托管在 GitLab 上的仓库改接 GitLab（`gitlab.repos`），Master 就能自己推送。
 
 [`docs/examples/config.yaml`](examples/config.yaml) 里也有一个用本地提案池的仓库（`my-intranet-tool`）。
 
@@ -577,12 +659,11 @@ backlog:
 
 ### 暂时还不支持的
 
-- 自动删掉本地提案更早失败的尝试的工作目录和分支：GitHub 仓库的 issue 重做成功或用完次数后会自动删掉（见「Run 失败后自动重做」），本地提案的还要手动清理。
-- GitLab 仓库的完整支持：`config.yaml` 的 `gitlab.repos` 已经能登记 GitLab 仓库（`issues_repo` 写项目路径，如 `grp/sub/demo`），Master 给 GitLab 单独开一路检查（和 GitHub 的各自轮询、各自记错误），把 `ares1:ready` 的 issue 建成 Run、在 issue 上回写进度（评论同样带隐藏标记、去掉家目录）、完成后关闭 issue，`push: true` 时把目标分支推送到 GitLab；作者对项目的权限在 Developer 及以上才算受信任，否则 Run 先等人确认目标。侦察也一样：提案和迭代建成 GitLab 上的 issue（标签、页脚的隐藏标记、迭代 issue 计划里的任务列表都和 GitHub 上相同），侦察的提示词里列的是 GitLab 上已有的 issue，说的也是 GitLab issue；在 `auto_accept` 范围内的自动采纳，迭代整批采纳后子 issue 按依赖开工，全部完成后在迭代 issue 上发总结并关闭；自动侦察的退避按 `gitlab.poll_minutes` 计算。GitLab 仓库的 `scout.completed`、`issue.auto_accepted` 和迭代事件（`iteration.*`）的数据里带 `platform: 'gitlab'`，「有提案等你决定」的通知让你去 GitLab 上采纳或关闭。`GET /api/gitlab` 和 `POST /api/gitlab/poll` 的格式和 `GET /api/github`、`POST /api/github/poll` 相同，`platform` 是 `gitlab`，`host` 是 `gitlab.host`（GitHub 的 `platform` 是 `github`，`host` 为 `null`）。看板上，「需求」页给 GitHub 和 GitLab 各一节（GitLab 的标题带上 host），各有概况、「立即检查」按钮和仓库卡片，「待审提案」「全部 issue」链接到 GitLab 上的 issue 列表（`https://<host>/<项目路径>/-/issues`）；没配 `gitlab` 时给出配置示例。「仓库」页每个仓库写明需求来源：GitHub、GitLab 和它的 host、本地提案池，或者未配置（不会建 Run）；API `GET /api/config` 的 `repoSources` 按仓库名给出 `{ source: 'github', issuesRepo }`（`issuesRepo` 没写时为 `null`）、`{ source: 'gitlab', host, issuesRepo }` 或 `{ source: 'backlog' }`，同一个仓库名出现在多个来源时按 `github` → `gitlab` → `backlog` 取第一个，不在其中的仓库没有需求来源。「配置」页列出无效、已停用的配置项，比如 `gitlab.repos.<仓库名>`。GitLab 仓库的 `github.error`、`github.pushed`、`github.pulled`、`github.diverged` 等事件数据里带 `platform: 'gitlab'`，事件页、Run 详情页和通知都说 GitLab（通知标题如「GitLab 访问失败」「没能拉取 GitLab 上的新提交」），通知的种类和事件类型不变。完整的登记说明还没写，不支持 MR（`deliver` 只能是 `push`）。
+- 自动删掉本地提案更早失败的尝试的工作目录和分支：GitHub 和 GitLab 仓库的 issue 重做成功或用完次数后会自动删掉（见「Run 失败后自动重做」），本地提案的还要手动清理。
 
 ### 本地提案池的 API
 
-- `GET /api/backlog`：本地提案池的状态。`enabled` 表示 `config.yaml` 有 `backlog` 一节，`pollMinutes` 是 `backlog.poll_minutes`，`lastPollAt` 是上一轮检查的时间（还没检查过时为 `null`），`lastError` 是上一轮没做成的事（下一轮全部做成后清空）。`repos` 按 `backlog.repos` 的顺序列出每个仓库，字段和 `GET /api/github` 里每个仓库共有的部分相同：`name`、`template`、`problems`（Master 为什么不能处理这个仓库，比如配置有误、没在看板上登记）、`scout`（`agent`、`auto`、`intervalMinutes`、`maxProposals`、`running`、`lastAt`，以及 `waiting`：上一轮检查时自动侦察为什么没开始；没配侦察时为 `null`）、`autoAccept`（`maxRisk`、`maxSize`、`maxPerDay`、当天已自动采纳的 `usedToday`）、`autoMerge`、`budget`（`dailyUsd`、`spentToday`、`reached`）、`maxRunAttempts`（`max_run_attempts`），另外 `pendingProposals` 是等人或等自动采纳的提案数：等采纳的迭代算一条，它的子项不算。`GET /api/github` 里每个仓库也有 `maxRunAttempts`。
+- `GET /api/backlog`：本地提案池的状态。`enabled` 表示 `config.yaml` 有 `backlog` 一节，`pollMinutes` 是 `backlog.poll_minutes`，`lastPollAt` 是上一轮检查的时间（还没检查过时为 `null`），`lastError` 是上一轮没做成的事（下一轮全部做成后清空）。`repos` 按 `backlog.repos` 的顺序列出每个仓库，字段和 `GET /api/github`、`GET /api/gitlab` 里每个仓库共有的部分相同：`name`、`template`、`problems`（Master 为什么不能处理这个仓库，比如配置有误、没在看板上登记）、`scout`（`agent`、`auto`、`intervalMinutes`、`maxProposals`、`running`、`lastAt`，以及 `waiting`：上一轮检查时自动侦察为什么没开始；没配侦察时为 `null`）、`autoAccept`（`maxRisk`、`maxSize`、`maxPerDay`、当天已自动采纳的 `usedToday`）、`autoMerge`、`budget`（`dailyUsd`、`spentToday`、`reached`）、`maxRunAttempts`（`max_run_attempts`），另外 `pendingProposals` 是等人或等自动采纳的提案数：等采纳的迭代算一条，它的子项不算。`GET /api/github` 和 `GET /api/gitlab` 里每个仓库也有 `maxRunAttempts`。
 - `POST /api/backlog/poll`：马上检查一轮（跟踪迭代、为依赖完成的子项建 Run，记下失败的 Run、重做到时间的提案，自动采纳范围内的待处理提案和迭代，能开始的自动侦察），不等下一轮；返回检查后的状态，格式同上。
 - `GET /api/proposals`：本地提案，新的在前。参数 `repo`（仓库名或 id）只列这个仓库的，`status`（`pending`、`accepted`、`rejected`、`failed`）只列这个状态的，`limit`（1–500 的整数）最多返回几条，不写时全部返回。每一项除了提案本身的字段（`id`、`repoId`、`scoutId`、`title`、`category`、`size`、`risk`、`why`、`evidence`、`what`、`acceptance`、`status`、`rejectReason`、`auto`、`runId`（最近一次建出的 Run）、`attempt`（`runId` 是第几次尝试，从 1 起）、`failures`（失败过的每次尝试，旧的在前：`runId`、`attempt`、`stage`、`error`）、`redo`（最近一次 Run 失败后怎么办：`pending` 等着重做，`exhausted` 次数用完了，其余时候为 `null`）、`iterationId`（所属的迭代，不属于迭代时为 `null`）、`dependsOn`（依赖的同一迭代里的提案 id）、`createdAt`、`decidedAt`），还有仓库名 `repo`、最近一次建出的 Run 的状态 `runStatus`（还没采纳时为 `null`）、预计什么时候重做 `redoAt`（ISO 时间，不在等重做时为 `null`）、一共能跑几次 `maxAttempts`（这个仓库的 `max_run_attempts`，已经跑过的次数 `attempt` 比它多时取 `attempt`；仓库已经不在 `backlog.repos` 里时为 `null`）和能不能重新开始 `restartable`（「已失败」、所属迭代还要它时为 `true`，见「重新开始」）。参数不合法时返回 400，仓库不存在时返回 404。
 - `POST /api/proposals/:id/accept`：采纳一条待处理的提案，用提案正文作为目标建 Run（模板和 `auto_merge` 按这个仓库在 `backlog.repos` 里的设置），返回 `{ proposal, run }`：采纳后的提案（格式同上）和建出的 Run（格式同 `GET /api/runs` 的各项）。提案不存在时返回 404；已经采纳、拒绝过或多次失败后放弃了、属于迭代（随迭代整体采纳），或者仓库已经不在 `backlog.repos` 里、配置有误时返回 409。
@@ -866,13 +947,15 @@ Agent 出错且重试、换 Agent 都用完，Agent 不可用且没有可换的 
 
 ## 通知
 
-只在需要你做点什么时通知：Run 卡住或失败、等审批、提案等人决定、迭代受阻、侦察连续失败、推送或升级失败、目标分支没能拉取 GitHub 上的新提交；Run 完成、侦察完成、迭代完成、拉取成功都不通知。通过 PR 交付（`deliver: pr`）时，等 PR 合并不通知（GitHub 会通知 PR 的评审者），PR 要求修改、CI 没过或冲突时 Run 回去返工也不通知（issue 上有评论），返工用完 `max_loops` 后按 `on_exhausted` 停下来或失败时照常通知，PR 没合并就被关掉按「Run 失败了」通知。
+只在需要你做点什么时通知：Run 卡住或失败、等审批、提案等人决定、迭代受阻、侦察连续失败、推送或升级失败、目标分支没能拉取 GitHub 或 GitLab 上的新提交；Run 完成、侦察完成、迭代完成、拉取成功都不通知。通过 PR 交付（`deliver: pr`）时，等 PR 合并不通知（GitHub 会通知 PR 的评审者），PR 要求修改、CI 没过或冲突时 Run 回去返工也不通知（issue 上有评论），返工用完 `max_loops` 后按 `on_exhausted` 停下来或失败时照常通知，PR 没合并就被关掉按「Run 失败了」通知。
 
 侦察失败（Agent 出错或超时、输出不符合约定、建临时工作目录失败等）时，事件列表里记一条 `scout.failed`（看板「事件」页能看到，标成红色），数据里有 `scoutId`、`repo`、`message`（错误信息）和 `streak`：这个仓库从最近一次侦察往回数连续失败的次数（包括这一次；自动和手动触发的都算）。额度用尽或被限流的、被 Master 停止打断的、还在进行的侦察既不计数，也不打断计数；正常结束的侦察（哪怕没找到需求）让计数从头开始。`streak` 正好到 3 时通知一次「侦察连续失败：<仓库名>」，正文是错误信息的第一行，点开是「需求」页；之后接着失败不再通知，直到有侦察正常结束、又连续失败 3 次。被 Master 停止打断的侦察也记 `scout.failed`，但不带 `streak`，不通知。
 
 迭代的一个子 issue 用完重做次数后以失败关闭，或者被人关成不做，又没有别的子 issue 替换它时，迭代进入「受阻」，事件列表里记一条 `iteration.blocked`（看板「事件」页能看到，标成橙色），数据里有 `repo`、`iterationId`、`issue`（迭代 issue）、`position` 和 `child`（是计划里的第几步、哪个子 issue）、`reason`（`failed` 是用完重做次数，`dropped` 是被人关掉），并通知「迭代受阻：<仓库名>」，点开是看板上这个迭代的页面（`#/iterations/<id>`）。每次进入受阻通知一次；那个子 issue 被重新打开、或者侦察换个做法补了一个子 issue 替换它之后，迭代回到进行中（`iteration.unblocked`），之后再受阻会再通知。
 
 访问 GitHub 失败（读写 issue、推送目标分支、侦察时搜索 issue 等）时，事件列表里记一条 `github.error`（数据是 `{ message }`，错误信息），并通知「GitHub 访问失败」，正文是错误信息的第一行，点开是「需求」页。一轮轮询要对每个登记的仓库做好几步，每一步都可能失败，所以按「一串连续失败」去重：从第一次失败起，到有一轮轮询对 GitHub 的访问全部成功为止，同一个错误只记一条、只通知一次，哪怕几种错误轮流出现（比如两个仓库一个返回 404、一个返回 502）也是每种各一条，不会每轮都通知。有一轮访问全部成功后重新开始，之后同样的错误再出现会再记、再通知。错误信息里可能带每次都变的内容（比如请求 id），所以一串失败最多记 20 种不同的错误，超过后这串失败不再记新的 `github.error`。看板「需求」页上的「GitHub 调用失败」不去重，始终显示最近一次失败的时间和信息，有一轮访问全部成功后消失。
+
+GitLab 仓库也一样：访问 GitLab 失败记的也是 `github.error`，数据里多一个 `platform: 'gitlab'`，通知的标题写「GitLab 访问失败」；GitLab 和 GitHub 各算各的「一串连续失败」，一边恢复不影响另一边的去重。下面说的拉取 GitHub 上的新提交，对 `push: true` 的 GitLab 仓库也一样，标题写「没能拉取 GitLab 上的新提交」。
 
 目标分支和 GitHub 上的分叉了、Master 没能自动合并（`github.diverged`），或者因为检出的工作目录有未提交的改动没能快进（`github.pull_blocked`）时，通知「没能拉取 GitHub 上的新提交：<仓库名>」，正文说明原因和要你做什么：自动合并有冲突（列出冲突的文件）或者合并后哪条命令没通过，已交给 Run <id> 处理（编码 Agent 合并两边，评审并合并后自动推送），点开是这个 Run；建不了 Run，或者这个 Run 被终止、失败了，要你手动合并；检查要用的程序找不到，装好后会自动再合并；或者要处理那些改动。除了交给 Run 的，点开都是「需求」页。同一次分叉里，交给同一个 Run、要你手动合并、同一种原因都只通知一次，细节见「拉取 GitHub 上的新提交」和「交给 Run 合并」。快进成功（`github.pulled`）、分叉后自动合并成功（`github.merged_remote`）、建了合并 Run（`github.diverged_run`，由同时记的 `github.diverged` 通知）和合并 Run 因为目标分支已经有那个提交而直接完成（`run.merge_remote_obsolete`）不通知。
 

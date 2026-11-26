@@ -25,6 +25,7 @@ import {
   type GuideInput,
   type GuideSection,
   guardrails,
+  guideRepos,
   idleReasons,
   isGuideSection,
   issueFlow,
@@ -40,7 +41,14 @@ import {
   stopCommand,
 } from '../lib/guide.js';
 import { useAction, useReloadOn, useResource } from '../lib/hooks.js';
-import { acceptRanges, deliveryText, GITHUB, issuesUrl, newIssueUrl } from '../lib/issues.js';
+import {
+  acceptRanges,
+  deliveryText,
+  GITHUB,
+  issuesUrl,
+  newIssueUrl,
+  platformName,
+} from '../lib/issues.js';
 import { href } from '../lib/router.js';
 import { attentionCount } from '../lib/runs.js';
 
@@ -58,20 +66,21 @@ export function GuidePage(props: {
   section?: string;
 }) {
   const github = useResource(() => api.github(), 'github');
+  const gitlab = useResource(() => api.gitlab(), 'gitlab');
   const upgrade = useResource(() => api.upgrade(), 'upgrade');
   const health = useResource(() => api.health(), 'health');
   const config = (type: string) => type.startsWith('config.');
-  useReloadOn(
-    github.reload,
-    (e) =>
-      config(e.type) ||
-      e.type.startsWith('scout.') ||
-      e.type.startsWith('github.') ||
-      e.type.startsWith('issue.') ||
-      e.type === 'run.created' ||
-      e.type === 'run.status' ||
-      e.type === 'master.working',
-  );
+  // GitLab's bridge records its events under the same types, with platform: 'gitlab'.
+  const hostEvent = (e: { type: string }) =>
+    config(e.type) ||
+    e.type.startsWith('scout.') ||
+    e.type.startsWith('github.') ||
+    e.type.startsWith('issue.') ||
+    e.type === 'run.created' ||
+    e.type === 'run.status' ||
+    e.type === 'master.working';
+  useReloadOn(github.reload, hostEvent);
+  useReloadOn(gitlab.reload, hostEvent);
   useReloadOn(
     upgrade.reload,
     (e) =>
@@ -83,7 +92,7 @@ export function GuidePage(props: {
   useReloadOn(health.reload, (e) => config(e.type) || e.type === 'master.working');
   const [picked, setPicked] = useState<string>();
 
-  const loaded = Boolean(github.data && upgrade.data && health.data && props.config);
+  const loaded = Boolean(github.data && gitlab.data && upgrade.data && health.data && props.config);
   const { section } = props;
   useEffect(() => {
     if (loaded && section && isGuideSection(section)) {
@@ -91,8 +100,8 @@ export function GuidePage(props: {
     }
   }, [loaded, section]);
 
-  const error = github.error ?? upgrade.error ?? health.error ?? props.configError;
-  if (!github.data || !upgrade.data || !health.data || !props.config) {
+  const error = github.error ?? gitlab.error ?? upgrade.error ?? health.error ?? props.configError;
+  if (!github.data || !gitlab.data || !upgrade.data || !health.data || !props.config) {
     return error ? (
       <ErrorBox>{error}</ErrorBox>
     ) : (
@@ -100,12 +109,16 @@ export function GuidePage(props: {
     );
   }
 
-  const ghRepos = github.data.repos;
-  const repoStatus = ghRepos.find((r) => r.name === picked) ?? ghRepos[0] ?? null;
+  const choices = guideRepos([github.data, gitlab.data]);
+  const chosen = choices.find((c) => c.key === picked) ?? choices[0] ?? null;
+  const repoStatus = chosen?.status ?? null;
   const repo = repoStatus ? props.repos?.find((r) => r.name === repoStatus.name) : undefined;
+  // Both platforms have repos: say which one each is on.
+  const bothPlatforms = new Set(choices.map((c) => c.host.platform)).size > 1;
   const input: GuideInput = {
-    github: github.data.enabled ? repoStatus : null,
-    pollMinutes: github.data.pollMinutes,
+    github: repoStatus,
+    host: chosen?.host ?? GITHUB,
+    pollMinutes: chosen?.pollMinutes ?? github.data.pollMinutes,
     perRepo: props.config.perRepo,
     maxRuns: props.config.maxRuns,
     flow: repoStatus ? issueFlow(props.config, repoStatus, repo?.verifyCommands ?? null) : null,
@@ -121,7 +134,7 @@ export function GuidePage(props: {
         input={input}
         working={working}
         version={health.data.version}
-        githubEnabled={github.data.enabled}
+        hostEnabled={github.data.enabled || gitlab.data.enabled}
       />
     ),
     cycle: <CycleSection input={input} />,
@@ -159,19 +172,21 @@ export function GuidePage(props: {
           </a>
         ))}
       </nav>
-      {github.data.enabled && ghRepos.length > 1 && (
+      {choices.length > 1 && (
         <div className="filter-row guide-repos">
           <span className="muted">
             {t({ zh: '按哪个仓库的设置说明：', en: 'Explain with the settings of:' })}
           </span>
-          {ghRepos.map((r) => (
+          {choices.map((c) => (
             <button
-              key={r.name}
+              key={c.key}
               type="button"
-              className={r.name === repoStatus?.name ? 'filter-chip active' : 'filter-chip'}
-              onClick={() => setPicked(r.name)}
+              className={c.key === chosen?.key ? 'filter-chip active' : 'filter-chip'}
+              onClick={() => setPicked(c.key)}
             >
-              {r.name}
+              {bothPlatforms
+                ? `${c.status.name} · ${platformName(c.host.platform)}`
+                : c.status.name}
             </button>
           ))}
         </div>
@@ -205,7 +220,8 @@ function Intro(props: {
   input: GuideInput;
   working: boolean;
   version: string | null;
-  githubEnabled: boolean;
+  /** config.yaml has a `github` or a `gitlab` section. */
+  hostEnabled: boolean;
 }) {
   const { auto, you } = autonomy(props.input);
   const level = autonomyLevel(props.input.github);
@@ -232,8 +248,8 @@ function Intro(props: {
         {t({
           zh: (
             <>
-              需求以 GitHub issue 的形式提出：可以是你写的，也可以是 AI 读代码、文档和 Run
-              记录后提的。Master 把 issue 变成 Run
+              需求以 GitHub 或 GitLab 上的 issue 的形式提出：可以是你写的，也可以是 AI
+              读代码、文档和 Run 记录后提的。Master 把 issue 变成 Run
               一步步做完、合并，再把自己升级到新版本，然后去找下一件事。下面按
               <strong>当前配置</strong>说明哪些步骤它自己做、哪些由你来做；改了{' '}
               <code>config.yaml</code> 后这页会跟着变。
@@ -241,35 +257,38 @@ function Intro(props: {
           ),
           en: (
             <>
-              Requirements come as GitHub issues: written by you, or proposed by the AI after
-              reading the code, the docs and past Runs. The Master turns an issue into a Run, works
-              it through step by step and merges it, upgrades itself to the new version, then looks
-              for the next thing. Below, by the <strong>current configuration</strong>, is which
-              steps it does by itself and which are up to you; this page follows changes to{' '}
+              Requirements come as issues on GitHub or GitLab: written by you, or proposed by the AI
+              after reading the code, the docs and past Runs. The Master turns an issue into a Run,
+              works it through step by step and merges it, upgrades itself to the new version, then
+              looks for the next thing. Below, by the <strong>current configuration</strong>, is
+              which steps it does by itself and which are up to you; this page follows changes to{' '}
               <code>config.yaml</code>.
             </>
           ),
         })}
       </p>
-      {!props.githubEnabled && (
+      {!props.hostEnabled && (
         <p className="guide-now guide-now-wait">
           {t({
             zh: (
               <>
-                还没有接入 GitHub：这一页讲的循环靠 GitHub issue 转起来，在 <code>config.yaml</code>{' '}
-                里加上 <code>github</code> 配置后自动生效，示例见
-                <a href={href.issues}>「需求」页</a>。不接 GitHub 的仓库可以用本地提案池（
+                还没有接入 GitHub 或 GitLab：这一页讲的循环靠 issue 转起来，在{' '}
+                <code>config.yaml</code> 里加上 <code>github</code>（用 gh）或 <code>gitlab</code>
+                （用 glab，gitlab.com 或自建的都行）配置后自动生效，示例见
+                <a href={href.issues}>「需求」页</a>。两者都不接的仓库可以用本地提案池（
                 <code>config.yaml</code> 的 <code>backlog</code>），同样能自己侦察、采纳、建
                 Run，也在「需求」页。
               </>
             ),
             en: (
               <>
-                GitHub is not set up yet: the loop on this page runs on GitHub issues. Add a{' '}
-                <code>github</code> section to <code>config.yaml</code> and it takes effect by
-                itself; see the <a href={href.issues}>Issues page</a> for an example. Repos without
-                GitHub can use the local backlog (<code>backlog</code> in <code>config.yaml</code>),
-                which scouts, accepts and creates Runs by itself too, also on the Issues page.
+                Neither GitHub nor GitLab is set up yet: the loop on this page runs on issues. Add a{' '}
+                <code>github</code> section (through gh) or a <code>gitlab</code> section (through
+                glab, gitlab.com or a self-hosted one) to <code>config.yaml</code> and it takes
+                effect by itself; see the <a href={href.issues}>Issues page</a> for examples. Repos
+                with neither can use the local backlog (<code>backlog</code> in{' '}
+                <code>config.yaml</code>), which scouts, accepts and creates Runs by itself too,
+                also on the Issues page.
               </>
             ),
           })}
@@ -396,6 +415,7 @@ function CycleStepItem(props: { n: number; step: CycleStep; stages: CycleStage[]
 function ScoutSection({ input }: { input: GuideInput }) {
   const guide = scoutGuide(input);
   const hasConditions = guide.conditions.length > 0;
+  const hostName = platformName(input.host.platform);
   return (
     <>
       {input.github && (
@@ -403,15 +423,15 @@ function ScoutSection({ input }: { input: GuideInput }) {
           {t({
             zh: (
               <>
-                Master 每 {input.pollMinutes} 分钟检查一次 GitHub：把带 <code>ares1:ready</code> 的
-                issue 建成 Run，补回写进展。
+                Master 每 {input.pollMinutes} 分钟检查一次 {hostName}：把带 <code>ares1:ready</code>{' '}
+                的 issue 建成 Run，补回写进展。
                 {hasConditions && '自动侦察要下面的条件都满足：'}
               </>
             ),
             en: (
               <>
-                Every {input.pollMinutes} minutes the Master checks GitHub: it turns issues labeled{' '}
-                <code>ares1:ready</code> into Runs and catches up on reporting progress.
+                Every {input.pollMinutes} minutes the Master checks {hostName}: it turns issues
+                labeled <code>ares1:ready</code> into Runs and catches up on reporting progress.
                 {hasConditions && ' An automatic scout needs all of these:'}
               </>
             ),
@@ -476,13 +496,15 @@ function YouSection(props: { input: GuideInput; home: string; working: boolean }
   const { input, home } = props;
   const issuesRepo = input.github?.issuesRepo ?? null;
   const upgrade = input.upgrade;
+  const hostName = platformName(input.host.platform);
+  const onGitLab = input.host.platform === 'gitlab';
   const newIssue = issuesRepo && (
-    <a href={newIssueUrl(GITHUB, issuesRepo, 'ares1:ready')} target="_blank" rel="noreferrer">
+    <a href={newIssueUrl(input.host, issuesRepo, 'ares1:ready')} target="_blank" rel="noreferrer">
       {t({ zh: '新建 issue', en: 'new issue' })}
     </a>
   );
   const proposals = issuesRepo && (
-    <a href={issuesUrl(GITHUB, issuesRepo, 'ares1:proposal')} target="_blank" rel="noreferrer">
+    <a href={issuesUrl(input.host, issuesRepo, 'ares1:proposal')} target="_blank" rel="noreferrer">
       {t({ zh: '待审提案', en: 'proposals to triage' })}
     </a>
   );
@@ -528,8 +550,8 @@ function YouSection(props: { input: GuideInput; home: string; working: boolean }
         <h3>{t({ zh: '工作开关', en: 'The work switch' })}</h3>
         <p>
           {t({
-            zh: `顶栏的「工作中 / 已停工」（现在：${props.working ? '工作中' : '已停工'}）。停工时排队的 Run 不开始，不从 issue 接活、不自动采纳、不自动侦察，也不自动升级；正在执行的 Run 会做完，想立刻停下就在 Run 详情页暂停它；issue 被你关闭的 Run 照样终止。开工后马上继续排队的 Run，并立即检查一次 GitHub。状态存在数据库里，重启后保持。`,
-            en: `"Working / Stopped" in the top bar (now: ${props.working ? 'working' : 'stopped'}). While stopped, queued Runs do not start, no issues are taken, nothing is accepted or scouted automatically and there are no automatic upgrades; running Runs finish (pause one on its page to stop it at once), and Runs whose issue you close are still cancelled. Once working again, queued Runs continue right away and GitHub is checked at once. The state is kept in the database across restarts.`,
+            zh: `顶栏的「工作中 / 已停工」（现在：${props.working ? '工作中' : '已停工'}）。停工时排队的 Run 不开始，不从 issue 接活、不自动采纳、不自动侦察，也不自动升级；正在执行的 Run 会做完，想立刻停下就在 Run 详情页暂停它；issue 被你关闭的 Run 照样终止。开工后马上继续排队的 Run，并立即检查一次 GitHub 和 GitLab。状态存在数据库里，重启后保持。`,
+            en: `"Working / Stopped" in the top bar (now: ${props.working ? 'working' : 'stopped'}). While stopped, queued Runs do not start, no issues are taken, nothing is accepted or scouted automatically and there are no automatic upgrades; running Runs finish (pause one on its page to stop it at once), and Runs whose issue you close are still cancelled. Once working again, queued Runs continue right away and GitHub and GitLab are checked at once. The state is kept in the database across restarts.`,
           })}
         </p>
       </div>
@@ -560,29 +582,29 @@ function YouSection(props: { input: GuideInput; home: string; working: boolean }
           {t({
             zh: (
               <>
-                在 GitHub 上写 issue，加上 <code>ares1:ready</code> 标签
+                在 {hostName} 上写 issue，加上 <code>ares1:ready</code> 标签
                 {newIssue && <>（{newIssue}）</>}，
                 {input.github
                   ? `Master 每 ${input.pollMinutes} 分钟查一次`
-                  : '接入 GitHub 后 Master 会定时查看'}
+                  : '接入 GitHub 或 GitLab 后 Master 会定时查看'}
                 ，工作中时就建 Run。写清楚为什么、要做什么和验收标准，Agent
                 就照着做。开工后、合并之前想改需求，直接改 issue 的标题或正文，Master
-                下次检查时终止旧 Run，按新内容重来。看板不提供手动建 Run：接了 GitHub
-                的仓库，需求只从 GitHub issue 来。
+                下次检查时终止旧 Run，按新内容重来。看板不提供手动建 Run：接了 GitHub 或 GitLab
+                的仓库，需求只从那里的 issue 来。
               </>
             ),
             en: (
               <>
-                Write an issue on GitHub and label it <code>ares1:ready</code>
+                Write an issue on {hostName} and label it <code>ares1:ready</code>
                 {newIssue && <> ({newIssue})</>}.{' '}
                 {input.github
                   ? `The Master checks every ${input.pollMinutes} minutes`
-                  : 'Once GitHub is set up, the Master checks regularly'}{' '}
+                  : 'Once GitHub or GitLab is set up, the Master checks regularly'}{' '}
                 and creates a Run while working. Say why, what to do and how to tell it is done, and
                 the agents follow it. To change the requirement after work started, before it
                 merges, just edit the issue's title or body: at its next check the Master cancels
                 the old Run and starts over on the new text. The dashboard does not create Runs by
-                hand: for a repo on GitHub, requirements only come from GitHub issues.
+                hand: for a repo on GitHub or GitLab, requirements only come from its issues there.
               </>
             ),
           })}
@@ -595,19 +617,45 @@ function YouSection(props: { input: GuideInput; home: string; working: boolean }
             zh: (
               <>
                 不想做的 <code>ares1:proposal</code>
-                {proposals && <>（{proposals}）</>}：在 GitHub 上关闭为 <strong>not planned</strong>
-                ，并留一句理由。侦察下次会把它当作反例，不再提类似的。已经开工的（例如自动采纳的）也会在
-                Master 下次检查时一并终止，Master 不再在这个 issue 上留言或改标签。
+                {proposals && <>（{proposals}）</>}：
+                {onGitLab ? (
+                  <>
+                    GitLab 关闭 issue 时不带原因，所以关闭的同时要加上{' '}
+                    <code>ares1:not-planned</code>{' '}
+                    标签，并留一句理由（比如评论第一行写理由，下面两行写{' '}
+                    <code>/label ~"ares1:not-planned"</code> 和 <code>/close</code>
+                    ）；只关闭不加标签会被当成已经做完。
+                  </>
+                ) : (
+                  <>
+                    在 GitHub 上关闭为 <strong>not planned</strong>，并留一句理由。
+                  </>
+                )}
+                侦察下次会把它当作反例，不再提类似的。已经开工的（例如自动采纳的）也会在 Master
+                下次检查时一并终止，Master 不再在这个 issue 上留言或改标签。
               </>
             ),
             en: (
               <>
                 For an <code>ares1:proposal</code> you do not want
-                {proposals && <> ({proposals})</>}: close it on GitHub as{' '}
-                <strong>not planned</strong> with a one-line reason. The next scout takes it as a
-                counterexample and does not propose anything like it again. If work has already
-                started (e.g. it was auto-accepted), the Run is cancelled at the Master's next
-                check, and the Master no longer comments on or relabels the issue.
+                {proposals && <> ({proposals})</>}:{' '}
+                {onGitLab ? (
+                  <>
+                    GitLab closes an issue without a reason, so close it with the{' '}
+                    <code>ares1:not-planned</code> label and a one-line reason (say, a comment with
+                    the reason on its first line, then <code>/label ~"ares1:not-planned"</code> and{' '}
+                    <code>/close</code> on lines of their own); closed without the label, it counts
+                    as done.
+                  </>
+                ) : (
+                  <>
+                    close it on GitHub as <strong>not planned</strong> with a one-line reason.
+                  </>
+                )}{' '}
+                The next scout takes it as a counterexample and does not propose anything like it
+                again. If work has already started (e.g. it was auto-accepted), the Run is cancelled
+                at the Master's next check, and the Master no longer comments on or relabels the
+                issue.
               </>
             ),
           })}

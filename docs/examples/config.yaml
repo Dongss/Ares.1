@@ -18,6 +18,9 @@ bins:
   claude-code: claude
   cursor-agent: cursor-agent
   codex: codex
+  # Master 自己用的 gh（GitHub）和 glab（GitLab）也可以在这里写路径，键是 gh、glab
+  # gh: /opt/homebrew/bin/gh
+  # glab: /opt/homebrew/bin/glab
 
 defaults:
   timeout_minutes: 60          # 单次 Agent 执行的超时（分钟），默认 60。agents.yaml 里 Agent 的 timeout_minutes、
@@ -39,7 +42,7 @@ concurrency:
                                # 调小时正在执行的 Run 照常做完
 
 # 用 GitHub Issues 管理需求：github.repos 里的仓库，Run 只从带 ares1:ready 标签的 issue 来。需要安装并登录 gh；
-# 不写 github 就不接入（不接 GitHub 的仓库用下面的 backlog）
+# 不写 github 就不接入（托管在 GitLab 上的仓库用下面的 gitlab，两者都不接的用 backlog）
 github:
   # account: my-account        # 用 gh 的哪个账号（登录了多个账号时）；不写 = gh 当前的账号
   poll_minutes: 5              # 多久查一次带 ares1:ready 标签的 issue、同步 issue 上的回复，默认 5
@@ -106,17 +109,51 @@ github:
       daily_budget_usd: 15
       # auto_merge、push 不写 = false：合并前等人审批，合并后不推送
 
-# 本地提案池：给不接 GitHub 的仓库用（只在本机的仓库、没有 GitHub 账号、托管在 GitLab 或内网的项目）。
+# 用 GitLab Issues 管理需求（gitlab.com 或自建的 GitLab）：gitlab.repos 里的仓库，Run 只从带 ares1:ready 标签的
+# GitLab issue 来；标签、侦察、自动采纳、迭代、重做的规则和上面 github 的一样。需要安装 glab 并登录：
+#   glab auth login                                # gitlab.com
+#   glab auth login --hostname gitlab.example.com  # 自建的 GitLab，--hostname 和下面的 host 一样
+# 登录的账号要能建标签、改 issue、写评论（项目的 Reporter 就行），push: true 时要能推送目标分支
+# （Developer 及以上；受保护分支要在「允许推送」里）。作者对项目的权限在 Developer 及以上才算受信任，
+# 其他人开的 issue 建出的 Run 先等你在看板上确认需求。不写 gitlab 就不接入
+gitlab:
+  host: gitlab.example.com     # GitLab 的主机名，默认 gitlab.com；自建的写它的主机名（有端口就带上），不带 https://
+  # account: my-account        # Master 在 GitLab 上用的账号，要和 glab 在这个主机上登录的一致；不写 = 问 glab 当前登录的账号
+  poll_minutes: 5              # 多久查一次带 ares1:ready 标签的 issue、同步 issue 上的回复，默认 5；和 github 的互不影响
+
+  # 键是看板「仓库」页登记的仓库名。一个仓库只能选一种需求来源：不能和上面 github.repos、下面 backlog.repos
+  # 里的重名，按 github → gitlab → backlog 的顺序，后出现的那一处不生效，看板「配置」页报错
+  repos:
+    # 自建 GitLab 上的后端服务：严格模板，L 的需求在编码阶段拆成几步做；低风险的提案自动采纳，合并前等人审批
+    my-gitlab-service:
+      issues_repo: my-group/backend/my-gitlab-service # 必填：项目在 GitLab 上的路径（链接里主机名后面那段），
+                               # 在子组里就把子组写全：group/subgroup/name
+      template: strict         # 以下各项的含义和默认值都和 github.repos 里的一样
+      scout:
+        agent: claude-reviewer
+        interval_minutes: 240
+        max_proposals: 3
+      auto_accept:
+        max_risk: low
+        max_size: L            # strict 模板的编码阶段是 planning: auto，L 的需求会拆成几步做完
+        max_per_day: 2
+      auto_merge: false        # strict 模板的合并阶段设了 gate: true，合并前等人审批
+      push: true               # true = 合并后把目标分支推送到 GitLab，每轮检查时也把 GitLab 上的新提交快进到本地；默认 false
+      deliver: push            # 目前只支持 push（默认）；还不支持 MR，写别的值 config.yaml 校验不通过
+      daily_budget_usd: 15
+      max_run_attempts: 3
+
+# 本地提案池：给没有 GitHub 或 GitLab issue 可用的仓库用（只在本机的仓库、没有这两种账号、托管在内网其他服务上的项目）。
 # 侦察的提案存在 Master 里，在看板上采纳，或填理由拒绝（理由会作为反例写进下一次侦察的提示词）；
-# 在 auto_accept 范围内的提案自动采纳，直接用提案正文作为目标建 Run。不需要 gh，全程不调用 GitHub。
+# 在 auto_accept 范围内的提案自动采纳，直接用提案正文作为目标建 Run。不需要 gh 或 glab，全程不调用 GitHub 和 GitLab。
 # 不写 backlog 就不用本地提案池
 backlog:
   poll_minutes: 5              # 多久检查一次本地提案池：自动采纳范围内的提案、该侦察时侦察，默认 5
 
-  # 键是看板「仓库」页登记的仓库名。一个仓库只能选一种需求来源：不能和上面 github.repos 里的重名，
-  # 重名时这里的设置不生效（GitHub 一侧照常工作），看板「配置」页报错
+  # 键是看板「仓库」页登记的仓库名。一个仓库只能选一种需求来源：不能和上面 github.repos、gitlab.repos 里的重名，
+  # 重名时这里的设置不生效（GitHub 或 GitLab 一侧照常工作），看板「配置」页报错
   repos:
-    # 内网的命令行工具：不接 GitHub，靠侦察和自动采纳自己转起来
+    # 内网的命令行工具：不接 GitHub 或 GitLab，靠侦察和自动采纳自己转起来
     my-intranet-tool:
       template: cross-review   # 采纳的提案建 Run 用的模板
       scout:                   # 各项的含义和默认值和 github.repos 里的一样；不写 = 不侦察，这个仓库就没有提案、不会有 Run
