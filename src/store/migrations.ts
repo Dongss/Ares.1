@@ -258,4 +258,11 @@ export const MIGRATIONS: readonly string[] = [
   ALTER TABLE proposals ADD COLUMN iteration_id TEXT;
   ALTER TABLE proposals ADD COLUMN depends_on TEXT NOT NULL DEFAULT '[]';
   `,
+  // v13: failed Runs of local proposals are redone: which attempt the latest Run is, the failed
+  // Runs before it (runId, attempt, stage, error), and what follows its failure.
+  `
+  ALTER TABLE proposals ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1;
+  ALTER TABLE proposals ADD COLUMN failures TEXT NOT NULL DEFAULT '[]';
+  ALTER TABLE proposals ADD COLUMN redo TEXT;
+  `,
 ];

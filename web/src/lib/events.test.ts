@@ -145,6 +145,39 @@ const SAMPLES: [string, Record<string, unknown>][] = [
   // The reason is a human's own words, kept as written: English here, so the check below holds.
   ['proposal.rejected', { repo: 'demo', proposalId: 'proposal-1', reason: 'a duplicate' }],
   [
+    'proposal.redo_scheduled',
+    {
+      repo: 'demo',
+      proposalId: 'proposal-1',
+      runId: 'run-1',
+      attempt: 2,
+      maxAttempts: 3,
+      redoAt: '2026-11-23T13:00:00Z',
+    },
+  ],
+  [
+    'proposal.redone',
+    {
+      repo: 'demo',
+      proposalId: 'proposal-1',
+      runId: 'run-2',
+      failedRunId: 'run-1',
+      attempt: 2,
+      maxAttempts: 3,
+    },
+  ],
+  [
+    'proposal.failed',
+    {
+      repo: 'demo',
+      proposalId: 'proposal-1',
+      runId: 'run-3',
+      attempts: 3,
+      maxAttempts: 3,
+      failures: [{ runId: 'run-1', attempt: 1, stage: 'coding', error: 'quota used up' }],
+    },
+  ],
+  [
     'scout.completed',
     { scoutId: 's-1', repo: 'demo', created: 2, auto: 1, pending: 1, backlog: true },
   ],
@@ -716,6 +749,44 @@ describe('globalEventText', () => {
     );
   });
 
+  it('says a failed local proposal is redone, when and as which attempt, or given up', () => {
+    const redoAt = '2026-11-23T13:00:00Z';
+    const scheduled = {
+      repo: 'demo',
+      proposalId: 'proposal-1',
+      runId: 'run-1',
+      attempt: 2,
+      maxAttempts: 3,
+      redoAt,
+    };
+    expect(text('proposal.redo_scheduled', scheduled)).toBe(
+      `demo 一条本地提案的 Run run-1 失败了，预计 ${formatTime(redoAt)} 带着失败原因自动重做，开始第 2/3 次尝试`,
+    );
+    const redone = {
+      repo: 'demo',
+      runId: 'run-2',
+      failedRunId: 'run-1',
+      attempt: 2,
+      maxAttempts: 3,
+    };
+    expect(text('proposal.redone', redone)).toBe(
+      '自动重做了 demo 一条失败的本地提案：Run run-2（第 2/3 次尝试），带着之前每次失败的原因',
+    );
+    expect(text('proposal.failed', { repo: 'demo', attempts: 3, maxAttempts: 3 })).toBe(
+      'demo 的一条本地提案失败 3 次，达到尝试次数上限（max_run_attempts），不再自动重做；之后的侦察会看到每次失败的原因',
+    );
+    setLang('en');
+    expect(text('proposal.redo_scheduled', scheduled)).toBe(
+      `Run run-1 of a local proposal of demo failed; it is redone automatically with the reason at ${formatTime(redoAt)}, as attempt 2 of 3`,
+    );
+    expect(text('proposal.redone', redone)).toBe(
+      'Redid a failed local proposal of demo automatically: Run run-2 (attempt 2 of 3), told why each earlier attempt failed',
+    );
+    expect(text('proposal.failed', { repo: 'demo', attempts: 1, maxAttempts: 1 })).toBe(
+      'A local proposal of demo failed once, all the attempts it gets (max_run_attempts), and is not redone any more; later scouts are shown why each attempt failed',
+    );
+  });
+
   it('describes every global event in both languages, without Chinese left in English', () => {
     for (const [type, data] of SAMPLES) {
       expect(text(type, data), type).toBeTruthy();
@@ -762,8 +833,12 @@ describe('globalEventTone', () => {
       'config.reload_failed',
       'upgrade.failed',
       'scout.failed',
+      'proposal.failed',
     ]) {
       expect(globalEventTone(ev(type)), type).toBe('danger');
+    }
+    for (const type of ['proposal.redo_scheduled', 'proposal.redone']) {
+      expect(globalEventTone(ev(type)), type).toBe('neutral');
     }
     for (const type of [
       'master.restarted',
@@ -836,6 +911,10 @@ describe('globalEventLink', () => {
     expect(globalEventLink(ev('proposal.accepted', { runId: 'run-7' }))).toEqual(run);
     expect(globalEventLink(ev('proposal.accepted'))).toEqual(issues);
     expect(globalEventLink(ev('proposal.rejected', { reason: 'x' }))).toEqual(issues);
+    // A redo to its new Run; a failure to the proposal, which lists every attempt.
+    expect(globalEventLink(ev('proposal.redone', { runId: 'run-7' }))).toEqual(run);
+    expect(globalEventLink(ev('proposal.redo_scheduled', { runId: 'run-7' }))).toEqual(issues);
+    expect(globalEventLink(ev('proposal.failed', { runId: 'run-7' }))).toEqual(issues);
     setLang('en');
     expect(globalEventLink(ev('proposal.rejected'))).toEqual({
       href: '#/issues',

@@ -2173,9 +2173,7 @@ export class IssueBridge {
 
   /** Name of the stage the Run is in, or ended in. */
   private stageNameOf(run: Run): string | undefined {
-    if (!run.currentStageRunId) return undefined;
-    const sr = this.deps.store.getStageRun(run.currentStageRunId);
-    return run.template.stages.find((s) => s.id === sr.stageId)?.name ?? sr.stageId;
+    return this.deps.store.currentStageName(run);
   }
 
   /**
@@ -3065,7 +3063,6 @@ export class IssueBridge {
         issuesRepo: cfg.issues_repo ?? (repo ? (this.resolved.get(repo.path) ?? null) : null),
         push: cfg.push,
         deliver: cfg.deliver,
-        maxRunAttempts: cfg.max_run_attempts,
       };
     });
     return {

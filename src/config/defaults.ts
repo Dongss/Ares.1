@@ -68,7 +68,8 @@ defaults:
 #       auto_accept:
 #         max_risk: low          # 风险和大小都在范围内的提案直接建 Run；范围外的等你在看板上采纳或拒绝
 #       auto_merge: false        # true = 采纳的提案建出的 Run 合并前不等人审批
-#       daily_budget_usd: 10     # 可选：当天侦察和自动采纳的 Run 花费达到后停止自动行为；不写 = 不限
+#       daily_budget_usd: 10     # 可选：当天侦察、自动采纳的 Run 和自动重做的 Run 花费达到后停止自动行为；不写 = 不限
+#       max_run_attempts: 3      # 一条提案最多跑几次 Run（含第一次）：失败后自动重做，带上失败原因；用完就把提案标为失败；1 = 不重做
 
 # 需要人处理时（Run 卡住或失败、等审批、提案等人决定、推送或升级失败），Master 直接发系统通知
 # macOS 用通知中心；Linux 需要 notify-send（libnotify）；其他平台不支持，仍由浏览器发通知
@@ -139,7 +140,8 @@ defaults:
 #       auto_accept:
 #         max_risk: low          # proposals within both risk and size become Runs right away; the others wait for you to accept or reject them on the dashboard
 #       auto_merge: false        # true = Runs from accepted proposals merge without waiting for approval
-#       daily_budget_usd: 10     # optional: stop automatic actions once the day's scouts and auto-accepted Runs cost this much; omitted = no limit
+#       daily_budget_usd: 10     # optional: stop automatic actions once the day's scouts, auto-accepted Runs and automatic redos cost this much; omitted = no limit
+#       max_run_attempts: 3      # Runs a proposal gets at most, the first included: a failed Run is redone automatically with its reason; once they are used up, the proposal is marked failed; 1 = never redone
 
 # When a human is needed (a Run is stuck or failed, an approval or a proposal waits, a push or upgrade failed), the Master sends a system notification:
 # Notification Center on macOS; on Linux it needs notify-send (libnotify); other platforms are not supported, and the browser keeps sending them

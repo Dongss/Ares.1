@@ -2115,6 +2115,9 @@ const localProposal = (id: string, title: string, extra: Partial<Proposal> = {})
   rejectReason: null,
   auto: false,
   runId: null,
+  attempt: 1,
+  failures: [],
+  redo: null,
   iterationId: null,
   dependsOn: [],
   createdAt: '2026-11-20T00:00:00.000Z',
@@ -2199,6 +2202,83 @@ describe('localProposalDigest', () => {
         '- proposal-0 没写理由的',
       ].join('\n'),
     );
+  });
+
+  it('lists the redos under way, and the proposals given up after failing every attempt', () => {
+    const failure = (runId: string, attempt: number, stage: string | null, error: string) => ({
+      runId,
+      attempt,
+      stage,
+      error,
+    });
+    const runs: Record<string, ProposalRun> = {
+      'run-1': proposalRun('failed', { error: '额度用完了' }),
+      'run-3': proposalRun('running'),
+      'run-5': proposalRun('failed', { error: '测试没过' }),
+    };
+    const digest = localProposalDigest(
+      [
+        localProposal('proposal-3', '放弃的', {
+          status: 'failed',
+          auto: true,
+          runId: 'run-5',
+          attempt: 2,
+          redo: 'exhausted',
+          failures: [
+            failure('run-4', 1, '编码', '准备命令\n失败了'),
+            failure('run-5', 2, null, '测试没过'),
+          ],
+        }),
+        localProposal('proposal-2', '重做中的', {
+          status: 'accepted',
+          runId: 'run-3',
+          attempt: 2,
+          failures: [failure('run-2', 1, '编码', '超时')],
+        }),
+        localProposal('proposal-1', '等重做的', {
+          status: 'accepted',
+          runId: 'run-1',
+          redo: 'pending',
+          failures: [failure('run-1', 1, '编码', '额度用完了')],
+        }),
+      ],
+      (id) => runs[id],
+    );
+    expect(digest).toBe(
+      [
+        '### 等人决定',
+        '（无）',
+        '',
+        '### 已采纳',
+        '- proposal-2 重做中的（Run run-3：执行中，第 2 次尝试）',
+        '- proposal-1 等重做的（Run run-1：失败，等自动重做）',
+        '  失败原因：额度用完了',
+        '',
+        '### 被拒绝',
+        '（无）',
+        '',
+        '### 多次失败后放弃（不是人拒绝的）',
+        '- proposal-3 放弃的（失败 2 次，自动采纳）',
+        '  第 1 次（Run run-4，失败在「编码」阶段）：准备命令 失败了',
+        '  第 2 次（Run run-5）：测试没过',
+      ].join('\n'),
+    );
+    setLang('en');
+    const english = localProposalDigest([
+      localProposal('proposal-3', 'Given up', {
+        status: 'failed',
+        runId: 'run-5',
+        failures: [failure('run-5', 1, 'Coding', 'tests failed')],
+      }),
+    ]);
+    expect(english).toContain(
+      [
+        '### Given up after repeated failures (not rejected by a human)',
+        '- proposal-3 Given up (failed once)',
+        '  Attempt 1 (Run run-5, failed in the "Coding" stage): tests failed',
+      ].join('\n'),
+    );
+    expect(english).not.toMatch(/[一-鿿]/);
   });
 
   it('names the Run without its status when it is not known', () => {
@@ -2394,7 +2474,10 @@ describe('scoutPrompt: the local backlog', () => {
     expect(splitting).toContain(
       '那条提案覆盖面很大、没有拆过、还在等人决定时，可以围绕它规划迭代，在相关子项的 why 里注明对应哪条提案（写上它的 id）',
     );
-    expect(splitting).toContain('已采纳、但 Run 失败了的提案不一样：它不是人拒绝的');
+    expect(splitting).toContain(
+      '已采纳、但 Run 失败了的提案，以及「多次失败后放弃」的提案不一样：它不是人拒绝的',
+    );
+    expect(splitting).toContain('还在等自动重做的不要再提');
   });
 
   it('keeps the prompt of a GitHub repo as it was', () => {

@@ -1537,6 +1537,7 @@ backlog:
           autoAccept: { maxRisk: 'low', maxSize: 'M', maxPerDay: 2, usedToday: 0 },
           autoMerge: true,
           budget: { dailyUsd: 5, spentToday: 0, reached: false },
+          maxRunAttempts: 3,
           pendingProposals: 1,
         },
         {
@@ -1547,6 +1548,7 @@ backlog:
           autoAccept: { maxRisk: 'none', maxSize: 'L', maxPerDay: null, usedToday: 0 },
           autoMerge: false,
           budget: { dailyUsd: null, spentToday: 0, reached: false },
+          maxRunAttempts: 3,
           pendingProposals: 0,
         },
       ] satisfies BacklogRepoStatus[],
@@ -1621,6 +1623,51 @@ backlog:
     expect((await call('GET', '/api/proposals?limit=501')).status).toBe(400);
     expect((await call('GET', '/api/proposals?state=pending')).status).toBe(400);
     expect((await call('GET', '/api/proposals?repo=nowhere')).status).toBe(404);
+  });
+
+  it('says when a proposal whose Run failed is redone, and lists the failed ones', async () => {
+    const t = await start();
+    const store = t.master.store;
+    const failedRun = (goal: string) => {
+      const run = t.run(goal);
+      const ended = '2026-11-25T08:00:00.000Z';
+      return store.updateRun(run.id, { status: 'failed', finishedAt: ended, error: '失败了' });
+    };
+    const waiting = propose(t.repo.id, '等重做的');
+    const run = failedRun('等重做的');
+    const failure = { runId: run.id, attempt: 1, stage: '编码', error: '失败了' };
+    store.updateProposal(waiting.id, {
+      status: 'accepted',
+      runId: run.id,
+      redo: 'pending',
+      failures: [failure],
+    });
+    const given = propose(t.repo.id, '放弃的');
+    const last = failedRun('放弃的');
+    store.updateProposal(given.id, {
+      status: 'failed',
+      runId: last.id,
+      redo: 'exhausted',
+      failures: [{ ...failure, runId: last.id }],
+    });
+
+    const listed = (await call('GET', '/api/proposals')).json as ProposalView[];
+    // The first failure waits poll_minutes (7) after the Run ended.
+    expect(listed.find((p) => p.id === waiting.id)).toMatchObject({
+      status: 'accepted',
+      runStatus: 'failed',
+      attempt: 1,
+      failures: [failure],
+      redo: 'pending',
+      redoAt: '2026-11-25T08:07:00.000Z',
+    });
+    expect(listed.find((p) => p.id === given.id)).toMatchObject({
+      status: 'failed',
+      runStatus: 'failed',
+      redo: 'exhausted',
+      redoAt: null,
+    });
+    expect(await titles('/api/proposals?status=failed')).toEqual(['放弃的']);
   });
 
   it('accepts a proposal into a Run, and rejects one only with a reason', async () => {

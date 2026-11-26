@@ -25,7 +25,8 @@ const AUTO_ACCEPTED_EVENTS = [
 
 /**
  * Spend of today on what this repo did without a human: scouts, auto-accepted Runs (from issues
- * or local proposals) and automatic redos of failed Runs.
+ * or local proposals) and automatic redos of failed Runs (of issues or local proposals, whoever
+ * accepted them).
  */
 export function spentToday(store: Store, repoId: string): number {
   const since = startOfToday();
@@ -36,7 +37,9 @@ export function spentToday(store: Store, repoId: string): number {
     .issueRunsSince(since)
     .filter((r) => r.repoId === repoId && (r.issue?.auto || (r.issue?.attempt ?? 1) > 1))
     .reduce((sum, r) => sum + r.costUsd, 0);
-  const local = store.autoProposalRunsSince(repoId, since).reduce((sum, r) => sum + r.costUsd, 0);
+  const local = store
+    .automaticProposalRunsSince(repoId, since)
+    .reduce((sum, r) => sum + r.costUsd, 0);
   return scouts + runs + local;
 }
 

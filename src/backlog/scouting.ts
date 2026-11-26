@@ -125,17 +125,28 @@ export function waitingForYouText(proposals: number, stuck: number): string {
 
 /**
  * Why the automatic scout waits for work that goes on by itself: 「等 1 个未结束的 Run 做完，
- * 另外有 2 个 issue 在等重做」. A part that is 0 is left out; null when both are.
+ * 另外有 2 个 issue 在等重做」 (local proposals instead of issues in the local backlog). A part
+ * that is 0 is left out; null when both are.
  */
-export function busyText(moving: number, redo: number): string | null {
+export function busyText(
+  moving: number,
+  redo: number,
+  source: ScoutSource = 'github',
+): string | null {
   const runs = t({
     zh: `等 ${moving} 个未结束的 Run 做完`,
     en: `Waiting for ${moving} unfinished Run${moving === 1 ? '' : 's'} to finish`,
   });
-  const issues = t({
-    zh: `有 ${redo} 个 issue 在等重做`,
-    en: `${redo} issue${redo === 1 ? '' : 's'} waiting to be redone`,
-  });
+  const issues =
+    source === 'local'
+      ? t({
+          zh: `有 ${redo} 条提案在等重做`,
+          en: `${redo} proposal${redo === 1 ? '' : 's'} waiting to be redone`,
+        })
+      : t({
+          zh: `有 ${redo} 个 issue 在等重做`,
+          en: `${redo} issue${redo === 1 ? '' : 's'} waiting to be redone`,
+        });
   if (redo === 0) return moving === 0 ? null : runs;
   if (moving === 0) return issues;
   return t({ zh: `${runs}，另外${issues}`, en: `${runs}; ${issues}` });
@@ -236,6 +247,13 @@ export interface ProposalSource<C extends ProposalSourceConfig> {
    * proposalsHoldingScout). `scouts`: the repo's, newest first.
    */
   holdingProposals(repo: Repo, cfg: C, scouts: Scout[]): Promise<number>;
+  /**
+   * How many of the repo's requirements wait to be redone that its Runs do not tell: the local
+   * proposals whose failed Run is redone later (`proposalAwaitingRedo`). The automatic scout
+   * waits for them as for the issues of failed Runs (splitUnfinishedRuns). A source without it
+   * has none.
+   */
+  awaitingRedo?(repo: Repo): number;
 }
 
 /** A scout in progress: its agent once started, and the whole scout including the cleanup. */
@@ -399,6 +417,7 @@ export class Scouting {
         spentToday: spent,
         reached: cfg.daily_budget_usd !== undefined && spent >= cfg.daily_budget_usd,
       },
+      maxRunAttempts: cfg.max_run_attempts,
     };
   }
 
@@ -432,7 +451,8 @@ export class Scouting {
       store.listRuns({ repoId: repo.id }),
       (id) => store.getStageRun(id).stageId,
     );
-    const busy = busyText(runs.moving.length, runs.redo.length);
+    const redo = runs.redo.length + (source.awaitingRedo?.(repo) ?? 0);
+    const busy = busyText(runs.moving.length, redo, source.kind);
     if (busy) return { reason: busy };
     if (this.deps.engine.held) {
       return { reason: t({ zh: '等 Master 升级', en: 'Waiting for the Master to upgrade' }) };

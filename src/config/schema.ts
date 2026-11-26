@@ -72,6 +72,12 @@ export const ProposalSourceSchema = z.strictObject({
    * redoing stop until the next day; omitted = no limit.
    */
   daily_budget_usd: z.number().positive().optional(),
+  /**
+   * Runs a requirement gets at most, the first included: a failed Run is redone automatically
+   * until then; after that the issue is closed as not planned with the reasons, or the local
+   * proposal is marked failed with them. 1 = never redone.
+   */
+  max_run_attempts: z.number().int().min(1).default(3),
 });
 /** The settings GitHub and local backlog repos share, for what works with either. */
 export type ProposalSourceConfig = z.infer<typeof ProposalSourceSchema>;
@@ -96,11 +102,6 @@ export const GitHubRepoSchema = z.strictObject({
    * is merged on GitHub; the target branch itself is never pushed. pr needs push: true.
    */
   deliver: z.enum(['push', 'pr']).default('push'),
-  /**
-   * Runs an issue gets at most, the first included: a failed Run is redone automatically until
-   * then; after that the issue is closed as not planned with the reasons. 1 = never redone.
-   */
-  max_run_attempts: z.number().int().min(1).default(3),
 });
 export type GitHubRepoConfig = z.infer<typeof GitHubRepoSchema>;
 

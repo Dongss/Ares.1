@@ -48,7 +48,7 @@ const JSON_COLUMNS: Partial<Record<Table, readonly string[]>> = {
   runs: ['template', 'overrides', 'blocked', 'issue', 'discussion'],
   attempts: ['structured'],
   scouts: ['proposals', 'gaps'],
-  proposals: ['evidence', 'acceptance', 'depends_on'],
+  proposals: ['evidence', 'acceptance', 'depends_on', 'failures'],
   iterations: ['criteria', 'out_of_scope', 'children', 'notes'],
 };
 const BOOL_COLUMNS: Partial<Record<Table, readonly string[]>> = {
@@ -824,17 +824,25 @@ export class Store {
   }
 
   /**
-   * Runs of the repo created since `since` (ISO time) from local proposals accepted without a
-   * human (backlog.repos).
+   * Runs of the repo created since `since` (ISO time) from local proposals (backlog.repos) that
+   * the Master started by itself: every Run of a proposal accepted without a human, and every
+   * automatic redo of a failed Run (attempt 2 on), whoever accepted the proposal. A proposal's
+   * latest Run is its `run_id`, the failed ones before it are in its `failures`.
    */
-  autoProposalRunsSince(repoId: string, since: string): Run[] {
+  automaticProposalRunsSince(repoId: string, since: string): Run[] {
     return this.many<Run>(
       'runs',
-      `SELECT runs.* FROM runs JOIN proposals ON proposals.run_id = runs.id
-         WHERE proposals.repo_id = ? AND proposals.auto = 1 AND runs.created_at >= ?
-         ORDER BY runs.created_at`,
-      repoId,
+      `SELECT * FROM runs WHERE created_at >= ? AND id IN (
+         SELECT run_id FROM proposals
+           WHERE repo_id = ? AND run_id IS NOT NULL AND (auto = 1 OR attempt > 1)
+         UNION
+         SELECT json_extract(f.value, '$.runId') FROM proposals p, json_each(p.failures) f
+           WHERE p.repo_id = ? AND (p.auto = 1 OR json_extract(f.value, '$.attempt') > 1)
+       )
+       ORDER BY created_at`,
       since,
+      repoId,
+      repoId,
     );
   }
 
@@ -899,6 +907,16 @@ export class Store {
       this.one<StageRun>('stage_runs', 'SELECT * FROM stage_runs WHERE id = ?', id),
       t({ zh: `阶段执行 ${id}`, en: `Stage run ${id}` }),
     );
+  }
+
+  /**
+   * Name of the stage the Run is in, or ended in, as its template names it (its id without a
+   * name); undefined before any stage started.
+   */
+  currentStageName(run: Pick<Run, 'currentStageRunId' | 'template'>): string | undefined {
+    if (!run.currentStageRunId) return undefined;
+    const sr = this.getStageRun(run.currentStageRunId);
+    return run.template.stages.find((s) => s.id === sr.stageId)?.name ?? sr.stageId;
   }
 
   listStageRuns(runId: string): StageRun[] {
@@ -1310,6 +1328,9 @@ export class Store {
       rejectReason: null,
       auto: false,
       runId: null,
+      attempt: 1,
+      failures: [],
+      redo: null,
       iterationId: input.iterationId ?? null,
       dependsOn: input.dependsOn ?? [],
       createdAt: nowIso(),
@@ -1334,6 +1355,23 @@ export class Store {
     this.getProposal(id);
     this.patch('proposals', id, patch);
     return this.getProposal(id);
+  }
+
+  /**
+   * The repo's accepted proposals of their own (no iteration) whose latest Run failed and that
+   * were not given up: the failure not recorded yet (`redo` null), or waiting to be redone
+   * (`redo` pending). Oldest first.
+   */
+  proposalsWithFailedRun(repoId: string): Proposal[] {
+    return this.many<Proposal>(
+      'proposals',
+      `SELECT proposals.* FROM proposals JOIN runs ON runs.id = proposals.run_id
+         WHERE proposals.repo_id = ? AND proposals.status = 'accepted'
+           AND proposals.iteration_id IS NULL AND runs.status = 'failed'
+           AND (proposals.redo IS NULL OR proposals.redo = 'pending')
+         ORDER BY proposals.created_at, proposals.rowid`,
+      repoId,
+    );
   }
 
   /** Newest first. `status` may list several; no `limit` = all of them. */

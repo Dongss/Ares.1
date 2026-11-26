@@ -922,8 +922,8 @@ function noticeHandling(kind: NoticeKind): string {
       });
     case 'failed':
       return t({
-        zh: '看 Run 上的错误说明。从 issue 来的 Run 会带着失败原因自动重做，一个 issue 最多跑 max_run_attempts 次，用完后 issue 关闭并写明每次的原因；不想再做就关闭 issue。保留的工作目录在「工作区」页清理',
-        en: 'Read the error on the Run. A Run from an issue is redone automatically with the reason it failed, up to max_run_attempts Runs per issue; after that the issue is closed with every reason. To stop it, close the issue. Clean up the kept working directory on the Workspaces page',
+        zh: '看 Run 上的错误说明。从 issue 来的 Run 会带着失败原因自动重做，一个 issue 最多跑 max_run_attempts 次，用完后 issue 关闭并写明每次的原因；不想再做就关闭 issue。单独的本地提案也一样自动重做，用完次数后提案标为失败。保留的工作目录在「工作区」页清理',
+        en: 'Read the error on the Run. A Run from an issue is redone automatically with the reason it failed, up to max_run_attempts Runs per issue; after that the issue is closed with every reason. To stop it, close the issue. A local proposal of its own is redone the same way, and marked failed once its attempts are used up. Clean up the kept working directory on the Workspaces page',
       });
     case 'proposals':
       return t({

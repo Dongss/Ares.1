@@ -23,11 +23,14 @@ import {
   MAX_TOUCHES,
   normalizeTouches,
   plansStage,
+  proposalAwaitingRedo,
+  proposalRedoDueAt,
   RATE_LIMIT_WAIT,
   REDO_BACKOFF_MAX_HOURS,
   rateLimitDelayMs,
   recordedLimitWait,
   redoDelayMs,
+  redoDueAfter,
   redoDueAt,
   requirementSource,
   resolveTemplate,
@@ -831,6 +834,7 @@ stages:
       auto_accept: { max_risk: low, max_size: M, max_per_day: 2 }
       auto_merge: true
       daily_budget_usd: 7.5
+      max_run_attempts: 2
 `);
       expect(cfg.errors).toEqual({});
       expect(cfg.warnings).toEqual({});
@@ -842,6 +846,7 @@ stages:
             template: 'self-dev',
             auto_accept: { max_risk: 'none', max_size: 'L' },
             auto_merge: false,
+            max_run_attempts: 3,
           },
           busy: {
             template: 'self-dev',
@@ -849,6 +854,7 @@ stages:
             auto_accept: { max_risk: 'low', max_size: 'M', max_per_day: 2 },
             auto_merge: true,
             daily_budget_usd: 7.5,
+            max_run_attempts: 2,
           },
         },
       });
@@ -861,15 +867,17 @@ stages:
         scout: { agent: 'a', interval_minutes: 30 },
         auto_accept: { max_risk: 'mid' },
         daily_budget_usd: 3,
+        max_run_attempts: 4,
       };
       const local = BacklogRepoSchema.parse(shared);
       expect(local).toEqual(ProposalSourceSchema.parse(shared));
+      expect(local.max_run_attempts).toBe(4);
+      expect(BacklogRepoSchema.parse({ template: 'x' }).max_run_attempts).toBe(3);
       // GitHub reads the same fields alike, and keeps its own defaults.
       expect(GitHubRepoSchema.parse(shared)).toEqual({
         ...local,
         push: false,
         deliver: 'push',
-        max_run_attempts: 3,
       });
       for (const bad of [
         { template: '' },
@@ -880,13 +888,15 @@ stages:
         { template: 'x', auto_accept: { max_size: 'XL' } },
         { template: 'x', auto_accept: { max_per_day: 0 } },
         { template: 'x', daily_budget_usd: 0 },
+        { template: 'x', max_run_attempts: 0 },
+        { template: 'x', max_run_attempts: 1.5 },
       ]) {
         const what = JSON.stringify(bad);
         expect(BacklogRepoSchema.safeParse(bad).success, what).toBe(false);
         expect(GitHubRepoSchema.safeParse(bad).success, what).toBe(false);
       }
       // What only GitHub does is not a setting of the local backlog.
-      for (const key of ['issues_repo', 'push', 'deliver', 'max_run_attempts']) {
+      for (const key of ['issues_repo', 'push', 'deliver']) {
         expect(
           () => load(`backlog:\n  repos:\n    app: { template: x, ${key}: 1 }\n`),
           key,
@@ -2115,7 +2125,9 @@ stages:
     expect(byDefault[0]).toMatch(/^defaults\.escalate：on_budget_exceeded: pause：/);
     expect(byDefault[0]).toContain('卡住等人调高预算，没人在场时就停在那里');
     expect(byDefault[0]).toContain('建议改成 abort');
-    expect(byDefault[0]).toContain('从 issue 来的 Run 会在 max_run_attempts 和 daily_budget_usd');
+    expect(byDefault[0]).toContain(
+      '从 issue 或单独的本地提案来的 Run 会在 max_run_attempts 和 daily_budget_usd',
+    );
 
     // Only the stage that runs an agent; merge never checks the budget. abort is not warned about.
     expect(cfg.warnings['workflows/stage.yaml']).toEqual([
@@ -2199,7 +2211,7 @@ stages:
 
     const toReview = cfg.warnings['workflows/to-review.yaml'] ?? [];
     expect(toReview).toEqual([
-      '阶段 merge：合并阶段失败时回退到的 review 不是 Agent 阶段。合并目标分支的最新代码发生冲突时，没有 Agent 能解决，Run 会直接结束、标为失败，从 issue 来的 Run 会在 max_run_attempts 的限制内基于目标分支的最新代码自动重做。想让 Agent 解决冲突，就把 on_fail 指向一个 Agent 阶段（kind: agent）',
+      '阶段 merge：合并阶段失败时回退到的 review 不是 Agent 阶段。合并目标分支的最新代码发生冲突时，没有 Agent 能解决，Run 会直接结束、标为失败，从 issue 或单独的本地提案来的 Run 会在 max_run_attempts 的限制内基于目标分支的最新代码自动重做。想让 Agent 解决冲突，就把 on_fail 指向一个 Agent 阶段（kind: agent）',
     ]);
     expect(cfg.warnings['workflows/merge-only.yaml']).toEqual([
       expect.stringMatching(/^阶段 merge：合并阶段失败时没有可回退的 Agent 阶段。合并目标分支/),
@@ -2215,7 +2227,7 @@ stages:
     writeMergeTemplates(paths.workflowsDir);
     const cfg = loadConfig(paths, ['claude-code']);
     expect(cfg.warnings['workflows/to-review.yaml']).toEqual([
-      'Stage merge: the merge stage goes back to review when it fails, which is not an agent stage. When merging the latest target branch runs into conflicts, no agent can resolve them, so the Run ends as failed, and a Run from an issue is redone on the latest target branch within max_run_attempts. To have an agent resolve conflicts, point on_fail at an agent stage (kind: agent)',
+      'Stage merge: the merge stage goes back to review when it fails, which is not an agent stage. When merging the latest target branch runs into conflicts, no agent can resolve them, so the Run ends as failed, and a Run from an issue or a local proposal of its own is redone on the latest target branch within max_run_attempts. To have an agent resolve conflicts, point on_fail at an agent stage (kind: agent)',
     ]);
     const mergeOnly = cfg.warnings['workflows/merge-only.yaml'] ?? [];
     expect(mergeOnly).toEqual([
@@ -2505,6 +2517,47 @@ describe('redo after a failure', () => {
     }
     expect(redoDueAt({ ...failed(1, 'pending'), status: 'cancelled' }, 5)).toBeNull();
     expect(redoDueAt({ ...failed(1, 'pending'), issue: null }, 5)).toBeNull();
+  });
+
+  it('waits the same for an issue and a local proposal', () => {
+    const finishedAt = '2026-11-20T00:00:00.000Z';
+    const ended = Date.parse(finishedAt);
+    expect(redoDueAfter(1, finishedAt, 5)).toBe(ended + 5 * MIN);
+    expect(redoDueAfter(3, finishedAt, 5)).toBe(ended + 20 * MIN);
+    expect(redoDueAfter(10, finishedAt, 5)).toBe(ended + MAX);
+
+    const run = { finishedAt, updatedAt: '2026-11-20T00:30:00.000Z' };
+    const waiting = {
+      status: 'accepted' as const,
+      iterationId: null,
+      redo: 'pending' as const,
+      attempt: 2,
+    };
+    expect(proposalAwaitingRedo(waiting)).toBe(true);
+    expect(proposalRedoDueAt(waiting, run, 5)).toBe(ended + 10 * MIN);
+    expect(proposalRedoDueAt(waiting, run, 5)).toBe(
+      redoDueAt(
+        {
+          status: 'failed',
+          ...run,
+          issue: { repo: 'me/demo', number: 1, url: '', auto: false, attempt: 2, redo: 'pending' },
+        },
+        5,
+      ),
+    );
+    expect(proposalRedoDueAt(waiting, { ...run, finishedAt: null }, 5)).toBe(
+      Date.parse(run.updatedAt) + 10 * MIN,
+    );
+    // Not waiting: its failure not recorded yet, given up, a step of an iteration, failed.
+    for (const p of [
+      { ...waiting, redo: null },
+      { ...waiting, redo: 'exhausted' as const },
+      { ...waiting, iterationId: 'iteration-1' },
+      { ...waiting, status: 'failed' as const },
+    ]) {
+      expect(proposalAwaitingRedo(p)).toBe(false);
+      expect(proposalRedoDueAt(p, run, 5)).toBeNull();
+    }
   });
 });
 

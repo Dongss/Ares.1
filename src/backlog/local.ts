@@ -1,11 +1,12 @@
 // The local backlog: where the requirements of a repo without GitHub come from (backlog.repos).
 // The scout's proposals are kept in the Master (the proposals table) instead of as issues; those
 // within the repo's auto_accept become Runs right away, the others wait for a human, who accepts
-// them on the dashboard or rejects them with a reason the next scouts are shown. An iteration a
-// scout plans is kept the same way: its record (source local) and one proposal per step, accepted
-// or rejected as a whole, its steps started in the order of their dependencies and the iteration
-// summed up once every step is done (the rules shared with GitHub are in iterations.ts and
-// flow.ts). Nothing here calls GitHub.
+// them on the dashboard or rejects them with a reason the next scouts are shown. A proposal of its
+// own whose Run failed is redone, told why, until max_run_attempts is used up, as an issue is.
+// An iteration a scout plans is kept the same way: its record (source local) and one proposal per
+// step, accepted or rejected as a whole, its steps started in the order of their dependencies and
+// the iteration summed up once every step is done (the rules shared with GitHub are in
+// iterations.ts and flow.ts). Nothing here calls GitHub.
 
 import type { BacklogStatus } from '../api/types.js';
 import {
@@ -18,10 +19,14 @@ import {
   iterationKind,
   iterationStatusOf,
   type ProposalKind,
+  proposalAwaitingRedo,
+  proposalRedoDueAt,
 } from '../config/flow.js';
 import { backlogConfigKey, findTemplate, type LoadedConfig } from '../config/load.js';
 import type { BacklogRepoConfig } from '../config/schema.js';
 import { type Engine, InvalidStateError } from '../engine/engine.js';
+import { goalWithEarlierAttempts } from '../engine/prompts.js';
+import { failedAttempt } from '../github/issues.js';
 import {
   type IterationUpdate,
   localProposalDigest,
@@ -46,7 +51,7 @@ import {
   type ScoutProposal,
 } from '../store/types.js';
 import { errorMessage, nowIso } from '../util.js';
-import { mayAutoAccept } from './guard.js';
+import { mayAutoAccept, overBudget } from './guard.js';
 import {
   type ChildOutcome,
   closeoutSuggestions,
@@ -81,9 +86,16 @@ export interface LocalBacklogDeps {
 
 /** Why a proposal cannot be decided again. */
 function decidedAlready(p: Proposal): string {
-  return p.status === 'accepted'
-    ? t({ zh: `提案 ${p.id} 已经采纳过了`, en: `Proposal ${p.id} was accepted already` })
-    : t({ zh: `提案 ${p.id} 已经被拒绝了`, en: `Proposal ${p.id} was rejected already` });
+  if (p.status === 'rejected') {
+    return t({ zh: `提案 ${p.id} 已经被拒绝了`, en: `Proposal ${p.id} was rejected already` });
+  }
+  if (p.status === 'failed') {
+    return t({
+      zh: `提案 ${p.id} 已经采纳过，Run 失败 ${p.attempt} 次后不再重做了`,
+      en: `Proposal ${p.id} was accepted already, and given up after its Runs failed ${p.attempt === 1 ? 'once' : `${p.attempt} times`}`,
+    });
+  }
+  return t({ zh: `提案 ${p.id} 已经采纳过了`, en: `Proposal ${p.id} was accepted already` });
 }
 
 /** Why an iteration that is no longer pending cannot be accepted or rejected. */
@@ -110,6 +122,10 @@ const CHILD_OVER: readonly IterationChildStatus[] = ['done', 'failed', 'dropped'
  *   on, within today's count and budget (`mayAutoAccept`); the others wait for a human, who
  *   accepts or rejects them on the dashboard. An accepted proposal becomes a Run whose goal is the
  *   proposal's text;
+ * - redo: a proposal of its own whose Run failed is redone as a new Run whose goal tells why the
+ *   earlier attempts failed, after the wait an issue's redo waits (`proposalRedoDueAt`), up to
+ *   `max_run_attempts` Runs and within the day's budget, while the work switch is on; after that
+ *   the proposal failed. A Run a human terminated is not redone;
  * - iterations: one a scout planned is accepted as a whole, by its riskiest and largest step
  *   (`iterationKind`) and counting once toward today's limit, or by a human on the dashboard, or
  *   rejected as a whole with a reason. Accepted, each step becomes a Run once every step it
@@ -188,10 +204,11 @@ export class LocalBacklog {
 
   /**
    * One round, repo by repo: follow the iterations (and, while the work switch is on, start the
-   * steps whose dependencies are done), then accept the pending proposals and iterations
+   * steps whose dependencies are done), record the failed Runs of proposals and (while the work
+   * switch is on) redo those whose wait is over, then accept the pending proposals and iterations
    * auto-accept takes, then start a scout where the repo is idle. A repo that is misconfigured or
    * not registered on the dashboard is skipped, with the reason kept as why it does not scout;
-   * with the work switch off, only the iterations are followed.
+   * with the work switch off, only the iterations and the failed Runs are followed.
    */
   poll(): Promise<void> {
     return this.serial(async () => {
@@ -214,6 +231,13 @@ export class LocalBacklog {
           // First: a step whose Run just completed lets the next one start before the scout
           // looks at whether the repo is idle.
           await this.followIterations(setup.repo, setup.cfg, working);
+        } catch (err) {
+          failed = true;
+          this.report(err);
+        }
+        try {
+          // Before auto-accepting: a requirement already taken on goes first within the budget.
+          this.redoFailedProposals(setup.repo, setup.cfg, working);
         } catch (err) {
           failed = true;
           this.report(err);
@@ -417,7 +441,7 @@ export class LocalBacklog {
    * proposal's text (createProposalRun), recorded on the proposal.
    */
   private acceptProposal(p: Proposal, repo: Repo, cfg: BacklogRepoConfig, auto: boolean): Proposal {
-    const run = this.createProposalRun(repo, cfg, p);
+    const run = this.createProposalRun(repo, cfg, proposalGoal(p));
     const store = this.deps.store;
     return store.tx(() => {
       const accepted = store.updateProposal(p.id, {
@@ -436,24 +460,129 @@ export class LocalBacklog {
   }
 
   /**
-   * The Run of a proposal, of its own or a step of an iteration: the repo's template, the
-   * proposal's text as its goal, and no approval before merging when `auto_merge` is on (the other
-   * gates of the template stay).
+   * The Run of a proposal, of its own or a step of an iteration: the repo's template, the goal
+   * (the proposal's text, `proposalGoal`, with why the earlier attempts failed for a redo), and no
+   * approval before merging when `auto_merge` is on (the other gates of the template stay).
    */
-  private createProposalRun(
-    repo: Repo,
-    cfg: BacklogRepoConfig,
-    p: Pick<Proposal, 'title' | 'why' | 'evidence' | 'what' | 'acceptance'>,
-  ): Run {
+  private createProposalRun(repo: Repo, cfg: BacklogRepoConfig, goal: string): Run {
     return this.deps.engine.createRun({
       repo: repo.name,
       template: cfg.template,
-      goal: proposalGoal(p),
+      goal,
       overrides: issueRunOverrides(
         findTemplate(this.cfg, repo.name, cfg.template)?.template,
         cfg.auto_merge,
       ),
     });
+  }
+
+  // ---- redoing failed Runs -----------------------------------------------------------
+
+  /**
+   * Follow the repo's proposals of their own whose latest Run failed, oldest first: a failure not
+   * recorded yet is recorded (recordFailure), which gives the proposal up once its attempts are
+   * used up; then, while the work switch is on, each one waiting whose wait is over
+   * (`proposalRedoDueAt`) is redone (redo) as long as the day's budget is not spent. Neither wait
+   * costs an attempt, and each proposal waits on its own. A Run a human terminated is cancelled,
+   * not failed, so it is not redone. Steps of iterations are left to their iteration. A proposal
+   * that could not be redone (its Run not created) leaves the others to go on, and the error is
+   * thrown afterwards.
+   */
+  private redoFailedProposals(repo: Repo, cfg: BacklogRepoConfig, working: boolean): void {
+    const store = this.deps.store;
+    let failure: { err: unknown } | undefined;
+    for (const found of store.proposalsWithFailedRun(repo.id)) {
+      if (this.stopping) break;
+      const failed = store.getRun(found.runId ?? '');
+      const p = found.redo === null ? this.recordFailure(repo, cfg, found, failed) : found;
+      if (!working) continue;
+      const due = proposalRedoDueAt(p, failed, this.pollMinutes);
+      if (due === null || due > Date.now()) continue;
+      // Over budget the redos wait for the next day; the other failures are still recorded.
+      if (overBudget(store, repo, cfg)) continue;
+      try {
+        this.redo(repo, cfg, p, failed);
+      } catch (err) {
+        failure ??= { err };
+      }
+    }
+    if (failure) throw failure.err;
+  }
+
+  /**
+   * Record that the latest Run of a proposal of its own failed (`failedAttempt`: which attempt,
+   * in which stage, why) and what follows, decided once as for an issue: while attempts are left
+   * (`max_run_attempts`) it waits to be redone, with a `proposal.redo_scheduled` event saying
+   * when; otherwise the proposal failed, with a `proposal.failed` event listing every attempt.
+   * In one transaction. Returns the proposal as recorded then.
+   */
+  private recordFailure(repo: Repo, cfg: BacklogRepoConfig, p: Proposal, run: Run): Proposal {
+    const store = this.deps.store;
+    const failures = [
+      ...p.failures,
+      failedAttempt(run, store.currentStageName(run) ?? null, p.attempt),
+    ];
+    const maxAttempts = Math.max(cfg.max_run_attempts, p.attempt);
+    return store.tx(() => {
+      if (p.attempt < cfg.max_run_attempts) {
+        const pending = store.updateProposal(p.id, { failures, redo: 'pending' });
+        const redoAt = proposalRedoDueAt(pending, run, this.pollMinutes) ?? Date.now();
+        store.event(null, 'proposal.redo_scheduled', {
+          repo: repo.name,
+          proposalId: p.id,
+          runId: run.id,
+          attempt: p.attempt + 1,
+          maxAttempts,
+          redoAt: new Date(redoAt).toISOString(),
+        });
+        return pending;
+      }
+      const given = store.updateProposal(p.id, { failures, redo: 'exhausted', status: 'failed' });
+      store.event(null, 'proposal.failed', {
+        repo: repo.name,
+        proposalId: p.id,
+        runId: run.id,
+        attempts: p.attempt,
+        maxAttempts,
+        failures,
+      });
+      return given;
+    });
+  }
+
+  /**
+   * Redo a proposal whose failed Run waited long enough: a new Run, the next attempt, whose goal
+   * is the proposal's text followed by why each earlier attempt failed
+   * (`goalWithEarlierAttempts`), recorded on the proposal with a `proposal.redone` event in one
+   * transaction. The Run counts toward the day's automatic spending, whoever accepted the
+   * proposal. When the Run cannot be created nothing is recorded: a later poll tries again.
+   */
+  private redo(repo: Repo, cfg: BacklogRepoConfig, p: Proposal, failed: Run): void {
+    const store = this.deps.store;
+    const attempt = p.attempt + 1;
+    const run = this.createProposalRun(
+      repo,
+      cfg,
+      goalWithEarlierAttempts(proposalGoal(p), p.failures),
+    );
+    store.tx(() => {
+      store.updateProposal(p.id, { runId: run.id, attempt, redo: null });
+      store.event(null, 'proposal.redone', {
+        repo: repo.name,
+        proposalId: p.id,
+        runId: run.id,
+        failedRunId: failed.id,
+        attempt,
+        maxAttempts: Math.max(cfg.max_run_attempts, attempt),
+      });
+    });
+  }
+
+  /** The repo's proposals whose failed Run waits to be redone (`proposalAwaitingRedo`). */
+  private awaitingRedo(repo: Repo): number {
+    return this.deps.store
+      .listProposals({ repoId: repo.id, status: 'accepted' })
+      .filter(proposalAwaitingRedo).length;
   }
 
   // ---- iterations ----------------------------------------------------------------
@@ -673,7 +802,8 @@ export class LocalBacklog {
 
   /**
    * Where a step stands by its proposal's Run: none yet or not finished, open; completed, done;
-   * otherwise failed, as a Run of the local backlog is never redone.
+   * otherwise failed. Only proposals of their own are redone (redoFailedProposals); redoing the
+   * steps of an iteration is left to a later step.
    */
   private outcomeOf(proposalId: string): ChildOutcome {
     const store = this.deps.store;
@@ -719,7 +849,7 @@ export class LocalBacklog {
     const what = child.closeout
       ? `${p.what.trimEnd()}\n\n${closeoutSuggestions(store, iteration, child)}`
       : p.what;
-    const run = this.createProposalRun(repo, cfg, { ...p, what });
+    const run = this.createProposalRun(repo, cfg, proposalGoal({ ...p, what }));
     store.updateProposal(p.id, what === p.what ? { runId: run.id } : { runId: run.id, what });
   }
 
@@ -889,6 +1019,7 @@ export class LocalBacklog {
     adjustIteration: async (scout, repo, cfg, iteration, update) =>
       this.adjustIteration(scout, repo, cfg, iteration, update),
     holdingProposals: async (repo, cfg) => this.waitingForHuman(repo, cfg),
+    awaitingRedo: (repo) => this.awaitingRedo(repo),
   };
 
   /**

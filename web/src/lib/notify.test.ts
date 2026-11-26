@@ -91,6 +91,10 @@ describe('noticeFor automation', () => {
     for (const type of ['proposal.auto_accepted', 'proposal.accepted', 'proposal.rejected']) {
       expect(noticeFor(ev(type, decided, null), undefined), type).toBeNull();
     }
+    // A redo of a failed local proposal, or giving it up: the failed Run was told already.
+    for (const type of ['proposal.redo_scheduled', 'proposal.redone', 'proposal.failed']) {
+      expect(noticeFor(ev(type, decided, null), undefined), type).toBeNull();
+    }
     setLang('en');
     const en = noticeFor(ev('scout.completed', scout, null), undefined);
     expect(en?.title).toBe('Proposals waiting for your decision: 2');

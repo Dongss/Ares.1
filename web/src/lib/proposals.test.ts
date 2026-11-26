@@ -5,14 +5,17 @@ import { formatTime } from './format.js';
 import { pollText } from './issues.js';
 import {
   acceptBlocker,
+  attemptsText,
   backlogOutdatedBy,
   canReject,
   decidedText,
+  failureLabel,
   mergeProposals,
   PROPOSAL_STATUS,
   pendingText,
   proposalCountsText,
   proposalGroups,
+  proposalRedoText,
   scoutProposalFiled,
   sortProposals,
 } from './proposals.js';
@@ -39,11 +42,15 @@ function proposal(over: Partial<ProposalView> & Pick<ProposalView, 'id'>): Propo
     rejectReason: null,
     auto: false,
     runId: null,
+    attempt: 1,
+    failures: [],
+    redo: null,
     iterationId: null,
     dependsOn: [],
     createdAt: '2026-11-25T08:00:00.000Z',
     decidedAt: null,
     runStatus: null,
+    redoAt: null,
     ...over,
   };
 }
@@ -57,6 +64,7 @@ function repo(name: string, over: Partial<BacklogRepoStatus> = {}): BacklogRepoS
     autoAccept: { maxRisk: 'low', maxSize: 'M', maxPerDay: null, usedToday: 0 },
     autoMerge: false,
     budget: { dailyUsd: null, spentToday: 0, reached: false },
+    maxRunAttempts: 3,
     pendingProposals: 0,
     ...over,
   };
@@ -206,11 +214,62 @@ describe('local proposal labels', () => {
     expect(PROPOSAL_STATUS.pending).toMatchObject({ label: '待处理', tone: 'attention' });
     expect(PROPOSAL_STATUS.accepted).toMatchObject({ label: '已采纳', tone: 'success' });
     expect(PROPOSAL_STATUS.rejected).toMatchObject({ label: '已拒绝', tone: 'muted' });
+    expect(PROPOSAL_STATUS.failed).toMatchObject({ label: '已失败', tone: 'danger' });
     setLang('en');
     expect(Object.values(PROPOSAL_STATUS).map((s) => s.label)).toEqual([
       'Pending',
       'Accepted',
       'Rejected',
+      'Failed',
+    ]);
+  });
+
+  it('counts the failed ones too', () => {
+    const ps = [proposal({ id: '1', status: 'accepted' }), proposal({ id: '2', status: 'failed' })];
+    expect(proposalCountsText(ps)).toBe('1 条已采纳、1 条已失败');
+    setLang('en');
+    expect(proposalCountsText(ps)).toBe('1 accepted, 1 failed');
+  });
+
+  it('tells the attempts at a proposal, the redo to come and why each attempt failed', () => {
+    const failures = [
+      { runId: 'run-1', attempt: 1, stage: '编码', error: '模型额度用完了' },
+      { runId: 'run-2', attempt: 2, stage: null, error: '准备命令失败' },
+    ];
+    const first = proposal({ id: 'p', status: 'accepted', runId: 'run-1' });
+    expect(attemptsText(first, 3)).toBeNull();
+    expect(attemptsText(proposal({ id: 'p' }), 3)).toBeNull();
+    // Its first Run failed and waits to be redone.
+    const waiting = { ...first, failures: failures.slice(0, 1), redo: 'pending' as const };
+    expect(attemptsText(waiting, 3)).toBe('第 1/3 次尝试');
+    const redone = { ...first, runId: 'run-3', attempt: 3, failures };
+    expect(attemptsText(redone, 3)).toBe('第 3/3 次尝试');
+    // Never fewer than the attempts made, and without the setting once the repo left.
+    expect(attemptsText(redone, 2)).toBe('第 3/3 次尝试');
+    expect(attemptsText(redone, null)).toBe('第 3 次尝试');
+    const failed = { ...redone, status: 'failed' as const };
+    expect(attemptsText(failed, 3)).toBe(
+      '失败 2 次，达到尝试次数上限（max_run_attempts），不再自动重做',
+    );
+
+    expect(proposalRedoText(first, NOW)).toBeNull();
+    const redoAt = '2026-11-25T12:30:00.000Z';
+    expect(proposalRedoText({ ...waiting, redoAt }, NOW)).toBe(
+      `预计 ${formatTime(redoAt, NOW)} 自动重做，开始第 2 次尝试`,
+    );
+    expect(proposalRedoText({ ...waiting, redoAt: '2026-11-25T03:00:00.000Z' }, NOW)).toBe(
+      '下一次检查时自动重做，开始第 2 次尝试',
+    );
+
+    expect(failures.map(failureLabel)).toEqual(['第 1 次，失败在「编码」阶段', '第 2 次']);
+    setLang('en');
+    expect(attemptsText(redone, 3)).toBe('Attempt 3 of 3');
+    expect(attemptsText(failed, 3)).toBe(
+      'Failed 2 times, the most attempts it gets (max_run_attempts); not redone any more',
+    );
+    expect(failures.map(failureLabel)).toEqual([
+      'Attempt 1, failed in the "编码" stage',
+      'Attempt 2',
     ]);
   });
 
@@ -235,6 +294,11 @@ describe('local proposal labels', () => {
       ),
       decidedText({ ...pending, status: 'rejected', decidedAt: NOW.toISOString() }, NOW),
       pollText(5, NOW.toISOString(), NOW),
+      proposalCountsText([{ status: 'failed' }]),
+      attemptsText({ status: 'accepted', attempt: 2, failures: [] }, 3),
+      attemptsText({ status: 'failed', attempt: 1, failures: [] }, 1),
+      proposalRedoText({ attempt: 1, redoAt: NOW.toISOString() }, NOW),
+      failureLabel({ attempt: 1, stage: 'coding' }),
     ];
     for (const s of texts) {
       expect(s).toBeTruthy();

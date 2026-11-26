@@ -368,6 +368,11 @@ export interface ProposalSourceStatus {
    * Today's spend on scouts, auto-accepted Runs and automatic redos; dailyUsd null = no limit.
    */
   budget: { dailyUsd: number | null; spentToday: number; reached: boolean };
+  /**
+   * Runs a requirement (an issue, or a local proposal of its own) gets at most, the first
+   * included (`max_run_attempts`); 1 = never redone.
+   */
+  maxRunAttempts: number;
 }
 
 /** One repo whose issues the Master works on. */
@@ -381,8 +386,6 @@ export interface GitHubRepoStatus extends ProposalSourceStatus {
    * pr = the Run's branch is pushed and a pull request opened, the Run completes once it merges.
    */
   deliver: 'push' | 'pr';
-  /** Runs an issue gets at most, the first included (`max_run_attempts`); 1 = never redone. */
-  maxRunAttempts: number;
 }
 
 /** GET /api/github */
@@ -421,8 +424,17 @@ export interface BacklogStatus {
 export interface ProposalView extends Proposal {
   /** Name of its repo as registered on the dashboard. */
   repo: string;
-  /** Status of the Run it became once accepted; null before, or when there is no such Run. */
+  /**
+   * Status of the latest Run it became once accepted; null before, or when there is no such Run.
+   */
   runStatus: RunStatus | null;
+  /**
+   * Its latest Run failed and it is redone as a new Run, at this time at the earliest (ISO;
+   * `proposalRedoDueAt`): the wait after a failure doubles with each attempt. Later when today's
+   * automatic spending reached its limit or the work switch is off. null when it does not wait
+   * to be redone.
+   */
+  redoAt: string | null;
 }
 
 /** POST /api/proposals/:id/accept: the proposal, accepted, and the Run created from it. */

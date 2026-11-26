@@ -143,7 +143,8 @@ test/
     and which of them does a round by the requirement's difficulty (`stageAgentIds` /
     `chooseStageAgent`; the difficulty it goes by is `assessedDifficulty` in
     `src/engine/discussion.ts`), rate-limit waits of Runs and scouts,
-    the redo wait (`redoDelayMs` / `redoDueAt`), raw log retention (`runRawLogsExpired` /
+    the redo wait of issues and local proposals (`redoDelayMs` / `redoDueAfter` / `redoDueAt` /
+    `proposalRedoDueAt`), raw log retention (`runRawLogsExpired` /
     `scoutRawLogExpired`), leftover worktrees (`leftoverWorkspaces`), which template a repo's
     Runs get by id, the home directory's or the repo's own (`resolveTemplate`), where a repo's
     requirements come from, GitHub or the local backlog (`requirementSource`), whether a repo

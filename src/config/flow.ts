@@ -4,8 +4,9 @@
 // which stage rounds are split into tasks and whether a template can split an L requirement at
 // all; also the overrides of Runs from issues, which proposals are accepted
 // automatically, how long the automatic scout backs off and which Runs it waits for, after how
-// many failed scouts in a row a human is notified, how long a failed Run of an issue waits before
-// it is redone, how long a Run or a scout waits for an agent that is out of quota or rate-limited,
+// many failed scouts in a row a human is notified, how long a failed Run of an issue or a local
+// proposal waits before it is redone, how long a Run or a scout waits for an agent that is out of
+// quota or rate-limited,
 // how long the raw output of agents is kept, which worktrees of failed or cancelled Runs of
 // issues are left over for the Master to remove, where a repo's requirements come from (GitHub
 // or the local backlog), whether a repo delivers through pull requests, how many Runs may
@@ -24,6 +25,7 @@ import {
   FINISHED_RUN_STATUSES,
   type IterationChild,
   type IterationStatus,
+  type Proposal,
   REQUIREMENT_SIZES,
   type RequirementSize,
   type Run,
@@ -280,8 +282,8 @@ export const SYSTEM_DEFAULTS = {
     // Nobody has to be there: retry, then another agent, then the Run ends as failed.
     on_agent_error: 'switch_agent',
     // Over budget: the Run ends as failed rather than waiting for a human to raise the budget, so
-    // nothing stops while nobody is around. A Run from an issue is redone, within max_run_attempts
-    // and daily_budget_usd, so spending stays bounded.
+    // nothing stops while nobody is around. A Run from an issue or a local proposal of its own is
+    // redone, within max_run_attempts and daily_budget_usd, so spending stays bounded.
     on_budget_exceeded: 'abort',
     // Out of reworks or rollbacks: the Run ends as failed, so an issue is redone with the reason
     // and nothing waits for a human.
@@ -769,16 +771,16 @@ export function backoffMs(backoff: Backoff, retry: number): number {
   return Math.min(backoff.firstMs * 2 ** Math.max(0, retry - 1), backoff.maxMs);
 }
 
-/** The longest a failed Run of an issue waits before it is redone. */
+/** The longest a failed Run of an issue or a local proposal waits before it is redone. */
 export const REDO_BACKOFF_MAX_HOURS = 2;
 
 /**
- * How long the issue waits after its `attempt`-th Run (1 = the first) failed before the next
- * attempt starts: poll_minutes × 2^(attempt-1), at most REDO_BACKOFF_MAX_HOURS. A passing outage
- * of the agents' API or of the network fails every agent at once, retries and switching agents
- * included; without a wait the attempts would be used up within minutes and the issue closed.
- * A failure the code itself brings about every time only ends a little later: the attempts and
- * their cost stay the same.
+ * How long a requirement (an issue, or a local proposal) waits after its `attempt`-th Run (1 =
+ * the first) failed before the next attempt starts: poll_minutes × 2^(attempt-1), at most
+ * REDO_BACKOFF_MAX_HOURS. A passing outage of the agents' API or of the network fails every agent
+ * at once, retries and switching agents included; without a wait the attempts would be used up
+ * within minutes and the requirement given up. A failure the code itself brings about every time
+ * only ends a little later: the attempts and their cost stay the same.
  */
 export function redoDelayMs(attempt: number, pollMinutes: number): number {
   return backoffMs(
@@ -806,8 +808,44 @@ export function redoDueAt(
   pollMinutes: number,
 ): number | null {
   if (!awaitingRedo(run)) return null;
-  const ended = Date.parse(run.finishedAt ?? run.updatedAt);
-  return ended + redoDelayMs(run.issue?.attempt ?? 1, pollMinutes);
+  return redoDueAfter(run.issue?.attempt ?? 1, run.finishedAt ?? run.updatedAt, pollMinutes);
+}
+
+/**
+ * When the next attempt at a requirement whose `attempt`-th Run failed is due, epoch ms:
+ * `redoDelayMs` after that Run ended (`endedAt`, ISO time). The one wait of issues
+ * (`redoDueAt`) and local proposals (`proposalRedoDueAt`) alike.
+ */
+export function redoDueAfter(attempt: number, endedAt: string, pollMinutes: number): number {
+  return Date.parse(endedAt) + redoDelayMs(attempt, pollMinutes);
+}
+
+/**
+ * Whether a proposal of the local backlog waits for its failed Run to be redone: accepted, of its
+ * own (the steps of an iteration are not redone), and attempts were left when its latest Run
+ * failed. It goes on by itself, as a new Run once `proposalRedoDueAt` has passed, the day's
+ * budget allows and the work switch is on.
+ */
+export function proposalAwaitingRedo(
+  p: Pick<Proposal, 'status' | 'iterationId' | 'redo'>,
+): boolean {
+  return p.status === 'accepted' && p.iterationId === null && p.redo === 'pending';
+}
+
+/**
+ * When a proposal waiting to be redone (`proposalAwaitingRedo`) gets its next attempt, epoch ms:
+ * the wait of an issue (`redoDueAfter`) after its latest Run (`run`) ended, by the local
+ * backlog's poll_minutes. Over the day's budget or with the work switch off it waits longer.
+ * Counted from the records alone, so it holds across Master restarts. null when it does not wait
+ * for a redo.
+ */
+export function proposalRedoDueAt(
+  p: Pick<Proposal, 'status' | 'iterationId' | 'redo' | 'attempt'>,
+  run: Pick<Run, 'finishedAt' | 'updatedAt'>,
+  pollMinutes: number,
+): number | null {
+  if (!proposalAwaitingRedo(p)) return null;
+  return redoDueAfter(p.attempt, run.finishedAt ?? run.updatedAt, pollMinutes);
 }
 
 /**

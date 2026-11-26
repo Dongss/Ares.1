@@ -45,7 +45,6 @@ function earlierAttemptsSection(
   role: 'assess' | 'task',
 ): string {
   if (!earlier || earlier.length === 0) return '';
-  const n = earlier.length;
   const advice =
     role === 'assess'
       ? t({
@@ -56,6 +55,27 @@ function earlierAttemptsSection(
           zh: '动手前先想清楚这些失败的原因，换个做法避开同样的问题。',
           en: 'Before you start, work out why these attempts failed, and take an approach that avoids the same problems.',
         });
+  return `${earlierAttemptsText(earlier, advice)}\n\n`;
+}
+
+/**
+ * The goal of a Run that redoes a local proposal: the proposal's goal, then the earlier attempts
+ * and why each one failed, as the agents of a redone issue are told them. A Run of the local
+ * backlog has no issue to carry them, so they are part of the goal every stage reads. The goal
+ * as it is without earlier attempts.
+ */
+export function goalWithEarlierAttempts(goal: string, earlier: readonly FailedAttempt[]): string {
+  if (earlier.length === 0) return goal;
+  const advice = t({
+    zh: '开工前先想清楚这些失败的原因，换个做法避开同样的问题；需求本身有问题的，在需求评估时指出来。',
+    en: 'Before starting, work out why these attempts failed and take an approach that avoids the same problems; if the requirement itself is the problem, say so when assessing it.',
+  });
+  return `${goal.trimEnd()}\n\n${earlierAttemptsText(earlier, advice)}`;
+}
+
+/** The earlier attempts, oldest first, with why each one failed; `advice` follows the intro. */
+function earlierAttemptsText(earlier: readonly FailedAttempt[], advice: string): string {
+  const n = earlier.length;
   const entries = earlier.map((f) => {
     const error =
       f.error.length > MAX_EARLIER_ERROR ? `${f.error.slice(0, MAX_EARLIER_ERROR)}…` : f.error;
@@ -70,7 +90,7 @@ function earlierAttemptsSection(
     en: `This requirement was attempted ${n === 1 ? 'once' : `${n} times`} before, and ${n === 1 ? 'it' : 'each'} failed; this is attempt ${n + 1}. Why each one failed is below. ${advice}`,
   });
   const heading = t({ zh: '## 之前的尝试', en: '## Earlier attempts' });
-  return `${heading}\n\n${intro}\n\n${entries.join('\n\n')}\n\n`;
+  return `${heading}\n\n${intro}\n\n${entries.join('\n\n')}`;
 }
 
 type AgentPermission = AgentConfig['permission'];

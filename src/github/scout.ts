@@ -1681,6 +1681,8 @@ const MAX_LOCAL_PENDING = 100;
 const MAX_LOCAL_ACCEPTED = 50;
 /** Rejections stay counterexamples however old, as issues closed as not planned do. */
 const MAX_LOCAL_REJECTED = 300;
+/** Proposals given up after repeated failures, newest first. */
+const MAX_LOCAL_FAILED = 50;
 
 /** What the scout's list of local proposals reads of the Run an accepted one became. */
 export type ProposalRun = Pick<Run, 'status' | 'error' | 'discussion'>;
@@ -1710,6 +1712,12 @@ function acceptedProposalLine(
   const parts: string[] = [];
   if (p.runId) {
     parts.push(run ? `Run ${p.runId}${colon()}${statusText(run.status)}` : `Run ${p.runId}`);
+  }
+  if (p.attempt > 1) {
+    parts.push(t({ zh: `第 ${p.attempt} 次尝试`, en: `attempt ${p.attempt}` }));
+  }
+  if (p.redo === 'pending') {
+    parts.push(t({ zh: '等自动重做', en: 'waiting to be redone automatically' }));
   }
   if (p.auto) parts.push(t({ zh: '自动采纳', en: 'accepted automatically' }));
   if (iteration?.status === 'done') {
@@ -1744,16 +1752,36 @@ function acceptedProposalLine(
 }
 
 /**
+ * A proposal given up after its Runs failed `max_run_attempts` times: how many times, whether it
+ * was accepted without a human, then each attempt with its Run, the stage it failed in and why.
+ */
+function failedProposalLine(p: Proposal): string {
+  const n = p.failures.length;
+  const parts = [t({ zh: `失败 ${n} 次`, en: `failed ${n === 1 ? 'once' : `${n} times`}` })];
+  if (p.auto) parts.push(t({ zh: '自动采纳', en: 'accepted automatically' }));
+  const about = t({ zh: `（${parts.join('，')}）`, en: ` (${parts.join('; ')})` });
+  const attempts = p.failures.map((f) => {
+    const head = t({
+      zh: `第 ${f.attempt} 次（Run ${f.runId}${f.stage ? `，失败在「${f.stage}」阶段` : ''}）`,
+      en: `Attempt ${f.attempt} (Run ${f.runId}${f.stage ? `, failed in the "${f.stage}" stage` : ''})`,
+    });
+    return `  ${head}${colon()}${oneLine(f.error, 300)}`;
+  });
+  return [`- ${p.id} ${oneLine(p.title, 120)}${about}`, ...attempts].join('\n');
+}
+
+/**
  * The repo's local proposals (backlog.repos), so the scout does not propose them again: those
  * waiting for a human, those accepted with the Run each became (`runOf`, undefined when it is not
- * known), and the rejected ones with the human's reason, as counterexamples. Pending and accepted
- * proposals carry their next steps (see nextSteps), so that the scout proposes the next step of a
- * large capability once the one before it is done. `proposals` are newest first; every one was
- * written by a scout of the Master and decided on its dashboard, so all of them are trusted.
- * `iterations` are the repo's: the steps of the one under way are left out, as the iteration's
- * own digest lists them (`iterationDigest`); the steps of one rejected as a whole make one entry,
- * the iteration with the titles of its steps and the reason; the steps of one that ended are
- * listed as the accepted proposals they are, with how it ended.
+ * known), the rejected ones with the human's reason, as counterexamples, and, when there are any,
+ * those given up after their Runs failed every attempt, with why each attempt failed. Pending and
+ * accepted proposals carry their next steps (see nextSteps), so that the scout proposes the next
+ * step of a large capability once the one before it is done. `proposals` are newest first; every
+ * one was written by a scout of the Master and decided on its dashboard, so all of them are
+ * trusted. `iterations` are the repo's: the steps of the one under way are left out, as the
+ * iteration's own digest lists them (`iterationDigest`); the steps of one rejected as a whole make
+ * one entry, the iteration with the titles of its steps and the reason; the steps of one that
+ * ended are listed as the accepted proposals they are, with how it ended.
  */
 export function localProposalDigest(
   proposals: readonly Proposal[],
@@ -1799,6 +1827,7 @@ export function localProposalDigest(
       })}${reasonLine(p.rejectReason)}`,
     );
   }
+  const failed = of('failed').map(failedProposalLine);
   return [
     digestSection(
       t({ zh: '### 等人决定', en: '### Waiting for a human' }),
@@ -1807,6 +1836,18 @@ export function localProposalDigest(
     ),
     digestSection(t({ zh: '### 已采纳', en: '### Accepted' }), accepted, MAX_LOCAL_ACCEPTED),
     digestSection(t({ zh: '### 被拒绝', en: '### Rejected' }), rejected, MAX_LOCAL_REJECTED),
+    ...(failed.length > 0
+      ? [
+          digestSection(
+            t({
+              zh: '### 多次失败后放弃（不是人拒绝的）',
+              en: '### Given up after repeated failures (not rejected by a human)',
+            }),
+            failed,
+            MAX_LOCAL_FAILED,
+          ),
+        ]
+      : []),
   ].join('\n\n');
 }
 
@@ -2343,8 +2384,8 @@ function duplicatesText(source: ScoutSource): string {
 function failedRequirementsText(source: ScoutSource): string {
   return source === 'local'
     ? t({
-        zh: '- 已采纳、但 Run 失败了的提案不一样：它不是人拒绝的，需求本身可能仍然需要。可以根据其中的失败原因换个思路重新提案（比如拆小、先补上缺的能力、换一种做法），在 why 里说明和上次的不同；不要原样再提。',
-        en: '- Accepted proposals whose Run failed are different: no human rejected them, and the requirement may well still be wanted. You may propose them again with another approach based on the failure (e.g. split them up, first add a missing capability, do it another way), saying in why what is different this time; do not propose them again as they were.',
+        zh: '- 已采纳、但 Run 失败了的提案，以及「多次失败后放弃」的提案不一样：它不是人拒绝的，需求本身可能仍然需要。可以根据其中的失败原因换个思路重新提案（比如拆小、先补上缺的能力、换一种做法），在 why 里说明和上次的不同；不要原样再提。还在等自动重做的不要再提，重做的结果出来之前，它还在做。',
+        en: '- Accepted proposals whose Run failed, and proposals "given up after repeated failures", are different: no human rejected them, and the requirement may well still be wanted. You may propose them again with another approach based on the failures (e.g. split them up, first add a missing capability, do it another way), saying in why what is different this time; do not propose them again as they were. Do not propose one still waiting to be redone automatically: until its redo is over, it is still being worked on.',
       })
     : t({
         zh: '- 「多次失败后关闭」的 issue 不一样：它不是人拒绝的，而是 Run 尝试了几次都失败了，需求本身可能仍然需要。可以根据其中的失败原因换个思路重新提案（比如拆小、先补上缺的能力、换一种做法），在 why 里说明和上次的不同；不要原样再提。',

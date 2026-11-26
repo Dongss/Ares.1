@@ -837,11 +837,19 @@ export type FailureOutcome =
       failures: FailedAttempt[];
     };
 
-/** A failed Run as the issue's next attempts remember it. */
-export function failedAttempt(run: Run, stage: string | null): FailedAttempt {
+/**
+ * A failed Run as the next attempts at its requirement remember it. `attempt`: which attempt it
+ * was; by default the one its issue records (a Run of a local proposal has none: its proposal
+ * says).
+ */
+export function failedAttempt(
+  run: Run,
+  stage: string | null,
+  attempt = run.issue?.attempt ?? 1,
+): FailedAttempt {
   return {
     runId: run.id,
-    attempt: run.issue?.attempt ?? 1,
+    attempt,
     stage,
     error: run.error ?? noDetail(),
   };

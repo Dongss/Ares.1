@@ -1522,6 +1522,20 @@ button.flow-stage-body:hover:not(:disabled) {
 .proposal .hint {
   margin-top: 4px;
 }
+.proposal-failures {
+  margin-top: 4px;
+  font-size: 13px;
+}
+.proposal-failures ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+.proposal-failures li {
+  margin: 4px 0;
+}
+.proposal-failed .proposal-title {
+  color: var(--text-2);
+}
 .proposal-actions {
   display: flex;
   flex-wrap: wrap;

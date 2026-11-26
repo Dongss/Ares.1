@@ -229,7 +229,10 @@ export interface UntrustedAuthor {
  */
 export type RedoState = 'pending' | 'redone' | 'exhausted' | 'abandoned';
 
-/** A failed Run of an issue, as the next attempts and the issue remember it. */
+/**
+ * A failed Run of an issue or of a local proposal, as the next attempts and the issue (or the
+ * proposal) remember it.
+ */
 export interface FailedAttempt {
   runId: string;
   attempt: number;
@@ -371,10 +374,20 @@ export interface ScoutProposal {
 
 /**
  * pending: waits for a human, or for the automatic acceptance; accepted: a Run was created from
- * it; rejected: a human turned it down, with a reason the next scouts are shown.
+ * it (a failed one being redone included); rejected: a human turned it down, with a reason the
+ * next scouts are shown; failed: a proposal of its own whose Runs failed until `max_run_attempts`
+ * was used up, so it is not redone any more (`failures` says why).
  */
-export const PROPOSAL_STATUSES = ['pending', 'accepted', 'rejected'] as const;
+export const PROPOSAL_STATUSES = ['pending', 'accepted', 'rejected', 'failed'] as const;
 export type ProposalStatus = (typeof PROPOSAL_STATUSES)[number];
+
+/**
+ * After the Run of a proposal of its own failed: pending, it is redone as a new Run once the wait
+ * is over (`proposalRedoDueAt` in src/config/flow.ts), the work switch is on and the day's budget
+ * allows; exhausted, no attempts were left, so the proposal failed. Decided once, when the
+ * failure is first seen, and cleared when the redo's Run is created.
+ */
+export type ProposalRedo = 'pending' | 'exhausted';
 
 /**
  * A proposal in the local backlog of a repo without GitHub (backlog.repos): what a scout
@@ -398,8 +411,21 @@ export interface Proposal {
   rejectReason: string | null;
   /** Accepted without a human, within the repo's auto_accept. */
   auto: boolean;
-  /** The Run created from it once accepted. */
+  /** The latest Run created from it once accepted; the earlier ones are in `failures`. */
   runId: string | null;
+  /**
+   * Which attempt `runId` is: 1 for the Run created when it was accepted, one more for each
+   * automatic redo after a failure (a proposal of its own only; the steps of an iteration are not
+   * redone).
+   */
+  attempt: number;
+  /**
+   * Its Runs that failed, oldest first, each recorded once the failure was seen: the latest one
+   * included once it failed. A redo's goal tells them.
+   */
+  failures: FailedAttempt[];
+  /** What follows the failure of `runId`; null while it has not failed or was redone. */
+  redo: ProposalRedo | null;
   /**
    * The iteration it is a child of (`Iteration.id`); null for a proposal of its own. Accepted or
    * rejected with its iteration, as a whole.

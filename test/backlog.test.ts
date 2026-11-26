@@ -1,13 +1,25 @@
+import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { ProposalSource } from '../src/backlog/scouting.js';
+import { REDO_BACKOFF_MAX_HOURS } from '../src/config/flow.js';
 import type { BacklogRepoConfig } from '../src/config/schema.js';
 import { InvalidStateError } from '../src/engine/engine.js';
-import type { IterationUpdate, PlannedIteration } from '../src/github/scout.js';
+import { type IterationUpdate, type PlannedIteration, proposalGoal } from '../src/github/scout.js';
 import { setLang } from '../src/i18n.js';
 import { noticeFor } from '../src/notify/notice.js';
 import { ConflictError, NotFoundError } from '../src/store/store.js';
 import type { IterationChild, Proposal, Run } from '../src/store/types.js';
-import { FakeGitHub, type Harness, harness, review, TEST_AGENTS_YAML, waitFor } from './helpers.js';
+import {
+  done,
+  FakeGitHub,
+  type Harness,
+  harness,
+  review,
+  type Script,
+  TEST_AGENTS_YAML,
+  waitFor,
+  writeFile,
+} from './helpers.js';
 
 const AGENTS = `${TEST_AGENTS_YAML}
   scout:
@@ -27,6 +39,8 @@ interface ConfigOptions {
   budget?: number;
   /** auto_merge, on unless a test waits at the merge gate to hold Runs back. */
   autoMerge?: boolean;
+  /** max_run_attempts; omitted = the default (3). */
+  maxAttempts?: number;
 }
 
 /**
@@ -50,6 +64,7 @@ ${opts.maxSize === undefined ? '' : `        max_size: ${opts.maxSize}`}
 ${maxPerDay === null ? '' : `        max_per_day: ${maxPerDay}`}
       auto_merge: ${opts.autoMerge ?? true}
 ${opts.budget === undefined ? '' : `      daily_budget_usd: ${opts.budget}`}
+${opts.maxAttempts === undefined ? '' : `      max_run_attempts: ${opts.maxAttempts}`}
 `;
 };
 
@@ -447,6 +462,422 @@ backlog:
     expect(waiting).toBe('The work switch is off');
 
     const text = [prompt, notice?.title, notice?.body, waiting, ...errors].join('\n');
+    expect(text).not.toMatch(/[一-鿿]/);
+  });
+});
+
+describe('local backlog: redo after a failure', () => {
+  /** Coding, then merging without approval; an agent error ends the Run as failed at once. */
+  const REDO_WORKFLOW = `
+id: dev
+name: 测试流程
+defaults:
+  escalate:
+    max_retries: 0
+    on_agent_error: retry
+stages:
+  - id: implement
+    name: 编码
+    kind: agent
+    agent: coder
+  - id: merge
+    name: 合并
+    kind: merge
+`;
+
+  /**
+   * A coder that errors on the calls listed (counted from 1) and otherwise writes feature.txt at
+   * a cost of $2. `error`: what it says when it errors.
+   */
+  const coderFailingOn = (
+    failing: number[],
+    error = (n: number) => `第 ${n} 次：模型额度用完了`,
+  ): Script => {
+    let calls = 0;
+    return (ctx) => {
+      calls++;
+      if (failing.includes(calls)) return { status: 'failed', error: error(calls) };
+      writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+      return { ...done('写了 feature.txt'), costUsd: 2 };
+    };
+  };
+
+  async function startRedo(
+    cfg: string,
+    failing: number[],
+    workflow = REDO_WORKFLOW,
+  ): Promise<Harness> {
+    gh = new FakeGitHub();
+    h = await harness({ agents: AGENTS, config: cfg, github: gh, workflow });
+    h.scripts.coder = coderFailingOn(failing);
+    h.scripts.scout = () => ({ structured: { gaps: [], proposals: [] } });
+    return h;
+  }
+
+  /** A proposal beyond auto-accept, accepted by a human: its Run starts at once. */
+  const acceptByHand = (t: Harness, title = '加 feature', p = proposal(title, 'high')) => {
+    const row = t.master.store.createProposal({
+      ...p,
+      category: 'improvement',
+      repoId: t.repo.id,
+      scoutId: null,
+    });
+    return t.master.backlog.accept(row.id);
+  };
+
+  /**
+   * As if `ms` had passed since the failed Runs ended (by default the longest wait before a
+   * redo): they ended that much earlier.
+   */
+  const elapseRedoWait = (t: Harness, ms = REDO_BACKOFF_MAX_HOURS * 3_600_000) => {
+    const store = t.master.store;
+    for (const r of store.listRuns({ status: 'failed' })) {
+      if (!r.finishedAt) continue;
+      store.updateRun(r.id, {
+        finishedAt: new Date(Date.parse(r.finishedAt) - ms).toISOString(),
+      });
+    }
+  };
+
+  /** The latest Run of the proposal. */
+  const latestRun = (t: Harness, id: string) =>
+    t.master.store.getRun(t.master.store.getProposal(id).runId ?? '');
+
+  const coderPrompts = (t: Harness) =>
+    t.fake.calls.filter((c) => c.model === 'coder').map((c) => c.prompt);
+
+  /** Today's automatic spending is $5 already: a scout cost that much. Returns the scout. */
+  const spendToday = (t: Harness) => {
+    const store = t.master.store;
+    const scout = store.createScout({
+      repoId: t.repo.id,
+      issuesRepo: '',
+      trigger: 'auto',
+      agentId: 'scout',
+      model: 'scout',
+      logPath: '',
+    });
+    return store.updateScout(scout.id, {
+      status: 'completed',
+      costUsd: 5,
+      endedAt: new Date().toISOString(),
+    });
+  };
+  /** As on the next day: the scout's spend is yesterday's. */
+  const nextDay = (t: Harness, scoutId: string) =>
+    t.master.store.updateScout(scoutId, {
+      startedAt: new Date(Date.now() - 86_400_000).toISOString(),
+    });
+
+  it('redoes a failed Run once the wait is over, its goal telling why the first attempt failed', async () => {
+    const t = await startRedo(config({ auto: true }), [1]);
+    const store = t.master.store;
+    const p = acceptByHand(t);
+    const first = await t.waitStatus(p.runId ?? '', 'failed');
+    // As if the failed attempt had cost something: a human accepted it, so it does not count.
+    store.updateRun(first.id, { costUsd: 1 });
+    await t.master.backlog.poll();
+
+    // Recorded, but not redone right away: the first failure waits poll_minutes (5).
+    expect(store.listRuns()).toHaveLength(1);
+    const failure = {
+      runId: first.id,
+      attempt: 1,
+      stage: '编码',
+      error: expect.stringContaining('第 1 次：模型额度用完了'),
+    };
+    expect(store.getProposal(p.id)).toMatchObject({
+      status: 'accepted',
+      runId: first.id,
+      attempt: 1,
+      redo: 'pending',
+      failures: [failure],
+    });
+    const redoAt = Date.parse(first.finishedAt ?? '') + 5 * 60_000;
+    expect(eventData(t, 'proposal.redo_scheduled')).toEqual([
+      {
+        repo: 'demo',
+        proposalId: p.id,
+        runId: first.id,
+        attempt: 2,
+        maxAttempts: 3,
+        redoAt: new Date(redoAt).toISOString(),
+      },
+    ]);
+    // The automatic scout waits for the redo, as its result changes what is worth doing next.
+    expect(demoStatus(t)?.scout?.waiting?.reason).toBe('有 1 条提案在等重做');
+    expect(store.listScouts()).toHaveLength(0);
+    // A poll before the wait is over changes nothing, and records nothing twice.
+    await t.master.backlog.poll();
+    expect(store.listRuns()).toHaveLength(1);
+    expect(eventData(t, 'proposal.redo_scheduled')).toHaveLength(1);
+
+    elapseRedoWait(t);
+    await t.master.backlog.poll();
+    const second = latestRun(t, p.id);
+    expect(second.id).not.toBe(first.id);
+    expect(store.listRuns()).toHaveLength(2);
+    expect(store.getProposal(p.id)).toMatchObject({
+      status: 'accepted',
+      runId: second.id,
+      attempt: 2,
+      redo: null,
+      failures: [failure],
+    });
+    expect(second.issue).toBeNull();
+    // The goal is the proposal's text, then why the earlier attempt failed.
+    expect(second.goal.startsWith(proposalGoal(p))).toBe(true);
+    expect(second.goal).toContain('## 之前的尝试');
+    expect(second.goal).toContain('这个需求之前已经做过 1 次，都失败了，这是第 2 次。');
+    expect(second.goal).toContain(`### 第 1 次（Run ${first.id}，失败在「编码」阶段）`);
+    expect(second.goal).toContain('第 1 次：模型额度用完了');
+    expect(eventData(t, 'proposal.redone')).toEqual([
+      {
+        repo: 'demo',
+        proposalId: p.id,
+        runId: second.id,
+        failedRunId: first.id,
+        attempt: 2,
+        maxAttempts: 3,
+      },
+    ]);
+    expect(demoStatus(t)?.scout?.waiting?.reason).toBe('等 1 个未结束的 Run 做完');
+
+    await t.waitStatus(second.id, 'completed');
+    // The second attempt's agent read why the first one failed; the first one's did not.
+    const [firstPrompt, secondPrompt] = coderPrompts(t);
+    expect(firstPrompt).not.toContain('之前的尝试');
+    expect(secondPrompt).toContain('## 之前的尝试');
+    expect(secondPrompt).toContain('第 1 次：模型额度用完了');
+    // The redo counts toward today's automatic spending; the attempt a human accepted does not.
+    expect(demoStatus(t)?.budget.spentToday).toBe(2);
+    // Nothing is left to redo.
+    expect(store.proposalsWithFailedRun(t.repo.id)).toEqual([]);
+    expect(gh.calls).toEqual([]);
+  });
+
+  it('gives the proposal up once max_run_attempts is used up, with every reason', async () => {
+    const t = await startRedo(config({ maxAttempts: 2 }), [1, 2]);
+    const store = t.master.store;
+    const p = acceptByHand(t);
+    const first = await t.waitStatus(p.runId ?? '', 'failed');
+    await t.master.backlog.poll();
+    elapseRedoWait(t);
+    await t.master.backlog.poll();
+    const second = await t.waitStatus(latestRun(t, p.id).id, 'failed');
+    expect(second.goal).toContain('第 1 次：模型额度用完了');
+    // No attempts left: given up at once, nothing to wait for.
+    await t.master.backlog.poll();
+
+    const failures = [
+      {
+        runId: first.id,
+        attempt: 1,
+        stage: '编码',
+        error: expect.stringContaining('第 1 次：模型额度用完了'),
+      },
+      {
+        runId: second.id,
+        attempt: 2,
+        stage: '编码',
+        error: expect.stringContaining('第 2 次：模型额度用完了'),
+      },
+    ];
+    expect(store.getProposal(p.id)).toMatchObject({
+      status: 'failed',
+      runId: second.id,
+      attempt: 2,
+      redo: 'exhausted',
+      failures,
+    });
+    expect(eventData(t, 'proposal.failed')).toEqual([
+      {
+        repo: 'demo',
+        proposalId: p.id,
+        runId: second.id,
+        attempts: 2,
+        maxAttempts: 2,
+        failures,
+      },
+    ]);
+    expect(eventData(t, 'proposal.redo_scheduled')).toHaveLength(1);
+    // Never redone again, however long it waits.
+    elapseRedoWait(t);
+    await t.master.backlog.poll();
+    expect(store.listRuns()).toHaveLength(2);
+    expect(store.listProposals({ repoId: t.repo.id, status: 'failed' })).toHaveLength(1);
+    expect(() => t.master.backlog.accept(p.id)).toThrow(
+      `提案 ${p.id} 已经采纳过，Run 失败 2 次后不再重做了`,
+    );
+    expect(() => t.master.backlog.reject(p.id, '不做了')).toThrow(InvalidStateError);
+
+    // The scout reads it as given up after failures, with every reason, not as a rejection.
+    await scoutByHand(t);
+    const prompt = lastScoutPrompt(t);
+    const given = prompt.slice(prompt.indexOf('### 多次失败后放弃（不是人拒绝的）'));
+    expect(given).toContain(`- ${p.id} 加 feature（失败 2 次）`);
+    expect(given).toContain(`  第 1 次（Run ${first.id}，失败在「编码」阶段）：`);
+    expect(given).toContain(`  第 2 次（Run ${second.id}，失败在「编码」阶段）：`);
+    expect(given).toContain('第 2 次：模型额度用完了');
+    expect(prompt.slice(prompt.indexOf('### 被拒绝'))).not.toContain(`${p.id} 加 feature\n`);
+  });
+
+  it('gives up at the first failure with max_run_attempts: 1', async () => {
+    const t = await startRedo(config({ maxAttempts: 1 }), [1]);
+    const p = acceptByHand(t);
+    await t.waitStatus(p.runId ?? '', 'failed');
+    await t.master.backlog.poll();
+    expect(t.master.store.getProposal(p.id)).toMatchObject({ status: 'failed', attempt: 1 });
+    expect(eventData(t, 'proposal.failed')[0]).toMatchObject({ attempts: 1, maxAttempts: 1 });
+    expect(eventData(t, 'proposal.redo_scheduled')).toEqual([]);
+  });
+
+  it('does not redo a Run a human terminated, nor give its proposal up', async () => {
+    const t = await startRedo(config(), []);
+    t.scripts.coder = async (ctx) => {
+      await new Promise((resolve) => ctx.signal.addEventListener('abort', resolve));
+      return done();
+    };
+    const p = acceptByHand(t);
+    const run = p.runId ?? '';
+    await waitFor(() => t.fake.calls.length === 1, 'the agent to start');
+    expect((await t.master.engine.cancel(run)).status).toBe('cancelled');
+    elapseRedoWait(t);
+    await t.master.backlog.poll();
+    expect(t.master.store.getProposal(p.id)).toMatchObject({
+      status: 'accepted',
+      runId: run,
+      attempt: 1,
+      redo: null,
+      failures: [],
+    });
+    expect(t.master.store.listRuns()).toHaveLength(1);
+    expect(eventData(t, 'proposal.redo_scheduled')).toEqual([]);
+    expect(eventData(t, 'proposal.failed')).toEqual([]);
+  });
+
+  it("waits for the next day once the day's budget is spent, and for the work switch", async () => {
+    const t = await startRedo(config({ budget: 5 }), [1]);
+    const store = t.master.store;
+    const scout = spendToday(t);
+    const p = acceptByHand(t);
+    await t.waitStatus(p.runId ?? '', 'failed');
+    // Recorded all the same: only the redo waits.
+    await t.master.backlog.poll();
+    expect(store.getProposal(p.id).redo).toBe('pending');
+    elapseRedoWait(t);
+    await t.master.backlog.poll();
+    expect(store.listRuns()).toHaveLength(1);
+    expect(store.getProposal(p.id)).toMatchObject({ redo: 'pending', attempt: 1 });
+
+    // The next day the budget is back, but the work switch is off.
+    nextDay(t, scout.id);
+    store.setWorking(false);
+    await t.master.backlog.poll();
+    expect(store.listRuns()).toHaveLength(1);
+
+    // Turned on, it polls at once and redoes the proposal; the next poll finds nothing more.
+    store.setWorking(true);
+    await t.master.backlog.poll();
+    expect(store.listRuns()).toHaveLength(2);
+    expect(store.getProposal(p.id)).toMatchObject({ attempt: 2, redo: null });
+    expect(eventData(t, 'proposal.redone')).toHaveLength(1);
+  });
+
+  it('redoes as recorded once the Master restarted', async () => {
+    const t = await startRedo(config(), [1]);
+    const p = acceptByHand(t);
+    const first = await t.waitStatus(p.runId ?? '', 'failed');
+    // The Master stops before any poll saw the failure.
+    await t.close();
+    h = await harness({
+      agents: AGENTS,
+      config: config(),
+      github: gh,
+      home: t.home,
+      repoDir: t.repoDir,
+      workflow: REDO_WORKFLOW,
+    });
+    const after = h;
+    const store = after.master.store;
+    await after.master.backlog.poll();
+    expect(store.getProposal(p.id)).toMatchObject({ redo: 'pending', attempt: 1 });
+    expect(store.listRuns()).toHaveLength(1);
+
+    // Again, while it waits: what it recorded holds.
+    await after.close();
+    h = await harness({
+      agents: AGENTS,
+      config: config(),
+      github: gh,
+      home: t.home,
+      repoDir: t.repoDir,
+      workflow: REDO_WORKFLOW,
+    });
+    const again = h;
+    elapseRedoWait(again);
+    await again.master.backlog.poll();
+    const second = latestRun(again, p.id);
+    expect(second.id).not.toBe(first.id);
+    expect(second.goal).toContain(`### 第 1 次（Run ${first.id}，失败在「编码」阶段）`);
+    await again.waitStatus(second.id, 'completed');
+    expect(again.master.store.listGlobalEventsOfType('proposal.redo_scheduled')).toHaveLength(1);
+    expect(again.master.store.listGlobalEventsOfType('proposal.redone')).toHaveLength(1);
+  });
+
+  it('speaks English without Chinese left', async () => {
+    const workflow = REDO_WORKFLOW.replace('测试流程', 'Test flow')
+      .replace('编码', 'Coding')
+      .replace('合并', 'Merge');
+    const t = await startRedo(
+      `language: en\n${config({ auto: true, maxAttempts: 2 })}`,
+      [1, 2],
+      workflow,
+    );
+    t.scripts.coder = coderFailingOn([1, 2], (n) => `attempt ${n}: out of quota`);
+    const english = {
+      ...proposal('Add a cache', 'high'),
+      why: 'Why: a cache',
+      evidence: ['run_abc was reworked 3 times'],
+      what: 'How: a cache',
+      acceptance: ['Tests pass'],
+    };
+    const p = acceptByHand(t, 'Add a cache', english);
+    const first = await t.waitStatus(p.runId ?? '', 'failed');
+    await t.master.backlog.poll();
+    const waiting = demoStatus(t)?.scout?.waiting?.reason;
+    expect(waiting).toBe('1 proposal waiting to be redone');
+    elapseRedoWait(t);
+    await t.master.backlog.poll();
+    const second = latestRun(t, p.id);
+    expect(second.goal).toContain('## Earlier attempts');
+    expect(second.goal).toContain(
+      'This requirement was attempted once before, and it failed; this is attempt 2.',
+    );
+    expect(second.goal).toContain(`### Attempt 1 (Run ${first.id}, failed in the "Coding" stage)`);
+    await t.waitStatus(second.id, 'failed');
+    // Given up: the repo is idle again, so the automatic scout starts.
+    await t.master.backlog.poll();
+    let refused = '';
+    try {
+      t.master.backlog.accept(p.id);
+    } catch (err) {
+      refused = (err as Error).message;
+    }
+    expect(refused).toBe(
+      `Proposal ${p.id} was accepted already, and given up after its Runs failed 2 times`,
+    );
+    const [scout] = t.master.store.listScouts();
+    if (!scout) throw new Error('no scout');
+    await scoutDone(t, scout.id);
+    const prompt = lastScoutPrompt(t);
+    const given = prompt.slice(
+      prompt.indexOf('### Given up after repeated failures (not rejected by a human)'),
+    );
+    expect(given).toContain(`- ${p.id} Add a cache (failed 2 times)`);
+    expect(given).toContain(`  Attempt 2 (Run ${second.id}, failed in the "Coding" stage): `);
+
+    const text = [second.goal, waiting, refused, given].join('\n');
     expect(text).not.toMatch(/[一-鿿]/);
   });
 });

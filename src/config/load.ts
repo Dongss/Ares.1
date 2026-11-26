@@ -680,8 +680,8 @@ function waitForHumanWarning(option: WaitingOption): string {
   switch (option) {
     case 'on_budget_exceeded':
       return t({
-        zh: 'on_budget_exceeded: pause：Run 花费达到预算（budget_usd）后会卡住等人调高预算，没人在场时就停在那里。建议改成 abort：结束 Run、标为失败，从 issue 来的 Run 会在 max_run_attempts 和 daily_budget_usd 的限制内自动重做',
-        en: 'on_budget_exceeded: pause: once a Run has spent its budget (budget_usd), it waits for a human to raise the budget, stuck while nobody is around. Better use abort: the Run ends as failed, and a Run from an issue is redone within max_run_attempts and daily_budget_usd',
+        zh: 'on_budget_exceeded: pause：Run 花费达到预算（budget_usd）后会卡住等人调高预算，没人在场时就停在那里。建议改成 abort：结束 Run、标为失败，从 issue 或单独的本地提案来的 Run 会在 max_run_attempts 和 daily_budget_usd 的限制内自动重做',
+        en: 'on_budget_exceeded: pause: once a Run has spent its budget (budget_usd), it waits for a human to raise the budget, stuck while nobody is around. Better use abort: the Run ends as failed, and a Run from an issue or a local proposal of its own is redone within max_run_attempts and daily_budget_usd',
       });
     case 'on_agent_error':
       return t({
@@ -976,8 +976,8 @@ export function validateTemplate(
           });
     warnings.push(
       t({
-        zh: `阶段 ${s.id}：合并阶段${where}。合并目标分支的最新代码发生冲突时，没有 Agent 能解决，Run 会直接结束、标为失败，从 issue 来的 Run 会在 max_run_attempts 的限制内基于目标分支的最新代码自动重做。想让 Agent 解决冲突，就把 on_fail 指向一个 Agent 阶段（kind: agent）`,
-        en: `Stage ${s.id}: the merge stage ${where}. When merging the latest target branch runs into conflicts, no agent can resolve them, so the Run ends as failed, and a Run from an issue is redone on the latest target branch within max_run_attempts. To have an agent resolve conflicts, point on_fail at an agent stage (kind: agent)`,
+        zh: `阶段 ${s.id}：合并阶段${where}。合并目标分支的最新代码发生冲突时，没有 Agent 能解决，Run 会直接结束、标为失败，从 issue 或单独的本地提案来的 Run 会在 max_run_attempts 的限制内基于目标分支的最新代码自动重做。想让 Agent 解决冲突，就把 on_fail 指向一个 Agent 阶段（kind: agent）`,
+        en: `Stage ${s.id}: the merge stage ${where}. When merging the latest target branch runs into conflicts, no agent can resolve them, so the Run ends as failed, and a Run from an issue or a local proposal of its own is redone on the latest target branch within max_run_attempts. To have an agent resolve conflicts, point on_fail at an agent stage (kind: agent)`,
       }),
     );
   }

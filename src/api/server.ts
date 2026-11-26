@@ -5,6 +5,7 @@ import { streamSSE } from 'hono/streaming';
 import { z } from 'zod';
 import type { LocalBacklog } from '../backlog/local.js';
 import {
+  proposalRedoDueAt,
   RAW_LOG_KEEP_DAYS,
   redoDueAt,
   requirementSource,
@@ -26,6 +27,7 @@ import {
   type Iteration,
   PROPOSAL_STATUSES,
   type Proposal,
+  type Run,
   type RunStatus,
 } from '../store/types.js';
 import type { Upgrader } from '../upgrade/upgrader.js';
@@ -518,15 +520,19 @@ export function createApi(deps: ApiDeps): Hono {
     return c.json(backlog.status() satisfies BacklogStatus);
   });
 
+  /** How often the local backlog polls: a failed proposal's redo waits by it. */
+  const backlogPollMinutes = () => config().master.backlog?.poll_minutes ?? 5;
+
   // Proposals of the local backlog, newest first; ?repo= and ?status= filter, ?limit= caps.
   app.get('/api/proposals', (c) => {
     const { repo, status, limit } = query(c, ProposalsQuery);
     const repoId = repo ? store.getRepo(repo).id : undefined;
     const names = new Map(store.listRepos().map((r) => [r.id, r.name]));
+    const poll = backlogPollMinutes();
     return c.json(
       store
         .listProposals({ repoId, status, limit })
-        .map((p) => proposalView(store, p, names)) satisfies ProposalView[],
+        .map((p) => proposalView(store, p, poll, names)) satisfies ProposalView[],
     );
   });
 
@@ -536,7 +542,7 @@ export function createApi(deps: ApiDeps): Hono {
     const proposal = backlog.accept(c.req.param('id'));
     const run = store.getRun(proposal.runId ?? '');
     return c.json({
-      proposal: proposalView(store, proposal),
+      proposal: proposalView(store, proposal, backlogPollMinutes()),
       run: summarizeRun(store, engine, run),
     } satisfies ProposalAccepted);
   });
@@ -545,9 +551,8 @@ export function createApi(deps: ApiDeps): Hono {
   // decided with its iteration (409).
   app.post('/api/proposals/:id/reject', async (c) => {
     const { reason } = await body(c, RejectProposalInput);
-    return c.json(
-      proposalView(store, backlog.reject(c.req.param('id'), reason)) satisfies ProposalView,
-    );
+    const rejected = backlog.reject(c.req.param('id'), reason);
+    return c.json(proposalView(store, rejected, backlogPollMinutes()) satisfies ProposalView);
   });
 
   // Iterations of both sources, newest first; ?repo= and ?status= (one, or several separated by
@@ -664,20 +669,32 @@ export function createApi(deps: ApiDeps): Hono {
 }
 
 /**
- * A proposal with its repo's name and the status of the Run it became. `names`: repo names by id,
- * for listing many; omitted = looked up.
+ * A proposal with its repo's name, the status of the latest Run it became and when that one is
+ * redone if it waits to be (by the local backlog's `pollMinutes`). `names`: repo names by id, for
+ * listing many; omitted = looked up.
  */
-function proposalView(store: Store, p: Proposal, names?: Map<string, string>): ProposalView {
-  let runStatus: RunStatus | null = null;
+function proposalView(
+  store: Store,
+  p: Proposal,
+  pollMinutes: number,
+  names?: Map<string, string>,
+): ProposalView {
+  let run: Run | undefined;
   if (p.runId) {
     try {
-      runStatus = store.getRun(p.runId).status;
+      run = store.getRun(p.runId);
     } catch (err) {
       if (!(err instanceof NotFoundError)) throw err;
     }
   }
+  const redoAt = run?.status === 'failed' ? proposalRedoDueAt(p, run, pollMinutes) : null;
   const repo = names ? names.get(p.repoId) : store.findRepo(p.repoId)?.name;
-  return { ...p, repo: repo ?? p.repoId, runStatus };
+  return {
+    ...p,
+    repo: repo ?? p.repoId,
+    runStatus: run?.status ?? null,
+    redoAt: redoAt === null ? null : new Date(redoAt).toISOString(),
+  };
 }
 
 function summarizeRun(store: Store, engine: Engine, run: ReturnType<Store['getRun']>): RunSummary {

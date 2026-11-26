@@ -20,7 +20,13 @@ import {
   NotFoundError,
   Store,
 } from '../src/store/store.js';
-import type { Attempt, IterationChild, Scout, ScoutProposal } from '../src/store/types.js';
+import type {
+  Attempt,
+  IterationChild,
+  Proposal,
+  Scout,
+  ScoutProposal,
+} from '../src/store/types.js';
 import { type Harness, harness, tmpDir } from './helpers.js';
 
 const template = TemplateSchema.parse({ id: 't', stages: [{ id: 'a', agent: 'x' }] });
@@ -472,6 +478,9 @@ describe('proposals of the local backlog', () => {
       rejectReason: null,
       auto: false,
       runId: null,
+      attempt: 1,
+      failures: [],
+      redo: null,
       iterationId: null,
       dependsOn: [],
       createdAt: a.createdAt,
@@ -551,6 +560,25 @@ describe('proposals of the local backlog', () => {
       store.updateProposal(p.id, { status: 'accepted', auto, runId: run.id });
       return run;
     };
+    const failure = (runId: string, attempt: number) => ({
+      runId,
+      attempt,
+      stage: '编码',
+      error: '失败了',
+    });
+    /** A proposal accepted by `auto` whose first Runs failed and were redone. */
+    const redone = (title: string, auto: boolean) => {
+      const p = store.createProposal({ ...proposed(title), repoId: repo.id, scoutId: null });
+      const runs = [mk(`${title} 1`), mk(`${title} 2`), mk(`${title} 3`)];
+      store.updateProposal(p.id, {
+        status: 'accepted',
+        auto,
+        runId: runs[2]?.id ?? '',
+        attempt: 3,
+        failures: [failure(runs[0]?.id ?? '', 1), failure(runs[1]?.id ?? '', 2)],
+      });
+      return runs;
+    };
     const old = accepted('old', true);
     store.updateRun(old.id, { createdAt: '2026-11-24T08:00:00.000Z' });
     const auto = accepted('auto', true);
@@ -570,12 +598,49 @@ describe('proposals of the local backlog', () => {
     mk('plain');
 
     const since = '2026-11-25T00:00:00.000Z';
-    expect(store.autoProposalRunsSince(repo.id, since).map((r) => r.id)).toEqual([auto.id]);
-    expect(store.autoProposalRunsSince(repo.id, '1970-01-01T00:00:00.000Z')).toEqual([
+    expect(store.automaticProposalRunsSince(repo.id, since).map((r) => r.id)).toEqual([auto.id]);
+    expect(store.automaticProposalRunsSince(repo.id, '1970-01-01T00:00:00.000Z')).toEqual([
       store.getRun(old.id),
       store.getRun(auto.id),
     ]);
-    expect(store.autoProposalRunsSince('nope', since)).toEqual([]);
+    expect(store.automaticProposalRunsSince('nope', since)).toEqual([]);
+
+    // Redos count whoever accepted the proposal: the first Run only when accepted automatically.
+    const [, byHand2, byHand3] = redone('by hand, redone', false);
+    const [auto1, auto2, auto3] = redone('auto, redone', true);
+    const ids = store.automaticProposalRunsSince(repo.id, since).map((r) => r.id);
+    // Created within the same millisecond, maybe: compared in any order.
+    expect(ids.sort()).toEqual(
+      [auto.id, byHand2?.id, byHand3?.id, auto1?.id, auto2?.id, auto3?.id].sort(),
+    );
+  });
+
+  it('finds the proposals of their own whose latest Run failed and that are not given up', () => {
+    const store = new Store(':memory:');
+    const { repo, mk } = seed(store);
+    const withRun = (
+      title: string,
+      status: 'failed' | 'cancelled' | 'completed',
+      patch: Partial<Proposal> = {},
+    ) => {
+      const p = store.createProposal({ ...proposed(title), repoId: repo.id, scoutId: null });
+      const run = mk(title);
+      store.updateRun(run.id, { status });
+      return store.updateProposal(p.id, { status: 'accepted', runId: run.id, ...patch });
+    };
+    const fresh = withRun('fresh', 'failed');
+    const waiting = withRun('waiting', 'failed', { redo: 'pending' });
+    withRun('given up', 'failed', { status: 'failed', redo: 'exhausted' });
+    withRun('cancelled', 'cancelled');
+    withRun('completed', 'completed');
+    withRun('step', 'failed', { iterationId: 'iteration-1' });
+    // Pending, without a Run.
+    store.createProposal({ ...proposed('pending'), repoId: repo.id, scoutId: null });
+    expect(store.proposalsWithFailedRun(repo.id)).toEqual([
+      store.getProposal(fresh.id),
+      store.getProposal(waiting.id),
+    ]);
+    expect(store.proposalsWithFailedRun('nope')).toEqual([]);
   });
 
   it('tells a proposal that does not exist, in both languages', () => {

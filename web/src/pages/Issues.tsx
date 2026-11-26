@@ -13,7 +13,7 @@ import type { Scout, ScoutGap } from '../../../src/store/types.js';
 import { Badge, ConfirmButton, Empty, ErrorBox, TemplateProblems } from '../components/ui.js';
 import { api } from '../lib/api.js';
 import { repoTemplateChoice, repoTemplateProblems, templateSourceText } from '../lib/config.js';
-import { formatCost, formatTime, RUN_STATUS } from '../lib/format.js';
+import { formatCost, formatTime, messageExcerpt, RUN_STATUS } from '../lib/format.js';
 import { useAction, useReloadOn, useResource } from '../lib/hooks.js';
 import {
   autoAcceptText,
@@ -32,15 +32,18 @@ import {
 } from '../lib/issues.js';
 import {
   acceptBlocker,
+  attemptsText,
   backlogOutdatedBy,
   canReject,
   decidedText,
+  failureLabel,
   mergeProposals,
   PROPOSAL_STATUS,
   type ProposalGroup,
   pendingText,
   proposalCountsText,
   proposalGroups,
+  proposalRedoText,
   RECENT_PROPOSALS,
   scoutProposalFiled,
 } from '../lib/proposals.js';
@@ -280,7 +283,8 @@ function backlogExample(): string {
         max_risk: low        # 自动采纳到哪个风险等级：none / low / mid / high
         max_size: M          # 自动采纳到哪个大小：S / M / L
       auto_merge: false      # 采纳的提案建出的 Run 合并前不再等你审批
-      # daily_budget_usd: 20 # 每天自动花费的上限，不写 = 不限`,
+      # daily_budget_usd: 20 # 每天自动花费的上限，不写 = 不限
+      max_run_attempts: 3    # 一条提案最多跑几次 Run（含第一次），失败后自动重做`,
     en: `backlog:
   poll_minutes: 5            # how often to go over the local backlog
   repos:
@@ -293,7 +297,8 @@ function backlogExample(): string {
         max_risk: low        # highest risk accepted automatically: none / low / mid / high
         max_size: M          # largest size accepted automatically: S / M / L
       auto_merge: false      # Runs from accepted proposals merge without waiting for your approval
-      # daily_budget_usd: 20 # daily limit of automatic spend; omitted = no limit`,
+      # daily_budget_usd: 20 # daily limit of automatic spend; omitted = no limit
+      max_run_attempts: 3    # Runs a proposal gets at most, the first included; failed ones are redone`,
   });
 }
 
@@ -708,6 +713,8 @@ function ProposalItem(props: {
   const blocker = acceptBlocker(p, group.status);
   const waiting = pendingText(p, group.status?.autoAccept ?? null);
   const decided = decidedText(p);
+  const attempts = attemptsText(p, group.status?.maxRunAttempts ?? null);
+  const redo = proposalRedoText(p);
   const accept = async () => {
     if ((await action.run(() => api.acceptProposal(p.id))) !== undefined) onChanged();
   };
@@ -731,7 +738,7 @@ function ProposalItem(props: {
         </summary>
         <ProposalBody proposal={p} />
       </details>
-      {p.status === 'accepted' && (
+      {(p.status === 'accepted' || p.status === 'failed') && (
         <div className="proposal-outcome">
           {p.auto && <Badge tone="active">{t({ zh: '已自动采纳', en: 'Auto-accepted' })}</Badge>}
           {decided && <span className="muted">{decided}</span>}
@@ -743,7 +750,28 @@ function ProposalItem(props: {
               )}
             </>
           )}
+          {attempts && <span className="muted">{attempts}</span>}
         </div>
+      )}
+      {redo && <div className="hint">{redo}</div>}
+      {p.failures.length > 0 && (
+        <details className="proposal-failures">
+          <summary>
+            {t({
+              zh: `失败的尝试（${p.failures.length} 次）及原因`,
+              en: `Failed attempts (${p.failures.length}) and why`,
+            })}
+          </summary>
+          <ul>
+            {p.failures.map((f) => (
+              <li key={f.runId}>
+                <a href={href.run(f.runId)}>Run {f.runId}</a>{' '}
+                <span className="muted">{failureLabel(f)}</span>
+                <pre className="pre">{messageExcerpt(f.error)}</pre>
+              </li>
+            ))}
+          </ul>
+        </details>
       )}
       {p.status === 'rejected' && (
         <div className="proposal-outcome">
