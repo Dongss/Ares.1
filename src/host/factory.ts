@@ -4,13 +4,14 @@
 import type { MasterConfig } from '../config/schema.js';
 import { GhCli } from '../github/client.js';
 import { GlabCli } from '../gitlab/client.js';
+import type { HostPlatform } from '../store/types.js';
 import type { CodeHost } from './code-host.js';
 
 /** The settings of the Master's config a code host's client is made with. */
 export type CodeHostConfig = Pick<MasterConfig, 'bins' | 'github' | 'gitlab'>;
 
 /** The platforms a code host's client is made for. */
-export type CodeHostPlatform = 'github' | 'gitlab';
+export type CodeHostPlatform = HostPlatform;
 
 /**
  * Makes the code host's client for the config, once per platform and setting: while the settings

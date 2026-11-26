@@ -48,6 +48,7 @@ import {
   blockOverBudget,
   done,
   FakeGitHub,
+  FakeGitLab,
   git,
   type Harness,
   harness,
@@ -1444,6 +1445,96 @@ ${lines}`;
     const { json } = (await call('GET', '/api/config')) as { json: ConfigView };
     expect(json.errors[githubConfigKey('demo')]).toEqual([problem]);
   });
+
+  it('says which platform it is, GitHub without a host', async () => {
+    h = await harness({ config: 'github:\n  repos: {}\n', github: new FakeGitHub() });
+    expect((await call('GET', '/api/github')).json).toMatchObject({
+      platform: 'github',
+      host: null,
+      enabled: true,
+    } satisfies Partial<GitHubStatus>);
+  });
+});
+
+describe('GET /api/gitlab', () => {
+  const AGENTS = `${TEST_AGENTS_YAML}
+  scout:
+    cli: fake
+    model: scout
+`;
+  const CONFIG = `
+gitlab:
+  host: gitlab.example.com:8443
+  poll_minutes: 3
+  repos:
+    demo:
+      issues_repo: grp/sub/demo
+      template: dev
+      scout: { agent: scout, auto: false }
+      push: true
+`;
+
+  it('gives the platform, its host and its repos, and polls it on demand', async () => {
+    const gl = new FakeGitLab('grp/sub/demo', 'gitlab.example.com:8443');
+    const gh = new FakeGitHub();
+    h = await harness({ agents: AGENTS, config: CONFIG, gitlab: gl, github: gh });
+    const res = await call('GET', '/api/gitlab');
+    expect(res.status).toBe(200);
+    const status = res.json as GitHubStatus;
+    expect(status).toMatchObject({
+      platform: 'gitlab',
+      host: 'gitlab.example.com:8443',
+      enabled: true,
+      account: null,
+      pollMinutes: 3,
+      lastPollAt: null,
+      lastError: null,
+    });
+    expect(status.repos).toEqual([
+      expect.objectContaining({
+        name: 'demo',
+        issuesRepo: 'grp/sub/demo',
+        push: true,
+        deliver: 'push',
+        problems: [],
+      }),
+    ]);
+    // GitHub's section is another's: none in config.yaml.
+    expect((await call('GET', '/api/github')).json).toMatchObject({
+      platform: 'github',
+      enabled: false,
+      repos: [],
+    });
+
+    gl.add({ title: '加 feature', labels: ['ares1:ready'] });
+    const polled = await call('POST', '/api/gitlab/poll');
+    expect(polled.status).toBe(200);
+    expect((polled.json as GitHubStatus).lastPollAt).toEqual(expect.any(String));
+    expect(h.master.store.listRuns()[0]?.issue).toMatchObject({
+      repo: 'grp/sub/demo',
+      platform: 'gitlab',
+      url: 'https://gitlab.example.com:8443/grp/sub/demo/-/issues/1',
+    });
+    expect(gh.calls).toEqual([]);
+  });
+
+  it('starts the scout of a GitLab repo through GitLab', async () => {
+    const gl = new FakeGitLab();
+    const gh = new FakeGitHub();
+    h = await harness({ agents: AGENTS, config: CONFIG, gitlab: gl, github: gh });
+    const t = h;
+    t.scripts.scout = () => ({ structured: { gaps: [], proposals: [] } });
+    const res = await call('POST', '/api/scouts', { repo: 'demo' });
+    expect(res.status).toBe(201);
+    expect(res.json as Scout).toMatchObject({ trigger: 'manual', issuesRepo: 'grp/sub/demo' });
+    await waitFor(
+      () => t.master.store.getScout(res.json.id).status !== 'running' && !t.master.scouting.running,
+      'scout to finish',
+    );
+    expect(t.master.store.getScout(res.json.id).status).toBe('completed');
+    expect([...gl.projects]).toEqual(['grp/sub/demo']);
+    expect(gh.calls).toEqual([]);
+  });
 });
 
 describe('local backlog API', () => {
@@ -2380,7 +2471,9 @@ backlog:
     });
     expect(await call('POST', '/api/scouts', { repo: 'nowhere' })).toMatchObject({
       status: 404,
-      json: { error: 'config.yaml 的 github.repos 和 backlog.repos 里都没有 nowhere' },
+      json: {
+        error: 'config.yaml 的 github.repos、gitlab.repos 和 backlog.repos 里都没有 nowhere',
+      },
     });
     expect(gh.calls).toEqual([]);
   });
@@ -2424,7 +2517,7 @@ backlog:
     expect(again.json.error).toBe(`Proposal ${p.id} was accepted already`);
     const scout = await call('POST', '/api/scouts', { repo: 'nowhere' });
     expect(scout.json.error).toBe(
-      'nowhere is in neither github.repos nor backlog.repos of config.yaml',
+      'nowhere is in none of github.repos, gitlab.repos and backlog.repos of config.yaml',
     );
     const status = (await call('GET', '/api/backlog')).json as BacklogStatus;
     expect(status.repos[1]?.problems).toEqual(['Repo other is not registered on the dashboard']);

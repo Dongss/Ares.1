@@ -4,11 +4,13 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { FakeAdapter, type FakeContext, type FakeOutcome } from '../src/adapters/fake.js';
 import { githubAuthor } from '../src/github/client.js';
+import { gitlabAuthor } from '../src/gitlab/client.js';
 import {
   type ChangeRequest,
   type ChangeRequestStatus,
   type CodeHost,
   forcePushable,
+  type HostAuthored,
   type HostCheck,
   type HostComment,
   type HostIssue,
@@ -231,6 +233,8 @@ export interface HarnessOptions {
   config?: string;
   /** In-memory GitHub; the harness never polls it on a timer. */
   github?: CodeHost;
+  /** In-memory GitLab (FakeGitLab); the harness never polls it on a timer. */
+  gitlab?: CodeHost;
   /** More Master options (the harness never runs the upgrade timer). */
   master?: Partial<MasterOptions>;
 }
@@ -262,6 +266,7 @@ export async function harness(opts: HarnessOptions = {}): Promise<Harness> {
     adapters: [fake],
     webDir: opts.webDir ?? join(home, 'no-web'),
     github: opts.github,
+    gitlab: opts.gitlab,
     pollIssues: false,
     upgradeTimer: false,
     notice: () => {},
@@ -304,13 +309,19 @@ export async function harness(opts: HarnessOptions = {}): Promise<Harness> {
 }
 
 /**
- * Who wrote an issue or a comment on FakeGitHub. FakeGitHub works out `trusted` and `role` from
- * it as the GitHub client does (`githubAuthor`).
+ * Who wrote an issue or a comment on FakeGitHub or FakeGitLab. Each works out `trusted` and
+ * `role` from it as its platform's client does: FakeGitHub from `association` (`githubAuthor`),
+ * FakeGitLab from `accessLevel` (`gitlabAuthor`).
  */
 export interface FakeAuthor {
   login: string | null;
   /** GitHub's authorAssociation, e.g. OWNER or NONE. */
   association: string;
+  /**
+   * The author's access level to the project on GitLab, e.g. 30 for Developer; null or omitted
+   * for somebody who is no member of it.
+   */
+  accessLevel?: number | null;
 }
 
 /** The owner of "me/demo"; the Master acts as this account unless a test says otherwise. */
@@ -319,13 +330,58 @@ export const OWNER: FakeAuthor = { login: 'me', association: 'OWNER' };
 /** Somebody with no relation to the repo, as anybody on a public repo. */
 export const STRANGER: FakeAuthor = { login: 'stranger', association: 'NONE' };
 
+/** The owner of FakeGitLab's project; the Master acts as this account there unless told. */
+export const GITLAB_OWNER: FakeAuthor = { login: 'me', association: 'OWNER', accessLevel: 50 };
+
+/** A Developer of FakeGitLab's project: the lowest level GitLab lets push, trusted. */
+export const GITLAB_DEVELOPER: FakeAuthor = {
+  login: 'dev',
+  association: 'DEVELOPER',
+  accessLevel: 30,
+};
+
+/** A Guest of FakeGitLab's project: a member, but one who cannot push, so not trusted. */
+export const GITLAB_GUEST: FakeAuthor = { login: 'guest', association: 'GUEST', accessLevel: 10 };
+
+/** Somebody who is no member of FakeGitLab's project. */
+export const GITLAB_STRANGER: FakeAuthor = {
+  login: 'stranger',
+  association: 'NONE',
+  accessLevel: null,
+};
+
+/**
+ * What tells the code hosts FakeGitHub keeps in memory apart: the project its issues are in, the
+ * links to them, how an author is judged, and who writes what a test adds without an author.
+ */
+interface FakePlatform {
+  /** The project, as the platform names it: "me/demo", or a GitLab path like "grp/sub/demo". */
+  project: string;
+  /** Link to issue #`number`. */
+  issueUrl(number: number): string;
+  /** Link to pull request #`number`. */
+  pullUrl(number: number): string;
+  /** Who wrote something, as the platform's client works it out. */
+  authored(author: FakeAuthor): HostAuthored;
+  /** The project's owner. */
+  owner: FakeAuthor;
+}
+
+const GITHUB_PLATFORM: FakePlatform = {
+  project: 'me/demo',
+  issueUrl: (n) => `https://github.com/me/demo/issues/${n}`,
+  pullUrl: (n) => `https://github.com/me/demo/pull/${n}`,
+  authored: (a) => githubAuthor(a.login, a.association),
+  owner: OWNER,
+};
+
 /**
  * An issue as FakeGitHub keeps it: the comment bodies as strings, so tests read and add them
  * directly, and who wrote each beside them.
  */
 export interface FakeIssue extends Omit<HostIssue, 'comments'> {
   comments: string[];
-  /** Authors of `comments` by index; a comment without one was written by OWNER. */
+  /** Authors of `comments` by index; a comment without one was written by the project's owner. */
   commentAuthors: (FakeAuthor | undefined)[];
 }
 
@@ -368,22 +424,38 @@ export interface FakeReviewComment {
 /** Issues a merged pull request's body closes on GitHub: "Closes #3", "fixes #4", ... */
 const CLOSING_REFS = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)\b/gi;
 
-/** GitHub in memory: issues of one repo, "me/demo". */
+/**
+ * GitHub in memory: issues of one repo, "me/demo". FakeGitLab is the same with GitLab's project
+ * path, links and trust.
+ */
 export class FakeGitHub implements CodeHost {
   readonly issues = new Map<number, FakeIssue>();
   readonly labelDefs = new Map<string, LabelDef>();
   /** Every call, e.g. "comment #3". */
   readonly calls: string[] = [];
+  /** The projects the calls named, e.g. "me/demo": only this platform's should be. */
+  readonly projects = new Set<string>();
   /** When set, every call throws this message. */
   failWith: string | null = null;
   /** Calls named as in `calls` (e.g. "list not_planned") that throw the message given. */
   readonly failing = new Map<string, string>();
   /** The account the Master acts as: it writes the Master's comments and issues. */
-  master: FakeAuthor = OWNER;
+  master: FakeAuthor;
   private next = 1;
 
-  private call(what: string): void {
+  constructor(private readonly platform: FakePlatform = GITHUB_PLATFORM) {
+    this.master = platform.owner;
+  }
+
+  /** The project the issues are in, as the platform names it. */
+  get project(): string {
+    return this.platform.project;
+  }
+
+  /** Record a call, and the project it named; throws when the test makes it fail. */
+  private call(what: string, project?: string): void {
     this.calls.push(what);
+    if (project !== undefined) this.projects.add(project);
     const message = this.failWith ?? this.failing.get(what);
     if (message) throw new Error(message);
   }
@@ -391,7 +463,7 @@ export class FakeGitHub implements CodeHost {
   /** An issue written by a human, the repo's owner unless `author` says otherwise. */
   add(issue: { title: string; body?: string; labels?: string[]; author?: FakeAuthor }): FakeIssue {
     const number = this.next++;
-    const author = issue.author ?? OWNER;
+    const author = issue.author ?? this.platform.owner;
     const created: FakeIssue = {
       number,
       title: issue.title,
@@ -399,8 +471,8 @@ export class FakeGitHub implements CodeHost {
       state: 'open',
       stateReason: null,
       labels: issue.labels ?? [],
-      url: `https://github.com/me/demo/issues/${number}`,
-      ...githubAuthor(author.login, author.association),
+      url: this.platform.issueUrl(number),
+      ...this.platform.authored(author),
       comments: [],
       commentAuthors: [],
     };
@@ -440,14 +512,14 @@ export class FakeGitHub implements CodeHost {
 
   private commentsOf(issue: FakeIssue): HostComment[] {
     return issue.comments.map((body, i) => {
-      const author = issue.commentAuthors[i] ?? OWNER;
-      return { body, ...githubAuthor(author.login, author.association) };
+      const author = issue.commentAuthors[i] ?? this.platform.owner;
+      return { body, ...this.platform.authored(author) };
     });
   }
 
   async resolveRepo(): Promise<string> {
     this.call('resolveRepo');
-    return 'me/demo';
+    return this.platform.project;
   }
 
   async viewer(): Promise<string> {
@@ -456,16 +528,16 @@ export class FakeGitHub implements CodeHost {
     return this.master.login;
   }
 
-  async ensureLabels(_repo: string, labels: readonly LabelDef[]): Promise<void> {
-    this.call('ensureLabels');
+  async ensureLabels(repo: string, labels: readonly LabelDef[]): Promise<void> {
+    this.call('ensureLabels', repo);
     for (const l of labels) this.labelDefs.set(l.name, l);
   }
 
   async listIssues(
-    _repo: string,
+    repo: string,
     q: { state: 'open' | 'closed'; label?: string; limit: number; comments?: boolean },
   ): Promise<HostIssue[]> {
-    this.call(`list ${q.state}${q.label ? ` ${q.label}` : ''}`);
+    this.call(`list ${q.state}${q.label ? ` ${q.label}` : ''}`, repo);
     return [...this.issues.values()]
       .filter((i) => i.state === q.state && (!q.label || i.labels.includes(q.label)))
       .sort((a, b) => b.number - a.number)
@@ -473,8 +545,8 @@ export class FakeGitHub implements CodeHost {
       .map((i) => this.view(i, q.comments === true));
   }
 
-  async listNotPlannedIssues(_repo: string, q: { limit: number }): Promise<HostIssue[]> {
-    this.call('list not_planned');
+  async listNotPlannedIssues(repo: string, q: { limit: number }): Promise<HostIssue[]> {
+    this.call('list not_planned', repo);
     return [...this.issues.values()]
       .filter((i) => i.state === 'closed' && i.stateReason === 'not_planned')
       .sort((a, b) => b.number - a.number)
@@ -483,36 +555,36 @@ export class FakeGitHub implements CodeHost {
   }
 
   async createIssue(
-    _repo: string,
+    repo: string,
     issue: { title: string; body: string; labels: string[] },
   ): Promise<{ number: number; url: string }> {
-    this.call(`create ${issue.title}`);
+    this.call(`create ${issue.title}`, repo);
     const created = this.add({ ...issue, author: this.master });
     return { number: created.number, url: created.url };
   }
 
-  async editIssue(_repo: string, number: number, edit: { body: string }): Promise<void> {
-    this.call(`editIssue #${number}`);
+  async editIssue(repo: string, number: number, edit: { body: string }): Promise<void> {
+    this.call(`editIssue #${number}`, repo);
     this.get(number).body = edit.body;
   }
 
-  async getIssue(_repo: string, number: number): Promise<HostIssue> {
-    this.call(`getIssue #${number}`);
+  async getIssue(repo: string, number: number): Promise<HostIssue> {
+    this.call(`getIssue #${number}`, repo);
     return this.view(this.get(number), false);
   }
 
-  async getLabels(_repo: string, number: number): Promise<string[]> {
-    this.call(`getLabels #${number}`);
+  async getLabels(repo: string, number: number): Promise<string[]> {
+    this.call(`getLabels #${number}`, repo);
     return [...this.get(number).labels];
   }
 
-  async setLabels(_repo: string, number: number, labels: string[]): Promise<void> {
-    this.call(`setLabels #${number} ${labels.join(',')}`);
+  async setLabels(repo: string, number: number, labels: string[]): Promise<void> {
+    this.call(`setLabels #${number} ${labels.join(',')}`, repo);
     this.get(number).labels = [...labels];
   }
 
-  async comment(_repo: string, number: number, body: string): Promise<void> {
-    this.call(`comment #${number}`);
+  async comment(repo: string, number: number, body: string): Promise<void> {
+    this.call(`comment #${number}`, repo);
     this.commentAs(number, this.master, body);
   }
 
@@ -524,11 +596,11 @@ export class FakeGitHub implements CodeHost {
 
   async push(
     path: string,
-    _repo: string,
+    repo: string,
     branch: string,
     opts: { force?: boolean } = {},
   ): Promise<void> {
-    this.call(`push ${branch}`);
+    this.call(`push ${branch}`, repo);
     if (opts.force && !forcePushable(branch)) throw new Error(`push ${branch}: no force allowed`);
     const head = execFileSync('git', ['rev-parse', branch], { cwd: path, encoding: 'utf8' }).trim();
     if (branch.startsWith('ares1/')) {
@@ -575,20 +647,20 @@ export class FakeGitHub implements CodeHost {
   /** GitHub has no such branch yet (a new, empty repo): fetch finds none, a push creates it. */
   remoteMissing = false;
 
-  async fetch(path: string, _repo: string, branch: string): Promise<string | null> {
-    this.call(`fetch ${branch}`);
+  async fetch(path: string, repo: string, branch: string): Promise<string | null> {
+    this.call(`fetch ${branch}`, repo);
     if (this.remoteMissing) return null;
     if (this.remoteHead !== null) return this.remoteHead;
     return execFileSync('git', ['rev-parse', branch], { cwd: path, encoding: 'utf8' }).trim();
   }
 
-  async listComments(_repo: string, number: number): Promise<HostComment[]> {
-    this.call(`listComments #${number}`);
+  async listComments(repo: string, number: number): Promise<HostComment[]> {
+    this.call(`listComments #${number}`, repo);
     return this.commentsOf(this.get(number));
   }
 
-  async close(_repo: string, number: number, reason: 'completed' | 'not_planned'): Promise<void> {
-    this.call(`close #${number} ${reason}`);
+  async close(repo: string, number: number, reason: 'completed' | 'not_planned'): Promise<void> {
+    this.call(`close #${number} ${reason}`, repo);
     const issue = this.get(number);
     issue.state = 'closed';
     issue.stateReason = reason;
@@ -603,17 +675,17 @@ export class FakeGitHub implements CodeHost {
     return pull;
   }
 
-  async findOpenChangeRequest(_repo: string, head: string): Promise<ChangeRequest | null> {
-    this.call(`findPull ${head}`);
+  async findOpenChangeRequest(repo: string, head: string): Promise<ChangeRequest | null> {
+    this.call(`findPull ${head}`, repo);
     const open = [...this.pulls.values()].find((p) => p.state === 'open' && p.headRefName === head);
     return open ? pullView(open) : null;
   }
 
   async createChangeRequest(
-    _repo: string,
+    repo: string,
     pr: { head: string; base: string; title: string; body: string },
   ): Promise<{ number: number; url: string }> {
-    this.call(`createPull ${pr.head}`);
+    this.call(`createPull ${pr.head}`, repo);
     // GitHub refuses a pull request from a branch it does not have, or a second open one.
     const headRefOid = this.remoteBranches.get(pr.head);
     if (headRefOid === undefined) throw new Error(`no branch ${pr.head} on GitHub`);
@@ -622,7 +694,7 @@ export class FakeGitHub implements CodeHost {
     );
     if (open) throw new Error(`a pull request for ${pr.head} already exists`);
     const number = this.next++;
-    const url = `https://github.com/me/demo/pull/${number}`;
+    const url = this.platform.pullUrl(number);
     this.pulls.set(number, {
       number,
       url,
@@ -643,14 +715,14 @@ export class FakeGitHub implements CodeHost {
     return { number, url };
   }
 
-  async getChangeRequest(_repo: string, number: number): Promise<ChangeRequestStatus> {
-    this.call(`getPull #${number}`);
+  async getChangeRequest(repo: string, number: number): Promise<ChangeRequestStatus> {
+    this.call(`getPull #${number}`, repo);
     return pullStatusView(this.pull(number));
   }
 
   /** As gh does: refused once merged, nothing done once closed, else commented on and closed. */
-  async closeChangeRequest(_repo: string, number: number, comment: string): Promise<void> {
-    this.call(`closePull #${number}`);
+  async closeChangeRequest(repo: string, number: number, comment: string): Promise<void> {
+    this.call(`closePull #${number}`, repo);
     const pull = this.pull(number);
     if (pull.state === 'merged') throw new Error(`pull request #${number} was already merged`);
     if (pull.state === 'closed') return;
@@ -720,6 +792,24 @@ export class FakeGitHub implements CodeHost {
   /** A human closes the pull request on GitHub without merging it. */
   closePull(number: number): void {
     this.pull(number).state = 'closed';
+  }
+}
+
+/**
+ * GitLab in memory: the issues of one project on a multi-level path, "grp/sub/demo" unless told,
+ * linked as GitLab does (https://<host>/<path>/-/issues/<n>), their authors judged as the GitLab
+ * client does, by their access level to the project (`gitlabAuthor`: Developer and up trusted).
+ * Otherwise FakeGitHub's: the calls, the projects they named, the pushes and fetches.
+ */
+export class FakeGitLab extends FakeGitHub {
+  constructor(project = 'grp/sub/demo', host = 'gitlab.com') {
+    super({
+      project,
+      issueUrl: (n) => `https://${host}/${project}/-/issues/${n}`,
+      pullUrl: (n) => `https://${host}/${project}/-/merge_requests/${n}`,
+      authored: (a) => gitlabAuthor(a.login, a.accessLevel ?? null),
+      owner: GITLAB_OWNER,
+    });
   }
 }
 

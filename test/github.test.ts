@@ -7344,7 +7344,12 @@ describe('issues: texts', () => {
       replyTimeoutHours: 24,
     };
     const asked = discussionComment(entry({ verdict: 'ask', questions: ['Q'] }), dc);
-    expect(asked).toContain('每 5 分钟');
+    expect(asked).toContain('Master 下次检查 GitHub 时（每 5 分钟）');
+    // On GitLab the comment names GitLab.
+    const onGitLab = { ...dc, host: 'GitLab' };
+    expect(discussionComment(entry({ verdict: 'ask', questions: ['Q'] }), onGitLab)).toContain(
+      'Master 下次检查 GitLab 时（每 5 分钟）',
+    );
     // How long the questions wait, and what happens then.
     expect(asked).toContain('24 小时内没有人回复的话，评估会自己决定');
     const forever = { ...dc, replyTimeoutHours: null };

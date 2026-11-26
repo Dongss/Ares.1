@@ -14,6 +14,7 @@ import {
   dependencyText,
   elapsedText,
   githubHint,
+  hostName,
   ITERATION_CHILD_STATUS,
   ITERATION_STATUS,
   isOpen,
@@ -244,6 +245,20 @@ describe('decisions', () => {
     expect(pendingHint(iteration({ status: 'pending' }))).toContain('GitHub');
     expect(pendingHint(local('pending'))).toBe('等采纳：在迭代页整体采纳，或者填上理由拒绝');
     expect(pendingHint(local('active'))).toBeNull();
+  });
+
+  it('tells an iteration on GitLab to be decided on GitLab, as one on GitHub on GitHub', () => {
+    const gitlab = iteration({ source: 'gitlab', status: 'pending' });
+    expect(iterationActions(gitlab)).toEqual({ decide: false, cancel: false });
+    expect(githubHint(gitlab)).toContain('这个迭代在 GitLab 上');
+    expect(pendingHint(gitlab)).toContain('在 GitLab 上给迭代 issue 加上 ares1:ready');
+    expect(blockedHint(iteration({ source: 'gitlab' }))).toContain('重新打开那个子 issue');
+    for (const text of [githubHint(gitlab), pendingHint(gitlab)]) {
+      expect(text).not.toContain('GitHub');
+    }
+    expect(hostName('gitlab')).toBe('GitLab');
+    expect(hostName('github')).toBe('GitHub');
+    expect(hostName('local')).toBeNull();
   });
 });
 

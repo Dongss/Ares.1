@@ -185,9 +185,17 @@ export const PR_CLOSE_REASONS = [
 ] as const;
 export type PrCloseReason = (typeof PR_CLOSE_REASONS)[number];
 
+/** The code hosts whose issues the Master takes requirements from. */
+export type HostPlatform = 'github' | 'gitlab';
+
 export interface RunIssue {
-  /** "owner/name". */
+  /** "owner/name" on GitHub; the project's path on GitLab ("group/subgroup/name"). */
   repo: string;
+  /**
+   * The code host the issue is on, whose bridge follows the Run: 'gitlab' for an issue on
+   * GitLab; missing for one on GitHub, as in every Run created before GitLab was supported.
+   */
+  platform?: 'gitlab';
   number: number;
   url: string;
   /** Accepted by the Master without a human. */
@@ -522,19 +530,22 @@ export interface IterationNote {
 /**
  * An iteration: one larger goal of a repo, planned by a scout in one go as a set of children
  * ordered by their dependencies, accepted as a whole and summed up once every child is done. On
- * GitHub it is an issue labelled `ares1:iteration` whose children are issues of their own; in the
- * local backlog, its children are proposals.
+ * a code host (GitHub or GitLab) it is an issue labelled `ares1:iteration` whose children are
+ * issues of their own; in the local backlog, its children are proposals.
  */
 export interface Iteration {
   id: string;
   repoId: string;
   /** The scout that planned it. */
   scoutId: string | null;
-  /** Where its children are: GitHub issues, or the local backlog (backlog.repos). */
-  source: 'github' | 'local';
-  /** "owner/name" of its issues; '' for the local backlog. */
+  /**
+   * Where its children are: issues on a code host, GitHub's or GitLab's, or the local backlog
+   * (backlog.repos).
+   */
+  source: HostPlatform | 'local';
+  /** "owner/name" (a GitLab project's path) of its issues; '' for the local backlog. */
   issuesRepo: string;
-  /** Its own issue on GitHub once created; null in the local backlog and until then. */
+  /** Its own issue on the code host once created; null in the local backlog and until then. */
   issue: IssueRef | null;
   title: string;
   /** What users can do once it is done that they could not before, in words they would use. */

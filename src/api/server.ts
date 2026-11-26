@@ -62,9 +62,11 @@ import { keptWorkspaces } from './workspaces.js';
 export interface ApiDeps {
   store: Store;
   engine: Engine;
-  /** GitHub Issues as the backlog. */
+  /** GitHub Issues as the backlog (github.repos). */
   issues: IssueBridge;
-  /** The local backlog of the repos without GitHub (backlog.repos). */
+  /** GitLab Issues as the backlog (gitlab.repos). */
+  gitlabIssues: IssueBridge;
+  /** The local backlog of the repos on neither GitHub nor GitLab (backlog.repos). */
   backlog: LocalBacklog;
   /** The Master upgrading itself. */
   upgrader: Upgrader;
@@ -208,7 +210,8 @@ function query<T>(c: { req: { query: () => Record<string, string> } }, schema: z
  * Listens on 127.0.0.1 only: there is no login.
  */
 export function createApi(deps: ApiDeps): Hono {
-  const { store, engine, issues, backlog, upgrader, version, config, configStatus, webDir } = deps;
+  const { store, engine, issues, gitlabIssues, backlog, upgrader, version, config } = deps;
+  const { configStatus, webDir } = deps;
   const platform = deps.platform ?? process.platform;
   const now = deps.now ?? Date.now;
   const startedAt = new Date().toISOString();
@@ -357,9 +360,9 @@ export function createApi(deps: ApiDeps): Hono {
 
   // ---- runs ----------------------------------------------------------------
   // There is no endpoint for creating a Run from an arbitrary goal: Runs come from requirements,
-  // either GitHub issues (IssueBridge) or proposals of the local backlog accepted on the dashboard
-  // (POST /api/proposals/:id/accept) or by auto-accept (LocalBacklog); besides those, the Master
-  // only creates the Runs that merge GitHub's commits it could not merge itself.
+  // either GitHub or GitLab issues (IssueBridge) or proposals of the local backlog accepted on the
+  // dashboard (POST /api/proposals/:id/accept) or by auto-accept (LocalBacklog); besides those,
+  // the Master only creates the Runs that merge the code host's commits it could not merge itself.
   app.get('/api/runs', (c) => {
     const status = c.req.query('status') as RunStatus | undefined;
     const repo = c.req.query('repo');
@@ -487,6 +490,15 @@ export function createApi(deps: ApiDeps): Hono {
     return c.json(issues.status() satisfies GitHubStatus);
   });
 
+  // ---- GitLab issues ----------------------------------------------------
+  app.get('/api/gitlab', (c) => c.json(gitlabIssues.status() satisfies GitHubStatus));
+
+  // As /api/github/poll, for the repos of gitlab.repos.
+  app.post('/api/gitlab/poll', async (c) => {
+    await gitlabIssues.poll();
+    return c.json(gitlabIssues.status() satisfies GitHubStatus);
+  });
+
   app.get('/api/scouts', (c) => {
     const repo = c.req.query('repo');
     const repoId = repo ? store.getRepo(repo).id : undefined;
@@ -499,13 +511,15 @@ export function createApi(deps: ApiDeps): Hono {
     switch (requirementSource(config().master, repo)) {
       case 'github':
         return c.json(await issues.startScout(repo, 'manual'), 201);
+      case 'gitlab':
+        return c.json(await gitlabIssues.startScout(repo, 'manual'), 201);
       case 'backlog':
         return c.json(await backlog.startScout(repo, 'manual'), 201);
       default:
         throw new NotFoundError(
           t({
-            zh: `config.yaml 的 github.repos 和 backlog.repos 里都没有 ${repo}`,
-            en: `${repo} is in neither github.repos nor backlog.repos of config.yaml`,
+            zh: `config.yaml 的 github.repos、gitlab.repos 和 backlog.repos 里都没有 ${repo}`,
+            en: `${repo} is in none of github.repos, gitlab.repos and backlog.repos of config.yaml`,
           }),
         );
     }
@@ -593,7 +607,8 @@ export function createApi(deps: ApiDeps): Hono {
     ),
   );
 
-  // Iterations of the local backlog are decided as a whole here; those of GitHub on GitHub (409).
+  // Iterations of the local backlog are decided as a whole here; those of a code host on its
+  // iteration issue (409).
   // Accepting accepts every step, and the steps whose dependencies are done become Runs.
   app.post('/api/iterations/:id/accept', (c) =>
     c.json(backlog.acceptIteration(c.req.param('id')) satisfies Iteration),

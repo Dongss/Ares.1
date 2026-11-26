@@ -205,7 +205,7 @@ export function blockedText(it: Pick<IterationView, 'status' | 'children'>): str
  * step that failed after its attempts were used up may also be started over (`restartable`).
  */
 export function blockedHint(it: Pick<IterationView, 'source' | 'children'>): string {
-  if (it.source === 'github') {
+  if (it.source !== 'local') {
     return t({
       zh: '下次侦察会换个做法补一个子 issue 替换它，替换后迭代接着做；也可以修好原因后重新打开那个子 issue、加上 ares1:ready 重做；不想做剩下的，就关掉迭代 issue',
       en: 'The next scout adds a sub-issue that replaces it with another approach, and the iteration goes on once it is replaced; or fix the cause, reopen the sub-issue and add ares1:ready to redo it; to drop the rest, close the iteration issue',
@@ -238,10 +238,11 @@ export function stepAttemptsText(
 /** Who accepts a pending iteration, and how; null unless it is pending. */
 export function pendingHint(it: Pick<IterationView, 'status' | 'source'>): string | null {
   if (it.status !== 'pending') return null;
-  return it.source === 'github'
+  const host = hostName(it.source);
+  return host
     ? t({
-        zh: '等采纳：在 GitHub 上给迭代 issue 加上 ares1:ready 就整体采纳，关掉它就不做',
-        en: 'Waiting to be accepted: add ares1:ready to the iteration issue on GitHub to accept it as a whole, or close it to drop it',
+        zh: `等采纳：在 ${host} 上给迭代 issue 加上 ares1:ready 就整体采纳，关掉它就不做`,
+        en: `Waiting to be accepted: add ares1:ready to the iteration issue on ${host} to accept it as a whole, or close it to drop it`,
       })
     : t({
         zh: '等采纳：在迭代页整体采纳，或者填上理由拒绝',
@@ -366,12 +367,22 @@ export function canRejectIteration(
   return iterationActions(it).decide && reason.trim() !== '';
 }
 
-/** Where an iteration of GitHub is decided; null for the local backlog and once it is over. */
+/** The code host an iteration's issues are on, as people know it; null for the local backlog. */
+export function hostName(source: IterationView['source']): string | null {
+  if (source === 'local') return null;
+  return source === 'gitlab' ? 'GitLab' : 'GitHub';
+}
+
+/**
+ * Where an iteration on a code host (GitHub or GitLab) is decided; null for the local backlog and
+ * once it is over.
+ */
 export function githubHint(it: Pick<IterationView, 'source' | 'status'>): string | null {
-  if (it.source !== 'github' || !isOpen(it)) return null;
+  const host = hostName(it.source);
+  if (!host || !isOpen(it)) return null;
   return t({
-    zh: '这个迭代在 GitHub 上：采纳、拒绝和终止都在迭代 issue 上做。加上 ares1:ready 就整体采纳；关掉它就不做，还没完成的子 issue 会一起终止并关成不做。',
-    en: 'This iteration is on GitHub, where it is accepted, rejected or cancelled on the iteration issue: add ares1:ready to accept it as a whole; close it to drop it, and the sub-issues not done yet are stopped and closed as not planned with it.',
+    zh: `这个迭代在 ${host} 上：采纳、拒绝和终止都在迭代 issue 上做。加上 ares1:ready 就整体采纳；关掉它就不做，还没完成的子 issue 会一起终止并关成不做。`,
+    en: `This iteration is on ${host}, where it is accepted, rejected or cancelled on the iteration issue: add ares1:ready to accept it as a whole; close it to drop it, and the sub-issues not done yet are stopped and closed as not planned with it.`,
   });
 }
 

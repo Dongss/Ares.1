@@ -812,8 +812,10 @@ export interface IssueUpdateContext {
   targetBranch: string;
   /** Name of the stage waiting for approval. */
   stageName?: string;
-  /** The target branch was pushed to GitHub before closing. */
+  /** The target branch was pushed to the code host before closing. */
   pushed?: boolean;
+  /** The code host the issue is on, as people know it: GitHub (if omitted) or GitLab. */
+  host?: string;
   /**
    * For a completed Run whose work was merged on GitHub through its pull request (deliver: pr):
    * the pull request, and the commit its merge put on the target branch when GitHub gave it.
@@ -1186,16 +1188,17 @@ export function issueUpdate(run: Run, ctx: IssueUpdateContext): IssueUpdate {
           close: 'completed',
         };
       }
+      const host = ctx.host ?? 'GitHub';
       return {
         label: null,
         comment: ctx.pushed
           ? t({
-              zh: `已合并到 ${branch}${sha}并推送到 GitHub。\n\n${stats}\n\n${link}`,
-              en: `Merged into ${branch}${sha} and pushed to GitHub.\n\n${stats}\n\n${link}`,
+              zh: `已合并到 ${branch}${sha}并推送到 ${host}。\n\n${stats}\n\n${link}`,
+              en: `Merged into ${branch}${sha} and pushed to ${host}.\n\n${stats}\n\n${link}`,
             })
           : t({
-              zh: `已合并到本地 ${branch}${sha}，推送到 GitHub 后就能看到代码。\n\n${stats}\n\n${link}`,
-              en: `Merged into the local ${branch}${sha}; the code shows on GitHub once it is pushed.\n\n${stats}\n\n${link}`,
+              zh: `已合并到本地 ${branch}${sha}，推送到 ${host} 后就能看到代码。\n\n${stats}\n\n${link}`,
+              en: `Merged into the local ${branch}${sha}; the code shows on ${host} once it is pushed.\n\n${stats}\n\n${link}`,
             }),
         close: 'completed',
       };
@@ -1289,8 +1292,10 @@ function failedUpdate(
 export interface DiscussionCommentContext {
   dashboardUrl: string;
   runId: string;
-  /** How often the Master looks at GitHub, to say when a reply is picked up. */
+  /** How often the Master looks at the code host, to say when a reply is picked up. */
   pollMinutes: number;
+  /** The code host the issue is on, as people know it: GitHub (if omitted) or GitLab. */
+  host?: string;
   /**
    * How long the assess stage of the entry waits for a reply (`replyTimeoutHours`), to say what
    * happens when nobody replies; null = it waits however long it takes.
@@ -1374,8 +1379,8 @@ export function discussionComment(
     } else {
       parts.push(
         t({
-          zh: `直接在这个 issue 下回复就行：Master 下次检查 GitHub 时（每 ${ctx.pollMinutes} 分钟）会带着讨论重新评估，讨论可以有多轮。${entry.proposedDrop ? '同意不做就回复说明，评估会给出不做的结论并关闭这个 issue；想继续做也请写明理由。' : '如果同意不做，也回复说明。'}`,
-          en: `Just reply on this issue: the next time the Master checks GitHub (every ${ctx.pollMinutes} min) it assesses again with the discussion, which can take several rounds. ${entry.proposedDrop ? 'If you agree not to do it, say so in a reply, and the assessment concludes with not doing it and closes this issue; to go ahead anyway, please give your reasons.' : 'If you agree not to do it, say so in a reply too.'}`,
+          zh: `直接在这个 issue 下回复就行：Master 下次检查 ${ctx.host ?? 'GitHub'} 时（每 ${ctx.pollMinutes} 分钟）会带着讨论重新评估，讨论可以有多轮。${entry.proposedDrop ? '同意不做就回复说明，评估会给出不做的结论并关闭这个 issue；想继续做也请写明理由。' : '如果同意不做，也回复说明。'}`,
+          en: `Just reply on this issue: the next time the Master checks ${ctx.host ?? 'GitHub'} (every ${ctx.pollMinutes} min) it assesses again with the discussion, which can take several rounds. ${entry.proposedDrop ? 'If you agree not to do it, say so in a reply, and the assessment concludes with not doing it and closes this issue; to go ahead anyway, please give your reasons.' : 'If you agree not to do it, say so in a reply too.'}`,
         }),
       );
       if (hours !== null) {

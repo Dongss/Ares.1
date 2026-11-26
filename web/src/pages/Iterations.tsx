@@ -20,6 +20,7 @@ import {
   dependencyText,
   elapsedText,
   githubHint,
+  hostName,
   ITERATION_STATUS,
   isOpen,
   iterationActions,
@@ -245,7 +246,10 @@ function IterationHeader(props: { iteration: IterationView; onChanged: () => voi
             ) : it.source === 'local' ? (
               t({ zh: '本地提案池', en: 'Local backlog' })
             ) : (
-              t({ zh: 'GitHub（迭代 issue 还没建好）', en: 'GitHub (no iteration issue yet)' })
+              t({
+                zh: `${hostName(it.source)}（迭代 issue 还没建好）`,
+                en: `${hostName(it.source)} (no iteration issue yet)`,
+              })
             )}
           </dd>
         </div>
@@ -436,7 +440,7 @@ function IterationStep(props: {
             {t({ zh: `提案 ${child.proposalId}`, en: `Proposal ${child.proposalId}` })}
           </span>
         ) : (
-          it.source === 'github' &&
+          it.source !== 'local' &&
           isOpen(it) && (
             <span className="muted">{t({ zh: 'issue 还没建好', en: 'No issue yet' })}</span>
           )

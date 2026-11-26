@@ -20,6 +20,7 @@ import type {
   BlockKind,
   CheckResult,
   FailedAttempt,
+  HostPlatform,
   Iteration,
   IterationChild,
   Proposal,
@@ -376,27 +377,35 @@ export interface ProposalSourceStatus {
   maxRunAttempts: number;
 }
 
-/** One repo whose issues the Master works on. */
+/** One repo whose issues on a code host (GitHub or GitLab) the Master works on. */
 export interface GitHubRepoStatus extends ProposalSourceStatus {
-  /** "owner/name" once known. */
+  /** "owner/name" (a GitLab project's path: "group/subgroup/name") once known. */
   issuesRepo: string | null;
-  /** The target branch is pushed to GitHub after merges. */
+  /** The target branch is pushed to the code host after merges. */
   push: boolean;
   /**
    * How Runs deliver (`deliver`): push = merged into the local target branch, which is pushed;
-   * pr = the Run's branch is pushed and a pull request opened, the Run completes once it merges.
+   * pr = the Run's branch is pushed and a pull request opened, the Run completes once it merges
+   * (GitHub only).
    */
   deliver: 'push' | 'pr';
 }
 
-/** GET /api/github */
+/** GET /api/github and GET /api/gitlab: a code host's section of config.yaml and its bridge. */
 export interface GitHubStatus {
-  /** config.yaml has a `github` section. */
+  /** Which code host it is. */
+  platform: HostPlatform;
+  /**
+   * The GitLab's host name (`gitlab.host`: gitlab.com or a self-hosted one), for the links to its
+   * issues; null for GitHub.
+   */
+  host: string | null;
+  /** config.yaml has the platform's section (`github` / `gitlab`). */
   enabled: boolean;
   account: string | null;
   pollMinutes: number;
   lastPollAt: string | null;
-  /** The last GitHub call that failed; cleared by a poll without errors. */
+  /** The last call to the code host that failed; cleared by a poll without errors. */
   lastError: { message: string; at: string } | null;
   repos: GitHubRepoStatus[];
 }

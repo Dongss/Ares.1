@@ -1,5 +1,5 @@
-// Iterations, wherever their children come from (GitHub issues, or proposals of the local
-// backlog): where each child stands as its Runs go, when the iteration is blocked and when it
+// Iterations, wherever their children come from (GitHub or GitLab issues, or proposals of the
+// local backlog): where each child stands as its Runs go, when the iteration is blocked and when it
 // goes on, a human turning it down, a scout's change to its plan, what it cost and how long it
 // took, the summary once every child is done, and the review suggestions its closing step goes
 // through. Reads and writes the store only: the sources (src/github/bridge.ts,
@@ -33,16 +33,16 @@ import {
 import { nowIso } from '../util.js';
 
 /**
- * The Runs that worked on a child, oldest first: on GitHub every Run created from its issue
- * (failed attempts, redos and Runs started over included); in the local backlog, the Runs its
- * proposal became: each failed attempt (`failures`) and the latest.
+ * The Runs that worked on a child, oldest first: on a code host (GitHub or GitLab) every Run
+ * created from its issue (failed attempts, redos and Runs started over included); in the local
+ * backlog, the Runs its proposal became: each failed attempt (`failures`) and the latest.
  */
 export function childRuns(
   store: Store,
   iteration: Pick<Iteration, 'source' | 'issuesRepo'>,
   child: Pick<IterationChild, 'issue' | 'proposalId'>,
 ): Run[] {
-  if (iteration.source === 'github') {
+  if (iteration.source !== 'local') {
     return child.issue ? store.runsForIssue(iteration.issuesRepo, child.issue.number) : [];
   }
   if (!child.proposalId) return [];
@@ -88,7 +88,8 @@ export function ranOutOfAttempts(store: Store, runs: readonly Run[]): boolean {
 export type ChildOutcome = 'open' | 'redo' | 'done' | 'closed' | 'failed';
 
 /**
- * What every event about an iteration starts with: its repo and id, its issue on GitHub, and
+ * What every event about an iteration starts with: its repo and id, its issue on the code host,
+ * `platform: 'gitlab'` for one on GitLab (none for GitHub, as before GitLab was), and
  * `backlog: true` for one of the local backlog, whose texts point to the dashboard instead.
  */
 export function iterationEventData(
@@ -99,6 +100,7 @@ export function iterationEventData(
     repo,
     iterationId: iteration.id,
     ...(iteration.issue ? { issue: iteration.issue.number } : {}),
+    ...(iteration.source === 'gitlab' ? { platform: 'gitlab' } : {}),
     ...(iteration.source === 'local' ? { backlog: true } : {}),
   };
 }

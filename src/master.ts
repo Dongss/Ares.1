@@ -41,7 +41,10 @@ import {
 import { errorMessage, newId, nowIso, parseJson } from './util.js';
 import { git, revParse } from './workspace/git.js';
 
-/** Events after which a target branch is at another commit: a Run merged, GitHub's pulled. */
+/**
+ * Events after which a target branch is at another commit: a Run merged, the code host's (GitHub
+ * or GitLab) pulled.
+ */
 const TARGET_MOVED = new Set(['merge.done', 'github.pulled', 'github.merged_remote']);
 
 /** The built-in adapters, with the executables config.yaml's `bins` sets. */
@@ -68,11 +71,13 @@ export interface MasterOptions {
   webDir?: string;
   /** Reload the configuration when its files change (default true). */
   watchConfig?: boolean;
-  /** Replace the code host's client, gh (tests use an in-memory GitHub). */
+  /** Replace GitHub's client, gh (tests use an in-memory GitHub). */
   github?: CodeHost;
+  /** Replace GitLab's client, glab (tests use an in-memory GitLab). */
+  gitlab?: CodeHost;
   /**
-   * Poll GitHub and the local backlog on a timer (default true); tests call `issues.poll()` and
-   * `backlog.poll()` themselves.
+   * Poll GitHub, GitLab and the local backlog on a timer (default true); tests call
+   * `issues.poll()`, `gitlabIssues.poll()` and `backlog.poll()` themselves.
    */
   pollIssues?: boolean;
   /**
@@ -222,8 +227,11 @@ export class Master {
     readonly engine: Engine,
     /** The scouts of every repo, whichever source their proposals go to. */
     readonly scouting: Scouting,
+    /** The issues on GitHub of the repos of github.repos. */
     readonly issues: IssueBridge,
-    /** The proposals of the repos without GitHub (backlog.repos). */
+    /** The issues on GitLab of the repos of gitlab.repos; polls apart from GitHub's. */
+    readonly gitlabIssues: IssueBridge,
+    /** The proposals of the repos on neither GitHub nor GitLab (backlog.repos). */
     readonly backlog: LocalBacklog,
     readonly notifier: SystemNotifier,
     readonly webhook: WebhookNotifier,
@@ -301,17 +309,21 @@ export class Master {
       : null;
     const masterOrigin = installDir && originUrl ? { installDir, url: originUrl } : null;
     const scouting = new Scouting({ store, engine, paths, config, adapters, masterOrigin });
-    const issues = new IssueBridge({
-      store,
-      engine,
-      paths,
-      config,
-      scouting,
-      platform: 'github',
-      host: opts.github,
-      nodeMissing,
-      refreshTemplates,
-    });
+    // One bridge per code host: each polls, keeps its timers and records its errors on its own.
+    const bridge = (platform: 'github' | 'gitlab', host: CodeHost | undefined) =>
+      new IssueBridge({
+        store,
+        engine,
+        paths,
+        config,
+        scouting,
+        platform,
+        host,
+        nodeMissing,
+        refreshTemplates,
+      });
+    const issues = bridge('github', opts.github);
+    const gitlabIssues = bridge('gitlab', opts.gitlab);
     const backlog = new LocalBacklog({ store, engine, config, scouting, refreshTemplates });
     const notifier = new SystemNotifier(store, config, opts.notice);
     const webhook = new WebhookNotifier(store, config, { fetch: opts.fetch });
@@ -338,6 +350,7 @@ export class Master {
       store,
       engine,
       issues,
+      gitlabIssues,
       backlog,
       upgrader,
       version,
@@ -374,6 +387,7 @@ export class Master {
       engine,
       scouting,
       issues,
+      gitlabIssues,
       backlog,
       notifier,
       webhook,
@@ -393,6 +407,7 @@ export class Master {
     // Before the polls, which may start scouts: the scouts the last Master left are put to rest.
     await scouting.start();
     await issues.start({ poll: opts.pollIssues !== false });
+    await gitlabIssues.start({ poll: opts.pollIssues !== false });
     backlog.start({ poll: opts.pollIssues !== false });
     upgrader.start({ timer: opts.upgradeTimer !== false });
     logPruner.start();
@@ -438,8 +453,13 @@ export class Master {
     // rejects.
     const drained = this.webhook.drain();
     // Together: the scouts record that they were cut short and delete their temporary worktrees
-    // while the bridge and the local backlog finish their rounds.
-    await Promise.all([this.issues.stop(), this.backlog.stop(), this.scouting.stop()]);
+    // while the bridges and the local backlog finish their rounds.
+    await Promise.all([
+      this.issues.stop(),
+      this.gitlabIssues.stop(),
+      this.backlog.stop(),
+      this.scouting.stop(),
+    ]);
     await this.engine.stop();
     await this.repoWorkflows.stop();
     const server = this.server;

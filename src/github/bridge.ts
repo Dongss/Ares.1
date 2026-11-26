@@ -557,6 +557,27 @@ class BridgePlatform {
     if (this.platform === 'github') return 'github.com';
     return this.config().master.gitlab?.host ?? 'gitlab.com';
   }
+
+  /**
+   * Whether the Run's issue is on this platform (`RunIssue.platform`), so that this bridge, and
+   * not the other platform's, follows it. False for a Run of no issue.
+   */
+  ownsRun(run: Pick<Run, 'issue'>): boolean {
+    return run.issue !== null && (run.issue.platform ?? 'github') === this.platform;
+  }
+
+  /** What a Run's issue records of the platform: nothing on GitHub, as before GitLab was. */
+  issueFields(): Pick<RunIssue, 'platform'> {
+    return this.platform === 'gitlab' ? { platform: 'gitlab' } : {};
+  }
+
+  /**
+   * The data of a `github.*` event the bridge records, with `platform: 'gitlab'` on GitLab, so
+   * that the dashboard and the notifications tell the two apart; GitHub's go without, as before.
+   */
+  eventData(data: Record<string, unknown>): Record<string, unknown> {
+    return this.platform === 'gitlab' ? { ...data, platform: 'gitlab' } : data;
+  }
 }
 
 export interface BridgeDeps {
@@ -777,7 +798,7 @@ export class IssueBridge {
     for (const name of Object.keys(section.repos)) {
       const repo = this.deps.store.findRepo(name);
       if (!repo) continue;
-      for (const run of this.deps.store.runsAwaitingRedo(repo.id)) {
+      for (const run of this.ownRunsAwaitingRedo(repo)) {
         const due = redoDueAt(run, this.pollMinutes);
         if (due !== null && due > now && (next === undefined || due < next)) next = due;
       }
@@ -786,6 +807,11 @@ export class IssueBridge {
     // A second late, so the wait is surely over when the sync looks.
     this.redoTimer = setTimeout(() => void this.sync(), next - now + 1_000);
     this.redoTimer.unref();
+  }
+
+  /** The repo's failed Runs whose issue is redone later, of issues on this bridge's platform. */
+  private ownRunsAwaitingRedo(repo: Repo): Run[] {
+    return this.deps.store.runsAwaitingRedo(repo.id).filter((r) => this.platform.ownsRun(r));
   }
 
   /** Run `fn` after everything queued before it; GitHub calls never overlap. */
@@ -804,14 +830,23 @@ export class IssueBridge {
   }
 
   /**
-   * Record a GitHub failure: each message once per streak of failures (a github.error notifies),
-   * the latest one always (the dashboard shows it). The streak ends with a poll that had no error.
+   * Record a `github.*` event of the bridge, with the platform in its data on GitLab
+   * (`BridgePlatform.eventData`).
+   */
+  private hostEvent(runId: string | null, type: string, data: Record<string, unknown>): void {
+    this.deps.store.event(runId, type, this.platform.eventData(data));
+  }
+
+  /**
+   * Record a failure of the code host: each message once per streak of failures (a github.error
+   * notifies), the latest one always (the dashboard shows it). The streak ends with a poll that
+   * had no error.
    */
   private report(err: unknown): void {
     const message = errorMessage(err);
     if (!this.reportedErrors.has(message) && this.reportedErrors.size < MAX_REPORTED_ERRORS) {
       this.reportedErrors.add(message);
-      this.deps.store.event(null, 'github.error', { message });
+      this.hostEvent(null, 'github.error', { message });
     }
     this.lastError = { message, at: nowIso() };
   }
@@ -1128,7 +1163,7 @@ export class IssueBridge {
     if (hasReviewSuggestions(issue.body)) return issue;
     const store = this.deps.store;
     if (store.latestRunForIssue(full, issue.number)) return issue;
-    const iteration = this.githubIterations(repo, full).find((it) =>
+    const iteration = this.hostIterations(repo, full).find((it) =>
       it.children.some((c) => c.closeout && c.issue?.number === issue.number),
     );
     const child = iteration?.children.find((c) => c.issue?.number === issue.number);
@@ -1143,13 +1178,14 @@ export class IssueBridge {
   /**
    * A Run of an issue: with the repo's template, and without approval before merging when
    * `auto_merge` is on (the other gates of the template stay). Every Run from an issue is created
-   * here, whether a human added ares1:ready, a failed one is redone, or the issue was changed.
+   * here, whether a human added ares1:ready, a failed one is redone, or the issue was changed. The
+   * issue records the platform it is on (`RunIssue.platform`), so that this bridge follows it.
    */
   private createIssueRun(
     repo: Repo,
     cfg: HostRepoConfig,
     goal: string,
-    issue: RunIssue,
+    issue: Omit<RunIssue, 'platform'>,
     confirmGoal?: string,
   ): Run {
     return this.deps.engine.createRun({
@@ -1157,7 +1193,7 @@ export class IssueBridge {
       template: cfg.template,
       goal,
       overrides: issueRunOverrides(this.template(repo.name, cfg), cfg.auto_merge),
-      issue,
+      issue: { ...issue, ...this.platform.issueFields() },
       confirmGoal,
     });
   }
@@ -1190,7 +1226,7 @@ export class IssueBridge {
       limit: 100,
     });
     const scouts = this.deps.store.listScouts({ repoId: repo.id, limit: 200 });
-    const iterations = this.githubIterations(repo, full, 'pending');
+    const iterations = this.hostIterations(repo, full, 'pending');
     for (const issue of untriaged(open).sort((a, b) => a.number - b.number)) {
       if (!this.mayAutoAccept(repo, cfg)) return;
       const iteration = iterations.find((it) => it.issue?.number === issue.number);
@@ -1242,7 +1278,7 @@ export class IssueBridge {
     const full = await this.issuesRepo(repo, cfg);
     await this.host().push(repo.path, full, repo.targetBranch);
     this.pushed.set(repo.path, head);
-    this.deps.store.event(null, 'github.pushed', { repo: name, branch: repo.targetBranch, head });
+    this.hostEvent(null, 'github.pushed', { repo: name, branch: repo.targetBranch, head });
     await this.trackOrigin(repo, full, head);
     return true;
   }
@@ -1299,7 +1335,7 @@ export class IssueBridge {
     const ref = { number: pr.number, url: pr.url };
     const latest = await gh.getChangeRequest(full, pr.number);
     if (latest.state !== 'open') {
-      store.event(run.id, 'github.pr_found_closed', { ...ref, state: latest.state });
+      this.hostEvent(run.id, 'github.pr_found_closed', { ...ref, state: latest.state });
       return;
     }
     const reason = prCloseReason(run, store.listEvents(run.id));
@@ -1310,7 +1346,7 @@ export class IssueBridge {
       dashboardUrl: this.dashboardUrl(),
     });
     await gh.closeChangeRequest(full, pr.number, markComment(redactForGitHub(comment)));
-    store.event(run.id, 'github.pr_closed_by_master', { ...ref, reason });
+    this.hostEvent(run.id, 'github.pr_closed_by_master', { ...ref, reason });
   }
 
   /**
@@ -1561,7 +1597,7 @@ export class IssueBridge {
       for (const review of ignored) {
         if (seen.has(key(review.author))) continue;
         seen.add(key(review.author));
-        store.event(run.id, 'github.pr_review_ignored', {
+        this.hostEvent(run.id, 'github.pr_review_ignored', {
           number: pr.number,
           url: pr.url,
           head,
@@ -1676,7 +1712,6 @@ export class IssueBridge {
   private async syncTarget(name: string): Promise<string | null | undefined> {
     const { repo, cfg } = this.repoSetup(name);
     if (!cfg.push || this.repoMerging(repo)) return undefined;
-    const store = this.deps.store;
     const branch = repo.targetBranch;
     const full = await this.issuesRepo(repo, cfg);
     const remote = await this.host().fetch(repo.path, full, branch);
@@ -1705,7 +1740,7 @@ export class IssueBridge {
     if (this.repoMerging(repo)) return remote;
     if (await this.fastForwardTarget(repo, name, remote)) {
       this.pushed.set(repo.path, remote);
-      store.event(null, 'github.pulled', { repo: name, branch, from: local, to: remote });
+      this.hostEvent(null, 'github.pulled', { repo: name, branch, from: local, to: remote });
     }
     return remote;
   }
@@ -1724,7 +1759,7 @@ export class IssueBridge {
     if (ff.reason === 'diverged') return false;
     if (this.pullBlocked.get(repo.id) === ff.reason) return false;
     this.pullBlocked.set(repo.id, ff.reason);
-    this.deps.store.event(null, 'github.pull_blocked', {
+    this.hostEvent(null, 'github.pull_blocked', {
       repo: name,
       branch: repo.targetBranch,
       reason: ff.reason,
@@ -1814,7 +1849,7 @@ export class IssueBridge {
     if (this.stopping || this.repoMerging(repo)) return;
     if (!(await this.fastForwardTarget(repo, name, merge))) return;
     this.diverged.delete(repo.id);
-    this.deps.store.event(null, 'github.merged_remote', {
+    this.hostEvent(null, 'github.merged_remote', {
       repo: name,
       branch: repo.targetBranch,
       local,
@@ -1922,7 +1957,7 @@ export class IssueBridge {
     const { local, remote } = divergence;
     const branch = repo.targetBranch;
     this.deps.store.tx(() => {
-      this.deps.store.event(null, 'github.diverged', {
+      this.hostEvent(null, 'github.diverged', {
         repo: name,
         branch,
         local,
@@ -1932,7 +1967,7 @@ export class IssueBridge {
         ...(repeated ? { repeated: true } : {}),
       });
       if (run?.created) {
-        this.deps.store.event(null, 'github.diverged_run', {
+        this.hostEvent(null, 'github.diverged_run', {
           repo: name,
           branch,
           local,
@@ -2019,13 +2054,14 @@ export class IssueBridge {
    * request was merged (deliver: pr), whose `Closes #N` closed it: that Run completes
    * (`mergedThroughPullRequest`). A human changed its title or body: the Run is started over on
    * the new text (`restartForChangedIssue`). Returns false when some issue could not be read or
-   * its Run not terminated (retried on the next poll); the Run stays as it is then.
+   * its Run not terminated (retried on the next poll); the Run stays as it is then. Only the Runs
+   * of issues on this bridge's platform: the other platform's bridge follows its own.
    */
   private async followIssues(): Promise<boolean> {
     let ok = true;
     const unfinished = this.deps.store
       .listRuns()
-      .filter((r) => r.issue && !FINISHED_RUN_STATUSES.includes(r.status));
+      .filter((r) => this.platform.ownsRun(r) && !FINISHED_RUN_STATUSES.includes(r.status));
     for (const run of unfinished) {
       if (this.stopping) break;
       const issue = run.issue;
@@ -2187,11 +2223,15 @@ export class IssueBridge {
     });
   }
 
-  /** Returns false when some issue could not be updated (retried on the next poll). */
+  /**
+   * Catch the issues on this bridge's platform up with their Runs. Returns false when some issue
+   * could not be updated (retried on the next poll).
+   */
   private async syncRuns(): Promise<boolean> {
     let ok = true;
     for (const run of this.deps.store.runsWithIssueBehind()) {
       if (this.stopping) break;
+      if (!this.platform.ownsRun(run)) continue;
       try {
         await this.syncRun(run);
       } catch (err) {
@@ -2234,6 +2274,7 @@ export class IssueBridge {
     const update = issueUpdate(run, {
       dashboardUrl: this.dashboardUrl(),
       targetBranch: repo.targetBranch,
+      host: this.platform.name,
       stageName,
       pushed,
       pr: merged,
@@ -2345,7 +2386,7 @@ export class IssueBridge {
   private async redoFailedRuns(name: string): Promise<void> {
     const { repo, cfg } = this.repoSetup(name);
     const store = this.deps.store;
-    for (const failed of store.runsAwaitingRedo(repo.id)) {
+    for (const failed of this.ownRunsAwaitingRedo(repo)) {
       if (this.stopping) return;
       const prev = failed.issue;
       if (!prev || failed.issueSynced !== 'failed') continue;
@@ -2451,6 +2492,7 @@ export class IssueBridge {
       dashboardUrl: this.dashboardUrl(),
       runId: run.id,
       pollMinutes: this.pollMinutes,
+      host: this.platform.name,
     };
     for (let i = run.issueDiscussionSynced; i < run.discussion.length; i++) {
       if (this.stopping) return;
@@ -2473,7 +2515,7 @@ export class IssueBridge {
     const { repo } = this.repoSetup(name);
     const waiting = this.deps.store
       .listRuns({ status: 'blocked', repoId: repo.id })
-      .filter((r) => r.issue && r.blocked?.kind === 'discussion');
+      .filter((r) => this.platform.ownsRun(r) && r.blocked?.kind === 'discussion');
     for (const run of waiting) {
       if (this.stopping) return;
       const issue = run.issue;
@@ -2552,8 +2594,9 @@ export class IssueBridge {
   }
 
   /**
-   * GitHub issues as where the scouts' proposals go: each proposal becomes an issue labeled
-   * ares1:proposal, and the scout is shown the repo's issues by people the Master trusts.
+   * The platform's issues as where the scouts' proposals go: each proposal becomes an issue
+   * labeled ares1:proposal, and the scout is shown the repo's issues by people the Master trusts.
+   * Its kind is 'github' on GitLab too: it only tells issues from local proposals in the prompt.
    */
   private readonly scoutSource: ProposalSource<HostRepoConfig> = {
     kind: 'github',
@@ -2580,7 +2623,7 @@ export class IssueBridge {
         label: LABELS.proposal,
         limit: 100,
       });
-      const iterations = this.githubIterations(repo, full);
+      const iterations = this.hostIterations(repo, full);
       return proposalsHoldingScout(open, scouts, cfg.auto_accept, iterations).length;
     },
   };
@@ -2624,7 +2667,8 @@ export class IssueBridge {
     }
     return {
       issues: issueDigest(open, closed, await this.masterLogin(), notPlanned),
-      github: scout.issuesRepo,
+      // Only a GitHub name tells whether the repo is the Master's own source.
+      github: this.platform.platform === 'github' ? scout.issuesRepo : null,
     };
   }
 
@@ -2673,20 +2717,23 @@ export class IssueBridge {
 
   // ---- iterations ------------------------------------------------------------
 
-  /** The repo's iterations whose issues are in `full`, newest first; of `status` if given. */
-  private githubIterations(
+  /**
+   * The repo's iterations on this bridge's platform whose issues are in `full`, newest first; of
+   * `status` if given.
+   */
+  private hostIterations(
     repo: Repo,
     full: string,
     status?: IterationStatus | readonly IterationStatus[],
   ): Iteration[] {
     return this.deps.store
       .listIterations({ repoId: repo.id, ...(status === undefined ? {} : { status }) })
-      .filter((it) => it.source === 'github' && it.issuesRepo === full);
+      .filter((it) => it.source === this.platform.platform && it.issuesRepo === full);
   }
 
   /** The iteration whose own issue is #`number` of `full`; null when the Master planned none. */
   private iterationOfIssue(repo: Repo, full: string, number: number): Iteration | null {
-    return this.githubIterations(repo, full).find((it) => it.issue?.number === number) ?? null;
+    return this.hostIterations(repo, full).find((it) => it.issue?.number === number) ?? null;
   }
 
   /**
@@ -2707,7 +2754,7 @@ export class IssueBridge {
     const created = store.createIteration({
       repoId: repo.id,
       scoutId: scout.id,
-      source: 'github',
+      source: this.platform.platform,
       issuesRepo: scout.issuesRepo,
       title: plan.title,
       goal: plan.goal,
@@ -2748,7 +2795,7 @@ export class IssueBridge {
   private async finishIterations(name: string): Promise<void> {
     const { repo, cfg } = this.repoSetup(name);
     const full = await this.issuesRepo(repo, cfg);
-    const pending = this.githubIterations(repo, full, 'pending').filter(
+    const pending = this.hostIterations(repo, full, 'pending').filter(
       (it) => !this.writing.has(it.id),
     );
     if (pending.length === 0) return;
@@ -2880,17 +2927,17 @@ export class IssueBridge {
   }
 
   /**
-   * Follow the repo's iterations that are not over (`followIteration`), but those a scout is
-   * writing out right now: the next round follows them. Runs whatever the work switch: it starts
-   * no work. A failure of one iteration leaves the others to go on and fails the round
-   * afterwards; it is tried again the next round.
+   * Follow the repo's iterations on this bridge's platform that are not over
+   * (`followIteration`), but those a scout is writing out right now: the next round follows them.
+   * Runs whatever the work switch: it starts no work. A failure of one iteration leaves the others
+   * to go on and fails the round afterwards; it is tried again the next round.
    */
   private async followIterations(name: string): Promise<void> {
     const repo = this.deps.store.findRepo(name);
     if (!repo) return;
     const open = this.deps.store
       .listIterations({ repoId: repo.id, status: ITERATION_OPEN_STATUSES })
-      .filter((it) => it.source === 'github' && it.issue !== null);
+      .filter((it) => it.source === this.platform.platform && it.issue !== null);
     let failure: { err: unknown } | undefined;
     for (const iteration of open) {
       if (this.stopping) break;
@@ -3064,7 +3111,7 @@ export class IssueBridge {
     update: IterationUpdate,
   ): Promise<void> {
     const own = iteration.issue;
-    if (iteration.source !== 'github' || !own) return;
+    if (iteration.source !== this.platform.platform || !own) return;
     const store = this.deps.store;
     const { adjusted } = recordAdjustment(store, iteration.id, repo.name, update, scout.id);
     if (!this.writing.has(iteration.id)) {
@@ -3199,6 +3246,8 @@ export class IssueBridge {
       };
     });
     return {
+      platform: this.platform.platform,
+      host: this.platform.platform === 'gitlab' ? this.platform.remoteHost() : null,
       enabled: section !== undefined,
       account: section?.account ?? null,
       pollMinutes: this.platform.pollMinutes(),

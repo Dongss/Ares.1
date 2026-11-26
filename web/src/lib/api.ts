@@ -130,6 +130,8 @@ export const api = {
 
   github: () => request<GitHubStatus>('GET', '/api/github'),
   githubPoll: () => request<GitHubStatus>('POST', '/api/github/poll'),
+  gitlab: () => request<GitHubStatus>('GET', '/api/gitlab'),
+  gitlabPoll: () => request<GitHubStatus>('POST', '/api/gitlab/poll'),
   upgrade: () => request<UpgradeStatus>('GET', '/api/upgrade'),
   upgradeCheck: () => request<UpgradeStatus>('POST', '/api/upgrade/check'),
   scouts: () => request<Scout[]>('GET', '/api/scouts'),

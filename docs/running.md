@@ -578,7 +578,7 @@ backlog:
 ### 暂时还不支持的
 
 - 自动删掉本地提案更早失败的尝试的工作目录和分支：GitHub 仓库的 issue 重做成功或用完次数后会自动删掉（见「Run 失败后自动重做」），本地提案的还要手动清理。
-- 在配置里选用 GitLab：GitLab 客户端（`src/gitlab/client.ts`，通过 glab）已经有了，能读写 issue、MR 和流水线状态，但还不能在配置里选用。托管在 GitLab 或内网的项目现在仍先用本地提案池，合并后自己推送。
+- GitLab 仓库的完整支持：`config.yaml` 的 `gitlab.repos` 已经能登记 GitLab 仓库（`issues_repo` 写项目路径，如 `grp/sub/demo`），Master 给 GitLab 单独开一路检查（和 GitHub 的各自轮询、各自记错误），把 `ares1:ready` 的 issue 建成 Run、在 issue 上回写进度（评论同样带隐藏标记、去掉家目录）、完成后关闭 issue，`push: true` 时把目标分支推送到 GitLab；作者对项目的权限在 Developer 及以上才算受信任，否则 Run 先等人确认目标。`GET /api/gitlab` 和 `POST /api/gitlab/poll` 的格式和 `GET /api/github`、`POST /api/github/poll` 相同，`platform` 是 `gitlab`，`host` 是 `gitlab.host`（GitHub 的 `platform` 是 `github`，`host` 为 `null`）。看板上的显示和完整的登记说明还没做完，不支持 MR（`deliver` 只能是 `push`）。
 
 ### 本地提案池的 API
 
@@ -588,7 +588,7 @@ backlog:
 - `POST /api/proposals/:id/accept`：采纳一条待处理的提案，用提案正文作为目标建 Run（模板和 `auto_merge` 按这个仓库在 `backlog.repos` 里的设置），返回 `{ proposal, run }`：采纳后的提案（格式同上）和建出的 Run（格式同 `GET /api/runs` 的各项）。提案不存在时返回 404；已经采纳、拒绝过或多次失败后放弃了、属于迭代（随迭代整体采纳），或者仓库已经不在 `backlog.repos` 里、配置有误时返回 409。
 - `POST /api/proposals/:id/reject`：拒绝一条待处理的提案，请求体是 `{ "reason": "…" }`，理由必填，去掉首尾空白后为空时返回 400。理由会和提案一起出现在这个仓库之后的侦察提示词里，作为不要再提的反例。返回拒绝后的提案；不存在时返回 404，已经采纳或拒绝过、属于迭代（随迭代整体拒绝）时返回 409。
 - `POST /api/proposals/:id/restart`：重新开始一条「已失败」的提案（包括迭代里还没被替换的子项），次数从头算，马上建 Run（见「本地提案失败后自动重做」的「重新开始」）。返回 `{ proposal, run }`，格式同 `accept`。提案不存在时返回 404；不是「已失败」、所属迭代已结束、这一步已被替换或不做了，或者仓库已经不在 `backlog.repos` 里、配置有误时返回 409。
-- `POST /api/scouts`：手动侦察，请求体是 `{ "repo": "<仓库名>" }`。仓库在 `backlog.repos` 里时交给本地提案池，提案写进本地提案池；在 `github.repos` 里时照旧建 issue。同一个仓库同时写在两处属于配置错误，这时 `backlog.repos` 里的设置不生效，按 GitHub 侦察。两处都没有时返回 404。
+- `POST /api/scouts`：手动侦察，请求体是 `{ "repo": "<仓库名>" }`。仓库在 `backlog.repos` 里时交给本地提案池，提案写进本地提案池；在 `github.repos` 或 `gitlab.repos` 里时在那个平台上建 issue。同一个仓库写在不止一处属于配置错误，这时按 `github.repos`、`gitlab.repos`、`backlog.repos` 的顺序只有第一处生效，按它侦察。三处都没有时返回 404。
 
 ### 迭代的看板和 API
 
