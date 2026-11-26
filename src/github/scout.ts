@@ -10,6 +10,7 @@ import {
   iterationProgress,
   MAX_ITERATION_CHILDREN,
   PROPOSAL_SIZES,
+  proposalAwaitingRedo,
   RISKS,
   sizeMeanings,
   unmetDependencies,
@@ -1696,7 +1697,7 @@ function digestSection(heading: string, lines: string[], max: number): string {
 }
 
 /** What the scout's list of local proposals reads of the iteration a proposal is a step of. */
-export type ProposalIteration = Pick<Iteration, 'id' | 'title' | 'status'>;
+export type ProposalIteration = Pick<Iteration, 'id' | 'title' | 'status' | 'children'>;
 
 /**
  * An accepted proposal: the Run it became and how that stands, whether it was accepted without a
@@ -1716,7 +1717,8 @@ function acceptedProposalLine(
   if (p.attempt > 1) {
     parts.push(t({ zh: `第 ${p.attempt} 次尝试`, en: `attempt ${p.attempt}` }));
   }
-  if (p.redo === 'pending') {
+  // A step of an iteration that ended is not redone, whatever it waited for.
+  if (proposalAwaitingRedo(p, iteration)) {
     parts.push(t({ zh: '等自动重做', en: 'waiting to be redone automatically' }));
   }
   if (p.auto) parts.push(t({ zh: '自动采纳', en: 'accepted automatically' }));

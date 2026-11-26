@@ -1358,16 +1358,16 @@ export class Store {
   }
 
   /**
-   * The repo's accepted proposals of their own (no iteration) whose latest Run failed and that
-   * were not given up: the failure not recorded yet (`redo` null), or waiting to be redone
-   * (`redo` pending). Oldest first.
+   * The repo's accepted proposals, of their own or steps of iterations, whose latest Run failed
+   * and that were not given up: the failure not recorded yet (`redo` null), or waiting to be
+   * redone (`redo` pending). Whether a step's iteration still wants it is the caller's to judge
+   * (`proposalRedoAllowed` in src/config/flow.ts). Oldest first.
    */
   proposalsWithFailedRun(repoId: string): Proposal[] {
     return this.many<Proposal>(
       'proposals',
       `SELECT proposals.* FROM proposals JOIN runs ON runs.id = proposals.run_id
-         WHERE proposals.repo_id = ? AND proposals.status = 'accepted'
-           AND proposals.iteration_id IS NULL AND runs.status = 'failed'
+         WHERE proposals.repo_id = ? AND proposals.status = 'accepted' AND runs.status = 'failed'
            AND (proposals.redo IS NULL OR proposals.redo = 'pending')
          ORDER BY proposals.created_at, proposals.rowid`,
       repoId,

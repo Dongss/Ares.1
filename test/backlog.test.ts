@@ -466,9 +466,8 @@ backlog:
   });
 });
 
-describe('local backlog: redo after a failure', () => {
-  /** Coding, then merging without approval; an agent error ends the Run as failed at once. */
-  const REDO_WORKFLOW = `
+/** Coding, then merging without approval; an agent error ends the Run as failed at once. */
+const REDO_WORKFLOW = `
 id: dev
 name: 测试流程
 defaults:
@@ -485,23 +484,38 @@ stages:
     kind: merge
 `;
 
-  /**
-   * A coder that errors on the calls listed (counted from 1) and otherwise writes feature.txt at
-   * a cost of $2. `error`: what it says when it errors.
-   */
-  const coderFailingOn = (
-    failing: number[],
-    error = (n: number) => `第 ${n} 次：模型额度用完了`,
-  ): Script => {
-    let calls = 0;
-    return (ctx) => {
-      calls++;
-      if (failing.includes(calls)) return { status: 'failed', error: error(calls) };
-      writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
-      return { ...done('写了 feature.txt'), costUsd: 2 };
-    };
+/**
+ * A coder that errors on the calls listed (counted from 1) and otherwise writes feature.txt at a
+ * cost of $2. `error`: what it says when it errors.
+ */
+const coderFailingOn = (
+  failing: number[],
+  error = (n: number) => `第 ${n} 次：模型额度用完了`,
+): Script => {
+  let calls = 0;
+  return (ctx) => {
+    calls++;
+    if (failing.includes(calls)) return { status: 'failed', error: error(calls) };
+    writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+    return { ...done('写了 feature.txt'), costUsd: 2 };
   };
+};
 
+/**
+ * As if `ms` had passed since the failed Runs ended (by default the longest wait before a redo):
+ * they ended that much earlier.
+ */
+const elapseRedoWait = (t: Harness, ms = REDO_BACKOFF_MAX_HOURS * 3_600_000) => {
+  const store = t.master.store;
+  for (const r of store.listRuns({ status: 'failed' })) {
+    if (!r.finishedAt) continue;
+    store.updateRun(r.id, {
+      finishedAt: new Date(Date.parse(r.finishedAt) - ms).toISOString(),
+    });
+  }
+};
+
+describe('local backlog: redo after a failure', () => {
   async function startRedo(
     cfg: string,
     failing: number[],
@@ -523,20 +537,6 @@ stages:
       scoutId: null,
     });
     return t.master.backlog.accept(row.id);
-  };
-
-  /**
-   * As if `ms` had passed since the failed Runs ended (by default the longest wait before a
-   * redo): they ended that much earlier.
-   */
-  const elapseRedoWait = (t: Harness, ms = REDO_BACKOFF_MAX_HOURS * 3_600_000) => {
-    const store = t.master.store;
-    for (const r of store.listRuns({ status: 'failed' })) {
-      if (!r.finishedAt) continue;
-      store.updateRun(r.id, {
-        finishedAt: new Date(Date.parse(r.finishedAt) - ms).toISOString(),
-      });
-    }
   };
 
   /** The latest Run of the proposal. */
@@ -1430,7 +1430,7 @@ describe('iterations of the local backlog', () => {
     const notice = noticeFor(blocked[0] as (typeof blocked)[number], undefined);
     expect(notice).toMatchObject({ kind: 'iteration', title: '迭代受阻：demo', about: 'issues' });
     expect(notice?.body).toBe(
-      '迭代的第 1 步没有做成（Run 失败、被终止，或需求评估结论为不做），依赖它的子项开不了工。侦察下次会换个做法补一个子项替换它；也可以在看板上终止这个迭代，不做剩下的',
+      '迭代的第 1 步没有做成（Run 用完重做次数后仍然失败、被终止，或需求评估结论为不做），依赖它的子项开不了工。侦察下次会换个做法补一个子项替换它；也可以在看板上终止这个迭代，不做剩下的',
     );
     // Once each time it gets blocked; the step depending on it waits.
     await t.master.backlog.poll();
@@ -1571,6 +1571,216 @@ describe('iterations of the local backlog', () => {
     await scoutByHand(t);
     expect(lastScoutPrompt(t)).toContain(`所属迭代 ${filed.id} 已被人终止`);
     expect(lastScoutPrompt(t)).toContain('终止：所属迭代被人在看板上终止，没做完的子项随之不做');
+  });
+
+  /**
+   * A Master whose Runs code then merge (REDO_WORKFLOW), the coder failing on the calls listed;
+   * the iteration `iteration` planned and filed, auto-accepted, its scouts finding nothing after.
+   */
+  async function plannedFailing(cfg: string, failing: number[], iteration: unknown) {
+    gh = new FakeGitHub();
+    h = await harness({ agents: AGENTS, config: cfg, github: gh, workflow: REDO_WORKFLOW });
+    h.scripts.coder = coderFailingOn(failing);
+    const filed = await planned(h, iteration);
+    h.scripts.scout = () => ({ structured: { gaps: [], proposals: [] } });
+    expect(filed.status).toBe('active');
+    return { t: h, filed };
+  }
+
+  /** The statuses a step went through, as its `iteration.child_status` events tell. */
+  const stepHistory = (t: Harness, position: number) =>
+    eventData(t, 'iteration.child_status')
+      .filter((d) => d.position === position)
+      .map((d) => d.status);
+
+  it('redoes a step whose Run failed: the iteration goes on, never blocked, and is summed up', async () => {
+    // The first Run of each step fails.
+    const { t, filed } = await plannedFailing(
+      config({ auto: true }),
+      [1, 3],
+      plan([step('第一步'), step('收尾', { criteria: [], dependsOn: [1], closeout: true })]),
+    );
+    const store = t.master.store;
+    const first = await t.waitStatus(runOfStep(t, filed.id, 1).id, 'failed');
+    await t.master.backlog.poll();
+
+    // Recorded and waiting for its redo: the step goes on, nothing blocks, nothing else starts.
+    const [p1] = stepProposals(t, filed.id);
+    expect(p1).toMatchObject({
+      status: 'accepted',
+      runId: first.id,
+      attempt: 1,
+      redo: 'pending',
+      failures: [expect.objectContaining({ runId: first.id, attempt: 1, stage: '编码' })],
+    });
+    expect(eventData(t, 'proposal.redo_scheduled')).toEqual([
+      expect.objectContaining({ proposalId: p1?.id, runId: first.id, attempt: 2, maxAttempts: 3 }),
+    ]);
+    expect(iterationOf(t, filed.id).status).toBe('active');
+    expect(statuses(t, filed.id)).toEqual(['running', 'waiting']);
+    expect(store.listRuns()).toHaveLength(1);
+    // The automatic scout waits for the redo, as for one of a proposal of its own.
+    expect(demoStatus(t)?.scout?.waiting?.reason).toBe('有 1 条提案在等重做');
+    await t.master.backlog.poll();
+    expect(statuses(t, filed.id)).toEqual(['running', 'waiting']);
+    expect(store.listRuns()).toHaveLength(1);
+
+    elapseRedoWait(t);
+    await t.master.backlog.poll();
+    const second = runOfStep(t, filed.id, 1);
+    expect(second.id).not.toBe(first.id);
+    expect(second.goal).toContain(`### 第 1 次（Run ${first.id}，失败在「编码」阶段）`);
+    expect(stepProposals(t, filed.id)[0]).toMatchObject({ attempt: 2, redo: null });
+    expect(eventData(t, 'proposal.redone')).toEqual([
+      expect.objectContaining({ proposalId: p1?.id, runId: second.id, failedRunId: first.id }),
+    ]);
+    // The step lists every Run that worked on it, the failed one included.
+    expect(iterationOf(t, filed.id).children[0]?.runIds).toEqual([first.id, second.id]);
+    await t.waitStatus(second.id, 'completed');
+
+    // The closing step starts with the review suggestions; its first Run fails too, and its redo
+    // goes by the text it was given, the suggestions once.
+    await t.master.backlog.poll();
+    expect(statuses(t, filed.id)).toEqual(['done', 'running']);
+    const closing = stepProposals(t, filed.id)[1] as Proposal;
+    expect(closing.what).toContain('收尾的做法\n\n### 本迭代评审留下的建议');
+    const third = await t.waitStatus(runOfStep(t, filed.id, 2).id, 'failed');
+    await t.master.backlog.poll();
+    expect(statuses(t, filed.id)).toEqual(['done', 'running']);
+    elapseRedoWait(t);
+    await t.master.backlog.poll();
+    const fourth = runOfStep(t, filed.id, 2);
+    expect(fourth.id).not.toBe(third.id);
+    expect(fourth.goal.split('### 本迭代评审留下的建议')).toHaveLength(2);
+    expect(fourth.goal).toContain(`### 第 1 次（Run ${third.id}，失败在「编码」阶段）`);
+    expect(stepProposals(t, filed.id)[1]?.what).toBe(closing.what);
+    await t.waitStatus(fourth.id, 'completed');
+
+    // Every step done: summed up and done, the failed attempts counted.
+    await t.master.backlog.poll();
+    const done = iterationOf(t, filed.id);
+    expect(done).toMatchObject({ status: 'done', summaryPosted: true });
+    expect(done.children.map((c) => [c.status, c.runIds])).toEqual([
+      ['done', [first.id, second.id]],
+      ['done', [third.id, fourth.id]],
+    ]);
+    expect(done.summary).toContain('## 迭代完成');
+    expect(done.summary).toContain('完成了全部 2 个子项');
+    expect(done.summary).toContain('- 总费用：$4.00，共 4 个 Run');
+    expect(eventData(t, 'iteration.completed')).toEqual([
+      { repo: 'demo', iterationId: filed.id, backlog: true, costUsd: 4, runs: 4 },
+    ]);
+    // Never blocked, never failed on the way.
+    expect(eventData(t, 'iteration.blocked')).toEqual([]);
+    expect(stepHistory(t, 1)).toEqual(['running', 'done']);
+    expect(stepHistory(t, 2)).toEqual(['ready', 'running', 'done']);
+    expect(gh.calls).toEqual([]);
+  });
+
+  it('blocks the iteration once a step used up its attempts, the step failed', async () => {
+    const { t, filed } = await plannedFailing(
+      config({ maxAttempts: 2 }),
+      [1, 2],
+      plan([step('第一步'), step('第二步', { dependsOn: [1] })]),
+    );
+    const store = t.master.store;
+    const first = await t.waitStatus(runOfStep(t, filed.id, 1).id, 'failed');
+    await t.master.backlog.poll();
+    expect(statuses(t, filed.id)).toEqual(['running', 'waiting']);
+    elapseRedoWait(t);
+    await t.master.backlog.poll();
+    const second = await t.waitStatus(runOfStep(t, filed.id, 1).id, 'failed');
+    expect(second.id).not.toBe(first.id);
+    // No attempts left: given up at once, which blocks the iteration.
+    await t.master.backlog.poll();
+
+    const [p1, p2] = stepProposals(t, filed.id);
+    expect(p1).toMatchObject({
+      status: 'failed',
+      runId: second.id,
+      attempt: 2,
+      redo: 'exhausted',
+      failures: [
+        expect.objectContaining({ runId: first.id, attempt: 1 }),
+        expect.objectContaining({ runId: second.id, attempt: 2 }),
+      ],
+    });
+    expect(eventData(t, 'proposal.failed')).toEqual([
+      expect.objectContaining({
+        proposalId: p1?.id,
+        runId: second.id,
+        attempts: 2,
+        maxAttempts: 2,
+      }),
+    ]);
+    const blocked = iterationOf(t, filed.id);
+    expect(blocked.status).toBe('blocked');
+    expect(blocked.children.map((c) => [c.status, c.runIds])).toEqual([
+      ['failed', [first.id, second.id]],
+      ['waiting', []],
+    ]);
+    expect(eventData(t, 'iteration.blocked')).toEqual([
+      {
+        repo: 'demo',
+        iterationId: filed.id,
+        backlog: true,
+        position: 1,
+        proposalId: p1?.id,
+        reason: 'failed',
+      },
+    ]);
+    // Running from its first Run until it was given up, never failed in between.
+    expect(stepHistory(t, 1)).toEqual(['running', 'failed']);
+
+    // Never redone again, however long it waits; the step depending on it waits.
+    elapseRedoWait(t);
+    await t.master.backlog.poll();
+    expect(store.listRuns()).toHaveLength(2);
+    expect(store.getProposal(p2?.id ?? '').runId).toBeNull();
+    expect(eventData(t, 'iteration.blocked')).toHaveLength(1);
+    expect(eventData(t, 'proposal.redone')).toHaveLength(1);
+  });
+
+  it.each([
+    { seen: true, when: 'while it waits for its redo' },
+    { seen: false, when: 'before its failure was seen' },
+  ])('does not redo the failed step of an iteration cancelled $when', async ({ seen }) => {
+    const { t, filed } = await plannedFailing(
+      config(),
+      [1],
+      plan([step('第一步'), step('第二步', { dependsOn: [1] })]),
+    );
+    const store = t.master.store;
+    const first = await t.waitStatus(runOfStep(t, filed.id, 1).id, 'failed');
+    if (seen) {
+      await t.master.backlog.poll();
+      expect(stepProposals(t, filed.id)[0]?.redo).toBe('pending');
+    }
+    const cancelled = await t.master.backlog.cancelIteration(filed.id);
+    expect(cancelled.children.map((c) => c.status)).toEqual(['dropped', 'dropped']);
+
+    // The wait is over, but nobody wants the step any more: neither redone nor given up.
+    elapseRedoWait(t);
+    await t.master.backlog.poll();
+    await t.master.backlog.poll();
+    expect(store.listRuns()).toHaveLength(1);
+    const [p1] = stepProposals(t, filed.id);
+    expect(p1).toMatchObject({
+      status: 'accepted',
+      runId: first.id,
+      attempt: 1,
+      redo: seen ? 'pending' : null,
+    });
+    expect(eventData(t, 'proposal.redo_scheduled')).toHaveLength(seen ? 1 : 0);
+    expect(eventData(t, 'proposal.redone')).toEqual([]);
+    expect(eventData(t, 'proposal.failed')).toEqual([]);
+    expect(eventData(t, 'iteration.blocked')).toEqual([]);
+    expect(statuses(t, filed.id)).toEqual(['dropped', 'dropped']);
+    // The scout reads the step as ended with its iteration, not as waiting for a redo.
+    await scoutByHand(t);
+    expect(lastScoutPrompt(t)).toContain(
+      `- ${p1?.id} 第一步（Run ${first.id}：失败，自动采纳，所属迭代 ${filed.id} 已被人终止）`,
+    );
   });
 
   it('speaks English without Chinese left', async () => {

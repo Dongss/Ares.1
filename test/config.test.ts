@@ -24,6 +24,7 @@ import {
   normalizeTouches,
   plansStage,
   proposalAwaitingRedo,
+  proposalRedoAllowed,
   proposalRedoDueAt,
   RATE_LIMIT_WAIT,
   REDO_BACKOFF_MAX_HOURS,
@@ -80,6 +81,7 @@ import {
   type DiscussionEntry,
   type IterationChild,
   type IterationChildStatus,
+  type IterationStatus,
   type RedoState,
   type Run,
   type RunStatus,
@@ -2528,14 +2530,15 @@ describe('redo after a failure', () => {
 
     const run = { finishedAt, updatedAt: '2026-11-20T00:30:00.000Z' };
     const waiting = {
+      id: 'proposal-1',
       status: 'accepted' as const,
       iterationId: null,
       redo: 'pending' as const,
       attempt: 2,
     };
-    expect(proposalAwaitingRedo(waiting)).toBe(true);
-    expect(proposalRedoDueAt(waiting, run, 5)).toBe(ended + 10 * MIN);
-    expect(proposalRedoDueAt(waiting, run, 5)).toBe(
+    expect(proposalAwaitingRedo(waiting, null)).toBe(true);
+    expect(proposalRedoDueAt(waiting, null, run, 5)).toBe(ended + 10 * MIN);
+    expect(proposalRedoDueAt(waiting, null, run, 5)).toBe(
       redoDueAt(
         {
           status: 'failed',
@@ -2545,19 +2548,80 @@ describe('redo after a failure', () => {
         5,
       ),
     );
-    expect(proposalRedoDueAt(waiting, { ...run, finishedAt: null }, 5)).toBe(
+    expect(proposalRedoDueAt(waiting, null, { ...run, finishedAt: null }, 5)).toBe(
       Date.parse(run.updatedAt) + 10 * MIN,
     );
-    // Not waiting: its failure not recorded yet, given up, a step of an iteration, failed.
+    // Not waiting: its failure not recorded yet, given up, failed.
     for (const p of [
       { ...waiting, redo: null },
       { ...waiting, redo: 'exhausted' as const },
-      { ...waiting, iterationId: 'iteration-1' },
       { ...waiting, status: 'failed' as const },
     ]) {
-      expect(proposalAwaitingRedo(p)).toBe(false);
-      expect(proposalRedoDueAt(p, run, 5)).toBeNull();
+      expect(proposalAwaitingRedo(p, null)).toBe(false);
+      expect(proposalRedoDueAt(p, null, run, 5)).toBeNull();
     }
+  });
+
+  it('redoes a step of an iteration only while its iteration still wants it', () => {
+    const run = { finishedAt: '2026-11-20T00:00:00.000Z', updatedAt: '2026-11-20T00:30:00.000Z' };
+    const step = {
+      id: 'proposal-2',
+      status: 'accepted' as const,
+      iterationId: 'iteration-1',
+      redo: 'pending' as const,
+      attempt: 1,
+    };
+    const child = (patch: Partial<IterationChild> = {}): IterationChild => ({
+      position: 1,
+      title: '第一步',
+      category: 'feature',
+      size: 'M',
+      risk: 'low',
+      why: '',
+      evidence: [],
+      what: '',
+      acceptance: [],
+      criteria: [],
+      dependsOn: [],
+      closeout: false,
+      proposalId: 'proposal-2',
+      status: 'running',
+      runIds: [],
+      ...patch,
+    });
+    const iteration = (status: IterationStatus, patch: Partial<IterationChild> = {}) => ({
+      status,
+      children: [child({ position: 2, proposalId: 'proposal-3' }), child(patch)],
+    });
+    // Accepted and not over: running, or blocked by another step, or failed before (an
+    // iteration from before steps were redone).
+    for (const it of [
+      iteration('active'),
+      iteration('blocked'),
+      iteration('blocked', { status: 'failed' }),
+    ]) {
+      expect(proposalRedoAllowed(step, it)).toBe(true);
+      expect(proposalAwaitingRedo(step, it)).toBe(true);
+      expect(proposalRedoDueAt(step, it, run, 5)).toBe(Date.parse(run.finishedAt) + 5 * MIN);
+    }
+    // Cancelled (turned down) or over, the step dropped or replaced, not in the plan, or the
+    // iteration not known.
+    for (const it of [
+      iteration('cancelled', { status: 'dropped' }),
+      iteration('done'),
+      iteration('pending'),
+      iteration('active', { status: 'dropped' }),
+      iteration('blocked', { status: 'failed', replacedBy: 3 }),
+      { status: 'active' as const, children: [child({ proposalId: 'proposal-9' })] },
+      null,
+      undefined,
+    ]) {
+      expect(proposalRedoAllowed(step, it)).toBe(false);
+      expect(proposalAwaitingRedo(step, it)).toBe(false);
+      expect(proposalRedoDueAt(step, it, run, 5)).toBeNull();
+    }
+    // A proposal of its own does not look at any iteration.
+    expect(proposalRedoAllowed({ id: 'proposal-1', iterationId: null }, null)).toBe(true);
   });
 });
 

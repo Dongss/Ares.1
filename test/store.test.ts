@@ -615,7 +615,7 @@ describe('proposals of the local backlog', () => {
     );
   });
 
-  it('finds the proposals of their own whose latest Run failed and that are not given up', () => {
+  it('finds the proposals whose latest Run failed and that are not given up, steps included', () => {
     const store = new Store(':memory:');
     const { repo, mk } = seed(store);
     const withRun = (
@@ -633,12 +633,14 @@ describe('proposals of the local backlog', () => {
     withRun('given up', 'failed', { status: 'failed', redo: 'exhausted' });
     withRun('cancelled', 'cancelled');
     withRun('completed', 'completed');
-    withRun('step', 'failed', { iterationId: 'iteration-1' });
+    // Whether its iteration still wants it is for the local backlog to judge.
+    const step = withRun('step', 'failed', { iterationId: 'iteration-1' });
     // Pending, without a Run.
     store.createProposal({ ...proposed('pending'), repoId: repo.id, scoutId: null });
     expect(store.proposalsWithFailedRun(repo.id)).toEqual([
       store.getProposal(fresh.id),
       store.getProposal(waiting.id),
+      store.getProposal(step.id),
     ]);
     expect(store.proposalsWithFailedRun('nope')).toEqual([]);
   });

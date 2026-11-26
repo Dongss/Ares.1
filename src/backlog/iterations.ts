@@ -34,8 +34,8 @@ import { nowIso } from '../util.js';
 
 /**
  * The Runs that worked on a child, oldest first: on GitHub every Run created from its issue
- * (failed attempts, redos and Runs started over included); in the local backlog, the Run its
- * proposal became.
+ * (failed attempts, redos and Runs started over included); in the local backlog, the Runs its
+ * proposal became: each failed attempt (`failures`) and the latest.
  */
 export function childRuns(
   store: Store,
@@ -46,8 +46,10 @@ export function childRuns(
     return child.issue ? store.runsForIssue(iteration.issuesRepo, child.issue.number) : [];
   }
   if (!child.proposalId) return [];
-  const runId = store.getProposal(child.proposalId).runId;
-  return runId ? [store.getRun(runId)] : [];
+  const p = store.getProposal(child.proposalId);
+  // The latest failure is the latest Run itself until the redo replaces it.
+  const ids = new Set([...p.failures.map((f) => f.runId), ...(p.runId ? [p.runId] : [])]);
+  return [...ids].map((id) => store.getRun(id));
 }
 
 /**
@@ -75,13 +77,15 @@ export function ranOutOfAttempts(store: Store, runs: readonly Run[]): boolean {
 }
 
 /**
- * Where the source has a child's requirement: open, still to be done; done (on GitHub: its issue
- * closed as completed; in the local backlog: its Run completed); closed without being done (on
- * GitHub: closed as not planned, or any other way but completed), which is failed or dropped by
- * its Runs; or failed outright (in the local backlog, where a Run is never redone: its Run failed,
- * was terminated, or its assessment dropped the requirement).
+ * Where the source has a child's requirement: open, still to be done; redo, still to be done and
+ * its latest Run failed, but a redo is coming (in the local backlog: its proposal has attempts
+ * left, so it is running all along; on GitHub an open issue's Runs tell that by themselves); done
+ * (on GitHub: its issue closed as completed; in the local backlog: its Run completed); closed
+ * without being done (on GitHub: closed as not planned, or any other way but completed), which is
+ * failed or dropped by its Runs; or failed outright (in the local backlog: its Runs failed until
+ * its attempts were used up, its Run was terminated, or its assessment dropped the requirement).
  */
-export type ChildOutcome = 'open' | 'done' | 'closed' | 'failed';
+export type ChildOutcome = 'open' | 'redo' | 'done' | 'closed' | 'failed';
 
 /**
  * What every event about an iteration starts with: its repo and id, its issue on GitHub, and
@@ -107,7 +111,9 @@ export function iterationEventData(
  * failed when its Runs used up their attempts (`ranOutOfAttempts`), otherwise dropped: a human
  * turned it down.
  * Open ones are running while a Run works on them, else waiting while a child they depend on is
- * not done (`unmetDependencies`), else ready. Each status change records an
+ * not done (`unmetDependencies`), else ready; ones a redo is coming for are running, so that
+ * neither the iteration is blocked nor another Run started for them meanwhile. Each status change
+ * records an
  * `iteration.child_status` event, and the iteration's own status follows (`settleStatus`), in the
  * same transaction. The children are not written when none changed.
  */
@@ -128,7 +134,7 @@ export function followChildren(
       else if (outcome === 'failed') settled.set(child.position, 'failed');
       else if (outcome === 'closed') {
         settled.set(child.position, ranOutOfAttempts(store, childRunsOf) ? 'failed' : 'dropped');
-      } else if (outcome === 'open' && worksOn(childRunsOf)) {
+      } else if (outcome === 'redo' || (outcome === 'open' && worksOn(childRunsOf))) {
         settled.set(child.position, 'running');
       }
     }

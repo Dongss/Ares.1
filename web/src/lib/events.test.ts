@@ -692,7 +692,7 @@ describe('globalEventText', () => {
       'demo 的一个本地迭代已整批采纳，子项按依赖顺序开工',
     );
     expect(text('iteration.blocked', { ...at, position: 2, reason: 'failed' })).toBe(
-      'demo 的迭代受阻：第 2 步没有做成（Run 失败、被终止，或需求评估结论为不做），依赖它的步骤开不了工；侦察下次会换个做法替换它',
+      'demo 的迭代受阻：第 2 步没有做成（Run 用完重做次数后仍然失败、被终止，或需求评估结论为不做），依赖它的步骤开不了工；侦察下次会换个做法替换它',
     );
     const rejected = { ...at, dropped: [1, 2], pending: true, reason: '现在不做' };
     expect(text('iteration.cancelled', rejected)).toBe(
@@ -712,7 +712,7 @@ describe('globalEventText', () => {
     expect(english).toEqual([
       'Accepted a local iteration of demo automatically as a whole; its steps start in the order of their dependencies',
       'A local iteration of demo was accepted as a whole; its steps start in the order of their dependencies',
-      'Iteration of demo is blocked: step 2 was not done (its Run failed, was terminated, or its assessment dropped it), so the steps depending on it cannot start; the next scout replaces it with another approach',
+      'Iteration of demo is blocked: step 2 was not done (its Runs failed until its attempts were used up, its Run was terminated, or its assessment dropped it), so the steps depending on it cannot start; the next scout replaces it with another approach',
       'Rejected a local iteration of demo, its steps with it, because: not now; later scouts are shown the reason',
       'A local iteration of demo was cancelled on the dashboard; its 1 step not done was dropped with it',
     ]);

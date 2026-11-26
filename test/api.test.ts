@@ -1668,6 +1668,60 @@ backlog:
       redoAt: null,
     });
     expect(await titles('/api/proposals?status=failed')).toEqual(['放弃的']);
+
+    // A step of an iteration is redone the same way, only while its iteration still wants it.
+    const step = propose(t.repo.id, '迭代的一步');
+    const stepRun = failedRun('迭代的一步');
+    const iteration = store.createIteration({
+      repoId: t.repo.id,
+      scoutId: null,
+      source: 'local',
+      issuesRepo: '',
+      title: '本地迭代',
+      goal: '本地仓库也能永动',
+      readmeGoal: '永动',
+      criteria: ['能演示'],
+      outOfScope: [],
+      children: [
+        {
+          title: '迭代的一步',
+          category: 'feature',
+          size: 'M',
+          risk: 'low',
+          why: '',
+          evidence: [],
+          what: '',
+          acceptance: [],
+          position: 1,
+          criteria: [1],
+          dependsOn: [],
+          closeout: false,
+          proposalId: step.id,
+          status: 'running',
+          runIds: [stepRun.id],
+        },
+      ],
+    });
+    store.updateIteration(iteration.id, { status: 'active' });
+    store.updateProposal(step.id, {
+      status: 'accepted',
+      runId: stepRun.id,
+      redo: 'pending',
+      failures: [{ ...failure, runId: stepRun.id }],
+      iterationId: iteration.id,
+    });
+    const redoAtOf = async (id: string) =>
+      ((await call('GET', '/api/proposals')).json as ProposalView[]).find((p) => p.id === id)
+        ?.redoAt;
+    expect(await redoAtOf(step.id)).toBe('2026-11-25T08:07:00.000Z');
+    // Cancelled by a human: the step is dropped and not redone.
+    store.updateIteration(iteration.id, {
+      status: 'cancelled',
+      children: store
+        .getIteration(iteration.id)
+        .children.map((c) => ({ ...c, status: 'dropped' as const })),
+    });
+    expect(await redoAtOf(step.id)).toBeNull();
   });
 
   it('accepts a proposal into a Run, and rejects one only with a reason', async () => {

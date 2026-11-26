@@ -375,17 +375,18 @@ export interface ScoutProposal {
 /**
  * pending: waits for a human, or for the automatic acceptance; accepted: a Run was created from
  * it (a failed one being redone included); rejected: a human turned it down, with a reason the
- * next scouts are shown; failed: a proposal of its own whose Runs failed until `max_run_attempts`
- * was used up, so it is not redone any more (`failures` says why).
+ * next scouts are shown; failed: its Runs failed until `max_run_attempts` was used up, so it is
+ * not redone any more (`failures` says why); a step of an iteration that failed so blocks it.
  */
 export const PROPOSAL_STATUSES = ['pending', 'accepted', 'rejected', 'failed'] as const;
 export type ProposalStatus = (typeof PROPOSAL_STATUSES)[number];
 
 /**
- * After the Run of a proposal of its own failed: pending, it is redone as a new Run once the wait
- * is over (`proposalRedoDueAt` in src/config/flow.ts), the work switch is on and the day's budget
- * allows; exhausted, no attempts were left, so the proposal failed. Decided once, when the
- * failure is first seen, and cleared when the redo's Run is created.
+ * After the Run of a proposal failed: pending, it is redone as a new Run once the wait is over
+ * (`proposalRedoDueAt` in src/config/flow.ts), the work switch is on and the day's budget allows,
+ * as long as the iteration it is a step of, if any, still wants it (`proposalRedoAllowed`);
+ * exhausted, no attempts were left, so the proposal failed. Decided once, when the failure is
+ * first seen, and cleared when the redo's Run is created.
  */
 export type ProposalRedo = 'pending' | 'exhausted';
 
@@ -415,8 +416,7 @@ export interface Proposal {
   runId: string | null;
   /**
    * Which attempt `runId` is: 1 for the Run created when it was accepted, one more for each
-   * automatic redo after a failure (a proposal of its own only; the steps of an iteration are not
-   * redone).
+   * automatic redo after a failure.
    */
   attempt: number;
   /**

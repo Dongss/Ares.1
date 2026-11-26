@@ -687,7 +687,19 @@ function proposalView(
       if (!(err instanceof NotFoundError)) throw err;
     }
   }
-  const redoAt = run?.status === 'failed' ? proposalRedoDueAt(p, run, pollMinutes) : null;
+  let redoAt: number | null = null;
+  if (run?.status === 'failed' && p.redo === 'pending') {
+    // A step is redone only while its iteration still wants it.
+    let iteration: Iteration | null = null;
+    if (p.iterationId) {
+      try {
+        iteration = store.getIteration(p.iterationId);
+      } catch (err) {
+        if (!(err instanceof NotFoundError)) throw err;
+      }
+    }
+    redoAt = proposalRedoDueAt(p, iteration, run, pollMinutes);
+  }
   const repo = names ? names.get(p.repoId) : store.findRepo(p.repoId)?.name;
   return {
     ...p,

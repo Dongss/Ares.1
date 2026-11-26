@@ -317,9 +317,9 @@ function iterationBlockedNotice(event: EventRow): Notice {
 }
 
 /**
- * An iteration of the local backlog got blocked: the Run of one of its steps failed, was
- * terminated or dropped by its assessment (a Run of the local backlog is never redone), and what
- * comes next, on the dashboard.
+ * An iteration of the local backlog got blocked: the Runs of one of its steps failed until its
+ * attempts were used up, or its Run was terminated or dropped by its assessment, and what comes
+ * next, on the dashboard.
  */
 function localIterationBlockedNotice(event: EventRow): Notice {
   const d = event.data;
@@ -330,8 +330,8 @@ function localIterationBlockedNotice(event: EventRow): Notice {
     kind: 'iteration',
     title: titleOf('iteration', text(d.repo) ?? undefined),
     body: t({
-      zh: `迭代的${zhStep}没有做成（Run 失败、被终止，或需求评估结论为不做），依赖它的子项开不了工。侦察下次会换个做法补一个子项替换它；也可以在看板上终止这个迭代，不做剩下的`,
-      en: `${capitalize(enStep)} of the iteration was not done (its Run failed, was terminated, or its assessment dropped it), so the steps depending on it cannot start. The next scout adds a step replacing it with another approach; you can also cancel the iteration on the dashboard to drop the rest`,
+      zh: `迭代的${zhStep}没有做成（Run 用完重做次数后仍然失败、被终止，或需求评估结论为不做），依赖它的子项开不了工。侦察下次会换个做法补一个子项替换它；也可以在看板上终止这个迭代，不做剩下的`,
+      en: `${capitalize(enStep)} of the iteration was not done (its Runs failed until its attempts were used up, its Run was terminated, or its assessment dropped it), so the steps depending on it cannot start. The next scout adds a step replacing it with another approach; you can also cancel the iteration on the dashboard to drop the rest`,
     }),
     runId: null,
     about: 'issues',

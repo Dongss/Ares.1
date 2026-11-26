@@ -4,9 +4,9 @@
 // them on the dashboard or rejects them with a reason the next scouts are shown. A proposal of its
 // own whose Run failed is redone, told why, until max_run_attempts is used up, as an issue is.
 // An iteration a scout plans is kept the same way: its record (source local) and one proposal per
-// step, accepted or rejected as a whole, its steps started in the order of their dependencies and
-// the iteration summed up once every step is done (the rules shared with GitHub are in
-// iterations.ts and flow.ts). Nothing here calls GitHub.
+// step, accepted or rejected as a whole, its steps started in the order of their dependencies,
+// redone the same way when their Runs fail, and the iteration summed up once every step is done
+// (the rules shared with GitHub are in iterations.ts and flow.ts). Nothing here calls GitHub.
 
 import type { BacklogStatus } from '../api/types.js';
 import {
@@ -20,6 +20,7 @@ import {
   iterationStatusOf,
   type ProposalKind,
   proposalAwaitingRedo,
+  proposalRedoAllowed,
   proposalRedoDueAt,
 } from '../config/flow.js';
 import { backlogConfigKey, findTemplate, type LoadedConfig } from '../config/load.js';
@@ -122,16 +123,19 @@ const CHILD_OVER: readonly IterationChildStatus[] = ['done', 'failed', 'dropped'
  *   on, within today's count and budget (`mayAutoAccept`); the others wait for a human, who
  *   accepts or rejects them on the dashboard. An accepted proposal becomes a Run whose goal is the
  *   proposal's text;
- * - redo: a proposal of its own whose Run failed is redone as a new Run whose goal tells why the
- *   earlier attempts failed, after the wait an issue's redo waits (`proposalRedoDueAt`), up to
- *   `max_run_attempts` Runs and within the day's budget, while the work switch is on; after that
- *   the proposal failed. A Run a human terminated is not redone;
+ * - redo: a proposal whose Run failed, of its own or a step of an iteration that still wants it
+ *   (`proposalRedoAllowed`), is redone as a new Run whose goal tells why the earlier attempts
+ *   failed, after the wait an issue's redo waits (`proposalRedoDueAt`), up to `max_run_attempts`
+ *   Runs and within the day's budget, while the work switch is on; after that the proposal
+ *   failed. A Run a human terminated is not redone;
  * - iterations: one a scout planned is accepted as a whole, by its riskiest and largest step
  *   (`iterationKind`) and counting once toward today's limit, or by a human on the dashboard, or
  *   rejected as a whole with a reason. Accepted, each step becomes a Run once every step it
- *   depends on completed; a step whose Run failed, was terminated or dropped blocks it until a
- *   scout replaces that step; a human may cancel it, terminating the Runs of its steps not done.
- *   Once every step is done its summary is recorded and it is done.
+ *   depends on completed; a step whose Run failed keeps running while it is redone, and blocks
+ *   the iteration once its attempts are used up, its Run was terminated or dropped, until a scout
+ *   replaces that step; a human may cancel it, terminating the Runs of its steps not done, and its
+ *   steps are not redone any more. Once every step is done its summary is recorded and it is
+ *   done.
  * Polls on its own timer (`backlog.poll_minutes`), whether or not GitHub is configured. Accepting
  * without a human, starting the next steps of iterations and automatic scouts only happen while
  * the work switch is on.
@@ -203,12 +207,13 @@ export class LocalBacklog {
   // ---- poll ------------------------------------------------------------------
 
   /**
-   * One round, repo by repo: follow the iterations (and, while the work switch is on, start the
-   * steps whose dependencies are done), record the failed Runs of proposals and (while the work
-   * switch is on) redo those whose wait is over, then accept the pending proposals and iterations
-   * auto-accept takes, then start a scout where the repo is idle. A repo that is misconfigured or
-   * not registered on the dashboard is skipped, with the reason kept as why it does not scout;
-   * with the work switch off, only the iterations and the failed Runs are followed.
+   * One round, repo by repo: record the failed Runs of proposals and (while the work switch is
+   * on) redo those whose wait is over, follow the iterations (and, while the work switch is on,
+   * start the steps whose dependencies are done), then accept the pending proposals and
+   * iterations auto-accept takes, then start a scout where the repo is idle. A repo that is
+   * misconfigured or not registered on the dashboard is skipped, with the reason kept as why it
+   * does not scout; with the work switch off, only the failed Runs and the iterations are
+   * followed.
    */
   poll(): Promise<void> {
     return this.serial(async () => {
@@ -228,16 +233,18 @@ export class LocalBacklog {
           continue;
         }
         try {
-          // First: a step whose Run just completed lets the next one start before the scout
-          // looks at whether the repo is idle.
-          await this.followIterations(setup.repo, setup.cfg, working);
+          // Before following the iterations: a step whose Run failed with attempts left is seen
+          // as waiting for its redo, never as failed. Before auto-accepting: a requirement already
+          // taken on goes first within the budget.
+          this.redoFailedProposals(setup.repo, setup.cfg, working);
         } catch (err) {
           failed = true;
           this.report(err);
         }
         try {
-          // Before auto-accepting: a requirement already taken on goes first within the budget.
-          this.redoFailedProposals(setup.repo, setup.cfg, working);
+          // A step whose Run just completed lets the next one start before the scout looks at
+          // whether the repo is idle.
+          await this.followIterations(setup.repo, setup.cfg, working);
         } catch (err) {
           failed = true;
           this.report(err);
@@ -479,24 +486,28 @@ export class LocalBacklog {
   // ---- redoing failed Runs -----------------------------------------------------------
 
   /**
-   * Follow the repo's proposals of their own whose latest Run failed, oldest first: a failure not
+   * Follow the repo's proposals whose latest Run failed, oldest first: those of their own, and
+   * the steps of iterations that still want them (`proposalRedoAllowed`: accepted and not over,
+   * the step neither replaced nor dropped; the others are left as they are). A failure not
    * recorded yet is recorded (recordFailure), which gives the proposal up once its attempts are
-   * used up; then, while the work switch is on, each one waiting whose wait is over
-   * (`proposalRedoDueAt`) is redone (redo) as long as the day's budget is not spent. Neither wait
-   * costs an attempt, and each proposal waits on its own. A Run a human terminated is cancelled,
-   * not failed, so it is not redone. Steps of iterations are left to their iteration. A proposal
-   * that could not be redone (its Run not created) leaves the others to go on, and the error is
-   * thrown afterwards.
+   * used up (a step so given up blocks its iteration); then, while the work switch is on, each one
+   * waiting whose wait is over (`proposalRedoDueAt`) is redone (redo) as long as the day's budget
+   * is not spent. Neither wait costs an attempt, and each proposal waits on its own. A Run a human
+   * terminated is cancelled, not failed, so it is not redone. A proposal that could not be redone
+   * (its Run not created) leaves the others to go on, and the error is thrown afterwards.
    */
   private redoFailedProposals(repo: Repo, cfg: BacklogRepoConfig, working: boolean): void {
     const store = this.deps.store;
     let failure: { err: unknown } | undefined;
     for (const found of store.proposalsWithFailedRun(repo.id)) {
       if (this.stopping) break;
+      const iteration = this.iterationOf(found);
+      if (!proposalRedoAllowed(found, iteration)) continue;
       const failed = store.getRun(found.runId ?? '');
-      const p = found.redo === null ? this.recordFailure(repo, cfg, found, failed) : found;
+      const p =
+        found.redo === null ? this.recordFailure(repo, cfg, found, failed, iteration) : found;
       if (!working) continue;
-      const due = proposalRedoDueAt(p, failed, this.pollMinutes);
+      const due = proposalRedoDueAt(p, iteration, failed, this.pollMinutes);
       if (due === null || due > Date.now()) continue;
       // Over budget the redos wait for the next day; the other failures are still recorded.
       if (overBudget(store, repo, cfg)) continue;
@@ -510,13 +521,20 @@ export class LocalBacklog {
   }
 
   /**
-   * Record that the latest Run of a proposal of its own failed (`failedAttempt`: which attempt,
-   * in which stage, why) and what follows, decided once as for an issue: while attempts are left
+   * Record that the latest Run of a proposal failed (`failedAttempt`: which attempt, in which
+   * stage, why) and what follows, decided once as for an issue: while attempts are left
    * (`max_run_attempts`) it waits to be redone, with a `proposal.redo_scheduled` event saying
    * when; otherwise the proposal failed, with a `proposal.failed` event listing every attempt.
-   * In one transaction. Returns the proposal as recorded then.
+   * In one transaction. `iteration`: the one it is a step of, null for a proposal of its own.
+   * Returns the proposal as recorded then.
    */
-  private recordFailure(repo: Repo, cfg: BacklogRepoConfig, p: Proposal, run: Run): Proposal {
+  private recordFailure(
+    repo: Repo,
+    cfg: BacklogRepoConfig,
+    p: Proposal,
+    run: Run,
+    iteration: Iteration | null,
+  ): Proposal {
     const store = this.deps.store;
     const failures = [
       ...p.failures,
@@ -526,7 +544,7 @@ export class LocalBacklog {
     return store.tx(() => {
       if (p.attempt < cfg.max_run_attempts) {
         const pending = store.updateProposal(p.id, { failures, redo: 'pending' });
-        const redoAt = proposalRedoDueAt(pending, run, this.pollMinutes) ?? Date.now();
+        const redoAt = proposalRedoDueAt(pending, iteration, run, this.pollMinutes) ?? Date.now();
         store.event(null, 'proposal.redo_scheduled', {
           repo: repo.name,
           proposalId: p.id,
@@ -552,7 +570,8 @@ export class LocalBacklog {
 
   /**
    * Redo a proposal whose failed Run waited long enough: a new Run, the next attempt, whose goal
-   * is the proposal's text followed by why each earlier attempt failed
+   * is the proposal's text as kept (for a closing step, with the review suggestions it was given
+   * when it started) followed by why each earlier attempt failed
    * (`goalWithEarlierAttempts`), recorded on the proposal with a `proposal.redone` event in one
    * transaction. The Run counts toward the day's automatic spending, whoever accepted the
    * proposal. When the Run cannot be created nothing is recorded: a later poll tries again.
@@ -578,11 +597,25 @@ export class LocalBacklog {
     });
   }
 
-  /** The repo's proposals whose failed Run waits to be redone (`proposalAwaitingRedo`). */
+  /**
+   * The repo's proposals whose failed Run waits to be redone (`proposalAwaitingRedo`), steps of
+   * iterations included.
+   */
   private awaitingRedo(repo: Repo): number {
     return this.deps.store
       .listProposals({ repoId: repo.id, status: 'accepted' })
-      .filter(proposalAwaitingRedo).length;
+      .filter((p) => p.redo === 'pending' && proposalAwaitingRedo(p, this.iterationOf(p))).length;
+  }
+
+  /** The iteration a proposal is a step of; null for one of its own, or once it is gone. */
+  private iterationOf(p: Pick<Proposal, 'iterationId'>): Iteration | null {
+    if (p.iterationId === null) return null;
+    try {
+      return this.deps.store.getIteration(p.iterationId);
+    } catch (err) {
+      if (err instanceof NotFoundError) return null;
+      throw err;
+    }
   }
 
   // ---- iterations ----------------------------------------------------------------
@@ -676,7 +709,8 @@ export class LocalBacklog {
   /**
    * Cancel an accepted iteration of the local backlog that is not over: nobody wants the rest of
    * it. It is recorded first (`recordCancelled`: every step neither done nor failed nor replaced
-   * dropped), so that nothing takes the end of their Runs for a failure, then the unfinished Runs
+   * dropped), so that nothing takes the end of their Runs for a failure nor redoes a failed one
+   * (`proposalRedoAllowed`), then the unfinished Runs
    * of its steps are terminated (stopDroppedRuns; a later poll finishes what a Master stopping
    * halfway left). A pending one is rejected instead, with a reason.
    */
@@ -780,11 +814,12 @@ export class LocalBacklog {
   }
 
   /**
-   * Record where each step of an accepted iteration not over stands by its Run (`followChildren`):
-   * done once its Run completed; failed once it failed, was terminated or dropped (blocking the
-   * iteration until a scout replaces the step); running while it goes on; waiting or ready while
-   * it has none. A step done or replaced is not read again. Once every step is done, the
-   * iteration is summed up and done (complete). Returns the iteration as recorded then.
+   * Record where each step of an accepted iteration not over stands by its Runs
+   * (`followChildren`): done once its Run completed; running while it goes on, and while its
+   * failed Run is to be redone; failed once its attempts are used up, its Run was terminated or
+   * dropped (blocking the iteration until a scout replaces the step); waiting or ready while it
+   * has none. A step done or replaced is not read again. Once every step is done, the iteration
+   * is summed up and done (complete). Returns the iteration as recorded then.
    */
   private follow(repo: Repo, id: string): Iteration {
     const store = this.deps.store;
@@ -793,7 +828,7 @@ export class LocalBacklog {
     const outcomes = new Map<number, ChildOutcome>();
     for (const child of iteration.children) {
       if (!child.proposalId || child.status === 'done' || child.replacedBy !== undefined) continue;
-      outcomes.set(child.position, this.outcomeOf(child.proposalId));
+      outcomes.set(child.position, this.outcomeOf(store.getProposal(child.proposalId), iteration));
     }
     const followed = followChildren(store, id, repo.name, outcomes);
     if (iterationStatusOf(followed.children) !== 'done') return followed;
@@ -801,17 +836,24 @@ export class LocalBacklog {
   }
 
   /**
-   * Where a step stands by its proposal's Run: none yet or not finished, open; completed, done;
-   * otherwise failed. Only proposals of their own are redone (redoFailedProposals); redoing the
-   * steps of an iteration is left to a later step.
+   * Where a step of `iteration` stands by its proposal's latest Run: none yet or not finished,
+   * open; completed, done. Failed while the proposal is accepted, not given up and still wanted
+   * (`proposalRedoAllowed`), redo: its failure not recorded yet or its redo still to come
+   * (redoFailedProposals), so the step goes on. Otherwise failed: its Runs failed until the
+   * attempts were used up (the proposal failed), a human terminated its Run (not redone, as for a
+   * proposal of its own), or its assessment dropped the requirement.
    */
-  private outcomeOf(proposalId: string): ChildOutcome {
-    const store = this.deps.store;
-    const runId = store.getProposal(proposalId).runId;
-    if (!runId) return 'open';
-    const status = store.getRun(runId).status;
+  private outcomeOf(p: Proposal, iteration: Iteration): ChildOutcome {
+    if (!p.runId) return 'open';
+    const status = this.deps.store.getRun(p.runId).status;
     if (status === 'completed') return 'done';
-    return FINISHED_RUN_STATUSES.includes(status) ? 'failed' : 'open';
+    if (!FINISHED_RUN_STATUSES.includes(status)) return 'open';
+    const redone =
+      status === 'failed' &&
+      p.status === 'accepted' &&
+      (p.redo === null || p.redo === 'pending') &&
+      proposalRedoAllowed(p, iteration);
+    return redone ? 'redo' : 'failed';
   }
 
   /**
@@ -835,8 +877,9 @@ export class LocalBacklog {
   /**
    * Create the Run of a step whose dependencies are done, recorded on its proposal. The closing
    * step's requirement gets the review suggestions the iteration's other steps left
-   * (`closeoutSuggestions`) first, kept on its proposal so that it says what the Run was given.
-   * Nothing is recorded when the Run cannot be created.
+   * (`closeoutSuggestions`) first, kept on its proposal so that it says what the Run was given;
+   * a redo of the step goes by that text, the suggestions once. Nothing is recorded when the Run
+   * cannot be created.
    */
   private startChild(
     repo: Repo,

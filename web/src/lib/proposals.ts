@@ -146,7 +146,8 @@ export function proposalCountsText(
 }
 
 /**
- * Where the attempts at an accepted or failed proposal of its own stand: 「第 2/3 次尝试」 while
+ * Where the attempts at an accepted or failed proposal (a step of an iteration included) stand:
+ * 「第 2/3 次尝试」 while
  * a redo works on it or waits (`max`: the repo's `max_run_attempts`, null once the repo left
  * backlog.repos), or 「失败 3 次，达到尝试次数上限，不再自动重做」 once it failed. null for one
  * not decided or rejected, and for an accepted one whose first Run has not failed.

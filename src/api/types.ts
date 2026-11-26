@@ -369,8 +369,8 @@ export interface ProposalSourceStatus {
    */
   budget: { dailyUsd: number | null; spentToday: number; reached: boolean };
   /**
-   * Runs a requirement (an issue, or a local proposal of its own) gets at most, the first
-   * included (`max_run_attempts`); 1 = never redone.
+   * Runs a requirement (an issue, or a local proposal, a step of an iteration included) gets at
+   * most, the first included (`max_run_attempts`); 1 = never redone.
    */
   maxRunAttempts: number;
 }
@@ -432,7 +432,7 @@ export interface ProposalView extends Proposal {
    * Its latest Run failed and it is redone as a new Run, at this time at the earliest (ISO;
    * `proposalRedoDueAt`): the wait after a failure doubles with each attempt. Later when today's
    * automatic spending reached its limit or the work switch is off. null when it does not wait
-   * to be redone.
+   * to be redone, a step whose iteration no longer wants it included.
    */
   redoAt: string | null;
 }

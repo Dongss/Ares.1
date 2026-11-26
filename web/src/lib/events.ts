@@ -398,12 +398,13 @@ export function globalEventText(event: GlobalEvent, now = new Date()): string | 
               zh: `第 ${position} 步${child === null ? '' : `（#${child}）`}`,
               en: `step ${position}${child === null ? '' : ` (#${child})`}`,
             });
-      // A Run of the local backlog is never redone: its step failed with it.
+      // A step of the local backlog fails once its Runs used up their attempts, and also when a
+      // human terminated its Run or its assessment dropped it.
       const why =
         d.reason === 'failed' && d.backlog === true
           ? t({
-              zh: '没有做成（Run 失败、被终止，或需求评估结论为不做）',
-              en: 'was not done (its Run failed, was terminated, or its assessment dropped it)',
+              zh: '没有做成（Run 用完重做次数后仍然失败、被终止，或需求评估结论为不做）',
+              en: 'was not done (its Runs failed until its attempts were used up, its Run was terminated, or its assessment dropped it)',
             })
           : d.reason === 'failed'
             ? t({ zh: '用完重做次数后失败了', en: 'failed after using up its attempts' })

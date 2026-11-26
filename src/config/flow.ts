@@ -5,7 +5,8 @@
 // all; also the overrides of Runs from issues, which proposals are accepted
 // automatically, how long the automatic scout backs off and which Runs it waits for, after how
 // many failed scouts in a row a human is notified, how long a failed Run of an issue or a local
-// proposal waits before it is redone, how long a Run or a scout waits for an agent that is out of
+// proposal waits before it is redone (and whether a step of an iteration still is), how long a
+// Run or a scout waits for an agent that is out of
 // quota or rate-limited,
 // how long the raw output of agents is kept, which worktrees of failed or cancelled Runs of
 // issues are left over for the Master to remove, where a repo's requirements come from (GitHub
@@ -23,6 +24,7 @@ import {
   type Difficulty,
   type EventRow,
   FINISHED_RUN_STATUSES,
+  type Iteration,
   type IterationChild,
   type IterationStatus,
   type Proposal,
@@ -282,8 +284,8 @@ export const SYSTEM_DEFAULTS = {
     // Nobody has to be there: retry, then another agent, then the Run ends as failed.
     on_agent_error: 'switch_agent',
     // Over budget: the Run ends as failed rather than waiting for a human to raise the budget, so
-    // nothing stops while nobody is around. A Run from an issue or a local proposal of its own is
-    // redone, within max_run_attempts and daily_budget_usd, so spending stays bounded.
+    // nothing stops while nobody is around. A Run from an issue or a local proposal is redone,
+    // within max_run_attempts and daily_budget_usd, so spending stays bounded.
     on_budget_exceeded: 'abort',
     // Out of reworks or rollbacks: the Run ends as failed, so an issue is redone with the reason
     // and nothing waits for a human.
@@ -820,31 +822,56 @@ export function redoDueAfter(attempt: number, endedAt: string, pollMinutes: numb
   return Date.parse(endedAt) + redoDelayMs(attempt, pollMinutes);
 }
 
+/** The iteration a local proposal is a step of, as far as redoing the step's Runs goes. */
+export type RedoIteration = Pick<Iteration, 'status' | 'children'>;
+
 /**
- * Whether a proposal of the local backlog waits for its failed Run to be redone: accepted, of its
- * own (the steps of an iteration are not redone), and attempts were left when its latest Run
- * failed. It goes on by itself, as a new Run once `proposalRedoDueAt` has passed, the day's
- * budget allows and the work switch is on.
+ * Whether a failed Run of a local proposal may still be followed by a redo, as far as what it
+ * belongs to goes: a proposal of its own, always; a step of an iteration (`iteration`, the one its
+ * `iterationId` names; null or undefined when it is not known) only while that iteration is
+ * accepted and not over (active or blocked) and the step was neither replaced by a scout nor
+ * dropped. Once the iteration was cancelled, turned down or is over, or the step was replaced,
+ * the failure is neither recorded nor redone: nobody wants that step any more.
  */
-export function proposalAwaitingRedo(
-  p: Pick<Proposal, 'status' | 'iterationId' | 'redo'>,
+export function proposalRedoAllowed(
+  p: Pick<Proposal, 'id' | 'iterationId'>,
+  iteration: RedoIteration | null | undefined,
 ): boolean {
-  return p.status === 'accepted' && p.iterationId === null && p.redo === 'pending';
+  if (p.iterationId === null) return true;
+  if (!iteration || (iteration.status !== 'active' && iteration.status !== 'blocked')) {
+    return false;
+  }
+  const child = iteration.children.find((c) => c.proposalId === p.id);
+  return child !== undefined && child.replacedBy === undefined && child.status !== 'dropped';
 }
 
 /**
- * When a proposal waiting to be redone (`proposalAwaitingRedo`) gets its next attempt, epoch ms:
- * the wait of an issue (`redoDueAfter`) after its latest Run (`run`) ended, by the local
- * backlog's poll_minutes. Over the day's budget or with the work switch off it waits longer.
- * Counted from the records alone, so it holds across Master restarts. null when it does not wait
- * for a redo.
+ * Whether a proposal of the local backlog waits for its failed Run to be redone: accepted,
+ * attempts were left when its latest Run failed, and still wanted (`proposalRedoAllowed`, with
+ * the iteration it is a step of if any). It goes on by itself, as a new Run once
+ * `proposalRedoDueAt` has passed, the day's budget allows and the work switch is on.
+ */
+export function proposalAwaitingRedo(
+  p: Pick<Proposal, 'id' | 'status' | 'iterationId' | 'redo'>,
+  iteration: RedoIteration | null | undefined,
+): boolean {
+  return p.status === 'accepted' && p.redo === 'pending' && proposalRedoAllowed(p, iteration);
+}
+
+/**
+ * When a proposal waiting to be redone (`proposalAwaitingRedo`, with the iteration it is a step
+ * of if any) gets its next attempt, epoch ms: the wait of an issue (`redoDueAfter`) after its
+ * latest Run (`run`) ended, by the local backlog's poll_minutes. Over the day's budget or with
+ * the work switch off it waits longer. Counted from the records alone, so it holds across Master
+ * restarts. null when it does not wait for a redo.
  */
 export function proposalRedoDueAt(
-  p: Pick<Proposal, 'status' | 'iterationId' | 'redo' | 'attempt'>,
+  p: Pick<Proposal, 'id' | 'status' | 'iterationId' | 'redo' | 'attempt'>,
+  iteration: RedoIteration | null | undefined,
   run: Pick<Run, 'finishedAt' | 'updatedAt'>,
   pollMinutes: number,
 ): number | null {
-  if (!proposalAwaitingRedo(p)) return null;
+  if (!proposalAwaitingRedo(p, iteration)) return null;
   return redoDueAfter(p.attempt, run.finishedAt ?? run.updatedAt, pollMinutes);
 }
 
