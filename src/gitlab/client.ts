@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { z } from 'zod';
 import { LABELS } from '../github/issues.js';
 import {
+  type ChangeRequest,
   type CodeHost,
   forcePushable,
   type HostAuthored,
@@ -270,6 +271,85 @@ function fromRawIssue(raw: RawIssue, authors: Authors, comments: HostComment[]):
   };
 }
 
+/** A merge request as GitLab returns it, listed or read alone. */
+const RawMergeRequest = z.object({
+  iid: z.number().int().positive(),
+  web_url: z.string().min(1),
+  /** locked: a merge is going on. */
+  state: z.enum(['opened', 'locked', 'merged', 'closed']),
+  source_branch: z.string(),
+  target_branch: z.string(),
+  /** The project of the source branch: a fork's when it differs from the target's. */
+  source_project_id: z.number().int().nullish(),
+  target_project_id: z.number().int().nullish(),
+  /** The commit the source branch points at. */
+  sha: z.string().nullish(),
+  /** The merge commit; none when the project merges by fast-forward. */
+  merge_commit_sha: z.string().nullish(),
+  /** The squashed commit, when the merge squashed the changes. */
+  squash_commit_sha: z.string().nullish(),
+  /** Since GitLab 15.6: mergeable, conflict, checking, not_approved, ci_must_pass, ... */
+  detailed_merge_status: z.string().nullish(),
+  /** Older and deprecated: can_be_merged, cannot_be_merged, unchecked, checking, ... */
+  merge_status: z.string().nullish(),
+  has_conflicts: z.boolean().nullish(),
+});
+type RawMergeRequest = z.infer<typeof RawMergeRequest>;
+
+/** detailed_merge_status values that say the merge request does not merge without conflicts. */
+const CONFLICTING_STATUSES: readonly string[] = ['conflict', 'broken_status'];
+
+/** detailed_merge_status values while GitLab has not worked out whether it merges yet. */
+const UNCHECKED_STATUSES: readonly string[] = [
+  'checking',
+  'unchecked',
+  'preparing',
+  'approvals_syncing',
+];
+
+/** merge_status values, read when detailed_merge_status is absent, while not worked out yet. */
+const UNCHECKED_MERGE_STATUSES: readonly string[] = [
+  'checking',
+  'unchecked',
+  'cannot_be_merged_recheck',
+];
+
+/**
+ * Whether the merge request merges without conflicts; null while GitLab is still working it out.
+ * Only conflicts count: a merge request waiting for approvals or for its pipeline still merges
+ * (those are told by the reviews and checks). Any status GitLab adds later is no conflict.
+ */
+function mergeable(raw: RawMergeRequest): boolean | null {
+  if (raw.has_conflicts === true) return false;
+  const detailed = raw.detailed_merge_status;
+  if (detailed) {
+    if (CONFLICTING_STATUSES.includes(detailed)) return false;
+    return UNCHECKED_STATUSES.includes(detailed) ? null : true;
+  }
+  const status = raw.merge_status ?? '';
+  if (status === 'cannot_be_merged') return false;
+  return UNCHECKED_MERGE_STATUSES.includes(status) ? null : true;
+}
+
+/**
+ * The merge request as the Master needs it. A locked one is still open: GitLab is merging it, and
+ * it turns merged or back to opened. The commit the merge put on the target branch is the merge
+ * commit, else the squashed commit (a squash merged by fast-forward), else the head itself (a
+ * fast-forward merge without squashing).
+ */
+function fromRawMergeRequest(raw: RawMergeRequest): ChangeRequest {
+  const merged = raw.state === 'merged';
+  return {
+    number: raw.iid,
+    url: raw.web_url,
+    state: merged ? 'merged' : raw.state === 'closed' ? 'closed' : 'open',
+    mergeable: mergeable(raw),
+    mergeCommit: merged ? raw.merge_commit_sha || raw.squash_commit_sha || raw.sha || null : null,
+    headRefName: raw.source_branch,
+    baseRefName: raw.target_branch,
+  };
+}
+
 type Method = 'GET' | 'POST' | 'PUT' | 'DELETE';
 
 /**
@@ -300,6 +380,9 @@ export class GlabCli
       | 'editIssue'
       | 'push'
       | 'fetch'
+      | 'findOpenChangeRequest'
+      | 'createChangeRequest'
+      | 'closeChangeRequest'
     >
 {
   private readonly host: string | undefined;
@@ -634,6 +717,60 @@ export class GlabCli
     await this.api('PUT', `projects/${projectId(repo)}/issues/${number}`, {
       description: edit.body,
     });
+  }
+
+  async findOpenChangeRequest(repo: string, head: string): Promise<ChangeRequest | null> {
+    const project = projectId(repo);
+    const path =
+      `projects/${project}/merge_requests?state=opened` +
+      `&source_branch=${encodeURIComponent(head)}&per_page=${MAX_PAGE}`;
+    const found = await this.read(path, z.array(RawMergeRequest));
+    // A fork's branch of the same name is not the Run's: only a merge request whose source is
+    // the project itself counts, and only when GitLab says which projects both sides are of.
+    const own = found.find(
+      (m) =>
+        m.source_branch === head &&
+        typeof m.source_project_id === 'number' &&
+        m.source_project_id === m.target_project_id,
+    );
+    return own ? fromRawMergeRequest(own) : null;
+  }
+
+  async createChangeRequest(
+    repo: string,
+    request: { head: string; base: string; title: string; body: string },
+  ): Promise<{ number: number; url: string }> {
+    // GitLab refuses a second open merge request of the branch into the same target: glab fails,
+    // and so does this, with what it wrote.
+    const created = await this.send(
+      'POST',
+      `projects/${projectId(repo)}/merge_requests`,
+      {
+        source_branch: request.head,
+        target_branch: request.base,
+        title: request.title,
+        description: request.body,
+      },
+      z.object({ iid: z.number().int().positive(), web_url: z.string().min(1) }),
+    );
+    return { number: created.iid, url: created.web_url };
+  }
+
+  async closeChangeRequest(repo: string, number: number, comment: string): Promise<void> {
+    const path = `projects/${projectId(repo)}/merge_requests/${number}`;
+    const raw = await this.read(path, RawMergeRequest);
+    if (raw.state === 'closed') return;
+    if (raw.state !== 'opened') {
+      // Merged, or being merged (locked): GitLab would refuse to close it, after the comment.
+      throw new GlabError(
+        t({
+          zh: `合并请求 !${number}（${repo}）已经合并或正在合并，不能关闭`,
+          en: `Merge request !${number} of ${repo} is merged or being merged and cannot be closed`,
+        }),
+      );
+    }
+    await this.api('POST', `${path}/notes`, { body: comment });
+    await this.api('PUT', path, { state_event: 'close' });
   }
 
   /** The https URL git reaches the project at. A path that is no project's fails here. */

@@ -6,6 +6,7 @@ import { delimiter, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { isTrusted, LABELS } from '../src/github/issues.js';
 import { GlabCli, GlabError, gitlabAuthor } from '../src/gitlab/client.js';
+import type { ChangeRequest } from '../src/host/code-host.js';
 import { setLang } from '../src/i18n.js';
 import { git, initRepo, tmpDir, writeFile } from './helpers.js';
 
@@ -253,6 +254,11 @@ describe('GlabCli projects and hosts', () => {
       await glabError(cli.getIssue(repo, 1));
       await glabError(cli.listComments(repo, 1));
       await glabError(cli.close(repo, 1, 'completed'));
+      await glabError(cli.findOpenChangeRequest(repo, 'ares1/run-1'));
+      await glabError(
+        cli.createChangeRequest(repo, { head: 'ares1/run-1', base: 'main', title: 't', body: 'b' }),
+      );
+      await glabError(cli.closeChangeRequest(repo, 1, 'x'));
     }
     expect(glab.calls()).toEqual([]);
   });
@@ -1127,6 +1133,346 @@ describe('GlabCli issue failures', () => {
   });
 });
 
+const BRANCH = 'ares1/run-abc';
+
+/** A merge request as GitLab returns it: open, from BRANCH of the project itself into main. */
+function rawMr(iid: number, fields: Record<string, unknown> = {}) {
+  return {
+    id: 7000 + iid,
+    iid,
+    project_id: 42,
+    title: `MR ${iid}`,
+    description: `Body ${iid}`,
+    state: 'opened',
+    created_at: '2026-11-01T00:00:00.000Z',
+    target_branch: 'main',
+    source_branch: BRANCH,
+    source_project_id: 42,
+    target_project_id: 42,
+    author: ALICE,
+    assignees: [],
+    reviewers: [],
+    labels: [],
+    draft: false,
+    squash: false,
+    sha: 'head111',
+    merge_commit_sha: null,
+    squash_commit_sha: null,
+    detailed_merge_status: 'mergeable',
+    merge_status: 'can_be_merged',
+    has_conflicts: false,
+    blocking_discussions_resolved: true,
+    references: { short: `!${iid}`, full: `acme/widgets!${iid}` },
+    web_url: `https://gitlab.com/acme/widgets/-/merge_requests/${iid}`,
+    ...fields,
+  };
+}
+
+/** The open merge requests from the branch, as findOpenChangeRequest asks for them. */
+function openMrsPath(branch: string, project = PROJECT): string {
+  return `${project}/merge_requests?state=opened&source_branch=${encodeURIComponent(branch)}&per_page=100`;
+}
+
+/** What findOpenChangeRequest makes of a merge request with each of the fields, in order. */
+async function mapped(fields: Record<string, unknown>[]): Promise<(ChangeRequest | null)[]> {
+  const glab = fakeGlab(fields.map((f) => get(openMrsPath(BRANCH), [rawMr(5, f)])));
+  const cli = new GlabCli(glab.bin);
+  const found: (ChangeRequest | null)[] = [];
+  for (const _ of fields) found.push(await cli.findOpenChangeRequest('acme/widgets', BRANCH));
+  return found;
+}
+
+describe('GlabCli findOpenChangeRequest', () => {
+  it("finds the branch's open merge request of a project of nested groups on a self-hosted GitLab", async () => {
+    const path = `${NESTED_PROJECT}/merge_requests?state=opened&source_branch=ares1%2Frun-abc&per_page=100`;
+    expect(openMrsPath(BRANCH, NESTED_PROJECT)).toBe(path);
+    const url = 'https://gitlab.example.com/acme/platform/tools/widgets/-/merge_requests/12';
+    const glab = fakeGlab([
+      get(path, [
+        // A fork's branch of the same name, a branch whose name only starts the same, and one
+        // that says not which project it is from: none of them is the Run's.
+        rawMr(13, { source_project_id: 77, target_project_id: 42 }),
+        rawMr(14, { source_branch: `${BRANCH}-2` }),
+        rawMr(15, { source_project_id: undefined, target_project_id: undefined }),
+        rawMr(12, { web_url: url, target_branch: 'develop' }),
+      ]),
+    ]);
+    const cli = new GlabCli(glab.bin, { host: 'gitlab.example.com' });
+    expect(await cli.findOpenChangeRequest(NESTED, BRANCH)).toEqual({
+      number: 12,
+      url,
+      state: 'open',
+      mergeable: true,
+      mergeCommit: null,
+      headRefName: BRANCH,
+      baseRefName: 'develop',
+    });
+    expect(glab.calls().map((c) => c.args)).toEqual([
+      apiArgs('GET', path, { host: 'gitlab.example.com' }),
+    ]);
+  });
+
+  it('returns null when the branch has no open merge request of the project itself', async () => {
+    const glab = fakeGlab([
+      get(openMrsPath(BRANCH), []),
+      get(openMrsPath(BRANCH), [rawMr(13, { source_project_id: 77 })]),
+    ]);
+    const cli = new GlabCli(glab.bin);
+    expect(await cli.findOpenChangeRequest('acme/widgets', BRANCH)).toBeNull();
+    expect(await cli.findOpenChangeRequest('acme/widgets', BRANCH)).toBeNull();
+  });
+
+  it('maps opened and locked to open, merged and closed as they are', async () => {
+    const states = await mapped([
+      { state: 'opened' },
+      { state: 'locked' },
+      { state: 'merged' },
+      { state: 'closed' },
+    ]);
+    expect(states.map((s) => s?.state)).toEqual(['open', 'open', 'merged', 'closed']);
+  });
+
+  it('tells conflicts from merge requests that merge and from ones GitLab is still checking', async () => {
+    const cases: [fields: Record<string, unknown>, mergeable: boolean | null][] = [
+      [{ detailed_merge_status: 'mergeable' }, true],
+      // Approvals, pipelines, drafts and discussions say nothing of conflicts.
+      [{ detailed_merge_status: 'not_approved' }, true],
+      [{ detailed_merge_status: 'ci_must_pass' }, true],
+      [{ detailed_merge_status: 'discussions_not_resolved' }, true],
+      [{ detailed_merge_status: 'need_rebase' }, true],
+      [{ detailed_merge_status: 'not_open' }, true],
+      [{ detailed_merge_status: 'a_status_gitlab_adds_later' }, true],
+      [{ detailed_merge_status: 'conflict', has_conflicts: true }, false],
+      [{ detailed_merge_status: 'broken_status' }, false],
+      [{ detailed_merge_status: 'mergeable', has_conflicts: true }, false],
+      [{ detailed_merge_status: 'checking', has_conflicts: true }, false],
+      [{ detailed_merge_status: 'checking' }, null],
+      [{ detailed_merge_status: 'unchecked' }, null],
+      [{ detailed_merge_status: 'preparing' }, null],
+      [{ detailed_merge_status: 'approvals_syncing' }, null],
+      // An older GitLab gives merge_status alone.
+      [{ detailed_merge_status: undefined, merge_status: 'can_be_merged' }, true],
+      [{ detailed_merge_status: null, merge_status: 'cannot_be_merged' }, false],
+      [{ detailed_merge_status: undefined, merge_status: 'checking' }, null],
+      [{ detailed_merge_status: undefined, merge_status: 'unchecked' }, null],
+      [{ detailed_merge_status: undefined, merge_status: 'cannot_be_merged_recheck' }, null],
+      [
+        { detailed_merge_status: undefined, merge_status: undefined, has_conflicts: undefined },
+        true,
+      ],
+      [{ detailed_merge_status: '', merge_status: 'checking', has_conflicts: null }, null],
+    ];
+    const found = await mapped(cases.map(([fields]) => fields));
+    expect(found.map((f) => f?.mergeable)).toEqual(cases.map(([, mergeable]) => mergeable));
+  });
+
+  it('gives the commit the merge put on the target branch, whichever way it merged, and only once merged', async () => {
+    const commits = { merge_commit_sha: 'merge1', squash_commit_sha: 'squash1', sha: 'head1' };
+    const cases: [fields: Record<string, unknown>, commit: string | null][] = [
+      // A merge commit, of the squashed changes or not.
+      [{ state: 'merged', ...commits }, 'merge1'],
+      [{ state: 'merged', merge_commit_sha: 'merge1', squash_commit_sha: null }, 'merge1'],
+      // Squashed and fast-forwarded.
+      [{ state: 'merged', ...commits, merge_commit_sha: null }, 'squash1'],
+      [{ state: 'merged', ...commits, merge_commit_sha: '' }, 'squash1'],
+      // Fast-forwarded: the head is on the target branch.
+      [{ state: 'merged', sha: 'head1', merge_commit_sha: null, squash_commit_sha: null }, 'head1'],
+      [{ state: 'merged', sha: 'head1', merge_commit_sha: undefined }, 'head1'],
+      [{ state: 'merged', sha: null, merge_commit_sha: null, squash_commit_sha: null }, null],
+      [{ state: 'opened', ...commits }, null],
+      [{ state: 'locked', ...commits }, null],
+      [{ state: 'closed', ...commits }, null],
+    ];
+    const found = await mapped(cases.map(([fields]) => fields));
+    expect(found.map((f) => f?.mergeCommit)).toEqual(cases.map(([, commit]) => commit));
+  });
+
+  it('fails on a merge request it cannot read, naming the fields', async () => {
+    const glab = fakeGlab([
+      get(openMrsPath(BRANCH), [rawMr(5, { state: 'reopened' })]),
+      get(openMrsPath(BRANCH), [rawMr(5, { iid: undefined, source_branch: 7 })]),
+      get(openMrsPath(BRANCH), { message: 'not a list' }),
+      get(openMrsPath(BRANCH), null, { stdout: '<html>proxy</html>' }),
+    ]);
+    const cli = new GlabCli(glab.bin);
+    const path = openMrsPath(BRANCH);
+    expect((await glabError(cli.findOpenChangeRequest('acme/widgets', BRANCH))).message).toContain(
+      `glab api ${path} 返回的数据无法识别（0.state）：`,
+    );
+    expect((await glabError(cli.findOpenChangeRequest('acme/widgets', BRANCH))).message).toContain(
+      `glab api ${path} 返回的数据无法识别（0.iid, 0.source_branch）：`,
+    );
+    expect((await glabError(cli.findOpenChangeRequest('acme/widgets', BRANCH))).message).toBe(
+      `glab api ${path} 返回的数据无法识别（$）：{"message":"not a list"}`,
+    );
+    expect((await glabError(cli.findOpenChangeRequest('acme/widgets', BRANCH))).message).toBe(
+      `glab api ${path} 返回的不是 JSON：<html>proxy</html>`,
+    );
+  });
+});
+
+describe('GlabCli createChangeRequest', () => {
+  const request = {
+    head: BRANCH,
+    base: 'main',
+    title: '#7 实现 "quoted" --title',
+    body: '## 改了什么\n\nline with \'quotes\', "double quotes" and --flags\n',
+  };
+
+  it('posts the branches, title and description through stdin, and returns the iid and link', async () => {
+    const url = 'https://gitlab.example.com/acme/platform/tools/widgets/-/merge_requests/12';
+    const glab = fakeGlab([
+      {
+        path: `${NESTED_PROJECT}/merge_requests`,
+        method: 'POST',
+        stdout: JSON.stringify(rawMr(12, { web_url: url })),
+      },
+    ]);
+    const cli = new GlabCli(glab.bin, { host: 'gitlab.example.com' });
+    expect(await cli.createChangeRequest(NESTED, request)).toEqual({ number: 12, url });
+    const [call, ...rest] = glab.calls();
+    expect(rest).toEqual([]);
+    expect(call?.args).toEqual(
+      apiArgs('POST', `${NESTED_PROJECT}/merge_requests`, {
+        host: 'gitlab.example.com',
+        body: true,
+      }),
+    );
+    expect(body(call)).toEqual({
+      source_branch: BRANCH,
+      target_branch: 'main',
+      title: request.title,
+      description: request.body,
+    });
+  });
+
+  it('fails when GitLab returns no iid or link', async () => {
+    const glab = fakeGlab([
+      { path: `${PROJECT}/merge_requests`, method: 'POST', stdout: JSON.stringify({ id: 7012 }) },
+      {
+        path: `${PROJECT}/merge_requests`,
+        method: 'POST',
+        stdout: JSON.stringify({ id: 7012, iid: 12 }),
+      },
+    ]);
+    const cli = new GlabCli(glab.bin);
+    expect((await glabError(cli.createChangeRequest('acme/widgets', request))).message).toBe(
+      `glab api -X POST ${PROJECT}/merge_requests 返回的数据无法识别（iid, web_url）：{"id":7012}`,
+    );
+    expect((await glabError(cli.createChangeRequest('acme/widgets', request))).message).toBe(
+      `glab api -X POST ${PROJECT}/merge_requests 返回的数据无法识别（web_url）：{"id":7012,"iid":12}`,
+    );
+  });
+
+  it('reports what glab wrote when GitLab refuses it', async () => {
+    const refused =
+      'glab: Another open merge request already exists for this source branch: !12 (HTTP 409)';
+    const glab = fakeGlab([
+      {
+        path: `${PROJECT}/merge_requests`,
+        method: 'POST',
+        stdout: JSON.stringify({ message: ['Another open merge request already exists'] }),
+        stderr: `${refused}\n`,
+        code: 1,
+      },
+    ]);
+    const err = await glabError(new GlabCli(glab.bin).createChangeRequest('acme/widgets', request));
+    expect(err.message).toBe(`glab api -X POST ${PROJECT}/merge_requests 失败：${refused}`);
+  });
+});
+
+describe('GlabCli closeChangeRequest', () => {
+  const mrPath = `${PROJECT}/merge_requests/12`;
+  const comment = '<!-- ares1:comment -->\nRun 已取消，关闭这个合并请求。\n';
+
+  it('posts the comment as it is, then closes the open merge request', async () => {
+    const glab = fakeGlab([
+      get(mrPath, rawMr(12)),
+      { path: `${mrPath}/notes`, method: 'POST', stdout: '{}' },
+      { path: mrPath, method: 'PUT', stdout: JSON.stringify(rawMr(12, { state: 'closed' })) },
+    ]);
+    await new GlabCli(glab.bin).closeChangeRequest('acme/widgets', 12, comment);
+    const calls = glab.calls();
+    expect(paths(calls)).toEqual([`GET ${mrPath}`, `POST ${mrPath}/notes`, `PUT ${mrPath}`]);
+    expect(calls[1]?.args).toEqual(apiArgs('POST', `${mrPath}/notes`, { body: true }));
+    expect(body(calls[1])).toEqual({ body: comment });
+    expect(calls[2]?.args).toEqual(apiArgs('PUT', mrPath, { body: true }));
+    expect(body(calls[2])).toEqual({ state_event: 'close' });
+  });
+
+  it('closes a merge request of a project of nested groups on a self-hosted GitLab', async () => {
+    const path = `${NESTED_PROJECT}/merge_requests/12`;
+    const glab = fakeGlab([
+      get(path, rawMr(12)),
+      { path: `${path}/notes`, method: 'POST', stdout: '{}' },
+      { path, method: 'PUT', stdout: '{}' },
+    ]);
+    const cli = new GlabCli(glab.bin, { host: 'gitlab.example.com' });
+    await cli.closeChangeRequest(NESTED, 12, comment);
+    expect(glab.calls().map((c) => c.args)).toEqual([
+      apiArgs('GET', path, { host: 'gitlab.example.com' }),
+      apiArgs('POST', `${path}/notes`, { host: 'gitlab.example.com', body: true }),
+      apiArgs('PUT', path, { host: 'gitlab.example.com', body: true }),
+    ]);
+  });
+
+  it('leaves a closed merge request as it is, without the comment', async () => {
+    const glab = fakeGlab([get(mrPath, rawMr(12, { state: 'closed' }))]);
+    await new GlabCli(glab.bin).closeChangeRequest('acme/widgets', 12, comment);
+    expect(paths(glab.calls())).toEqual([`GET ${mrPath}`]);
+  });
+
+  it('refuses a merge request that is merged or being merged, without the comment', async () => {
+    const glab = fakeGlab([
+      get(mrPath, rawMr(12, { state: 'merged', merge_commit_sha: 'merge1' })),
+      get(mrPath, rawMr(12, { state: 'locked' })),
+    ]);
+    const cli = new GlabCli(glab.bin);
+    for (let i = 0; i < 2; i++) {
+      expect((await glabError(cli.closeChangeRequest('acme/widgets', 12, comment))).message).toBe(
+        '合并请求 !12（acme/widgets）已经合并或正在合并，不能关闭',
+      );
+    }
+    expect(paths(glab.calls())).toEqual([`GET ${mrPath}`, `GET ${mrPath}`]);
+  });
+
+  it('does not close it when the comment fails, and reports what glab wrote', async () => {
+    const glab = fakeGlab([
+      get(mrPath, rawMr(12)),
+      {
+        path: `${mrPath}/notes`,
+        method: 'POST',
+        stderr: 'glab: 403 Forbidden (HTTP 403)\n',
+        code: 1,
+      },
+    ]);
+    const err = await glabError(new GlabCli(glab.bin).closeChangeRequest('acme/widgets', 12, 'x'));
+    expect(err.message).toBe(
+      `glab api -X POST ${mrPath}/notes 失败：glab: 403 Forbidden (HTTP 403)`,
+    );
+    expect(paths(glab.calls())).toEqual([`GET ${mrPath}`, `POST ${mrPath}/notes`]);
+  });
+
+  it('fails on a merge request it cannot read, and on one it cannot find', async () => {
+    const glab = fakeGlab([
+      get(mrPath, null, { stdout: '<html>proxy</html>' }),
+      get(mrPath, { ...rawMr(12), state: 42 }),
+      { path: mrPath, stderr: 'glab: 404 Not found (HTTP 404)\n', code: 1 },
+    ]);
+    const cli = new GlabCli(glab.bin);
+    expect((await glabError(cli.closeChangeRequest('acme/widgets', 12, comment))).message).toBe(
+      `glab api ${mrPath} 返回的不是 JSON：<html>proxy</html>`,
+    );
+    expect(
+      (await glabError(cli.closeChangeRequest('acme/widgets', 12, comment))).message,
+    ).toContain(`glab api ${mrPath} 返回的数据无法识别（state）：`);
+    expect((await glabError(cli.closeChangeRequest('acme/widgets', 12, comment))).message).toBe(
+      `glab api ${mrPath} 失败：glab: 404 Not found (HTTP 404)`,
+    );
+    expect(paths(glab.calls())).toEqual([`GET ${mrPath}`, `GET ${mrPath}`, `GET ${mrPath}`]);
+  });
+});
+
 describe('GlabCli failures', () => {
   it('reports what glab wrote to stderr when it fails, naming the call', async () => {
     const glab = fakeGlab([
@@ -1537,6 +1883,7 @@ describe('GlabCli in English', () => {
       get(`${PROJECT}/issues/7`, null, { stdout: '<html>proxy</html>' }),
       get(`${PROJECT}/issues/7`, { labels: 'x' }),
       { path: `${PROJECT}/issues`, method: 'POST', stdout: '{}' },
+      get(`${PROJECT}/merge_requests/12`, rawMr(12, { state: 'merged' })),
     ]);
     const cli = new GlabCli(glab.bin, { account: 'alice' });
     const noOrigin = emptyClone();
@@ -1549,19 +1896,21 @@ describe('GlabCli in English', () => {
       (await glabError(cli.getLabels('acme/widgets', 7))).message,
       (await glabError(cli.createIssue('acme/widgets', { title: 't', body: 'b', labels: [] })))
         .message,
+      (await glabError(cli.closeChangeRequest('acme/widgets', 12, 'x'))).message,
       (await glabError(cli.resolveRepo(cloneWithOrigin('/srv/git/widgets.git')))).message,
       (await glabError(cli.resolveRepo(noOrigin))).message,
     ];
-    expect(messages.slice(0, 7)).toEqual([
+    expect(messages.slice(0, 8)).toEqual([
       'glab api user failed: glab: 401 Unauthorized (HTTP 401)',
       'glab is logged in as ares1-bot, not as the configured alice',
       'A GitLab project is named group/name or group/subgroup/name: widgets',
       `glab api ${PROJECT}/issues/7 returned no JSON: <html>proxy</html>`,
       `glab api ${PROJECT}/issues/7 returned data it cannot read (labels): {"labels":"x"}`,
       `glab api -X POST ${PROJECT}/issues returned data it cannot read (iid, web_url): {}`,
+      'Merge request !12 of acme/widgets is merged or being merged and cannot be closed',
       'The origin URL names no GitLab project: /srv/git/widgets.git',
     ]);
-    expect(messages[7]?.startsWith(`Reading the origin URL of ${noOrigin} failed: `)).toBe(true);
+    expect(messages[8]?.startsWith(`Reading the origin URL of ${noOrigin} failed: `)).toBe(true);
 
     // After resolveRepo, which reads the clones with the real git.
     fakeGit();
