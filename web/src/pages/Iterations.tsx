@@ -2,6 +2,7 @@ import { useState } from 'react';
 import type { IterationChildView, IterationView } from '../../../src/api/types.js';
 import { ITERATION_OPEN_STATUSES } from '../../../src/config/flow.js';
 import { t } from '../../../src/i18n.js';
+import { FailedAttempts, RestartAction } from '../components/Attempts.js';
 import { IterationCard, IterationProgress } from '../components/IterationCard.js';
 import { Badge, ConfirmButton, Empty, ErrorBox } from '../components/ui.js';
 import { api } from '../lib/api.js';
@@ -31,9 +32,11 @@ import {
   replacedText,
   runCountText,
   sortIterations,
+  stepAttemptsText,
   stepName,
   wasAccepted,
 } from '../lib/iterations.js';
+import { proposalRedoText, restartHint } from '../lib/proposals.js';
 import { href } from '../lib/router.js';
 
 /** Every iteration not over (a repo has one at most) and the latest ones, each once. */
@@ -174,7 +177,12 @@ function IterationDetail({ id }: { id: string }) {
         ) : (
           <ol className="iteration-steps">
             {it.children.map((child) => (
-              <IterationStep key={child.position} iteration={it} child={child} />
+              <IterationStep
+                key={child.position}
+                iteration={it}
+                child={child}
+                onChanged={detail.reload}
+              />
             ))}
           </ol>
         )}
@@ -377,13 +385,21 @@ function IterationActions(props: { iteration: IterationView; onChanged: () => vo
 
 /**
  * One step of the plan: where it stands, what it waits for or who replaced it, its issue (GitHub)
- * or proposal (local backlog), each Run that worked on it, and, folded, what it is about.
+ * or proposal (local backlog), each Run that worked on it, and, folded, what it is about. In the
+ * local backlog also which attempt it is at, when its failed Run is redone, why each attempt
+ * failed, and, once it failed for good, starting it over.
  */
-function IterationStep(props: { iteration: IterationView; child: IterationChildView }) {
+function IterationStep(props: {
+  iteration: IterationView;
+  child: IterationChildView;
+  onChanged: () => void;
+}) {
   const { iteration: it, child } = props;
   const status = childBadge(child);
   const dependency = dependencyText(child);
   const replaced = replacedText(child);
+  const attempts = stepAttemptsText(child);
+  const redo = proposalRedoText(child);
   return (
     <li className="iteration-step">
       <details>
@@ -431,7 +447,17 @@ function IterationStep(props: { iteration: IterationView; child: IterationChildV
             <span className="muted">{formatRunCost(run.costUsd, run.costUnknown)}</span>
           </span>
         ))}
+        {attempts && <span className="muted">{attempts}</span>}
       </div>
+      {redo && <div className="hint">{redo}</div>}
+      <FailedAttempts failures={child.failures} />
+      {child.restartable && child.proposalId && (
+        <RestartAction
+          proposalId={child.proposalId}
+          hint={restartHint({ restartable: true, iterationId: it.id })}
+          onRestarted={props.onChanged}
+        />
+      )}
     </li>
   );
 }

@@ -17,6 +17,7 @@ import type {
   LiveAgentEvent,
   NotifyTestResult,
   ProposalAccepted,
+  ProposalRestarted,
   ProposalView,
   RawLogMissing,
   RunSummary,
@@ -1657,15 +1658,20 @@ backlog:
       status: 'accepted',
       runStatus: 'failed',
       attempt: 1,
+      maxAttempts: 3,
       failures: [failure],
       redo: 'pending',
       redoAt: '2026-11-25T08:07:00.000Z',
+      restartable: false,
     });
     expect(listed.find((p) => p.id === given.id)).toMatchObject({
       status: 'failed',
       runStatus: 'failed',
+      attempt: 1,
+      maxAttempts: 3,
       redo: 'exhausted',
       redoAt: null,
+      restartable: true,
     });
     expect(await titles('/api/proposals?status=failed')).toEqual(['放弃的']);
 
@@ -1714,6 +1720,17 @@ backlog:
       ((await call('GET', '/api/proposals')).json as ProposalView[]).find((p) => p.id === id)
         ?.redoAt;
     expect(await redoAtOf(step.id)).toBe('2026-11-25T08:07:00.000Z');
+    // Its iteration's page tells the same of the step.
+    const stepView = async () =>
+      ((await call('GET', `/api/iterations/${iteration.id}`)).json as IterationView).children[0];
+    expect(await stepView()).toMatchObject({
+      proposalId: step.id,
+      attempt: 1,
+      maxAttempts: 3,
+      redoAt: '2026-11-25T08:07:00.000Z',
+      failures: [{ ...failure, runId: stepRun.id }],
+      restartable: false,
+    });
     // Cancelled by a human: the step is dropped and not redone.
     store.updateIteration(iteration.id, {
       status: 'cancelled',
@@ -1722,6 +1739,202 @@ backlog:
         .children.map((c) => ({ ...c, status: 'dropped' as const })),
     });
     expect(await redoAtOf(step.id)).toBeNull();
+    expect((await stepView())?.redoAt).toBeNull();
+  });
+
+  it('starts a failed proposal over into a Run, its attempts from 1; any other, 409', async () => {
+    const t = await start();
+    const store = t.master.store;
+    // Given up once its third Run failed.
+    const failed = propose(t.repo.id, '失败的');
+    const failedRun = store.updateRun(t.run('失败的').id, {
+      status: 'failed',
+      finishedAt: '2026-11-25T08:00:00.000Z',
+      error: '失败了',
+    }).id;
+    store.updateProposal(failed.id, {
+      status: 'failed',
+      runId: failedRun,
+      attempt: 3,
+      redo: 'exhausted',
+      failures: [{ runId: failedRun, attempt: 3, stage: '编码', error: '第 3 次失败了' }],
+    });
+    const before = (await call('GET', '/api/proposals?status=failed')).json as ProposalView[];
+    expect(before).toMatchObject([
+      { id: failed.id, attempt: 3, maxAttempts: 3, restartable: true },
+    ]);
+
+    const res = await call('POST', `/api/proposals/${failed.id}/restart`);
+    expect(res.status).toBe(200);
+    const { proposal, run } = res.json as ProposalRestarted;
+    expect(run).toMatchObject({ repoId: t.repo.id, templateName: '测试流程' });
+    expect(run.goal.startsWith('失败的\n\n')).toBe(true);
+    expect(run.goal).toContain(`### 第 3 次（Run ${failedRun}，失败在「编码」阶段）`);
+    expect(proposal).toMatchObject({
+      id: failed.id,
+      repo: 'demo',
+      status: 'accepted',
+      runId: run.id,
+      runStatus: run.status,
+      attempt: 1,
+      maxAttempts: 3,
+      redo: null,
+      redoAt: null,
+      failures: [expect.objectContaining({ runId: failedRun, attempt: 3 })],
+      restartable: false,
+    });
+    expect(store.listGlobalEventsOfType('proposal.restarted').map((e) => e.data)).toEqual([
+      {
+        repo: 'demo',
+        proposalId: failed.id,
+        runId: run.id,
+        failedRunId: failedRun,
+        attempts: 3,
+        maxAttempts: 3,
+      },
+    ]);
+    await t.waitStatus(run.id, 'completed');
+    expect((await call('GET', '/api/proposals?status=accepted')).json).toMatchObject([
+      { id: failed.id, runId: run.id, runStatus: 'completed', attempt: 1, restartable: false },
+    ]);
+
+    // Not failed (any more): nothing to start over.
+    expect(await call('POST', `/api/proposals/${failed.id}/restart`)).toMatchObject({
+      status: 409,
+      json: {
+        error: `提案 ${failed.id} 没有失败：只有 Run 用完尝试次数、标为已失败的提案能重新开始`,
+      },
+    });
+    const pending = propose(t.repo.id, '待处理的');
+    expect(await call('POST', `/api/proposals/${pending.id}/restart`)).toMatchObject({
+      status: 409,
+      json: { error: `提案 ${pending.id} 还没有采纳，不用重新开始` },
+    });
+    await call('POST', `/api/proposals/${pending.id}/reject`, { reason: '不要' });
+    expect(await call('POST', `/api/proposals/${pending.id}/restart`)).toMatchObject({
+      status: 409,
+      json: { error: `提案 ${pending.id} 已经被拒绝了，不能重新开始` },
+    });
+    expect((await call('POST', '/api/proposals/proposal_none/restart')).status).toBe(404);
+
+    // A repo no longer in backlog.repos gets no Run.
+    const third = store.createRepo({
+      name: 'third',
+      path: initRepo(),
+      targetBranch: 'main',
+      verifyCommands: [],
+      setupCommands: [],
+      mergeMode: 'direct',
+    });
+    const elsewhere = store.updateProposal(propose(third.id, '别处的').id, {
+      status: 'failed',
+      redo: 'exhausted',
+    });
+    const listed = (await call('GET', `/api/proposals?repo=third`)).json as ProposalView[];
+    // Its setting unknown, it may still be started over once it is back in backlog.repos.
+    expect(listed).toMatchObject([{ id: elsewhere.id, maxAttempts: null, restartable: true }]);
+    expect(await call('POST', `/api/proposals/${elsewhere.id}/restart`)).toMatchObject({
+      status: 409,
+      json: {
+        error: '仓库 third 已经不在 config.yaml 的 backlog.repos 里，不能再重新开始它的提案',
+      },
+    });
+    expect(store.getProposal(elsewhere.id).status).toBe('failed');
+    // The Runs: the failed one, and the one it was started over with.
+    expect(
+      store
+        .listRuns()
+        .map((r) => r.id)
+        .sort(),
+    ).toEqual([failedRun, run.id].sort());
+    expect(gh.calls).toEqual([]);
+  });
+
+  it('starts a failed step over: running again, its iteration active once nothing blocks it', async () => {
+    const t = await start();
+    const store = t.master.store;
+    store.setWorking(false);
+    const iteration = planIteration(t);
+    // Both steps start at once, neither depending on the other.
+    const [first, second] = stepsOf(t, iteration.id);
+    if (!first || !second) throw new Error('no steps');
+    store.updateProposal(second.id, { dependsOn: [] });
+    store.updateIteration(iteration.id, {
+      children: store.getIteration(iteration.id).children.map((c) => ({ ...c, dependsOn: [] })),
+    });
+    // Accepted by hand with the work switch off: their Runs wait in the queue.
+    await call('POST', `/api/iterations/${iteration.id}/accept`);
+    const ran = stepsOf(t, iteration.id).map((p) => p.runId ?? '');
+    // Each Run failed, the attempts used up.
+    for (const [i, p] of stepsOf(t, iteration.id).entries()) {
+      const runId = ran[i] ?? '';
+      store.updateRun(runId, { status: 'failed', finishedAt: new Date().toISOString() });
+      store.updateProposal(p.id, {
+        status: 'failed',
+        redo: 'exhausted',
+        attempt: 3,
+        failures: [{ runId, attempt: 3, stage: '编码', error: '失败了' }],
+      });
+    }
+    await call('POST', '/api/backlog/poll');
+    const view = async () =>
+      (await call('GET', `/api/iterations/${iteration.id}`)).json as IterationView;
+    const blocked = await view();
+    expect(blocked.status).toBe('blocked');
+    expect(
+      blocked.children.map((c) => [c.status, c.attempt, c.maxAttempts, c.restartable]),
+    ).toEqual([
+      ['failed', 3, 3, true],
+      ['failed', 3, 3, true],
+    ]);
+
+    // The first started over: running again, the second still blocks the iteration.
+    const res = await call('POST', `/api/proposals/${first.id}/restart`);
+    expect(res.status).toBe(200);
+    const { proposal, run } = res.json as ProposalRestarted;
+    expect(proposal).toMatchObject({
+      status: 'accepted',
+      attempt: 1,
+      iterationId: iteration.id,
+      restartable: false,
+    });
+    expect(run.status).toBe('queued');
+    const once = await view();
+    expect(once.status).toBe('blocked');
+    expect(once.children.map((c) => [c.status, c.runIds, c.attempt, c.restartable])).toEqual([
+      ['running', [ran[0], run.id], 1, false],
+      ['failed', [ran[1]], 3, true],
+    ]);
+    expect(once.children[0]?.runs.map((r) => [r.id, r.status])).toEqual([
+      [ran[0], 'failed'],
+      [run.id, 'queued'],
+    ]);
+
+    // The second too: nothing blocks it any more.
+    expect((await call('POST', `/api/proposals/${second.id}/restart`)).status).toBe(200);
+    const twice = await view();
+    expect(twice.status).toBe('active');
+    expect(twice.children.map((c) => c.status)).toEqual(['running', 'running']);
+    expect(store.listGlobalEventsOfType('iteration.unblocked')).toHaveLength(1);
+    expect(store.listGlobalEventsOfType('proposal.restarted').map((e) => e.data)).toEqual([
+      expect.objectContaining({ proposalId: first.id, iterationId: iteration.id }),
+      expect.objectContaining({ proposalId: second.id, iterationId: iteration.id }),
+    ]);
+
+    // A step of an iteration that is over is not started over.
+    store.updateProposal(first.id, { status: 'failed', redo: 'exhausted' });
+    await call('POST', `/api/iterations/${iteration.id}/cancel`);
+    expect(await call('POST', `/api/proposals/${first.id}/restart`)).toMatchObject({
+      status: 409,
+      json: { error: `提案 ${first.id} 所在的迭代 ${iteration.id} 已经结束了，不能再重新开始它` },
+    });
+    expect(
+      ((await call('GET', `/api/proposals?status=failed`)).json as ProposalView[]).map((p) => [
+        p.id,
+        p.restartable,
+      ]),
+    ).toEqual([[first.id, false]]);
+    expect(gh.calls).toEqual([]);
   });
 
   it('accepts a proposal into a Run, and rejects one only with a reason', async () => {

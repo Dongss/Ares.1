@@ -722,6 +722,104 @@ describe('local backlog: redo after a failure', () => {
     expect(prompt.slice(prompt.indexOf('### 被拒绝'))).not.toContain(`${p.id} 加 feature\n`);
   });
 
+  it('starts a failed proposal over by hand: attempts from 1, told why, redone again', async () => {
+    // Its first two Runs use up the attempts; the one it is started over with fails too.
+    const t = await startRedo(config({ maxAttempts: 2, budget: 5 }), [1, 2, 3]);
+    const store = t.master.store;
+    const p = acceptByHand(t);
+    const first = await t.waitStatus(p.runId ?? '', 'failed');
+    await t.master.backlog.poll();
+    elapseRedoWait(t);
+    await t.master.backlog.poll();
+    const second = await t.waitStatus(latestRun(t, p.id).id, 'failed');
+    await t.master.backlog.poll();
+    expect(store.getProposal(p.id)).toMatchObject({ status: 'failed', attempt: 2 });
+
+    // A human's decision: the day's budget, spent already, does not hold it back.
+    const scout = spendToday(t);
+    const restarted = t.master.backlog.restart(p.id);
+    const third = latestRun(t, p.id);
+    expect(third.id).not.toBe(second.id);
+    expect(restarted).toMatchObject({
+      status: 'accepted',
+      runId: third.id,
+      attempt: 1,
+      redo: null,
+      failures: [
+        expect.objectContaining({ runId: first.id, attempt: 1 }),
+        expect.objectContaining({ runId: second.id, attempt: 2 }),
+      ],
+    });
+    expect(third.goal).toContain(`### 第 1 次（Run ${first.id}，失败在「编码」阶段）`);
+    expect(third.goal).toContain(`### 第 2 次（Run ${second.id}，失败在「编码」阶段）`);
+    expect(eventData(t, 'proposal.restarted')).toEqual([
+      {
+        repo: 'demo',
+        proposalId: p.id,
+        runId: third.id,
+        failedRunId: second.id,
+        attempts: 2,
+        maxAttempts: 2,
+      },
+    ]);
+    // Started over once: nothing more to start over until it fails for good again.
+    expect(() => t.master.backlog.restart(p.id)).toThrow(
+      `提案 ${p.id} 没有失败：只有 Run 用完尝试次数、标为已失败的提案能重新开始`,
+    );
+
+    // It failed again, as its first attempt: to be redone, an automatic redo again, which waits
+    // for the day's budget.
+    await t.waitStatus(third.id, 'failed');
+    await t.master.backlog.poll();
+    expect(store.getProposal(p.id)).toMatchObject({ status: 'accepted', redo: 'pending' });
+    expect(eventData(t, 'proposal.redo_scheduled').at(-1)).toMatchObject({
+      runId: third.id,
+      attempt: 2,
+      maxAttempts: 2,
+    });
+    elapseRedoWait(t);
+    await t.master.backlog.poll();
+    expect(latestRun(t, p.id).id).toBe(third.id);
+    nextDay(t, scout.id);
+    await t.master.backlog.poll();
+    const fourth = latestRun(t, p.id);
+    expect(fourth.id).not.toBe(third.id);
+    await t.waitStatus(fourth.id, 'completed');
+    expect(store.getProposal(p.id)).toMatchObject({
+      status: 'accepted',
+      attempt: 2,
+      failures: [
+        expect.objectContaining({ runId: first.id, attempt: 1 }),
+        expect.objectContaining({ runId: second.id, attempt: 2 }),
+        expect.objectContaining({ runId: third.id, attempt: 1 }),
+      ],
+    });
+    // Its new Runs are told why every earlier attempt failed, those before it was started over too.
+    expect(fourth.goal).toContain(`Run ${second.id}`);
+    expect(fourth.goal).toContain(`Run ${third.id}`);
+  });
+
+  it('does not start over a proposal that has not failed', async () => {
+    const t = await startRedo(config(), []);
+    const store = t.master.store;
+    const pending = store.createProposal({
+      ...proposal('待处理', 'high'),
+      category: 'improvement',
+      repoId: t.repo.id,
+      scoutId: null,
+    });
+    expect(() => t.master.backlog.restart(pending.id)).toThrow(
+      `提案 ${pending.id} 还没有采纳，不用重新开始`,
+    );
+    store.updateProposal(pending.id, { status: 'rejected', rejectReason: '不要' });
+    expect(() => t.master.backlog.restart(pending.id)).toThrow(
+      `提案 ${pending.id} 已经被拒绝了，不能重新开始`,
+    );
+    expect(() => t.master.backlog.restart('proposal_none')).toThrow(NotFoundError);
+    expect(store.listRuns()).toEqual([]);
+    expect(eventData(t, 'proposal.restarted')).toEqual([]);
+  });
+
   it('gives up at the first failure with max_run_attempts: 1', async () => {
     const t = await startRedo(config({ maxAttempts: 1 }), [1]);
     const p = acceptByHand(t);
@@ -1739,6 +1837,108 @@ describe('iterations of the local backlog', () => {
     expect(store.getProposal(p2?.id ?? '').runId).toBeNull();
     expect(eventData(t, 'iteration.blocked')).toHaveLength(1);
     expect(eventData(t, 'proposal.redone')).toHaveLength(1);
+  });
+
+  it('starts a step given up over by hand: the iteration goes on, and is done', async () => {
+    // Two independent steps and a closing one; the first Run of each of the two fails, and with
+    // max_run_attempts: 1 each is given up at once.
+    const { t, filed } = await plannedFailing(
+      config({ maxAttempts: 1 }),
+      [1, 2],
+      plan([
+        step('第一步'),
+        step('第二步'),
+        step('收尾', { criteria: [], dependsOn: [1, 2], closeout: true }),
+      ]),
+    );
+    const store = t.master.store;
+    const first = await t.waitStatus(runOfStep(t, filed.id, 1).id, 'failed');
+    const second = await t.waitStatus(runOfStep(t, filed.id, 2).id, 'failed');
+    await t.master.backlog.poll();
+    expect(iterationOf(t, filed.id).status).toBe('blocked');
+    expect(statuses(t, filed.id)).toEqual(['failed', 'failed', 'waiting']);
+    const [p1, p2, p3] = stepProposals(t, filed.id);
+    if (!p1 || !p2 || !p3) throw new Error('no steps');
+
+    // The first started over: running again, but the second still blocks the iteration.
+    t.master.backlog.restart(p1.id);
+    const again = runOfStep(t, filed.id, 1);
+    expect(again.id).not.toBe(first.id);
+    expect(again.goal).toContain(`### 第 1 次（Run ${first.id}，失败在「编码」阶段）`);
+    expect(store.getProposal(p1.id)).toMatchObject({ status: 'accepted', attempt: 1, redo: null });
+    let iteration = iterationOf(t, filed.id);
+    expect(iteration.status).toBe('blocked');
+    expect(iteration.children.map((c) => [c.status, c.runIds])).toEqual([
+      ['running', [first.id, again.id]],
+      ['failed', [second.id]],
+      ['waiting', []],
+    ]);
+    expect(eventData(t, 'iteration.unblocked')).toEqual([]);
+
+    // The second started over too: nothing blocks it any more.
+    t.master.backlog.restart(p2.id);
+    const secondAgain = runOfStep(t, filed.id, 2);
+    iteration = iterationOf(t, filed.id);
+    expect(iteration.status).toBe('active');
+    expect(statuses(t, filed.id)).toEqual(['running', 'running', 'waiting']);
+    expect(eventData(t, 'iteration.unblocked')).toEqual([
+      { repo: 'demo', iterationId: filed.id, backlog: true },
+    ]);
+    expect(eventData(t, 'proposal.restarted')).toEqual([
+      expect.objectContaining({ proposalId: p1.id, runId: again.id, iterationId: filed.id }),
+      expect.objectContaining({ proposalId: p2.id, runId: secondAgain.id, iterationId: filed.id }),
+    ]);
+    expect(stepHistory(t, 1)).toEqual(['running', 'failed', 'running']);
+
+    // Both done, the closing step starts, and the iteration is done once it is.
+    await t.waitStatus(again.id, 'completed');
+    await t.waitStatus(secondAgain.id, 'completed');
+    await t.master.backlog.poll();
+    const closing = runOfStep(t, filed.id, 3);
+    await t.waitStatus(closing.id, 'completed');
+    await t.master.backlog.poll();
+    const done = iterationOf(t, filed.id);
+    expect(done.status).toBe('done');
+    expect(done.children.map((c) => [c.status, c.runIds])).toEqual([
+      ['done', [first.id, again.id]],
+      ['done', [second.id, secondAgain.id]],
+      ['done', [closing.id]],
+    ]);
+    // Neither a step done nor a step of an iteration over may be started over.
+    expect(() => t.master.backlog.restart(p1.id)).toThrow(
+      `提案 ${p1.id} 没有失败：只有 Run 用完尝试次数、标为已失败的提案能重新开始`,
+    );
+    expect(gh.calls).toEqual([]);
+  });
+
+  it('does not start over a step its iteration no longer wants', async () => {
+    const { t, filed } = await plannedFailing(
+      config({ maxAttempts: 1 }),
+      [1],
+      plan([step('第一步'), step('第二步', { dependsOn: [1] })]),
+    );
+    const store = t.master.store;
+    await t.waitStatus(runOfStep(t, filed.id, 1).id, 'failed');
+    await t.master.backlog.poll();
+    const [p1] = stepProposals(t, filed.id);
+    if (!p1) throw new Error('no steps');
+    expect(p1.status).toBe('failed');
+
+    // Replaced by a scout: the new approach goes on instead.
+    const children = iterationOf(t, filed.id).children.map((c) =>
+      c.position === 1 ? { ...c, replacedBy: 3 } : c,
+    );
+    store.updateIteration(filed.id, { children });
+    expect(() => t.master.backlog.restart(p1.id)).toThrow(
+      `提案 ${p1.id} 这一步已经由第 3 步换个做法接替，不能再重新开始`,
+    );
+    // Cancelled by a human: nothing of it is wanted any more.
+    await t.master.backlog.cancelIteration(filed.id);
+    expect(() => t.master.backlog.restart(p1.id)).toThrow(
+      `提案 ${p1.id} 所在的迭代 ${filed.id} 已经结束了，不能再重新开始它`,
+    );
+    expect(store.listRuns()).toHaveLength(1);
+    expect(eventData(t, 'proposal.restarted')).toEqual([]);
   });
 
   it.each([

@@ -6,16 +6,22 @@ import { pollText } from './issues.js';
 import {
   acceptBlocker,
   attemptsText,
+  attemptText,
   backlogOutdatedBy,
   canReject,
   decidedText,
   failureLabel,
+  failureLabels,
+  failuresHeading,
   mergeProposals,
   PROPOSAL_STATUS,
   pendingText,
   proposalCountsText,
   proposalGroups,
   proposalRedoText,
+  restartBlocker,
+  restartHint,
+  restartLabels,
   scoutProposalFiled,
   sortProposals,
 } from './proposals.js';
@@ -51,6 +57,8 @@ function proposal(over: Partial<ProposalView> & Pick<ProposalView, 'id'>): Propo
     decidedAt: null,
     runStatus: null,
     redoAt: null,
+    maxAttempts: 3,
+    restartable: false,
     ...over,
   };
 }
@@ -237,20 +245,41 @@ describe('local proposal labels', () => {
       { runId: 'run-2', attempt: 2, stage: null, error: '准备命令失败' },
     ];
     const first = proposal({ id: 'p', status: 'accepted', runId: 'run-1' });
-    expect(attemptsText(first, 3)).toBeNull();
-    expect(attemptsText(proposal({ id: 'p' }), 3)).toBeNull();
-    // Its first Run failed and waits to be redone.
+    expect(attemptsText(first)).toBeNull();
+    expect(attemptsText(proposal({ id: 'p' }))).toBeNull();
+    // Its first Run failed and waits to be redone: of as many attempts as the API says it gets.
     const waiting = { ...first, failures: failures.slice(0, 1), redo: 'pending' as const };
-    expect(attemptsText(waiting, 3)).toBe('第 1/3 次尝试');
+    expect(attemptsText(waiting)).toBe('第 1/3 次尝试');
     const redone = { ...first, runId: 'run-3', attempt: 3, failures };
-    expect(attemptsText(redone, 3)).toBe('第 3/3 次尝试');
-    // Never fewer than the attempts made, and without the setting once the repo left.
-    expect(attemptsText(redone, 2)).toBe('第 3/3 次尝试');
-    expect(attemptsText(redone, null)).toBe('第 3 次尝试');
-    const failed = { ...redone, status: 'failed' as const };
-    expect(attemptsText(failed, 3)).toBe(
-      '失败 2 次，达到尝试次数上限（max_run_attempts），不再自动重做',
+    expect(attemptsText(redone)).toBe('第 3/3 次尝试');
+    expect(attemptsText({ ...redone, maxAttempts: 5 })).toBe('第 3/5 次尝试');
+    // Without the setting once the repo left backlog.repos.
+    expect(attemptsText({ ...redone, maxAttempts: null })).toBe('第 3 次尝试');
+    const failed = {
+      ...redone,
+      status: 'failed' as const,
+      failures: [...failures, { runId: 'run-3', attempt: 3, stage: null, error: '又失败了' }],
+    };
+    expect(attemptsText(failed)).toBe(
+      '失败 3 次，达到尝试次数上限（max_run_attempts），不再自动重做',
     );
+    // Started over once, its attempts from 1 again, and failed again: counted since.
+    const again = {
+      ...failed,
+      attempt: 2,
+      maxAttempts: 2,
+      failures: [
+        ...failed.failures,
+        { runId: 'run-4', attempt: 1, stage: '编码', error: '还是不行' },
+        { runId: 'run-5', attempt: 2, stage: null, error: '还是不行' },
+      ],
+    };
+    expect(attemptsText(again)).toBe(
+      '重新开始后又失败 2 次，达到尝试次数上限（max_run_attempts），不再自动重做',
+    );
+    // Started over and at work again: which attempt of this round.
+    const restarted = { ...again, status: 'accepted' as const, runId: 'run-6', attempt: 1 };
+    expect(attemptsText({ ...restarted, maxAttempts: 3 })).toBe('第 1/3 次尝试');
 
     expect(proposalRedoText(first, NOW)).toBeNull();
     const redoAt = '2026-11-25T12:30:00.000Z';
@@ -260,17 +289,64 @@ describe('local proposal labels', () => {
     expect(proposalRedoText({ ...waiting, redoAt: '2026-11-25T03:00:00.000Z' }, NOW)).toBe(
       '下一次检查时自动重做，开始第 2 次尝试',
     );
+    // A step of GitHub has no attempts of a proposal.
+    expect(proposalRedoText({ attempt: null, redoAt }, NOW)).toBeNull();
 
-    expect(failures.map(failureLabel)).toEqual(['第 1 次，失败在「编码」阶段', '第 2 次']);
+    expect(failures.map((f) => failureLabel(f))).toEqual([
+      '第 1 次，失败在「编码」阶段',
+      '第 2 次',
+    ]);
+    expect(failureLabels(again.failures)).toEqual([
+      '第 1 次，失败在「编码」阶段',
+      '第 2 次',
+      '第 3 次',
+      '第 2 轮第 1 次，失败在「编码」阶段',
+      '第 2 轮第 2 次',
+    ]);
     setLang('en');
-    expect(attemptsText(redone, 3)).toBe('Attempt 3 of 3');
-    expect(attemptsText(failed, 3)).toBe(
-      'Failed 2 times, the most attempts it gets (max_run_attempts); not redone any more',
+    expect(attemptsText(redone)).toBe('Attempt 3 of 3');
+    expect(attemptsText(failed)).toBe(
+      'Failed 3 times, the most attempts it gets (max_run_attempts); not redone any more',
     );
-    expect(failures.map(failureLabel)).toEqual([
+    expect(attemptsText(again)).toBe(
+      'Failed 2 more times after being started over, the most attempts it gets (max_run_attempts); not redone any more',
+    );
+    expect(failureLabels(again.failures)).toEqual([
       'Attempt 1, failed in the "编码" stage',
       'Attempt 2',
+      'Attempt 3',
+      'Round 2, attempt 1, failed in the "编码" stage',
+      'Round 2, attempt 2',
     ]);
+  });
+
+  it('offers to start a failed proposal over, and says why it cannot be now', () => {
+    const failed = proposal({ id: 'p', status: 'failed', restartable: true });
+    expect(restartHint(proposal({ id: 'p', status: 'accepted' }))).toBeNull();
+    expect(restartHint(failed)).toBe(
+      '不再自动重做了。修好原因后可以重新开始：次数从头算，马上建一个新的 Run，它会看到之前每次失败的原因',
+    );
+    expect(restartHint({ ...failed, iterationId: 'iteration-1' })).toContain(
+      '迭代没有别的步骤卡住时回到进行中',
+    );
+    expect(restartBlocker(failed, repo('demo'))).toBeNull();
+    expect(restartBlocker({ ...failed, restartable: false }, null)).toBeNull();
+    expect(restartBlocker(failed, null)).toBe(
+      'demo 已经不在 config.yaml 的 backlog.repos 里，不能再重新开始它的提案',
+    );
+    expect(restartBlocker(failed, repo('demo', { problems: ['x'] }))).toBe(
+      '这个仓库的配置有问题（见上面），改好之后才能重新开始',
+    );
+    expect(restartLabels()).toEqual({
+      label: '重新开始',
+      confirm: '确认重新开始：次数从头算，马上建 Run',
+    });
+    expect(failuresHeading(3)).toBe('失败的尝试（3 次）及原因');
+    setLang('en');
+    expect(restartLabels().label).toBe('Start over');
+    expect(restartHint({ ...failed, iterationId: 'iteration-1' })).toBe(
+      'It is not redone automatically any more. Once the cause is fixed, start it over: its attempts count from 1 again, and a new Run is created at once, told why each earlier attempt failed; the iteration goes on again unless another step still blocks it',
+    );
   });
 
   it('has no Chinese left in English', () => {
@@ -295,10 +371,28 @@ describe('local proposal labels', () => {
       decidedText({ ...pending, status: 'rejected', decidedAt: NOW.toISOString() }, NOW),
       pollText(5, NOW.toISOString(), NOW),
       proposalCountsText([{ status: 'failed' }]),
-      attemptsText({ status: 'accepted', attempt: 2, failures: [] }, 3),
-      attemptsText({ status: 'failed', attempt: 1, failures: [] }, 1),
+      attemptsText({ status: 'accepted', attempt: 2, maxAttempts: 3, failures: [] }),
+      attemptsText({ status: 'failed', attempt: 1, maxAttempts: 1, failures: [] }),
+      attemptsText({
+        status: 'failed',
+        attempt: 1,
+        maxAttempts: 1,
+        failures: [{ attempt: 1 }, { attempt: 1 }],
+      }),
+      attemptText(2, null),
       proposalRedoText({ attempt: 1, redoAt: NOW.toISOString() }, NOW),
       failureLabel({ attempt: 1, stage: 'coding' }),
+      ...failureLabels([
+        { attempt: 1, stage: null },
+        { attempt: 1, stage: 'coding' },
+      ]),
+      failuresHeading(1),
+      restartHint({ restartable: true, iterationId: null }),
+      restartHint({ restartable: true, iterationId: 'iteration-1' }),
+      restartBlocker({ restartable: true, repo: 'demo' }, null),
+      restartBlocker({ restartable: true, repo: 'demo' }, repo('demo', { problems: ['x'] })),
+      restartLabels().label,
+      restartLabels().confirm,
     ];
     for (const s of texts) {
       expect(s).toBeTruthy();

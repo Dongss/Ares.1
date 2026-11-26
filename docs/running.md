@@ -46,13 +46,13 @@ Agent CLI 的原始输出（stream-json）带着工具调用的完整结果：�
 
 ### 全局事件
 
-Master 把不属于任何 Run 的事记成全局事件（事件的 Run 为空）：上一个 Master 异常退出（`master.restarted`）、清理原始日志（`logs.pruned`）、恢复数据库备份（`store.backup_restored`）、node 不见了（`master.node_missing`）、打开或关闭工作开关（`master.working`）、配置重新加载（`config.reloaded`、`config.reload_failed`）、访问 GitHub 出错（`github.error`，同一串连续失败里同一个错误只记一次，见「通知」）、webhook 通知发送失败（`notify.webhook_failed`）、系统通知发送失败（`notify.system_failed`）、推送目标分支（`github.pushed`）、从 GitHub 拉取目标分支（`github.pulled`、`github.merged_remote`、`github.diverged`、`github.diverged_run`、`github.pull_blocked`，见「拉取 GitHub 上的新提交」）、自动采纳提案（`issue.auto_accepted`）、本地提案的采纳、拒绝和失败后的重做（`proposal.auto_accepted`、`proposal.accepted`、`proposal.rejected`、`proposal.redo_scheduled`、`proposal.redone`、`proposal.failed`，见「不用 GitHub 时」）、迭代（`iteration.auto_accepted`、`iteration.accepted`、`iteration.child_status`、`iteration.blocked`、`iteration.unblocked`、`iteration.adjusted`、`iteration.completed`、`iteration.cancelled`，见「迭代」）、侦察（`scout.started`、`scout.completed`、`scout.failed`、`scout.rate_limited`、`scout.update_dropped`）和升级（`upgrade.started`、`upgrade.done`、`upgrade.failed`）。这篇文档里说「事件列表里记一条」这些事件的地方，都指这里。
+Master 把不属于任何 Run 的事记成全局事件（事件的 Run 为空）：上一个 Master 异常退出（`master.restarted`）、清理原始日志（`logs.pruned`）、恢复数据库备份（`store.backup_restored`）、node 不见了（`master.node_missing`）、打开或关闭工作开关（`master.working`）、配置重新加载（`config.reloaded`、`config.reload_failed`）、访问 GitHub 出错（`github.error`，同一串连续失败里同一个错误只记一次，见「通知」）、webhook 通知发送失败（`notify.webhook_failed`）、系统通知发送失败（`notify.system_failed`）、推送目标分支（`github.pushed`）、从 GitHub 拉取目标分支（`github.pulled`、`github.merged_remote`、`github.diverged`、`github.diverged_run`、`github.pull_blocked`，见「拉取 GitHub 上的新提交」）、自动采纳提案（`issue.auto_accepted`）、本地提案的采纳、拒绝、失败后的重做和重新开始（`proposal.auto_accepted`、`proposal.accepted`、`proposal.rejected`、`proposal.redo_scheduled`、`proposal.redone`、`proposal.failed`、`proposal.restarted`，见「不用 GitHub 时」）、迭代（`iteration.auto_accepted`、`iteration.accepted`、`iteration.child_status`、`iteration.blocked`、`iteration.unblocked`、`iteration.adjusted`、`iteration.completed`、`iteration.cancelled`，见「迭代」）、侦察（`scout.started`、`scout.completed`、`scout.failed`、`scout.rate_limited`、`scout.update_dropped`）和升级（`upgrade.started`、`upgrade.done`、`upgrade.failed`）。这篇文档里说「事件列表里记一条」这些事件的地方，都指这里。
 
 Master 大部分时间没人看着，人回来时在看板的「事件」页查这段时间发生过什么：
 
 - 最新的在前，每页 200 条，底部「加载更早的」往前翻；有新的全局事件时自动刷新。
 - 每条有时间、类型和一句说明：比如删了几个原始日志、多大，上一个 Master 的 pid 和启动时间，恢复了哪个备份、较新的库移到了哪里。出错的（`github.error`、`notify.webhook_failed`、`notify.system_failed`、`config.reload_failed`、`upgrade.failed`、`scout.failed`，以及多次失败后放弃的本地提案 `proposal.failed`）标成红色，值得留意的（`master.restarted`、`master.node_missing`、`store.backup_restored`、`github.diverged`、`github.pull_blocked`、`iteration.blocked`、`scout.update_dropped`，有无效配置项的 `config.reloaded`）标成橙色，其余的（包括建了合并 Run 的 `github.diverged_run`：要留意的分叉由同时记的 `github.diverged` 标出）不标颜色。分叉交给 Run 处理时，`github.diverged` 的说明写「已交给 Run <id> 处理」，不再要你手动合并。升级失败带着脚本输出末尾时可以展开看。鼠标悬停在说明上能看到原始数据。
-- 迭代的事件带着去这个迭代的页面（`#/iterations/<id>`）的链接；侦察、自动采纳和拒绝本地提案的事件带着去「需求」页的链接；交给 Run 的 `github.diverged` 和 `github.diverged_run`，以及采纳本地提案建出了 Run 的 `proposal.accepted`、`proposal.auto_accepted` 和重做本地提案建出了新 Run 的 `proposal.redone` 带着去这个 Run 的链接。
+- 迭代的事件带着去这个迭代的页面（`#/iterations/<id>`）的链接；侦察、自动采纳和拒绝本地提案的事件带着去「需求」页的链接；交给 Run 的 `github.diverged` 和 `github.diverged_run`，以及采纳本地提案建出了 Run 的 `proposal.accepted`、`proposal.auto_accepted`，重做本地提案建出了新 Run 的 `proposal.redone` 和重新开始本地提案建出了新 Run 的 `proposal.restarted` 带着去这个 Run 的链接。
 - 看板还不认识的事件类型（以后新加的）照样列出，显示类型名和原始数据。
 - 每个 Run 自己的事件不在这里，在 Run 详情页。
 
@@ -527,6 +527,9 @@ backlog:
 - **重做**：到时间后，工作开关开着、当天的自动花费没到 `daily_budget_usd` 时，用提案正文再建一个 Run，模板和 `auto_merge` 的设置和采纳时一样。新 Run 的目标是提案正文后面加一节「之前的尝试」：之前每次尝试的 Run、失败在哪个阶段和原因（每次最多 2000 字），并要求先想清楚失败的原因、换个做法，和 GitHub 重做时告诉 Agent 的一样；需求评估、编码和评审都读得到。建 Run 和更新提案（`runId` 换成新的 Run，`attempt` 加一，`redo` 清空）在一起完成，事件列表里记一条 `proposal.redone`，数据是 `{ repo, proposalId, runId, failedRunId, attempt, maxAttempts }`。建 Run 失败时什么都不记，下一轮再试。
 - 花费已达上限时先不重做，第二天预算恢复后再做；工作开关关着时也不重做，打开后马上检查一轮。这些等待都不算用掉一次，多条提案各等各的。自动重做建出的 Run 计入当天的自动花费，不管提案当初是不是人采纳的。
 - 被终止的 Run（人在看板上终止）不重做，提案也不标成失败，保持「已采纳」，等你决定。
+- **重新开始**：用完次数、标成「已失败」的提案，修好原因后可以在看板上点「重新开始」再给一次机会（`POST /api/proposals/:id/restart`），相当于 GitHub 仓库里给失败的 issue 重新加 `ares1:ready`：次数从头算（`attempt` 回到 1，之后失败了照样按 `max_run_attempts` 自动重做），马上用提案正文建一个新 Run，目标后面照样加上「之前的尝试」：之前每次失败的原因都在（`failures` 保留着，看板上重新开始之后的那几次写成「第 2 轮第 1 次」）。提案改回「已采纳」，`runId` 换成新的 Run，`redo` 清空；这些和事件列表里的一条 `proposal.restarted`（数据是 `{ repo, proposalId, runId, failedRunId, attempts, maxAttempts }`，`attempts` 是之前用掉的次数，`maxAttempts` 是这一轮的上限，迭代的子项另有 `iterationId`）在同一个事务里记下。这是人的决定，和手动采纳一样不受当天的自动采纳条数和预算限制，也不发通知；提案当初是不是自动采纳的保持不变（自动采纳的提案的 Run 照旧计入当天的自动花费），之后的自动重做照常计入。建 Run 失败时什么都不记。
+  - 只有「已失败」的提案能重新开始。待处理、已采纳（包括在等重做的，和 Run 被人终止的）、已拒绝的提案，以及仓库已经不在 `backlog.repos` 里或配置有误时，返回 409。
+  - 迭代的子项也能重新开始，条件是所属迭代还在进行中或受阻、这一步没被替换也没被标成不做；迭代已结束（完成、被拒绝或终止）、这一步已被替换的返回 409。重新开始后子项回到「进行中」，迭代页列出它的每一次 Run；迭代没有别的子项卡住时从「受阻」回到「进行中」（记一条 `iteration.unblocked`），还有别的子项失败时仍然受阻。
 - 失败后在等重做的提案会挡住自动侦察（「有 1 条提案在等重做」），和 GitHub 仓库里等重做的 issue 一样。
 - 每次尝试都是一个新 Run，有自己的工作目录和分支；之前失败的 Run 的工作目录和分支保留着（本地提案还不会像 GitHub 仓库的 issue 那样自动删掉更早的尝试），不需要时在看板上手动清理（「工作区」页或 Run 详情页）。
 - 迭代的子项也按上面的规则重做，次数、等待时间、预算和工作开关的限制都一样：子项失败后先重做，等重做期间子项保持「进行中」，迭代不受阻，也不会为它另建 Run；次数用完、提案标成「已失败」后，迭代才受阻（见下面的「本地提案池里的迭代」）。只重做所属迭代还在进行中或受阻、自己没被替换也没被标成不做的子项：迭代被终止（或被拒绝、已结束）、子项被侦察替换后，它的失败既不再记下，也不再重做，等重做的子项也不再计入「在等重做」。
@@ -539,12 +542,12 @@ backlog:
 - 每个仓库一张卡片：用的模板和它来自数据目录还是仓库、侦察的 Agent 和调度方式（以及现在为什么没有自动侦察）、自动采纳的范围和今天已经自动采纳了几条、合并前要不要审批、今天的自动花费和预算，以及「让 AI 找活」按钮。只配了 `backlog`、没配 `github` 的仓库也能在这里手动侦察。
 - 卡片下面是这个仓库的提案，待处理的排在前面（新的在前），之后是已经决定的（最近决定的在前）。看板加载全部待处理的提案和最近的 50 条，更早决定的不显示（仍在数据库里，侦察照样看得到）。每条显示状态、标题、风险、类别、大小和提出的时间，点开能看为什么、证据、要做什么和验收标准。
 - 待处理的提案写明它在不在自动采纳范围内：在范围内只是还没采纳（条数、预算或工作开关），之后会自动采纳；不在范围内就等你决定。点「采纳」马上用它建 Run，不受 `max_per_day` 和预算限制（这是人的决定）；仓库已经不在 `backlog.repos` 里或配置有误时不能采纳。要拒绝，先在输入框里写理由（必填，理由为空时「拒绝」按钮不能点），再点「拒绝」「确认拒绝」。拒绝后提案标成「已拒绝」（`rejected`），事件列表里记一条 `proposal.rejected`，数据是 `{ repo, proposalId, reason }`。
-- 已采纳的提案显示最近一次建出的 Run 的链接和状态，自动采纳的标着「已自动采纳」，重做过或在等重做的写明是第几次尝试（「第 2/3 次尝试」），在等重做的写明预计什么时候重做；已拒绝的显示拒绝的理由；已失败的（「已失败」，红色）写明失败了几次、不再自动重做。有过失败的提案可以展开「失败的尝试及原因」，看每次尝试的 Run（链到 Run 详情页）、失败在哪个阶段和原因。
-- 迭代的子项也是提案，但不能单独采纳或拒绝：它们没有这两个按钮，链到所属的迭代，在看板的迭代页整体采纳、拒绝或终止（见下面的「本地提案池里的迭代」）。
+- 已采纳的提案显示最近一次建出的 Run 的链接和状态，自动采纳的标着「已自动采纳」，重做过或在等重做的写明是第几次尝试（「第 2/3 次尝试」，上限是 API 的 `maxAttempts`），在等重做的写明预计什么时候重做；已拒绝的显示拒绝的理由；已失败的（「已失败」，红色）写明失败了几次、不再自动重做，下面有「重新开始」按钮（点了要再点「确认重新开始」，见上面的「重新开始」；仓库已经不在 `backlog.repos` 里或配置有误时按钮不能点，旁边写明原因）。有过失败的提案可以展开「失败的尝试及原因」，看每次尝试的 Run（链到 Run 详情页）、失败在哪个阶段和原因；重新开始过的，之后的尝试写成「第 2 轮第 1 次」。
+- 迭代的子项也是提案，但不能单独采纳或拒绝：它们没有这两个按钮，链到所属的迭代，在看板的迭代页整体采纳、拒绝或终止（见下面的「本地提案池里的迭代」）。用完次数失败的子项和单独的提案一样可以「重新开始」，这里和迭代页都有这个按钮。
 - 被拒绝的提案连同理由会出现在这个仓库之后每次侦察的提示词里（上面「侦察怎么调度」里的「被拒绝的」一节），作为反例：理由写得越具体（为什么不做、什么情况下才值得做），侦察越不会再提类似的东西。
 - 从 `backlog.repos` 里拿掉的仓库，如果还有提案，仍然列在这里，写明已经不在 `backlog.repos` 里：不再侦察、不能采纳，待处理的还可以拒绝。
 
-页面在有提案写入、采纳、拒绝、重做或失败，侦察开始或结束，建了新 Run、Run 状态变化，以及配置重新加载时自动刷新。
+页面在有提案写入、采纳、拒绝、重做、失败或重新开始，侦察开始或结束，建了新 Run、Run 状态变化，以及配置重新加载时自动刷新。
 
 ### 本地提案池里的迭代
 
@@ -555,7 +558,7 @@ backlog:
 - **拒绝**：等采纳的迭代在迭代页填上理由（必填）拒绝（`POST /api/iterations/:id/reject`）：全部子项的提案一起标成已拒绝，记下同一个理由；迭代标为已终止，记一条 `iteration.cancelled`（`pending: true`，带 `reason`）。之后的侦察在「被拒绝的」一节里把整个迭代当作一条反例。
 - **依赖门**：一个子项依赖的提案的 Run 都完成后，才为它建 Run。采纳时马上为没有依赖的子项建 Run；之后每轮检查（工作开关开着时）为依赖刚完成的子项建 Run。受阻时，不依赖失败那一步的子项照常开工。
 - **完成**：全部子项的 Run 都完成后（被替换的不算），Master 写一份总结（内容和 GitHub 迭代的总结一样），存在迭代上，在迭代页显示，记一条 `iteration.completed`，不通知。
-- **受阻**：子项的 Run 失败后先按「本地提案失败后自动重做」重做，这期间子项保持「进行中」（迭代页列出它的每一次 Run，失败的也在），迭代照常进行。子项的 Run 用完 `max_run_attempts` 次仍然失败（提案标成「已失败」）、被人终止，或需求评估结论为不做时，这一步才算没做成，迭代进入受阻，记一条 `iteration.blocked` 并通知「迭代受阻」（点开是迭代页）。侦察下次换个做法补一个子项替换它；替换后迭代回到进行中，新的子项按依赖开工（工作开关开着时马上建 Run）。每轮检查先记下失败、重做到期的子项，再跟进迭代，所以有次数的子项不会在同一轮里先被当成失败。
+- **受阻**：子项的 Run 失败后先按「本地提案失败后自动重做」重做，这期间子项保持「进行中」（迭代页列出它的每一次 Run，失败的也在，并写明是第几次尝试、预计什么时候重做，可以展开看每次失败的原因），迭代照常进行。子项的 Run 用完 `max_run_attempts` 次仍然失败（提案标成「已失败」）、被人终止，或需求评估结论为不做时，这一步才算没做成，迭代进入受阻，记一条 `iteration.blocked` 并通知「迭代受阻」（点开是迭代页）。侦察下次换个做法补一个子项替换它；替换后迭代回到进行中，新的子项按依赖开工（工作开关开着时马上建 Run）。用完次数失败的子项，也可以修好原因后在迭代页那一步上点「重新开始」（见「本地提案失败后自动重做」的「重新开始」），次数从头算，没有别的子项卡住时迭代回到进行中；Run 被人终止或需求评估结论为不做的子项提案还是「已采纳」，不能重新开始，等侦察替换。每轮检查先记下失败、重做到期的子项，再跟进迭代，所以有次数的子项不会在同一轮里先被当成失败。
 - **终止**：已采纳、还没结束的迭代可以在迭代页「终止」（`POST /api/iterations/:id/cancel`）：还没完成的子项不做了，它们还没结束的 Run 被终止，Run 上记 `run.iteration_cancelled`，不算失败；迭代标为已终止，记一条 `iteration.cancelled`。等采纳的迭代不能终止，要拒绝。
 - **侦察调整计划**：调整的理由记在迭代上（迭代页的「计划调整」），新子项写成提案，跟着迭代是否已采纳；依赖变了的提案改写 `dependsOn`。
 - **收尾**：收尾子项建 Run 之前，把本迭代评审留下的建议（规则同「迭代」的「收尾」）写进它的提案的「要做什么」，看板上看到的就是交给 Run 的内容。收尾子项失败后重做时用提案上已经存好的这段内容，评审建议不会再追加一次。
@@ -565,7 +568,7 @@ backlog:
 规则和 GitHub 仓库的一样（`src/notify/notice.ts`），通过浏览器、系统通知和 webhook 三条通道发（见「通知」）：
 
 - 侦察结束时，有留着等人的提案（`scout.completed` 的 `pending` 大于 0，等人采纳的迭代也算一条）就通知「有提案等你决定：N 条」，正文说明这些提案没有自动采纳（太大、超出自动采纳的风险，或今天的自动采纳额度用完了），去看板的需求页上采纳或拒绝；点开是「需求」页。每次侦察只通知一次。
-- 采纳、自动采纳和拒绝提案或迭代都不通知：要么是人自己做的，要么不需要人。迭代完成也不通知。
+- 采纳、自动采纳和拒绝提案或迭代，以及重新开始失败的提案（`proposal.restarted`）都不通知：要么是人自己做的，要么不需要人。迭代完成也不通知。
 - 迭代受阻时通知「迭代受阻：<仓库名>」，正文说明有一步没做成（Run 用完重做次数后仍然失败、被终止，或需求评估结论为不做）、侦察下次会换个做法替换它，也可以在看板上终止这个迭代；点开是迭代页。
 - 侦察连续失败 3 次时通知「侦察连续失败：<仓库名>」，和 GitHub 仓库一样。
 - 从提案建出的 Run 和别的 Run 一样：等审批、卡住、失败时通知（每次失败都通知，自动重做的也是）。安排重做、重做和多次失败后放弃提案（`proposal.redo_scheduled`、`proposal.redone`、`proposal.failed`）不另外通知：失败本身已经通知过，放弃的提案在「需求」页和事件页标成红色。
@@ -579,16 +582,17 @@ backlog:
 
 - `GET /api/backlog`：本地提案池的状态。`enabled` 表示 `config.yaml` 有 `backlog` 一节，`pollMinutes` 是 `backlog.poll_minutes`，`lastPollAt` 是上一轮检查的时间（还没检查过时为 `null`），`lastError` 是上一轮没做成的事（下一轮全部做成后清空）。`repos` 按 `backlog.repos` 的顺序列出每个仓库，字段和 `GET /api/github` 里每个仓库共有的部分相同：`name`、`template`、`problems`（Master 为什么不能处理这个仓库，比如配置有误、没在看板上登记）、`scout`（`agent`、`auto`、`intervalMinutes`、`maxProposals`、`running`、`lastAt`，以及 `waiting`：上一轮检查时自动侦察为什么没开始；没配侦察时为 `null`）、`autoAccept`（`maxRisk`、`maxSize`、`maxPerDay`、当天已自动采纳的 `usedToday`）、`autoMerge`、`budget`（`dailyUsd`、`spentToday`、`reached`）、`maxRunAttempts`（`max_run_attempts`），另外 `pendingProposals` 是等人或等自动采纳的提案数：等采纳的迭代算一条，它的子项不算。`GET /api/github` 里每个仓库也有 `maxRunAttempts`。
 - `POST /api/backlog/poll`：马上检查一轮（跟踪迭代、为依赖完成的子项建 Run，记下失败的 Run、重做到时间的提案，自动采纳范围内的待处理提案和迭代，能开始的自动侦察），不等下一轮；返回检查后的状态，格式同上。
-- `GET /api/proposals`：本地提案，新的在前。参数 `repo`（仓库名或 id）只列这个仓库的，`status`（`pending`、`accepted`、`rejected`、`failed`）只列这个状态的，`limit`（1–500 的整数）最多返回几条，不写时全部返回。每一项除了提案本身的字段（`id`、`repoId`、`scoutId`、`title`、`category`、`size`、`risk`、`why`、`evidence`、`what`、`acceptance`、`status`、`rejectReason`、`auto`、`runId`（最近一次建出的 Run）、`attempt`（`runId` 是第几次尝试，从 1 起）、`failures`（失败过的每次尝试，旧的在前：`runId`、`attempt`、`stage`、`error`）、`redo`（最近一次 Run 失败后怎么办：`pending` 等着重做，`exhausted` 次数用完了，其余时候为 `null`）、`iterationId`（所属的迭代，不属于迭代时为 `null`）、`dependsOn`（依赖的同一迭代里的提案 id）、`createdAt`、`decidedAt`），还有仓库名 `repo`、最近一次建出的 Run 的状态 `runStatus`（还没采纳时为 `null`）和预计什么时候重做 `redoAt`（ISO 时间，不在等重做时为 `null`）。参数不合法时返回 400，仓库不存在时返回 404。
+- `GET /api/proposals`：本地提案，新的在前。参数 `repo`（仓库名或 id）只列这个仓库的，`status`（`pending`、`accepted`、`rejected`、`failed`）只列这个状态的，`limit`（1–500 的整数）最多返回几条，不写时全部返回。每一项除了提案本身的字段（`id`、`repoId`、`scoutId`、`title`、`category`、`size`、`risk`、`why`、`evidence`、`what`、`acceptance`、`status`、`rejectReason`、`auto`、`runId`（最近一次建出的 Run）、`attempt`（`runId` 是第几次尝试，从 1 起）、`failures`（失败过的每次尝试，旧的在前：`runId`、`attempt`、`stage`、`error`）、`redo`（最近一次 Run 失败后怎么办：`pending` 等着重做，`exhausted` 次数用完了，其余时候为 `null`）、`iterationId`（所属的迭代，不属于迭代时为 `null`）、`dependsOn`（依赖的同一迭代里的提案 id）、`createdAt`、`decidedAt`），还有仓库名 `repo`、最近一次建出的 Run 的状态 `runStatus`（还没采纳时为 `null`）、预计什么时候重做 `redoAt`（ISO 时间，不在等重做时为 `null`）、一共能跑几次 `maxAttempts`（这个仓库的 `max_run_attempts`，已经跑过的次数 `attempt` 比它多时取 `attempt`；仓库已经不在 `backlog.repos` 里时为 `null`）和能不能重新开始 `restartable`（「已失败」、所属迭代还要它时为 `true`，见「重新开始」）。参数不合法时返回 400，仓库不存在时返回 404。
 - `POST /api/proposals/:id/accept`：采纳一条待处理的提案，用提案正文作为目标建 Run（模板和 `auto_merge` 按这个仓库在 `backlog.repos` 里的设置），返回 `{ proposal, run }`：采纳后的提案（格式同上）和建出的 Run（格式同 `GET /api/runs` 的各项）。提案不存在时返回 404；已经采纳、拒绝过或多次失败后放弃了、属于迭代（随迭代整体采纳），或者仓库已经不在 `backlog.repos` 里、配置有误时返回 409。
 - `POST /api/proposals/:id/reject`：拒绝一条待处理的提案，请求体是 `{ "reason": "…" }`，理由必填，去掉首尾空白后为空时返回 400。理由会和提案一起出现在这个仓库之后的侦察提示词里，作为不要再提的反例。返回拒绝后的提案；不存在时返回 404，已经采纳或拒绝过、属于迭代（随迭代整体拒绝）时返回 409。
+- `POST /api/proposals/:id/restart`：重新开始一条「已失败」的提案（包括迭代里还没被替换的子项），次数从头算，马上建 Run（见「本地提案失败后自动重做」的「重新开始」）。返回 `{ proposal, run }`，格式同 `accept`。提案不存在时返回 404；不是「已失败」、所属迭代已结束、这一步已被替换或不做了，或者仓库已经不在 `backlog.repos` 里、配置有误时返回 409。
 - `POST /api/scouts`：手动侦察，请求体是 `{ "repo": "<仓库名>" }`。仓库在 `backlog.repos` 里时交给本地提案池，提案写进本地提案池；在 `github.repos` 里时照旧建 issue。同一个仓库同时写在两处属于配置错误，这时 `backlog.repos` 里的设置不生效，按 GitHub 侦察。两处都没有时返回 404。
 
 ### 迭代的看板和 API
 
-看板顶栏的「迭代」页列出所有仓库的迭代：没结束的在前（受阻的、等采纳的、进行中的），然后是最近结束的。每个迭代显示目标、状态、进度条（完成几步 / 共几步，被替换的步骤不算）、用了几个 Run、费用和用时，受阻时写明是哪一步失败或不做了。点进去是这个迭代的页面（`#/iterations/<id>`）：目标和对应的 README 目标、完成标准（每条后面写着推进它的步骤）、不做的事、计划里每一步的状态、在等哪几步、被哪一步替换、它的 issue 或本地提案、做过它的每个 Run（链到 Run 详情页，带状态和费用），以及侦察的计划调整和完成后的总结。本地提案池的迭代在这里整体采纳、填理由拒绝或终止；GitHub 的迭代链到迭代 issue，在 GitHub 上操作。首页在 Run 列表上面列出没结束的迭代（按仓库筛选时只列这个仓库的），有受阻的时这一栏标成橙色。「需求」页里属于迭代的本地提案不能单独采纳或拒绝，链到它的迭代。
+看板顶栏的「迭代」页列出所有仓库的迭代：没结束的在前（受阻的、等采纳的、进行中的），然后是最近结束的。每个迭代显示目标、状态、进度条（完成几步 / 共几步，被替换的步骤不算）、用了几个 Run、费用和用时，受阻时写明是哪一步失败或不做了。点进去是这个迭代的页面（`#/iterations/<id>`）：目标和对应的 README 目标、完成标准（每条后面写着推进它的步骤）、不做的事、计划里每一步的状态、在等哪几步、被哪一步替换、它的 issue 或本地提案、做过它的每个 Run（链到 Run 详情页，带状态和费用），本地提案池的步骤还写明是第几次尝试（「第 2/3 次尝试」）、在等重做时预计什么时候重做，可以展开「失败的尝试及原因」，用完次数失败的步骤有「重新开始」按钮（受阻的提示里也会提到）；以及侦察的计划调整和完成后的总结。本地提案池的迭代在这里整体采纳、填理由拒绝或终止；GitHub 的迭代链到迭代 issue，在 GitHub 上操作。首页在 Run 列表上面列出没结束的迭代（按仓库筛选时只列这个仓库的），有受阻的时这一栏标成橙色。「需求」页里属于迭代的本地提案不能单独采纳或拒绝，链到它的迭代。
 
-- `GET /api/iterations`：两种来源的迭代，新的在前。参数 `repo`（仓库名或 id）只列这个仓库的；`status` 是一个状态或用逗号隔开的几个（`pending`、`active`、`blocked`、`done`、`cancelled`），比如 `pending,active,blocked` 列出没结束的；`limit`（1–500 的整数）最多返回几条，不写时全部返回。每一项除了迭代本身的字段（`id`、`repoId`、`source`、`issue`、`title`、`goal`、`readmeGoal`、`criteria`、`outOfScope`、`notes`、`status`、`auto`、`summary`、`createdAt`、`decidedAt`、`endedAt` 等），还有仓库名 `repo`；`children` 的每一步另有 `waitingFor`（还没开工时在等的步骤序号，开工后为空）和 `runs`（做过它的每个 Run 的 `id`、`status`、`costUsd`、`costUnknown`，旧的在前，失败后重做的也在内）；`progress` 是 `{ done, total }`；`totals` 是所有步骤的 Run 合计：`runs`（几个 Run）、`costUsd`、`costUnknown`（有的执行费用未知，`costUsd` 只是下限）、`elapsedMs`（从采纳到结束，没结束时到读取的时候；没采纳时为 `null`）和 `agentMs`（Agent 执行的时间）。参数不合法时返回 400，仓库不存在时返回 404。
+- `GET /api/iterations`：两种来源的迭代，新的在前。参数 `repo`（仓库名或 id）只列这个仓库的；`status` 是一个状态或用逗号隔开的几个（`pending`、`active`、`blocked`、`done`、`cancelled`），比如 `pending,active,blocked` 列出没结束的；`limit`（1–500 的整数）最多返回几条，不写时全部返回。每一项除了迭代本身的字段（`id`、`repoId`、`source`、`issue`、`title`、`goal`、`readmeGoal`、`criteria`、`outOfScope`、`notes`、`status`、`auto`、`summary`、`createdAt`、`decidedAt`、`endedAt` 等），还有仓库名 `repo`；`children` 的每一步另有 `waitingFor`（还没开工时在等的步骤序号，开工后为空）和 `runs`（做过它的每个 Run 的 `id`、`status`、`costUsd`、`costUnknown`，旧的在前，失败后重做的也在内），本地提案池的步骤还从它的提案读出 `attempt`、`maxAttempts`、`redoAt`、`failures` 和 `restartable`（含义同 `GET /api/proposals`；GitHub 的步骤和还没有提案的步骤分别为 `null`、`null`、`null`、`[]` 和 `false`）；`progress` 是 `{ done, total }`；`totals` 是所有步骤的 Run 合计：`runs`（几个 Run）、`costUsd`、`costUnknown`（有的执行费用未知，`costUsd` 只是下限）、`elapsedMs`（从采纳到结束，没结束时到读取的时候；没采纳时为 `null`）和 `agentMs`（Agent 执行的时间）。参数不合法时返回 400，仓库不存在时返回 404。
 - `GET /api/iterations/:id`：一个迭代，格式同上；不存在时返回 404。
 - `POST /api/iterations/:id/accept`、`POST /api/iterations/:id/reject`（请求体 `{ "reason": "…" }`，理由必填）、`POST /api/iterations/:id/cancel`：整体采纳、拒绝等采纳的、终止已采纳的本地提案池迭代，返回处理后的迭代（不带上面那些合计）。GitHub 的迭代和状态不对时返回 409，不存在时返回 404。
 

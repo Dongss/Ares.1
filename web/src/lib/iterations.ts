@@ -4,6 +4,7 @@ import { join, t } from '../../../src/i18n.js';
 import type { IterationChildStatus, IterationStatus } from '../../../src/store/types.js';
 import { formatDuration, formatRunCost, goalTitle, type Tone } from './format.js';
 import { badge, RISK } from './issues.js';
+import { attemptText } from './proposals.js';
 
 // Iterations on the dashboard (the Iterations page and the card on Home): where each stands, its
 // progress, what each step waits for, what holds it up and what a human can do about it. Labels
@@ -199,17 +200,39 @@ export function blockedText(it: Pick<IterationView, 'status' | 'children'>): str
   });
 }
 
-/** What a human can do about a blocked iteration, wherever its steps are. */
-export function blockedHint(it: Pick<IterationView, 'source'>): string {
-  return it.source === 'github'
+/**
+ * What a human can do about a blocked iteration, wherever its steps are. In the local backlog, a
+ * step that failed after its attempts were used up may also be started over (`restartable`).
+ */
+export function blockedHint(it: Pick<IterationView, 'source' | 'children'>): string {
+  if (it.source === 'github') {
+    return t({
+      zh: '下次侦察会换个做法补一个子 issue 替换它，替换后迭代接着做；也可以修好原因后重新打开那个子 issue、加上 ares1:ready 重做；不想做剩下的，就关掉迭代 issue',
+      en: 'The next scout adds a sub-issue that replaces it with another approach, and the iteration goes on once it is replaced; or fix the cause, reopen the sub-issue and add ares1:ready to redo it; to drop the rest, close the iteration issue',
+    });
+  }
+  return blockingSteps(it).some((c) => c.restartable)
     ? t({
-        zh: '下次侦察会换个做法补一个子 issue 替换它，替换后迭代接着做；也可以修好原因后重新打开那个子 issue、加上 ares1:ready 重做；不想做剩下的，就关掉迭代 issue',
-        en: 'The next scout adds a sub-issue that replaces it with another approach, and the iteration goes on once it is replaced; or fix the cause, reopen the sub-issue and add ares1:ready to redo it; to drop the rest, close the iteration issue',
+        zh: '下次侦察会换个做法补一步替换它，替换后迭代接着做；也可以修好原因后在下面的计划里点那一步的「重新开始」，次数从头算；不想做剩下的，就终止这个迭代',
+        en: 'The next scout adds a step that replaces it with another approach, and the iteration goes on once it is replaced; or fix the cause and use "Start over" on that step in the plan below, its attempts counted from 1 again; to drop the rest, cancel the iteration',
       })
     : t({
         zh: '下次侦察会换个做法补一步替换它，替换后迭代接着做；不想做剩下的，就终止这个迭代',
         en: 'The next scout adds a step that replaces it with another approach, and the iteration goes on once it is replaced; to drop the rest, cancel the iteration',
       });
+}
+
+/**
+ * Which attempt a step of the local backlog is at, while it runs or once it failed: 「第 2/3 次
+ * 尝试」 once its first Run failed (`attemptText`); null before, on GitHub, and for a step
+ * neither running nor failed.
+ */
+export function stepAttemptsText(
+  child: Pick<IterationChildView, 'status' | 'attempt' | 'maxAttempts' | 'failures'>,
+): string | null {
+  if (child.status !== 'running' && child.status !== 'failed') return null;
+  if (child.attempt === null || (child.attempt === 1 && child.failures.length === 0)) return null;
+  return attemptText(child.attempt, child.maxAttempts);
 }
 
 /** Who accepts a pending iteration, and how; null unless it is pending. */
@@ -355,13 +378,18 @@ export function githubHint(it: Pick<IterationView, 'source' | 'status'>): string
 /**
  * The live events after which iterations on a page are out of date: iterations accepted, moving
  * on, blocked, adjusted or ended; scouts (one files a new iteration); Runs created or changing
- * status (each step shows its Runs).
+ * status (each step shows its Runs); a local proposal's failure recorded, redone, given up or
+ * started over (a step of the local backlog shows its attempts and when it is redone).
  */
 export function iterationsOutdatedBy(type: string): boolean {
   return (
     type.startsWith('iteration.') ||
     type.startsWith('scout.') ||
     type === 'run.created' ||
-    type === 'run.status'
+    type === 'run.status' ||
+    type === 'proposal.redo_scheduled' ||
+    type === 'proposal.redone' ||
+    type === 'proposal.failed' ||
+    type === 'proposal.restarted'
   );
 }

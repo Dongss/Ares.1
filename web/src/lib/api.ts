@@ -10,6 +10,7 @@ import type {
   KeptWorkspace,
   NotifyTestResult,
   ProposalAccepted,
+  ProposalRestarted,
   ProposalView,
   RunDetail,
   RunSummary,
@@ -154,6 +155,9 @@ export const api = {
   /** The reason is required; the repo's next scouts are shown it. */
   rejectProposal: (proposalId: string, reason: string) =>
     request<ProposalView>('POST', `/api/proposals/${id(proposalId)}/reject`, { reason }),
+  /** A failed proposal (or step) started over: attempts from 1 again, a Run created at once. */
+  restartProposal: (proposalId: string) =>
+    request<ProposalRestarted>('POST', `/api/proposals/${id(proposalId)}/restart`),
 
   /** Iterations of both sources, newest first; `status`: any of these. */
   iterations: (

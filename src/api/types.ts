@@ -19,6 +19,7 @@ import type {
   Attempt,
   BlockKind,
   CheckResult,
+  FailedAttempt,
   Iteration,
   IterationChild,
   Proposal,
@@ -435,6 +436,16 @@ export interface ProposalView extends Proposal {
    * to be redone, a step whose iteration no longer wants it included.
    */
   redoAt: string | null;
+  /**
+   * How many Runs it gets in all, `attempt` among them: its repo's `max_run_attempts`, or
+   * `attempt` when past that (`attemptsAllowed`). null once its repo left backlog.repos.
+   */
+  maxAttempts: number | null;
+  /**
+   * A human may start it over (`proposalRestartable`, POST /api/proposals/:id/restart): it failed,
+   * and the iteration it is a step of, if any, still wants it.
+   */
+  restartable: boolean;
 }
 
 /** POST /api/proposals/:id/accept: the proposal, accepted, and the Run created from it. */
@@ -442,6 +453,12 @@ export interface ProposalAccepted {
   proposal: ProposalView;
   run: RunSummary;
 }
+
+/**
+ * POST /api/proposals/:id/restart: the proposal, started over (accepted again, attempt 1), and
+ * the Run created for it.
+ */
+export type ProposalRestarted = ProposalAccepted;
 
 /** One Run that worked on a step of an iteration. */
 export interface IterationRunView {
@@ -461,6 +478,20 @@ export interface IterationChildView extends IterationChild {
   waitingFor: number[];
   /** Every Run that worked on it, oldest first: failed attempts and redos included. */
   runs: IterationRunView[];
+  /**
+   * The rest is read from its proposal, in the local backlog only, as GET /api/proposals gives
+   * it; null, empty or false on GitHub and before it has a proposal. Which attempt its latest Run
+   * is (`Proposal.attempt`).
+   */
+  attempt: number | null;
+  /** How many Runs it gets in all (`ProposalView.maxAttempts`). */
+  maxAttempts: number | null;
+  /** When its failed Run is redone, while it waits to be (`ProposalView.redoAt`). */
+  redoAt: string | null;
+  /** Its Runs that failed and why, oldest first (`Proposal.failures`). */
+  failures: FailedAttempt[];
+  /** A human may start it over (`ProposalView.restartable`). */
+  restartable: boolean;
 }
 
 /**

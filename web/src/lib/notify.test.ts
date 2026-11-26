@@ -86,9 +86,14 @@ describe('noticeFor automation', () => {
       href: '#/issues',
       tag: 'ares1-event-42',
     });
-    // Accepted by auto-accept or a human, or rejected by a human: nobody has to act.
+    // Accepted by auto-accept or a human, rejected or started over by a human: nobody has to act.
     const decided = { repo: 'demo', proposalId: 'proposal-1', runId: 'run-1', reason: 'x' };
-    for (const type of ['proposal.auto_accepted', 'proposal.accepted', 'proposal.rejected']) {
+    for (const type of [
+      'proposal.auto_accepted',
+      'proposal.accepted',
+      'proposal.rejected',
+      'proposal.restarted',
+    ]) {
       expect(noticeFor(ev(type, decided, null), undefined), type).toBeNull();
     }
     // A redo of a failed local proposal, or giving it up: the failed Run was told already.

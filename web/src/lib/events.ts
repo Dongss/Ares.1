@@ -617,6 +617,40 @@ export function globalEventText(event: GlobalEvent, now = new Date()): string | 
         en: `${failed}, and is not redone any more; later scouts are shown why each attempt failed`,
       });
     }
+    case 'proposal.restarted': {
+      const runId = str(d.runId);
+      const n = num(d.attempts);
+      const max = num(d.maxAttempts);
+      const what = d.iterationId
+        ? t({
+            zh: `${repoOf(event)} 迭代里一步失败的本地提案`,
+            en: `a failed step of an iteration of ${repoOf(event)}`,
+          })
+        : t({
+            zh: `${repoOf(event)} 一条失败的本地提案`,
+            en: `a failed local proposal of ${repoOf(event)}`,
+          });
+      const before =
+        n === null
+          ? ''
+          : t({
+              zh: `（之前失败 ${n} 次）`,
+              en: ` (it had failed ${n === 1 ? 'once' : `${n} times`})`,
+            });
+      const count = t({
+        zh: `次数从头算${max === null ? '' : `，最多 ${max} 次`}`,
+        en: `its attempts count from 1 again${max === null ? '' : `, ${max} at most`}`,
+      });
+      return runId
+        ? t({
+            zh: `重新开始了 ${what}${before}：${count}，建了 Run ${runId}，带着之前每次失败的原因`,
+            en: `Started ${what} over${before}: ${count}, with Run ${runId}, told why each earlier attempt failed`,
+          })
+        : t({
+            zh: `重新开始了 ${what}${before}：${count}`,
+            en: `Started ${what} over${before}: ${count}`,
+          });
+    }
     case 'proposal.rejected': {
       const rejected = t({
         zh: `拒绝了 ${repoOf(event)} 的一条本地提案`,
@@ -813,8 +847,8 @@ export interface EventLink {
 /**
  * Where to see more about the event: an iteration on its own page; scouts, the issues they propose
  * and the local proposals on the Issues page (a failed one with every reason, one waiting to be
- * redone with when); a divergence handed to a Run, and an accepted or redone local proposal, on
- * that Run's page.
+ * redone with when); a divergence handed to a Run, and an accepted, redone or restarted local
+ * proposal, on that Run's page.
  */
 export function globalEventLink(event: GlobalEvent): EventLink | null {
   const iterationId = str(event.data.iterationId);
@@ -830,7 +864,8 @@ export function globalEventLink(event: GlobalEvent): EventLink | null {
     event.type === 'github.diverged_run' ||
     event.type === 'proposal.accepted' ||
     event.type === 'proposal.auto_accepted' ||
-    event.type === 'proposal.redone';
+    event.type === 'proposal.redone' ||
+    event.type === 'proposal.restarted';
   if (toRun && runId) {
     return { href: href.run(runId), label: t({ zh: '查看 Run', en: 'See the Run' }) };
   }

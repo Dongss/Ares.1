@@ -395,8 +395,10 @@ export function noticeFor(event: EventRow, goal: string | undefined): Notice | n
     case 'proposal.auto_accepted':
     case 'proposal.accepted':
     case 'proposal.rejected':
-      // A local proposal decided, by auto-accept or by a human on the dashboard: nobody has to
-      // act on it. Those left for a human were told once, when the scout that filed them ended.
+    case 'proposal.restarted':
+      // A local proposal decided, by auto-accept or by a human on the dashboard (accepting,
+      // rejecting or starting a failed one over): nobody has to act on it. Those left for a human
+      // were told once, when the scout that filed them ended.
       return null;
     case 'proposal.redo_scheduled':
     case 'proposal.redone':

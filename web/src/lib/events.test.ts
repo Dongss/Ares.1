@@ -178,6 +178,28 @@ const SAMPLES: [string, Record<string, unknown>][] = [
     },
   ],
   [
+    'proposal.restarted',
+    {
+      repo: 'demo',
+      proposalId: 'proposal-1',
+      runId: 'run-4',
+      failedRunId: 'run-3',
+      attempts: 3,
+      maxAttempts: 3,
+    },
+  ],
+  [
+    'proposal.restarted',
+    {
+      repo: 'demo',
+      proposalId: 'proposal-1',
+      runId: 'run-4',
+      attempts: 1,
+      maxAttempts: 3,
+      iterationId: 'iteration-1',
+    },
+  ],
+  [
     'scout.completed',
     { scoutId: 's-1', repo: 'demo', created: 2, auto: 1, pending: 1, backlog: true },
   ],
@@ -787,6 +809,24 @@ describe('globalEventText', () => {
     );
   });
 
+  it('says a human started a failed local proposal or step over', () => {
+    const restarted = { repo: 'demo', runId: 'run-4', attempts: 3, maxAttempts: 3 };
+    expect(text('proposal.restarted', restarted)).toBe(
+      '重新开始了 demo 一条失败的本地提案（之前失败 3 次）：次数从头算，最多 3 次，建了 Run run-4，带着之前每次失败的原因',
+    );
+    const step = { repo: 'demo', iterationId: 'iteration-1', attempts: 1 };
+    expect(text('proposal.restarted', step)).toBe(
+      '重新开始了 demo 迭代里一步失败的本地提案（之前失败 1 次）：次数从头算',
+    );
+    setLang('en');
+    expect(text('proposal.restarted', restarted)).toBe(
+      'Started a failed local proposal of demo over (it had failed 3 times): its attempts count from 1 again, 3 at most, with Run run-4, told why each earlier attempt failed',
+    );
+    expect(text('proposal.restarted', step)).toBe(
+      'Started a failed step of an iteration of demo over (it had failed once): its attempts count from 1 again',
+    );
+  });
+
   it('describes every global event in both languages, without Chinese left in English', () => {
     for (const [type, data] of SAMPLES) {
       expect(text(type, data), type).toBeTruthy();
@@ -837,7 +877,7 @@ describe('globalEventTone', () => {
     ]) {
       expect(globalEventTone(ev(type)), type).toBe('danger');
     }
-    for (const type of ['proposal.redo_scheduled', 'proposal.redone']) {
+    for (const type of ['proposal.redo_scheduled', 'proposal.redone', 'proposal.restarted']) {
       expect(globalEventTone(ev(type)), type).toBe('neutral');
     }
     for (const type of [
@@ -913,6 +953,10 @@ describe('globalEventLink', () => {
     expect(globalEventLink(ev('proposal.rejected', { reason: 'x' }))).toEqual(issues);
     // A redo to its new Run; a failure to the proposal, which lists every attempt.
     expect(globalEventLink(ev('proposal.redone', { runId: 'run-7' }))).toEqual(run);
+    // Started over by a human: to the new Run, a step's too.
+    expect(
+      globalEventLink(ev('proposal.restarted', { runId: 'run-7', iterationId: 'iteration-1' })),
+    ).toEqual(run);
     expect(globalEventLink(ev('proposal.redo_scheduled', { runId: 'run-7' }))).toEqual(issues);
     expect(globalEventLink(ev('proposal.failed', { runId: 'run-7' }))).toEqual(issues);
     setLang('en');

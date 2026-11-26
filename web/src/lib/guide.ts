@@ -890,8 +890,8 @@ export function iterationGuide(): string[] {
       en: 'A step gets its Run only once every step it depends on is closed as completed; steps that do not depend on each other start side by side. Each step done is checked in the plan on the iteration issue; once all are done, the Master posts a summary (against the completion criteria, the Runs used, total cost and time) and closes the iteration',
     }),
     t({
-      zh: '一个子项用完重做次数后失败，或者被人关成不做，迭代就停在「受阻」并通知你；侦察下次换个做法补一个子项替换它。关掉迭代 issue（本地提案池在「迭代」页上终止），还没完成的子项一起终止，不做了',
-      en: 'When a step fails after using up its attempts, or is closed as not planned by a human, the iteration is blocked and you are notified; the next scout adds a step that replaces it with another approach. Close the iteration issue (in the local backlog, cancel it on the Iterations page), and the steps not yet done are stopped and dropped with it',
+      zh: '一个子项用完重做次数后失败，或者被人关成不做，迭代就停在「受阻」并通知你；侦察下次换个做法补一个子项替换它，本地提案池里用完次数失败的子项也可以修好原因后在「迭代」页点「重新开始」。关掉迭代 issue（本地提案池在「迭代」页上终止），还没完成的子项一起终止，不做了',
+      en: 'When a step fails after using up its attempts, or is closed as not planned by a human, the iteration is blocked and you are notified; the next scout adds a step that replaces it with another approach, and in the local backlog a step that used up its attempts can also be started over on the Iterations page once the cause is fixed. Close the iteration issue (in the local backlog, cancel it on the Iterations page), and the steps not yet done are stopped and dropped with it',
     }),
     t({
       zh: '迭代进行中（包括等采纳和受阻时），侦察不规划新的迭代，也不提迭代之外的能力需求和评审建议，只提让系统停转或空耗的问题，并判断计划要不要调整：补一个漏掉的子项，或替换失败的子项，理由写在迭代上。评审通过时留下的建议不单独成 issue，由迭代最后的收尾子项统一整理',
@@ -922,8 +922,8 @@ function noticeHandling(kind: NoticeKind): string {
       });
     case 'failed':
       return t({
-        zh: '看 Run 上的错误说明。从 issue 来的 Run 会带着失败原因自动重做，一个 issue 最多跑 max_run_attempts 次，用完后 issue 关闭并写明每次的原因；不想再做就关闭 issue。本地提案（包括迭代的子项）也一样自动重做，用完次数后提案标为失败。保留的工作目录在「工作区」页清理',
-        en: 'Read the error on the Run. A Run from an issue is redone automatically with the reason it failed, up to max_run_attempts Runs per issue; after that the issue is closed with every reason. To stop it, close the issue. A local proposal, a step of an iteration included, is redone the same way, and marked failed once its attempts are used up. Clean up the kept working directory on the Workspaces page',
+        zh: '看 Run 上的错误说明。从 issue 来的 Run 会带着失败原因自动重做，一个 issue 最多跑 max_run_attempts 次，用完后 issue 关闭并写明每次的原因；不想再做就关闭 issue。本地提案（包括迭代的子项）也一样自动重做，用完次数后提案标为失败，修好原因后可以在「需求」页点「重新开始」，次数从头算。保留的工作目录在「工作区」页清理',
+        en: 'Read the error on the Run. A Run from an issue is redone automatically with the reason it failed, up to max_run_attempts Runs per issue; after that the issue is closed with every reason. To stop it, close the issue. A local proposal, a step of an iteration included, is redone the same way, and marked failed once its attempts are used up; once the cause is fixed, start it over on the Issues page, its attempts counted from 1 again. Clean up the kept working directory on the Workspaces page',
       });
     case 'proposals':
       return t({

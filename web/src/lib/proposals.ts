@@ -146,50 +146,162 @@ export function proposalCountsText(
 }
 
 /**
- * Where the attempts at an accepted or failed proposal (a step of an iteration included) stand:
- * 「第 2/3 次尝试」 while
- * a redo works on it or waits (`max`: the repo's `max_run_attempts`, null once the repo left
- * backlog.repos), or 「失败 3 次，达到尝试次数上限，不再自动重做」 once it failed. null for one
- * not decided or rejected, and for an accepted one whose first Run has not failed.
+ * 「第 2/3 次尝试」 / "Attempt 2 of 3": which attempt the latest Run is, of how many it gets
+ * (`max`, the API's `maxAttempts`; without it, null, only which: 「第 2 次尝试」).
  */
-export function attemptsText(
-  p: Pick<ProposalView, 'status' | 'attempt' | 'failures'>,
-  max: number | null,
-): string | null {
-  if (p.status === 'failed') {
-    const n = p.failures.length;
-    return t({
-      zh: `失败 ${n} 次，达到尝试次数上限（max_run_attempts），不再自动重做`,
-      en: `Failed ${n === 1 ? 'once' : `${n} times`}, the most attempts it gets (max_run_attempts); not redone any more`,
-    });
-  }
-  if (p.status !== 'accepted' || (p.attempt === 1 && p.failures.length === 0)) return null;
-  const most = max === null ? null : Math.max(max, p.attempt);
+export function attemptText(attempt: number, max: number | null): string {
   return t({
-    zh: `第 ${p.attempt}${most === null ? '' : `/${most}`} 次尝试`,
-    en: `Attempt ${p.attempt}${most === null ? '' : ` of ${most}`}`,
+    zh: `第 ${attempt}${max === null ? '' : `/${max}`} 次尝试`,
+    en: `Attempt ${attempt}${max === null ? '' : ` of ${max}`}`,
   });
 }
 
+/** What the attempt texts read of a proposal, or of a step of an iteration (its proposal's). */
+export interface AttemptsOf {
+  /** Which attempt its latest Run is; null for a step without a proposal (GitHub). */
+  attempt: number | null;
+  /** How many Runs it gets in all; null once its repo left backlog.repos. */
+  maxAttempts: number | null;
+  failures: readonly Pick<FailedAttempt, 'attempt'>[];
+}
+
 /**
- * When the failed Run of a proposal waiting to be redone is redone (`redoText`, as on a Run's
- * page): 「预计 14:05 自动重做，开始第 2 次尝试」; null when it does not wait.
+ * Whether a proposal, or a step's proposal, has been through more than one Run, or its only one
+ * failed: only then is it worth telling which attempt it is at.
+ */
+function triedAgain(p: AttemptsOf): p is AttemptsOf & { attempt: number } {
+  return p.attempt !== null && (p.attempt > 1 || p.failures.length > 0);
+}
+
+/**
+ * Where the attempts at an accepted or failed proposal (a step of an iteration included) stand:
+ * 「第 2/3 次尝试」 while a redo works on it or waits, or 「失败 3 次，达到尝试次数上限，不再自动
+ * 重做」 once it failed (「重新开始后又失败 3 次…」 when it failed before it was started over, its
+ * attempts counted from 1 again). null for one not decided or rejected, and for an accepted one
+ * whose first Run has not failed.
+ */
+export function attemptsText(p: Pick<ProposalView, 'status'> & AttemptsOf): string | null {
+  if (p.status === 'failed') {
+    const n = p.attempt ?? p.failures.length;
+    return p.failures.length > n
+      ? t({
+          zh: `重新开始后又失败 ${n} 次，达到尝试次数上限（max_run_attempts），不再自动重做`,
+          en: `Failed ${n === 1 ? 'once more' : `${n} more times`} after being started over, the most attempts it gets (max_run_attempts); not redone any more`,
+        })
+      : t({
+          zh: `失败 ${n} 次，达到尝试次数上限（max_run_attempts），不再自动重做`,
+          en: `Failed ${n === 1 ? 'once' : `${n} times`}, the most attempts it gets (max_run_attempts); not redone any more`,
+        });
+  }
+  if (p.status !== 'accepted' || !triedAgain(p)) return null;
+  return attemptText(p.attempt, p.maxAttempts);
+}
+
+/**
+ * When the failed Run of a proposal (or a step's) waiting to be redone is redone (`redoText`, as
+ * on a Run's page): 「预计 14:05 自动重做，开始第 2 次尝试」; null when it does not wait.
  */
 export function proposalRedoText(
-  p: Pick<ProposalView, 'redoAt' | 'attempt'>,
+  p: { redoAt: string | null; attempt: number | null },
   now = new Date(),
 ): string | null {
-  return p.redoAt ? redoText(p.redoAt, p.attempt, now) : null;
+  return p.redoAt && p.attempt !== null ? redoText(p.redoAt, p.attempt, now) : null;
 }
 
 /** 「第 1 次，失败在「编码」阶段」: which attempt failed, and in which stage if any. */
 export function failureLabel(f: Pick<FailedAttempt, 'attempt' | 'stage'>): string {
+  return labelIn(f, 1);
+}
+
+/**
+ * The label of each failed attempt, oldest first, as `failureLabel` gives it; once a human started
+ * the proposal over, its attempts counted from 1 again, the later ones tell their round:
+ * 「第 2 轮第 1 次，失败在「编码」阶段」. A new round begins wherever the attempt does not go up.
+ */
+export function failureLabels(
+  failures: readonly Pick<FailedAttempt, 'attempt' | 'stage'>[],
+): string[] {
+  let round = 1;
+  return failures.map((f, i) => {
+    const before = failures[i - 1];
+    if (before && f.attempt <= before.attempt) round += 1;
+    return labelIn(f, round);
+  });
+}
+
+function labelIn(f: Pick<FailedAttempt, 'attempt' | 'stage'>, round: number): string {
+  const which =
+    round > 1
+      ? t({ zh: `第 ${round} 轮第 ${f.attempt} 次`, en: `Round ${round}, attempt ${f.attempt}` })
+      : t({ zh: `第 ${f.attempt} 次`, en: `Attempt ${f.attempt}` });
   return f.stage
     ? t({
-        zh: `第 ${f.attempt} 次，失败在「${f.stage}」阶段`,
-        en: `Attempt ${f.attempt}, failed in the "${f.stage}" stage`,
+        zh: `${which}，失败在「${f.stage}」阶段`,
+        en: `${which}, failed in the "${f.stage}" stage`,
       })
-    : t({ zh: `第 ${f.attempt} 次`, en: `Attempt ${f.attempt}` });
+    : which;
+}
+
+/** 「失败的尝试（3 次）及原因」: the heading of the failures folded under a proposal or a step. */
+export function failuresHeading(n: number): string {
+  return t({ zh: `失败的尝试（${n} 次）及原因`, en: `Failed attempts (${n}) and why` });
+}
+
+/**
+ * What starting a failed proposal over does, beside its button: for one of its own, or a step
+ * (`iterationId`) whose iteration goes on again unless another step still blocks it. null unless
+ * it may be started over (`restartable`).
+ */
+export function restartHint(
+  p: Pick<ProposalView, 'restartable'> & { iterationId: string | null },
+): string | null {
+  if (!p.restartable) return null;
+  const common = t({
+    zh: '不再自动重做了。修好原因后可以重新开始：次数从头算，马上建一个新的 Run，它会看到之前每次失败的原因',
+    en: 'It is not redone automatically any more. Once the cause is fixed, start it over: its attempts count from 1 again, and a new Run is created at once, told why each earlier attempt failed',
+  });
+  return p.iterationId === null
+    ? common
+    : t({
+        zh: `${common}；迭代没有别的步骤卡住时回到进行中`,
+        en: `${common}; the iteration goes on again unless another step still blocks it`,
+      });
+}
+
+/**
+ * Why a failed proposal cannot be started over now, as the Master would refuse it: its repo left
+ * backlog.repos, or has problems. null when it can, and for one that may not be started over at
+ * all (`restartable` false).
+ */
+export function restartBlocker(
+  p: Pick<ProposalView, 'restartable' | 'repo'>,
+  repo: Pick<BacklogRepoStatus, 'problems'> | null,
+): string | null {
+  if (!p.restartable) return null;
+  if (!repo) {
+    return t({
+      zh: `${p.repo} 已经不在 config.yaml 的 backlog.repos 里，不能再重新开始它的提案`,
+      en: `${p.repo} is no longer in backlog.repos of config.yaml, so its proposals cannot be started over`,
+    });
+  }
+  if (repo.problems.length > 0) {
+    return t({
+      zh: '这个仓库的配置有问题（见上面），改好之后才能重新开始',
+      en: 'The repo has problems (see above); fix them before starting it over',
+    });
+  }
+  return null;
+}
+
+/** The button that starts a failed proposal (or step) over, and what confirming it says. */
+export function restartLabels(): { label: string; confirm: string } {
+  return {
+    label: t({ zh: '重新开始', en: 'Start over' }),
+    confirm: t({
+      zh: '确认重新开始：次数从头算，马上建 Run',
+      en: 'Confirm: count from 1 again and create a Run now',
+    }),
+  };
 }
 
 /**
@@ -228,9 +340,9 @@ export function scoutProposalFiled(p: Pick<ScoutProposal, 'issue' | 'local'>): {
 
 /**
  * The live events after which the local backlog on the page is out of date: proposals filed,
- * accepted, rejected, redone or failed, on their own or with their iteration, scouts, Runs created or changing
- * status (an accepted proposal shows its Run's status), and configuration reloads (backlog.repos
- * changed).
+ * accepted, rejected, redone, failed or started over, on their own or with their iteration,
+ * scouts, Runs created or changing status (an accepted proposal shows its Run's status), and
+ * configuration reloads (backlog.repos changed).
  */
 export function backlogOutdatedBy(type: string): boolean {
   return (

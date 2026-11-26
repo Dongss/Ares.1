@@ -10,6 +10,7 @@
 
 import type { BacklogStatus } from '../api/types.js';
 import {
+  attemptsAllowed,
   childReady,
   effectiveDependencies,
   holdsScout,
@@ -22,6 +23,7 @@ import {
   proposalAwaitingRedo,
   proposalRedoAllowed,
   proposalRedoDueAt,
+  proposalRestartable,
 } from '../config/flow.js';
 import { backlogConfigKey, findTemplate, type LoadedConfig } from '../config/load.js';
 import type { BacklogRepoConfig } from '../config/schema.js';
@@ -99,6 +101,46 @@ function decidedAlready(p: Proposal): string {
   return t({ zh: `提案 ${p.id} 已经采纳过了`, en: `Proposal ${p.id} was accepted already` });
 }
 
+/** Why a proposal cannot be started over: `proposalRestartable` says it cannot. */
+function notRestartable(p: Proposal, iteration: Iteration | null): string {
+  if (p.status === 'pending') {
+    return t({
+      zh: `提案 ${p.id} 还没有采纳，不用重新开始`,
+      en: `Proposal ${p.id} is not accepted yet, so there is nothing to start over`,
+    });
+  }
+  if (p.status === 'rejected') {
+    return t({
+      zh: `提案 ${p.id} 已经被拒绝了，不能重新开始`,
+      en: `Proposal ${p.id} was rejected, so it cannot be started over`,
+    });
+  }
+  if (p.status === 'accepted') {
+    return t({
+      zh: `提案 ${p.id} 没有失败：只有 Run 用完尝试次数、标为已失败的提案能重新开始`,
+      en: `Proposal ${p.id} has not failed: only a proposal whose Runs used up their attempts can be started over`,
+    });
+  }
+  // Failed, but a step its iteration no longer wants.
+  if (!iteration || (iteration.status !== 'active' && iteration.status !== 'blocked')) {
+    return t({
+      zh: `提案 ${p.id} 所在的迭代 ${p.iterationId} 已经结束了，不能再重新开始它`,
+      en: `Iteration ${p.iterationId}, which proposal ${p.id} is a step of, is over, so the step cannot be started over`,
+    });
+  }
+  const child = iteration.children.find((c) => c.proposalId === p.id);
+  if (child?.replacedBy !== undefined) {
+    return t({
+      zh: `提案 ${p.id} 这一步已经由第 ${child.replacedBy} 步换个做法接替，不能再重新开始`,
+      en: `Proposal ${p.id} was taken over by step ${child.replacedBy} with another approach, so it cannot be started over`,
+    });
+  }
+  return t({
+    zh: `提案 ${p.id} 这一步已经不做了，不能再重新开始`,
+    en: `Proposal ${p.id} is a step that was dropped, so it cannot be started over`,
+  });
+}
+
 /** Why an iteration that is no longer pending cannot be accepted or rejected. */
 function iterationDecidedAlready(it: Pick<Iteration, 'id' | 'status'>): string {
   if (it.status === 'done') {
@@ -128,6 +170,9 @@ const CHILD_OVER: readonly IterationChildStatus[] = ['done', 'failed', 'dropped'
  *   failed, after the wait an issue's redo waits (`proposalRedoDueAt`), up to `max_run_attempts`
  *   Runs and within the day's budget, while the work switch is on; after that the proposal
  *   failed. A Run a human terminated is not redone;
+ * - restart: a human may start a failed proposal over on the dashboard, a step of an iteration
+ *   that still wants it included: its attempts count from 1 again, the new Run told why the
+ *   earlier ones failed, and its iteration goes on unless another step still blocks it;
  * - iterations: one a scout planned is accepted as a whole, by its riskiest and largest step
  *   (`iterationKind`) and counting once toward today's limit, or by a human on the dashboard, or
  *   rejected as a whole with a reason. Accepted, each step becomes a Run once every step it
@@ -350,39 +395,45 @@ export class LocalBacklog {
   // ---- deciding proposals --------------------------------------------------------
 
   /**
-   * The repo of a proposal or iteration a human accepts, with its settings: it must still be in
-   * backlog.repos, without problems. `what`: the proposal or iteration, for messages.
+   * The repo of a proposal or iteration a human accepts, or of a proposal a human starts over
+   * (`restart`), with its settings: it must still be in backlog.repos, without problems. `what`:
+   * the proposal or iteration, for messages.
    */
   private deciding(
     repoId: string,
-    what: { kind: 'proposal' | 'iteration'; id: string },
+    what: { kind: 'proposal' | 'restart' | 'iteration'; id: string },
   ): { repo: Repo; cfg: BacklogRepoConfig } {
     const repo = this.deps.store.findRepo(repoId);
-    const proposal = what.kind === 'proposal';
     if (!repo) {
       throw new NotFoundError(
-        proposal
+        what.kind === 'iteration'
           ? t({
-              zh: `提案 ${what.id} 的仓库不存在`,
-              en: `The repo of proposal ${what.id} not found`,
-            })
-          : t({
               zh: `迭代 ${what.id} 的仓库不存在`,
               en: `The repo of iteration ${what.id} not found`,
+            })
+          : t({
+              zh: `提案 ${what.id} 的仓库不存在`,
+              en: `The repo of proposal ${what.id} not found`,
             }),
       );
     }
     if (!this.cfg.master.backlog?.repos[repo.name]) {
+      const name = repo.name;
       throw new InvalidStateError(
-        proposal
+        what.kind === 'proposal'
           ? t({
-              zh: `仓库 ${repo.name} 已经不在 config.yaml 的 backlog.repos 里，不能再采纳它的提案`,
-              en: `Repo ${repo.name} is no longer in backlog.repos of config.yaml, so its proposals cannot be accepted`,
+              zh: `仓库 ${name} 已经不在 config.yaml 的 backlog.repos 里，不能再采纳它的提案`,
+              en: `Repo ${name} is no longer in backlog.repos of config.yaml, so its proposals cannot be accepted`,
             })
-          : t({
-              zh: `仓库 ${repo.name} 已经不在 config.yaml 的 backlog.repos 里，不能再采纳它的迭代`,
-              en: `Repo ${repo.name} is no longer in backlog.repos of config.yaml, so its iterations cannot be accepted`,
-            }),
+          : what.kind === 'restart'
+            ? t({
+                zh: `仓库 ${name} 已经不在 config.yaml 的 backlog.repos 里，不能再重新开始它的提案`,
+                en: `Repo ${name} is no longer in backlog.repos of config.yaml, so its proposals cannot be started over`,
+              })
+            : t({
+                zh: `仓库 ${name} 已经不在 config.yaml 的 backlog.repos 里，不能再采纳它的迭代`,
+                en: `Repo ${name} is no longer in backlog.repos of config.yaml, so its iterations cannot be accepted`,
+              }),
       );
     }
     return this.repoSetup(repo.name);
@@ -540,7 +591,7 @@ export class LocalBacklog {
       ...p.failures,
       failedAttempt(run, store.currentStageName(run) ?? null, p.attempt),
     ];
-    const maxAttempts = Math.max(cfg.max_run_attempts, p.attempt);
+    const maxAttempts = attemptsAllowed(cfg.max_run_attempts, p.attempt);
     return store.tx(() => {
       if (p.attempt < cfg.max_run_attempts) {
         const pending = store.updateProposal(p.id, { failures, redo: 'pending' });
@@ -592,8 +643,56 @@ export class LocalBacklog {
         runId: run.id,
         failedRunId: failed.id,
         attempt,
-        maxAttempts: Math.max(cfg.max_run_attempts, attempt),
+        maxAttempts: attemptsAllowed(cfg.max_run_attempts, attempt),
       });
+    });
+  }
+
+  /**
+   * Start a failed proposal over by hand, as adding ares1:ready again does for an issue: its
+   * attempts count from 1 again, and a Run is created at once whose goal is the proposal's text
+   * as kept followed by why each earlier attempt failed (`goalWithEarlierAttempts`; `failures`
+   * stays, for that and for the dashboard). Only a failed proposal its iteration, if any, still
+   * wants (`proposalRestartable`); the repo must still be in backlog.repos, without problems. A
+   * human's decision, like accepting: neither today's auto-accept count nor the day's budget hold
+   * it back, and whether it was accepted without a human stays as it was. Then, in one
+   * transaction: the proposal accepted again with the new Run as its latest, attempt 1 and no
+   * redo; a `proposal.restarted` event; for a step, its iteration brought in line (follow): the
+   * step running again, and the iteration active again unless another step still blocks it.
+   * Nothing is recorded when the Run cannot be created, as for a redo.
+   */
+  restart(id: string): Proposal {
+    const store = this.deps.store;
+    const p = store.getProposal(id);
+    const iteration = this.iterationOf(p);
+    if (!proposalRestartable(p, iteration)) {
+      throw new InvalidStateError(notRestartable(p, iteration));
+    }
+    const { repo, cfg } = this.deciding(p.repoId, { kind: 'restart', id });
+    const run = this.createProposalRun(
+      repo,
+      cfg,
+      goalWithEarlierAttempts(proposalGoal(p), p.failures),
+    );
+    return store.tx(() => {
+      const restarted = store.updateProposal(id, {
+        status: 'accepted',
+        runId: run.id,
+        attempt: 1,
+        redo: null,
+      });
+      store.event(null, 'proposal.restarted', {
+        repo: repo.name,
+        proposalId: id,
+        runId: run.id,
+        ...(p.runId ? { failedRunId: p.runId } : {}),
+        // The attempts it had used up before.
+        attempts: p.attempt,
+        maxAttempts: attemptsAllowed(cfg.max_run_attempts, 1),
+        ...(iteration ? { iterationId: iteration.id } : {}),
+      });
+      if (iteration) this.follow(repo, iteration.id);
+      return restarted;
     });
   }
 

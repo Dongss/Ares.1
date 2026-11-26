@@ -10,10 +10,11 @@ import type {
 } from '../../../src/api/types.js';
 import { t } from '../../../src/i18n.js';
 import type { Scout, ScoutGap } from '../../../src/store/types.js';
+import { FailedAttempts, RestartAction } from '../components/Attempts.js';
 import { Badge, ConfirmButton, Empty, ErrorBox, TemplateProblems } from '../components/ui.js';
 import { api } from '../lib/api.js';
 import { repoTemplateChoice, repoTemplateProblems, templateSourceText } from '../lib/config.js';
-import { formatCost, formatTime, messageExcerpt, RUN_STATUS } from '../lib/format.js';
+import { formatCost, formatTime, RUN_STATUS } from '../lib/format.js';
 import { useAction, useReloadOn, useResource } from '../lib/hooks.js';
 import {
   autoAcceptText,
@@ -36,7 +37,6 @@ import {
   backlogOutdatedBy,
   canReject,
   decidedText,
-  failureLabel,
   mergeProposals,
   PROPOSAL_STATUS,
   type ProposalGroup,
@@ -45,6 +45,8 @@ import {
   proposalGroups,
   proposalRedoText,
   RECENT_PROPOSALS,
+  restartBlocker,
+  restartHint,
   scoutProposalFiled,
 } from '../lib/proposals.js';
 import { href } from '../lib/router.js';
@@ -713,7 +715,7 @@ function ProposalItem(props: {
   const blocker = acceptBlocker(p, group.status);
   const waiting = pendingText(p, group.status?.autoAccept ?? null);
   const decided = decidedText(p);
-  const attempts = attemptsText(p, group.status?.maxRunAttempts ?? null);
+  const attempts = attemptsText(p);
   const redo = proposalRedoText(p);
   const accept = async () => {
     if ((await action.run(() => api.acceptProposal(p.id))) !== undefined) onChanged();
@@ -754,24 +756,14 @@ function ProposalItem(props: {
         </div>
       )}
       {redo && <div className="hint">{redo}</div>}
-      {p.failures.length > 0 && (
-        <details className="proposal-failures">
-          <summary>
-            {t({
-              zh: `失败的尝试（${p.failures.length} 次）及原因`,
-              en: `Failed attempts (${p.failures.length}) and why`,
-            })}
-          </summary>
-          <ul>
-            {p.failures.map((f) => (
-              <li key={f.runId}>
-                <a href={href.run(f.runId)}>Run {f.runId}</a>{' '}
-                <span className="muted">{failureLabel(f)}</span>
-                <pre className="pre">{messageExcerpt(f.error)}</pre>
-              </li>
-            ))}
-          </ul>
-        </details>
+      <FailedAttempts failures={p.failures} />
+      {p.restartable && (
+        <RestartAction
+          proposalId={p.id}
+          hint={restartHint(p)}
+          blocker={restartBlocker(p, group.status)}
+          onRestarted={onChanged}
+        />
       )}
       {p.status === 'rejected' && (
         <div className="proposal-outcome">

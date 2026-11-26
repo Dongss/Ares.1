@@ -31,6 +31,7 @@ import {
   runCountText,
   runningText,
   sortIterations,
+  stepAttemptsText,
   stepName,
   stepsName,
   wasAccepted,
@@ -57,6 +58,11 @@ const child = (position: number, over: Partial<IterationChildView> = {}): Iterat
   runIds: [],
   waitingFor: [],
   runs: [],
+  attempt: null,
+  maxAttempts: null,
+  redoAt: null,
+  failures: [],
+  restartable: false,
   ...over,
 });
 
@@ -334,10 +340,47 @@ describe('where an iteration stands', () => {
     expect(blockedText({ ...blocked, status: 'active' })).toBeNull();
     expect(blockedHint(blocked)).toContain('ares1:ready');
     expect(blockedHint(iteration({ source: 'local' }))).toContain('终止这个迭代');
+    expect(blockedHint(iteration({ source: 'local' }))).not.toContain('重新开始');
+    // A step of the local backlog whose attempts were used up may be started over.
+    const restartable = iteration({
+      source: 'local',
+      status: 'blocked',
+      children: [child(1, { status: 'failed', restartable: true })],
+    });
+    expect(blockedHint(restartable)).toBe(
+      '下次侦察会换个做法补一步替换它，替换后迭代接着做；也可以修好原因后在下面的计划里点那一步的「重新开始」，次数从头算；不想做剩下的，就终止这个迭代',
+    );
     setLang('en');
     expect(blockedText(two)).toBe(
       'Step 1 “Step title 1” failed, step 2 “Step title 2” was dropped, so the steps depending on them cannot start',
     );
+    expect(blockedHint(restartable)).toContain('use "Start over" on that step');
+  });
+
+  it('tells which attempt a step of the local backlog is at, of how many it gets', () => {
+    const failure = { runId: 'run-1', attempt: 1, stage: null, error: 'x' };
+    // On GitHub, and before its first Run failed: nothing to tell.
+    expect(stepAttemptsText(child(1, { status: 'running' }))).toBeNull();
+    expect(
+      stepAttemptsText(child(1, { status: 'running', attempt: 1, maxAttempts: 3 })),
+    ).toBeNull();
+    const redoing = child(1, {
+      status: 'running',
+      attempt: 2,
+      maxAttempts: 3,
+      failures: [failure],
+    });
+    expect(stepAttemptsText(redoing)).toBe('第 2/3 次尝试');
+    // Its first Run failed and waits to be redone.
+    expect(stepAttemptsText({ ...redoing, attempt: 1 })).toBe('第 1/3 次尝试');
+    expect(stepAttemptsText({ ...redoing, status: 'failed', attempt: 3 })).toBe('第 3/3 次尝试');
+    expect(stepAttemptsText({ ...redoing, maxAttempts: null })).toBe('第 2 次尝试');
+    // Done, dropped or not started: its Runs show for themselves.
+    for (const status of ['done', 'dropped', 'waiting'] as const) {
+      expect(stepAttemptsText({ ...redoing, status }), status).toBeNull();
+    }
+    setLang('en');
+    expect(stepAttemptsText(redoing)).toBe('Attempt 2 of 3');
   });
 
   it('says on a card what blocks it, who accepts it, or what is under way', () => {
@@ -370,6 +413,11 @@ describe('where an iteration stands', () => {
       blockedText(iteration({ status: 'blocked', children: [child(1, { status: 'failed' })] })),
       blockedHint(blocked),
       blockedHint(local),
+      blockedHint({
+        source: 'local',
+        children: [child(1, { status: 'failed', restartable: true })],
+      }),
+      stepAttemptsText(child(1, { status: 'running', attempt: 2, maxAttempts: 3 })),
       pendingHint(local),
       pendingHint(iteration({ status: 'pending' })),
       githubHint(iteration({ status: 'pending' })),
@@ -402,6 +450,11 @@ describe('iterationsOutdatedBy', () => {
       'scout.completed',
       'run.created',
       'run.status',
+      // What a step of the local backlog shows of its attempts.
+      'proposal.redo_scheduled',
+      'proposal.redone',
+      'proposal.failed',
+      'proposal.restarted',
     ]) {
       expect(iterationsOutdatedBy(type), type).toBe(true);
     }

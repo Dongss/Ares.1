@@ -25,6 +25,7 @@ import {
 } from '../backlog/scouting.js';
 import { brandName } from '../brand.js';
 import {
+  attemptsAllowed,
   effectiveDependencies,
   ITERATION_OPEN_STATUSES,
   isAutoAcceptable,
@@ -2192,7 +2193,7 @@ export class IssueBridge {
       redo = attempt < cfg.max_run_attempts ? 'pending' : 'exhausted';
       this.deps.store.setIssueRedo(run.id, redo);
     }
-    const max = Math.max(cfg.max_run_attempts, attempt);
+    const max = attemptsAllowed(cfg.max_run_attempts, attempt);
     if (redo === 'exhausted') {
       const failures = [...(issue.earlier ?? []), failedAttempt(run, stage)];
       return { kind: 'exhausted', attempt, max, failures };
@@ -2237,7 +2238,7 @@ export class IssueBridge {
         continue;
       }
       const attempt = (prev.attempt ?? 1) + 1;
-      const max = Math.max(cfg.max_run_attempts, attempt);
+      const max = attemptsAllowed(cfg.max_run_attempts, attempt);
       // The goal is read from the issue again: a human may have made it clearer meanwhile.
       const goal = goalFromIssue(issue);
       let untrusted: UntrustedAuthor | undefined;

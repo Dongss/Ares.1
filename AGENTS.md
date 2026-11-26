@@ -92,8 +92,8 @@ src/
   api/
     server.ts         HTTP API (Hono) and SSE
     types.ts          API data types, shared by Master and dashboard
-    agents.ts, stats.ts, workspaces.ts, iterations.ts, diff.ts   Agents, Stats, Workspaces and
-                      Iterations page data, diffs
+    agents.ts, stats.ts, workspaces.ts, iterations.ts, proposals.ts, diff.ts   Agents, Stats,
+                      Workspaces, Iterations and local proposals data, diffs
     cost.ts           whether a cost is unknown (shared with the dashboard)
     static.ts         serves the built dashboard
 scripts/
@@ -105,7 +105,7 @@ web/                  dashboard (React + Vite)
   src/App.tsx         top bar (navigation, work, notification and language switches) and routing
   src/pages/          Home, RunDetail, Issues, Iterations, Stats, Agents, Events, Workspaces, Repos,
                       Config, Guide
-  src/components/     ui.tsx (common), AgentOutput, DiffPanel, FlowChart, IterationCard,
+  src/components/     ui.tsx (common), AgentOutput, Attempts, DiffPanel, FlowChart, IterationCard,
                       Notifications, WorkSwitch
   src/lib/            API calls, SSE, routing, language choice, formatting, each page's pure logic
   src/styles.css      all styles
@@ -144,7 +144,8 @@ test/
     `chooseStageAgent`; the difficulty it goes by is `assessedDifficulty` in
     `src/engine/discussion.ts`), rate-limit waits of Runs and scouts,
     the redo wait of issues and local proposals (`redoDelayMs` / `redoDueAfter` / `redoDueAt` /
-    `proposalRedoDueAt`), raw log retention (`runRawLogsExpired` /
+    `proposalRedoDueAt`), how many Runs a requirement gets (`attemptsAllowed`), which local
+    proposals a human may start over (`proposalRestartable`), raw log retention (`runRawLogsExpired` /
     `scoutRawLogExpired`), leftover worktrees (`leftoverWorkspaces`), which template a repo's
     Runs get by id, the home directory's or the repo's own (`resolveTemplate`), where a repo's
     requirements come from, GitHub or the local backlog (`requirementSource`), whether a repo

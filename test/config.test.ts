@@ -2,6 +2,7 @@ import { readdirSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  attemptsAllowed,
   budgetPauses,
   childReady,
   chooseStageAgent,
@@ -26,6 +27,7 @@ import {
   proposalAwaitingRedo,
   proposalRedoAllowed,
   proposalRedoDueAt,
+  proposalRestartable,
   RATE_LIMIT_WAIT,
   REDO_BACKOFF_MAX_HOURS,
   rateLimitDelayMs,
@@ -2622,6 +2624,33 @@ describe('redo after a failure', () => {
     }
     // A proposal of its own does not look at any iteration.
     expect(proposalRedoAllowed({ id: 'proposal-1', iterationId: null }, null)).toBe(true);
+
+    // Given up, a step may be started over by hand while its iteration still wants it.
+    const givenUp = { ...step, status: 'failed' as const };
+    expect(proposalRestartable(givenUp, iteration('blocked', { status: 'failed' }))).toBe(true);
+    for (const it of [
+      iteration('cancelled', { status: 'failed' }),
+      iteration('done'),
+      iteration('blocked', { status: 'failed', replacedBy: 3 }),
+      iteration('active', { status: 'dropped' }),
+      null,
+    ]) {
+      expect(proposalRestartable(givenUp, it)).toBe(false);
+    }
+    // Not given up: there is nothing to start over.
+    expect(proposalRestartable(step, iteration('blocked', { status: 'failed' }))).toBe(false);
+  });
+
+  it('starts over by hand only a proposal given up, counting attempts of as many as it gets', () => {
+    const own = { id: 'proposal-1', iterationId: null };
+    expect(proposalRestartable({ ...own, status: 'failed' }, null)).toBe(true);
+    for (const status of ['pending', 'accepted', 'rejected'] as const) {
+      expect(proposalRestartable({ ...own, status }, null), status).toBe(false);
+    }
+    expect(attemptsAllowed(3, 1)).toBe(3);
+    expect(attemptsAllowed(3, 3)).toBe(3);
+    // max_run_attempts lowered since it started: never fewer than the attempts made.
+    expect(attemptsAllowed(2, 3)).toBe(3);
   });
 });
 

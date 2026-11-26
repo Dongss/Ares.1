@@ -876,6 +876,29 @@ export function proposalRedoDueAt(
 }
 
 /**
+ * How many Runs a requirement whose latest Run is its `attempt`-th gets in all: its repo's
+ * `max_run_attempts`, or `attempt` when it is past that already (the setting was lowered since
+ * it started), so that 「第 n/m 次」 never has n above m.
+ */
+export function attemptsAllowed(maxRunAttempts: number, attempt: number): number {
+  return Math.max(maxRunAttempts, attempt);
+}
+
+/**
+ * Whether a human may start a local proposal over (`POST /api/proposals/:id/restart`), counting
+ * its attempts from 1 again: it failed, its Runs having used up `max_run_attempts`; a step of an
+ * iteration only while that iteration still wants it (`proposalRedoAllowed`: accepted and not
+ * over, the step neither replaced nor dropped). A step that failed otherwise (its Run terminated,
+ * or its assessment dropped the requirement) is not: its proposal is still accepted.
+ */
+export function proposalRestartable(
+  p: Pick<Proposal, 'id' | 'status' | 'iterationId'>,
+  iteration: RedoIteration | null | undefined,
+): boolean {
+  return p.status === 'failed' && proposalRedoAllowed(p, iteration);
+}
+
+/**
  * How long a Run or a scout waits when its agent is out of quota or rate-limited: until the reset
  * time the CLI gave plus `marginMs` (clocks differ, and a quota may come back a little late);
  * without one, a backoff over the limits hit in a row.
