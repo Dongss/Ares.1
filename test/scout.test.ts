@@ -2282,7 +2282,7 @@ describe('localProposalDigest', () => {
     expect(english).not.toMatch(/[一-鿿]/);
   });
 
-  it('leaves the failed steps of an iteration under way to its own digest', () => {
+  it('leaves the failed steps of an iteration under way to its own digest, names the ended one', () => {
     const iterations: ProposalIteration[] = (
       [
         ['iteration-4', 'active'],
@@ -2325,9 +2325,9 @@ describe('localProposalDigest', () => {
         '（无）',
         '',
         '### 多次失败后放弃（不是人拒绝的）',
-        '- proposal-3 已完成迭代的子项（失败 1 次）',
+        '- proposal-3 已完成迭代的子项（失败 1 次，所属迭代 iteration-2 已完成）',
         '  第 1 次（Run run-proposal-3）：构建 失败',
-        '- proposal-2 被终止迭代的子项（失败 1 次）',
+        '- proposal-2 被终止迭代的子项（失败 1 次，所属迭代 iteration-1 已被人终止）',
         '  第 1 次（Run run-proposal-2）：额度用完了',
         '- proposal-1 不属于迭代的（失败 1 次）',
         '  第 1 次（Run run-proposal-1）：准备命令失败',
@@ -2342,6 +2342,7 @@ describe('localProposalDigest', () => {
         givenUp('proposal-5', 'iteration-4', 'Step under way', 'timed out'),
         givenUp('proposal-4', 'iteration-3', 'Blocked step', 'tests failed'),
         givenUp('proposal-3', 'iteration-2', 'Step of a done iteration', 'build failed'),
+        givenUp('proposal-2', 'iteration-1', 'Step of a cancelled iteration', 'out of quota'),
         givenUp('proposal-1', null, 'Outside any iteration', 'setup failed'),
       ],
       undefined,
@@ -2350,8 +2351,10 @@ describe('localProposalDigest', () => {
     expect(english).toContain(
       [
         '### Given up after repeated failures (not rejected by a human)',
-        '- proposal-3 Step of a done iteration (failed once)',
+        '- proposal-3 Step of a done iteration (failed once; its iteration iteration-2 is done)',
         '  Attempt 1 (Run run-proposal-3): build failed',
+        '- proposal-2 Step of a cancelled iteration (failed once; its iteration iteration-1 was cancelled by a human)',
+        '  Attempt 1 (Run run-proposal-2): out of quota',
         '- proposal-1 Outside any iteration (failed once)',
         '  Attempt 1 (Run run-proposal-1): setup failed',
       ].join('\n'),

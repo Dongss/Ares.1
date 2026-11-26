@@ -556,8 +556,8 @@ export function createApi(deps: ApiDeps): Hono {
 
   // Starting a failed proposal over, a step of an iteration that still wants it included: its
   // attempts count from 1 again and a Run is created at once. Any other proposal, 409.
-  app.post('/api/proposals/:id/restart', (c) => {
-    const proposal = backlog.restart(c.req.param('id'));
+  app.post('/api/proposals/:id/restart', async (c) => {
+    const proposal = await backlog.restart(c.req.param('id'));
     const run = store.getRun(proposal.runId ?? '');
     return c.json({
       proposal: proposalView(store, proposal, settings()),

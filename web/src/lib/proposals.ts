@@ -1,4 +1,4 @@
-import type { BacklogRepoStatus, ProposalView } from '../../../src/api/types.js';
+import type { BacklogRepoStatus, BacklogStatus, ProposalView } from '../../../src/api/types.js';
 import { isAutoAcceptable } from '../../../src/config/flow.js';
 import { join, t } from '../../../src/i18n.js';
 import type { FailedAttempt, ProposalStatus, ScoutProposal } from '../../../src/store/types.js';
@@ -271,11 +271,13 @@ export function restartHint(
 /**
  * Why a failed proposal cannot be started over now, as the Master would refuse it: its repo left
  * backlog.repos, or has problems. null when it can, and for one that may not be started over at
- * all (`restartable` false).
+ * all (`restartable` false). `problemsShown`: the page shows the repo's problems above the
+ * proposal, so they are only pointed to; otherwise they are spelled out.
  */
 export function restartBlocker(
   p: Pick<ProposalView, 'restartable' | 'repo'>,
   repo: Pick<BacklogRepoStatus, 'problems'> | null,
+  problemsShown = true,
 ): string | null {
   if (!p.restartable) return null;
   if (!repo) {
@@ -284,13 +286,36 @@ export function restartBlocker(
       en: `${p.repo} is no longer in backlog.repos of config.yaml, so its proposals cannot be started over`,
     });
   }
-  if (repo.problems.length > 0) {
+  if (repo.problems.length === 0) return null;
+  if (problemsShown) {
     return t({
       zh: '这个仓库的配置有问题（见上面），改好之后才能重新开始',
       en: 'The repo has problems (see above); fix them before starting it over',
     });
   }
-  return null;
+  // The problems come from the Master, in its language; only the separator follows the page's.
+  const problems = repo.problems.join(t({ zh: '；', en: '; ' }));
+  return t({
+    zh: `${p.repo} 的配置有问题，改好之后才能重新开始：${problems}`,
+    en: `${p.repo} has problems; fix them before starting it over: ${problems}`,
+  });
+}
+
+/**
+ * Why a failed step of an iteration of the local backlog cannot be started over now, as
+ * `restartBlocker` says of a proposal of `repo` (the iteration's), the repo's problems spelled
+ * out: the iteration's page does not show them. null while the local backlog's status is not
+ * known (`backlog` undefined), so that the button is not held back on a guess; the Master still
+ * refuses what it must.
+ */
+export function stepRestartBlocker(
+  step: Pick<ProposalView, 'restartable'>,
+  repo: string,
+  backlog: Pick<BacklogStatus, 'repos'> | undefined,
+): string | null {
+  if (!backlog) return null;
+  const status = backlog.repos.find((r) => r.name === repo) ?? null;
+  return restartBlocker({ restartable: step.restartable, repo }, status, false);
 }
 
 /** The button that starts a failed proposal (or step) over, and what confirming it says. */

@@ -1700,6 +1700,26 @@ function digestSection(heading: string, lines: string[], max: number): string {
 export type ProposalIteration = Pick<Iteration, 'id' | 'title' | 'status' | 'children'>;
 
 /**
+ * How the iteration a listed proposal was a step of ended: done, or cancelled by a human. Null
+ * when it is not a step of one; the steps of an iteration still open are not listed at all.
+ */
+function endedIterationPart(iteration: ProposalIteration | undefined): string | null {
+  if (iteration?.status === 'done') {
+    return t({
+      zh: `所属迭代 ${iteration.id} 已完成`,
+      en: `its iteration ${iteration.id} is done`,
+    });
+  }
+  if (iteration?.status === 'cancelled') {
+    return t({
+      zh: `所属迭代 ${iteration.id} 已被人终止`,
+      en: `its iteration ${iteration.id} was cancelled by a human`,
+    });
+  }
+  return null;
+}
+
+/**
  * An accepted proposal: the Run it became and how that stands, whether it was accepted without a
  * human, the iteration it was a step of once that ended (done, or cancelled by a human, when a
  * step without a Run never got one); why the Run failed or why its assessment dropped the
@@ -1722,18 +1742,8 @@ function acceptedProposalLine(
     parts.push(t({ zh: '等自动重做', en: 'waiting to be redone automatically' }));
   }
   if (p.auto) parts.push(t({ zh: '自动采纳', en: 'accepted automatically' }));
-  if (iteration?.status === 'done') {
-    parts.push(
-      t({ zh: `所属迭代 ${iteration.id} 已完成`, en: `its iteration ${iteration.id} is done` }),
-    );
-  } else if (iteration?.status === 'cancelled') {
-    parts.push(
-      t({
-        zh: `所属迭代 ${iteration.id} 已被人终止`,
-        en: `its iteration ${iteration.id} was cancelled by a human`,
-      }),
-    );
-  }
+  const ended = endedIterationPart(iteration);
+  if (ended) parts.push(ended);
   const about = parts.length
     ? t({ zh: `（${parts.join('，')}）`, en: ` (${parts.join('; ')})` })
     : '';
@@ -1755,12 +1765,16 @@ function acceptedProposalLine(
 
 /**
  * A proposal given up after its Runs failed `max_run_attempts` times: how many times, whether it
- * was accepted without a human, then each attempt with its Run, the stage it failed in and why.
+ * was accepted without a human, the iteration it was a step of and how that ended, so the scout
+ * can tell a step left behind from a requirement of its own; then each attempt with its Run, the
+ * stage it failed in and why.
  */
-function failedProposalLine(p: Proposal): string {
+function failedProposalLine(p: Proposal, iteration: ProposalIteration | undefined): string {
   const n = p.failures.length;
   const parts = [t({ zh: `失败 ${n} 次`, en: `failed ${n === 1 ? 'once' : `${n} times`}` })];
   if (p.auto) parts.push(t({ zh: '自动采纳', en: 'accepted automatically' }));
+  const ended = endedIterationPart(iteration);
+  if (ended) parts.push(ended);
   const about = t({ zh: `（${parts.join('，')}）`, en: ` (${parts.join('; ')})` });
   const attempts = p.failures.map((f) => {
     const head = t({
@@ -1783,7 +1797,7 @@ function failedProposalLine(p: Proposal): string {
  * trusted. `iterations` are the repo's: the steps of the one under way are left out, as the
  * iteration's own digest lists them (`iterationDigest`); the steps of one rejected as a whole make
  * one entry, the iteration with the titles of its steps and the reason; the steps of one that
- * ended are listed as the accepted proposals they are, with how it ended.
+ * ended are listed as the accepted or failed proposals they are, with how it ended.
  */
 export function localProposalDigest(
   proposals: readonly Proposal[],
@@ -1829,7 +1843,7 @@ export function localProposalDigest(
       })}${reasonLine(p.rejectReason)}`,
     );
   }
-  const failed = of('failed').map(failedProposalLine);
+  const failed = of('failed').map((p) => failedProposalLine(p, iterationOf(p)));
   return [
     digestSection(
       t({ zh: '### 等人决定', en: '### Waiting for a human' }),

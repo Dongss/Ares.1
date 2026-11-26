@@ -659,9 +659,12 @@ export class LocalBacklog {
    * transaction: the proposal accepted again with the new Run as its latest, attempt 1 and no
    * redo; a `proposal.restarted` event; for a step, its iteration brought in line (follow): the
    * step running again, and the iteration active again unless another step still blocks it.
-   * Nothing is recorded when the Run cannot be created, as for a redo.
+   * Nothing is recorded when the Run cannot be created, as for a redo. Within the transaction the
+   * proposal and its iteration are read again and must still allow it: when they no longer do, or
+   * recording fails otherwise, nothing is recorded and the new Run, which no proposal leads to, is
+   * terminated before the error is thrown.
    */
-  restart(id: string): Proposal {
+  async restart(id: string): Promise<Proposal> {
     const store = this.deps.store;
     const p = store.getProposal(id);
     const iteration = this.iterationOf(p);
@@ -674,26 +677,49 @@ export class LocalBacklog {
       cfg,
       goalWithEarlierAttempts(proposalGoal(p), p.failures),
     );
-    return store.tx(() => {
-      const restarted = store.updateProposal(id, {
-        status: 'accepted',
-        runId: run.id,
-        attempt: 1,
-        redo: null,
+    try {
+      return store.tx(() => {
+        // What creating the Run set off may have decided the proposal or ended its iteration.
+        const current = store.getProposal(id);
+        const currentIteration = this.iterationOf(current);
+        if (!proposalRestartable(current, currentIteration)) {
+          throw new InvalidStateError(notRestartable(current, currentIteration));
+        }
+        const restarted = store.updateProposal(id, {
+          status: 'accepted',
+          runId: run.id,
+          attempt: 1,
+          redo: null,
+        });
+        store.event(null, 'proposal.restarted', {
+          repo: repo.name,
+          proposalId: id,
+          runId: run.id,
+          ...(current.runId ? { failedRunId: current.runId } : {}),
+          // The attempts it had used up before.
+          attempts: current.attempt,
+          maxAttempts: attemptsAllowed(cfg.max_run_attempts, 1),
+          ...(currentIteration ? { iterationId: currentIteration.id } : {}),
+        });
+        if (currentIteration) this.follow(repo, currentIteration.id);
+        return restarted;
       });
-      store.event(null, 'proposal.restarted', {
-        repo: repo.name,
-        proposalId: id,
-        runId: run.id,
-        ...(p.runId ? { failedRunId: p.runId } : {}),
-        // The attempts it had used up before.
-        attempts: p.attempt,
-        maxAttempts: attemptsAllowed(cfg.max_run_attempts, 1),
-        ...(iteration ? { iterationId: iteration.id } : {}),
-      });
-      if (iteration) this.follow(repo, iteration.id);
-      return restarted;
-    });
+    } catch (err) {
+      await this.cancelUnclaimedRun(run.id);
+      throw err;
+    }
+  }
+
+  /**
+   * Terminate a Run created for a proposal that was not recorded on it after all, so that no
+   * work goes on that nothing follows. One that finished meanwhile is left as it is.
+   */
+  private async cancelUnclaimedRun(runId: string): Promise<void> {
+    try {
+      await this.deps.engine.cancel(runId);
+    } catch (err) {
+      if (!(err instanceof InvalidStateError)) throw err;
+    }
   }
 
   /**

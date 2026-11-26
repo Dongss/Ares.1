@@ -36,7 +36,12 @@ import {
   stepName,
   wasAccepted,
 } from '../lib/iterations.js';
-import { proposalRedoText, restartHint } from '../lib/proposals.js';
+import {
+  backlogOutdatedBy,
+  proposalRedoText,
+  restartHint,
+  stepRestartBlocker,
+} from '../lib/proposals.js';
 import { href } from '../lib/router.js';
 
 /** Every iteration not over (a repo has one at most) and the latest ones, each once. */
@@ -452,13 +457,32 @@ function IterationStep(props: {
       {redo && <div className="hint">{redo}</div>}
       <FailedAttempts failures={child.failures} />
       {child.restartable && child.proposalId && (
-        <RestartAction
-          proposalId={child.proposalId}
-          hint={restartHint({ restartable: true, iterationId: it.id })}
-          onRestarted={props.onChanged}
-        />
+        <StepRestart iteration={it} proposalId={child.proposalId} onRestarted={props.onChanged} />
       )}
     </li>
+  );
+}
+
+/**
+ * Starting a failed step of the local backlog over, disabled with the reason when the Master
+ * would refuse it now: the iteration's repo left backlog.repos, or has problems. Loads the local
+ * backlog's status only for such a step.
+ */
+function StepRestart(props: {
+  iteration: IterationView;
+  proposalId: string;
+  onRestarted: () => void;
+}) {
+  const { iteration: it } = props;
+  const backlog = useResource(() => api.backlog(), 'backlog');
+  useReloadOn(backlog.reload, (e) => backlogOutdatedBy(e.type));
+  return (
+    <RestartAction
+      proposalId={props.proposalId}
+      hint={restartHint({ restartable: true, iterationId: it.id })}
+      blocker={stepRestartBlocker({ restartable: true }, it.repo, backlog.data)}
+      onRestarted={props.onRestarted}
+    />
   );
 }
 

@@ -24,6 +24,7 @@ import {
   restartLabels,
   scoutProposalFiled,
   sortProposals,
+  stepRestartBlocker,
 } from './proposals.js';
 
 afterEach(() => setLang('zh'));
@@ -344,8 +345,33 @@ describe('local proposal labels', () => {
     expect(failuresHeading(3)).toBe('失败的尝试（3 次）及原因');
     setLang('en');
     expect(restartLabels().label).toBe('Start over');
+    expect(restartBlocker(failed, repo('demo', { problems: ['模板 x 不存在', 'y'] }), false)).toBe(
+      'demo has problems; fix them before starting it over: 模板 x 不存在; y',
+    );
     expect(restartHint({ ...failed, iterationId: 'iteration-1' })).toBe(
       'It is not redone automatically any more. Once the cause is fixed, start it over: its attempts count from 1 again, and a new Run is created at once, told why each earlier attempt failed; the iteration goes on again unless another step still blocks it',
+    );
+  });
+
+  it("says why a failed step cannot be started over, by its iteration's repo in the backlog", () => {
+    const step = { restartable: true };
+    const backlog = {
+      repos: [repo('other', { problems: ['别的仓库的问题'] }), repo('demo', { problems: [] })],
+    };
+    // Not known yet: nothing held back on a guess.
+    expect(stepRestartBlocker(step, 'demo', undefined)).toBeNull();
+    expect(stepRestartBlocker(step, 'demo', backlog)).toBeNull();
+    expect(stepRestartBlocker({ restartable: false }, 'gone', backlog)).toBeNull();
+    expect(stepRestartBlocker(step, 'gone', backlog)).toBe(
+      'gone 已经不在 config.yaml 的 backlog.repos 里，不能再重新开始它的提案',
+    );
+    // The iteration's page does not show the repo's problems: they are spelled out.
+    expect(stepRestartBlocker(step, 'other', backlog)).toBe(
+      'other 的配置有问题，改好之后才能重新开始：别的仓库的问题',
+    );
+    const broken = { repos: [repo('demo', { problems: ['模板 x 不存在', 'demo 没有注册'] })] };
+    expect(stepRestartBlocker(step, 'demo', broken)).toBe(
+      'demo 的配置有问题，改好之后才能重新开始：模板 x 不存在；demo 没有注册',
     );
   });
 
@@ -391,6 +417,10 @@ describe('local proposal labels', () => {
       restartHint({ restartable: true, iterationId: 'iteration-1' }),
       restartBlocker({ restartable: true, repo: 'demo' }, null),
       restartBlocker({ restartable: true, repo: 'demo' }, repo('demo', { problems: ['x'] })),
+      stepRestartBlocker({ restartable: true }, 'gone', { repos: [] }),
+      stepRestartBlocker({ restartable: true }, 'demo', {
+        repos: [repo('demo', { problems: ['x'] })],
+      }),
       restartLabels().label,
       restartLabels().confirm,
     ];
