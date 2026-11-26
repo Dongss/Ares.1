@@ -343,6 +343,13 @@ export const GITLAB_DEVELOPER: FakeAuthor = {
 /** A Guest of FakeGitLab's project: a member, but one who cannot push, so not trusted. */
 export const GITLAB_GUEST: FakeAuthor = { login: 'guest', association: 'GUEST', accessLevel: 10 };
 
+/** A Reporter of FakeGitLab's project: may review merge requests, cannot push, not trusted. */
+export const GITLAB_REPORTER: FakeAuthor = {
+  login: 'reporter',
+  association: 'REPORTER',
+  accessLevel: 20,
+};
+
 /** Somebody who is no member of FakeGitLab's project. */
 export const GITLAB_STRANGER: FakeAuthor = {
   login: 'stranger',
@@ -396,12 +403,18 @@ export interface FakePull extends ChangeRequestStatus {
   comments: string[];
 }
 
-/** A review a human submits on FakeGitHub (`reviewPull`). */
+/**
+ * A review a human submits on FakeGitHub's pull request or FakeGitLab's merge request
+ * (`reviewPull`); its author is judged as for any FakeAuthor, by `association` on GitHub and by
+ * `accessLevel` on GitLab.
+ */
 export interface FakeReview {
   /** Login; null for a deleted account. */
   author: string | null;
   /** GitHub's authorAssociation, e.g. OWNER or NONE. */
   association: string;
+  /** The reviewer's access level to GitLab's project, e.g. 30 for Developer; null: no member. */
+  accessLevel?: number | null;
   state: ReviewState;
   body: string;
   /** The commit reviewed; defaults to the pull request's head. */
@@ -410,10 +423,15 @@ export interface FakeReview {
   reviewVerdict?: ReviewVerdict | null;
 }
 
-/** A review comment a human writes on a line of FakeGitHub's pull request (`commentPull`). */
+/**
+ * A review comment a human writes on a line of FakeGitHub's pull request or FakeGitLab's merge
+ * request (`commentPull`), its author judged as in FakeReview.
+ */
 export interface FakeReviewComment {
   author: string | null;
   association: string;
+  /** The author's access level to GitLab's project; null: no member. */
+  accessLevel?: number | null;
   path: string;
   line: number | null;
   body: string;
@@ -737,7 +755,7 @@ export class FakeGitHub implements CodeHost {
   reviewPull(number: number, review: FakeReview): void {
     const pull = this.pull(number);
     pull.reviews.push({
-      ...githubAuthor(review.author, review.association),
+      ...this.authoredBy(review),
       state: review.state,
       body: review.body,
       commit: review.commit === undefined ? pull.headRefOid : review.commit,
@@ -750,7 +768,7 @@ export class FakeGitHub implements CodeHost {
   commentPull(number: number, comment: FakeReviewComment): void {
     const pull = this.pull(number);
     pull.reviewComments.push({
-      ...githubAuthor(comment.author, comment.association),
+      ...this.authoredBy(comment),
       path: comment.path,
       line: comment.line,
       body: comment.body,
@@ -758,7 +776,23 @@ export class FakeGitHub implements CodeHost {
     });
   }
 
-  /** The checks of the pull request's head commit, as CI reports them. */
+  /** Who wrote a review or a line comment, judged as the platform's client does. */
+  private authoredBy(by: {
+    author: string | null;
+    association: string;
+    accessLevel?: number | null;
+  }): HostAuthored {
+    return this.platform.authored({
+      login: by.author,
+      association: by.association,
+      accessLevel: by.accessLevel,
+    });
+  }
+
+  /**
+   * The checks of the pull request's head commit, as CI reports them; on GitLab, the jobs of the
+   * merge request's head pipeline.
+   */
   setChecks(number: number, checks: readonly HostCheck[]): void {
     this.pull(number).checks = checks.map((c) => ({ ...c }));
   }
@@ -771,15 +805,17 @@ export class FakeGitHub implements CodeHost {
   /**
    * A human merges the pull request on GitHub: its base branch there moves to `commit` (which
    * must exist in the clone, as for `remoteHead`), and the issues its body closes ("Closes #N")
-   * are closed as completed.
+   * are closed as completed, unless `closeIssues` is false: a GitLab project can have closing
+   * issues automatically turned off.
    */
-  mergePull(number: number, commit: string): void {
+  mergePull(number: number, commit: string, opts: { closeIssues?: boolean } = {}): void {
     const pull = this.pull(number);
     pull.state = 'merged';
     pull.mergeable = null;
     pull.mergeCommit = commit;
     this.remoteMissing = false;
     this.remoteHead = commit;
+    if (opts.closeIssues === false) return;
     for (const [, ref] of pull.body.matchAll(CLOSING_REFS)) {
       const issue = this.issues.get(Number(ref));
       if (issue && issue.state === 'open') {
@@ -798,8 +834,11 @@ export class FakeGitHub implements CodeHost {
 /**
  * GitLab in memory: the issues of one project on a multi-level path, "grp/sub/demo" unless told,
  * linked as GitLab does (https://<host>/<path>/-/issues/<n>), their authors judged as the GitLab
- * client does, by their access level to the project (`gitlabAuthor`: Developer and up trusted).
- * Otherwise FakeGitHub's: the calls, the projects they named, the pushes and fetches.
+ * client does, by their access level to the project (`gitlabAuthor`: Developer and up trusted),
+ * also those of reviews and line comments on its merge requests. Otherwise FakeGitHub's: the
+ * calls, the projects they named, the pushes and fetches, and the merge requests as its pull
+ * requests, numbered from the same counter as the issues (GitLab numbers them apart; nothing the
+ * Master does depends on it).
  */
 export class FakeGitLab extends FakeGitHub {
   constructor(project = 'grp/sub/demo', host = 'gitlab.com') {
