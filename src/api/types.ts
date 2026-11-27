@@ -5,6 +5,7 @@ import type { AgentEvent } from '../adapters/types.js';
 import type {
   AgentConfig,
   AgentEntry,
+  AutoAcceptConfig,
   SourceFile,
   TemplateFile,
   WorkflowTemplate,
@@ -365,6 +366,57 @@ export type RepoSourceView =
   | { source: 'github'; issuesRepo: string | null }
   | { source: 'gitlab'; host: string; issuesRepo: string }
   | { source: 'backlog' };
+
+/**
+ * The AI scout of a PUT /api/repos/:id/source body, as written under the entry's `scout:`; a
+ * field left out is left out of config.yaml too, so the schema's default applies.
+ */
+export interface RepoScoutInput {
+  agent: string;
+  auto?: boolean;
+  interval_minutes?: number;
+  max_proposals?: number;
+}
+
+/** The `auto_accept:` of a PUT /api/repos/:id/source body; fields left out take the defaults. */
+export interface RepoAutoAcceptInput {
+  max_risk?: AutoAcceptConfig['max_risk'];
+  max_size?: AutoAcceptConfig['max_size'];
+  max_per_day?: number;
+}
+
+/** What every source of requirements takes, named as in config.yaml (`ProposalSourceSchema`). */
+export interface RepoSourceFieldsInput {
+  template: string;
+  /** null or left out: no scouting. */
+  scout?: RepoScoutInput | null;
+  auto_accept?: RepoAutoAcceptInput;
+  auto_merge?: boolean;
+  max_run_attempts?: number;
+  daily_budget_usd?: number;
+}
+
+/**
+ * Body of PUT /api/repos/:id/source: where the repo's requirements come from, written as its
+ * entry under config.yaml's `github.repos`, `gitlab.repos` or `backlog.repos` (`none`: under
+ * none of them). Field names are config.yaml's; only the fields given are written, so those left
+ * out take the schema's defaults, and fields a platform does not have are refused.
+ */
+export type RepoSourceInput =
+  | ({
+      platform: 'github';
+      issues_repo?: string;
+      push?: boolean;
+      deliver?: 'push' | 'pr';
+    } & RepoSourceFieldsInput)
+  | ({
+      platform: 'gitlab';
+      issues_repo: string;
+      push?: boolean;
+      deliver?: 'push' | 'mr';
+    } & RepoSourceFieldsInput)
+  | ({ platform: 'backlog' } & RepoSourceFieldsInput)
+  | { platform: 'none' };
 
 /** A CLI the Master has an adapter for. */
 export interface CliInfo {

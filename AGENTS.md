@@ -44,6 +44,7 @@ src/
     schema.ts         formats of config.yaml, agents.yaml, workflows and Run overrides (zod)
     defaults.ts       default config and the self-dev template, written on first start
     load.ts           load and validate config (invalid agents and templates are only disabled)
+    edit.ts           rewrite one repo's requirements source entry in config.yaml, keeping comments
     watch.ts          reload config when its files or the repos' own templates change
     repo-workflows.ts read each repo's .ares1/workflows/ as committed on its target branch, again
                       when the branch moves
