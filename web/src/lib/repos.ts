@@ -1,12 +1,20 @@
 import type {
   RepoDetection,
   RepoInput,
+  RepoPatchInput,
+  RepoServeInput,
   RepoTrial,
   RepoTrialResult,
   RepoTrialStatus,
 } from '../../../src/api/types.js';
+import {
+  REPO_SERVE_DEFAULTS,
+  REPO_SERVE_TIMEOUT_SECONDS,
+  serveReadyPathValid,
+  serveReadyTimeoutValid,
+} from '../../../src/config/flow.js';
 import { t } from '../../../src/i18n.js';
-import type { Repo } from '../../../src/store/types.js';
+import type { Repo, RepoServe } from '../../../src/store/types.js';
 import {
   formatDuration,
   formatSpan,
@@ -190,6 +198,147 @@ export function detectLabel(busy: boolean): string {
   return busy
     ? t({ zh: '探测中…', en: 'Detecting…' })
     : t({ zh: '按项目文件探测', en: 'Detect from project files' });
+}
+
+/**
+ * The service boxes of the edit form, as typed. A blank ready path or timeout takes the
+ * default (`REPO_SERVE_DEFAULTS`), which the boxes show as their placeholders.
+ */
+export interface ServeForm {
+  command: string;
+  readyPath: string;
+  /** Whole seconds. */
+  readyTimeoutSeconds: string;
+}
+
+/** The service boxes for the repo's saved service; all blank when it has none. */
+export function serveFormInit(serve: RepoServe | null): ServeForm {
+  if (!serve) return emptyServeForm();
+  return {
+    command: serve.command,
+    readyPath: serve.readyPath,
+    readyTimeoutSeconds: String(serve.readyTimeoutSeconds),
+  };
+}
+
+/** The service boxes cleared: saved like this, the repo has no service. */
+export function emptyServeForm(): ServeForm {
+  return { command: '', readyPath: '', readyTimeoutSeconds: '' };
+}
+
+/** Whether every service box is blank, so that clearing them would change nothing. */
+export function serveFormBlank(form: ServeForm): boolean {
+  return [form.command, form.readyPath, form.readyTimeoutSeconds].every((v) => v.trim() === '');
+}
+
+/** A typed ready timeout: the default when blank, NaN when it is not a whole number. */
+function typedTimeout(typed: string): number {
+  const s = typed.trim();
+  if (s === '') return REPO_SERVE_DEFAULTS.readyTimeoutSeconds;
+  return /^\d+$/.test(s) ? Number(s) : Number.NaN;
+}
+
+/**
+ * What keeps the service boxes from being saved, one line each, by the rules the API checks.
+ * None without a start command: saving then removes the service, and the other two boxes are
+ * not sent.
+ */
+export function serveFormProblems(form: ServeForm): string[] {
+  if (form.command.trim() === '') return [];
+  const problems: string[] = [];
+  const path = form.readyPath.trim();
+  if (path !== '' && !serveReadyPathValid(path)) {
+    problems.push(t({ zh: '就绪路径必须以 / 开头', en: 'The ready path must start with /' }));
+  }
+  if (!serveReadyTimeoutValid(typedTimeout(form.readyTimeoutSeconds))) {
+    const { min, max } = REPO_SERVE_TIMEOUT_SECONDS;
+    problems.push(
+      t({
+        zh: `就绪超时必须是 ${min} 到 ${max} 之间的整数（秒）`,
+        en: `The ready timeout must be a whole number of seconds from ${min} to ${max}`,
+      }),
+    );
+  }
+  return problems;
+}
+
+/**
+ * `serve` of PATCH /api/repos/:id for the service boxes: null, which removes the service, without
+ * a start command; blank boxes take the defaults. For boxes without problems (`serveFormProblems`).
+ */
+export function serveInput(form: ServeForm): RepoServeInput | null {
+  const command = form.command.trim();
+  if (command === '') return null;
+  return {
+    command,
+    readyPath: form.readyPath.trim() || REPO_SERVE_DEFAULTS.readyPath,
+    readyTimeoutSeconds: typedTimeout(form.readyTimeoutSeconds),
+  };
+}
+
+/** What the edit form of a repo holds, as typed. */
+export interface EditRepoForm {
+  targetBranch: string;
+  /** Commands, one per line. */
+  verify: string;
+  setup: string;
+  serve: ServeForm;
+}
+
+/** The body of PATCH /api/repos/:id for the edit form: every setting it shows, trimmed. */
+export function repoPatch(form: EditRepoForm): RepoPatchInput {
+  return {
+    targetBranch: form.targetBranch.trim(),
+    verifyCommands: parseLines(form.verify),
+    setupCommands: parseLines(form.setup),
+    serve: serveInput(form.serve),
+  };
+}
+
+export function serveLabel(): string {
+  return t({ zh: '服务启动命令', en: 'Service start command' });
+}
+
+/** What the start command is for, by its box. */
+export function serveHint(): string {
+  return t({
+    zh: '写了 serve: true 的命令阶段先在 Run 的工作目录里运行它起服务，等服务就绪再跑命令，命令跑完停掉。服务要监听环境变量 PORT 给的端口；留空就是不起服务',
+    en: "A command stage with serve: true first runs it in the Run's working directory to start the service, runs its commands once the service is ready, and stops it after them. The service must listen on the port in the PORT environment variable; leave it empty for no service",
+  });
+}
+
+/** What the ready path is for, by its box. */
+export function serveReadyPathHint(): string {
+  return t({
+    zh: '对这个路径的请求收到状态码小于 500 的响应就算就绪',
+    en: 'The service is ready once a request to this path gets an answer with a status below 500',
+  });
+}
+
+/** What the ready timeout is for, by its box. */
+export function serveTimeoutHint(): string {
+  const { min, max } = REPO_SERVE_TIMEOUT_SECONDS;
+  return t({
+    zh: `这么久还没就绪，阶段就按命令失败处理（${min}–${max}）`,
+    en: `Not ready by then, the stage fails as a failed command would (${min}–${max})`,
+  });
+}
+
+/** How a repo's card describes its saved service, after the start command. */
+export function serveSummary(serve: Pick<RepoServe, 'readyPath' | 'readyTimeoutSeconds'>): string {
+  const n = serve.readyTimeoutSeconds;
+  return t({
+    zh: `就绪路径 ${serve.readyPath}，最多等 ${n} 秒`,
+    en: `ready at ${serve.readyPath}, within ${n} ${n === 1 ? 'second' : 'seconds'}`,
+  });
+}
+
+/** What a repo's card says when it has no service. */
+export function noServeNote(): string {
+  return t({
+    zh: '无（写了 serve: true 的命令阶段不起服务，命令照常运行）',
+    en: 'None (a command stage with serve: true starts no service and runs its commands as usual)',
+  });
 }
 
 /** Where a command of a trial is, as its row on the dashboard shows it. */

@@ -13,7 +13,8 @@
 // GitLab or the local backlog) and how often that source is polled, whether a repo delivers
 // through pull requests (GitHub's) or merge requests (GitLab's) and what each is called, which
 // code host a Run goes with, what a repo's entry in a source of requirements takes for the fields
-// it leaves out, how many Runs may execute across every repo
+// it leaves out, the defaults and limits of a repo's service settings, how many Runs may execute
+// across every repo
 // (`concurrency.max_runs`), and the rules of iterations: how many
 // children one plans at most, the kind auto-accept judges one by as a whole, which children a
 // child waits for, its progress and where it stands.
@@ -81,6 +82,30 @@ export const REPO_SOURCE_DEFAULTS = {
   push: boolean;
   deliver: 'push';
 };
+
+/**
+ * What a repo's service settings (`Repo.serve`) take for a field the API is given without, the
+ * same as the repos table's column defaults; the API's schema fills them in, and the dashboard's
+ * form starts from them.
+ */
+export const REPO_SERVE_DEFAULTS = { readyPath: '/', readyTimeoutSeconds: 120 } as const;
+
+/** The range of a repo's service's ready timeout, in whole seconds: the API and the form check it. */
+export const REPO_SERVE_TIMEOUT_SECONDS = { min: 1, max: 3600 } as const;
+
+/** Whether a ready path is one the API takes: it starts with `/`. */
+export function serveReadyPathValid(path: string): boolean {
+  return path.startsWith('/');
+}
+
+/** Whether a ready timeout is one the API takes: whole seconds within the range. */
+export function serveReadyTimeoutValid(seconds: number): boolean {
+  return (
+    Number.isInteger(seconds) &&
+    seconds >= REPO_SERVE_TIMEOUT_SECONDS.min &&
+    seconds <= REPO_SERVE_TIMEOUT_SECONDS.max
+  );
+}
 
 /**
  * What each size means, by scope. The one definition the scout's output format, the requirement

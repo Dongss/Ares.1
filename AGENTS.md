@@ -125,8 +125,9 @@ web/                  dashboard (React + Vite)
   src/pages/          Home, RunDetail, Issues, Iterations, Stats, Agents, Events, Workspaces, Repos,
                       Config, Guide
   src/components/     ui.tsx (common), AgentOutput, Attempts, DiffPanel, FlowChart, IterationCard,
-                      Notifications, WorkSwitch, RepoForms (a repo's register, commands, trial and
-                      source forms), OnboardWizard (the Repos page's wizard bringing a project in)
+                      Notifications, WorkSwitch, RepoForms (a repo's register, commands, service,
+                      trial and source forms), OnboardWizard (the Repos page's wizard bringing a
+                      project in)
   src/lib/            API calls, SSE, routing, language choice, formatting, each page's pure logic
   src/styles.css      all styles
 docs/                 documents for people besides the README (in Chinese)
@@ -175,7 +176,9 @@ test/
     requirements come from, GitHub, GitLab or the local backlog (`requirementSource`: a name in
     more than one of `github.repos`, `gitlab.repos`, `backlog.repos` is the first's), and how
     often that source is polled (`sourcePollMinutes`), the defaults of a repo's entry there, which
-    the schema fills in and the dashboard's form starts from (`REPO_SOURCE_DEFAULTS`), whether a
+    the schema fills in and the dashboard's form starts from (`REPO_SOURCE_DEFAULTS`), the
+    defaults and limits of a repo's service settings, which the API and the dashboard's form both
+    go by (`REPO_SERVE_DEFAULTS` / `serveReadyPathValid` / `serveReadyTimeoutValid`), whether a
     repo delivers through pull
     requests (`deliversByPr` / `repoDeliversByPr`: GitHub repos with `deliver: pr`, GitLab repos
     with `deliver: mr`, their merge requests) and what the texts call them (`changeRequestTerms`:

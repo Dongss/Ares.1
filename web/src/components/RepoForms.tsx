@@ -5,21 +5,35 @@ import type {
   RepoTrial,
   RepoTrialInput,
 } from '../../../src/api/types.js';
-import { changeRequestTerms } from '../../../src/config/flow.js';
+import {
+  changeRequestTerms,
+  REPO_SERVE_DEFAULTS,
+  REPO_SERVE_TIMEOUT_SECONDS,
+} from '../../../src/config/flow.js';
 import { t } from '../../../src/i18n.js';
-import type { Repo } from '../../../src/store/types.js';
+import type { Repo, RepoServe } from '../../../src/store/types.js';
 import { api } from '../lib/api.js';
 import { useAction, useReloadOn, useResource, useTick } from '../lib/hooks.js';
 import {
   detectionNote,
+  emptyServeForm,
   missingProgramNote,
   newRepoInput,
+  noServeNote,
   REPO_ORIGINS,
   type RepoOrigin,
   registerLabel,
   repoOriginHint,
   repoOriginLabel,
   repoPathLabel,
+  type ServeForm,
+  serveFormBlank,
+  serveFormProblems,
+  serveHint,
+  serveLabel,
+  serveReadyPathHint,
+  serveSummary,
+  serveTimeoutHint,
   setupHint,
   setupLabel,
   type TrialRow,
@@ -55,7 +69,8 @@ import {
 import { Badge, Collapsible, ErrorBox, Pre } from './ui.js';
 
 // The pieces of the Repos page that its cards and the wizard bringing a new project in share:
-// registering a repo, its commands, trying them, and where its requirements come from.
+// registering a repo, its commands, its service, trying the commands, and where its requirements
+// come from.
 
 /** A repo's commands, one `code` each; 「None」 without any. */
 export function CommandList({ commands }: { commands: string[] }) {
@@ -114,6 +129,103 @@ export function CommandsFields(props: {
         onChange={props.onSetup}
       />
     </>
+  );
+}
+
+/** A repo's saved service as its card shows it: the start command and its ready settings. */
+export function ServeView({ serve }: { serve: RepoServe | null }) {
+  if (!serve) return <span className="muted">{noServeNote()}</span>;
+  return (
+    <>
+      <span className="commands">
+        <code>{serve.command}</code>
+      </span>
+      <div className="hint">{serveSummary(serve)}</div>
+    </>
+  );
+}
+
+/**
+ * The service boxes of the edit form: the start command, its ready path and timeout, what keeps
+ * them from being saved, and a button that clears them (saved cleared, the repo has no service).
+ */
+export function ServeFields(props: {
+  value: ServeForm;
+  onChange: (value: ServeForm) => void;
+  disabled?: boolean;
+}) {
+  const { value, onChange } = props;
+  const set = <K extends keyof ServeForm>(key: K, v: ServeForm[K]) =>
+    onChange({ ...value, [key]: v });
+  const problems = serveFormProblems(value);
+  return (
+    <fieldset className="serve-fields" disabled={props.disabled}>
+      <legend>{t({ zh: '服务', en: 'Service' })}</legend>
+      <label className="field">
+        <span>
+          {serveLabel()}
+          {t({ zh: '（可选）', en: ' (optional)' })}
+          <span className="hint"> {serveHint()}</span>
+        </span>
+        <input
+          className="mono"
+          value={value.command}
+          onChange={(e) => set('command', e.target.value)}
+          placeholder="npm start"
+        />
+      </label>
+      <div className="serve-row">
+        <label className="field">
+          <span>
+            {t({ zh: '就绪路径', en: 'Ready path' })}
+            <span className="hint"> {serveReadyPathHint()}</span>
+          </span>
+          <input
+            className="mono"
+            value={value.readyPath}
+            onChange={(e) => set('readyPath', e.target.value)}
+            placeholder={REPO_SERVE_DEFAULTS.readyPath}
+          />
+        </label>
+        <label className="field">
+          <span>
+            {t({ zh: '就绪超时（秒）', en: 'Ready timeout (seconds)' })}
+            <span className="hint"> {serveTimeoutHint()}</span>
+          </span>
+          <input
+            type="number"
+            value={value.readyTimeoutSeconds}
+            onChange={(e) => set('readyTimeoutSeconds', e.target.value)}
+            min={REPO_SERVE_TIMEOUT_SECONDS.min}
+            max={REPO_SERVE_TIMEOUT_SECONDS.max}
+            step={1}
+            placeholder={String(REPO_SERVE_DEFAULTS.readyTimeoutSeconds)}
+          />
+        </label>
+      </div>
+      {problems.length > 0 && (
+        <ul className="serve-problems">
+          {problems.map((p) => (
+            <li key={p}>{p}</li>
+          ))}
+        </ul>
+      )}
+      <div className="form-actions">
+        <button
+          type="button"
+          onClick={() => onChange(emptyServeForm())}
+          disabled={serveFormBlank(value)}
+        >
+          {t({ zh: '清空', en: 'Clear' })}
+        </button>
+        <span className="hint">
+          {t({
+            zh: '清空后保存，就去掉这个仓库的服务启动命令',
+            en: "Clear and save to remove the repo's service start command",
+          })}
+        </span>
+      </div>
+    </fieldset>
   );
 }
 

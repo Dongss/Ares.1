@@ -8,6 +8,8 @@ import { RepoSourceInputSchema, SourceEditConflict, SourceEditInvalid } from '..
 import {
   PROPOSAL_SIZES,
   RAW_LOG_KEEP_DAYS,
+  REPO_SERVE_DEFAULTS,
+  REPO_SERVE_TIMEOUT_SECONDS,
   REQUIREMENT_ITEMS_MAX,
   REQUIREMENT_TEXT_MAX,
   REQUIREMENT_TITLE_MAX,
@@ -16,6 +18,8 @@ import {
   requirementSource,
   runRawLogsExpired,
   SCOUT_GOAL_MAX,
+  serveReadyPathValid,
+  serveReadyTimeoutValid,
   sourcePollMinutes,
 } from '../config/flow.js';
 import type { LoadedConfig } from '../config/load.js';
@@ -167,11 +171,13 @@ const RepoInputSourceSchema = z.discriminatedUnion('kind', [
   z.strictObject({ kind: z.literal('init') }),
 ]) satisfies z.ZodType<RepoInputSource>;
 
-const serveTimeoutInvalid = () =>
-  t({
-    zh: '就绪超时必须是 1 到 3600 之间的整数（秒）',
-    en: 'the ready timeout must be a whole number of seconds from 1 to 3600',
+const serveTimeoutInvalid = () => {
+  const { min, max } = REPO_SERVE_TIMEOUT_SECONDS;
+  return t({
+    zh: `就绪超时必须是 ${min} 到 ${max} 之间的整数（秒）`,
+    en: `the ready timeout must be a whole number of seconds from ${min} to ${max}`,
   });
+};
 
 /** A repo's service; what is left out takes the defaults of the repos table. */
 const RepoServeSchema = z.strictObject({
@@ -181,16 +187,14 @@ const RepoServeSchema = z.strictObject({
     .min(1, { error: () => t({ zh: '启动命令不能为空', en: 'the start command is empty' }) }),
   readyPath: z
     .string()
-    .startsWith('/', {
+    .refine(serveReadyPathValid, {
       error: () => t({ zh: '就绪路径必须以 / 开头', en: 'the ready path must start with /' }),
     })
-    .default('/'),
+    .default(REPO_SERVE_DEFAULTS.readyPath),
   readyTimeoutSeconds: z
     .number({ error: serveTimeoutInvalid })
-    .int({ error: serveTimeoutInvalid })
-    .min(1, { error: serveTimeoutInvalid })
-    .max(3600, { error: serveTimeoutInvalid })
-    .default(120),
+    .refine(serveReadyTimeoutValid, { error: serveTimeoutInvalid })
+    .default(REPO_SERVE_DEFAULTS.readyTimeoutSeconds),
 }) satisfies z.ZodType<RepoServe, RepoServeInput>;
 
 const RepoInput = z.strictObject({

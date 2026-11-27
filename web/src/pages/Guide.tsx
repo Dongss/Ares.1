@@ -392,8 +392,8 @@ function OnboardSection() {
       </p>
       <p className="muted">
         {t({
-          zh: '登记好的仓库在中途关掉向导后照样留着，之后在仓库卡片上接着设置：「修改」里探测和改命令，「试运行」，需求来源后面的「设置」。每一步对应的 API 见 docs/running.md 的「接入新项目」。',
-          en: 'A registered repo stays when the wizard is closed halfway; the rest can be set on its card later: Edit to detect and change the commands, Try the commands, and Set by its requirements. The API behind each step is in the section on bringing in a new project of docs/running.md.',
+          zh: '登记好的仓库在中途关掉向导后照样留着，之后在仓库卡片上接着设置：「修改」里探测和改命令，「试运行」，需求来源后面的「设置」。要对跑起来的服务做检查（冒烟测试、E2E）的，在「修改」里登记服务启动命令，模板的命令阶段写 serve: true，Master 就为每个 Run 起服务、分配端口、用完停掉。每一步对应的 API 见 docs/running.md 的「接入新项目」。',
+          en: 'A registered repo stays when the wizard is closed halfway; the rest can be set on its card later: Edit to detect and change the commands, Try the commands, and Set by its requirements. To check a running service (smoke tests, E2E), register its start command under Edit and write serve: true on a command stage of the template: the Master then starts the service for each Run on a port of its own and stops it afterwards. The API behind each step is in the section on bringing in a new project of docs/running.md.',
         })}
       </p>
     </>

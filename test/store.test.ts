@@ -10,6 +10,7 @@ import {
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { REPO_SERVE_DEFAULTS } from '../src/config/flow.js';
 import { TemplateSchema } from '../src/config/schema.js';
 import { setLang } from '../src/i18n.js';
 import { MIGRATIONS } from '../src/store/migrations.js';
@@ -208,6 +209,8 @@ describe('store', () => {
         )
         .get(repo.id),
     ).toEqual({ serve_command: null, serve_ready_path: '/', serve_ready_timeout_seconds: 120 });
+    // The defaults the API and the dashboard's form go by are the columns' own.
+    expect(REPO_SERVE_DEFAULTS).toEqual({ readyPath: '/', readyTimeoutSeconds: 120 });
     expect(store.getRepo(repo.id).verifyCommands).toEqual(['npm run lint']);
 
     // Given when the repo is made.

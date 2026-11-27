@@ -10,6 +10,8 @@ import {
   DetectionNote,
   detectHint,
   RegisterForm,
+  ServeFields,
+  ServeView,
   SourceSettings,
   TrialPanel,
 } from '../components/RepoForms.js';
@@ -30,6 +32,10 @@ import {
   lacksVerify,
   noVerifyBadge,
   noVerifyWarning,
+  repoPatch,
+  serveFormInit,
+  serveFormProblems,
+  serveLabel,
 } from '../lib/repos.js';
 import { href } from '../lib/router.js';
 
@@ -135,6 +141,12 @@ function RepoCard(props: { repo: Repo; config: ConfigView | undefined; onChanged
           <dt>{t({ zh: '准备命令', en: 'Setup commands' })}</dt>
           <dd>
             <CommandList commands={repo.setupCommands} />
+          </dd>
+        </div>
+        <div className="wide">
+          <dt>{serveLabel()}</dt>
+          <dd>
+            <ServeView serve={repo.serve} />
           </dd>
         </div>
         {config && (
@@ -245,9 +257,11 @@ function EditRepo(props: { repo: Repo; onDone: () => void; onCancel: () => void 
   const [targetBranch, setTargetBranch] = useState(repo.targetBranch);
   const [verify, setVerify] = useState(repo.verifyCommands.join('\n'));
   const [setup, setSetup] = useState(repo.setupCommands.join('\n'));
+  const [serve, setServe] = useState(() => serveFormInit(repo.serve));
   const [detection, setDetection] = useState<RepoDetection>();
   const action = useAction();
   const detecting = useAction();
+  const serveProblems = serveFormProblems(serve);
   // Fills the boxes only; the human checks them and saves.
   const detect = async () => {
     const found = await detecting.run(() => api.detectRepo(repo.id));
@@ -258,12 +272,9 @@ function EditRepo(props: { repo: Repo; onDone: () => void; onCancel: () => void 
   };
   const submit = async (e: FormEvent) => {
     e.preventDefault();
+    if (serveProblems.length > 0) return;
     const result = await action.run(() =>
-      api.updateRepo(repo.id, {
-        targetBranch: targetBranch.trim(),
-        verifyCommands: parseLines(verify),
-        setupCommands: parseLines(setup),
-      }),
+      api.updateRepo(repo.id, repoPatch({ targetBranch, verify, setup, serve })),
     );
     if (result) props.onDone();
   };
@@ -290,15 +301,20 @@ function EditRepo(props: { repo: Repo; onDone: () => void; onCancel: () => void 
         commands={() => ({ setupCommands: parseLines(setup), verifyCommands: parseLines(verify) })}
         disabled={action.busy}
       />
+      <ServeFields value={serve} onChange={setServe} disabled={action.busy} />
       <p className="hint">
         {t({
-          zh: '修改对之后开始的 Task 生效。',
-          en: 'Changes apply to Tasks started afterwards.',
+          zh: '修改对之后开始的 Task 和命令阶段生效。',
+          en: 'Changes apply to Tasks and command stages started afterwards.',
         })}
       </p>
       <ErrorBox>{action.error}</ErrorBox>
       <div className="form-actions">
-        <button type="submit" className="btn-primary" disabled={action.busy}>
+        <button
+          type="submit"
+          className="btn-primary"
+          disabled={action.busy || serveProblems.length > 0}
+        >
           {t({ zh: '保存', en: 'Save' })}
         </button>
         <button type="button" onClick={props.onCancel}>

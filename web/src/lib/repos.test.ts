@@ -6,16 +6,29 @@ import {
   detectedBox,
   detectionNote,
   detectLabel,
+  emptyServeForm,
   lacksVerify,
   missingProgramNote,
   newRepoInput,
+  noServeNote,
   noVerifyBadge,
   noVerifyWarning,
   REPO_ORIGINS,
   registerLabel,
   repoOriginHint,
   repoOriginLabel,
+  repoPatch,
   repoPathLabel,
+  type ServeForm,
+  serveFormBlank,
+  serveFormInit,
+  serveFormProblems,
+  serveHint,
+  serveInput,
+  serveLabel,
+  serveReadyPathHint,
+  serveSummary,
+  serveTimeoutHint,
   targetBranchPlaceholder,
   trialLabel,
   trialRowNote,
@@ -275,6 +288,115 @@ describe('a trial of the commands', () => {
     expect(texts[0]).toBe('passed (2s)');
     expect(texts.at(-1)).toContain('target branch main · started at');
     expect(texts.at(-1)).toContain('took 1m 5s');
+    expect(texts.join('\n')).not.toMatch(/[一-鿿]/);
+  });
+});
+
+describe('the service boxes of the edit form', () => {
+  const serve = (extra: Partial<ServeForm> = {}): ServeForm => ({
+    command: ' npm start ',
+    readyPath: ' /health ',
+    readyTimeoutSeconds: ' 30 ',
+    ...extra,
+  });
+
+  it('start from the saved service, or blank without one', () => {
+    expect(
+      serveFormInit({ command: 'npm start', readyPath: '/health', readyTimeoutSeconds: 30 }),
+    ).toEqual({ command: 'npm start', readyPath: '/health', readyTimeoutSeconds: '30' });
+    expect(serveFormInit(null)).toEqual(emptyServeForm());
+    expect(serveFormBlank(emptyServeForm())).toBe(true);
+    expect(serveFormBlank(serve({ command: ' ', readyPath: '', readyTimeoutSeconds: '' }))).toBe(
+      true,
+    );
+    expect(serveFormBlank(serve({ command: '', readyPath: '', readyTimeoutSeconds: '30' }))).toBe(
+      false,
+    );
+  });
+
+  it('send the trimmed settings', () => {
+    expect(serveInput(serve())).toEqual({
+      command: 'npm start',
+      readyPath: '/health',
+      readyTimeoutSeconds: 30,
+    });
+  });
+
+  it('send the defaults for a blank ready path or timeout', () => {
+    expect(serveInput(serve({ readyPath: ' ', readyTimeoutSeconds: '' }))).toEqual({
+      command: 'npm start',
+      readyPath: '/',
+      readyTimeoutSeconds: 120,
+    });
+  });
+
+  it('send null, which removes the service, without a start command', () => {
+    expect(serveInput(serve({ command: '  ' }))).toBeNull();
+    expect(serveInput(emptyServeForm())).toBeNull();
+  });
+
+  it('check the ready path and timeout by the rules of the API', () => {
+    expect(serveFormProblems(serve())).toEqual([]);
+    expect(serveFormProblems(serve({ readyPath: '', readyTimeoutSeconds: '' }))).toEqual([]);
+    expect(serveFormProblems(serve({ readyTimeoutSeconds: '1' }))).toEqual([]);
+    expect(serveFormProblems(serve({ readyTimeoutSeconds: '3600' }))).toEqual([]);
+    expect(serveFormProblems(serve({ readyPath: 'health' }))).toEqual(['就绪路径必须以 / 开头']);
+    for (const readyTimeoutSeconds of ['0', '3601', '1.5', '-1', 'abc', '1e3']) {
+      expect(serveFormProblems(serve({ readyTimeoutSeconds }))).toEqual([
+        '就绪超时必须是 1 到 3600 之间的整数（秒）',
+      ]);
+    }
+    expect(serveFormProblems(serve({ readyPath: 'x', readyTimeoutSeconds: '0' }))).toHaveLength(2);
+  });
+
+  it('have nothing to check without a start command: the other boxes are not sent', () => {
+    expect(
+      serveFormProblems(serve({ command: '', readyPath: 'x', readyTimeoutSeconds: '0' })),
+    ).toEqual([]);
+  });
+
+  it('go into the PATCH body with the rest of the edit form', () => {
+    expect(
+      repoPatch({
+        targetBranch: ' main ',
+        verify: 'npm test\n\n',
+        setup: ' npm ci ',
+        serve: serve(),
+      }),
+    ).toEqual({
+      targetBranch: 'main',
+      verifyCommands: ['npm test'],
+      setupCommands: ['npm ci'],
+      serve: { command: 'npm start', readyPath: '/health', readyTimeoutSeconds: 30 },
+    });
+    expect(
+      repoPatch({ targetBranch: 'main', verify: '', setup: '', serve: emptyServeForm() }).serve,
+    ).toBeNull();
+  });
+
+  it('are described in both languages', () => {
+    expect(serveLabel()).toBe('服务启动命令');
+    expect(serveSummary({ readyPath: '/health', readyTimeoutSeconds: 30 })).toBe(
+      '就绪路径 /health，最多等 30 秒',
+    );
+    expect(serveTimeoutHint()).toContain('1–3600');
+    expect(noServeNote()).toMatch(/^无/);
+    setLang('en');
+    expect(serveSummary({ readyPath: '/', readyTimeoutSeconds: 1 })).toBe(
+      'ready at /, within 1 second',
+    );
+    expect(serveSummary({ readyPath: '/', readyTimeoutSeconds: 120 })).toBe(
+      'ready at /, within 120 seconds',
+    );
+    const texts = [
+      serveLabel(),
+      serveHint(),
+      serveReadyPathHint(),
+      serveTimeoutHint(),
+      noServeNote(),
+      ...serveFormProblems(serve({ readyPath: 'x', readyTimeoutSeconds: '0' })),
+    ];
+    expect(texts.at(-2)).toBe('The ready path must start with /');
     expect(texts.join('\n')).not.toMatch(/[一-鿿]/);
   });
 });
