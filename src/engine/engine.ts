@@ -91,12 +91,19 @@ import {
 import { errorMessage, executionSlot, newId, nowIso } from '../util.js';
 import {
   type CommandResult,
+  commandMissing,
   environmentProblem,
   firstMissingCommand,
   formatCommandFailure,
   missingProgram,
   runCommands,
 } from '../verify/commands.js';
+import {
+  formatServiceFailure,
+  type RunningService,
+  type ServiceFailure,
+  startService,
+} from '../verify/serve.js';
 import {
   addExistingWorktree,
   addWorktree,
@@ -3759,6 +3766,16 @@ export class Engine {
    * left in the worktree is discarded, commits they made included (`discardStageWork`), so that
    * an agent going on from here does not commit it with its work and the merge does not take it
    * in. Interrupted (a pause, a restart), the stage runs its commands again.
+   *
+   * With `serve: true`, the commands run against the repo's service (`repo.serve`): it is started
+   * in the worktree first (`startService`), and once it answers, each command gets its `PORT` and
+   * `ARES1_SERVICE_URL`. However the commands end (passed, failed, a pause, a cancel, the Master
+   * stopping), the service's whole process group is stopped, and gone, before anything else
+   * happens to the worktree. A service that does not become ready fails the stage like a failed
+   * command, with why and the end of its output (`formatServiceFailure`), and its commands do not
+   * run; a start command whose program is missing from the environment blocks the Run on it, as
+   * a command would. A repo that registers no start command gets `stage.no_service`, and the
+   * commands run without a service. A stage with nothing to run starts none.
    */
   private async executeCommandStage(
     run: Run,
@@ -3778,15 +3795,47 @@ export class Engine {
       return;
     }
     if (this.blockOnMissingNode(run, sr.id)) return;
+    const serve = eff.def.serve === true ? repo.serve : null;
+    if (eff.def.serve === true && !serve) {
+      this.store.tx(() => {
+        this.store.event(run.id, 'stage.no_service', { stageId: sr.stageId });
+      });
+    }
     const before = await revParse(workdir, 'HEAD');
     this.checkAbort(signal);
     const env = this.agentEnv();
-    const results = await runCommands(commands, workdir, {
-      timeoutMs: this.commandTimeoutMs(),
-      logPath: join(this.runLogDir(run.id), `command-${sr.id}.log`),
-      env,
-      signal,
-    });
+    let results: CommandResult[] = [];
+    let notReady: ServiceFailure | null = null;
+    let service: RunningService | null = null;
+    try {
+      if (serve) {
+        // Aborted while it starts, it stops itself and says so (`aborted`).
+        const started = await startService({
+          command: serve.command,
+          cwd: workdir,
+          env,
+          logPath: join(this.runLogDir(run.id), `serve-${sr.id}.log`),
+          readyPath: serve.readyPath,
+          readyTimeoutMs: serve.readyTimeoutSeconds * 1000,
+          signal,
+        });
+        if (started.ok) service = started;
+        else notReady = started;
+      }
+      if (!notReady && !signal.aborted) {
+        results = await runCommands(commands, workdir, {
+          timeoutMs: this.commandTimeoutMs(),
+          logPath: join(this.runLogDir(run.id), `command-${sr.id}.log`),
+          env: service ? { ...env, ...service.env } : env,
+          signal,
+        });
+      }
+    } finally {
+      // Whatever ended the commands, a pause, a cancel or the Master stopping included (they
+      // abort `signal` and wait for this to return): nothing of the service outlives the stage,
+      // and it no longer writes to the worktree when its work is discarded below.
+      await service?.stop();
+    }
     // Also when interrupted: the commands run again later from the same commit.
     const discarded = await this.discardStageWork(run, before);
     if (discarded) {
@@ -3798,6 +3847,7 @@ export class Engine {
       });
     }
     this.checkAbort(signal);
+    if (serve && notReady) return this.serviceNotReady(run, sr, serve.command, notReady, env);
     const failed = results.find((r) => !r.passed);
     // Not the code's failure: the stage stays executing and runs its commands again later.
     const missing = failed && environmentProblem(failed, env);
@@ -3820,6 +3870,48 @@ export class Engine {
     if (failed) return;
     if (eff.gate) this.requestApproval(run, sr);
     else this.passStage(run, sr);
+  }
+
+  /**
+   * A command stage's service that did not become ready (`executeCommandStage`), recorded as a
+   * failed check named after its start command. When the shell could not find the program the
+   * start command runs (127, `commandMissing`), the Run blocks on the environment and the stage
+   * stays executing, to start the service again later. Otherwise the stage fails like a failed
+   * command: the rollback goes to `failTarget` with why and the end of the service's output as
+   * feedback, counted toward max_loops.
+   */
+  private serviceNotReady(
+    run: Run,
+    sr: StageRun,
+    command: string,
+    result: ServiceFailure,
+    env: NodeJS.ProcessEnv,
+  ): void {
+    const feedback = formatServiceFailure(result, command);
+    const missing =
+      result.reason === 'exited' && result.exitCode === 127 ? commandMissing(command, env) : null;
+    this.store.tx(() => {
+      this.store.addCheck({
+        runId: run.id,
+        stageRunId: sr.id,
+        attemptId: null,
+        kind: 'command',
+        name: t({ zh: `启动服务：${command}`, en: `Start the service: ${command}` }),
+        passed: false,
+        detail: feedback,
+      });
+      if (missing) {
+        this.blockOnEnvironment(run, command, missing, 'serve', sr.id);
+        return;
+      }
+      this.store.updateStageRun(sr.id, {
+        status: 'failed',
+        failReason: 'check',
+        failFeedback: feedback,
+        endedAt: nowIso(),
+      });
+      this.store.event(run.id, 'stage.failed', { stageId: sr.stageId, reason: 'check' });
+    });
   }
 
   /**
@@ -4895,7 +4987,8 @@ export class Engine {
   /**
    * A command could not run for the environment: the program it starts first, or that program's
    * interpreter, is not in PATH. Either it failed with 127 (`environmentProblem`; `setup`,
-   * `verify`), or the agent reported its task incomplete and the verify command was not run
+   * `verify`, or `serve`: a command stage's start command, `serviceNotReady`), or the agent
+   * reported its task incomplete and the verify command was not run
    * (`incomplete`, see `blockIncompleteOnEnvironment`). Blocks the Run on it rather than sending
    * the work back or failing the Run: the agents cannot change the Master's environment, and a
    * redo would fail the same way. Whatever stage or task it was in stays where it is, to run the
@@ -4906,7 +4999,7 @@ export class Engine {
     run: Run,
     command: string,
     missing: string,
-    what: 'setup' | 'verify' | 'incomplete',
+    what: 'setup' | 'verify' | 'serve' | 'incomplete',
     stageRunId?: string,
   ): void {
     const goOn = t({
@@ -4923,7 +5016,12 @@ export class Engine {
       const which =
         what === 'setup'
           ? t({ zh: `准备命令 \`${command}\``, en: `the setup command \`${command}\`` })
-          : t({ zh: `检查命令 \`${command}\``, en: `the verify command \`${command}\`` });
+          : what === 'serve'
+            ? t({
+                zh: `服务启动命令 \`${command}\``,
+                en: `the service's start command \`${command}\``,
+              })
+            : t({ zh: `检查命令 \`${command}\``, en: `the verify command \`${command}\`` });
       message = t({
         zh: `运行环境里找不到 \`${missing}\`：${which}的退出码是 127（找不到命令）。这是 Master 运行环境的问题，不是代码的问题：不返工，也不消耗返工和重做次数。${goOn}`,
         en: `\`${missing}\` is not found in the environment: ${which} exited with 127 (command not found). That is a problem of the Master's environment, not of the code, so there is no rework and no rework or redo is used up. ${goOn}`,

@@ -1055,6 +1055,437 @@ describe('engine: command stages', () => {
   });
 });
 
+/**
+ * The repo's service for `serve: true` stages, as a start command runs it in the Run's worktree:
+ * an HTTP server on 127.0.0.1:$PORT answering every request with `hello from <port><path>`. It
+ * starts a `sleep` in its process group, which must go with it, and appends what it is and got
+ * to `services.txt` in the directory given (its pid is the group's id when the start command
+ * `exec`s it). The worktree's `mode.txt`, as the coder wrote it, can make it fail: `exit` exits
+ * with 1 at once, `never` stays up without ever listening.
+ */
+const SERVICE_SCRIPT = `import { spawn } from 'node:child_process';
+import { appendFileSync, existsSync, readFileSync } from 'node:fs';
+import { createServer } from 'node:http';
+import { join } from 'node:path';
+const out = process.argv[2];
+const mode = existsSync('mode.txt') ? readFileSync('mode.txt', 'utf8').trim() : 'ok';
+const port = Number(process.env.PORT);
+const child = mode === 'exit' ? null : spawn('sleep', ['60'], { stdio: 'ignore' });
+appendFileSync(join(out, 'services.txt'), JSON.stringify({
+  pgid: process.pid,
+  child: child?.pid ?? null,
+  port,
+  mode,
+  url: process.env.ARES1_SERVICE_URL ?? null,
+  githubToken: process.env.GITHUB_TOKEN ?? null,
+  ghToken: process.env.GH_TOKEN ?? null,
+}) + '\\n');
+if (mode === 'exit') {
+  console.error('boom: the service cannot start');
+  process.exit(1);
+}
+if (mode === 'never') {
+  console.log('still starting');
+  setInterval(() => {}, 1000);
+} else {
+  createServer((req, res) => {
+    console.log('request ' + req.url);
+    res.end('hello from ' + port + req.url);
+  }).listen(port, '127.0.0.1', () => console.log('listening on ' + port));
+}
+`;
+
+/**
+ * A command stage's command: asks $ARES1_SERVICE_URL/hello and appends $PORT and the answer to
+ * `answers.txt` in the directory given, then waits until that file has the number of answers
+ * given (one by default, so that Runs side by side all reach their services at the same time)
+ * and exits with 0; with 1 when the service does not answer.
+ */
+const CLIENT_SCRIPT = `import { appendFileSync, readFileSync } from 'node:fs';
+import { get } from 'node:http';
+import { join } from 'node:path';
+const [out, wanted = '1'] = process.argv.slice(2);
+const answers = join(out, 'answers.txt');
+const count = () => readFileSync(answers, 'utf8').trim().split('\\n').length;
+get(process.env.ARES1_SERVICE_URL + '/hello', { agent: false }, (res) => {
+  let body = '';
+  res.setEncoding('utf8');
+  res.on('data', (chunk) => { body += chunk; });
+  res.on('end', () => {
+    appendFileSync(answers, JSON.stringify({ port: process.env.PORT, status: res.statusCode, body }) + '\\n');
+    const deadline = Date.now() + 15000;
+    const wait = () => {
+      if (count() >= Number(wanted)) process.exit(0);
+      if (Date.now() > deadline) process.exit(2);
+      setTimeout(wait, 20);
+    };
+    wait();
+  });
+}).on('error', (err) => {
+  console.error('no answer from the service: ' + err.message);
+  process.exit(1);
+});
+`;
+
+describe('engine: command stages with a service (serve: true)', () => {
+  const NODE = JSON.stringify(process.execPath);
+  const store = () => (h as Harness).master.store;
+  const stagesOf = (runId: string) =>
+    store()
+      .listStageRuns(runId)
+      .map((sr) => [sr.stageId, sr.status]);
+  const stageRun = (runId: string, stageId: string, round = 1) =>
+    store()
+      .listStageRuns(runId)
+      .find((sr) => sr.stageId === stageId && sr.round === round);
+  const checksOf = (runId: string, stageId: string, round = 1) => {
+    const id = stageRun(runId, stageId, round)?.id;
+    return store()
+      .listChecks(runId)
+      .filter((c) => c.stageRunId === id);
+  };
+  const eventTypes = (runId: string) =>
+    store()
+      .listEvents(runId)
+      .map((e) => e.type);
+  const serveLog = (runId: string, stageRunId: string) =>
+    join((h as Harness).master.paths.logsDir, runId, `serve-${stageRunId}.log`);
+
+  /** Whether no process of the group `pgid` is left: kill(-pgid, 0) fails with ESRCH. */
+  const groupGone = (pgid: number) => {
+    try {
+      process.kill(-pgid, 0);
+      return false;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code === 'ESRCH';
+    }
+  };
+
+  interface ServiceSeen {
+    pgid: number;
+    child: number | null;
+    port: number;
+    mode: string;
+    url: string | null;
+    githubToken: string | null;
+    ghToken: string | null;
+  }
+  interface AnswerSeen {
+    port: string;
+    status: number;
+    body: string;
+  }
+  const jsonLines = <T>(file: string): T[] =>
+    existsSync(file)
+      ? readFileSync(file, 'utf8')
+          .trim()
+          .split('\n')
+          .filter(Boolean)
+          .map((line) => JSON.parse(line) as T)
+      : [];
+
+  /** The service and client scripts in a directory of their own, where they record what they see. */
+  const scripts = () => {
+    const dir = tmpDir('ares1-serve-e2e-');
+    writeFile(join(dir, 'server.mjs'), SERVICE_SCRIPT);
+    writeFile(join(dir, 'client.mjs'), CLIENT_SCRIPT);
+    return {
+      dir,
+      startCommand: `exec ${NODE} ${JSON.stringify(join(dir, 'server.mjs'))} ${JSON.stringify(dir)}`,
+      client: (wanted = 1) =>
+        `${NODE} ${JSON.stringify(join(dir, 'client.mjs'))} ${JSON.stringify(dir)} ${wanted}`,
+      services: () => jsonLines<ServiceSeen>(join(dir, 'services.txt')),
+      answers: () => jsonLines<AnswerSeen>(join(dir, 'answers.txt')),
+    };
+  };
+
+  const setServe = (
+    command: string,
+    opts: { readyPath?: string; readyTimeoutSeconds?: number } = {},
+  ) =>
+    store().updateRepo((h as Harness).repo.id, {
+      serve: {
+        command,
+        readyPath: opts.readyPath ?? '/',
+        readyTimeoutSeconds: opts.readyTimeoutSeconds ?? 30,
+      },
+    });
+
+  /** TEST_WORKFLOW_YAML with an E2E command stage running `command` against the service. */
+  const serveStage = (command: string) =>
+    withCommandStage(
+      `    serve: true\n    verify:\n      commands: [${JSON.stringify(command)}]\n`,
+    );
+  /** `commandOnFail` with the service: back to coding on failure, one rollback allowed. */
+  const serveOnFail = (command: string) =>
+    commandOnFail(command).replace('    kind: command\n', '    kind: command\n    serve: true\n');
+
+  /** A coder writing feature.txt and the service's `mode.txt`, by round from 1. */
+  const coderWithMode = (mode: (round: number) => string, onRound?: (round: number) => void) => {
+    let round = 0;
+    return ((ctx) => {
+      round++;
+      onRound?.(round);
+      writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+      writeFile(join(ctx.input.workdir, 'mode.txt'), `${mode(round)}\n`);
+      return done();
+    }) as Script;
+  };
+
+  it('runs its commands once the service is ready, with its port, and stops the whole service after', async () => {
+    vi.stubEnv('GITHUB_TOKEN', 'ghp_master');
+    const s = scripts();
+    h = await harness({ workflow: serveStage(s.client()) });
+    setServe(s.startCommand, { readyPath: '/health' });
+    const run = h.run();
+    await h.waitStatus(run.id, 'waiting_approval');
+    expect(stagesOf(run.id)).toEqual([
+      ['implement', 'passed'],
+      ['review', 'passed'],
+      ['e2e', 'passed'],
+      ['merge', 'waiting_approval'],
+    ]);
+
+    const services = s.services();
+    expect(services).toHaveLength(1);
+    const service = services[0] as ServiceSeen;
+    // Its own address, and no GitHub credentials, like the commands run on the agents' work.
+    expect(service).toMatchObject({
+      mode: 'ok',
+      url: `http://127.0.0.1:${service.port}`,
+      githubToken: null,
+      ghToken: AGENT_GH_TOKEN,
+    });
+    // The command reached it through $ARES1_SERVICE_URL, and got the same $PORT.
+    expect(s.answers()).toEqual([
+      { port: String(service.port), status: 200, body: `hello from ${service.port}/hello` },
+    ]);
+    expect(checksOf(run.id, 'e2e').map((c) => [c.name, c.passed])).toEqual([[s.client(), true]]);
+    const e2e = stageRun(run.id, 'e2e') as StageRun;
+    const log = readFileSync(serveLog(run.id, e2e.id), 'utf8');
+    expect(log).toContain(`$ ${s.startCommand}`);
+    expect(log).toContain(`listening on ${service.port}`);
+    // Polled at the ready path before the command's request.
+    expect(log.indexOf('request /health')).toBeGreaterThan(-1);
+    expect(log.indexOf('request /health')).toBeLessThan(log.indexOf('request /hello'));
+    // Stopped before the stage passed, the process it started as well.
+    expect(groupGone(service.pgid)).toBe(true);
+    expect(eventTypes(run.id)).not.toContain('stage.no_service');
+  });
+
+  it('goes back to on_fail with the end of its output when the service exits, counted toward max_loops', async () => {
+    const s = scripts();
+    h = await harness({ workflow: serveOnFail(s.client()) });
+    setServe(s.startCommand);
+    h.scripts.coder = coderWithMode(() => 'exit');
+    const run = h.run();
+    const failed = await h.waitStatus(run.id, 'failed');
+    expect(stagesOf(run.id)).toEqual([
+      ['implement', 'passed'],
+      ['docs', 'passed'],
+      ['e2e', 'failed'],
+      ['implement', 'passed'],
+      ['docs', 'passed'],
+      ['e2e', 'failed'],
+    ]);
+    const first = stageRun(run.id, 'e2e', 1) as StageRun;
+    expect(first.failReason).toBe('check');
+    const feedback = first.failFeedback as string;
+    expect(feedback).toContain(
+      `服务没有就绪：启动命令 \`${s.startCommand}\`（进程提前退出，退出码 1）。输出末尾：`,
+    );
+    expect(feedback).toContain('boom: the service cannot start');
+    expect(checksOf(run.id, 'e2e', 1).map((c) => [c.name, c.passed, c.detail])).toEqual([
+      [`启动服务：${s.startCommand}`, false, feedback],
+    ]);
+    expect(readFileSync(serveLog(run.id, first.id), 'utf8')).toContain(
+      'boom: the service cannot start',
+    );
+    // The commands never ran without their service.
+    expect(s.answers()).toEqual([]);
+    expect(
+      store()
+        .listEvents(run.id)
+        .filter((e) => e.type === 'stage.rollback')
+        .map((e) => e.data),
+    ).toEqual([{ from: 'e2e', to: 'implement' }]);
+    const coder = h.fake.calls.filter((c) => c.model === 'coder');
+    expect(coder).toHaveLength(2);
+    expect(coder[1]?.prompt).toContain('「E2E」没有通过');
+    expect(coder[1]?.prompt).toContain('服务没有就绪');
+    expect(coder[1]?.prompt).toContain('boom: the service cannot start');
+    expect(failed.error).toContain('超过回退上限 1');
+    expect(failed.error).toContain('服务没有就绪');
+    const services = s.services();
+    expect(services.map((sv) => sv.mode)).toEqual(['exit', 'exit']);
+    for (const service of services) expect(groupGone(service.pgid)).toBe(true);
+  });
+
+  it('fails the stage when the service is not ready in time, and passes once the coder fixes it', async () => {
+    const s = scripts();
+    h = await harness({ workflow: serveOnFail(s.client()) });
+    setServe(s.startCommand, { readyTimeoutSeconds: 1 });
+    // The fixed service gets more time: a loaded machine may take over a second to start node.
+    h.scripts.coder = coderWithMode(
+      (round) => (round === 1 ? 'never' : 'ok'),
+      (round) => {
+        if (round === 2) setServe(s.startCommand);
+      },
+    );
+    const run = h.run();
+    await h.waitStatus(run.id, 'completed');
+    expect(stagesOf(run.id)).toEqual([
+      ['implement', 'passed'],
+      ['docs', 'passed'],
+      ['e2e', 'failed'],
+      ['implement', 'passed'],
+      ['docs', 'passed'],
+      ['e2e', 'passed'],
+      ['merge', 'passed'],
+    ]);
+    const feedback = stageRun(run.id, 'e2e', 1)?.failFeedback as string;
+    expect(feedback).toContain('服务没有就绪');
+    expect(feedback).toContain('1 秒内没有就绪');
+    expect(feedback).toContain('still starting');
+    expect(h.fake.calls.filter((c) => c.model === 'coder')[1]?.prompt).toContain('服务没有就绪');
+    const services = s.services();
+    expect(services.map((sv) => sv.mode)).toEqual(['never', 'ok']);
+    expect(s.answers().map((a) => a.port)).toEqual([String(services[1]?.port)]);
+    // The service that never got ready went, its `sleep` too, and so did the fixed one.
+    for (const service of services) expect(groupGone(service.pgid)).toBe(true);
+  });
+
+  it.each(['pause', 'cancel', 'stop'] as const)(
+    'leaves no process of the service after a %s while its commands run',
+    async (how) => {
+      const s = scripts();
+      const t = await harness({ workflow: serveStage(`${s.client()} && sleep 30`) });
+      h = t;
+      setServe(s.startCommand);
+      const run = t.run();
+      await waitFor(() => s.answers().length === 1, 'the command to reach the service');
+      const service = s.services()[0] as ServiceSeen;
+      expect(groupGone(service.pgid)).toBe(false);
+      if (how === 'pause') {
+        expect((await t.master.engine.pause(run.id)).status).toBe('paused');
+      } else if (how === 'cancel') {
+        expect((await t.master.engine.cancel(run.id)).status).toBe('cancelled');
+      } else {
+        await t.close();
+        h = undefined;
+      }
+      // Once it returns: nothing is left to wait for.
+      expect(groupGone(service.pgid)).toBe(true);
+    },
+  );
+
+  it('gives Runs executing side by side services on ports of their own', async () => {
+    const s = scripts();
+    // Each command waits until both have reached their services: both are up at the same time.
+    h = await harness({
+      config: 'concurrency: { per_repo: 2 }\n',
+      workflow: serveStage(s.client(2)),
+    });
+    setServe(s.startCommand);
+    const a = h.run('第一个');
+    const b = h.run('第二个');
+    await h.waitStatus(a.id, 'waiting_approval', 30_000);
+    await h.waitStatus(b.id, 'waiting_approval', 30_000);
+    const services = s.services();
+    expect(services).toHaveLength(2);
+    const ports = services.map((sv) => sv.port);
+    expect(ports[0]).not.toBe(ports[1]);
+    // Each command reached its own Run's service.
+    const answers = s.answers();
+    expect(answers.map((x) => Number(x.port)).sort()).toEqual([...ports].sort());
+    for (const answer of answers) {
+      expect(answer).toEqual({
+        port: answer.port,
+        status: 200,
+        body: `hello from ${answer.port}/hello`,
+      });
+    }
+    for (const service of services) expect(groupGone(service.pgid)).toBe(true);
+  });
+
+  it('records stage.no_service and runs the commands without one when the repo has no start command', async () => {
+    const out = tmpDir('ares1-serve-e2e-');
+    h = await harness({
+      workflow: serveStage(
+        `echo "url=[$ARES1_SERVICE_URL]" > ${JSON.stringify(join(out, 'env.txt'))}`,
+      ),
+    });
+    const run = h.run();
+    await h.waitStatus(run.id, 'waiting_approval');
+    const e2e = stageRun(run.id, 'e2e') as StageRun;
+    expect(e2e.status).toBe('passed');
+    expect(readFileSync(join(out, 'env.txt'), 'utf8')).toBe('url=[]\n');
+    expect(
+      store()
+        .listEvents(run.id)
+        .filter((e) => e.type === 'stage.no_service')
+        .map((e) => e.data),
+    ).toEqual([{ stageId: 'e2e' }]);
+    expect(existsSync(serveLog(run.id, e2e.id))).toBe(false);
+  });
+
+  it('starts no service for a stage with nothing to run', async () => {
+    const s = scripts();
+    h = await harness({ workflow: withCommandStage('    serve: true\n'), verifyCommands: [] });
+    setServe(s.startCommand);
+    const run = h.run();
+    await h.waitStatus(run.id, 'waiting_approval');
+    expect(stageRun(run.id, 'e2e')?.status).toBe('passed');
+    expect(eventTypes(run.id)).toContain('stage.no_commands');
+    expect(eventTypes(run.id)).not.toContain('stage.no_service');
+    expect(s.services()).toEqual([]);
+  });
+
+  it('blocks on the environment when the start command is not found, and starts it again on a retry', async () => {
+    const s = scripts();
+    h = await harness({ workflow: serveStage(s.client()) });
+    setServe('ares1-no-such-server --port "$PORT"');
+    const run = h.run();
+    const blocked = await h.waitStatus(run.id, 'blocked');
+    expect(blocked.blocked).toMatchObject({ kind: 'environment', missing: 'ares1-no-such-server' });
+    expect(blocked.blocked?.message).toContain(
+      '运行环境里找不到 `ares1-no-such-server`：服务启动命令 `ares1-no-such-server --port "$PORT"`的退出码是 127',
+    );
+    // No rollback: the stage runs again once the Run goes on.
+    expect(stageRun(run.id, 'e2e')?.status).toBe('executing');
+    expect(eventTypes(run.id)).not.toContain('stage.rollback');
+    expect(s.answers()).toEqual([]);
+
+    setServe(s.startCommand);
+    await h.master.engine.retry(run.id);
+    await h.waitStatus(run.id, 'waiting_approval');
+    expect(stageRun(run.id, 'e2e')?.status).toBe('passed');
+    expect(s.answers()).toHaveLength(1);
+    expect(h.fake.calls.map((c) => c.model)).toEqual(['coder', 'reviewer']);
+  });
+
+  it('says so in English', async () => {
+    setLang('en');
+    try {
+      const s = scripts();
+      h = await harness({ workflow: serveOnFail(s.client()) });
+      setServe(s.startCommand);
+      h.scripts.coder = coderWithMode(() => 'exit');
+      const run = h.run();
+      await h.waitStatus(run.id, 'failed');
+      const feedback = stageRun(run.id, 'e2e', 1)?.failFeedback as string;
+      expect(feedback).toContain(
+        `The service did not become ready: start command \`${s.startCommand}\` (it exited early with exit code 1). End of the output:`,
+      );
+      const [check] = checksOf(run.id, 'e2e', 1);
+      expect(check?.name).toBe(`Start the service: ${s.startCommand}`);
+      for (const text of [feedback, check?.name]) expect(text).not.toMatch(/[一-鿿]/);
+    } finally {
+      setLang('zh');
+    }
+  });
+});
+
 describe("engine: the merge tries the repo's templates the Run changed", () => {
   const store = () => (h as Harness).master.store;
   const stagesOf = (runId: string) =>

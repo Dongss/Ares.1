@@ -1118,6 +1118,12 @@ export function eventText(
       });
     }
   }
+  if (event.type === 'stage.no_service') {
+    return t({
+      zh: '这个命令阶段要为 Run 起服务（serve: true），但仓库没有登记服务启动命令：命令照常运行，没有服务，也不给 PORT 和 ARES1_SERVICE_URL',
+      en: 'This command stage starts a service for the Run (serve: true), but the repo registers no start command: the commands run as usual, without a service, PORT or ARES1_SERVICE_URL',
+    });
+  }
   if (event.type === 'task.verify_resumed') {
     return t({
       zh: 'Agent 的改动还在工作目录里，只重新运行检查命令',

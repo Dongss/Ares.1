@@ -1066,6 +1066,27 @@ describe('a review stopped halfway whose work could not be put back', () => {
   });
 });
 
+describe('a command stage with serve: true in a repo without a start command', () => {
+  afterEach(() => setLang('zh'));
+  const noService = { type: 'stage.no_service', data: { stageId: 'e2e' } };
+
+  it('says the commands run without a service', () => {
+    expect(eventText(noService)).toBe(
+      '这个命令阶段要为 Run 起服务（serve: true），但仓库没有登记服务启动命令：命令照常运行，没有服务，也不给 PORT 和 ARES1_SERVICE_URL',
+    );
+    expect(eventText({ type: 'stage.no_commands', data: { stageId: 'e2e' } })).toBeNull();
+  });
+
+  it('in English', () => {
+    setLang('en');
+    const text = eventText(noService);
+    expect(text).toBe(
+      'This command stage starts a service for the Run (serve: true), but the repo registers no start command: the commands run as usual, without a service, PORT or ARES1_SERVICE_URL',
+    );
+    expect(text).not.toMatch(/[一-鿿]/);
+  });
+});
+
 describe('raw logs past retention', () => {
   afterEach(() => setLang('zh'));
   const now = new Date('2026-12-31T00:00:00.000Z');
