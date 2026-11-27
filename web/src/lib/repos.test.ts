@@ -1,8 +1,15 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import type { RepoDetection, RepoTrial, RepoTrialResult } from '../../../src/api/types.js';
+import type {
+  RepoDetection,
+  RepoTrial,
+  RepoTrialResult,
+  RepoTrialService,
+} from '../../../src/api/types.js';
 import { setLang } from '../../../src/i18n.js';
 import {
   type AddRepoForm,
+  adoptServeSuggestion,
+  adoptSuggestionLabel,
   detectedBox,
   detectionNote,
   detectLabel,
@@ -11,6 +18,7 @@ import {
   missingProgramNote,
   newRepoInput,
   noServeNote,
+  noServeSuggestionNote,
   noVerifyBadge,
   noVerifyWarning,
   REPO_ORIGINS,
@@ -27,12 +35,17 @@ import {
   serveInput,
   serveLabel,
   serveReadyPathHint,
+  serveSuggestionAdopted,
   serveSummary,
   serveTimeoutHint,
   targetBranchPlaceholder,
+  trialHint,
   trialLabel,
+  trialNothingNote,
   trialRowNote,
   trialRows,
+  trialServiceLabel,
+  trialServiceView,
   trialStatusBadge,
   trialSummary,
 } from './repos.js';
@@ -120,13 +133,84 @@ describe('repos without verify commands', () => {
 });
 
 describe('detecting commands on the edit form', () => {
-  const detection = (verify: string[], setup: string[]): RepoDetection => ({
+  const suggested = {
+    command: 'npm run dev',
+    readyPath: '/',
+    basis: 'Node：package.json 的 scripts 里有 dev',
+  };
+  const detection = (
+    verify: string[],
+    setup: string[],
+    serve: RepoDetection['serve'] = null,
+  ): RepoDetection => ({
     branch: 'main',
     commit: '0123456789abcdef',
     verify,
     setup,
-    serve: null,
+    serve,
     basis: ['Go：go.mod'],
+  });
+
+  it('tells the human to adopt a suggested start command, which fills no box by itself', () => {
+    const both = detectionNote(detection(['npm test'], ['npm ci'], suggested));
+    expect(both).toContain('点「保存」才生效');
+    expect(both).toContain('建议的启动命令不会自动填进「服务」一栏，要用就点那里的「采用建议」');
+    const serveOnly = detectionNote(detection([], [], suggested));
+    expect(serveOnly).toContain('准备命令和检查命令没有可填的建议');
+    expect(serveOnly).toContain('「采用建议」');
+    expect(serveOnly).not.toContain('。没有可填的建议');
+    // Without one, it is not mentioned.
+    expect(detectionNote(detection(['npm test'], []))).not.toContain('启动命令');
+    expect(detectionNote(detection([], []))).not.toContain('启动命令');
+    expect(adoptSuggestionLabel()).toBe('采用建议');
+    expect(noServeSuggestionNote()).toContain('没有建议启动命令');
+    setLang('en');
+    const texts = [
+      detectionNote(detection(['npm test'], ['npm ci'], suggested)),
+      detectionNote(detection([], [], suggested)),
+      adoptSuggestionLabel(),
+      noServeSuggestionNote(),
+    ];
+    expect(texts[0]).toContain('choose Use the suggestion there');
+    expect(texts[1]).toContain('No setup or verify commands to suggest');
+    expect(texts.join('\n')).not.toMatch(/[一-鿿]/);
+  });
+
+  it('puts a suggested start command and ready path in the service boxes, keeping the timeout', () => {
+    const typed: ServeForm = {
+      command: 'node x.js',
+      readyPath: '/health',
+      readyTimeoutSeconds: '30',
+    };
+    expect(adoptServeSuggestion(typed, suggested)).toEqual({
+      command: 'npm run dev',
+      readyPath: '/',
+      readyTimeoutSeconds: '30',
+    });
+    expect(adoptServeSuggestion(emptyServeForm(), suggested)).toEqual({
+      command: 'npm run dev',
+      readyPath: '/',
+      readyTimeoutSeconds: '',
+    });
+    expect(typed.command).toBe('node x.js');
+  });
+
+  it('knows when the service boxes hold the suggestion already', () => {
+    const form = (command: string, readyPath: string): ServeForm => ({
+      command,
+      readyPath,
+      readyTimeoutSeconds: '45',
+    });
+    expect(serveSuggestionAdopted(form('npm run dev', '/'), suggested)).toBe(true);
+    expect(serveSuggestionAdopted(form(' npm run dev ', ' / '), suggested)).toBe(true);
+    // A blank ready path is the default one, which is what is suggested.
+    expect(serveSuggestionAdopted(form('npm run dev', ''), suggested)).toBe(true);
+    expect(serveSuggestionAdopted(form('npm run dev', '/health'), suggested)).toBe(false);
+    expect(serveSuggestionAdopted(form('npm start', '/'), suggested)).toBe(false);
+    expect(serveSuggestionAdopted(emptyServeForm(), suggested)).toBe(false);
+    expect(
+      serveSuggestionAdopted(form('npm run dev', ''), { ...suggested, readyPath: '/health' }),
+    ).toBe(false);
   });
 
   it('fills a box with its suggestions and leaves one without as typed', () => {
@@ -271,7 +355,7 @@ describe('a trial of the commands', () => {
     ]);
     expect(trialStatusBadge('failed')).toEqual({ label: '没通过', tone: 'danger' });
     expect(missingProgramNote('pnpm')).toContain('运行环境里找不到 `pnpm`');
-    expect(trialLabel(false, true)).toBe('试运行表单里的命令');
+    expect(trialLabel(false, true)).toBe('试运行表单里的命令和服务');
     const now = Date.parse('2026-11-27T10:00:05.000Z');
     expect(trialSummary(trial(), now)).toContain('目标分支 main（提交 01234567）');
     expect(trialSummary(trial(), now)).toContain('已用 5 秒');
@@ -291,6 +375,246 @@ describe('a trial of the commands', () => {
     expect(texts[0]).toBe('passed (2s)');
     expect(texts.at(-1)).toContain('target branch main · started at');
     expect(texts.at(-1)).toContain('took 1m 5s');
+    expect(texts.join('\n')).not.toMatch(/[一-鿿]/);
+  });
+
+  it('runs no verify command while the service is still to start or starting', () => {
+    const serve = { command: 'npm run dev', readyPath: '/', readyTimeoutSeconds: 120 };
+    const starting = trial({ serve, results: [result('setup', 'npm ci')] });
+    expect(states(starting)).toEqual([
+      'setup:npm ci:passed',
+      'verify:npm test:waiting',
+      'verify:npm run lint:waiting',
+    ]);
+    expect(states(trial({ serve }))).toEqual([
+      'setup:npm ci:running',
+      'verify:npm test:waiting',
+      'verify:npm run lint:waiting',
+    ]);
+    // Once it answered or was given up on, the verify commands run.
+    const answered = trial({
+      serve,
+      results: [result('setup', 'npm ci')],
+      serviceResult: {
+        ok: false,
+        reason: 'timeout',
+        exitCode: null,
+        url: null,
+        port: 4000,
+        durationMs: 120_000,
+        outputTail: '',
+      },
+    });
+    expect(states(answered)).toEqual([
+      'setup:npm ci:passed',
+      'verify:npm test:running',
+      'verify:npm run lint:waiting',
+    ]);
+  });
+});
+
+describe('the service of a trial', () => {
+  const serve = { command: 'npm run dev', readyPath: '/', readyTimeoutSeconds: 30 };
+  const passed = (command: string): RepoTrialResult => ({
+    kind: 'setup',
+    command,
+    ok: true,
+    exitCode: 0,
+    timedOut: false,
+    durationMs: 1000,
+    outputTail: '',
+    missingProgram: null,
+  });
+  const service = (extra: Partial<RepoTrialService>): RepoTrialService => ({
+    ok: false,
+    reason: 'exited',
+    exitCode: 1,
+    url: null,
+    port: 53817,
+    durationMs: 2400,
+    outputTail: 'Error: listen EADDRINUSE',
+    ...extra,
+  });
+  const trial = (
+    extra: Partial<
+      Pick<RepoTrial, 'status' | 'setupCommands' | 'results' | 'serve' | 'serviceResult'>
+    > = {},
+  ) => ({
+    status: 'running' as RepoTrial['status'],
+    setupCommands: ['npm ci', 'npm run build'],
+    results: [] as RepoTrialResult[],
+    serve: serve as RepoTrial['serve'],
+    serviceResult: null as RepoTrialService | null,
+    ...extra,
+  });
+  const ready = service({
+    ok: true,
+    reason: null,
+    exitCode: null,
+    url: 'http://127.0.0.1:53817',
+    outputTail: 'listening',
+  });
+  const setupDone = [passed('npm ci'), passed('npm run build')];
+
+  it('is not tried without a start command', () => {
+    const view = trialServiceView(trial({ serve: null }));
+    expect(view).toEqual({
+      state: 'none',
+      row: 'skipped',
+      command: null,
+      note: '没有启动命令，不试服务',
+      outputTail: null,
+    });
+    expect(trialServiceView(trial({ serve: null, status: 'passed' })).state).toBe('none');
+  });
+
+  it('waits for the setup commands, then starts', () => {
+    expect(trialServiceView(trial())).toMatchObject({
+      state: 'waiting',
+      row: 'waiting',
+      command: 'npm run dev',
+      note: '等准备命令通过后起服务',
+      outputTail: null,
+    });
+    expect(trialServiceView(trial({ results: [passed('npm ci')] })).state).toBe('waiting');
+    expect(trialServiceView(trial({ results: setupDone }))).toMatchObject({
+      state: 'starting',
+      row: 'running',
+      note: '起服务中…（最多等 30 秒就绪）',
+    });
+    // Without setup commands it starts at once.
+    expect(trialServiceView(trial({ setupCommands: [] })).state).toBe('starting');
+  });
+
+  it('says where it was ready and how long it took', () => {
+    const view = trialServiceView(
+      trial({ status: 'passed', results: setupDone, serviceResult: ready }),
+    );
+    expect(view).toEqual({
+      state: 'ready',
+      row: 'passed',
+      command: 'npm run dev',
+      note: '已就绪：http://127.0.0.1:53817，用时 2 秒，随后已停掉',
+      outputTail: 'listening',
+    });
+    // The verify commands may still run after it.
+    expect(trialServiceView(trial({ results: setupDone, serviceResult: ready })).state).toBe(
+      'ready',
+    );
+  });
+
+  it('tells a timeout from an early exit, with the end of its output', () => {
+    const timedOut = trialServiceView(
+      trial({
+        status: 'failed',
+        results: setupDone,
+        serviceResult: service({ reason: 'timeout', exitCode: null, durationMs: 30_000 }),
+      }),
+    );
+    expect(timedOut).toMatchObject({
+      state: 'timeout',
+      row: 'failed',
+      note: '超时：30 秒内没有就绪',
+      outputTail: 'Error: listen EADDRINUSE',
+    });
+    const exited = trialServiceView(
+      trial({ status: 'failed', results: setupDone, serviceResult: service({}) }),
+    );
+    expect(exited).toMatchObject({
+      state: 'exited',
+      row: 'failed',
+      note: '进程提前退出（退出码 1）',
+    });
+    const signalled = trialServiceView(
+      trial({ status: 'failed', results: setupDone, serviceResult: service({ exitCode: null }) }),
+    );
+    expect(signalled.note).toBe('进程提前退出');
+    const aborted = trialServiceView(
+      trial({
+        status: 'failed',
+        results: setupDone,
+        serviceResult: service({ reason: 'aborted', exitCode: null, outputTail: '' }),
+      }),
+    );
+    expect(aborted).toMatchObject({
+      state: 'aborted',
+      row: 'failed',
+      note: '被中止（Master 停止了）',
+      outputTail: '',
+    });
+  });
+
+  it('is not run after a setup command failed, or when the trial ended before it', () => {
+    const failedSetup = [passed('npm ci'), { ...passed('npm run build'), ok: false, exitCode: 2 }];
+    for (const status of ['running', 'failed'] as const) {
+      expect(trialServiceView(trial({ status, results: failedSetup }))).toMatchObject({
+        state: 'skipped',
+        row: 'skipped',
+        note: '没有运行（准备命令没通过）',
+        outputTail: null,
+      });
+    }
+    // The target branch could not be read, say.
+    expect(trialServiceView(trial({ status: 'failed' }))).toMatchObject({
+      state: 'skipped',
+      note: '没有运行',
+    });
+    // A missing program keeps every command from running.
+    const missing = {
+      ...passed('npm test'),
+      kind: 'verify' as const,
+      ok: false,
+      exitCode: null,
+      missingProgram: 'npm',
+    };
+    expect(trialServiceView(trial({ status: 'failed', results: [missing] })).note).toBe('没有运行');
+  });
+
+  it('is described in both languages', () => {
+    expect(trialServiceLabel()).toBe('服务');
+    expect(trialHint('main', false)).toContain('起登记的服务');
+    expect(trialHint('main', true)).toContain('用表单里的命令和服务设置（不保存）');
+    expect(trialNothingNote()).toContain('也没有启动命令');
+    setLang('en');
+    const views = [
+      trial({ serve: null }),
+      trial(),
+      trial({ results: setupDone }),
+      trial({ results: setupDone, serviceResult: ready }),
+      trial({ results: setupDone, serviceResult: service({ reason: 'timeout', exitCode: null }) }),
+      trial({ results: setupDone, serviceResult: service({}) }),
+      trial({ results: setupDone, serviceResult: service({ exitCode: null }) }),
+      trial({ results: setupDone, serviceResult: service({ reason: 'aborted', exitCode: null }) }),
+      trial({ status: 'failed', results: [{ ...passed('npm ci'), ok: false, exitCode: 1 }] }),
+      trial({ status: 'failed' }),
+    ].map((t) => trialServiceView(t).note);
+    expect(views).toEqual([
+      'no start command, so no service to try',
+      'starts once the setup commands pass',
+      'starting… (ready within 30 seconds at most)',
+      'ready at http://127.0.0.1:53817 after 2s, then stopped',
+      'timed out: not ready within 30 seconds',
+      'exited before it was ready (exit code 1)',
+      'exited before it was ready',
+      'stopped (the Master stopped)',
+      'not run (a setup command failed)',
+      'not run',
+    ]);
+    expect(
+      trialServiceView(
+        trial({
+          serve: { ...serve, readyTimeoutSeconds: 1 },
+          serviceResult: service({ reason: 'timeout', exitCode: null }),
+        }),
+      ).note,
+    ).toBe('timed out: not ready within 1 second');
+    const texts = [
+      ...views,
+      trialServiceLabel(),
+      trialHint('main', false),
+      trialHint('main', true),
+      trialNothingNote(),
+    ];
     expect(texts.join('\n')).not.toMatch(/[一-鿿]/);
   });
 });

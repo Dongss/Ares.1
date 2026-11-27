@@ -1,6 +1,7 @@
 import { type FormEvent, useId, useState } from 'react';
 import type {
   ConfigView,
+  DetectedCommands,
   RepoDetection,
   RepoTrial,
   RepoTrialInput,
@@ -15,11 +16,14 @@ import type { Repo, RepoServe } from '../../../src/store/types.js';
 import { api } from '../lib/api.js';
 import { useAction, useReloadOn, useResource, useTick } from '../lib/hooks.js';
 import {
+  adoptServeSuggestion,
+  adoptSuggestionLabel,
   detectionNote,
   emptyServeForm,
   missingProgramNote,
   newRepoInput,
   noServeNote,
+  noServeSuggestionNote,
   REPO_ORIGINS,
   type RepoOrigin,
   registerLabel,
@@ -27,20 +31,28 @@ import {
   repoOriginLabel,
   repoPathLabel,
   type ServeForm,
+  type ServeSuggestion,
   serveFormBlank,
   serveFormProblems,
   serveHint,
   serveLabel,
   serveReadyPathHint,
+  serveSuggestionAdopted,
   serveSummary,
   serveTimeoutHint,
   setupHint,
   setupLabel,
   type TrialRow,
+  type TrialRowState,
+  type TrialServiceView,
   targetBranchPlaceholder,
+  trialHint,
   trialLabel,
+  trialNothingNote,
   trialRowNote,
   trialRows,
+  trialServiceLabel,
+  trialServiceView,
   trialStatusBadge,
   trialSummary,
   verifyHint,
@@ -148,19 +160,30 @@ export function ServeView({ serve }: { serve: RepoServe | null }) {
 /**
  * The service boxes of the edit form: the start command, its ready path and timeout, what keeps
  * them from being saved, and a button that clears them (saved cleared, the repo has no service).
+ * `suggestion`: what detecting from the project files suggested, once detected (null: nothing),
+ * shown with a button that puts it in the boxes; detecting never fills them by itself.
  */
 export function ServeFields(props: {
   value: ServeForm;
   onChange: (value: ServeForm) => void;
   disabled?: boolean;
+  suggestion?: DetectedCommands['serve'];
 }) {
-  const { value, onChange } = props;
+  const { value, onChange, suggestion } = props;
   const set = <K extends keyof ServeForm>(key: K, v: ServeForm[K]) =>
     onChange({ ...value, [key]: v });
   const problems = serveFormProblems(value);
   return (
     <fieldset className="serve-fields" disabled={props.disabled}>
       <legend>{t({ zh: '服务', en: 'Service' })}</legend>
+      {suggestion && (
+        <ServeSuggestionBox
+          suggestion={suggestion}
+          adopted={serveSuggestionAdopted(value, suggestion)}
+          onAdopt={() => onChange(adoptServeSuggestion(value, suggestion))}
+        />
+      )}
+      {suggestion === null && <p className="hint">{noServeSuggestionNote()}</p>}
       <label className="field">
         <span>
           {serveLabel()}
@@ -226,6 +249,38 @@ export function ServeFields(props: {
         </span>
       </div>
     </fieldset>
+  );
+}
+
+/**
+ * The start command and ready path detecting suggested, why, and the button that puts them in
+ * the boxes (not clickable while they hold them already).
+ */
+function ServeSuggestionBox(props: {
+  suggestion: ServeSuggestion;
+  adopted: boolean;
+  onAdopt: () => void;
+}) {
+  const { suggestion } = props;
+  return (
+    <div className="serve-suggestion">
+      <div className="serve-suggestion-head">
+        <span>{t({ zh: '探测建议：', en: 'Suggested: ' })}</span>
+        <code>{suggestion.command}</code>
+        <span className="hint">
+          {t({ zh: '就绪路径', en: 'ready path' })} <code>{suggestion.readyPath}</code>
+        </span>
+        <button type="button" onClick={props.onAdopt} disabled={props.adopted}>
+          {adoptSuggestionLabel()}
+        </button>
+        {props.adopted && (
+          <span className="hint">
+            {t({ zh: '表单里已经是这条建议', en: 'The boxes hold it already' })}
+          </span>
+        )}
+      </div>
+      <p className="hint">{suggestion.basis}</p>
+    </div>
   );
 }
 
@@ -351,8 +406,8 @@ export function DetectionNote({ detection }: { detection: RepoDetection }) {
 /** Says what the detect button reads: the files committed on the saved target branch. */
 export function detectHint(branch: string): string {
   return t({
-    zh: `看已保存的目标分支 ${branch} 上提交了的 package.json、pyproject.toml、go.mod、Cargo.toml、Makefile 等文件，建议该填的命令`,
-    en: `Suggests the commands from the package.json, pyproject.toml, go.mod, Cargo.toml, Makefile and the like committed on the saved target branch ${branch}`,
+    zh: `看已保存的目标分支 ${branch} 上提交了的 package.json、pyproject.toml、manage.py、go.mod、Cargo.toml、Makefile 等文件，建议该填的准备命令、检查命令和服务启动命令`,
+    en: `Suggests the setup and verify commands and the service start command from the package.json, pyproject.toml, manage.py, go.mod, Cargo.toml, Makefile and the like committed on the saved target branch ${branch}`,
   });
 }
 
@@ -387,9 +442,9 @@ export function useTrial(repoId: string) {
 }
 
 /**
- * The trial button and the repo's latest trial: each command's state, with the end of the output
- * of the one that failed. `commands`: the commands of the edit form to try instead of the saved
- * ones (nothing is saved); omitted on the card, which tries the saved ones.
+ * The trial button and the repo's latest trial: each command's state and the service's, with the
+ * end of the output of what failed. `commands`: the commands and service of the edit form to try
+ * instead of the saved ones (nothing is saved); omitted on the card, which tries the saved ones.
  */
 export function TrialPanel(props: {
   repo: Repo;
@@ -409,17 +464,7 @@ export function TrialPanel(props: {
         >
           {trialLabel(trial.running || trial.busy, form)}
         </button>
-        <span className="hint">
-          {form
-            ? t({
-                zh: `用输入框里的命令（不保存）在已保存的目标分支 ${repo.targetBranch} 当前的提交上依次跑准备命令和检查命令，和 Run 用的环境一样，不建 Run`,
-                en: `Runs the setup and then the verify commands in the boxes (without saving them) on the commit the saved target branch ${repo.targetBranch} is at, in the environment Runs use; no Run is created`,
-              })
-            : t({
-                zh: `在目标分支 ${repo.targetBranch} 当前的提交上依次跑准备命令和检查命令，和 Run 用的环境一样，不建 Run、什么都不改`,
-                en: `Runs the setup and then the verify commands on the commit the target branch ${repo.targetBranch} is at, in the environment Runs use; no Run is created and nothing changes`,
-              })}
-        </span>
+        <span className="hint">{trialHint(repo.targetBranch, form)}</span>
       </div>
       <ErrorBox>{trial.error}</ErrorBox>
       {trial.trial && <TrialResult trial={trial.trial} now={trial.now} />}
@@ -427,9 +472,26 @@ export function TrialPanel(props: {
   );
 }
 
+/**
+ * A trial as it goes or went: the setup commands, the service (started once they all passed and
+ * stopped once it answered), then the verify commands.
+ */
 export function TrialResult({ trial, now }: { trial: RepoTrial; now: number }) {
   const badge = trialStatusBadge(trial.status);
   const rows = trialRows(trial);
+  const service = trialServiceView(trial);
+  const commandRows = (kind: TrialRow['kind']) =>
+    rows
+      .filter((row) => row.kind === kind)
+      .map((row, i) => (
+        <li
+          // biome-ignore lint/suspicious/noArrayIndexKey: the same command may be listed twice
+          key={`${kind}-${i}`}
+          className={trialRowClass(row.state)}
+        >
+          <TrialRowView row={row} />
+        </li>
+      ));
   return (
     <div className="trial-result">
       <div className="trial-head">
@@ -437,24 +499,15 @@ export function TrialResult({ trial, now }: { trial: RepoTrial; now: number }) {
         <span className="hint">{trialSummary(trial, now)}</span>
       </div>
       <ErrorBox>{trial.error}</ErrorBox>
-      {rows.length === 0 ? (
-        <p className="hint">
-          {t({
-            zh: '没有准备命令，也没有检查命令，没什么可跑的。',
-            en: 'There are no setup or verify commands: nothing to run.',
-          })}
-        </p>
+      {rows.length === 0 && service.state === 'none' ? (
+        <p className="hint">{trialNothingNote()}</p>
       ) : (
         <ul className="checks">
-          {rows.map((row, i) => (
-            <li
-              // biome-ignore lint/suspicious/noArrayIndexKey: the same command may be listed twice
-              key={i}
-              className={`trial-${row.state} ${row.state === 'failed' ? 'check-fail' : row.state === 'passed' ? 'check-pass' : ''}`}
-            >
-              <TrialRowView row={row} />
-            </li>
-          ))}
+          {commandRows('setup')}
+          <li className={trialRowClass(service.row)}>
+            <TrialServiceRow view={service} />
+          </li>
+          {commandRows('verify')}
         </ul>
       )}
       {trial.log && (
@@ -467,11 +520,47 @@ export function TrialResult({ trial, now }: { trial: RepoTrial; now: number }) {
   );
 }
 
-function TrialRowView({ row }: { row: TrialRow }) {
-  const icon = { passed: '✓', failed: '✗', running: '…', waiting: '·', skipped: '–' }[row.state];
+const TRIAL_ICONS: Record<TrialRowState, string> = {
+  passed: '✓',
+  failed: '✗',
+  running: '…',
+  waiting: '·',
+  skipped: '–',
+};
+
+/** The classes of a trial's row in `state`: its color, and its icon's. */
+function trialRowClass(state: TrialRowState): string {
+  const check = state === 'failed' ? 'check-fail' : state === 'passed' ? 'check-pass' : '';
+  return `trial-${state} ${check}`;
+}
+
+/**
+ * The service's row: the start command and how it went; the end of its output opens under it
+ * once it answered or was given up on.
+ */
+function TrialServiceRow({ view }: { view: TrialServiceView }) {
   const title = (
     <span>
-      <span className="check-icon">{icon}</span>
+      <span className="check-icon">{TRIAL_ICONS[view.row]}</span>
+      {trialServiceLabel()} {view.command && <code>{view.command}</code>}{' '}
+      <span className="muted">{view.note}</span>
+    </span>
+  );
+  const failed = view.row === 'failed';
+  if (view.outputTail === null || (!failed && view.outputTail === '')) {
+    return <div className="trial-row">{title}</div>;
+  }
+  return (
+    <Collapsible title={title}>
+      <Pre>{view.outputTail || t({ zh: '（没有输出）', en: '(no output)' })}</Pre>
+    </Collapsible>
+  );
+}
+
+function TrialRowView({ row }: { row: TrialRow }) {
+  const title = (
+    <span>
+      <span className="check-icon">{TRIAL_ICONS[row.state]}</span>
       {row.kind === 'setup' ? setupLabel() : verifyLabel()} <code>{row.command}</code>{' '}
       <span className="muted">{trialRowNote(row)}</span>
     </span>

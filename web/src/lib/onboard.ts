@@ -283,7 +283,10 @@ export interface TrialFailure {
 
 /** Why the trial failed; null unless it did. */
 export function trialFailure(
-  trial: Pick<RepoTrial, 'status' | 'setupCommands' | 'verifyCommands' | 'results' | 'error'>,
+  trial: Pick<
+    RepoTrial,
+    'status' | 'setupCommands' | 'verifyCommands' | 'results' | 'serve' | 'serviceResult' | 'error'
+  >,
 ): TrialFailure | null {
   if (trial.status !== 'failed') return null;
   const row = trialRows(trial).find((r) => r.state === 'failed');

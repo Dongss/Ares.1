@@ -35,6 +35,7 @@ import {
   repoPatch,
   serveFormInit,
   serveFormProblems,
+  serveInput,
   serveLabel,
 } from '../lib/repos.js';
 import { href } from '../lib/router.js';
@@ -296,12 +297,22 @@ function EditRepo(props: { repo: Repo; onDone: () => void; onCancel: () => void 
         {detection && <DetectionNote detection={detection} />}
       </div>
       <CommandsFields verify={verify} setup={setup} onVerify={setVerify} onSetup={setSetup} />
+      <ServeFields
+        value={serve}
+        onChange={setServe}
+        disabled={action.busy}
+        suggestion={detection?.serve}
+      />
+      {/* Tries the service of the boxes too: none when they have no start command. */}
       <TrialPanel
         repo={repo}
-        commands={() => ({ setupCommands: parseLines(setup), verifyCommands: parseLines(verify) })}
-        disabled={action.busy}
+        commands={() => ({
+          setupCommands: parseLines(setup),
+          verifyCommands: parseLines(verify),
+          serve: serveInput(serve),
+        })}
+        disabled={action.busy || serveProblems.length > 0}
       />
-      <ServeFields value={serve} onChange={setServe} disabled={action.busy} />
       <p className="hint">
         {t({
           zh: '修改对之后开始的 Task 和命令阶段生效。',

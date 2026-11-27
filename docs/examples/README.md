@@ -56,7 +56,7 @@ cp docs/examples/workflows/*.yaml ~/.ares1/workflows/
 - **目标分支**：合并进哪个分支；不填就用仓库当前检出的分支（克隆时是远端的默认分支，新建空项目时是 `main`）。
 - **准备命令**：每个 Run 建好工作目录后运行一次，通常是安装依赖。每个 Run 的工作目录都是新的，所以每次都要装。有一条失败，Run 就结束、标为失败，从 issue 来的会自动重做。
 - **检查命令**：每次编码完成后运行，全部通过才算验收通过；没通过就带着输出返工。合并前同步了目标分支的新提交后也会再跑一遍；命令阶段没写 `verify.commands` 时也运行它们。
-- **服务启动命令**（登记后在「修改」的「服务」一栏填，可空）：命令阶段写了 `serve: true` 时，Master 先在 Run 的工作目录里运行它起服务，服务要监听环境变量 `PORT` 给的端口，比如 `npm start`、`node dist/server.js`。另有就绪路径（默认 `/`）和就绪超时（默认 120 秒），见 [`docs/running.md`](../running.md#服务启动命令)。常见项目的启动命令见下表最后一列；「按项目文件探测」也按这张表建议启动命令和就绪路径，规则见下面的「按项目文件探测」。
+- **服务启动命令**（登记后在「修改」的「服务」一栏填，可空）：命令阶段写了 `serve: true` 时，Master 先在 Run 的工作目录里运行它起服务，服务要监听环境变量 `PORT` 给的端口，比如 `npm start`、`node dist/server.js`。另有就绪路径（默认 `/`）和就绪超时（默认 120 秒），见 [`docs/running.md`](../running.md#服务启动命令)。常见项目的启动命令见下表最后一列；「按项目文件探测」也按这张表建议启动命令和就绪路径，列在「服务」一栏顶上，点「采用建议」才填进去，规则见下面的「按项目文件探测」。保存前可以点「试运行表单里的命令和服务」确认服务起得来，看板会写明是否就绪、地址和用时，没就绪时分开写超时还是进程提前退出，并能展开看服务输出的末尾。
 
 每行一条命令，在 Run 的工作目录里用 `/bin/sh -c` 依次运行，有一条失败就不再往下跑。常见项目可以这样填：
 
@@ -79,7 +79,7 @@ cp docs/examples/workflows/*.yaml ~/.ares1/workflows/
 
 ### 按项目文件探测
 
-已经登记的仓库，在「仓库」页点「修改」，再点「按项目文件探测」，Master 会看目标分支上已提交的根目录文件（工作目录里没提交的改动不算），按上面这张表建议准备命令、检查命令和启动命令（连同就绪路径），把准备命令和检查命令填进两个输入框，并列出是凭哪些文件判断的。它只填表单，不保存：检查一遍、按需要改过之后点「保存」才生效。规则如下（`src/workspace/detect.ts`，改规则时这张表和它一起改，`test/detect.test.ts` 会拿这张表核对）：
+已经登记的仓库，在「仓库」页点「修改」，再点「按项目文件探测」，Master 会看目标分支上已提交的根目录文件（工作目录里没提交的改动不算），按上面这张表建议准备命令、检查命令和启动命令（连同就绪路径），把准备命令和检查命令填进两个输入框，并列出是凭哪些文件判断的；启动命令不自动填，列在「服务」一栏顶上，点「采用建议」才填进去（就绪超时保持原样）。它只填表单，不保存：检查一遍、按需要改过之后点「保存」才生效。规则如下（`src/workspace/detect.ts`，改规则时这张表和它一起改，`test/detect.test.ts` 会拿这张表核对）：
 
 - **Node**（有 `package.json`）：包管理器先看 `package.json` 的 `packageManager` 字段（如 `pnpm@9.0.0`），没有就看锁文件：`package-lock.json` 或 `npm-shrinkwrap.json` → npm，`pnpm-lock.yaml` → pnpm，`yarn.lock` → yarn，`bun.lock` 或 `bun.lockb` → bun；有几个锁文件时按这个顺序取第一个。都没有就按 npm 处理。准备命令按表里那一行；yarn 只有 `packageManager` 字段写明 2 及以上的版本（如 `yarn@4.1.0`）时才按 Berry 那一行用 `--immutable`，没有这个字段时按 yarn 1 处理。用的包管理器没有自己的锁文件时不加 `--frozen-lockfile`、`--immutable`，npm 用 `npm install` 代替 `npm ci`。检查命令只按 `scripts` 里实际有的 `build`、`test`、`lint` 生成，顺序是 build → test → lint；`npm init` 生成的占位 `test`（`no test specified`）不算。`package.json` 是符号链接时不读它的内容：包管理器只按锁文件选，不生成检查命令，依据里写明是符号链接。
 - **Python**（有 `pyproject.toml` 或 `requirements.txt`）：有 `pyproject.toml` 和 `uv.lock` 时按 uv 那一行；只有 `pyproject.toml` 时按 pip + venv 那一行（`pyproject.toml` 里没有 `dev` 可选依赖时依据里会提醒改 `'.[dev]'`）；只有 `requirements.txt` 时按「只有 requirements.txt」那一行。`pytest` 一定加；ruff 的两条只在项目配置了 ruff 时才加：根目录有 `ruff.toml` 或 `.ruff.toml`，`pyproject.toml` 里有 `[tool.ruff]`，或者 `pyproject.toml`、`requirements.txt` 的依赖里有 ruff。

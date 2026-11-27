@@ -1331,6 +1331,27 @@ textarea:focus {
   flex-wrap: wrap;
   margin-top: 0;
 }
+/* The start command detecting suggested, why, and the button that puts it in the boxes. */
+.serve-suggestion {
+  margin: 0 0 10px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--active-bg);
+}
+.serve-suggestion-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 8px;
+}
+.serve-suggestion code {
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--code-bg);
+}
+.serve-suggestion p {
+  margin: 4px 0 0;
+}
 .serve-row {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));

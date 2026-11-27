@@ -175,22 +175,80 @@ export function detectedBox(suggested: readonly string[], typed: string): string
   return suggested.length > 0 ? suggested.join('\n') : typed;
 }
 
-/** What the edit form says after detecting: what was read, and what became of the boxes. */
+/**
+ * What the edit form says after detecting: what was read, and what became of the boxes. The
+ * suggested start command is not put in the service boxes: they may hold a service saved on
+ * purpose, so the human adopts it there (`adoptServeSuggestion`).
+ */
 export function detectionNote(detection: RepoDetection): string {
   const read = t({
     zh: `读自目标分支 ${detection.branch}（提交 ${shortSha(detection.commit)}）已提交的文件。`,
     en: `Read from the files committed on the target branch ${detection.branch} (commit ${shortSha(detection.commit)}).`,
   });
-  if (detection.verify.length === 0 && detection.setup.length === 0) {
+  const commands = detection.verify.length > 0 || detection.setup.length > 0;
+  if (!commands && !detection.serve) {
     return `${read}${t({
       zh: '没有可填的建议，输入框没有改动。',
       en: ' Nothing to suggest; the boxes are left as they were.',
     })}`;
   }
-  return `${read}${t({
-    zh: '建议已填进下面的输入框（没有建议的那一栏不动），检查无误后点「保存」才生效。',
-    en: ' The suggestions are in the boxes below (a box without one is left as it was); they take effect once you check them and choose Save.',
+  const boxes = commands
+    ? t({
+        zh: '建议已填进下面的输入框（没有建议的那一栏不动），检查无误后点「保存」才生效。',
+        en: ' The suggestions are in the boxes below (a box without one is left as it was); they take effect once you check them and choose Save.',
+      })
+    : t({
+        zh: '准备命令和检查命令没有可填的建议，输入框没有改动。',
+        en: ' No setup or verify commands to suggest; their boxes are left as they were.',
+      });
+  if (!detection.serve) return `${read}${boxes}`;
+  const adopt = adoptSuggestionLabel();
+  return `${read}${boxes}${t({
+    zh: `建议的启动命令不会自动填进「服务」一栏，要用就点那里的「${adopt}」，同样保存后才生效。`,
+    en: ` The suggested start command is not put in the Service boxes by itself: choose ${adopt} there to use it, and Save as well.`,
   })}`;
+}
+
+/** The suggested service of a detection: the start command, its ready path and why. */
+export type ServeSuggestion = NonNullable<RepoDetection['serve']>;
+
+/** The button by a suggested start command that puts it in the service boxes. */
+export function adoptSuggestionLabel(): string {
+  return t({ zh: '采用建议', en: 'Use the suggestion' });
+}
+
+/**
+ * The service boxes with the suggested start command and ready path in them; the ready timeout
+ * stays as typed, the suggestion having none (the default is left to it).
+ */
+export function adoptServeSuggestion(
+  form: ServeForm,
+  suggestion: Pick<ServeSuggestion, 'command' | 'readyPath'>,
+): ServeForm {
+  return { ...form, command: suggestion.command, readyPath: suggestion.readyPath };
+}
+
+/**
+ * Whether the service boxes hold the suggestion already, so that adopting it would change
+ * nothing: the same start command and ready path once trimmed, a blank ready path being the
+ * default one.
+ */
+export function serveSuggestionAdopted(
+  form: ServeForm,
+  suggestion: Pick<ServeSuggestion, 'command' | 'readyPath'>,
+): boolean {
+  return (
+    form.command.trim() === suggestion.command &&
+    (form.readyPath.trim() || REPO_SERVE_DEFAULTS.readyPath) === suggestion.readyPath
+  );
+}
+
+/** What the service boxes say when detecting suggested no start command. */
+export function noServeSuggestionNote(): string {
+  return t({
+    zh: '按项目文件探测没有建议启动命令，原因见上面探测结果的最后一条。',
+    en: 'Detecting from the project files suggested no start command; the last line of what it found above says why.',
+  });
 }
 
 /** The detect button's text; `busy`: the request is under way. */
@@ -357,10 +415,14 @@ export interface TrialRow {
  * While the trial runs, the first without a result is the one running and the rest wait; once
  * it is over, those without a result were not run (an earlier command failed, or a missing
  * program kept all of them from running). A result goes to the first command of its kind with
- * its text that has none yet.
+ * its text that has none yet. The service, which `trialServiceView` shows, comes between the
+ * setup and the verify commands: while it is still to start or starting, no verify command runs.
  */
 export function trialRows(
-  trial: Pick<RepoTrial, 'status' | 'setupCommands' | 'verifyCommands' | 'results'>,
+  trial: Pick<
+    RepoTrial,
+    'status' | 'setupCommands' | 'verifyCommands' | 'results' | 'serve' | 'serviceResult'
+  >,
 ): TrialRow[] {
   const rows: TrialRow[] = [
     ...trial.setupCommands.map((command) => ({ kind: 'setup' as const, command })),
@@ -375,8 +437,10 @@ export function trialRows(
       row.state = result.ok ? 'passed' : 'failed';
     }
   }
+  const servicePending = trial.serve !== null && trial.serviceResult === null;
   let next = trial.status === 'running';
   for (const row of rows) {
+    if (row.kind === 'verify' && servicePending) next = false;
     if (row.result) continue;
     if (trial.status !== 'running') row.state = 'skipped';
     else if (next) {
@@ -385,6 +449,135 @@ export function trialRows(
     }
   }
   return rows;
+}
+
+/**
+ * Where a trial's service is: `none`, no start command to try; `waiting` for the setup commands;
+ * `starting`, waiting for it to answer; `ready`, it answered (and was stopped); not ready by its
+ * timeout (`timeout`), ended before it was (`exited`), or stopped with the Master (`aborted`);
+ * `skipped`, never started (a setup command failed, or the trial ended before it got there).
+ */
+export type TrialServiceState =
+  | 'none'
+  | 'waiting'
+  | 'starting'
+  | 'ready'
+  | 'timeout'
+  | 'exited'
+  | 'aborted'
+  | 'skipped';
+
+/** A trial's service as its row between the setup and the verify commands shows it. */
+export interface TrialServiceView {
+  state: TrialServiceState;
+  /** How its row looks: as a command's row in the same state would. */
+  row: TrialRowState;
+  /** The start command tried; null without one. */
+  command: string | null;
+  /** What its row says after the start command. */
+  note: string;
+  /** The end of its output, once it answered or was given up on; null before. */
+  outputTail: string | null;
+}
+
+/** The name of a trial's service row, before its start command. */
+export function trialServiceLabel(): string {
+  return t({ zh: '服务', en: 'Service' });
+}
+
+/** How a trial's service went, or where it is while the trial runs. */
+export function trialServiceView(
+  trial: Pick<RepoTrial, 'status' | 'setupCommands' | 'results' | 'serve' | 'serviceResult'>,
+): TrialServiceView {
+  const { serve } = trial;
+  if (!serve) {
+    return {
+      state: 'none',
+      row: 'skipped',
+      command: null,
+      note: t({ zh: '没有启动命令，不试服务', en: 'no start command, so no service to try' }),
+      outputTail: null,
+    };
+  }
+  const seconds = serve.readyTimeoutSeconds;
+  const view = (state: TrialServiceState, row: TrialRowState, note: string): TrialServiceView => ({
+    state,
+    row,
+    command: serve.command,
+    note,
+    outputTail: trial.serviceResult?.outputTail ?? null,
+  });
+  const r = trial.serviceResult;
+  if (r?.ok) {
+    const took = formatDuration(r.durationMs);
+    return view(
+      'ready',
+      'passed',
+      t({
+        zh: `已就绪：${r.url ?? ''}，用时 ${took}，随后已停掉`,
+        en: `ready at ${r.url ?? ''} after ${took}, then stopped`,
+      }),
+    );
+  }
+  if (r) {
+    switch (r.reason) {
+      case 'timeout':
+        return view(
+          'timeout',
+          'failed',
+          t({
+            zh: `超时：${seconds} 秒内没有就绪`,
+            en: `timed out: not ready within ${seconds} ${seconds === 1 ? 'second' : 'seconds'}`,
+          }),
+        );
+      case 'aborted':
+        return view(
+          'aborted',
+          'failed',
+          t({ zh: '被中止（Master 停止了）', en: 'stopped (the Master stopped)' }),
+        );
+      default:
+        return view(
+          'exited',
+          'failed',
+          r.exitCode === null
+            ? t({ zh: '进程提前退出', en: 'exited before it was ready' })
+            : t({
+                zh: `进程提前退出（退出码 ${r.exitCode}）`,
+                en: `exited before it was ready (exit code ${r.exitCode})`,
+              }),
+        );
+    }
+  }
+  // Not started yet: the trial runs it once every setup command passed, never after a failure.
+  if (trial.results.some((result) => !result.ok)) {
+    return view(
+      'skipped',
+      'skipped',
+      trial.results.some((result) => result.kind === 'setup' && !result.ok)
+        ? t({ zh: '没有运行（准备命令没通过）', en: 'not run (a setup command failed)' })
+        : t({ zh: '没有运行', en: 'not run' }),
+    );
+  }
+  if (trial.status !== 'running') {
+    return view('skipped', 'skipped', t({ zh: '没有运行', en: 'not run' }));
+  }
+  const setupPassed = trial.results.filter((result) => result.kind === 'setup').length;
+  if (setupPassed < trial.setupCommands.length) {
+    return view(
+      'waiting',
+      'waiting',
+      t({ zh: '等准备命令通过后起服务', en: 'starts once the setup commands pass' }),
+    );
+  }
+  return view(
+    'starting',
+    'running',
+    t({
+      zh: `起服务中…（最多等 ${seconds} 秒就绪）`,
+      en: `starting… (ready within ${seconds} ${seconds === 1 ? 'second' : 'seconds'} at most)`,
+    }),
+  );
 }
 
 /** The badge of a trial's status. */
@@ -465,10 +658,38 @@ export function trialSummary(
   return `${where} · ${when}`;
 }
 
-/** The trial button's text; `form`: it tries the commands of the edit form, not the saved ones. */
+/**
+ * The trial button's text; `form`: it tries the commands and service of the edit form, not the
+ * saved ones.
+ */
 export function trialLabel(running: boolean, form: boolean): string {
   if (running) return t({ zh: '试运行中…', en: 'Trying…' });
   return form
-    ? t({ zh: '试运行表单里的命令', en: 'Try the commands in the form' })
+    ? t({ zh: '试运行表单里的命令和服务', en: 'Try the commands and service in the form' })
     : t({ zh: '试运行', en: 'Try the commands' });
+}
+
+/**
+ * What the trial button does, by it: on the commit the saved target branch `branch` is at, the
+ * setup commands, the service started and stopped once it answers, then the verify commands.
+ * `form`: those of the edit form, unsaved; else the saved ones.
+ */
+export function trialHint(branch: string, form: boolean): string {
+  return form
+    ? t({
+        zh: `用表单里的命令和服务设置（不保存），在已保存的目标分支 ${branch} 当前的提交上依次跑准备命令、起服务（就绪后马上停掉）、跑检查命令，和 Run 用的环境一样，不建 Run；服务一栏没有启动命令时不试服务`,
+        en: `Runs the setup commands, starts the service (stopping it once it is ready) and runs the verify commands of the form (without saving them) on the commit the saved target branch ${branch} is at, in the environment Runs use; no Run is created, and no service is tried without a start command in the Service boxes`,
+      })
+    : t({
+        zh: `在目标分支 ${branch} 当前的提交上依次跑准备命令、起登记的服务（有的话，就绪后马上停掉）、跑检查命令，和 Run 用的环境一样，不建 Run、什么都不改`,
+        en: `Runs the setup commands, starts the registered service if there is one (stopping it once it is ready) and runs the verify commands on the commit the target branch ${branch} is at, in the environment Runs use; no Run is created and nothing changes`,
+      });
+}
+
+/** What a trial says when it has nothing to try. */
+export function trialNothingNote(): string {
+  return t({
+    zh: '没有准备命令、检查命令，也没有启动命令，没什么可跑的。',
+    en: 'There are no setup, verify or start commands: nothing to run.',
+  });
 }
