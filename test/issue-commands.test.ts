@@ -401,6 +401,72 @@ describe('issue commands: carried out on GitHub', () => {
     expect(decisions(t, run.id).map((e) => e.data.source)).toEqual(['dashboard']);
   });
 
+  it('takes no command written for an approval decided on the dashboard for the next one', async () => {
+    const t = await start();
+    const run = await waitingRun(t);
+    const issue = gh.get(1);
+    issue.comments.push('/ares1 approve');
+    // Decided on the dashboard, and waiting for the next approval before the next poll.
+    t.master.engine.reject(run.id, '请把文件名改成 feature.md', { source: 'dashboard' });
+    await waitFor(
+      () => t.master.store.countStageRounds(run.id, 'merge') === 2,
+      'second merge round',
+    );
+    await t.waitStatus(run.id, 'waiting_approval');
+    expect(t.master.store.getRun(run.id).issueSynced).toBeNull();
+
+    await t.master.issues.poll();
+    // The issue says the Run waits for the new approval; the command before it is not read.
+    expect(issue.comments.at(-1)).toContain('等你审批：「合并」阶段');
+    expect(issue.comments.filter((c) => c.includes('等你审批'))).toHaveLength(2);
+    expect(t.master.store.getRun(run.id).status).toBe('waiting_approval');
+    await t.master.issues.poll();
+    expect(decisions(t, run.id).map((e) => e.data.source)).toEqual(['dashboard']);
+
+    // A command written after it decides the new one.
+    issue.comments.push('/ares1 approve');
+    await t.master.issues.poll();
+    await t.waitStatus(run.id, 'completed');
+    expect(decisions(t, run.id).map((e) => e.data.source)).toEqual(['dashboard', 'issue']);
+  });
+
+  it('takes no command for the next approval when the one announced was decided during the update', async () => {
+    const t = await start();
+    gh.add({ title: '加 feature', body: 'feature.txt', labels: [LABELS.ready] });
+    await t.master.issues.poll();
+    const [run] = t.master.store.listRuns();
+    if (!run) throw new Error('no run');
+    await t.waitStatus(run.id, 'waiting_approval');
+    const issue = gh.get(1);
+    // Rejected on the dashboard right after the issue is told the Run waits, and waiting for the
+    // next approval before the issue's update is done.
+    const comment = gh.comment.bind(gh);
+    vi.spyOn(gh, 'comment').mockImplementation(async (repo, number, body) => {
+      await comment(repo, number, body);
+      if (!body.includes('等你审批')) return;
+      vi.restoreAllMocks();
+      t.master.engine.reject(run.id, '请把文件名改成 feature.md', { source: 'dashboard' });
+      await waitFor(
+        () => t.master.store.countStageRounds(run.id, 'merge') === 2,
+        'second merge round',
+      );
+      await t.waitStatus(run.id, 'waiting_approval');
+    });
+    await t.master.issues.sync();
+    vi.restoreAllMocks();
+    expect(t.master.store.getRun(run.id).issueSynced).toBeNull();
+
+    // Written for the approval the issue was told of.
+    issue.comments.push('/ares1 approve');
+    await t.master.issues.poll();
+    expect(issue.comments.at(-1)).toContain('等你审批：「合并」阶段');
+    expect(t.master.store.getRun(run.id)).toMatchObject({
+      status: 'waiting_approval',
+      issueSynced: 'waiting_approval',
+    });
+    expect(decisions(t, run.id).map((e) => e.data.source)).toEqual(['dashboard']);
+  });
+
   it('answers a malformed command, a rejection without its reason and an unsupported one without acting', async () => {
     const t = await start();
     const run = await waitingRun(t);

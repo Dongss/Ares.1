@@ -3621,6 +3621,11 @@ export class Engine {
         approvalId: approval.id,
         stageId: sr.stageId,
       });
+      // The issue has not said yet that the Run waits for this approval, even when it said so
+      // of the last one and the Run came back to waiting before the issue was caught up: a
+      // new comment says so before a command on the issue is read for it, so that no command
+      // written for an earlier approval decides this one.
+      if (run.issue) this.store.setIssueSynced(run.id, null);
       // Waiting for a human no longer counts as executing: the next queued Run takes its place.
       this.setStatus(run.id, 'waiting_approval');
     });

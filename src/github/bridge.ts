@@ -2289,6 +2289,7 @@ export class IssueBridge {
     if (run.issueSynced === run.status) return;
     const repo = this.deps.store.getRepo(run.repoId);
     const stageName = this.stageNameOf(run);
+    const announced = this.announcedApproval(run);
     // The issue closes once the code is on the platform; a failed push is retried on the next
     // poll. While the target branch has diverged from the platform's, the issue waits as it is,
     // open, until the two are merged (by the Master, or by a human when that failed) and the push
@@ -2337,7 +2338,14 @@ export class IssueBridge {
     if (close) await gh.close(issue.repo, issue.number, close);
     const store = this.deps.store;
     store.tx(() => {
-      store.setIssueSynced(run.id, run.status);
+      // A comment saying the Run waits for an approval that was decided while the issue was
+      // updated (or before, the Run read being out of date) does not count as saying it of the
+      // next one: the issue is left behind, and the next poll says the Run waits again before a
+      // command is read for it.
+      const caughtUp =
+        run.status !== 'waiting_approval' ||
+        (announced !== null && this.announcedApproval(run) === announced);
+      store.setIssueSynced(run.id, caughtUp ? run.status : null);
       if (failure?.kind === 'redo') {
         // The failed Run's page learns when the next attempt starts.
         store.event(run.id, 'issue.redo_scheduled', {
@@ -2384,6 +2392,17 @@ export class IssueBridge {
   /** Name of the stage the Run is in, or ended in. */
   private stageNameOf(run: Run): string | undefined {
     return this.deps.store.currentStageName(run);
+  }
+
+  /**
+   * The id of the approval an update of the issue saying the Run waits for one is about: the one
+   * pending in the store, when it is of the stage round `run` (read earlier) is at. null when
+   * `run` waits for none, or the Run has moved on from that round since.
+   */
+  private announcedApproval(run: Run): string | null {
+    if (run.status !== 'waiting_approval') return null;
+    const pending = this.deps.store.pendingApproval(run.id);
+    return pending && pending.stageRunId === run.currentStageRunId ? pending.id : null;
   }
 
   /**
@@ -2618,10 +2637,10 @@ export class IssueBridge {
 
   /**
    * Decide the approval `approvalId` of the Run as the command says, when it says so properly.
-   * Before the decision, the issue counts as not caught up with the Run any more: once the Run
-   * waits for an approval again, the issue says so in a new comment before a command is read
-   * for it. Should the Master stop between the decision and its answer on the issue, the command
-   * comes before that comment then, and is never carried out twice.
+   * Once the Run waits for an approval again, the issue says so in a new comment before a
+   * command is read for it (the engine's `requestApproval` leaves the issue behind the Run):
+   * should the Master stop between the decision and its answer on the issue, the command comes
+   * before that comment then, and is never carried out twice.
    */
   private carryOut(
     run: Run,
@@ -2647,7 +2666,6 @@ export class IssueBridge {
     }
     const origin = { source: 'issue', author: command.author } as const;
     try {
-      if (pending) store.setIssueSynced(run.id, null);
       if (name === 'approve') {
         this.deps.engine.approve(run.id, note || undefined, origin);
         return { kind: 'approved' };
