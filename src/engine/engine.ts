@@ -363,6 +363,13 @@ class Aborted extends Error {}
 export class InvalidStateError extends Error {}
 
 /**
+ * A request that is wrong whatever the state, e.g. a text it needs left blank: the HTTP API
+ * answers it with 400, where an InvalidStateError (the request is fine, the state refuses it) gets
+ * 409.
+ */
+export class InvalidInputError extends Error {}
+
+/**
  * Why a kept worktree and branch were removed, as their `workspace.removed` event records it: by
  * a human, or automatically (`LeftoverWorkspaceReason`).
  */

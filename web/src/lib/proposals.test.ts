@@ -20,12 +20,14 @@ import {
   editedAtText,
   editedMark,
   editedResultText,
+  editLists,
   emptyDraft,
   failureLabel,
   failureLabels,
   failuresHeading,
   humanMark,
   lineItems,
+  listFill,
   mergeProposals,
   PROPOSAL_STATUS,
   pendingText,
@@ -35,6 +37,8 @@ import {
   proposalRedoText,
   type RequirementDraft,
   requirementInput,
+  resplitOnEdit,
+  resplitText,
   restartBlocker,
   restartHint,
   restartLabels,
@@ -341,6 +345,56 @@ describe('writing a requirement', () => {
     );
   });
 
+  it('shows how full a list is under its field while it is typed', () => {
+    const lines = (n: number) => Array.from({ length: n }, (_, i) => `- ${i}`).join('\n');
+    expect(listFill('')).toEqual({
+      count: 0,
+      over: false,
+      text: `最多 ${REQUIREMENT_ITEMS_MAX} 条`,
+    });
+    // Counted as sent: blank lines and list marks are not items.
+    expect(listFill('- 能导出\n\n  \n1. 有测试')).toEqual({
+      count: 2,
+      over: false,
+      text: `已有 2 条，最多 ${REQUIREMENT_ITEMS_MAX} 条`,
+    });
+    expect(listFill(lines(REQUIREMENT_ITEMS_MAX)).over).toBe(false);
+    expect(listFill(lines(REQUIREMENT_ITEMS_MAX + 1))).toEqual({
+      count: REQUIREMENT_ITEMS_MAX + 1,
+      over: true,
+      text: `已有 ${REQUIREMENT_ITEMS_MAX + 1} 条，超过了上限 ${REQUIREMENT_ITEMS_MAX} 条`,
+    });
+    const long = 'x'.repeat(REQUIREMENT_TEXT_MAX + 1);
+    expect(listFill(`ok\n${long}`)).toEqual({
+      count: 2,
+      over: true,
+      text: `已有 2 条，最多 ${REQUIREMENT_ITEMS_MAX} 条；有 1 条超过 ${REQUIREMENT_TEXT_MAX} 个字`,
+    });
+    // Over whenever the Master would refuse the list, as writeBlocker says.
+    const ok = repo('demo');
+    for (const text of ['', lines(3), lines(REQUIREMENT_ITEMS_MAX + 1), `ok\n${long}`]) {
+      expect(listFill(text).over).toBe(writeBlocker(ok, filled({ acceptance: text })) !== null);
+    }
+    setLang('en');
+    const texts = [
+      listFill('').text,
+      listFill('one').text,
+      listFill(lines(3)).text,
+      listFill(lines(REQUIREMENT_ITEMS_MAX + 1)).text,
+      listFill(`${long}\n${long}`).text,
+      listFill(`ok\n${long}`).text,
+    ];
+    expect(texts).toEqual([
+      `At most ${REQUIREMENT_ITEMS_MAX} items`,
+      `1 of at most ${REQUIREMENT_ITEMS_MAX} items`,
+      `3 of at most ${REQUIREMENT_ITEMS_MAX} items`,
+      `${REQUIREMENT_ITEMS_MAX + 1} items, over the limit of ${REQUIREMENT_ITEMS_MAX}`,
+      `2 of at most ${REQUIREMENT_ITEMS_MAX} items; 2 items are longer than ${REQUIREMENT_TEXT_MAX} characters`,
+      `2 of at most ${REQUIREMENT_ITEMS_MAX} items; 1 item is longer than ${REQUIREMENT_TEXT_MAX} characters`,
+    ]);
+    for (const text of texts) expect(text).not.toMatch(CHINESE);
+  });
+
   it('cannot be sent while the repo has problems, whatever the draft', () => {
     const broken = repo('demo', { problems: ['模板 self-dev 不存在或无效'] });
     const reason = '这个仓库的配置有问题（见上面），改好之后才能写需求';
@@ -534,6 +588,86 @@ describe('editing a pending proposal', () => {
     expect(saveEditBlocker(before, { ...before, what: '' })).toBe('写清楚要做什么');
     setLang('en');
     expect(saveEditBlocker(before, before)).toBe('Nothing changed yet');
+  });
+
+  it('checks only the fields changed against the limits, as the Master does', () => {
+    // A scout's lists may be longer than a human may write: they are kept when not changed.
+    const long = 'x'.repeat(REQUIREMENT_TEXT_MAX + 1);
+    const many = Array.from({ length: REQUIREMENT_ITEMS_MAX + 1 }, (_, i) => `第 ${i} 条`);
+    const big = proposal({
+      ...scouted,
+      title: 't'.repeat(REQUIREMENT_TITLE_MAX + 1),
+      why: long,
+      evidence: [long],
+      acceptance: many,
+    });
+    const before = draftOf(big);
+    expect(saveEditBlocker(before, { ...before, risk: 'low' })).toBeNull();
+    const retitled = { ...before, title: '短标题' };
+    expect(saveEditBlocker(before, retitled)).toBeNull();
+    expect(proposalEdit(before, retitled)).toEqual({ title: '短标题' });
+    // A field changed is checked, the others still not.
+    expect(saveEditBlocker(before, { ...before, acceptance: `${before.acceptance}\n再一条` })).toBe(
+      `验收标准最多 ${REQUIREMENT_ITEMS_MAX} 条`,
+    );
+    expect(saveEditBlocker(before, { ...before, acceptance: '一条就够' })).toBeNull();
+    expect(saveEditBlocker(before, { ...before, evidence: `${long}y` })).toBe(
+      `每条证据最多 ${REQUIREMENT_TEXT_MAX} 个字`,
+    );
+    expect(saveEditBlocker(before, { ...before, why: `${long}y` })).toBe(
+      `「为什么」最多 ${REQUIREMENT_TEXT_MAX} 个字`,
+    );
+    expect(saveEditBlocker(before, { ...before, title: `${before.title}t` })).toBe(
+      `标题最多 ${REQUIREMENT_TITLE_MAX} 个字`,
+    );
+    // A title and what to do are needed whatever changed.
+    expect(saveEditBlocker(before, { ...before, title: '' })).toBe('先写标题');
+    expect(saveEditBlocker(before, { ...before, what: ' ' })).toBe('写清楚要做什么');
+
+    // Under the fields: a list left alone is not marked over the limit, and says it is kept.
+    const untouched = editLists(big, before, { ...before, title: '短标题' });
+    expect(untouched.acceptance.checked).toBe(false);
+    expect(listFill(before.acceptance, untouched.acceptance.checked)).toEqual({
+      count: REQUIREMENT_ITEMS_MAX + 1,
+      over: false,
+      text: `已有 ${REQUIREMENT_ITEMS_MAX + 1} 条，超过了上限 ${REQUIREMENT_ITEMS_MAX} 条；这一栏没改动，原样保留，不受上限限制`,
+    });
+    // Changed, it is.
+    const more = { ...before, acceptance: `${before.acceptance}\n再一条` };
+    const touched = editLists(big, before, more);
+    expect(touched.acceptance.checked).toBe(true);
+    expect(listFill(more.acceptance, touched.acceptance.checked).over).toBe(true);
+    // Within the limits, nothing more is said either way.
+    expect(listFill('一条', false)).toEqual(listFill('一条'));
+    setLang('en');
+    const kept = listFill(before.evidence, false).text;
+    expect(kept).toBe(
+      `1 of at most ${REQUIREMENT_ITEMS_MAX} items; 1 item is longer than ${REQUIREMENT_TEXT_MAX} characters; left unchanged, it is kept as it is whatever the limit`,
+    );
+  });
+
+  it('tells which lists would be split into other items once their field changes', () => {
+    expect(resplitOnEdit([])).toBe(false);
+    expect(resplitOnEdit(['web/src/pages/Home.tsx', '能导出'])).toBe(false);
+    // An item with a line break in it, or starting with a list mark.
+    expect(resplitOnEdit(['第一行\n第二行'])).toBe(true);
+    expect(resplitOnEdit(scouted.acceptance)).toBe(true);
+    expect(resplitOnEdit(['1. 先做这个'])).toBe(true);
+    // Marks that are not list marks stay.
+    expect(resplitOnEdit(['-1 表示不限', '1.5 秒内返回'])).toBe(false);
+    // The edit form warns under each list field it holds for.
+    const before = draftOf(scouted);
+    expect(editLists(scouted, before, before)).toEqual({
+      evidence: { checked: false, resplit: false },
+      acceptance: { checked: false, resplit: true },
+    });
+    expect(editLists(scouted, before, { ...before, evidence: '另一个文件' })).toEqual({
+      evidence: { checked: true, resplit: false },
+      acceptance: { checked: false, resplit: true },
+    });
+    expect(resplitText()).toContain('不动这一栏就原样保留');
+    setLang('en');
+    expect(resplitText()).not.toMatch(CHINESE);
   });
 
   it('marks a proposal a human edited, and says when', () => {

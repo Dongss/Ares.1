@@ -20,7 +20,12 @@ import {
 import type { LoadedConfig } from '../config/load.js';
 import type { MasterConfig } from '../config/schema.js';
 import type { ConfigStatus } from '../config/watch.js';
-import { type Engine, InvalidStateError, readAttemptEvents } from '../engine/engine.js';
+import {
+  type Engine,
+  InvalidInputError,
+  InvalidStateError,
+  readAttemptEvents,
+} from '../engine/engine.js';
 import { storedRunTimes } from '../engine/times.js';
 import type { IssueBridge } from '../github/bridge.js';
 import { t } from '../i18n.js';
@@ -103,8 +108,6 @@ export interface ApiDeps {
   /** The CLIs the Master has an adapter for; omitted = none told. */
   clis?: readonly CliInfo[];
 }
-
-class BadRequestError extends Error {}
 
 function noBranch(branch: string): string {
   return t({ zh: `分支 ${branch} 不存在`, en: `Branch ${branch} does not exist` });
@@ -253,7 +256,7 @@ async function body<T>(
   }
   const parsed = schema.safeParse(raw ?? {});
   if (!parsed.success) {
-    throw new BadRequestError(
+    throw new InvalidInputError(
       parsed.error.issues
         .map((i) => `${i.path.join('.') || '(body)'}: ${i.message}`)
         .join(t({ zh: '；', en: '; ' })),
@@ -266,7 +269,7 @@ async function body<T>(
 function query<T>(c: { req: { query: () => Record<string, string> } }, schema: z.ZodType<T>): T {
   const parsed = schema.safeParse(c.req.query());
   if (!parsed.success) {
-    throw new BadRequestError(
+    throw new InvalidInputError(
       parsed.error.issues
         .map((i) => `${i.path.join('.') || '(query)'}: ${i.message}`)
         .join(t({ zh: '；', en: '; ' })),
@@ -295,7 +298,7 @@ export function createApi(deps: ApiDeps): Hono {
         ? 404
         : err instanceof ConflictError || err instanceof InvalidStateError
           ? 409
-          : err instanceof BadRequestError
+          : err instanceof InvalidInputError
             ? 400
             : 500;
     return c.json({ error: err.message }, status);
@@ -378,12 +381,12 @@ export function createApi(deps: ApiDeps): Hono {
     const input = await body(c, RepoInput);
     const path = resolve(input.path);
     if (!isAbsolute(input.path)) {
-      throw new BadRequestError(
+      throw new InvalidInputError(
         t({ zh: 'path 必须是绝对路径', en: 'path must be an absolute path' }),
       );
     }
     if (!existsSync(path) || !(await isGitRepo(path))) {
-      throw new BadRequestError(
+      throw new InvalidInputError(
         t({ zh: `${path} 不是 git 仓库`, en: `${path} is not a git repository` }),
       );
     }
@@ -397,7 +400,7 @@ export function createApi(deps: ApiDeps): Hono {
     }
     const targetBranch = input.targetBranch ?? (await currentBranch(path));
     if (!(await branchExists(path, targetBranch))) {
-      throw new BadRequestError(noBranch(targetBranch));
+      throw new InvalidInputError(noBranch(targetBranch));
     }
     const repo = store.createRepo({
       name: input.name,
@@ -415,7 +418,7 @@ export function createApi(deps: ApiDeps): Hono {
     const repo = store.getRepo(c.req.param('id'));
     const input = await body(c, RepoPatch);
     if (input.targetBranch && !(await branchExists(repo.path, input.targetBranch))) {
-      throw new BadRequestError(noBranch(input.targetBranch));
+      throw new InvalidInputError(noBranch(input.targetBranch));
     }
     const updated = store.updateRepo(repo.id, input);
     await deps.reposChanged?.();

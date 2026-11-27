@@ -61,8 +61,11 @@ import {
   editedAtText,
   editedMark,
   editedResultText,
+  editLists,
   emptyDraft,
   humanMark,
+  type ListField,
+  listFill,
   mergeProposals,
   PROPOSAL_STATUS,
   type ProposalGroup,
@@ -74,6 +77,7 @@ import {
   RECENT_PROPOSALS,
   type RequirementDraft,
   requirementInput,
+  resplitText,
   restartBlocker,
   restartHint,
   saveEditBlocker,
@@ -928,16 +932,37 @@ function WriteRequirement({ repo, onWritten }: { repo: BacklogRepoStatus; onWrit
   );
 }
 
+/** How a list field is shown; writing a requirement, every list is checked and none resplit. */
+type ListShown = { checked: boolean; resplit: boolean };
+const WRITING: ListShown = { checked: true, resplit: false };
+
+/**
+ * What is shown under a list field: how full it is (`listFill`), in the danger color once the
+ * Master would refuse it, and, editing a proposal whose items would be split again once the field
+ * changes (`resplit`), a warning saying so.
+ */
+function ListNotes({ text, shown }: { text: string; shown: ListShown }) {
+  const fill = listFill(text, shown.checked);
+  return (
+    <>
+      <small className={fill.over ? 'field-note field-note-over' : 'field-note'}>{fill.text}</small>
+      {shown.resplit && <small className="field-note">{resplitText()}</small>}
+    </>
+  );
+}
+
 /**
  * The fields of a requirement: title, what to do, why, evidence, acceptance criteria, category,
  * size and risk, with what the size chosen means. The form that writes a requirement and the one
- * that edits a pending proposal are the same.
+ * that edits a pending proposal are the same; `lists`: editing, how each list field is shown
+ * (`editLists`).
  */
 function RequirementFields(props: {
   draft: RequirementDraft;
   update: (patch: Partial<RequirementDraft>) => void;
+  lists?: Record<ListField, ListShown>;
 }) {
-  const { draft, update } = props;
+  const { draft, update, lists } = props;
   return (
     <>
       <label className="field">
@@ -989,6 +1014,7 @@ function RequirementFields(props: {
             en: 'Files, lines or symptoms it is about, e.g.:\nweb/src/pages/Home.tsx',
           })}
         />
+        <ListNotes text={draft.evidence} shown={lists?.evidence ?? WRITING} />
       </label>
       <label className="field">
         <span>
@@ -1006,6 +1032,7 @@ function RequirementFields(props: {
             en: 'How to tell it is done, e.g.:\nThe list can be exported\nThere are tests',
           })}
         />
+        <ListNotes text={draft.acceptance} shown={lists?.acceptance ?? WRITING} />
       </label>
       <div className="form-row write-requirement-kind">
         <label className="field">
@@ -1080,7 +1107,7 @@ function EditProposal(props: {
   };
   return (
     <div className="form write-requirement-form proposal-edit-form">
-      <RequirementFields draft={draft} update={update} />
+      <RequirementFields draft={draft} update={update} lists={editLists(p, before, draft)} />
       <ErrorBox>{action.error}</ErrorBox>
       <div className="form-actions write-requirement-actions">
         <button

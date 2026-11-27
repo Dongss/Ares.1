@@ -273,9 +273,12 @@ const categoryText = (category: ScoutProposal['category']) =>
 
 /**
  * What a proposal asks for, as Markdown sections: why, the evidence, what to do and the acceptance
- * criteria. The text of a proposal's issue (`proposalBody`) and the goal of a Run from a local
- * proposal (`proposalGoal`) both open with it. A section with nothing in it is left out: a
- * requirement a human wrote may say only what to do.
+ * criteria. The text of a proposal's issue (`proposalBody`, `iterationChildBody`) and the goal of
+ * a Run from a local proposal (`proposalGoal`) both open with it. A section with nothing in it is
+ * left out, by the same rule for every source of requirements: a requirement a human wrote into
+ * the local backlog may say only what to do. A scout's proposal has every section (its output
+ * format requires why, evidence, what to do and acceptance criteria, none empty), so the issues it
+ * files on GitHub or GitLab keep all four.
  */
 export function proposalSections(
   p: Pick<ScoutProposal, 'why' | 'evidence' | 'what' | 'acceptance'>,

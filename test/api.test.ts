@@ -26,7 +26,7 @@ import type {
 } from '../src/api/types.js';
 import { SCOUT_FAILURE_NOTIFY_AFTER, SCOUT_GOAL_MAX } from '../src/config/flow.js';
 import { findTemplate, githubConfigKey, gitlabConfigKey } from '../src/config/load.js';
-import { InvalidStateError } from '../src/engine/engine.js';
+import { InvalidInputError, InvalidStateError } from '../src/engine/engine.js';
 import { storedRunTimes } from '../src/engine/times.js';
 import { setLang } from '../src/i18n.js';
 import { type ExecFile, noticeScript } from '../src/notify/system.js';
@@ -2541,6 +2541,33 @@ backlog:
     expect(store.getProposal(accepted.id).title).toBe('采纳了的');
     expect(store.getProposal(step.id)).toMatchObject({ risk: 'high', editedAt: null });
     expect(gh.calls).toEqual([]);
+  });
+
+  it('answers a wrong request the local backlog refuses by itself with 400, not 409', async () => {
+    const t = await start();
+    const pending = propose(t.repo.id, '待处理的');
+    // The API's own checks come first; the backlog's (InvalidInputError) still answer 400 when a
+    // request gets past them.
+    const backlog = t.master.backlog;
+    backlog.edit = () => {
+      throw new InvalidInputError('需求的标题和要做什么都不能为空');
+    };
+    expect(await call('PATCH', `/api/proposals/${pending.id}`, { title: '改' })).toMatchObject({
+      status: 400,
+      json: { error: '需求的标题和要做什么都不能为空' },
+    });
+    backlog.write = () => {
+      throw new InvalidInputError('需求的标题和要做什么都不能为空');
+    };
+    const written = await call('POST', '/api/proposals', { repo: 'demo', title: 't', what: 'w' });
+    expect(written.status).toBe(400);
+    // A request refused for the state it finds is still a conflict.
+    backlog.write = () => {
+      throw new InvalidStateError('backlog.repos.demo 配置有误');
+    };
+    expect(
+      (await call('POST', '/api/proposals', { repo: 'demo', title: 't', what: 'w' })).status,
+    ).toBe(409);
   });
 
   it("accepts a scout's proposal an edit puts within auto-accept; a human's draft stays pending", async () => {

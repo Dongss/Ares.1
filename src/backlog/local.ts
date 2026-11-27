@@ -33,7 +33,7 @@ import {
 } from '../config/flow.js';
 import { backlogConfigKey, findTemplate, type LoadedConfig } from '../config/load.js';
 import type { BacklogRepoConfig } from '../config/schema.js';
-import { type Engine, InvalidStateError } from '../engine/engine.js';
+import { type Engine, InvalidInputError, InvalidStateError } from '../engine/engine.js';
 import { goalWithEarlierAttempts } from '../engine/prompts.js';
 import { failedAttempt, LABELS } from '../github/issues.js';
 import {
@@ -166,8 +166,22 @@ function notStarted(p: Proposal, err: unknown): Error {
   const known =
     err instanceof NotFoundError ||
     err instanceof InvalidStateError ||
+    err instanceof InvalidInputError ||
     err instanceof ConflictError;
   return known ? new InvalidStateError(message) : new Error(message);
+}
+
+/**
+ * A requirement written or edited with a blank title or what to do: the request is wrong, so the
+ * API answers 400 (InvalidInputError), not 409, whoever calls it.
+ */
+function incomplete(): InvalidInputError {
+  return new InvalidInputError(
+    t({
+      zh: '需求的标题和要做什么都不能为空',
+      en: 'A requirement needs a title and what to do',
+    }),
+  );
 }
 
 /** Why a proposal cannot be decided again. */
@@ -520,7 +534,8 @@ export class LocalBacklog {
 
   /**
    * Write a human's requirement into the local backlog of repo `name` (see `writable` for the
-   * repos that take one): a proposal of author human and no scout, recorded with a
+   * repos that take one; a blank title or what to do is refused, `incomplete`): a proposal of
+   * author human and no scout, recorded with a
    * `proposal.created` event in one transaction (`started`: whether the human asked to start it).
    * With `start` (the default) it is then accepted as a human accepts one on the dashboard
    * (acceptProposal, in its own transaction: neither today's auto-accepts nor the day's automatic
@@ -534,14 +549,7 @@ export class LocalBacklog {
     const { repo, cfg } = this.writable(name);
     const title = oneLine(input.title);
     const what = input.what.trim();
-    if (!title || !what) {
-      throw new InvalidStateError(
-        t({
-          zh: '需求的标题和要做什么都不能为空',
-          en: 'A requirement needs a title and what to do',
-        }),
-      );
-    }
+    if (!title || !what) throw incomplete();
     const start = input.start ?? true;
     const store = this.deps.store;
     const written = store.tx(() => {
@@ -657,7 +665,7 @@ export class LocalBacklog {
   reject(id: string, reason: string): Proposal {
     const why = reason.trim();
     if (!why) {
-      throw new InvalidStateError(
+      throw new InvalidInputError(
         t({ zh: '拒绝提案时必须填写理由', en: 'Rejecting a proposal needs a reason' }),
       );
     }
@@ -688,7 +696,7 @@ export class LocalBacklog {
    * one or a step of an iteration (decided with its iteration as a whole) is refused
    * (ConflictError, saying why), and so is one whose repo left backlog.repos or has problems
    * (`deciding`). The texts are tidied as `write` tidies them: the title on one line, every text
-   * trimmed, empty list items left out; a blank title or what to do is refused.
+   * trimmed, empty list items left out; a blank title or what to do is refused (`incomplete`).
    *
    * Only the fields whose value changes count: those are written, with `editedAt` and a
    * `proposal.edited` event (`{ repo, proposalId, fields }`, the names of the changed fields,
@@ -715,14 +723,7 @@ export class LocalBacklog {
       ...(patch.size !== undefined ? { size: patch.size } : {}),
       ...(patch.risk !== undefined ? { risk: patch.risk } : {}),
     };
-    if (next.title === '' || next.what === '') {
-      throw new InvalidStateError(
-        t({
-          zh: '需求的标题和要做什么都不能为空',
-          en: 'A requirement needs a title and what to do',
-        }),
-      );
-    }
+    if (next.title === '' || next.what === '') throw incomplete();
     const fields = PROPOSAL_EDIT_FIELDS.filter((f) => {
       const value = next[f];
       return value !== undefined && !sameValue(value, p[f]);
@@ -1049,7 +1050,7 @@ export class LocalBacklog {
   rejectIteration(id: string, reason: string): Iteration {
     const why = reason.trim();
     if (!why) {
-      throw new InvalidStateError(
+      throw new InvalidInputError(
         t({ zh: '拒绝迭代时必须填写理由', en: 'Rejecting an iteration needs a reason' }),
       );
     }

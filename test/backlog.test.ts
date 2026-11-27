@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { ProposalSource } from '../src/backlog/scouting.js';
 import { REDO_BACKOFF_MAX_HOURS } from '../src/config/flow.js';
 import type { BacklogRepoConfig } from '../src/config/schema.js';
-import { InvalidStateError } from '../src/engine/engine.js';
+import { InvalidInputError, InvalidStateError } from '../src/engine/engine.js';
 import { type IterationUpdate, type PlannedIteration, proposalGoal } from '../src/github/scout.js';
 import { setLang } from '../src/i18n.js';
 import { noticeFor } from '../src/notify/notice.js';
@@ -409,11 +409,31 @@ ${config()}
     expect(() => t.master.backlog.write('demo', { title: ' \n', what: '要做的事' })).toThrow(
       '需求的标题和要做什么都不能为空',
     );
+    // A blank title or what to do is a wrong request, answered with 400 whoever calls this.
     expect(() => t.master.backlog.write('demo', { title: '一个需求', what: ' ' })).toThrow(
-      InvalidStateError,
+      InvalidInputError,
     );
     expect(t.master.store.listProposals()).toEqual([]);
     expect(eventData(t, 'proposal.created')).toEqual([]);
+  });
+
+  it('refuses an edit that blanks the title or what to do as a wrong request, keeping the proposal', async () => {
+    const t = await start(config());
+    const draft = t.master.backlog.write('demo', {
+      title: '一个需求',
+      what: '要做的事',
+      start: false,
+    });
+    expect(() => t.master.backlog.edit(draft.id, { title: ' \n ' })).toThrow(InvalidInputError);
+    expect(() => t.master.backlog.edit(draft.id, { what: '' })).toThrow(
+      '需求的标题和要做什么都不能为空',
+    );
+    expect(() => t.master.backlog.reject(draft.id, ' ')).toThrow(InvalidInputError);
+    expect(t.master.store.getProposal(draft.id)).toEqual(draft);
+    expect(eventData(t, 'proposal.edited')).toEqual([]);
+    // A decided one is refused for its state instead.
+    t.master.backlog.reject(draft.id, '不做了');
+    expect(() => t.master.backlog.edit(draft.id, { title: '改' })).toThrow(ConflictError);
   });
 
   it("stops auto-accepting once the day's budget is spent, the auto-accepted Runs counted", async () => {
@@ -1724,6 +1744,7 @@ describe('iterations of the local backlog', () => {
     expect(() => t.master.backlog.rejectIteration(filed.id, ' \n ')).toThrow(
       '拒绝迭代时必须填写理由',
     );
+    expect(() => t.master.backlog.rejectIteration(filed.id, '')).toThrow(InvalidInputError);
     const rejected = t.master.backlog.rejectIteration(filed.id, ' 现在不做本地仓库 \n');
     expect(rejected).toMatchObject({
       status: 'cancelled',

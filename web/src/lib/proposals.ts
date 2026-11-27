@@ -196,15 +196,23 @@ export function writeBlocker(
   return draftBlocker(draft);
 }
 
+/** A field of a draft, by the name the Master takes it under. */
+type DraftField = keyof ReturnType<typeof tidied>;
+
 /**
  * What is wrong with a draft, as the Master would refuse it, writing a requirement or editing a
  * proposal alike: no title or no what to do, too many items in a list, or something longer than
- * the Master takes. null when there is nothing.
+ * the Master takes. null when there is nothing. A title and what to do are always needed; the
+ * limits are checked only for the fields `limited` picks (all of them by default), since an edit
+ * sends only the fields changed and the Master checks only those.
  */
-function draftBlocker(draft: RequirementDraft): string | null {
+function draftBlocker(
+  draft: RequirementDraft,
+  limited: (field: DraftField) => boolean = () => true,
+): string | null {
   const title = draft.title.trim();
   if (title === '') return t({ zh: '先写标题', en: 'Write a title first' });
-  if (title.length > REQUIREMENT_TITLE_MAX) {
+  if (limited('title') && title.length > REQUIREMENT_TITLE_MAX) {
     return t({
       zh: `标题最多 ${REQUIREMENT_TITLE_MAX} 个字`,
       en: `A title has at most ${REQUIREMENT_TITLE_MAX} characters`,
@@ -217,33 +225,80 @@ function draftBlocker(draft: RequirementDraft): string | null {
       zh: `${field}最多 ${REQUIREMENT_TEXT_MAX} 个字`,
       en: `${field} has at most ${REQUIREMENT_TEXT_MAX} characters`,
     });
-  if (what.length > REQUIREMENT_TEXT_MAX) {
+  if (limited('what') && what.length > REQUIREMENT_TEXT_MAX) {
     return tooLong(t({ zh: '「要做什么」', en: '"What to do"' }));
   }
-  if (draft.why.trim().length > REQUIREMENT_TEXT_MAX) {
+  if (limited('why') && draft.why.trim().length > REQUIREMENT_TEXT_MAX) {
     return tooLong(t({ zh: '「为什么」', en: '"Why"' }));
   }
   const evidence = lineItems(draft.evidence);
-  if (evidence.length > REQUIREMENT_ITEMS_MAX) {
+  if (limited('evidence') && evidence.length > REQUIREMENT_ITEMS_MAX) {
     return t({
       zh: `证据最多 ${REQUIREMENT_ITEMS_MAX} 条`,
       en: `At most ${REQUIREMENT_ITEMS_MAX} items of evidence`,
     });
   }
-  if (evidence.some((item) => item.length > REQUIREMENT_TEXT_MAX)) {
+  if (limited('evidence') && evidence.some((item) => item.length > REQUIREMENT_TEXT_MAX)) {
     return tooLong(t({ zh: '每条证据', en: 'Each item of evidence' }));
   }
   const items = lineItems(draft.acceptance);
-  if (items.length > REQUIREMENT_ITEMS_MAX) {
+  if (limited('acceptance') && items.length > REQUIREMENT_ITEMS_MAX) {
     return t({
       zh: `验收标准最多 ${REQUIREMENT_ITEMS_MAX} 条`,
       en: `At most ${REQUIREMENT_ITEMS_MAX} acceptance criteria`,
     });
   }
-  if (items.some((item) => item.length > REQUIREMENT_TEXT_MAX)) {
+  if (limited('acceptance') && items.some((item) => item.length > REQUIREMENT_TEXT_MAX)) {
     return tooLong(t({ zh: '每条验收标准', en: 'Each acceptance criterion' }));
   }
   return null;
+}
+
+/**
+ * How full a list field (the evidence, the acceptance criteria) is, shown under it while it is
+ * typed, so that a long paste shows it is over the limit right there: how many items it has as
+ * sent (`lineItems`) of the most the Master takes, and how many are longer than it takes.
+ * `over`: the Master would refuse the list as it is. `checked`: whether the limits apply; not to a
+ * list an edit leaves as it was (`saveEditBlocker`), which is kept whatever its length and is
+ * said to be.
+ */
+export function listFill(
+  text: string,
+  checked = true,
+): { count: number; over: boolean; text: string } {
+  const items = lineItems(text);
+  const count = items.length;
+  const max = REQUIREMENT_ITEMS_MAX;
+  const tooMany = count > max;
+  const long = items.filter((item) => item.length > REQUIREMENT_TEXT_MAX).length;
+  const counted =
+    count === 0
+      ? t({ zh: `最多 ${max} 条`, en: `At most ${max} items` })
+      : tooMany
+        ? t({
+            zh: `已有 ${count} 条，超过了上限 ${max} 条`,
+            en: `${count} items, over the limit of ${max}`,
+          })
+        : t({ zh: `已有 ${count} 条，最多 ${max} 条`, en: `${count} of at most ${max} items` });
+  const longText =
+    long === 0
+      ? ''
+      : t({
+          zh: `；有 ${long} 条超过 ${REQUIREMENT_TEXT_MAX} 个字`,
+          en:
+            long === 1
+              ? `; 1 item is longer than ${REQUIREMENT_TEXT_MAX} characters`
+              : `; ${long} items are longer than ${REQUIREMENT_TEXT_MAX} characters`,
+        });
+  const over = tooMany || long > 0;
+  const kept =
+    over && !checked
+      ? t({
+          zh: '；这一栏没改动，原样保留，不受上限限制',
+          en: '; left unchanged, it is kept as it is whatever the limit',
+        })
+      : '';
+  return { count, over: over && checked, text: `${counted}${longText}${kept}` };
 }
 
 /** A draft's texts as the Master takes them: trimmed, the title on one line, lists split. */
@@ -352,16 +407,57 @@ export function proposalEdit(before: RequirementDraft, draft: RequirementDraft):
 }
 
 /**
- * Why the edit cannot be saved yet: what `writeBlocker` says of a draft, or nothing was changed.
- * null when it can be sent.
+ * Why the edit cannot be saved yet: no title or no what to do, a field changed past what the
+ * Master takes, or nothing was changed. null when it can be sent. Only the fields changed are
+ * checked against the limits, as the Master checks only those it is sent: a scout's proposal whose
+ * lists are longer than a human may write can still have its title changed.
  */
 export function saveEditBlocker(before: RequirementDraft, draft: RequirementDraft): string | null {
-  const wrong = draftBlocker(draft);
+  const edit = proposalEdit(before, draft);
+  const wrong = draftBlocker(draft, (field) => field in edit);
   if (wrong !== null) return wrong;
-  if (Object.keys(proposalEdit(before, draft)).length === 0) {
+  if (Object.keys(edit).length === 0) {
     return t({ zh: '还没有改动', en: 'Nothing changed yet' });
   }
   return null;
+}
+
+/**
+ * Whether a proposal's list (its evidence or acceptance criteria) would come back as other items
+ * once its field in the edit form is changed: the form shows it one item per line (`draftOf`) and
+ * splits it again line by line (`lineItems`), so an item with a line break in it becomes several
+ * and the list mark one starts with (`1. `, `- `) is dropped. Left alone, the field is not sent
+ * and the list is kept as it is (`proposalEdit`).
+ */
+export function resplitOnEdit(items: readonly string[]): boolean {
+  const again = lineItems(items.join('\n'));
+  return again.length !== items.length || again.some((item, i) => item !== items[i]);
+}
+
+/** The warning under a list field of the edit form whose items `resplitOnEdit` would change. */
+export function resplitText(): string {
+  return t({
+    zh: '原来有的条目里带换行，或者以「1. 」「- 」这类列表记号开头：改动这一栏后会按行重新拆成条目，换行处拆成多条，行首的记号去掉；不动这一栏就原样保留',
+    en: 'Some items here have line breaks in them or start with a list mark such as "1. " or "- ": once you change this field it is split into items line by line again, each line break starting a new item and the marks dropped; left alone, it is kept as it is',
+  });
+}
+
+/** The list fields of a requirement: written one item per line in the form. */
+export type ListField = 'evidence' | 'acceptance';
+
+/**
+ * How each list field of the form that edits proposal `p` is shown: `checked`, it was changed
+ * from the form as it was opened (`before`), so the limits apply to it (`saveEditBlocker`);
+ * `resplit`, its items would come back as others once it is changed (`resplitOnEdit`).
+ */
+export function editLists(
+  p: Pick<ProposalView, ListField>,
+  before: RequirementDraft,
+  draft: RequirementDraft,
+): Record<ListField, { checked: boolean; resplit: boolean }> {
+  const edit = proposalEdit(before, draft);
+  const of = (field: ListField) => ({ checked: field in edit, resplit: resplitOnEdit(p[field]) });
+  return { evidence: of('evidence'), acceptance: of('acceptance') };
 }
 
 /** The mark of a proposal a human edited before it was decided, beside its status. */
