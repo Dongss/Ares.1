@@ -47,22 +47,33 @@ const TABLE_PROJECTS: Record<string, ProjectFiles> = {
   'Python（uv）': project(['uv.lock'], { 'pyproject.toml': PYPROJECT }),
   'Python（pip + venv）': project([], { 'pyproject.toml': PYPROJECT }),
   'Python（只有 requirements.txt）': project([], { 'requirements.txt': 'httpx\npytest\n' }),
+  'Django（manage.py）': project(['manage.py'], { 'requirements.txt': 'django\npytest\n' }),
   Go: project(['go.mod', 'go.sum']),
   Rust: project(['Cargo.toml', 'Cargo.lock']),
   'Makefile（有 test 目标）': project([], { Makefile: MAKEFILE }),
 };
 
-/** The rows of the commands table in docs/examples/README.md: name, setup, verify. */
-function tableRows(): Map<string, { setup: string[]; verify: string[] }> {
+interface TableRow {
+  setup: string[];
+  verify: string[];
+  /** The start command; null for （无）. */
+  serve: string | null;
+}
+
+/** The rows of the commands table in docs/examples/README.md: name, setup, verify, start. */
+function tableRows(): Map<string, TableRow> {
   const readme = readFileSync(join(import.meta.dirname, '../docs/examples/README.md'), 'utf8');
-  const rows = new Map<string, { setup: string[]; verify: string[] }>();
+  const rows = new Map<string, TableRow>();
   for (const line of readme.split('\n')) {
-    const cells = /^\| (.+?) \| (.+?) \| (.+?) \|$/.exec(line);
+    const cells = /^\| (.+?) \| (.+?) \| (.+?) \| (.+?) \|$/.exec(line);
     if (!cells?.[1] || !(cells[1] in TABLE_PROJECTS)) continue;
-    const commands = (cell: string) => [...cell.matchAll(/`([^`]+)`/g)].map((m) => m[1]);
+    const commands = (cell: string) => [...cell.matchAll(/`([^`]+)`/g)].map((m) => m[1] as string);
+    const serve = commands(cells[4] ?? '');
+    expect(serve.length).toBeLessThanOrEqual(1);
     rows.set(cells[1], {
-      setup: commands(cells[2] ?? '') as string[],
-      verify: commands(cells[3] ?? '') as string[],
+      setup: commands(cells[2] ?? ''),
+      verify: commands(cells[3] ?? ''),
+      serve: serve[0] ?? null,
     });
   }
   return rows;
@@ -74,11 +85,15 @@ describe('detectProjectCommands', () => {
     expect([...rows.keys()].sort()).toEqual(Object.keys(TABLE_PROJECTS).sort());
     for (const [name, files] of Object.entries(TABLE_PROJECTS)) {
       const found = detectProjectCommands(files);
-      expect({ name, setup: found.setup, verify: found.verify }).toEqual({
+      expect({
         name,
-        ...rows.get(name),
-      });
-      expect(found.basis).toHaveLength(1);
+        setup: found.setup,
+        verify: found.verify,
+        serve: found.serve?.command ?? null,
+      }).toEqual({ name, ...rows.get(name) });
+      expect(found.serve?.readyPath ?? '/').toBe('/');
+      // One line for the ecosystem, and one more saying why there is no start command.
+      expect(found.basis).toHaveLength(found.serve ? 1 : 2);
     }
   });
 
@@ -195,14 +210,20 @@ describe('detectProjectCommands', () => {
   it('says a symlinked package.json was not read rather than that it could not be parsed', () => {
     // Listed among the files with no content: a symlink, as committedRootFiles reports one.
     const found = detectProjectCommands({ files: ['package.json', 'yarn.lock'], contents: {} });
-    expect(found).toMatchObject({ setup: ['yarn install --frozen-lockfile'], verify: [] });
+    expect(found).toMatchObject({
+      setup: ['yarn install --frozen-lockfile'],
+      verify: [],
+      serve: null,
+    });
     expect(found.basis).toEqual([
       'Node（yarn）：package.json，有 `yarn.lock`；package.json 是符号链接，没有读它的内容，没有生成检查命令',
+      '没有建议启动命令：package.json 是符号链接，没有读它的 scripts；项目要起服务时请按实际情况填写',
     ]);
-    expect(found.basis[0]).not.toContain('解析不了');
+    expect(found.basis.join('\n')).not.toContain('解析不了');
     setLang('en');
     expect(detectProjectCommands({ files: ['package.json'], contents: {} }).basis).toEqual([
       'Node (npm): package.json, no lock file found, so npm; package.json is a symlink, whose content is not read, so no verify commands',
+      'No start command suggested: package.json is a symlink whose scripts were not read; fill one in if the project has a service to start',
     ]);
   });
 
@@ -280,7 +301,10 @@ describe('detectProjectCommands', () => {
     );
     expect(both.verify).toEqual([]);
     const basis = make('test:\n\tx\n').basis;
-    expect(basis).toEqual(['Makefile：Makefile 里有 test 目标']);
+    expect(basis).toEqual([
+      'Makefile：Makefile 里有 test 目标',
+      '没有建议启动命令：从 Makefile 看不出服务怎么起；项目要起服务时请按实际情况填写',
+    ]);
   });
 
   it('puts the ecosystems of a mixed project together in a fixed order, no command twice', () => {
@@ -315,7 +339,9 @@ describe('detectProjectCommands', () => {
       'Go',
       'Rust',
       'Makefile',
+      '没有建议启动命令',
     ]);
+    expect(found.serve).toBeNull();
   });
 
   it('keeps a command the ecosystems share once', () => {
@@ -336,12 +362,17 @@ describe('detectProjectCommands', () => {
       project([]),
       project(['README.md', 'main.c', 'CMakeLists.txt']),
       project([], { Makefile: 'all:\n\tcc main.c\n' }),
+      // manage.py alone is not a Python project: nothing would install Django.
+      project(['manage.py']),
     ]) {
       const found = detectProjectCommands(files);
       expect(found.setup).toEqual([]);
       expect(found.verify).toEqual([]);
+      expect(found.serve).toBeNull();
+      // The start command is in the one line saying nothing was recognised.
       expect(found.basis).toHaveLength(1);
       expect(found.basis[0]).toContain('没有认得出的项目文件');
+      expect(found.basis[0]).toContain('启动命令');
     }
   });
 
@@ -351,19 +382,198 @@ describe('detectProjectCommands', () => {
       project(['pnpm-lock.yaml'], { 'package.json': PACKAGE_JSON }),
       project([], { 'package.json': '{' }),
       project([], { 'package.json': JSON.stringify({ packageManager: 'bun@1.1.0' }) }),
+      project([], { 'package.json': JSON.stringify({ scripts: { start: 'node .' } }) }),
+      project(['package.json']),
       project(['uv.lock'], { 'pyproject.toml': PYPROJECT }),
       project([], { 'pyproject.toml': '[project]\nname = "x"\n' }),
       project([], { 'requirements.txt': 'pytest\n' }),
+      project(['manage.py', 'uv.lock'], { 'pyproject.toml': PYPROJECT }),
+      project(['manage.py'], { 'requirements.txt': 'django\n', 'package.json': PACKAGE_JSON }),
       project(['go.mod', 'Cargo.toml'], { Makefile: MAKEFILE }),
       project(['README.md']),
     ];
     for (const files of cases) {
-      for (const line of detectProjectCommands(files).basis) {
+      const found = detectProjectCommands(files);
+      for (const line of [...found.basis, found.serve?.basis ?? '']) {
         expect(line).not.toMatch(/[一-鿿]/);
       }
     }
     expect(
       detectProjectCommands(project(['yarn.lock'], { 'package.json': PACKAGE_JSON })).basis,
     ).toEqual(['Node (yarn): package.json, `yarn.lock` is there; scripts has build, test, lint']);
+    expect(detectProjectCommands(project(['go.mod', 'Cargo.toml'])).basis[2]).toBe(
+      'No start command suggested: go.mod, Cargo.toml do not tell how the service starts; fill one in if the project has a service to start',
+    );
+  });
+});
+
+describe('the start command detectProjectCommands suggests', () => {
+  const node = (scripts: Record<string, string> | undefined, files: string[] = []) =>
+    detectProjectCommands(project(files, { 'package.json': JSON.stringify({ scripts }) }));
+
+  it("runs package.json's dev script, else its start script, from the root", () => {
+    expect(node({ dev: 'vite' }).serve).toEqual({
+      command: 'npm run dev',
+      readyPath: '/',
+      basis: expect.stringContaining('scripts 里有 dev'),
+    });
+    expect(node({ start: 'node server.js' }).serve).toEqual({
+      command: 'npm start',
+      readyPath: '/',
+      basis: expect.stringContaining('scripts 里没有 dev，有 start'),
+    });
+    expect(node({ start: 'node server.js', dev: 'nodemon server.js' }).serve?.command).toBe(
+      'npm run dev',
+    );
+    // A blank dev script is no script.
+    expect(node({ dev: ' ', start: 'node .' }).serve?.command).toBe('npm start');
+    // The service has its own basis; the ecosystems' lines stay one each.
+    expect(node({ dev: 'vite', test: 'vitest' }, ['package-lock.json']).basis).toEqual([
+      'Node（npm）：package.json，有 `package-lock.json`；scripts 里有 test',
+    ]);
+  });
+
+  it('says the script must listen on 127.0.0.1 at $PORT', () => {
+    const basis = node({ dev: 'vite' }, ['pnpm-lock.yaml']).serve?.basis;
+    expect(basis).toBe(
+      'Node：package.json 的 scripts 里有 dev，用 pnpm 运行它；服务要在 127.0.0.1 上监听环境变量 PORT 给的端口，脚本不是这样时请改命令（比如 vite 要加 --host 127.0.0.1 --port $PORT）',
+    );
+  });
+
+  it('runs the script with the package manager detected', () => {
+    const managers: [string, string, string][] = [
+      ['package-lock.json', 'npm run dev', 'npm start'],
+      ['pnpm-lock.yaml', 'pnpm dev', 'pnpm start'],
+      ['yarn.lock', 'yarn dev', 'yarn start'],
+      ['bun.lock', 'bun run dev', 'bun run start'],
+    ];
+    for (const [lock, dev, start] of managers) {
+      expect({ lock, dev: node({ dev: 'x' }, [lock]).serve?.command }).toEqual({ lock, dev });
+      expect({ lock, start: node({ start: 'x' }, [lock]).serve?.command }).toEqual({
+        lock,
+        start,
+      });
+    }
+    // The packageManager field decides, as for the other commands.
+    const pkg = JSON.stringify({ packageManager: 'yarn@4.5.0', scripts: { dev: 'next dev' } });
+    expect(
+      detectProjectCommands(project(['package-lock.json'], { 'package.json': pkg })).serve?.command,
+    ).toBe('yarn dev');
+  });
+
+  it('suggests none for a package.json without dev or start, and says why', () => {
+    // What npm init writes.
+    const init = {
+      test: 'echo "Error: no test specified" && exit 1',
+    };
+    for (const scripts of [init, { build: 'tsc', serve: 'node .' }, undefined]) {
+      const found = node(scripts, ['package-lock.json']);
+      expect(found.serve).toBeNull();
+      expect(found.basis[1]).toBe(
+        '没有建议启动命令：package.json 的 scripts 里没有 dev、start；项目要起服务时请按实际情况填写',
+      );
+    }
+  });
+
+  it('suggests none for a package.json it cannot read or parse', () => {
+    const symlink = detectProjectCommands(project(['package.json', 'pnpm-lock.yaml']));
+    expect(symlink.serve).toBeNull();
+    expect(symlink.basis[1]).toContain('package.json 是符号链接，没有读它的 scripts');
+    // Not even a dev script mentioned in an unparsable text.
+    const broken = detectProjectCommands(
+      project([], { 'package.json': '{ "scripts": { "dev": "vite" }' }),
+    );
+    expect(broken.serve).toBeNull();
+    expect(broken.basis[1]).toContain('package.json 解析不了');
+    const array = detectProjectCommands(project([], { 'package.json': '["dev"]' }));
+    expect(array.serve).toBeNull();
+  });
+
+  it("runs Django's manage.py with the Python the setup commands install", () => {
+    const uv = detectProjectCommands(
+      project(['manage.py', 'uv.lock'], { 'pyproject.toml': PYPROJECT }),
+    );
+    expect(uv.setup).toEqual(['uv sync']);
+    expect(uv.serve).toEqual({
+      command: 'uv run python manage.py runserver 127.0.0.1:$PORT',
+      readyPath: '/',
+      basis: expect.stringContaining('uv 的环境'),
+    });
+    expect(uv.basis).toHaveLength(1);
+    const venvProjects: Record<string, string>[] = [
+      { 'pyproject.toml': PYPROJECT },
+      { 'requirements.txt': 'django\n' },
+    ];
+    for (const contents of venvProjects) {
+      const venv = detectProjectCommands(project(['manage.py'], contents));
+      expect(venv.setup[0]).toBe('python3 -m venv .venv');
+      expect(venv.serve).toEqual({
+        command: '.venv/bin/python manage.py runserver 127.0.0.1:$PORT',
+        readyPath: '/',
+        basis: expect.stringContaining('.venv'),
+      });
+    }
+    // uv.lock without pyproject.toml is not uv, for the service as for the setup.
+    expect(
+      detectProjectCommands(project(['manage.py', 'uv.lock'], { 'requirements.txt': 'django\n' }))
+        .serve?.command,
+    ).toBe('.venv/bin/python manage.py runserver 127.0.0.1:$PORT');
+    // Without manage.py, Python suggests none.
+    const plain = detectProjectCommands(project(['uv.lock'], { 'pyproject.toml': PYPROJECT }));
+    expect(plain.serve).toBeNull();
+    expect(plain.basis[1]).toContain('根目录没有 Django 的 manage.py');
+  });
+
+  it("prefers manage.py to package.json's script and says why", () => {
+    const found = detectProjectCommands(
+      project(['manage.py', 'package-lock.json'], {
+        'requirements.txt': 'django\n',
+        'package.json': PACKAGE_JSON,
+      }),
+    );
+    expect(found.serve?.command).toBe('.venv/bin/python manage.py runserver 127.0.0.1:$PORT');
+    expect(found.serve?.basis).toContain('`npm run dev`');
+    expect(found.serve?.basis).toContain('通常只用来构建前端资源');
+    // Both setups and the ecosystems' lines are kept.
+    expect(found.setup).toEqual([
+      'npm ci',
+      'python3 -m venv .venv',
+      '.venv/bin/pip install -r requirements.txt',
+    ]);
+    expect(found.basis).toHaveLength(2);
+    // Node's start command when Python has no manage.py.
+    expect(
+      detectProjectCommands(
+        project(['package-lock.json'], {
+          'requirements.txt': 'pytest\n',
+          'package.json': PACKAGE_JSON,
+        }),
+      ).serve?.command,
+    ).toBe('npm run dev');
+  });
+
+  it('suggests none for Go, Rust or a Makefile, naming their files together', () => {
+    for (const [files, why] of [
+      [project(['go.mod']), '从 go.mod 看不出服务怎么起'],
+      [project(['Cargo.toml']), '从 Cargo.toml 看不出服务怎么起'],
+      [project([], { Makefile: MAKEFILE }), '从 Makefile 看不出服务怎么起'],
+      [project(['go.mod'], { Makefile: MAKEFILE }), '从 go.mod、Makefile 看不出服务怎么起'],
+    ] as const) {
+      const found = detectProjectCommands(files);
+      expect(found.serve).toBeNull();
+      expect(found.basis.at(-1)).toBe(`没有建议启动命令：${why}；项目要起服务时请按实际情况填写`);
+    }
+    // Every reason, Node's and Python's first.
+    const mixed = detectProjectCommands(
+      project(['go.mod'], { 'package.json': '{}', 'requirements.txt': 'x\n' }),
+    );
+    expect(mixed.basis.at(-1)).toBe(
+      '没有建议启动命令：package.json 的 scripts 里没有 dev、start；根目录没有 Django 的 manage.py；从 go.mod 看不出服务怎么起；项目要起服务时请按实际情况填写',
+    );
+    // Go's or Rust's files do not stop Node's suggestion.
+    expect(
+      detectProjectCommands(project(['go.mod', 'Cargo.toml'], { 'package.json': PACKAGE_JSON }))
+        .serve?.command,
+    ).toBe('npm run dev');
   });
 });

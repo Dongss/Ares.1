@@ -103,22 +103,32 @@ export interface RepoPatchInput {
 }
 
 /**
- * The setup and verify commands the files at a repo's root suggest (`detectProjectCommands` in
- * src/workspace/detect.ts, which returns this type).
+ * The setup, verify and start commands the files at a repo's root suggest
+ * (`detectProjectCommands` in src/workspace/detect.ts, which returns this type).
  */
 export interface DetectedCommands {
   /** Setup commands, one per entry, in the order to run. */
   setup: string[];
   /** Verify commands, one per entry, in the order to run. */
   verify: string[];
-  /** For people: which files each suggestion comes from, one line per ecosystem recognised. */
+  /**
+   * The start command suggested for the repo's service (`RepoServe.command`), the ready path to
+   * go with it and, for people, which file and script it comes from and what the service must do
+   * (listen on $PORT). The ready timeout is left to its default. null when the files suggest
+   * none with any confidence; `basis` then has a line saying so and why.
+   */
+  serve: { command: string; readyPath: string; basis: string } | null;
+  /**
+   * For people: which files each suggestion comes from, one line per ecosystem recognised, and
+   * one more when no start command is suggested.
+   */
   basis: string[];
 }
 
 /**
- * GET /api/repos/:id/detect: the setup and verify commands the files at the root of the repo's
- * target branch suggest (`detectProjectCommands`), read from the commit it is at. `basis` is in
- * the Master's language.
+ * GET /api/repos/:id/detect: the setup, verify and start commands the files at the root of the
+ * repo's target branch suggest (`detectProjectCommands`), read from the commit it is at. `basis`
+ * and `serve.basis` are in the Master's language.
  */
 export interface RepoDetection extends DetectedCommands {
   /** The target branch read, and the commit it was at. */

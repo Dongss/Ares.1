@@ -125,6 +125,7 @@ describe('detecting commands on the edit form', () => {
     commit: '0123456789abcdef',
     verify,
     setup,
+    serve: null,
     basis: ['Go：go.mod'],
   });
 

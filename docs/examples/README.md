@@ -56,36 +56,42 @@ cp docs/examples/workflows/*.yaml ~/.ares1/workflows/
 - **目标分支**：合并进哪个分支；不填就用仓库当前检出的分支（克隆时是远端的默认分支，新建空项目时是 `main`）。
 - **准备命令**：每个 Run 建好工作目录后运行一次，通常是安装依赖。每个 Run 的工作目录都是新的，所以每次都要装。有一条失败，Run 就结束、标为失败，从 issue 来的会自动重做。
 - **检查命令**：每次编码完成后运行，全部通过才算验收通过；没通过就带着输出返工。合并前同步了目标分支的新提交后也会再跑一遍；命令阶段没写 `verify.commands` 时也运行它们。
-- **服务启动命令**（登记后在「修改」的「服务」一栏填，可空）：命令阶段写了 `serve: true` 时，Master 先在 Run 的工作目录里运行它起服务，服务要监听环境变量 `PORT` 给的端口，比如 `npm start`、`node dist/server.js`。另有就绪路径（默认 `/`）和就绪超时（默认 120 秒），见 [`docs/running.md`](../running.md#服务启动命令)。
+- **服务启动命令**（登记后在「修改」的「服务」一栏填，可空）：命令阶段写了 `serve: true` 时，Master 先在 Run 的工作目录里运行它起服务，服务要监听环境变量 `PORT` 给的端口，比如 `npm start`、`node dist/server.js`。另有就绪路径（默认 `/`）和就绪超时（默认 120 秒），见 [`docs/running.md`](../running.md#服务启动命令)。常见项目的启动命令见下表最后一列；「按项目文件探测」也按这张表建议启动命令和就绪路径，规则见下面的「按项目文件探测」。
 
 每行一条命令，在 Run 的工作目录里用 `/bin/sh -c` 依次运行，有一条失败就不再往下跑。常见项目可以这样填：
 
-| 项目 | 准备命令 | 检查命令 |
-|---|---|---|
-| npm | `npm ci` | `npm run build`<br>`npm test`<br>`npm run lint` |
-| pnpm | `pnpm install --frozen-lockfile` | `pnpm build`<br>`pnpm test`<br>`pnpm lint` |
-| yarn 1 | `yarn install --frozen-lockfile` | `yarn build`<br>`yarn test`<br>`yarn lint` |
-| yarn 2 及以上（Berry） | `yarn install --immutable` | `yarn build`<br>`yarn test`<br>`yarn lint` |
-| bun | `bun install` | `bun run build`<br>`bun run test`<br>`bun run lint` |
-| Python（uv） | `uv sync` | `uv run ruff check .`<br>`uv run ruff format --check .`<br>`uv run pytest` |
-| Python（pip + venv） | `python3 -m venv .venv`<br>`.venv/bin/pip install -e '.[dev]'` | `.venv/bin/ruff check .`<br>`.venv/bin/ruff format --check .`<br>`.venv/bin/pytest` |
-| Python（只有 requirements.txt） | `python3 -m venv .venv`<br>`.venv/bin/pip install -r requirements.txt` | `.venv/bin/pytest` |
-| Go | `go mod download` | `go build ./...`<br>`go vet ./...`<br>`go test ./...` |
-| Rust | `cargo fetch` | `cargo build --all-targets`<br>`cargo clippy --all-targets -- -D warnings`<br>`cargo test`<br>`cargo fmt --check` |
-| Makefile（有 test 目标） | （无） | `make test` |
+| 项目 | 准备命令 | 检查命令 | 启动命令 |
+|---|---|---|---|
+| npm | `npm ci` | `npm run build`<br>`npm test`<br>`npm run lint` | `npm run dev` |
+| pnpm | `pnpm install --frozen-lockfile` | `pnpm build`<br>`pnpm test`<br>`pnpm lint` | `pnpm dev` |
+| yarn 1 | `yarn install --frozen-lockfile` | `yarn build`<br>`yarn test`<br>`yarn lint` | `yarn dev` |
+| yarn 2 及以上（Berry） | `yarn install --immutable` | `yarn build`<br>`yarn test`<br>`yarn lint` | `yarn dev` |
+| bun | `bun install` | `bun run build`<br>`bun run test`<br>`bun run lint` | `bun run dev` |
+| Python（uv） | `uv sync` | `uv run ruff check .`<br>`uv run ruff format --check .`<br>`uv run pytest` | （无） |
+| Python（pip + venv） | `python3 -m venv .venv`<br>`.venv/bin/pip install -e '.[dev]'` | `.venv/bin/ruff check .`<br>`.venv/bin/ruff format --check .`<br>`.venv/bin/pytest` | （无） |
+| Python（只有 requirements.txt） | `python3 -m venv .venv`<br>`.venv/bin/pip install -r requirements.txt` | `.venv/bin/pytest` | （无） |
+| Django（manage.py） | `python3 -m venv .venv`<br>`.venv/bin/pip install -r requirements.txt` | `.venv/bin/pytest` | `.venv/bin/python manage.py runserver 127.0.0.1:$PORT` |
+| Go | `go mod download` | `go build ./...`<br>`go vet ./...`<br>`go test ./...` | （无） |
+| Rust | `cargo fetch` | `cargo build --all-targets`<br>`cargo clippy --all-targets -- -D warnings`<br>`cargo test`<br>`cargo fmt --check` | （无） |
+| Makefile（有 test 目标） | （无） | `make test` | （无） |
 
-`npm run build` 这类脚本名按项目 `package.json` 里实际有的写；pip 的 `'.[dev]'` 假设开发依赖（pytest、ruff）写在 `pyproject.toml` 的 `dev` 可选依赖里，按项目实际情况改。
+`npm run build` 这类脚本名按项目 `package.json` 里实际有的写，Node 各行的启动命令假设 `scripts` 里有 `dev`；pip 的 `'.[dev]'` 假设开发依赖（pytest、ruff）写在 `pyproject.toml` 的 `dev` 可选依赖里，按项目实际情况改。Django 那一行假设依赖写在 `requirements.txt` 里，准备命令和检查命令同「只有 requirements.txt」那一行；用 uv 管理时准备命令和检查命令按 uv 那一行，启动命令是 `uv run python manage.py runserver 127.0.0.1:$PORT`。启动命令的就绪路径都是 `/`，就绪超时用默认的 120 秒。
 
 ### 按项目文件探测
 
-已经登记的仓库，在「仓库」页点「修改」，再点「按项目文件探测」，Master 会看目标分支上已提交的根目录文件（工作目录里没提交的改动不算），按上面这张表把建议的命令填进两个输入框，并列出是凭哪些文件判断的。它只填表单，不保存：检查一遍、按需要改过之后点「保存」才生效。规则如下（`src/workspace/detect.ts`，改规则时这张表和它一起改，`test/detect.test.ts` 会拿这张表核对）：
+已经登记的仓库，在「仓库」页点「修改」，再点「按项目文件探测」，Master 会看目标分支上已提交的根目录文件（工作目录里没提交的改动不算），按上面这张表建议准备命令、检查命令和启动命令（连同就绪路径），把准备命令和检查命令填进两个输入框，并列出是凭哪些文件判断的。它只填表单，不保存：检查一遍、按需要改过之后点「保存」才生效。规则如下（`src/workspace/detect.ts`，改规则时这张表和它一起改，`test/detect.test.ts` 会拿这张表核对）：
 
 - **Node**（有 `package.json`）：包管理器先看 `package.json` 的 `packageManager` 字段（如 `pnpm@9.0.0`），没有就看锁文件：`package-lock.json` 或 `npm-shrinkwrap.json` → npm，`pnpm-lock.yaml` → pnpm，`yarn.lock` → yarn，`bun.lock` 或 `bun.lockb` → bun；有几个锁文件时按这个顺序取第一个。都没有就按 npm 处理。准备命令按表里那一行；yarn 只有 `packageManager` 字段写明 2 及以上的版本（如 `yarn@4.1.0`）时才按 Berry 那一行用 `--immutable`，没有这个字段时按 yarn 1 处理。用的包管理器没有自己的锁文件时不加 `--frozen-lockfile`、`--immutable`，npm 用 `npm install` 代替 `npm ci`。检查命令只按 `scripts` 里实际有的 `build`、`test`、`lint` 生成，顺序是 build → test → lint；`npm init` 生成的占位 `test`（`no test specified`）不算。`package.json` 是符号链接时不读它的内容：包管理器只按锁文件选，不生成检查命令，依据里写明是符号链接。
 - **Python**（有 `pyproject.toml` 或 `requirements.txt`）：有 `pyproject.toml` 和 `uv.lock` 时按 uv 那一行；只有 `pyproject.toml` 时按 pip + venv 那一行（`pyproject.toml` 里没有 `dev` 可选依赖时依据里会提醒改 `'.[dev]'`）；只有 `requirements.txt` 时按「只有 requirements.txt」那一行。`pytest` 一定加；ruff 的两条只在项目配置了 ruff 时才加：根目录有 `ruff.toml` 或 `.ruff.toml`，`pyproject.toml` 里有 `[tool.ruff]`，或者 `pyproject.toml`、`requirements.txt` 的依赖里有 ruff。
 - **Go**（有 `go.mod`）、**Rust**（有 `Cargo.toml`）：按表里那一行。
 - **Makefile**（根目录的 `GNUmakefile`、`makefile` 或 `Makefile`，按 make 找它们的顺序取第一个）：有 `test` 目标时检查命令加 `make test`。
 - **混合项目**：每种认出来的都加上，按 Node → Python → Go → Rust → Makefile 的顺序拼起来，同一条命令只出现一次；依据每种一条。
-- 都认不出来时两栏都是空的，依据里写明没认出来，输入框不动。只认出准备命令或只认出检查命令时，没有建议的那一栏也不动。
+- **启动命令**：只在有把握时建议一条，就绪路径是 `/`。
+  - Node：`package.json` 的 `scripts` 里有 `dev` 就用 `dev`，没有再用 `start`，用上面选出的包管理器运行：`npm run dev` / `pnpm dev` / `yarn dev` / `bun run dev`，`npm start` / `pnpm start` / `yarn start` / `bun run start`。脚本要让服务在 `127.0.0.1` 上监听环境变量 `PORT` 给的端口，不是这样时请改命令，比如 vite 要加 `--host 127.0.0.1 --port $PORT`，依据里会写明这一点。
+  - Django：认出了 Python，根目录又有 `manage.py`（只看有没有，不读内容）时，用 `runserver` 在 `127.0.0.1:$PORT` 上起服务，python 和准备命令用的一致：按 uv 那一行时是 `uv run python manage.py runserver 127.0.0.1:$PORT`，否则用 venv 里的 `.venv/bin/python manage.py runserver 127.0.0.1:$PORT`。
+  - `manage.py` 和 Node 的建议都有时用 `manage.py`：这类项目的 `package.json` 通常只用来构建前端资源，依据里写明原因。
+  - 不建议的情况：`package.json` 是符号链接、解析不了、`scripts` 里 `dev` 和 `start` 都没有（比如 `npm init` 生成的）；Python 项目根目录没有 `manage.py`；Go、Rust、Makefile 看不出服务怎么起，一律不建议。这时依据里多一条，写明没有建议启动命令和原因。
+- 都认不出来时两栏都是空的，也没有建议的启动命令，依据里写明没认出来，输入框不动。只认出准备命令或只认出检查命令时，没有建议的那一栏也不动。
 
 检查命令为空的仓库，卡片上会标「没有检查命令」：这时 Run 的改动不经任何检查就进入评审和合并（模板阶段自己写了 `verify.commands` 的除外）。
 

@@ -501,6 +501,10 @@ describe('HTTP API', () => {
     const commit = git(dir, 'rev-parse', 'HEAD');
     git(dir, 'checkout', '-q', '-b', 'rust');
     writeFile(join(dir, 'Cargo.toml'), '[package]\nname = "demo"\n');
+    writeFile(
+      join(dir, 'package.json'),
+      JSON.stringify({ scripts: { build: 'tsc', test: 'vitest run', dev: 'vite' } }),
+    );
     git(dir, 'add', '-A');
     git(dir, 'commit', '-q', '-m', 'rust');
     const rustCommit = git(dir, 'rev-parse', 'HEAD');
@@ -522,7 +526,12 @@ describe('HTTP API', () => {
       commit,
       setup: ['pnpm install --frozen-lockfile', 'go mod download'],
       verify: ['pnpm build', 'pnpm test', 'go build ./...', 'go vet ./...', 'go test ./...'],
-      basis: [expect.stringContaining('Node（pnpm）'), 'Go：go.mod'],
+      serve: null,
+      basis: [
+        expect.stringContaining('Node（pnpm）'),
+        'Go：go.mod',
+        '没有建议启动命令：package.json 的 scripts 里没有 dev、start；从 go.mod 看不出服务怎么起；项目要起服务时请按实际情况填写',
+      ],
     } satisfies RepoDetection);
     // Saves nothing.
     expect(h.master.store.getRepo('mine')).toMatchObject({ verifyCommands: [], setupCommands: [] });
@@ -536,6 +545,12 @@ describe('HTTP API', () => {
       'go mod download',
       'cargo fetch',
     ]);
+    // The dev script committed there suggests the start command, which has its own basis.
+    expect(rust.serve).toEqual({
+      command: 'pnpm dev',
+      readyPath: '/',
+      basis: expect.stringContaining('scripts 里有 dev'),
+    });
     expect(rust.basis).toHaveLength(3);
   });
 
@@ -587,8 +602,10 @@ describe('HTTP API', () => {
     expect(res.json).toMatchObject({
       setup: ['pnpm install --frozen-lockfile'],
       verify: [],
+      serve: null,
       basis: [
         'Node（pnpm）：package.json，有 `pnpm-lock.yaml`；package.json 是符号链接，没有读它的内容，没有生成检查命令',
+        '没有建议启动命令：package.json 是符号链接，没有读它的 scripts；项目要起服务时请按实际情况填写',
       ],
     });
   });

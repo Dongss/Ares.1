@@ -101,8 +101,8 @@ src/
   logs/prune.ts       deletes raw agent output past retention; each round also sweeps worktrees
   workspace/git.ts    git: worktrees, commits, rollback, merge, fast-forward, committed files,
                       cloning or making the repos registered on the dashboard
-  workspace/detect.ts the setup and verify commands a repo's root files suggest (pure; the rules
-                      follow the table of docs/examples/README.md)
+  workspace/detect.ts the setup, verify and start commands a repo's root files suggest (pure; the
+                      rules follow the table of docs/examples/README.md)
   verify/commands.ts  run check and setup commands; tell a missing program from a failing command
   verify/serve.ts     a command stage's service: a free port, the repo's start command in its own
                       process group, the wait until it answers, stopping the whole group

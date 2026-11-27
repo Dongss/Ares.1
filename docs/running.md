@@ -58,7 +58,7 @@ Master 大部分时间没人看着，人回来时在看板的「事件」页查�
 
 API 是 `GET /api/events`，按 id 从新到旧返回 Run 为空的事件，格式和 `GET /api/runs/:id/events` 的一样（`id`、`runId`、`ts`、`type`、`data`）。参数 `limit` 是 1–500 的整数，默认 200；`before=<id>` 只返回比这个 id 更早的，用上一页最后一条的 id 往前翻。参数不合法时返回 400。
 
-默认配置只有给 Ares.1 开发自己用的 `self-dev` 模板。给别的项目配置时，先看下面的「接入新项目」：在看板「仓库」页用向导按顺序登记仓库、填检查命令、试运行、设置需求来源，不用手改配置文件。要手写配置文件时可以参考 [`docs/examples/`](examples/README.md)：一组完整的 `config.yaml`、`agents.yaml` 和几种场景的流程模板（轻量、严格、带 E2E、交叉评审），每一项都有注释，目录结构和数据目录一样，可以直接复制过来改；那里还写了 npm、pnpm、yarn、bun、Python、Go、Rust 和带 Makefile 的项目登记仓库时检查命令和准备命令怎么填，看板的「仓库」页也能按项目文件探测出这些命令（见下面的「按项目文件探测检查命令和准备命令」）。流程模板也可以放在仓库自己的 `.ares1/workflows/` 里，跟着代码一起演进，见下面的「仓库自带的流程模板」。
+默认配置只有给 Ares.1 开发自己用的 `self-dev` 模板。给别的项目配置时，先看下面的「接入新项目」：在看板「仓库」页用向导按顺序登记仓库、填检查命令、试运行、设置需求来源，不用手改配置文件。要手写配置文件时可以参考 [`docs/examples/`](examples/README.md)：一组完整的 `config.yaml`、`agents.yaml` 和几种场景的流程模板（轻量、严格、带 E2E、交叉评审），每一项都有注释，目录结构和数据目录一样，可以直接复制过来改；那里还写了 npm、pnpm、yarn、bun、Python、Django、Go、Rust 和带 Makefile 的项目登记仓库时检查命令、准备命令和服务启动命令怎么填，看板的「仓库」页也能按项目文件探测出这些命令（见下面的「按项目文件探测检查命令和准备命令」）。流程模板也可以放在仓库自己的 `.ares1/workflows/` 里，跟着代码一起演进，见下面的「仓库自带的流程模板」。
 
 ## 接入新项目
 
@@ -106,7 +106,7 @@ API 是 `POST /api/repos`，请求体是 `{ name, path, targetBranch?, verifyCom
 
 ### 服务启动命令
 
-项目的冒烟测试、接口测试、E2E 往往要对跑起来的服务做。命令阶段只会在前台一条接一条运行命令，没法让服务在后台跑着，几个 Run 同时执行时还会抢同一个端口。所以仓库可以登记一条服务启动命令：模板里写了 `serve: true` 的命令阶段，由 Master 替 Run 起服务、分配独立的端口、等它就绪，命令跑完再整组停掉（怎么运行见下面「命令阶段」里的 `serve: true`）。项目自己不用写拉起服务、找端口、收尾的脚本。
+项目的冒烟测试、接口测试、E2E 往往要对跑起来的服务做。命令阶段只会在前台一条接一条运行命令，没法让服务在后台跑着，几个 Run 同时执行时还会抢同一个端口。所以仓库可以登记一条服务启动命令：模板里写了 `serve: true` 的命令阶段，由 Master 替 Run 起服务、分配独立的端口、等它就绪，命令跑完再整组停掉（怎么运行见下面「命令阶段」里的 `serve: true`）。项目自己不用写拉起服务、找端口、收尾的脚本。不知道该写什么时，可以先按项目文件探测一条建议的启动命令和就绪路径，见下面的「按项目文件探测检查命令和准备命令」。
 
 一个仓库有三项设置：
 
@@ -132,9 +132,15 @@ API：`GET /api/repos` 各项的 `serve` 是 `{ command, readyPath, readyTimeout
 
 检查命令留空时，Run 的改动不经任何检查就进入评审和合并（模板阶段自己写了 `verify.commands` 的除外）。所以「仓库」页在检查命令为空的仓库卡片上标「没有检查命令」，提醒去补上。
 
-不知道该填什么时，在「仓库」页点仓库的「修改」，再点「按项目文件探测」：Master 看目标分支上已提交的根目录文件，建议准备命令和检查命令，填进两个输入框，并列出是凭哪些文件判断的。它只填表单不保存，检查过后点「保存」才生效；没有建议的那一栏保持原样。探测的是已经保存的目标分支：表单里改了目标分支，要先保存再探测。
+不知道该填什么时，在「仓库」页点仓库的「修改」，再点「按项目文件探测」：Master 看目标分支上已提交的根目录文件，建议准备命令、检查命令和服务启动命令（连同就绪路径），把准备命令和检查命令填进两个输入框，并列出是凭哪些文件判断的。它只填表单不保存，检查过后点「保存」才生效；没有建议的那一栏保持原样。探测的是已经保存的目标分支：表单里改了目标分支，要先保存再探测。
 
 认得出的有 Node（按 `packageManager` 字段或锁文件选 npm、pnpm、yarn、bun，检查命令只按 `scripts` 里实际有的 build、test、lint 生成）、Python（uv，或者 pip + venv 装 `pyproject.toml` / `requirements.txt`，检查用 pytest，项目配置了 ruff 时再加 ruff）、Go（`go.mod`）、Rust（`Cargo.toml`）和带 `test` 目标的 Makefile；几种都有时按 Node → Python → Go → Rust → Makefile 的顺序拼起来，同一条命令只出现一次。生成的命令和 [`docs/examples/README.md`](examples/README.md#在看板上登记仓库) 里那张表一致，完整规则也写在那里。
+
+启动命令只在有把握时建议一条，就绪路径是 `/`，就绪超时用默认的 120 秒：
+
+- Node：`scripts` 里有 `dev` 就用它，没有再用 `start`，用选出的包管理器运行（`npm run dev`、`pnpm dev`、`yarn dev`、`bun run dev`；`npm start`、`pnpm start`、`yarn start`、`bun run start`）。脚本要让服务在 `127.0.0.1` 上监听环境变量 `PORT` 给的端口，不是这样时请改命令（比如 vite 要加 `--host 127.0.0.1 --port $PORT`），依据里会写明这一点。
+- Django：认出了 Python、根目录又有 `manage.py` 时用 `runserver`，python 和准备命令一致：uv 的项目是 `uv run python manage.py runserver 127.0.0.1:$PORT`，否则是 `.venv/bin/python manage.py runserver 127.0.0.1:$PORT`。`manage.py` 和 Node 的脚本都有时用 `manage.py`，因为这类项目的 `package.json` 通常只构建前端资源。
+- 其余情况不建议：`package.json` 是符号链接、解析不了、`scripts` 里没有 `dev` 和 `start`；Python 项目没有 `manage.py`；Go、Rust、Makefile 的项目文件看不出服务怎么起。
 
 API 是 `GET /api/repos/:id/detect`（`:id` 是仓库的 id 或名字），什么都不改，返回：
 
@@ -144,12 +150,18 @@ API 是 `GET /api/repos/:id/detect`（`:id` 是仓库的 id 或名字），什�
   "commit": "<目标分支所在的提交>",
   "setup": ["pnpm install --frozen-lockfile"],
   "verify": ["pnpm build", "pnpm test"],
+  "serve": {
+    "command": "pnpm dev",
+    "readyPath": "/",
+    "basis": "Node：package.json 的 scripts 里有 dev，用 pnpm 运行它；服务要在 127.0.0.1 上监听环境变量 PORT 给的端口，脚本不是这样时请改命令（比如 vite 要加 --host 127.0.0.1 --port $PORT）"
+  },
   "basis": ["Node（pnpm）：package.json，有 `pnpm-lock.yaml`；scripts 里有 build、test"]
 }
 ```
 
-- 读的是目标分支所在提交里的文件（`git ls-tree` / `git cat-file`），不看任何工作目录：没提交的改动和没跟踪的文件都不影响结果。只看根目录，子目录里的项目文件不算；符号链接只算有这个文件，不读内容（`package.json` 是符号链接时只按锁文件选包管理器，不生成检查命令，`basis` 里写明是符号链接）。
-- `basis` 是给人看的说明，用 Master 的语言（`config.yaml` 的 `language`），每认出一种一条；都认不出来时 `setup`、`verify` 是空列表，`basis` 只有一条，说明没认出来。
+- 读的是目标分支所在提交里的文件（`git ls-tree` / `git cat-file`），不看任何工作目录：没提交的改动和没跟踪的文件都不影响结果。只看根目录，子目录里的项目文件不算；符号链接只算有这个文件，不读内容（`package.json` 是符号链接时只按锁文件选包管理器，不生成检查命令和启动命令，`basis` 里写明是符号链接）。
+- `serve` 是建议的启动命令（`command`，可以直接用作仓库的 `serve.command`）、就绪路径（`readyPath`）和给人看的依据（`basis`：凭哪个文件、哪个脚本，服务要监听 `$PORT`）。没有建议时 `serve` 是 `null`，`basis` 末尾多一条，写明没有建议启动命令和原因（比如「package.json 的 scripts 里没有 dev、start」「从 go.mod 看不出服务怎么起」）。
+- `basis` 是给人看的说明，用 Master 的语言（`config.yaml` 的 `language`），每认出一种一条，没有建议启动命令时再加一条；都认不出来时 `setup`、`verify` 是空列表，`serve` 是 `null`，`basis` 只有一条，说明没认出来，也就建议不出任何命令。
 - 仓库不存在时返回 404；目标分支读不到（分支被删了、路径不是 git 仓库等）时返回 409，错误信息里有 git 的输出。
 
 ### 试运行准备命令和检查命令
