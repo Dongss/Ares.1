@@ -1,7 +1,9 @@
-// Trial runs of a repo's setup and verify commands from the dashboard (POST /api/repos/:id/trial):
-// run the way a Run's checks run them, on the commit the target branch is at, so that a human
-// registering a repo finds out whether its checks work before any Run spends money on them. No
-// Run is created and nothing is saved; only the latest trial of each repo is kept, in memory.
+// Trial runs of a repo's setup and verify commands and of its service from the dashboard (POST
+// /api/repos/:id/trial): run the way a Run's checks run them, and the service started the way a
+// command stage with `serve: true` starts it, on the commit the target branch is at, so that a
+// human registering a repo finds out whether its checks work and its service comes up before any
+// Run spends money on them. No Run is created and nothing is saved; only the latest trial of each
+// repo is kept, in memory.
 
 import { randomBytes } from 'node:crypto';
 import { EventEmitter } from 'node:events';
@@ -10,16 +12,22 @@ import { join } from 'node:path';
 import { prepareAgentEnv } from '../adapters/process.js';
 import type {
   LiveNotice,
+  RepoServeInput,
   RepoTrial,
   RepoTrialInput,
   RepoTrialResult,
   RepoTrialStatus,
 } from '../api/types.js';
-import { leftoverTrialWorktrees, trialWorktreeName, trialWorktreeRepo } from '../config/flow.js';
+import {
+  leftoverTrialWorktrees,
+  REPO_SERVE_DEFAULTS,
+  trialWorktreeName,
+  trialWorktreeRepo,
+} from '../config/flow.js';
 import type { HomePaths, LoadedConfig } from '../config/load.js';
 import { t } from '../i18n.js';
 import { ConflictError, type Store } from '../store/store.js';
-import type { Repo } from '../store/types.js';
+import type { Repo, RepoServe } from '../store/types.js';
 import { errorMessage, nowIso } from '../util.js';
 import { addDetachedWorktree, dropWorktree, pruneWorktrees, revParse } from '../workspace/git.js';
 import {
@@ -28,6 +36,7 @@ import {
   firstMissingCommand,
   runCommands,
 } from './commands.js';
+import { type RunningService, startService } from './serve.js';
 
 export interface RepoTrialsDeps {
   store: Store;
@@ -38,17 +47,23 @@ export interface RepoTrialsDeps {
 type Kind = RepoTrialResult['kind'];
 
 /**
- * The trials of the registered repos' commands. One repo tries one set of commands at a time;
- * different repos try at once.
+ * The trials of the registered repos' commands and services. One repo tries one set of commands
+ * and one service at a time; different repos try at once.
  */
 export class RepoTrials {
-  /** A trial started, ran a command or ended: for the dashboard, over GET /api/stream. */
+  /**
+   * A trial started, ran a command, had its service answer or not, or ended: for the dashboard,
+   * over GET /api/stream.
+   */
   readonly live = new EventEmitter<{ notice: [LiveNotice] }>();
   /** The latest trial of each repo, by repo id; changed in place while it runs. */
   private readonly latest = new Map<string, RepoTrial>();
   /** The trials under way, by repo id; each is over once its worktree is deleted. */
   private readonly running = new Map<string, Promise<void>>();
-  /** Aborted when the Master stops: the commands running are killed. */
+  /**
+   * Aborted when the Master stops: the commands running are killed, and a service still starting
+   * is stopped.
+   */
   private readonly stopped = new AbortController();
   /** The `sweepLeftovers` in progress; a second call joins it, `stop` waits for it. */
   private sweeping: Promise<void> | undefined;
@@ -56,19 +71,24 @@ export class RepoTrials {
   constructor(private readonly deps: RepoTrialsDeps) {}
 
   /**
-   * Starts trying `repo`'s commands in the background: `input`'s instead of the registered ones,
-   * each group it leaves out the registered one; nothing is saved. Returns the trial as it starts.
-   * Throws ConflictError while the repo is trying already, or the Master is stopping.
+   * Starts trying `repo`'s commands and service in the background: `input`'s instead of the
+   * registered ones, each group it leaves out the registered one, its `serve: null` no service;
+   * nothing is saved. Returns the trial as it starts. Throws ConflictError while the repo is
+   * trying already, or the Master is stopping.
    *
    * In order: the commit the target branch is at is read; when the program some command starts
    * first is not found in the commands' environment (`firstMissingCommand`), no command runs and
-   * that command's result names it. Otherwise, with commands to run, a worktree of that commit
-   * with a detached HEAD is made under worktrees/ (`trialWorktreeName`), the setup commands run
-   * in it and then, when they all passed, the verify commands, each stopping at the first
-   * failure. They run as a Run's do: with the environment agents get (`prepareAgentEnv`: no
-   * GitHub or GitLab credentials), `defaults.command_timeout_minutes` each, their output in
+   * that command's result names it. Otherwise, with commands to run or a service to try, a
+   * worktree of that commit with a detached HEAD is made under worktrees/ (`trialWorktreeName`)
+   * and the setup commands run in it. When they all passed, the service is started there as a
+   * command stage starts it (`startService`) and, once it answered, stopped at once, its whole
+   * process group gone, before the verify commands run: they run whether it answered or not, but
+   * a service that did not makes the trial fail. Commands and service run as a Run's do: with the
+   * environment agents get (`prepareAgentEnv`: no GitHub or GitLab credentials), the commands
+   * `defaults.command_timeout_minutes` each and each stopping at the first failure, all output in
    * `trial-<repo>.log` under the logs directory (overwritten each time), killed when the Master
-   * stops. The worktree is deleted whatever comes of it, before the trial counts as over.
+   * stops. The worktree is deleted whatever comes of it, after the service is gone and before the
+   * trial counts as over.
    */
   start(repo: Repo, input: RepoTrialInput = {}): RepoTrial {
     if (this.stopped.signal.aborted) {
@@ -96,7 +116,9 @@ export class RepoTrials {
       endedAt: null,
       setupCommands: [...(input.setupCommands ?? repo.setupCommands)],
       verifyCommands: [...(input.verifyCommands ?? repo.verifyCommands)],
+      serve: trialServe(input.serve === undefined ? repo.serve : input.serve),
       results: [],
+      serviceResult: null,
       error: null,
       log: null,
     };
@@ -144,7 +166,8 @@ export class RepoTrials {
   }
 
   /**
-   * Kills the commands running, and waits until every trial and sweep is over. Never rejects, so
+   * Kills the commands running and stops the services, and waits until every trial and sweep is
+   * over. Never rejects, so
    * that the Master goes on stopping: a sweep leaving directories behind is reported to whoever
    * started it, and the next Master's sweep tries them again.
    */
@@ -157,6 +180,7 @@ export class RepoTrials {
     const { paths } = this.deps;
     const signal = this.stopped.signal;
     let dir: string | undefined;
+    let service: RunningService | undefined;
     try {
       try {
         trial.sha = await revParse(repo.path, repo.targetBranch);
@@ -182,7 +206,8 @@ export class RepoTrials {
         });
         return;
       }
-      if (trial.setupCommands.length === 0 && trial.verifyCommands.length === 0) return;
+      const { serve } = trial;
+      if (trial.setupCommands.length === 0 && trial.verifyCommands.length === 0 && !serve) return;
       dir = join(paths.worktreesDir, trialWorktreeName(repo.id, randomBytes(4).toString('hex')));
       try {
         await addDetachedWorktree(repo.path, dir, trial.sha);
@@ -209,7 +234,48 @@ export class RepoTrials {
       };
       const setup = await runCommands(trial.setupCommands, dir, opts, record('setup'));
       if (setup.every((r) => r.passed) && !signal.aborted) {
-        await runCommands(trial.verifyCommands, dir, opts, record('verify'));
+        if (serve) {
+          const begun = Date.now();
+          // Aborted while it starts, it stops itself and says so (`aborted`).
+          const started = await startService({
+            command: serve.command,
+            cwd: dir,
+            env,
+            logPath: log,
+            readyPath: serve.readyPath,
+            readyTimeoutMs: serve.readyTimeoutSeconds * 1000,
+            signal,
+          });
+          const durationMs = Date.now() - begun;
+          if (started.ok) {
+            service = started;
+            // Its whole group gone before the verify commands, so its last lines are in the tail.
+            await started.stop();
+            trial.serviceResult = {
+              ok: true,
+              reason: null,
+              exitCode: null,
+              url: started.url,
+              port: started.port,
+              durationMs,
+              outputTail: started.outputTail(),
+            };
+          } else {
+            trial.serviceResult = {
+              ok: false,
+              reason: started.reason,
+              exitCode: started.exitCode,
+              url: null,
+              port: started.port,
+              durationMs,
+              outputTail: started.outputTail,
+            };
+          }
+          this.notify(trial);
+        }
+        // A service that did not answer fails the trial, but the verify commands are worth
+        // knowing about all the same.
+        if (!signal.aborted) await runCommands(trial.verifyCommands, dir, opts, record('verify'));
       }
       if (signal.aborted) {
         trial.error = t({
@@ -220,6 +286,9 @@ export class RepoTrials {
     } catch (err) {
       trial.error = errorMessage(err);
     } finally {
+      // Nothing of the service outlives the trial or writes to its worktree as it is deleted: a
+      // no-op when it was stopped already. Never rejects.
+      await service?.stop().catch(() => {});
       // Never rejects; were it to, the sweep would delete the worktree later.
       if (dir) await dropWorktree(repo.path, dir).catch(() => {});
       trial.status = outcome(trial);
@@ -299,7 +368,27 @@ function trialResult(kind: Kind, result: CommandResult, env: NodeJS.ProcessEnv):
   };
 }
 
-/** Passed when nothing went wrong and every command run passed: none to run passes too. */
+/**
+ * The service a trial tries, with the defaults POST and PATCH /api/repos fill in where `serve`
+ * leaves them out; null for none.
+ */
+function trialServe(serve: RepoServeInput | null): RepoServe | null {
+  if (!serve) return null;
+  return {
+    command: serve.command,
+    readyPath: serve.readyPath ?? REPO_SERVE_DEFAULTS.readyPath,
+    readyTimeoutSeconds: serve.readyTimeoutSeconds ?? REPO_SERVE_DEFAULTS.readyTimeoutSeconds,
+  };
+}
+
+/**
+ * Passed when nothing went wrong, every command run passed and the service, when started,
+ * answered: nothing to run passes too.
+ */
 function outcome(trial: RepoTrial): RepoTrialStatus {
-  return trial.error === null && trial.results.every((r) => r.ok) ? 'passed' : 'failed';
+  return trial.error === null &&
+    trial.results.every((r) => r.ok) &&
+    trial.serviceResult?.ok !== false
+    ? 'passed'
+    : 'failed';
 }

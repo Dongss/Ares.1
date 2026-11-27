@@ -143,6 +143,36 @@ export interface RepoDetection extends DetectedCommands {
 export interface RepoTrialInput {
   setupCommands?: string[];
   verifyCommands?: string[];
+  /**
+   * The service to try instead of the registered one, its defaults as POST and PATCH
+   * /api/repos fill them in. Left out: the registered one (none when the repo has none); null:
+   * no service this time.
+   */
+  serve?: RepoServeInput | null;
+}
+
+/** How a trial's service went: started after the setup commands, stopped once it answered. */
+export interface RepoTrialService {
+  /** Whether it answered at its ready path within the ready timeout. */
+  ok: boolean;
+  /**
+   * Why it did not (null when it did): `exited`, the start command ended (or could not be
+   * started) before the service answered; `timeout`, it did not answer within the ready timeout;
+   * `aborted`, the Master stopped meanwhile.
+   */
+  reason: 'exited' | 'timeout' | 'aborted' | null;
+  /** The start command's exit code when it exited; null otherwise or when a signal ended it. */
+  exitCode: number | null;
+  /** `http://127.0.0.1:<port>` where it answered, without the ready path; null when it did not. */
+  url: string | null;
+  /** The port it was given in `PORT` to listen on. */
+  port: number;
+  /** From starting it until it answered, or until it was given up on. */
+  durationMs: number;
+  /**
+   * End of its output: once it answered, up to its stop; else up to when it was given up on.
+   */
+  outputTail: string;
 }
 
 /** Where a trial of a repo's commands is: under way, or over with every command passed or not. */
@@ -168,8 +198,9 @@ export interface RepoTrialResult {
 }
 
 /**
- * GET /api/repos/:id/trial: the latest trial of the repo's setup and verify commands on the
- * commit its target branch was at, kept in memory only (gone when the Master restarts).
+ * GET /api/repos/:id/trial: the latest trial of the repo's setup and verify commands, and of its
+ * service, on the commit its target branch was at, kept in memory only (gone when the Master
+ * restarts). It failed when a command failed, the service did not answer, or `error` is set.
  */
 export interface RepoTrial {
   repoId: string;
@@ -183,13 +214,24 @@ export interface RepoTrial {
   setupCommands: string[];
   verifyCommands: string[];
   /**
+   * The service tried, the request's or the registered one, with its defaults filled in; null
+   * when none was.
+   */
+  serve: RepoServe | null;
+  /**
    * The commands run so far, in order. Setup commands come first; the first failure ends the
    * trial, so the commands after it are not run.
    */
   results: RepoTrialResult[];
+  /**
+   * How the service went, once it answered and was stopped or was given up on; it is started
+   * after the setup commands all passed and before the verify commands, which run whether it
+   * answered or not. null while it has not been started yet, or with no service to try.
+   */
+  serviceResult: RepoTrialService | null;
   /** Why the trial could not go on besides a command failing, in the Master's language. */
   error: string | null;
-  /** The commands' output, overwritten by the repo's next trial. */
+  /** The commands' and the service's output, overwritten by the repo's next trial. */
   log: string | null;
 }
 

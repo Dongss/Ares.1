@@ -62,6 +62,11 @@ export interface RunningService {
    * once no process of it is left. Calling it again waits for the same stop.
    */
   stop(): Promise<void>;
+  /**
+   * End of the service's output so far, as long as a failure's `outputTail`; after `stop`
+   * resolved, up to its last line.
+   */
+  outputTail(): string;
 }
 
 /** A service that did not become ready; its process group is already gone. */
@@ -88,6 +93,8 @@ const DEFAULT_POLL_MS = 300;
 const PROBE_TIMEOUT_MS = 1000;
 /** Output kept in memory; only its end is ever shown. */
 const OUTPUT_KEEP = 64_000;
+/** Characters of the output's end that a result reports. */
+const OUTPUT_TAIL = 4000;
 /**
  * How long a stop waits for the service's output pipes to close once its group is gone, so the
  * last lines reach the log; a process that left the group may hold them open for good.
@@ -203,7 +210,7 @@ export async function startService(opts: ServiceOptions): Promise<ServiceResult>
       reason,
       exitCode,
       port,
-      outputTail: tail(output, 4000),
+      outputTail: tail(output, OUTPUT_TAIL),
       readyTimeoutMs: opts.readyTimeoutMs,
     };
   };
@@ -294,7 +301,15 @@ export async function startService(opts: ServiceOptions): Promise<ServiceResult>
     if (endedNow() || opts.signal?.aborted) continue;
     if (answered && child.pid !== undefined) {
       appendFileSync(opts.logPath, `\n[ready after ${Date.now() - started}ms at ${url}]\n`);
-      return { ok: true, port, url, env, pid: child.pid, stop: () => stop('stopped') };
+      return {
+        ok: true,
+        port,
+        url,
+        env,
+        pid: child.pid,
+        stop: () => stop('stopped'),
+        outputTail: () => tail(output, OUTPUT_TAIL),
+      };
     }
     const left = deadline - Date.now();
     if (left <= 0) {

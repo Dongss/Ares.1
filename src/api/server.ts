@@ -257,11 +257,15 @@ const RepoPatch = z.strictObject({
   serve: RepoServeSchema.nullable().optional(),
 }) satisfies z.ZodType<unknown, RepoPatchInput>;
 
-/** Commands to try instead of the registered ones; nothing is saved. */
+/**
+ * Commands and a service to try instead of the registered ones; nothing is saved. The service is
+ * checked as PATCH checks it; null tries none.
+ */
 const RepoTrialBody = z.strictObject({
   setupCommands: z.array(z.string()).optional(),
   verifyCommands: z.array(z.string()).optional(),
-}) satisfies z.ZodType<RepoTrialInput>;
+  serve: RepoServeSchema.nullable().optional(),
+}) satisfies z.ZodType<unknown, RepoTrialInput>;
 
 const CommentInput = z.strictObject({ comment: z.string().optional() });
 /** Most proposals one request returns. */
@@ -698,9 +702,10 @@ export function createApi(deps: ApiDeps): Hono {
     } satisfies RepoDetection);
   });
 
-  // Runs the setup commands, then the verify commands, on the commit the target branch is at, in
-  // a temporary worktree deleted afterwards (`RepoTrials.start`): the body's commands, else the
-  // registered ones. In the background: 202 at once, 409 while the repo is trying already.
+  // Runs the setup commands, then starts the service and stops it once it answers, then runs the
+  // verify commands, on the commit the target branch is at, in a temporary worktree deleted
+  // afterwards (`RepoTrials.start`): the body's commands and service, else the registered ones.
+  // In the background: 202 at once, 409 while the repo is trying already.
   app.post('/api/repos/:id/trial', async (c) => {
     const repo = store.getRepo(c.req.param('id'));
     const input = await body(c, RepoTrialBody);

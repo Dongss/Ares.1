@@ -106,8 +106,8 @@ src/
   verify/commands.ts  run check and setup commands; tell a missing program from a failing command
   verify/serve.ts     a command stage's service: a free port, the repo's start command in its own
                       process group, the wait until it answers, stopping the whole group
-  verify/trial.ts     trial runs of a repo's setup and verify commands from the dashboard, kept in
-                      memory, and the sweep of the worktrees they leave behind
+  verify/trial.ts     trial runs of a repo's setup and verify commands and of its service from the
+                      dashboard, kept in memory, and the sweep of the worktrees they leave behind
   api/
     server.ts         HTTP API (Hono) and SSE
     types.ts          API data types, shared by Master and dashboard

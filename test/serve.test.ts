@@ -151,6 +151,8 @@ describe('startService', () => {
 
     await service.stop();
     expect(groupGone(service.pid)).toBe(true);
+    // Its output up to the stop, without the log's own lines.
+    expect(service.outputTail()).toBe('server starting\nserver listening\n');
     const log = readFileSync(join(dir, 'logs', 'serve.log'), 'utf8');
     expect(log.startsWith(`$ ${NODE} server.mjs\n`)).toBe(true);
     expect(log).toContain('server starting');

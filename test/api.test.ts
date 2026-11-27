@@ -1,4 +1,5 @@
-import { existsSync, readdirSync, readFileSync, symlinkSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
+import { connect } from 'node:net';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { parse as parseYaml } from 'yaml';
@@ -27,6 +28,7 @@ import type {
   RepoDetection,
   RepoSourceRejected,
   RepoTrial,
+  RepoTrialService,
   RunSummary,
   StatsView,
 } from '../src/api/types.js';
@@ -4707,8 +4709,212 @@ describe('trying a repo’s commands', () => {
       400,
     );
     expect((await call('POST', '/api/repos/demo/trial', { commands: ['true'] })).status).toBe(400);
+    // A service is checked as PATCH checks it.
+    const badServe = async (serve: unknown) => {
+      const res = await call('POST', '/api/repos/demo/trial', { serve });
+      expect(res.status, JSON.stringify(serve)).toBe(400);
+      return res.json.error as string;
+    };
+    expect(await badServe({ command: 'x', readyPath: 'health' })).toContain(
+      '就绪路径必须以 / 开头',
+    );
+    await badServe({ command: 'x', port: 3000 });
+    expect(await badServe({ command: ' ' })).toContain('启动命令不能为空');
+    expect(await badServe({ command: 'x', readyTimeoutSeconds: 0 })).toContain(
+      '就绪超时必须是 1 到 3600 之间的整数（秒）',
+    );
+    await badServe('npm start');
     expect((await call('GET', '/api/repos/demo/trial')).status).toBe(404);
     expect(trialDirs()).toEqual([]);
+  });
+
+  describe('with a service', () => {
+    const NODE = JSON.stringify(process.execPath);
+
+    /**
+     * A start command: an HTTP server on 127.0.0.1:$PORT answering every path, which writes its
+     * pid to `pidFile` and says on which port it listens.
+     */
+    const server = (pidFile: string) => {
+      const script = [
+        `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));`,
+        "require('http').createServer((req, res) => res.end('ok'))",
+        ".listen(Number(process.env.PORT), '127.0.0.1',",
+        "() => console.log('listening on ' + process.env.PORT));",
+      ].join(' ');
+      return `exec ${NODE} -e ${JSON.stringify(script)}`;
+    };
+
+    /** A start command that writes its pid to `pidFile` and then never answers. */
+    const silent = (pidFile: string) => `echo $$ > ${pidFile}; exec sleep 30`;
+
+    /** The pid a start command wrote to `file`. */
+    const pidIn = (file: string) => Number(readFileSync(file, 'utf8').trim());
+
+    const alive = (pid: number) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    /** Whether a connection to 127.0.0.1:`port` is refused: nothing listens there. */
+    const refused = (port: number) =>
+      new Promise<boolean>((resolve) => {
+        const socket = connect(port, '127.0.0.1');
+        socket.once('connect', () => {
+          socket.destroy();
+          resolve(false);
+        });
+        socket.once('error', () => resolve(true));
+      });
+
+    it('starts it after the setup commands, stops it once it answers, then runs the verify commands', async () => {
+      h = await harness({ setupCommands: ['true'], verifyCommands: [] });
+      const pidFile = join(tmpDir('ares1-trial-serve-'), 'pid');
+      const serve = { command: server(pidFile), readyPath: '/health' };
+      // The service is gone by the time the verify commands run.
+      const gone = `! kill -0 "$(cat ${pidFile})" 2>/dev/null`;
+      const started = await call('POST', '/api/repos/demo/trial', {
+        verifyCommands: [gone],
+        serve,
+      });
+      expect(started.status).toBe(202);
+      expect(started.json).toMatchObject({
+        serve: { ...serve, readyTimeoutSeconds: 120 },
+        serviceResult: null,
+      });
+
+      const over = await trialOver();
+      expect(over).toMatchObject({
+        status: 'passed',
+        error: null,
+        serve: { ...serve, readyTimeoutSeconds: 120 },
+        results: [
+          { kind: 'setup', command: 'true', ok: true },
+          { kind: 'verify', command: gone, ok: true },
+        ],
+      });
+      const service = over.serviceResult as RepoTrialService;
+      expect(service).toMatchObject({
+        ok: true,
+        reason: null,
+        exitCode: null,
+        url: `http://127.0.0.1:${service.port}`,
+      });
+      expect(service.port).toBeGreaterThan(0);
+      expect(service.durationMs).toBeGreaterThanOrEqual(0);
+      expect(service.outputTail).toContain(`listening on ${service.port}`);
+      // Nothing is left of it.
+      expect(await refused(service.port)).toBe(true);
+      expect(alive(pidIn(pidFile))).toBe(false);
+      expect(trialDirs()).toEqual([]);
+      expect(worktrees(h.repoDir)).toHaveLength(1);
+      // Its output is in the trial's log, between the setup and the verify commands.
+      const log = readFileSync(over.log as string, 'utf8');
+      const at = (text: string) => log.indexOf(text);
+      expect(at('$ true')).toBeGreaterThan(-1);
+      expect(at(`$ ${serve.command}`)).toBeGreaterThan(at('$ true'));
+      expect(at(`[ready after `)).toBeGreaterThan(at(`$ ${serve.command}`));
+      expect(at(`$ ${gone}`)).toBeGreaterThan(at('[ready after '));
+      // Nothing is saved.
+      expect(h.master.store.getRepo('demo').serve).toBeNull();
+
+      // A setup command fails: the service is not started.
+      rmSync(pidFile);
+      await call('POST', '/api/repos/demo/trial', { setupCommands: ['exit 2'], serve });
+      expect(await trialOver()).toMatchObject({ status: 'failed', serviceResult: null });
+      expect(existsSync(pidFile)).toBe(false);
+    });
+
+    it('tries it when there is no command to run', async () => {
+      h = await harness({ setupCommands: [], verifyCommands: [] });
+      const pidFile = join(tmpDir('ares1-trial-serve-'), 'pid');
+      await call('POST', '/api/repos/demo/trial', { serve: { command: server(pidFile) } });
+      const over = await trialOver();
+      expect(over).toMatchObject({
+        status: 'passed',
+        error: null,
+        results: [],
+        serviceResult: { ok: true, reason: null },
+      });
+      expect(over.log).toBe(join(h.master.paths.logsDir, 'trial-demo.log'));
+      expect(alive(pidIn(pidFile))).toBe(false);
+      expect(trialDirs()).toEqual([]);
+      expect(worktrees(h.repoDir)).toHaveLength(1);
+    });
+
+    it('tells a service that timed out from one that exited, and still runs the verify commands', async () => {
+      h = await harness({ setupCommands: [], verifyCommands: ['true'] });
+      const pidFile = join(tmpDir('ares1-trial-serve-'), 'pid');
+      await call('POST', '/api/repos/demo/trial', {
+        serve: { command: silent(pidFile), readyTimeoutSeconds: 1 },
+      });
+      const timedOut = await trialOver();
+      expect(timedOut).toMatchObject({
+        status: 'failed',
+        error: null,
+        results: [{ kind: 'verify', command: 'true', ok: true }],
+        serviceResult: { ok: false, reason: 'timeout', exitCode: null, url: null },
+      });
+      expect(timedOut.serviceResult?.durationMs).toBeGreaterThanOrEqual(1000);
+      expect(alive(pidIn(pidFile))).toBe(false);
+
+      await call('POST', '/api/repos/demo/trial', { serve: { command: 'echo boom; exit 3' } });
+      const exited = await trialOver();
+      expect(exited).toMatchObject({
+        status: 'failed',
+        error: null,
+        results: [{ kind: 'verify', command: 'true', ok: true }],
+        serviceResult: { ok: false, reason: 'exited', exitCode: 3, url: null },
+      });
+      expect(exited.serviceResult?.port).toBeGreaterThan(0);
+      expect(exited.serviceResult?.outputTail).toContain('boom');
+      expect(readFileSync(exited.log as string, 'utf8')).toContain('boom');
+      expect(trialDirs()).toEqual([]);
+    });
+
+    it('tries the registered service unless the request says null', async () => {
+      h = await harness({ setupCommands: [], verifyCommands: ['true'] });
+      const pidFile = join(tmpDir('ares1-trial-serve-'), 'pid');
+      const serve = { command: server(pidFile), readyPath: '/', readyTimeoutSeconds: 30 };
+      expect((await call('PATCH', '/api/repos/demo', { serve })).status).toBe(200);
+
+      await call('POST', '/api/repos/demo/trial', { serve: null });
+      expect(await trialOver()).toMatchObject({
+        status: 'passed',
+        serve: null,
+        serviceResult: null,
+        results: [{ kind: 'verify', command: 'true', ok: true }],
+      });
+      expect(existsSync(pidFile)).toBe(false);
+
+      await call('POST', '/api/repos/demo/trial', {});
+      const registered = await trialOver();
+      expect(registered).toMatchObject({ status: 'passed', serve, serviceResult: { ok: true } });
+      expect(alive(pidIn(pidFile))).toBe(false);
+      expect(trialDirs()).toEqual([]);
+    });
+
+    it('stops a service still starting when the Master stops', async () => {
+      h = await harness({ setupCommands: [], verifyCommands: ['true'] });
+      const pidFile = join(tmpDir('ares1-trial-serve-'), 'pid');
+      await call('POST', '/api/repos/demo/trial', { serve: { command: silent(pidFile) } });
+      await waitFor(() => existsSync(pidFile) && pidIn(pidFile) > 0, 'the service to start');
+      const pid = pidIn(pidFile);
+      await h.close();
+      expect(alive(pid)).toBe(false);
+      expect(trialDirs()).toEqual([]);
+      expect(worktrees(h.repoDir)).toHaveLength(1);
+      expect(h.master.trials.get(h.repo.id)).toMatchObject({
+        status: 'failed',
+        error: 'Master 停止了，试运行没有跑完',
+        results: [],
+        serviceResult: { ok: false, reason: 'aborted' },
+      });
+    });
   });
 
   it('deletes the trial worktrees a Master left behind, at start and with the leftover workspaces', async () => {
