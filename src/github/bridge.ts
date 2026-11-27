@@ -90,10 +90,13 @@ import {
   type AuthoredCommand,
   autoAcceptedComment,
   type CommandOutcome,
+  type CommandState,
   checkPlanItem,
   closedWithIterationComment,
   commandReply,
+  commandState,
   commandsAfterMaster,
+  commandsFor,
   discussionComment,
   type FailureOutcome,
   failedAttempt,
@@ -450,6 +453,57 @@ function sameIssues(a: readonly number[], b: readonly number[]): boolean {
   return set.size === new Set(b).size && b.every((n) => set.has(n));
 }
 
+/**
+ * Which block a Run is stuck on, as its issue tells of it: two blocks with the same key are the
+ * same to a human reading the issue.
+ */
+function blockKey(block: Run['blocked']): string {
+  return block
+    ? JSON.stringify([block.kind, block.taskId ?? null, block.stageRunId ?? null, block.message])
+    : '';
+}
+
+/**
+ * Whether the issue says what the Run is at: its status, and the discussion's questions when it
+ * has some. Commands on the issue are read only then, for what the issue says.
+ */
+function issueCaughtUp(run: Run): boolean {
+  return run.issueSynced === run.status && run.issueDiscussionSynced >= run.discussion.length;
+}
+
+/** What a Run that has not ended waits for, as the commands on its issue are read for it. */
+interface CommandWait {
+  state: CommandState;
+  /** Tells this wait from another one with the same state: the approval, or the block. */
+  key: string;
+  /** state approval: the approval waited for, and its stage. */
+  approvalId?: string;
+  stageId?: string;
+}
+
+/**
+ * Why a command was not carried out when the Run moved on from what it waited for (`before`)
+ * while the issue's comments were read: the command was written for that.
+ */
+function movedOnReason(before: Run, now: Run): string {
+  if (before.status === 'waiting_approval' && now.status === 'waiting_approval') {
+    return t({
+      zh: '读这条命令时，那次审批已经有了结果，Run 又在等下一次审批；命令是给上一次的。要审批这一次，请重新回复。',
+      en: 'While the command was read, that approval was decided and the Run came to wait for the next one; the command was for the earlier one. To decide this one, reply again.',
+    });
+  }
+  if (before.status === 'blocked' && now.status === 'blocked') {
+    return t({
+      zh: '读这条命令时，Run 已经又卡在了别的地方；命令是给上一次的。要处理这一次，请重新回复。',
+      en: 'While the command was read, the Run came to be stuck on something else; the command was for the earlier block. To handle this one, reply again.',
+    });
+  }
+  return t({
+    zh: `读这条命令时 Run 的状态变了（现在是 ${now.status}），命令是给之前的状态的。还需要的话，请重新回复。`,
+    en: `While the command was read, the Run's status changed (it is now ${now.status}); the command was for the earlier one. Reply again if still needed.`,
+  });
+}
+
 /** The code hosts whose issues a bridge takes requirements from; each bridge works with one. */
 export type HostPlatform = CodeHostPlatform;
 
@@ -640,8 +694,9 @@ export interface BridgeDeps {
  *   budget; then the issue is closed with every failure's reason;
  * - discussion: the requirement assessment's questions and conclusion are posted on the issue,
  *   and a human's replies there go back to the Run;
- * - commands: on the issue of a Run waiting for approval, a trusted human's `/ares1 approve` or
- *   `/ares1 reject <comment>` decides the approval as the dashboard does, answered on the issue;
+ * - commands: on the issue of a Run that has not ended, a trusted human's `/ares1 approve`,
+ *   `/ares1 reject <comment>`, `/ares1 retry [note]`, `/ares1 confirm`, `/ares1 resume` or
+ *   `/ares1 cancel` does what the dashboard does when the Run takes it, answered on the issue;
  * - pull requests (deliver: pr, or mr on GitLab): a Run whose checks passed pushes its branch and
  *   opens a pull request into the target branch; once it is merged on the code host the target
  *   branch is pulled and the Run completes, once it is closed unmerged the Run fails; a Run that
@@ -885,8 +940,8 @@ export class IssueBridge {
    * start over those whose issue a human changed, catch issues up, follow the iterations under
    * way (blocked by a step that failed or was dropped, turned down when a human closed their
    * issue, summed up once done), pass on replies to the assessments' questions, carry out the
-   * approvals and rejections trusted humans wrote on issues as commands, start a scout
-   * where the repo is idle. With the work switch off only the pulling, the pull requests, the
+   * commands trusted humans wrote on issues (approve, reject, retry, confirm, resume, cancel),
+   * start a scout where the repo is idle. With the work switch off only the pulling, the pull requests, the
    * terminating and the catching up happen: none of them starts new work.
    */
   poll(): Promise<void> {
@@ -2341,10 +2396,15 @@ export class IssueBridge {
       // A comment saying the Run waits for an approval that was decided while the issue was
       // updated (or before, the Run read being out of date) does not count as saying it of the
       // next one: the issue is left behind, and the next poll says the Run waits again before a
-      // command is read for it.
+      // command is read for it. Likewise a comment saying the Run is stuck on something, when
+      // it is stuck on something else by now.
+      const now = store.getRun(run.id);
       const caughtUp =
-        run.status !== 'waiting_approval' ||
-        (announced !== null && this.announcedApproval(run) === announced);
+        run.status === 'waiting_approval'
+          ? announced !== null && this.announcedApproval(run) === announced
+          : run.status !== 'blocked' ||
+            now.status !== 'blocked' ||
+            blockKey(now.blocked) === blockKey(run.blocked);
       store.setIssueSynced(run.id, caughtUp ? run.status : null);
       if (failure?.kind === 'redo') {
         // The failed Run's page learns when the next attempt starts.
@@ -2597,37 +2657,58 @@ export class IssueBridge {
   }
 
   /**
-   * Commands on the issues of Runs waiting for approval (`commandsAfterMaster`): a trusted
-   * human's `/ares1 approve [comment]` approves, `/ares1 reject <comment>` rejects, as the
-   * dashboard does; commands of others are only counted (`recordIgnoredCommands`). Only once the
-   * issue says the Run waits for approval, so that no command written before decides it. The
-   * earliest command after the Master's last comment is taken, the later ones left alone, and
-   * each command taken is answered on the issue whatever became of it: the answer, the Master's
-   * last comment now, keeps it from being read again.
+   * Commands on the issues of Runs that have not ended (`commandsAfterMaster`): a trusted human's
+   * command is carried out as the dashboard would when the Run takes it in what it is at
+   * (`commandsFor`): `/ares1 approve [comment]` and `/ares1 reject <comment>` on an approval,
+   * `/ares1 retry [note]` on a blocked Run, `/ares1 confirm` on a Run from an issue by someone
+   * the Master does not trust, `/ares1 resume` on a paused Run, `/ares1 cancel` on any; commands
+   * of others are only counted (`recordIgnoredCommands`). Only once the issue says what the Run
+   * is at: each new approval and each new block leaves the issue behind until a new comment says
+   * so (the engine's `requestApproval` and `block`), so that no command written for an earlier
+   * one acts on it. The earliest command after the Master's last comment is taken, the later
+   * ones left alone, and each command taken is answered on the issue whatever became of it: the
+   * answer, the Master's last comment now, keeps it from being read again.
    */
   private async followCommands(name: string): Promise<void> {
     const { repo } = this.repoSetup(name);
     const store = this.deps.store;
-    const waiting = store
-      .listRuns({ status: 'waiting_approval', repoId: repo.id })
-      .filter((r) => this.platform.ownsRun(r) && r.issueSynced === 'waiting_approval');
-    for (const run of waiting) {
+    const ids = store
+      .listRuns({ repoId: repo.id })
+      .filter((r) => this.platform.ownsRun(r) && r.issue && commandState(r) !== null)
+      .map((r) => r.id);
+    for (const id of ids) {
       if (this.stopping) return;
+      // Read again: the Runs before it took their time.
+      const run = store.getRun(id);
       const issue = run.issue;
-      const approval = store.pendingApproval(run.id);
-      if (!issue || !approval) continue;
+      const wait = this.commandWait(run);
+      if (!issue || !wait || !issueCaughtUp(run)) continue;
       const master = await this.masterLogin();
       const comments = await this.host().listComments(issue.repo, issue.number);
       const { commands, ignored } = commandsAfterMaster(comments, master);
-      this.recordIgnoredCommands(run, issue, approval.id, ignored);
+      const now = store.getRun(id);
+      // Decided on the dashboard while the comments were read, for one.
+      const same = this.commandWait(now)?.key === wait.key;
+      if (same) this.recordIgnoredCommands(now, issue, wait, ignored);
       const [command, ...later] = commands;
       if (!command) continue;
-      const stageId = store.getStageRun(approval.stageRunId).stageId;
-      const outcome = this.carryOut(run, approval.id, stageId, command);
+      // Replies to the assessment's questions go to the Run first (`collectReplies`, on the
+      // next poll): with an answer to the command after them they would no longer be read.
+      if (same && wait.state === 'discussion') {
+        if (repliesAfterMaster(comments, master).replies.length > 0) continue;
+      }
+      const outcome: CommandOutcome = same
+        ? await this.carryOut(now, wait, command)
+        : { kind: 'refused', reason: movedOnReason(run, now) };
+      const stageId = wait.stageId;
       const reply = commandReply(outcome, {
         command,
-        stageName: run.template.stages.find((s) => s.id === stageId)?.name ?? stageId,
+        state: wait.state,
+        stageName: stageId
+          ? (run.template.stages.find((s) => s.id === stageId)?.name ?? stageId)
+          : undefined,
         skipped: later.length,
+        platform: this.platform.platform,
         dashboardUrl: this.dashboardUrl(),
         runId: run.id,
       });
@@ -2635,50 +2716,72 @@ export class IssueBridge {
     }
   }
 
-  /**
-   * Decide the approval `approvalId` of the Run as the command says, when it says so properly.
-   * Once the Run waits for an approval again, the issue says so in a new comment before a
-   * command is read for it (the engine's `requestApproval` leaves the issue behind the Run):
-   * should the Master stop between the decision and its answer on the issue, the command comes
-   * before that comment then, and is never carried out twice.
-   */
-  private carryOut(
-    run: Run,
-    approvalId: string,
-    stageId: string,
-    command: AuthoredCommand,
-  ): CommandOutcome {
-    const { name, note } = command;
-    if (name === null) return { kind: 'malformed' };
-    if (name !== 'approve' && name !== 'reject') return { kind: 'unsupported' };
-    if (name === 'reject' && !note) return { kind: 'note_missing' };
-    const store = this.deps.store;
-    const pending = store.pendingApproval(run.id);
-    if (pending && pending.id !== approvalId) {
-      // Decided on the dashboard while the comments were read, and waiting for the next one.
+  /** What the Run waits for, for the commands on its issue; null once it has ended. */
+  private commandWait(run: Run): CommandWait | null {
+    const state = commandState(run);
+    if (!state) return null;
+    if (state === 'approval') {
+      const approval = this.deps.store.pendingApproval(run.id);
+      if (!approval) return null;
       return {
-        kind: 'refused',
-        reason: t({
-          zh: '读这条命令时，那次审批已经有了结果，Run 又在等下一次审批；命令是给上一次的。要审批这一次，请重新回复。',
-          en: 'While the command was read, that approval was decided and the Run came to wait for the next one; the command was for the earlier one. To decide this one, reply again.',
-        }),
+        state,
+        key: `approval ${approval.id}`,
+        approvalId: approval.id,
+        stageId: this.deps.store.getStageRun(approval.stageRunId).stageId,
       };
     }
+    return { state, key: run.status === 'blocked' ? `blocked ${blockKey(run.blocked)}` : state };
+  }
+
+  /**
+   * Carry out the command on the Run when it takes it in what it waits for (`wait`, still the
+   * same) and the command says so properly. Should the Master stop between carrying it out and
+   * answering it on the issue, it is not carried out again: the Run has moved on, and once it
+   * waits for an approval or is blocked again, the issue says so in a new comment before a
+   * command is read for it; a Run that went on takes no approve, retry, confirm or resume, and a
+   * cancelled one no command.
+   */
+  private async carryOut(
+    run: Run,
+    wait: CommandWait,
+    command: AuthoredCommand,
+  ): Promise<CommandOutcome> {
+    const { name, note } = command;
+    if (name === null) return { kind: 'malformed' };
+    if (!commandsFor(wait.state).includes(name)) return { kind: 'not_applicable' };
+    if (name === 'reject' && !note) return { kind: 'note_missing' };
+    const engine = this.deps.engine;
     const origin = { source: 'issue', author: command.author } as const;
     try {
-      if (name === 'approve') {
-        this.deps.engine.approve(run.id, note || undefined, origin);
-        return { kind: 'approved' };
+      switch (name) {
+        case 'approve':
+          engine.approve(run.id, note || undefined, origin);
+          return { kind: 'approved' };
+        case 'reject': {
+          engine.reject(run.id, note, origin);
+          const target = wait.stageId ? rollbackTarget(run.template, wait.stageId, 'reject') : null;
+          return {
+            kind: 'rejected',
+            target: target && (run.template.stages.find((s) => s.id === target)?.name ?? target),
+          };
+        }
+        case 'retry':
+          await engine.retry(run.id, note ? { note } : {}, origin);
+          return { kind: 'retried' };
+        case 'confirm':
+          // As "Confirm and start" on the dashboard: the confirmation is recorded on the Run.
+          await engine.retry(run.id, {}, origin);
+          return { kind: 'confirmed' };
+        case 'resume':
+          engine.resume(run.id, origin);
+          return { kind: 'resumed' };
+        case 'cancel':
+          await engine.cancel(run.id, origin);
+          return { kind: 'cancelled' };
       }
-      this.deps.engine.reject(run.id, note, origin);
-      const target = rollbackTarget(run.template, stageId, 'reject');
-      return {
-        kind: 'rejected',
-        target: run.template.stages.find((s) => s.id === target)?.name ?? target,
-      };
     } catch (err) {
-      // The Run is no longer waiting for this approval: decided on the dashboard meanwhile, or
-      // by this very command before the Master stopped short of answering it.
+      // The Run's state refused it: it moved on while the command was carried out (a retry
+      // waits for git), or the engine asks for more than a command gives.
       if (err instanceof InvalidStateError) return { kind: 'refused', reason: err.message };
       throw err;
     }
@@ -2686,23 +2789,30 @@ export class IssueBridge {
 
   /**
    * Record on the Run how many commands on its issue were not carried out because the Master
-   * does not trust their authors, once per approval and count, so the dashboard shows them.
+   * does not trust their authors, so the dashboard shows them: once per count while the Run
+   * waits for the same thing, i.e. has had no status of its own since. The data say what it
+   * waited for: the approval, else its status and what it is blocked on.
    */
   private recordIgnoredCommands(
     run: Run,
     issue: RunIssue,
-    approvalId: string,
+    wait: CommandWait,
     ignored: number,
   ): void {
     if (ignored === 0) return;
-    const last = this.deps.store
-      .listEvents(run.id)
-      .findLast((e) => e.type === 'issue.commands_ignored' && e.data.approvalId === approvalId);
-    if (last?.data.count === ignored) return;
+    const events = this.deps.store.listEvents(run.id);
+    const at = events.findLastIndex((e) => e.type === 'issue.commands_ignored');
+    const recorded =
+      at >= 0 &&
+      events[at]?.data.count === ignored &&
+      !events.slice(at + 1).some((e) => e.type === 'run.status');
+    if (recorded) return;
     this.hostEvent(run.id, 'issue.commands_ignored', {
       repo: issue.repo,
       issue: issue.number,
-      approvalId,
+      ...(wait.approvalId
+        ? { approvalId: wait.approvalId }
+        : { status: run.status, ...(run.blocked ? { kind: run.blocked.kind } : {}) }),
       count: ignored,
     });
   }

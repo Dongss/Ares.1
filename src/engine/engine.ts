@@ -275,9 +275,10 @@ export interface CreateRunInput {
 }
 
 /**
- * Where a human decided an approval, recorded in the data of its `approval.approved` /
- * `approval.rejected` event: on the dashboard (its HTTP API), or by a command on the Run's issue,
- * with the login of who wrote it (null for a deleted account).
+ * Where a human decided what a Run waited for, recorded in the data of the one event that says
+ * so (`approval.approved` / `approval.rejected`, `run.retry`, the `run.resumed` of a resume, and
+ * the `run.status` of a cancellation): on the dashboard (its HTTP API), or by a command on the
+ * Run's issue, with the login of who wrote it (null for a deleted account).
  */
 export type DecisionOrigin = { source: 'dashboard' } | { source: 'issue'; author: string | null };
 
@@ -1084,8 +1085,11 @@ export class Engine {
     return this.store.getRun(runId);
   }
 
-  /** Human handling of a blocked Run: redo what failed, optionally with another agent. */
-  async retry(runId: string, input: RetryInput = {}): Promise<Run> {
+  /**
+   * Human handling of a blocked Run: redo what failed, optionally with another agent. Also how a
+   * human confirms the goal of a Run from an issue by someone the Master does not trust.
+   */
+  async retry(runId: string, input: RetryInput = {}, origin?: DecisionOrigin): Promise<Run> {
     const run = this.store.getRun(runId);
     if (run.status !== 'blocked' || !run.blocked) {
       throw new InvalidStateError(
@@ -1216,7 +1220,7 @@ export class Engine {
         const untrusted = { ...current.issue.untrusted, confirmedAt: nowIso() };
         this.store.updateRun(runId, { issue: { ...current.issue, untrusted } });
       }
-      this.store.event(runId, 'run.retry', { kind: info.kind, ...input });
+      this.store.event(runId, 'run.retry', { kind: info.kind, ...input, ...origin });
       this.requeueHead(runId, 'run.resumed');
     });
     this.kick();
@@ -1633,7 +1637,7 @@ export class Engine {
     }
   }
 
-  resume(runId: string): Run {
+  resume(runId: string, origin?: DecisionOrigin): Run {
     const run = this.store.getRun(runId);
     if (run.status !== 'paused')
       throw new InvalidStateError(
@@ -1642,13 +1646,17 @@ export class Engine {
           en: `The Run is ${run.status}, not paused`,
         }),
       );
-    this.requeueHead(runId, 'run.resumed');
+    this.requeueHead(runId, 'run.resumed', origin);
     this.kick();
     return this.store.getRun(runId);
   }
 
-  /** Terminate a Run. Its worktree and branch are kept for inspection. */
-  async cancel(runId: string): Promise<Run> {
+  /**
+   * Terminate a Run. Its worktree and branch are kept for inspection. `origin`: where a human
+   * cancelled it, recorded with its `run.status` event; left out when the Master ends it for a
+   * reason it records itself (its issue closed or changed, its iteration ended).
+   */
+  async cancel(runId: string, origin?: DecisionOrigin): Promise<Run> {
     const run = this.store.getRun(runId);
     if (FINISHED_RUN_STATUSES.includes(run.status)) {
       throw new InvalidStateError(alreadyFinished(run.status));
@@ -1665,7 +1673,7 @@ export class Engine {
           this.store.updateTask(task.id, { status: 'cancelled' });
         }
       }
-      this.setStatus(runId, 'cancelled', { queuePos: null, finishedAt: nowIso() });
+      this.setStatus(runId, 'cancelled', { queuePos: null, finishedAt: nowIso() }, origin);
     });
     this.limitWaits.delete(runId);
     // Runs that overlap it wait for it no longer (`conflictWith`), also when it was not executing
@@ -4770,9 +4778,15 @@ export class Engine {
     return run.template.stages.find((s) => s.id === stageId)?.kind;
   }
 
-  private setStatus(runId: string, status: RunStatus, patch: Partial<Run> = {}): Run {
+  /** `origin`: where a human made the change, recorded with its `run.status` event. */
+  private setStatus(
+    runId: string,
+    status: RunStatus,
+    patch: Partial<Run> = {},
+    origin?: DecisionOrigin,
+  ): Run {
     const run = this.store.updateRun(runId, { ...patch, status });
-    this.store.event(runId, 'run.status', { status });
+    this.store.event(runId, 'run.status', { status, ...origin });
     if (FINISHED_RUN_STATUSES.includes(status)) {
       // Ended: the Runs waiting for it have outlasted it, and it queues no more.
       this.outlast(runId);
@@ -4781,17 +4795,25 @@ export class Engine {
     return run;
   }
 
-  /** Put the Run first in the queue, to go on as soon as its repo's execution slot has room. */
-  private requeueHead(runId: string, eventType: string): void {
+  /**
+   * Put the Run first in the queue, to go on as soon as its repo's execution slot has room.
+   * `origin`: where a human let it go on, recorded with the `eventType` event.
+   */
+  private requeueHead(runId: string, eventType: string, origin?: DecisionOrigin): void {
     this.store.tx(() => {
       this.setStatus(runId, 'queued', { queuePos: this.store.queueHead(), blocked: null });
-      this.store.event(runId, eventType, {});
+      this.store.event(runId, eventType, { ...origin });
     });
     this.limitWaits.delete(runId);
   }
 
   private block(runId: string, info: BlockInfo): void {
     this.store.tx(() => {
+      // As for an approval (`requestApproval`): the issue has not said yet that the Run is stuck
+      // on this, even when it said so of the last block and the Run came back to it before the
+      // issue was caught up; a new comment says so before a command on the issue is read for
+      // it, so that no command written for an earlier block (`/ares1 retry`) redoes this one.
+      if (this.store.getRun(runId).issue) this.store.setIssueSynced(runId, null);
       this.setStatus(runId, 'blocked', { blocked: info });
       this.store.event(runId, 'run.blocked', { ...info });
     });

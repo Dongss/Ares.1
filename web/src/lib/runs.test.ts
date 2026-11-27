@@ -783,6 +783,62 @@ describe('a Run terminated because its iteration was closed', () => {
   });
 });
 
+describe('what a human did with a command on the issue', () => {
+  afterEach(() => setLang('zh'));
+
+  const by = (author: string | null) => ({ source: 'issue', author });
+  const cases = [
+    { type: 'approval.approved', data: { approvalId: 'a1', ...by('alice') } },
+    { type: 'approval.rejected', data: { approvalId: 'a1', comment: '改名', ...by('alice') } },
+    { type: 'run.retry', data: { kind: 'task_failed', note: '换个思路', ...by('alice') } },
+    { type: 'run.retry', data: { kind: 'untrusted_issue', ...by('alice') } },
+    { type: 'run.resumed', data: by('alice') },
+    { type: 'run.status', data: { status: 'cancelled', ...by('alice') } },
+  ];
+
+  it('says who did what with which command, in both languages', () => {
+    expect(cases.map((e) => eventText(e))).toEqual([
+      '@alice 在 issue 上用 /ares1 approve 批准了',
+      '@alice 在 issue 上用 /ares1 reject 驳回了',
+      '@alice 在 issue 上用 /ares1 retry 重试了',
+      '@alice 在 issue 上用 /ares1 confirm 确认了需求',
+      '@alice 在 issue 上用 /ares1 resume 让暂停的 Run 继续',
+      '@alice 在 issue 上用 /ares1 cancel 终止了 Run',
+    ]);
+    expect(eventText({ type: 'run.status', data: { status: 'cancelled', ...by(null) } })).toBe(
+      '已删除的账号 在 issue 上用 /ares1 cancel 终止了 Run',
+    );
+    expect(eventText({ type: 'issue.commands_ignored', data: { count: 2 } })).toBe(
+      'issue 上有 2 条命令的作者不是仓库成员，没有执行',
+    );
+    setLang('en');
+    for (const author of ['alice', null]) {
+      for (const e of cases) {
+        const text = eventText({ ...e, data: { ...e.data, author } });
+        expect(text).toMatch(author ? /^@alice / : /^A deleted account /);
+        expect(text).not.toMatch(/[一-鿿]/);
+      }
+    }
+    expect(eventText(cases[3] as (typeof cases)[number])).toBe(
+      '@alice confirmed the requirement with /ares1 confirm on the issue',
+    );
+    expect(eventText({ type: 'issue.commands_ignored', data: { count: 1 } })).toBe(
+      '1 command on the issue by non-members of the repo was not carried out',
+    );
+  });
+
+  it('says nothing more of what was done on the dashboard or by the Master', () => {
+    for (const e of cases) {
+      expect(eventText({ ...e, data: { ...e.data, source: 'dashboard' } })).toBeNull();
+    }
+    expect(eventText({ type: 'run.status', data: { status: 'cancelled' } })).toBeNull();
+    expect(eventText({ type: 'run.resumed', data: {} })).toBeNull();
+    expect(
+      eventText({ type: 'run.status', data: { status: 'running', ...by('alice') } }),
+    ).toBeNull();
+  });
+});
+
 describe('a Run started over because its issue changed', () => {
   afterEach(() => setLang('zh'));
   const changed = { repo: 'me/demo', issue: 7, newRun: 'run_new' };

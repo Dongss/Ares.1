@@ -229,8 +229,10 @@ export const COMMAND_PREFIX = '/ares1';
 /**
  * The commands a human may write on a Run's issue, as the word after `/ares1`: protocol, the
  * same in every language, matched whatever the case. approve and reject decide the approval a
- * Run waits for; the others are recognised already, to be answered as not supported rather than
- * as malformed.
+ * Run waits for, retry redoes what a blocked Run is stuck on, confirm lets a Run from an issue
+ * by someone the Master does not trust start, resume goes on with a paused Run, and cancel
+ * terminates a Run that has not ended. Which of them a Run takes depends on what it is at
+ * (`commandsFor`).
  */
 export const ISSUE_COMMANDS = [
   'approve',
@@ -312,37 +314,210 @@ export function commandsAfterMaster(
   return { commands, ignored };
 }
 
-/** What became of a command on the issue of a Run waiting for approval. */
+/**
+ * What a Run that has not ended is at, as far as the commands on its issue go: waiting for an
+ * approval, blocked (on a requirement by someone the Master does not trust, on a discussion, on
+ * its pull request, over its budget, or on anything else), paused, or queued or running.
+ */
+export type CommandState =
+  | 'approval'
+  | 'untrusted_issue'
+  | 'discussion'
+  | 'pr_open'
+  | 'budget'
+  | 'blocked'
+  | 'paused'
+  | 'active';
+
+/** What the Run is at for the commands on its issue; null once it has ended. */
+export function commandState(run: Pick<Run, 'status' | 'blocked'>): CommandState | null {
+  switch (run.status) {
+    case 'waiting_approval':
+      return 'approval';
+    case 'paused':
+      return 'paused';
+    case 'queued':
+    case 'running':
+      return 'active';
+    case 'blocked': {
+      const kind = run.blocked?.kind;
+      if (
+        kind === 'untrusted_issue' ||
+        kind === 'discussion' ||
+        kind === 'pr_open' ||
+        kind === 'budget'
+      ) {
+        return kind;
+      }
+      return 'blocked';
+    }
+    case 'completed':
+    case 'failed':
+    case 'cancelled':
+    case 'dropped':
+      return null;
+  }
+}
+
+/**
+ * The commands a Run takes on its issue in `state`; any other is answered without being carried
+ * out. cancel always. retry only on a Run blocked on something it can redo: not on a discussion
+ * (a reply on the issue is what it waits for), its pull request (merged or closed on the code
+ * host), its budget (a new one is given on the dashboard) or a requirement to confirm (confirm).
+ */
+export function commandsFor(state: CommandState): IssueCommandName[] {
+  switch (state) {
+    case 'approval':
+      return ['approve', 'reject', 'cancel'];
+    case 'untrusted_issue':
+      return ['confirm', 'cancel'];
+    case 'blocked':
+      return ['retry', 'cancel'];
+    case 'paused':
+      return ['resume', 'cancel'];
+    case 'discussion':
+    case 'pr_open':
+    case 'budget':
+    case 'active':
+      return ['cancel'];
+  }
+}
+
+/** What became of a command on the issue of a Run. */
 export type CommandOutcome =
   | { kind: 'approved' }
   /** `target`: name of the stage the Run goes back to with the comment, when known. */
   | { kind: 'rejected'; target: string | null }
-  /** Not carried out: the Run's state refused it, e.g. it was decided on the dashboard first. */
+  /** A blocked Run redoes what it was stuck on, with the command's note if any. */
+  | { kind: 'retried' }
+  /** A human confirmed the requirement of an issue by someone the Master does not trust. */
+  | { kind: 'confirmed' }
+  | { kind: 'resumed' }
+  | { kind: 'cancelled' }
+  /** Not carried out: the Run's state refused it, e.g. it changed while the issue was read. */
   | { kind: 'refused'; reason: string }
+  /** A command the Run does not take in the state it is at (`commandsFor`). */
+  | { kind: 'not_applicable' }
   /** No command word the Master knows. */
   | { kind: 'malformed' }
   /** A rejection without its comment. */
-  | { kind: 'note_missing' }
-  /** retry, confirm, resume, cancel: recognised, not carried out on issues yet. */
-  | { kind: 'unsupported' };
+  | { kind: 'note_missing' };
 
 export interface CommandReplyContext {
   /** The command answered. */
   command: AuthoredCommand;
+  /** What the Run was at when the command was read: the commands it takes then. */
+  state: CommandState;
   /** Name of the stage whose approval the Run waited for. */
   stageName?: string;
   /** How many trusted commands after it were left alone: one is carried out at a time. */
   skipped: number;
+  /** The code host the issue is on, whose words the texts use: GitHub if omitted, or GitLab. */
+  platform?: HostPlatform;
   dashboardUrl: string;
   runId: string;
 }
 
-/** 「`/ares1 approve [意见]` 批准，`/ares1 reject <意见>` 驳回」: how to decide an approval. */
-const approvalUsage = () =>
-  t({
-    zh: `评论第一行写 \`${COMMAND_PREFIX} approve [意见]\` 批准，写 \`${COMMAND_PREFIX} reject <意见>\` 驳回（意见必填，会交给返工的 Agent）`,
-    en: `start a comment with \`${COMMAND_PREFIX} approve [comment]\` to approve, or \`${COMMAND_PREFIX} reject <comment>\` to reject (the comment is required and goes to the agent that reworks it)`,
+/** 「`/ares1 retry [说明]` 重试（说明会交给 Agent）」: how to write one command, and what it does. */
+function commandUsage(name: IssueCommandName): string {
+  const c = `\`${COMMAND_PREFIX} ${name}`;
+  switch (name) {
+    case 'approve':
+      return t({ zh: `${c} [意见]\` 批准`, en: `${c} [comment]\` to approve` });
+    case 'reject':
+      return t({
+        zh: `${c} <意见>\` 驳回（意见必填，会交给返工的 Agent）`,
+        en: `${c} <comment>\` to reject (the comment is required and goes to the agent that reworks it)`,
+      });
+    case 'retry':
+      return t({
+        zh: `${c} [说明]\` 重试（说明会交给 Agent）`,
+        en: `${c} [note]\` to retry (the note goes to the agent)`,
+      });
+    case 'confirm':
+      return t({
+        zh: `${c}\` 确认需求，Run 开始做`,
+        en: `${c}\` to confirm the requirement and start the Run`,
+      });
+    case 'resume':
+      return t({ zh: `${c}\` 继续`, en: `${c}\` to resume it` });
+    case 'cancel':
+      return t({ zh: `${c}\` 终止 Run`, en: `${c}\` to cancel the Run` });
+  }
+}
+
+/**
+ * 「评论第一行写 `/ares1 approve [意见]` 批准，写 …」: how to write the commands `names` on the
+ * issue, in a sentence.
+ */
+export function commandsUsage(names: readonly IssueCommandName[]): string {
+  const each = names.map(commandUsage);
+  const last = each.at(-1) ?? '';
+  return t({
+    zh: `评论第一行写 ${each.join('，写 ')}`,
+    en: `start a comment with ${each.length > 1 ? `${each.slice(0, -1).join(', ')}, or ${last}` : last}`,
   });
+}
+
+/** 「`/ares1 approve [意见]` 批准，`/ares1 reject <意见>` 驳回」: how to decide an approval. */
+const approvalUsage = () => commandsUsage(['approve', 'reject']);
+
+/**
+ * 「只认仓库成员的命令；Master 下次检查 GitHub 时（每 5 分钟）执行……」: whose commands count and
+ * when they are carried out, after how to write them in a comment on the issue.
+ */
+function commandsWhen(platform: HostPlatform | undefined, every: number | undefined): string {
+  const host = changeRequestTerms(platform).host;
+  return t({
+    zh: `只认仓库成员的命令；Master 下次检查 ${host} 时${every ? `（每 ${every} 分钟）` : ''}执行，并在这里回复结果。`,
+    en: `Only commands from members of the repo count; the next time the Master checks ${host}${every ? ` (every ${every} min)` : ''} it carries them out and replies here.`,
+  });
+}
+
+/** 「Run 暂停了。」: what the Run is at, in a sentence for an answer to a command. */
+function commandStateText(state: CommandState, platform: HostPlatform | undefined): string {
+  switch (state) {
+    case 'approval':
+      return t({ zh: 'Run 在等审批。', en: 'The Run waits for approval.' });
+    case 'untrusted_issue':
+      return t({
+        zh: 'Run 在等仓库成员确认 issue 作者写的需求。',
+        en: "The Run waits for a member of the repo to confirm the requirement the issue's author wrote.",
+      });
+    case 'discussion':
+      return t({
+        zh: 'Run 在等需求评估疑问的回复：直接在这个 issue 下回复就行，不用写命令，评估会带着回复重新做。',
+        en: "The Run waits for replies to the assessment's questions: just reply on this issue, with no command, and the assessment runs again with your reply.",
+      });
+    case 'pr_open': {
+      const { host, short, long } = changeRequestTerms(platform);
+      return t({
+        zh: `Run 在等 ${host} 上的 ${short} 合并：合并后 Run 完成；关掉 ${short}，Run 结束为失败。`,
+        en: `The Run waits for its ${long} on ${host}: merged, the Run completes; closed, the Run ends as failed.`,
+      });
+    }
+    case 'budget':
+      return t({
+        zh: 'Run 超出了预算：要接着做，请在看板上重试并给出新的预算。',
+        en: 'The Run is over its budget: to go on, retry it on the dashboard with a new budget.',
+      });
+    case 'blocked':
+      return t({ zh: 'Run 卡住了。', en: 'The Run is stuck.' });
+    case 'paused':
+      return t({ zh: 'Run 暂停了。', en: 'The Run is paused.' });
+    case 'active':
+      return t({ zh: 'Run 在排队或执行中。', en: 'The Run is queued or running.' });
+  }
+}
+
+/** 「Run 暂停了。在这个 issue 上现在可以：……」: what the Run is at and the commands it takes. */
+function commandStateHint(state: CommandState, platform: HostPlatform | undefined): string {
+  const usage = commandsUsage(commandsFor(state));
+  return t({
+    zh: `${commandStateText(state, platform)}在这个 issue 上现在可以：${usage}。`,
+    en: `${commandStateText(state, platform)} On this issue you can now ${usage}.`,
+  });
+}
 
 /**
  * The Master's answer on the issue to a command it read there: what it did, or why it did not.
@@ -380,6 +555,50 @@ export function commandReply(outcome: CommandOutcome, ctx: CommandReplyContext):
       );
       break;
     }
+    case 'retried':
+      parts.push(
+        t({
+          zh: `${who} 用 ${written} 重试了，Run 重新排队。`,
+          en: `${who} retried the Run with ${written}, and it is queued again.`,
+        }),
+      );
+      if (command.note) {
+        parts.push(`${t({ zh: '补充说明：', en: 'Note:' })}\n\n${quote(command.note)}`);
+      }
+      break;
+    case 'confirmed':
+      parts.push(
+        t({
+          zh: `${who} 用 ${written} 确认了需求，Run 开始做，之后照常按流程走。`,
+          en: `${who} confirmed the requirement with ${written}: the Run starts, and goes on as usual from here.`,
+        }),
+      );
+      break;
+    case 'resumed':
+      parts.push(
+        t({
+          zh: `${who} 用 ${written} 让暂停的 Run 继续，Run 重新排队。`,
+          en: `${who} resumed the paused Run with ${written}, and it is queued again.`,
+        }),
+      );
+      break;
+    case 'cancelled':
+      parts.push(
+        t({
+          zh: `${who} 用 ${written} 终止了 Run。`,
+          en: `${who} cancelled the Run with ${written}.`,
+        }),
+      );
+      break;
+    case 'not_applicable':
+      parts.push(
+        t({
+          zh: `${who} 的 ${written} 现在不适用，没有执行。`,
+          en: `${who}'s ${written} does not apply now, so it was not carried out.`,
+        }),
+        commandStateHint(ctx.state, ctx.platform),
+      );
+      break;
     case 'refused':
       parts.push(
         t({
@@ -396,10 +615,7 @@ export function commandReply(outcome: CommandOutcome, ctx: CommandReplyContext):
           en: `${who}'s command was not understood, so nothing was done:`,
         }),
         quote(command.line, 200),
-        t({
-          zh: `Run 在等审批：${approvalUsage()}。`,
-          en: `The Run waits for approval: ${approvalUsage()}.`,
-        }),
+        commandStateHint(ctx.state, ctx.platform),
       );
       break;
     case 'note_missing':
@@ -407,14 +623,6 @@ export function commandReply(outcome: CommandOutcome, ctx: CommandReplyContext):
         t({
           zh: `${who} 的 ${written} 没有写意见，没有执行。驳回要写明原因，意见会交给返工的 Agent，比如 \`${COMMAND_PREFIX} reject 缺少 X 的测试\`。`,
           en: `${who}'s ${written} has no comment, so it was not carried out. A rejection needs its reason, which goes to the agent that reworks it, e.g. \`${COMMAND_PREFIX} reject tests for X are missing\`.`,
-        }),
-      );
-      break;
-    case 'unsupported':
-      parts.push(
-        t({
-          zh: `${who} 的 ${written} 在 issue 上暂不支持，没有执行。Run 在等审批：${approvalUsage()}。`,
-          en: `${who}'s ${written} is not supported on issues yet, so it was not carried out. The Run waits for approval: ${approvalUsage()}.`,
         }),
       );
       break;
@@ -1026,8 +1234,8 @@ export interface IssueUpdateContext {
   /** Name of the stage waiting for approval. */
   stageName?: string;
   /**
-   * How often the Master checks the code host, in minutes: when the approval commands written
-   * on the issue are carried out. Left unsaid when omitted.
+   * How often the Master checks the code host, in minutes: when the commands written on the
+   * issue (approve, retry, confirm, …) are carried out. Left unsaid when omitted.
    */
   pollMinutes?: number;
   /** The target branch was pushed to the code host before closing. */
@@ -1375,18 +1583,18 @@ export function issueUpdate(run: Run, ctx: IssueUpdateContext): IssueUpdate {
     case 'paused':
       return { label: LABELS.needsYou, comment: null, close: null };
     case 'waiting_approval': {
-      const host = changeRequestTerms(ctx.platform).host;
-      const every = ctx.pollMinutes;
+      const when = commandsWhen(ctx.platform, ctx.pollMinutes);
       return {
         label: LABELS.needsYou,
         comment: t({
-          zh: `等你审批${ctx.stageName ? `：「${ctx.stageName}」阶段` : ''}。\n\n可以在看板上审批，也可以直接在这个 issue 下回复：${approvalUsage()}。只认仓库成员的命令；Master 下次检查 ${host} 时${every ? `（每 ${every} 分钟）` : ''}执行，并在这里回复结果。\n\n${link}`,
-          en: `Waiting for your approval${ctx.stageName ? ` of the "${ctx.stageName}" stage` : ''}.\n\nApprove on the dashboard, or reply on this issue: ${approvalUsage()}. Only commands from members of the repo count; the next time the Master checks ${host}${every ? ` (every ${every} min)` : ''} it carries them out and replies here.\n\n${link}`,
+          zh: `等你审批${ctx.stageName ? `：「${ctx.stageName}」阶段` : ''}。\n\n可以在看板上审批，也可以直接在这个 issue 下回复：${approvalUsage()}。${when}\n\n${link}`,
+          en: `Waiting for your approval${ctx.stageName ? ` of the "${ctx.stageName}" stage` : ''}.\n\nApprove on the dashboard, or reply on this issue: ${approvalUsage()}. ${when}\n\n${link}`,
         }),
         close: null,
       };
     }
-    case 'blocked':
+    case 'blocked': {
+      const when = commandsWhen(ctx.platform, ctx.pollMinutes);
       // The assessment's questions are posted with the discussion (`discussionComment`).
       if (run.blocked?.kind === 'discussion') {
         return { label: LABELS.needsYou, comment: null, close: null };
@@ -1399,23 +1607,39 @@ export function issueUpdate(run: Run, ctx: IssueUpdateContext): IssueUpdate {
       if (run.blocked?.kind === 'untrusted_issue') {
         const author = run.issue?.untrusted;
         const who = author ? authorText(author.author, author.association) : '';
+        const usage = commandsUsage(commandsFor('untrusted_issue'));
         return {
           label: LABELS.needsYou,
           comment: t({
-            zh: `issue 的作者${who ? ` ${who}` : ''}不是这个仓库的成员，所以 Run 要等仓库成员在看板上确认需求后才开始，在这之前不会有 Agent 读到它。之后再改这个 issue 不会改变 Run 的需求。\n\n${link}`,
-            en: `The author of this issue${who ? `, ${who},` : ''} is not a member of this repo, so the Run waits until a member confirms the requirement on the dashboard; until then no agent reads it. Editing this issue afterwards does not change the Run's requirement.\n\n${link}`,
+            zh: `issue 的作者${who ? ` ${who}` : ''}不是这个仓库的成员，所以 Run 要等仓库成员在看板上确认需求后才开始，在这之前不会有 Agent 读到它。之后再改这个 issue 不会改变 Run 的需求。\n\n仓库成员读过需求后，也可以直接在这个 issue 下回复：${usage}。${when}issue 作者自己回复不算。\n\n${link}`,
+            en: `The author of this issue${who ? `, ${who},` : ''} is not a member of this repo, so the Run waits until a member confirms the requirement on the dashboard; until then no agent reads it. Editing this issue afterwards does not change the Run's requirement.\n\nOnce a member of the repo has read the requirement, they can also reply on this issue: ${usage}. ${when} A reply by the issue's author does not count.\n\n${link}`,
           }),
           close: null,
         };
       }
+      const stuck = quote(run.blocked?.message ?? noDetail());
+      if (run.blocked?.kind === 'budget') {
+        // Going on takes a new budget, which is given on the dashboard.
+        const usage = commandsUsage(commandsFor('budget'));
+        return {
+          label: LABELS.needsYou,
+          comment: t({
+            zh: `Run 卡住了，需要你处理：\n\n${stuck}\n\n要接着做，请在看板上重试并给出新的预算；要终止，也可以直接在这个 issue 下回复：${usage}。${when}\n\n${link}`,
+            en: `The Run is stuck and needs you:\n\n${stuck}\n\nTo go on, retry it on the dashboard with a new budget; to stop it, you can also reply on this issue: ${usage}. ${when}\n\n${link}`,
+          }),
+          close: null,
+        };
+      }
+      const usage = commandsUsage(commandsFor('blocked'));
       return {
         label: LABELS.needsYou,
         comment: t({
-          zh: `Run 卡住了，需要你处理：\n\n${quote(run.blocked?.message ?? noDetail())}\n\n${link}`,
-          en: `The Run is stuck and needs you:\n\n${quote(run.blocked?.message ?? noDetail())}\n\n${link}`,
+          zh: `Run 卡住了，需要你处理：\n\n${stuck}\n\n可以在看板上处理，也可以直接在这个 issue 下回复：${usage}。${when}\n\n${link}`,
+          en: `The Run is stuck and needs you:\n\n${stuck}\n\nHandle it on the dashboard, or reply on this issue: ${usage}. ${when}\n\n${link}`,
         }),
         close: null,
       };
+    }
     case 'completed': {
       const pr = ctx.pr;
       // What the target branch got: the pull request's merge, a squash or a rebase of the Run's

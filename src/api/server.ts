@@ -525,12 +525,16 @@ export function createApi(deps: ApiDeps): Hono {
 
   app.post('/api/runs/:id/retry', async (c) => {
     const input = await body(c, RetryInput);
-    return c.json(await engine.retry(c.req.param('id'), input));
+    return c.json(await engine.retry(c.req.param('id'), input, { source: 'dashboard' }));
   });
 
   app.post('/api/runs/:id/pause', async (c) => c.json(await engine.pause(c.req.param('id'))));
-  app.post('/api/runs/:id/resume', (c) => c.json(engine.resume(c.req.param('id'))));
-  app.post('/api/runs/:id/cancel', async (c) => c.json(await engine.cancel(c.req.param('id'))));
+  app.post('/api/runs/:id/resume', (c) =>
+    c.json(engine.resume(c.req.param('id'), { source: 'dashboard' })),
+  );
+  app.post('/api/runs/:id/cancel', async (c) =>
+    c.json(await engine.cancel(c.req.param('id'), { source: 'dashboard' })),
+  );
   // Remove the worktree and branch a failed / cancelled Run kept.
   app.post('/api/runs/:id/cleanup', async (c) =>
     c.json(await engine.cleanupWorkspace(c.req.param('id'))),

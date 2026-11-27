@@ -992,6 +992,63 @@ function pullRequestEventText(
 }
 
 /**
+ * 「@alice 在 issue 上用 /ares1 retry 重试了」: what a human did with a command on the Run's issue
+ * (the one event of each with `source: 'issue'`), and how many commands on it were not carried
+ * out because their authors are not trusted. null for other events, and for the same events
+ * from the dashboard.
+ */
+export function issueCommandEventText(event: Pick<EventRow, 'type' | 'data'>): string | null {
+  if (event.type === 'issue.commands_ignored') {
+    const { count } = event.data;
+    if (typeof count !== 'number') return null;
+    return t({
+      zh: `issue 上有 ${count} 条命令的作者不是仓库成员，没有执行`,
+      en: `${count} command${count === 1 ? '' : 's'} on the issue by non-members of the repo ${count === 1 ? 'was' : 'were'} not carried out`,
+    });
+  }
+  const { source, author } = event.data;
+  if (source !== 'issue' || (author !== null && typeof author !== 'string')) return null;
+  // Each English text opens with who wrote the command.
+  const who = author ? `@${author}` : t({ zh: '已删除的账号', en: 'A deleted account' });
+  switch (event.type) {
+    case 'approval.approved':
+      return t({
+        zh: `${who} 在 issue 上用 /ares1 approve 批准了`,
+        en: `${who} approved with /ares1 approve on the issue`,
+      });
+    case 'approval.rejected':
+      return t({
+        zh: `${who} 在 issue 上用 /ares1 reject 驳回了`,
+        en: `${who} rejected with /ares1 reject on the issue`,
+      });
+    case 'run.retry':
+      return event.data.kind === 'untrusted_issue'
+        ? t({
+            zh: `${who} 在 issue 上用 /ares1 confirm 确认了需求`,
+            en: `${who} confirmed the requirement with /ares1 confirm on the issue`,
+          })
+        : t({
+            zh: `${who} 在 issue 上用 /ares1 retry 重试了`,
+            en: `${who} retried with /ares1 retry on the issue`,
+          });
+    case 'run.resumed':
+      return t({
+        zh: `${who} 在 issue 上用 /ares1 resume 让暂停的 Run 继续`,
+        en: `${who} resumed the paused Run with /ares1 resume on the issue`,
+      });
+    case 'run.status':
+      return event.data.status === 'cancelled'
+        ? t({
+            zh: `${who} 在 issue 上用 /ares1 cancel 终止了 Run`,
+            en: `${who} cancelled the Run with /ares1 cancel on the issue`,
+          })
+        : null;
+    default:
+      return null;
+  }
+}
+
+/**
  * The event in words, for the events list, from its structured data; null for events that only
  * show their data. `platform`: the code host the Run goes with (`runPlatform`), named where an
  * event is about its commits, and whose words the merge stage's wait for a pull request uses (a
@@ -1003,6 +1060,8 @@ export function eventText(
   platform: HostPlatform = 'github',
 ): string | null {
   if (event.type === 'agent.selected') return agentSelectedText(event.data);
+  const command = issueCommandEventText(event);
+  if (command !== null) return command;
   if (event.type === 'task.rate_limited') {
     const { agentId, retryAt } = event.data;
     if (typeof agentId === 'string' && typeof retryAt === 'string') {

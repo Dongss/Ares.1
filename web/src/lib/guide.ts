@@ -1009,8 +1009,8 @@ function noticeHandling(kind: NoticeKind): string {
       });
     case 'blocked':
       return t({
-        zh: '打开 Run 看原因：重试当前 Task（可以换 Agent、附一段说明）；超出预算的调高预算后继续；issue 作者不是仓库成员的，读过目标后确认才开始；不想要了就终止',
-        en: 'Open the Run to see why: retry the current Task (with another agent or a note if you like); over budget, raise the budget and continue; for an issue by a non-member of the repo, read the goal and confirm it to start; no longer wanted, cancel it',
+        zh: '打开 Run 看原因：重试当前 Task（可以换 Agent、附一段说明）；超出预算的调高预算后继续；issue 作者不是仓库成员的，读过目标后确认才开始；不想要了就终止。来自 issue 的 Run 也可以在 issue 下回复「/ares1 retry [说明]」「/ares1 confirm」或「/ares1 cancel」，暂停的回复「/ares1 resume」',
+        en: 'Open the Run to see why: retry the current Task (with another agent or a note if you like); over budget, raise the budget and continue; for an issue by a non-member of the repo, read the goal and confirm it to start; no longer wanted, cancel it. For a Run from an issue you can also reply "/ares1 retry [note]", "/ares1 confirm" or "/ares1 cancel" on the issue, and "/ares1 resume" to a paused one',
       });
     case 'failed':
       return t({

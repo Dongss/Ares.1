@@ -182,8 +182,9 @@ test/
     `ares1:iteration` label, the hidden markers in a child's footer, the plan's task list):
     `src/github/issues.ts`
   - which comments on an issue are commands, whose count and which are still to be answered
-    (`parseIssueCommand` / `commandsAfterMaster`), and what the Master answers to them
-    (`commandReply`): `src/github/issues.ts`
+    (`parseIssueCommand` / `commandsAfterMaster`), which commands a Run takes in what it is at
+    (`commandState` / `commandsFor`), and what the Master answers to them (`commandReply`):
+    `src/github/issues.ts`
   - notification rules: `src/notify/notice.ts`
   - assessment conclusion rules: `src/engine/discussion.ts`
   - how a Run's time is split, and the names and groups of the parts: `src/engine/times.ts`
