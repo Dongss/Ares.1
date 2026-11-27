@@ -364,6 +364,32 @@ textarea:focus {
   align-items: center;
   margin-top: 8px;
 }
+/* One of a few options as radio buttons in a row, e.g. where a registered repo comes from. */
+.choice-group {
+  border: none;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
+.choice-group legend {
+  padding: 0;
+  margin-bottom: 4px;
+  font-weight: 600;
+}
+.choice {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: 18px;
+  cursor: pointer;
+}
+.choice input {
+  width: auto;
+  margin: 0;
+}
+.choice-group .hint {
+  margin: 6px 0 0;
+}
 
 /* ---- home ---------------------------------------------------------------- */
 

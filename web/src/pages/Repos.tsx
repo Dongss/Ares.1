@@ -13,6 +13,16 @@ import {
 } from '../lib/config.js';
 import { parseLines, shortSha } from '../lib/format.js';
 import { useAction } from '../lib/hooks.js';
+import {
+  newRepoInput,
+  REPO_ORIGINS,
+  type RepoOrigin,
+  registerLabel,
+  repoOriginHint,
+  repoOriginLabel,
+  repoPathLabel,
+  targetBranchPlaceholder,
+} from '../lib/repos.js';
 import { href } from '../lib/router.js';
 
 /** `config`: the configuration in use (reloaded by the app), for the templates repos keep. */
@@ -258,26 +268,22 @@ function EditRepo(props: { repo: Repo; onDone: () => void; onCancel: () => void 
 }
 
 function AddRepo({ onAdded }: { onAdded: () => void }) {
+  const [origin, setOrigin] = useState<RepoOrigin>('local');
   const [name, setName] = useState('');
   const [path, setPath] = useState('');
+  const [url, setUrl] = useState('');
   const [targetBranch, setTargetBranch] = useState('');
   const [verify, setVerify] = useState('');
   const [setup, setSetup] = useState('');
   const action = useAction();
   const submit = async (e: FormEvent) => {
     e.preventDefault();
-    const repo = await action.run(() =>
-      api.createRepo({
-        name: name.trim(),
-        path: path.trim(),
-        targetBranch: targetBranch.trim() || undefined,
-        verifyCommands: parseLines(verify),
-        setupCommands: parseLines(setup),
-      }),
-    );
+    const input = newRepoInput({ origin, name, path, url, targetBranch, verify, setup });
+    const repo = await action.run(() => api.createRepo(input));
     if (repo) {
       setName('');
       setPath('');
+      setUrl('');
       setTargetBranch('');
       setVerify('');
       setSetup('');
@@ -287,6 +293,33 @@ function AddRepo({ onAdded }: { onAdded: () => void }) {
   return (
     <form className="card form" onSubmit={submit}>
       <h2>{t({ zh: '登记仓库', en: 'Register a repo' })}</h2>
+      <fieldset className="field choice-group" disabled={action.busy}>
+        <legend>{t({ zh: '仓库从哪来', en: 'Where the repo comes from' })}</legend>
+        {REPO_ORIGINS.map((o) => (
+          <label key={o} className="choice">
+            <input
+              type="radio"
+              name="repo-origin"
+              value={o}
+              checked={origin === o}
+              onChange={() => setOrigin(o)}
+            />
+            {repoOriginLabel(o)}
+          </label>
+        ))}
+        <p className="hint">{repoOriginHint(origin)}</p>
+      </fieldset>
+      {origin === 'clone' && (
+        <label className="field">
+          <span>{t({ zh: '远端地址', en: 'Remote address' })}</span>
+          <input
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            placeholder="git@github.com:me/my-repo.git"
+            required
+          />
+        </label>
+      )}
       <div className="form-row">
         <label className="field">
           <span>{t({ zh: '名称', en: 'Name' })}</span>
@@ -302,15 +335,12 @@ function AddRepo({ onAdded }: { onAdded: () => void }) {
           <input
             value={targetBranch}
             onChange={(e) => setTargetBranch(e.target.value)}
-            placeholder={t({
-              zh: '默认：当前检出的分支',
-              en: 'Default: the branch checked out now',
-            })}
+            placeholder={targetBranchPlaceholder(origin)}
           />
         </label>
       </div>
       <label className="field">
-        <span>{t({ zh: '本机路径（绝对路径）', en: 'Local path (absolute)' })}</span>
+        <span>{repoPathLabel(origin)}</span>
         <input
           value={path}
           onChange={(e) => setPath(e.target.value)}
@@ -328,7 +358,7 @@ function AddRepo({ onAdded }: { onAdded: () => void }) {
       <ErrorBox>{action.error}</ErrorBox>
       <div className="form-actions">
         <button type="submit" className="btn-primary" disabled={action.busy}>
-          {t({ zh: '登记', en: 'Register' })}
+          {registerLabel(origin, action.busy)}
         </button>
       </div>
     </form>

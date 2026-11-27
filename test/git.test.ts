@@ -4,13 +4,19 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   addWorktree,
+  cloneRepo,
+  cloneUrlAllowed,
   commitAll,
   commitTime,
   committedYamlFiles,
   conflictedFiles,
+  currentBranch,
   fastForwardBranch,
   filesWithConflictMarkers,
+  GitError,
   hasChanges,
+  INITIAL_COMMIT_MESSAGE,
+  initEmptyRepo,
   isMerging,
   mergeOrAbort,
   pathDiffers,
@@ -19,6 +25,8 @@ import {
   revParse,
   startMerge,
   targetCheckoutDirty,
+  validBranchName,
+  withoutUrlCredentials,
 } from '../src/workspace/git.js';
 import { git, initRepo, tmpDir, writeFile } from './helpers.js';
 
@@ -250,5 +258,102 @@ describe('git merges', () => {
     writeFile(join(wt, 'b.txt'), 'in the way\n');
     await expect(startMerge(wt, main)).rejects.toThrow();
     expect(await isMerging(wt)).toBe(false);
+  });
+});
+
+describe('repos the Master clones or makes', () => {
+  it('clones only from https://, ssh://, user@host:path and absolute local paths', () => {
+    for (const url of [
+      'https://github.com/me/repo.git',
+      'HTTPS://example.com:8443/group/sub/repo',
+      'https://me:token@example.com/repo.git',
+      'ssh://git@example.com:2222/me/repo.git',
+      'ssh://[::1]/repo',
+      'git@github.com:me/repo.git',
+      'me@host.example:repos/x',
+      '/srv/git/repo.git',
+      '/Users/me/my repo',
+    ]) {
+      expect(cloneUrlAllowed(url), url).toBe(true);
+    }
+    for (const url of [
+      '',
+      'ext::sh -c touch% /tmp/pwned',
+      'fd::17',
+      'file:///srv/git/repo.git',
+      'git://example.com/repo.git',
+      'http://example.com/repo.git',
+      'ftp://example.com/repo.git',
+      'relative/path',
+      './repo',
+      'host:path',
+      '--upload-pack=touch /tmp/x',
+      '-x',
+      'https://-oProxyCommand=x/repo',
+      'ssh://-oProxyCommand=x/repo',
+      'ssh://git@-oProxyCommand=x/repo',
+      'ssh://host:-p/repo',
+      'https:///repo',
+      'https://exa mple.com/repo',
+      '-git@host:repo',
+      'git@-oProxyCommand=x:repo',
+      'git@host:',
+      'git@host/x:repo',
+      '/srv/repo\n--upload-pack=x',
+      'https://example.com/repo\u0000',
+    ]) {
+      expect(cloneUrlAllowed(url), JSON.stringify(url)).toBe(false);
+    }
+  });
+
+  it('keeps credentials of URLs out of the text it shows', () => {
+    expect(
+      withoutUrlCredentials(
+        "fatal: repository 'https://me:ghp_secret@github.com/me/repo.git/' not found",
+      ),
+    ).toBe("fatal: repository 'https://github.com/me/repo.git/' not found");
+    expect(withoutUrlCredentials('ssh://git@host/x and https://token@host/y')).toBe(
+      'ssh://host/x and https://host/y',
+    );
+    expect(withoutUrlCredentials('git@github.com:me/repo.git')).toBe('git@github.com:me/repo.git');
+  });
+
+  it('accepts branch names git accepts, never one that looks like an option', async () => {
+    expect(await validBranchName('main')).toBe(true);
+    expect(await validBranchName('feature/x')).toBe(true);
+    expect(await validBranchName('-x')).toBe(false);
+    expect(await validBranchName('a..b')).toBe(false);
+    expect(await validBranchName('has space')).toBe(false);
+  });
+
+  it('clones a branch or the default one, and fails with the end of git output', async () => {
+    const src = initRepo();
+    git(src, 'checkout', '-q', '-b', 'trunk');
+    const dest = join(tmpDir(), 'clone');
+    await cloneRepo(src, dest, { timeoutMs: 60_000 });
+    expect(await currentBranch(dest)).toBe('trunk');
+    const other = join(tmpDir(), 'clone');
+    await cloneRepo(src, other, { branch: 'main', timeoutMs: 60_000 });
+    expect(await currentBranch(other)).toBe('main');
+    const missing = join(tmpDir(), 'missing');
+    const err = await cloneRepo(missing, join(tmpDir(), 'clone'), { timeoutMs: 60_000 }).catch(
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(GitError);
+    // Then git's own output, in whatever language git speaks here.
+    const [first, ...output] = (err as GitError).message.split('\n');
+    expect(first).toBe(`克隆 ${missing} 失败：`);
+    expect(output.join('\n')).toContain(missing);
+    await expect(
+      cloneRepo('ext::sh -c true', join(tmpDir(), 'x'), { timeoutMs: 1000 }),
+    ).rejects.toThrow('不支持的仓库地址');
+  });
+
+  it('makes a new repo with an empty first commit on the branch', async () => {
+    const dir = tmpDir();
+    await initEmptyRepo(dir, 'trunk');
+    expect(await currentBranch(dir)).toBe('trunk');
+    expect(git(dir, 'log', '--format=%B', 'trunk')).toBe(INITIAL_COMMIT_MESSAGE);
+    expect(git(dir, 'ls-tree', '-r', '--name-only', 'trunk')).toBe('');
   });
 });

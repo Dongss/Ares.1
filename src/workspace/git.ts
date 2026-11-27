@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import { rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { t } from '../i18n.js';
 
 export class GitError extends Error {
@@ -67,6 +68,130 @@ async function identityArgs(cwd: string): Promise<string[]> {
 
 export async function isGitRepo(path: string): Promise<boolean> {
   return gitOk(path, ['rev-parse', '--git-dir']);
+}
+
+/**
+ * Whether the Master clones from `url`: https://, ssh://, scp-like user@host:path, or an absolute
+ * path on this machine. Everything else is refused: remote helpers (`ext::<command>` runs a
+ * command), file://, git:// and http:// (no transport security), relative paths, anything that
+ * starts with `-` or has control characters, and a user, password, host or port starting with
+ * `-`, which ssh could read as an option.
+ */
+export function cloneUrlAllowed(url: string): boolean {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: control characters are what it refuses
+  if (url === '' || url.startsWith('-') || /[\u0000-\u001f\u007f]/.test(url)) return false;
+  const remote = /^(?:https|ssh):\/\/([^/\s]+)(?:\/\S*)?$/i.exec(url);
+  if (remote) {
+    const authority = remote[1] as string;
+    const host = authority.slice(authority.lastIndexOf('@') + 1);
+    return host !== '' && !authority.split(/[@:]/).some((part) => part.startsWith('-'));
+  }
+  // git reads "<user>@<host>:<path>" as ssh when no slash comes before the colon.
+  const scp = /^([^\s/:@]+)@([^\s/:@]+):(.+)$/.exec(url);
+  if (scp) return !scp[1]?.startsWith('-') && !scp[2]?.startsWith('-');
+  return url.startsWith('/');
+}
+
+/**
+ * `text` without the user, password or token of the URLs in it ("https://me:token@host/x" →
+ * "https://host/x"), e.g. git's output before the dashboard shows it.
+ */
+export function withoutUrlCredentials(text: string): string {
+  return text.replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^/\s@]+@/gi, '$1');
+}
+
+/** The last lines of a program's output, enough to tell why it failed. */
+function outputTail(output: string, lines = 5, chars = 2000): string {
+  const tail = output.trim().split('\n').slice(-lines).join('\n');
+  return tail.length > chars ? `…${tail.slice(-chars)}` : tail;
+}
+
+/**
+ * Whether `name` may name a new branch: git accepts `refs/heads/<name>` and it does not start
+ * with `-`, which `git init -b` or `git clone --branch` could take for an option.
+ */
+export function validBranchName(name: string): Promise<boolean> {
+  if (name.startsWith('-')) return Promise.resolve(false);
+  return gitOk(tmpdir(), ['check-ref-format', `refs/heads/${name}`]);
+}
+
+/**
+ * Clone `url` (see `cloneUrlAllowed`) into `path`, missing or an empty directory, with `branch`
+ * checked out (else the remote's default branch). It is the Master's own git: it uses the
+ * credentials of the machine's user, never an agent's environment. Remote helpers stay off even
+ * if a URL got past the check (`protocol.ext.allow=never`), `--` keeps the URL from being read as
+ * an option, git never waits for a password at a prompt, and it is stopped after `timeoutMs`.
+ * Throws GitError, whose message ends with the last lines of git's output with no credentials in
+ * them; what was cloned so far is left for the caller to remove.
+ */
+export function cloneRepo(
+  url: string,
+  path: string,
+  opts: { branch?: string; timeoutMs: number },
+): Promise<void> {
+  const shown = withoutUrlCredentials(url);
+  if (!cloneUrlAllowed(url)) {
+    return Promise.reject(
+      new GitError(
+        t({ zh: `不支持的仓库地址：${shown}`, en: `Unsupported repository address: ${shown}` }),
+        '',
+        null,
+      ),
+    );
+  }
+  const args = ['-c', 'protocol.ext.allow=never', 'clone', '-q'];
+  if (opts.branch !== undefined) args.push('--branch', opts.branch);
+  args.push('--', url, path);
+  return new Promise((resolve, reject) => {
+    execFile(
+      'git',
+      args,
+      {
+        cwd: tmpdir(),
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+        timeout: opts.timeoutMs,
+        maxBuffer: 16 * 1024 * 1024,
+      },
+      (err, _stdout, stderr) => {
+        if (!err) {
+          resolve();
+          return;
+        }
+        const output = withoutUrlCredentials(stderr);
+        const tail = outputTail(output || withoutUrlCredentials(err.message));
+        const minutes = Math.round((opts.timeoutMs / 60_000) * 10) / 10;
+        const message = err.killed
+          ? t({
+              zh: `克隆 ${shown} 超过 ${minutes} 分钟，已停止：\n${tail}`,
+              en: `Cloning ${shown} took over ${minutes} minutes and was stopped:\n${tail}`,
+            })
+          : t({ zh: `克隆 ${shown} 失败：\n${tail}`, en: `Cloning ${shown} failed:\n${tail}` });
+        const code = typeof err.code === 'number' ? err.code : null;
+        reject(new GitError(message.trimEnd(), output, code));
+      },
+    );
+  });
+}
+
+/** Message of the commit `initEmptyRepo` makes: in both languages, whichever the Master uses. */
+export const INITIAL_COMMIT_MESSAGE = '初始提交\nInitial commit';
+
+/**
+ * Make `path` (an existing directory) a new repo with `branch` and an empty first commit on it,
+ * so that the branch exists. Commits as the repo's identity when git has one, else as ares1.
+ */
+export async function initEmptyRepo(path: string, branch: string): Promise<void> {
+  await git(path, ['init', '-q', '-b', branch]);
+  const identity = await identityArgs(path);
+  await git(path, [
+    ...identity,
+    'commit',
+    '--allow-empty',
+    '--no-verify',
+    '-q',
+    '-m',
+    INITIAL_COMMIT_MESSAGE,
+  ]);
 }
 
 export function revParse(cwd: string, ref: string): Promise<string> {

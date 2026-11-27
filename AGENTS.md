@@ -97,7 +97,8 @@ src/
                       records failed upgrades, restarts when its node is gone
     source.ts         which registered repo is the Master's own source
   logs/prune.ts       deletes raw agent output past retention; each round also sweeps worktrees
-  workspace/git.ts    git: worktrees, commits, rollback, merge, fast-forward, committed files
+  workspace/git.ts    git: worktrees, commits, rollback, merge, fast-forward, committed files,
+                      cloning or making the repos registered on the dashboard
   verify/commands.ts  run check and setup commands; tell a missing program from a failing command
   api/
     server.ts         HTTP API (Hono) and SSE

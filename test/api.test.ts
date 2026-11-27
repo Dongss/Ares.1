@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { FakeContext } from '../src/adapters/fake.js';
@@ -95,6 +95,222 @@ describe('HTTP API', () => {
     expect(ok.json).toMatchObject({ name: 'x', targetBranch: 'main', verifyCommands: ['true'] });
     expect((await call('POST', '/api/repos', { name: 'x', path: dir })).status).toBe(409);
     expect((await call('DELETE', `/api/repos/${ok.json.id}`)).status).toBe(204);
+  });
+
+  it('registers a repo it clones, on the default branch of the source or the one given', async () => {
+    h = await harness();
+    const src = initRepo();
+    git(src, 'checkout', '-q', '-b', 'trunk');
+    writeFile(join(src, 'trunk.txt'), 'trunk\n');
+    git(src, 'add', '-A');
+    git(src, 'commit', '-q', '-m', 'trunk');
+    // Neither the directory nor its parent is there yet.
+    const path = join(tmpDir(), 'projects', 'cloned');
+    const cloned = await call('POST', '/api/repos', {
+      name: 'cloned',
+      path,
+      verifyCommands: ['true'],
+      source: { kind: 'clone', url: src },
+    });
+    expect(cloned.status).toBe(201);
+    expect(cloned.json).toMatchObject({
+      name: 'cloned',
+      path,
+      targetBranch: 'trunk',
+      verifyCommands: ['true'],
+    });
+    expect(existsSync(join(path, 'trunk.txt'))).toBe(true);
+    expect(git(path, 'rev-parse', 'HEAD')).toBe(git(src, 'rev-parse', 'trunk'));
+    expect(h.master.store.findRepo('cloned')?.path).toBe(path);
+
+    // A branch other than the remote's default one becomes a local branch to merge into.
+    const emptyDir = tmpDir();
+    const onMain = await call('POST', '/api/repos', {
+      name: 'on-main',
+      path: emptyDir,
+      targetBranch: 'main',
+      source: { kind: 'clone', url: `  ${src}  ` },
+    });
+    expect(onMain.status).toBe(201);
+    expect(onMain.json).toMatchObject({ path: emptyDir, targetBranch: 'main' });
+    expect(git(emptyDir, 'rev-parse', 'HEAD')).toBe(git(src, 'rev-parse', 'main'));
+    expect(existsSync(join(emptyDir, 'trunk.txt'))).toBe(false);
+  });
+
+  it('registers a new repo with an empty first commit on its target branch', async () => {
+    h = await harness();
+    const path = join(tmpDir(), 'fresh');
+    const made = await call('POST', '/api/repos', {
+      name: 'fresh',
+      path,
+      source: { kind: 'init' },
+    });
+    expect(made.status).toBe(201);
+    expect(made.json).toMatchObject({ name: 'fresh', path, targetBranch: 'main' });
+    expect(git(path, 'rev-list', '--count', 'main')).toBe('1');
+    expect(git(path, 'log', '-1', '--format=%B', 'main')).toBe('初始提交\nInitial commit');
+
+    const dir = tmpDir();
+    const trunk = await call('POST', '/api/repos', {
+      name: 'fresh-trunk',
+      path: dir,
+      targetBranch: 'trunk',
+      source: { kind: 'init' },
+    });
+    expect(trunk.status).toBe(201);
+    expect(trunk.json).toMatchObject({ path: dir, targetBranch: 'trunk' });
+    expect(git(dir, 'symbolic-ref', '--short', 'HEAD')).toBe('trunk');
+    expect(git(dir, 'rev-list', '--count', 'trunk')).toBe('1');
+  });
+
+  it('refuses to clone or make a repo where something is, or from an unsupported address', async () => {
+    h = await harness();
+    const src = initRepo();
+    const repos = async () => ((await call('GET', '/api/repos')).json as { name: string }[]).length;
+    const before = await repos();
+
+    // A directory that is not empty stays as it was, whether the source is a clone or a new repo.
+    const full = tmpDir();
+    writeFile(join(full, 'mine.txt'), 'keep\n');
+    for (const source of [{ kind: 'clone', url: src }, { kind: 'init' }]) {
+      const res = await call('POST', '/api/repos', { name: 'x', path: full, source });
+      expect(res.status).toBe(400);
+      expect(res.json.error).toContain('不是空目录');
+      expect(readdirSync(full)).toEqual(['mine.txt']);
+    }
+    const file = join(tmpDir(), 'a-file');
+    writeFile(file, 'x\n');
+    expect(
+      (await call('POST', '/api/repos', { name: 'x', path: file, source: { kind: 'init' } }))
+        .status,
+    ).toBe(400);
+
+    // Addresses other than https://, ssh://, user@host:path and absolute paths: nothing is made.
+    const parent = tmpDir();
+    const path = join(parent, 'repo');
+    for (const url of [
+      'ext::sh -c touch% /tmp/ares1-pwned',
+      'fd::7',
+      `file://${src}`,
+      'git://example.com/repo.git',
+      'http://example.com/repo.git',
+      '--upload-pack=touch /tmp/ares1-pwned',
+      'relative/repo',
+      '',
+    ]) {
+      const res = await call('POST', '/api/repos', {
+        name: 'x',
+        path,
+        source: { kind: 'clone', url },
+      });
+      expect(res.status, url).toBe(400);
+      expect(res.json.error, url).toContain('source.url');
+    }
+    expect(existsSync(path)).toBe(false);
+    for (const source of [{ kind: 'other' }, { kind: 'init', url: src }, { kind: 'clone' }]) {
+      const res = await call('POST', '/api/repos', { name: 'x', path, source });
+      expect(res.status, JSON.stringify(source)).toBe(400);
+    }
+    // Still an absolute path.
+    expect(
+      (await call('POST', '/api/repos', { name: 'x', path: 'rel', source: { kind: 'init' } }))
+        .status,
+    ).toBe(400);
+    // A branch name git would not take, or one that looks like an option.
+    for (const targetBranch of ['-x', 'a..b']) {
+      const res = await call('POST', '/api/repos', {
+        name: 'x',
+        path,
+        targetBranch,
+        source: { kind: 'init' },
+      });
+      expect(res.status, targetBranch).toBe(400);
+    }
+    // A name already taken is refused before anything is cloned.
+    const taken = await call('POST', '/api/repos', {
+      name: 'demo',
+      path,
+      source: { kind: 'clone', url: src },
+    });
+    expect(taken.status).toBe(409);
+    expect(existsSync(path)).toBe(false);
+    expect(readdirSync(parent)).toEqual([]);
+    expect(await repos()).toBe(before);
+  });
+
+  it('removes what a failed clone left and tells the end of git output', async () => {
+    h = await harness();
+    const src = initRepo();
+    const parent = tmpDir();
+    const path = join(parent, 'nested', 'repo');
+    const missing = join(tmpDir(), 'no-such-repo');
+    const failed = await call('POST', '/api/repos', {
+      name: 'x',
+      path,
+      source: { kind: 'clone', url: missing },
+    });
+    expect(failed.status).toBe(400);
+    // Then the end of git's own output, in whatever language git speaks here.
+    const [first, ...output] = (failed.json.error as string).split('\n');
+    expect(first).toBe(`克隆 ${missing} 失败：`);
+    expect(output.join('\n')).toContain(missing);
+    // The missing parent made for it goes too.
+    expect(readdirSync(parent)).toEqual([]);
+
+    // A branch the remote does not have: the clone fails, the empty directory given stays empty.
+    const empty = tmpDir();
+    const noBranch = await call('POST', '/api/repos', {
+      name: 'x',
+      path: empty,
+      targetBranch: 'nope',
+      source: { kind: 'clone', url: src },
+    });
+    expect(noBranch.status).toBe(400);
+    expect(existsSync(empty)).toBe(true);
+    expect(readdirSync(empty)).toEqual([]);
+
+    // A remote without commits clones, but has no branch to merge into: nothing stays either.
+    const bare = tmpDir();
+    git(bare, 'init', '-q', '--bare', '-b', 'main');
+    const noCommits = await call('POST', '/api/repos', {
+      name: 'x',
+      path,
+      source: { kind: 'clone', url: bare },
+    });
+    expect(noCommits.status).toBe(400);
+    expect(noCommits.json.error).toMatch(/分支 \S+ 不存在/);
+    expect(readdirSync(parent)).toEqual([]);
+    expect(h.master.store.findRepo('x')).toBeUndefined();
+  });
+
+  it('tells why it cannot clone or make a repo in English too', async () => {
+    h = await harness();
+    setLang('en');
+    const full = tmpDir();
+    writeFile(join(full, 'mine.txt'), 'keep\n');
+    const taken = await call('POST', '/api/repos', {
+      name: 'x',
+      path: full,
+      source: { kind: 'init' },
+    });
+    expect(taken.json.error).toContain('is not an empty directory');
+    const bad = await call('POST', '/api/repos', {
+      name: 'x',
+      path: join(tmpDir(), 'r'),
+      source: { kind: 'clone', url: 'ext::sh' },
+    });
+    expect(bad.json.error).toContain('only https://');
+    const missing = join(tmpDir(), 'no-such-repo');
+    const failed = await call('POST', '/api/repos', {
+      name: 'x',
+      path: join(tmpDir(), 'r'),
+      source: { kind: 'clone', url: missing },
+    });
+    // git's own output after it is in git's language, not the Master's.
+    expect((failed.json.error as string).split('\n')[0]).toBe(`Cloning ${missing} failed:`);
+    for (const error of [taken.json.error, bad.json.error]) {
+      expect(error).not.toMatch(/[一-鿿]/);
+    }
   });
 
   it('updates repo settings', async () => {

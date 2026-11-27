@@ -1,5 +1,5 @@
-import { existsSync, readFileSync } from 'node:fs';
-import { isAbsolute, resolve } from 'node:path';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { isAbsolute, join, resolve } from 'node:path';
 import { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
 import { z } from 'zod';
@@ -39,10 +39,20 @@ import {
   type Iteration,
   PROPOSAL_CATEGORIES,
   PROPOSAL_STATUSES,
+  type Repo,
   type RunStatus,
 } from '../store/types.js';
 import type { Upgrader } from '../upgrade/upgrader.js';
-import { branchExists, currentBranch, isGitRepo } from '../workspace/git.js';
+import {
+  branchExists,
+  cloneRepo,
+  cloneUrlAllowed,
+  currentBranch,
+  GitError,
+  initEmptyRepo,
+  isGitRepo,
+  validBranchName,
+} from '../workspace/git.js';
 import { agentSummaries } from './agents.js';
 import { isCostUnknown } from './cost.js';
 import { diffView, runDiffRange } from './diff.js';
@@ -66,6 +76,7 @@ import type {
   ProposalView,
   ProposalWritten,
   RawLogMissing,
+  RepoInputSource,
   RepoSourceView,
   RunDetail,
   RunSummary,
@@ -113,6 +124,20 @@ function noBranch(branch: string): string {
   return t({ zh: `分支 ${branch} 不存在`, en: `Branch ${branch} does not exist` });
 }
 
+const urlUnsupported = () =>
+  t({
+    zh: '只支持 https://、ssh://、user@host:path 形式的地址和本机的绝对路径',
+    en: 'only https://, ssh:// and user@host:path addresses and absolute paths on this machine are supported',
+  });
+
+const RepoInputSourceSchema = z.discriminatedUnion('kind', [
+  z.strictObject({
+    kind: z.literal('clone'),
+    url: z.string().trim().refine(cloneUrlAllowed, { error: urlUnsupported }),
+  }),
+  z.strictObject({ kind: z.literal('init') }),
+]) satisfies z.ZodType<RepoInputSource>;
+
 const RepoInput = z.strictObject({
   name: z.string().regex(/^[\w.-]+$/, {
     error: () =>
@@ -125,7 +150,45 @@ const RepoInput = z.strictObject({
   targetBranch: z.string().min(1).optional(),
   verifyCommands: z.array(z.string()).default([]),
   setupCommands: z.array(z.string()).default([]),
+  source: RepoInputSourceSchema.optional(),
 });
+
+function nameTaken(name: string): ConflictError {
+  return new ConflictError(
+    t({ zh: `仓库名 ${name} 已存在`, en: `A repo named ${name} already exists` }),
+  );
+}
+
+/**
+ * Whether a repo can be cloned or made at `path`: it is missing, an empty directory, or
+ * `taken` (anything else there).
+ */
+function newRepoPathState(path: string): 'missing' | 'empty' | 'taken' {
+  if (!existsSync(path)) return 'missing';
+  try {
+    return statSync(path).isDirectory() && readdirSync(path).length === 0 ? 'empty' : 'taken';
+  } catch {
+    return 'taken';
+  }
+}
+
+/**
+ * Undo what was made at `path` for a registration that failed: `created` is the first directory
+ * made for it (`path` or a missing parent), removed with all in it; undefined = `path` was an
+ * empty directory already, which is emptied again and stays. Best effort.
+ */
+function removeNewRepo(path: string, created: string | undefined): void {
+  try {
+    if (created !== undefined) {
+      rmSync(created, { recursive: true, force: true });
+      return;
+    }
+    for (const entry of readdirSync(path))
+      rmSync(join(path, entry), { recursive: true, force: true });
+  } catch {
+    // Nothing more to do: the error the registration failed with is what the human needs.
+  }
+}
 
 const RepoPatch = z.strictObject({
   targetBranch: z.string().min(1).optional(),
@@ -377,6 +440,86 @@ export function createApi(deps: ApiDeps): Hono {
   // ---- repos ---------------------------------------------------------------
   app.get('/api/repos', (c) => c.json(store.listRepos()));
 
+  // Names and paths of the registrations cloning or making their repo now: a second one with the
+  // same name or path would clone in vain or into the same directory.
+  const newReposPending = new Set<string>();
+
+  /**
+   * Registers (`register`) a repo first made at `path` by `source`: cloned (`targetBranch`
+   * checked out, else the remote's default branch) or new (an empty first commit on
+   * `targetBranch`, else main). Everything is checked before the disk is touched; when anything
+   * fails afterwards, what was made goes.
+   */
+  const makeNewRepo = async (
+    input: z.infer<typeof RepoInput>,
+    path: string,
+    source: RepoInputSource,
+    register: (targetBranch: string) => Repo,
+  ): Promise<Repo> => {
+    if (store.findRepo(input.name)) throw nameTaken(input.name);
+    const branch = input.targetBranch;
+    if (branch !== undefined && !(await validBranchName(branch))) {
+      throw new InvalidInputError(
+        t({ zh: `${branch} 不是合法的分支名`, en: `${branch} is not a valid branch name` }),
+      );
+    }
+    const state = newRepoPathState(path);
+    if (state === 'taken') {
+      throw new InvalidInputError(
+        t({
+          zh: `${path} 已经存在而且不是空目录；克隆或新建仓库要用一个不存在的路径或空目录`,
+          en: `${path} already exists and is not an empty directory; cloning or making a repo needs a path that does not exist or an empty directory`,
+        }),
+      );
+    }
+    const keys = [`name:${input.name}`, `path:${path}`];
+    if (keys.some((key) => newReposPending.has(key))) {
+      throw new ConflictError(
+        t({
+          zh: `另一次登记正在用仓库名 ${input.name} 或路径 ${path} 克隆或新建仓库`,
+          en: `Another registration is cloning or making a repo named ${input.name} or at ${path}`,
+        }),
+      );
+    }
+    for (const key of keys) newReposPending.add(key);
+    let created: string | undefined;
+    try {
+      try {
+        created = mkdirSync(path, { recursive: true });
+      } catch (err) {
+        throw new InvalidInputError(
+          t({
+            zh: `建不了目录 ${path}：${(err as Error).message}`,
+            en: `Could not create the directory ${path}: ${(err as Error).message}`,
+          }),
+        );
+      }
+      let targetBranch: string;
+      if (source.kind === 'clone') {
+        const timeoutMs = config().master.defaults.command_timeout_minutes * 60_000;
+        await cloneRepo(source.url, path, { branch, timeoutMs });
+        targetBranch = branch ?? (await currentBranch(path));
+      } else {
+        targetBranch = branch ?? 'main';
+        await initEmptyRepo(path, targetBranch);
+      }
+      if (!(await branchExists(path, targetBranch))) {
+        throw new InvalidInputError(noBranch(targetBranch));
+      }
+      // A registration without a source may have taken the name while this one cloned.
+      if (store.findRepo(input.name)) throw nameTaken(input.name);
+      return register(targetBranch);
+    } catch (err) {
+      removeNewRepo(path, state === 'missing' ? (created ?? path) : undefined);
+      // git's failures here come from what the human gave: the address, the branch, the path.
+      if (err instanceof GitError) throw new InvalidInputError(err.message);
+      throw err;
+    } finally {
+      for (const key of keys) newReposPending.delete(key);
+    }
+  };
+
+  // A repo already on this machine; or, with `source`, one the Master clones or makes first.
   app.post('/api/repos', async (c) => {
     const input = await body(c, RepoInput);
     const path = resolve(input.path);
@@ -385,31 +528,31 @@ export function createApi(deps: ApiDeps): Hono {
         t({ zh: 'path 必须是绝对路径', en: 'path must be an absolute path' }),
       );
     }
-    if (!existsSync(path) || !(await isGitRepo(path))) {
-      throw new InvalidInputError(
-        t({ zh: `${path} 不是 git 仓库`, en: `${path} is not a git repository` }),
-      );
+    const register = (targetBranch: string): Repo =>
+      store.createRepo({
+        name: input.name,
+        path,
+        targetBranch,
+        verifyCommands: input.verifyCommands,
+        setupCommands: input.setupCommands,
+        mergeMode: 'direct',
+      });
+    let repo: Repo;
+    if (input.source) {
+      repo = await makeNewRepo(input, path, input.source, register);
+    } else {
+      if (!existsSync(path) || !(await isGitRepo(path))) {
+        throw new InvalidInputError(
+          t({ zh: `${path} 不是 git 仓库`, en: `${path} is not a git repository` }),
+        );
+      }
+      if (store.findRepo(input.name)) throw nameTaken(input.name);
+      const targetBranch = input.targetBranch ?? (await currentBranch(path));
+      if (!(await branchExists(path, targetBranch))) {
+        throw new InvalidInputError(noBranch(targetBranch));
+      }
+      repo = register(targetBranch);
     }
-    if (store.findRepo(input.name)) {
-      throw new ConflictError(
-        t({
-          zh: `仓库名 ${input.name} 已存在`,
-          en: `A repo named ${input.name} already exists`,
-        }),
-      );
-    }
-    const targetBranch = input.targetBranch ?? (await currentBranch(path));
-    if (!(await branchExists(path, targetBranch))) {
-      throw new InvalidInputError(noBranch(targetBranch));
-    }
-    const repo = store.createRepo({
-      name: input.name,
-      path,
-      targetBranch,
-      verifyCommands: input.verifyCommands,
-      setupCommands: input.setupCommands,
-      mergeMode: 'direct',
-    });
     await deps.reposChanged?.();
     return c.json(repo, 201);
   });

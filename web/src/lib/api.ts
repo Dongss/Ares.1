@@ -13,6 +13,7 @@ import type {
   ProposalRestarted,
   ProposalView,
   ProposalWritten,
+  RepoInput,
   RunDetail,
   RunSummary,
   StatsView,
@@ -74,14 +75,6 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 }
 
 const id = encodeURIComponent;
-
-export interface RepoInput {
-  name: string;
-  path: string;
-  targetBranch?: string;
-  verifyCommands: string[];
-  setupCommands: string[];
-}
 
 export type RepoPatch = Partial<Pick<Repo, 'targetBranch' | 'verifyCommands' | 'setupCommands'>>;
 

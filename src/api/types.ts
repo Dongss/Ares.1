@@ -56,6 +56,27 @@ export interface RawLogMissing {
   pruned: boolean;
 }
 
+/**
+ * Where POST /api/repos gets the repo at `path` from, when it is not there yet: cloned from `url`
+ * by the Master (https://, ssh://, user@host:path or an absolute path on this machine), or a new
+ * repo with an empty first commit on its target branch.
+ */
+export type RepoInputSource = { kind: 'clone'; url: string } | { kind: 'init' };
+
+/**
+ * Body of POST /api/repos. Without `source`, `path` is a git repo already there; with it, `path`
+ * is missing or an empty directory, filled by the source. `targetBranch` left out: the branch
+ * checked out (a clone's is the remote's default branch, a new repo's is main).
+ */
+export interface RepoInput {
+  name: string;
+  path: string;
+  targetBranch?: string;
+  verifyCommands: string[];
+  setupCommands: string[];
+  source?: RepoInputSource;
+}
+
 /** GET /api/runs items. */
 export type RunSummary = Omit<Run, 'template'> & {
   templateName: string;
