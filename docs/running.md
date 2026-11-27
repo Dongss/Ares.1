@@ -477,7 +477,7 @@ GitLab 仓库按作者对项目的权限判断：Developer 及以上（Developer
 
 ## 接入 GitLab
 
-托管在 GitLab 上的仓库（gitlab.com 或自建的 GitLab）写在 `config.yaml` 的 `gitlab.repos` 里，Run 从 GitLab issue 来。做法和「接入 GitHub」一样，用的是同一份代码：标签和它们的含义、侦察和自动采纳、迭代（迭代 issue、子 issue 页脚的隐藏标记、计划里的任务列表）、依赖门、Run 失败后自动重做、Run 期间改了 issue、拉取目标分支上的新提交和分叉时自动合并、通过 PR 交付和 PR 返工（GitLab 上是 MR，见下面的「通过 MR 交付」）、只信任能改仓库的人写的内容、Master 评论的隐藏标记和去掉用户目录，都按上面 GitHub 的说明。下面只写怎样登记，以及和 GitHub 不一样的地方。
+托管在 GitLab 上的仓库（gitlab.com 或自建的 GitLab）写在 `config.yaml` 的 `gitlab.repos` 里，Run 从 GitLab issue 来。做法和「接入 GitHub」一样，用的是同一份代码：标签和它们的含义、侦察和自动采纳、迭代（迭代 issue、子 issue 页脚的隐藏标记、计划里的任务列表）、依赖门、在 issue 上用命令处理等人的 Run（`/ares1 approve`、`reject`、`retry`、`confirm`、`resume`、`cancel`，见「在 issue 上处理 Run」）、Run 失败后自动重做、Run 期间改了 issue、拉取目标分支上的新提交和分叉时自动合并、通过 PR 交付和 PR 返工（GitLab 上是 MR，见下面的「通过 MR 交付」）、只信任能改仓库的人写的内容、Master 评论的隐藏标记和去掉用户目录，都按上面 GitHub 的说明。下面只写怎样登记，以及和 GitHub 不一样的地方。
 
 ### 登记 GitLab 仓库
 
