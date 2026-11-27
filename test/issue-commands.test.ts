@@ -13,6 +13,7 @@ import {
   commandState,
   commandsAfterMaster,
   commandsFor,
+  commandsReadInterval,
   isMasterComment,
   issueUpdate,
   LABELS,
@@ -41,6 +42,7 @@ import {
 } from './helpers.js';
 
 const CJK = /[　-〿一-鿿＀-￯]/;
+const MIN = 60_000;
 
 /** A collaborator of "me/demo": trusted. */
 const ALICE: FakeAuthor = { login: 'alice', association: 'COLLABORATOR' };
@@ -70,10 +72,17 @@ let h: Harness | undefined;
 let gh: FakeGitHub;
 
 afterEach(async () => {
+  vi.useRealTimers();
   await h?.close();
   h = undefined;
   setLang('zh');
 });
+
+/** Move the clock of Date on by `ms`; it goes on running from there. */
+function elapse(ms: number): void {
+  if (!vi.isFakeTimers()) vi.useFakeTimers({ toFake: ['Date'], shouldAdvanceTime: true });
+  vi.setSystemTime(Date.now() + ms);
+}
 
 async function start(workflow?: string, config = CONFIG): Promise<Harness> {
   gh = new FakeGitHub();
@@ -319,6 +328,24 @@ describe('issue commands: reading them', () => {
     }
   });
 
+  it('reads the issue of a queued or running Run every three checks, at least 15 minutes apart', () => {
+    expect(commandsReadInterval('active', 5)).toBe(15 * MIN);
+    expect(commandsReadInterval('active', 10)).toBe(30 * MIN);
+    expect(commandsReadInterval('active', 1)).toBe(15 * MIN);
+    expect(commandsReadInterval('active', 0.5)).toBe(15 * MIN);
+    // A Run waiting for a human is read at every check, as its issue says.
+    const waiting = [
+      'approval',
+      'untrusted_issue',
+      'discussion',
+      'pr_open',
+      'budget',
+      'blocked',
+      'paused',
+    ] as const;
+    for (const state of waiting) expect(commandsReadInterval(state, 5)).toBe(0);
+  });
+
   it('says on the issue of a stuck Run, and of one by a stranger, which commands it takes', () => {
     const base = { dashboardUrl: 'http://127.0.0.1:4870', targetBranch: 'main', pollMinutes: 5 };
     const blocked = (kind: BlockKind, extra: Partial<Run> = {}) =>
@@ -328,7 +355,7 @@ describe('issue commands: reading them', () => {
       ).comment ?? '';
     expect(blocked('task_failed')).toBe(
       'Run 卡住了，需要你处理：\n\n> 测试没过\n\n' +
-        '可以在看板上处理，也可以直接在这个 issue 下回复：评论第一行写 `/ares1 retry [说明]` 重试（说明会交给 Agent），写 `/ares1 cancel` 终止 Run。只认仓库成员的命令；Master 下次检查 GitHub 时（每 5 分钟）执行，并在这里回复结果。' +
+        '可以在看板上处理，也可以直接在这个 issue 下回复：评论第一行写 `/ares1 retry [说明]` 重试（说明会交给 Agent），写 `/ares1 cancel` 终止 Run。只认仓库成员和 Master 所用账号的命令；Master 下次检查 GitHub 时（每 5 分钟）执行，并在这里回复结果。' +
         '\n\n看板：http://127.0.0.1:4870/#/runs/r1',
     );
     const budget = blocked('budget');
@@ -342,7 +369,7 @@ describe('issue commands: reading them', () => {
       } as Run['issue'],
     });
     expect(untrusted).toContain(
-      '仓库成员读过需求后，也可以直接在这个 issue 下回复：评论第一行写 `/ares1 confirm` 确认需求，Run 开始做，写 `/ares1 cancel` 终止 Run。只认仓库成员的命令；Master 下次检查 GitHub 时（每 5 分钟）执行，并在这里回复结果。issue 作者自己回复不算。',
+      '仓库成员读过需求后，也可以直接在这个 issue 下回复：评论第一行写 `/ares1 confirm` 确认需求，Run 开始做，写 `/ares1 cancel` 终止 Run。只认仓库成员和 Master 所用账号的命令；Master 下次检查 GitHub 时（每 5 分钟）执行，并在这里回复结果。issue 作者自己回复不算。',
     );
     // No comment while paused: a member replies `/ares1 resume` to the Run's last comment.
     expect(issueUpdate({ id: 'r1', status: 'paused' } as Run, base).comment).toBeNull();
@@ -353,7 +380,7 @@ describe('issue commands: reading them', () => {
     const base = { dashboardUrl: 'http://127.0.0.1:4870', targetBranch: 'main' };
     const github = issueUpdate(run, { ...base, stageName: '合并', pollMinutes: 5 }).comment;
     expect(github).toBe(
-      '等你审批：「合并」阶段。\n\n可以在看板上审批，也可以直接在这个 issue 下回复：评论第一行写 `/ares1 approve [意见]` 批准，写 `/ares1 reject <意见>` 驳回（意见必填，会交给返工的 Agent）。只认仓库成员的命令；Master 下次检查 GitHub 时（每 5 分钟）执行，并在这里回复结果。' +
+      '等你审批：「合并」阶段。\n\n可以在看板上审批，也可以直接在这个 issue 下回复：评论第一行写 `/ares1 approve [意见]` 批准，写 `/ares1 reject <意见>` 驳回（意见必填，会交给返工的 Agent）。只认仓库成员和 Master 所用账号的命令；Master 下次检查 GitHub 时（每 5 分钟）执行，并在这里回复结果。' +
         '\n\n看板：http://127.0.0.1:4870/#/runs/r1',
     );
     const gitlab = issueUpdate(run, { ...base, platform: 'gitlab' }).comment;
@@ -461,7 +488,9 @@ describe('issue commands: reading them', () => {
       expect(waiting).toContain(
         'Approve on the dashboard, or reply on this issue: start a comment with `/ares1 approve [comment]` to approve, or `/ares1 reject <comment>` to reject',
       );
-      expect(waiting).toContain('the next time the Master checks GitHub (every 5 min)');
+      expect(waiting).toContain(
+        'Only commands from members of the repo and the account the Master uses count; the next time the Master checks GitHub (every 5 min)',
+      );
       expect(waiting).not.toMatch(CJK);
     });
   });
@@ -974,7 +1003,7 @@ describe('issue commands: stuck, paused and from strangers', () => {
     ).toEqual([{ source: 'issue', author: 'me' }]);
   });
 
-  it('cancels a running Run on /ares1 cancel, and the issue is updated as usual', async () => {
+  it('cancels a running Run on /ares1 cancel, its issue read 15 minutes apart at most', async () => {
     const t = await start();
     t.scripts.coder = async (ctx) => {
       await new Promise((resolve) => ctx.signal.addEventListener('abort', resolve));
@@ -984,17 +1013,29 @@ describe('issue commands: stuck, paused and from strangers', () => {
     await t.master.issues.poll();
     const run = await runOfIssue(t, 'running');
     const issue = gh.get(1);
+    const reads = () => gh.calls.filter((c) => c === 'listComments #1').length;
 
     // A stranger's is only counted.
     gh.commentAs(1, STRANGER, '/ares1 cancel');
+    elapse(15 * MIN);
     await t.master.issues.poll();
     expect(t.master.store.getRun(run.id).status).toBe('running');
     expect(ignoredCommands(t, run.id).map((e) => e.data)).toEqual([
       { repo: 'me/demo', issue: 1, status: 'running', count: 1 },
     ]);
+    const read = reads();
 
+    // Running, its issue is not read again for three checks of 5 minutes.
     gh.commentAs(1, ALICE, '/ares1 cancel');
     await t.master.issues.poll();
+    elapse(14 * MIN);
+    await t.master.issues.poll();
+    expect(reads()).toBe(read);
+    expect(t.master.store.getRun(run.id).status).toBe('running');
+
+    elapse(MIN);
+    await t.master.issues.poll();
+    expect(reads()).toBe(read + 1);
     expect(t.master.store.getRun(run.id).status).toBe('cancelled');
     expect(issue.comments.at(-1)).toContain('@alice 用 `/ares1 cancel` 终止了 Run。');
     const cancelled = ofType('run.status')(t, run.id).filter((e) => e.data.status === 'cancelled');
@@ -1010,6 +1051,41 @@ describe('issue commands: stuck, paused and from strangers', () => {
     issue.comments.push('/ares1 cancel');
     await t.master.issues.poll();
     expect(issue.comments.at(-1)).toBe('/ares1 cancel');
+  });
+
+  it('reads the issue at every check once the Run waits for a human, at once after running', async () => {
+    const t = await start();
+    let finish = () => {};
+    const coding = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    t.scripts.coder = async (ctx) => {
+      await coding;
+      writeFile(join(ctx.input.workdir, 'feature.txt'), 'ok\n');
+      return done();
+    };
+    gh.add({ title: '加 feature', body: 'feature.txt', labels: [LABELS.ready] });
+    await t.master.issues.poll();
+    const run = await runOfIssue(t, 'running');
+    const reads = () => gh.calls.filter((c) => c === 'listComments #1').length;
+    await t.master.issues.poll();
+    const read = reads();
+    await t.master.issues.poll();
+    expect(reads()).toBe(read);
+
+    finish();
+    await t.waitStatus(run.id, 'waiting_approval');
+    await t.master.issues.sync();
+    expect(gh.get(1).comments.at(-1)).toContain('等你审批');
+    // Not 15 minutes after the last read: the approval is read at every check all the same.
+    await t.master.issues.poll();
+    await t.master.issues.poll();
+    expect(reads()).toBe(read + 2);
+    gh.commentAs(1, ALICE, '/ares1 approve');
+    await t.master.issues.poll();
+    expect(reads()).toBe(read + 3);
+    await t.waitStatus(run.id, 'completed');
+    expect(decisions(t, run.id).map((e) => e.data.source)).toEqual(['issue']);
   });
 
   it('only answers a command a stuck Run does not take, changing nothing', async () => {

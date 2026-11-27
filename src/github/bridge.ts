@@ -97,6 +97,7 @@ import {
   commandState,
   commandsAfterMaster,
   commandsFor,
+  commandsReadInterval,
   discussionComment,
   type FailureOutcome,
   failedAttempt,
@@ -757,6 +758,12 @@ export class IssueBridge {
    * rather than finishing them too (finishIterations), which would create their issues twice.
    */
   private readonly writing = new Set<string>();
+  /**
+   * When the comments of a queued or running Run's issue were last read for commands, by Run id
+   * (`commandsReadInterval`); forgotten once the Run is neither. In memory only: after a restart
+   * the first check reads them.
+   */
+  private readonly commandsReadAt = new Map<string, number>();
   private stopping = false;
   private readonly onEvent = (e: EventRow) => {
     // An assessment's result changes the discussion, not always the Run status (go keeps running).
@@ -2667,15 +2674,18 @@ export class IssueBridge {
    * so (the engine's `requestApproval` and `block`), so that no command written for an earlier
    * one acts on it. The earliest command after the Master's last comment is taken, the later
    * ones left alone, and each command taken is answered on the issue whatever became of it: the
-   * answer, the Master's last comment now, keeps it from being read again.
+   * answer, the Master's last comment now, keeps it from being read again. A queued or running
+   * Run's issue is read less often than at every check (`commandsReadInterval`).
    */
   private async followCommands(name: string): Promise<void> {
     const { repo } = this.repoSetup(name);
     const store = this.deps.store;
-    const ids = store
+    const runs = store
       .listRuns({ repoId: repo.id })
-      .filter((r) => this.platform.ownsRun(r) && r.issue && commandState(r) !== null)
-      .map((r) => r.id);
+      .filter((r) => this.platform.ownsRun(r) && r.issue);
+    // Neither queued nor running any more: read at every check, and again at once should it be.
+    for (const r of runs) if (commandState(r) !== 'active') this.commandsReadAt.delete(r.id);
+    const ids = runs.filter((r) => commandState(r) !== null).map((r) => r.id);
     for (const id of ids) {
       if (this.stopping) return;
       // Read again: the Runs before it took their time.
@@ -2683,8 +2693,12 @@ export class IssueBridge {
       const issue = run.issue;
       const wait = this.commandWait(run);
       if (!issue || !wait || !issueCaughtUp(run)) continue;
+      const every = commandsReadInterval(wait.state, this.pollMinutes);
+      const readAt = Date.now();
+      if (readAt - (this.commandsReadAt.get(id) ?? Number.NEGATIVE_INFINITY) < every) continue;
       const master = await this.masterLogin();
       const comments = await this.host().listComments(issue.repo, issue.number);
+      if (every > 0) this.commandsReadAt.set(id, readAt);
       const { commands, ignored } = commandsAfterMaster(comments, master);
       const now = store.getRun(id);
       // Decided on the dashboard while the comments were read, for one.

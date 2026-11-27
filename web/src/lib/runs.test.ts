@@ -943,15 +943,15 @@ describe('the code host a Run goes with', () => {
 
   it('says where to reply to the assessment, on GitHub or GitLab', () => {
     expect(issueReplyHint('github')).toBe(
-      '可以直接在 issue 上回复（只认仓库成员的回复），Master 下次检查 GitHub 时会带着回复重新评估；也可以在这里回复。',
+      '可以直接在 issue 上回复（只认仓库成员和 Master 所用账号的回复），Master 下次检查 GitHub 时会带着回复重新评估；也可以在这里回复。',
     );
     expect(issueReplyHint('gitlab')).toBe(
-      '可以直接在 issue 上回复（只认仓库成员的回复），Master 下次检查 GitLab 时会带着回复重新评估；也可以在这里回复。',
+      '可以直接在 issue 上回复（只认仓库成员和 Master 所用账号的回复），Master 下次检查 GitLab 时会带着回复重新评估；也可以在这里回复。',
     );
     setLang('en');
     const text = issueReplyHint('gitlab');
     expect(text).toBe(
-      'You can reply on the issue (only replies by members of the repo count): the Master reassesses with your reply the next time it checks GitLab. Or reply here.',
+      'You can reply on the issue (only replies by members of the repo and the account the Master uses count): the Master reassesses with your reply the next time it checks GitLab. Or reply here.',
     );
     expect(text).not.toMatch(/[一-鿿]/);
   });

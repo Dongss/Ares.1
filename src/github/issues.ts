@@ -383,6 +383,21 @@ export function commandsFor(state: CommandState): IssueCommandName[] {
   }
 }
 
+/** The least time between two reads of a queued or running Run's issue for commands. */
+const ACTIVE_COMMANDS_MIN_MINUTES = 15;
+
+/**
+ * The least time, in ms, between two reads of the comments of the issue of a Run in `state` for
+ * commands, the Master checking the platform every `pollMinutes`; 0: at every check. A queued or
+ * running Run takes `/ares1 cancel` only, and there are many of them, so its comments are read
+ * every three checks and no more often than every 15 minutes; the issue promises it no time. A
+ * Run that waits for a human is read at every check, as its issue says.
+ */
+export function commandsReadInterval(state: CommandState, pollMinutes: number): number {
+  if (state !== 'active') return 0;
+  return Math.max(3 * pollMinutes, ACTIVE_COMMANDS_MIN_MINUTES) * 60_000;
+}
+
 /** What became of a command on the issue of a Run. */
 export type CommandOutcome =
   | { kind: 'approved' }
@@ -463,14 +478,15 @@ export function commandsUsage(names: readonly IssueCommandName[]): string {
 const approvalUsage = () => commandsUsage(['approve', 'reject']);
 
 /**
- * 「只认仓库成员的命令；Master 下次检查 GitHub 时（每 5 分钟）执行……」: whose commands count and
- * when they are carried out, after how to write them in a comment on the issue.
+ * 「只认仓库成员和 Master 所用账号的命令；Master 下次检查 GitHub 时（每 5 分钟）执行……」: whose
+ * commands count (`isTrusted`: the repo's members and the account the Master acts as) and when
+ * they are carried out, after how to write them in a comment on the issue.
  */
 function commandsWhen(platform: HostPlatform | undefined, every: number | undefined): string {
   const host = changeRequestTerms(platform).host;
   return t({
-    zh: `只认仓库成员的命令；Master 下次检查 ${host} 时${every ? `（每 ${every} 分钟）` : ''}执行，并在这里回复结果。`,
-    en: `Only commands from members of the repo count; the next time the Master checks ${host}${every ? ` (every ${every} min)` : ''} it carries them out and replies here.`,
+    zh: `只认仓库成员和 Master 所用账号的命令；Master 下次检查 ${host} 时${every ? `（每 ${every} 分钟）` : ''}执行，并在这里回复结果。`,
+    en: `Only commands from members of the repo and the account the Master uses count; the next time the Master checks ${host}${every ? ` (every ${every} min)` : ''} it carries them out and replies here.`,
   });
 }
 

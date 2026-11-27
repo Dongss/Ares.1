@@ -1222,8 +1222,8 @@ export function runPlatform(run: Pick<Run, 'issue'>, source: RepoSourceView | nu
 export function issueReplyHint(platform: HostPlatform): string {
   const host = platformName(platform);
   return t({
-    zh: `可以直接在 issue 上回复（只认仓库成员的回复），Master 下次检查 ${host} 时会带着回复重新评估；也可以在这里回复。`,
-    en: `You can reply on the issue (only replies by members of the repo count): the Master reassesses with your reply the next time it checks ${host}. Or reply here.`,
+    zh: `可以直接在 issue 上回复（只认仓库成员和 Master 所用账号的回复），Master 下次检查 ${host} 时会带着回复重新评估；也可以在这里回复。`,
+    en: `You can reply on the issue (only replies by members of the repo and the account the Master uses count): the Master reassesses with your reply the next time it checks ${host}. Or reply here.`,
   });
 }
 
