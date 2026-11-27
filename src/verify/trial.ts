@@ -122,10 +122,19 @@ export class RepoTrials {
   }
 
   /**
+   * Forgets the latest trial of the repo with id `repoId`, when the repo is removed. A trial
+   * under way runs to its end and deletes its worktree, but is not kept.
+   */
+  forget(repoId: string): void {
+    this.latest.delete(repoId);
+  }
+
+  /**
    * Deletes the trial worktrees a previous Master left under worktrees/, having stopped before it
    * got to (`leftoverTrialWorktrees`), and has git forget them. Called with the other leftover
    * worktrees: at start and then daily. The worktrees of trials under way stay. A call while one
-   * is in progress joins it.
+   * is in progress joins it. A directory that cannot be removed does not stop the others: once
+   * each has been tried, the call rejects naming those left, which the next sweep tries again.
    */
   sweepLeftovers(): Promise<void> {
     this.sweeping ??= this.sweepNow().finally(() => {
@@ -224,26 +233,36 @@ export class RepoTrials {
     } catch {
       return; // no worktree made yet
     }
+    // Each directory on its own: one that fails is tried again next time, and the others go now.
+    const failed: string[] = [];
     let unknown = false;
     for (const name of leftoverTrialWorktrees(names, this.trying())) {
       if (this.stopped.signal.aborted) return;
       const dir = join(worktreesDir, name);
-      const repoId = trialWorktreeRepo(name);
-      const repo = repoId === null ? undefined : this.deps.store.findRepo(repoId);
-      if (repo) {
-        await dropWorktree(repo.path, dir);
-        continue;
-      }
       try {
+        const repoId = trialWorktreeRepo(name);
+        const repo = repoId === null ? undefined : this.deps.store.findRepo(repoId);
+        if (repo) {
+          await dropWorktree(repo.path, dir);
+          continue;
+        }
         rmSync(dir, { recursive: true, force: true });
-      } catch {
-        continue; // tried again next time
+        unknown = true;
+      } catch (err) {
+        failed.push(`${dir}: ${errorMessage(err)}`);
       }
-      unknown = true;
     }
     // Of a repo removed since, or not told by the name: any registered repo may still list it.
     if (unknown) {
       for (const repo of this.deps.store.listRepos()) await pruneWorktrees(repo.path);
+    }
+    if (failed.length > 0) {
+      throw new Error(
+        t({
+          zh: `${failed.length} 个目录没删掉，下次再试：\n${failed.join('\n')}`,
+          en: `${failed.length === 1 ? '1 directory was' : `${failed.length} directories were`} not removed and will be tried again next time:\n${failed.join('\n')}`,
+        }),
+      );
     }
   }
 

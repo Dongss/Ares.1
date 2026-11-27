@@ -1,6 +1,7 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { killProcessGroup } from '../adapters/process.js';
 import { t } from '../i18n.js';
 
 export class GitError extends Error {
@@ -115,19 +116,30 @@ export function validBranchName(name: string): Promise<boolean> {
   return gitOk(tmpdir(), ['check-ref-format', `refs/heads/${name}`]);
 }
 
+/** How much of the end of git's output a failed clone keeps. */
+const CLONE_OUTPUT_KEEP = 64 * 1024;
+
 /**
  * Clone `url` (see `cloneUrlAllowed`) into `path`, missing or an empty directory, with `branch`
  * checked out (else the remote's default branch). It is the Master's own git: it uses the
  * credentials of the machine's user, never an agent's environment. Remote helpers stay off even
  * if a URL got past the check (`protocol.ext.allow=never`), `--` keeps the URL from being read as
- * an option, git never waits for a password at a prompt, and it is stopped after `timeoutMs`.
+ * an option, and git never waits for a password at a prompt.
+ *
+ * git runs in a process group of its own, with the programs it starts (ssh, git-remote-https,
+ * the local upload-pack). After `timeoutMs` the whole group is stopped, SIGTERM and then SIGKILL
+ * for what is left after `graceMs` (`killProcessGroup`), and the promise settles only once none
+ * of it is left: nothing writes into `path` any more when the caller removes it. On Windows,
+ * which has no process groups, only git itself is stopped.
+ *
  * Throws GitError, whose message ends with the last lines of git's output with no credentials in
- * them; what was cloned so far is left for the caller to remove.
+ * them and says whether the clone failed or ran out of time; what was cloned so far is left for
+ * the caller to remove.
  */
 export function cloneRepo(
   url: string,
   path: string,
-  opts: { branch?: string; timeoutMs: number },
+  opts: { branch?: string; timeoutMs: number; graceMs?: number },
 ): Promise<void> {
   const shown = withoutUrlCredentials(url);
   if (!cloneUrlAllowed(url)) {
@@ -142,35 +154,82 @@ export function cloneRepo(
   const args = ['-c', 'protocol.ext.allow=never', 'clone', '-q'];
   if (opts.branch !== undefined) args.push('--branch', opts.branch);
   args.push('--', url, path);
+  const group = process.platform !== 'win32';
   return new Promise((resolve, reject) => {
-    execFile(
-      'git',
-      args,
-      {
-        cwd: tmpdir(),
-        env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
-        timeout: opts.timeoutMs,
-        maxBuffer: 16 * 1024 * 1024,
-      },
-      (err, _stdout, stderr) => {
-        if (!err) {
-          resolve();
-          return;
-        }
-        const output = withoutUrlCredentials(stderr);
-        const tail = outputTail(output || withoutUrlCredentials(err.message));
-        const minutes = Math.round((opts.timeoutMs / 60_000) * 10) / 10;
-        const message = err.killed
-          ? t({
-              zh: `克隆 ${shown} 超过 ${minutes} 分钟，已停止：\n${tail}`,
-              en: `Cloning ${shown} took over ${minutes} minutes and was stopped:\n${tail}`,
-            })
-          : t({ zh: `克隆 ${shown} 失败：\n${tail}`, en: `Cloning ${shown} failed:\n${tail}` });
-        const code = typeof err.code === 'number' ? err.code : null;
-        reject(new GitError(message.trimEnd(), output, code));
-      },
-    );
+    const child = spawn('git', args, {
+      cwd: tmpdir(),
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+      detached: group,
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    // Only the end is shown, so the output is never too much to keep, however long it gets.
+    let stderr = '';
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk: string) => {
+      stderr = (stderr + chunk).slice(-CLONE_OUTPUT_KEEP);
+    });
+    let timedOut = false;
+    let stopped: Promise<void> = Promise.resolve();
+    const timer = setTimeout(() => {
+      timedOut = true;
+      if (group && child.pid !== undefined) {
+        stopped = killProcessGroup(child.pid, opts.graceMs);
+      } else {
+        child.kill('SIGTERM');
+      }
+    }, opts.timeoutMs);
+    let settled = false;
+    const settle = async (outcome: CloneOutcome) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      await stopped;
+      if (outcome.kind === 'exited' && outcome.code === 0 && !timedOut) {
+        resolve();
+        return;
+      }
+      reject(cloneError(shown, withoutUrlCredentials(stderr), outcome, timedOut, opts.timeoutMs));
+    };
+    child.on('error', (err) => void settle({ kind: 'error', message: err.message }));
+    // 'close', not 'exit': the programs git started keep its stderr open until they end.
+    child.on('close', (code, signal) => void settle({ kind: 'exited', code, signal }));
   });
+}
+
+/** How the git of a clone ended: it exited (or was killed), or it could not be started. */
+export type CloneOutcome =
+  | { kind: 'exited'; code: number | null; signal: NodeJS.Signals | null }
+  | { kind: 'error'; message: string };
+
+/**
+ * The error of a clone of `shown` that did not succeed: `timedOut` when it was stopped after
+ * `timeoutMs`, whatever git did then; otherwise a failure, with git's exit code (null when it
+ * was not started or a signal from elsewhere ended it). `output` is git's stderr, without
+ * credentials; its last lines end the message (else the reason it could not start, or the signal).
+ */
+export function cloneError(
+  shown: string,
+  output: string,
+  outcome: CloneOutcome,
+  timedOut: boolean,
+  timeoutMs: number,
+): GitError {
+  const reason =
+    outcome.kind === 'error'
+      ? outcome.message
+      : outcome.signal !== null
+        ? t({ zh: `git 被信号 ${outcome.signal} 结束`, en: `git was ended by ${outcome.signal}` })
+        : t({ zh: `git 退出码 ${outcome.code}`, en: `git exit code ${outcome.code}` });
+  const tail = outputTail(output || withoutUrlCredentials(reason));
+  const minutes = Math.round((timeoutMs / 60_000) * 10) / 10;
+  const message = timedOut
+    ? t({
+        zh: `克隆 ${shown} 超过 ${minutes} 分钟，已停止：\n${tail}`,
+        en: `Cloning ${shown} took over ${minutes} ${minutes === 1 ? 'minute' : 'minutes'} and was stopped:\n${tail}`,
+      })
+    : t({ zh: `克隆 ${shown} 失败：\n${tail}`, en: `Cloning ${shown} failed:\n${tail}` });
+  const code = !timedOut && outcome.kind === 'exited' ? outcome.code : null;
+  return new GitError(message.trimEnd(), output, code);
 }
 
 /** Message of the commit `initEmptyRepo` makes: in both languages, whichever the Master uses. */

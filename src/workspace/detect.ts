@@ -1,8 +1,15 @@
 // Setup and verify commands suggested for a repo by the files at its root: which ecosystems it is
 // (Node, Python, Go, Rust, a Makefile) and, for those, which package manager, scripts and tools.
 // The rules follow the table of docs/examples/README.md ("在看板上登记仓库"), the one place they
-// are written for people; change both together. Pure logic: the caller reads the files.
+// are written for people; change both together.
+//
+// Keep this file pure logic, importing no Node module (fs, child_process, path, ...) and nothing
+// that does: the caller reads the files (`committedRootFiles` in src/workspace/git.ts), so the
+// rules are tested on plain objects, and they stay free to be shared with the dashboard, which
+// cannot bundle Node modules. The type the API returns, `DetectedCommands`, lives in
+// src/api/types.ts, which the dashboard imports.
 
+import type { DetectedCommands } from '../api/types.js';
 import { join, t } from '../i18n.js';
 
 /** The files at the root whose content the rules read, when they are there. */
@@ -16,19 +23,13 @@ export const DETECT_READ_FILES = [
 ] as const;
 
 export interface ProjectFiles {
-  /** Names of the files at the repo's root (directories left out). */
+  /** Names of the files at the repo's root (directories left out), symlinks among them. */
   files: readonly string[];
-  /** Content of the files of `DETECT_READ_FILES` that are there, by name. */
+  /**
+   * Content of the files of `DETECT_READ_FILES` that are there as regular files, by name. A
+   * symlink is in `files` but not here: its content is not read, since it may point anywhere.
+   */
   contents: Readonly<Record<string, string>>;
-}
-
-export interface DetectedCommands {
-  /** Setup commands, one per entry, in the order to run. */
-  setup: string[];
-  /** Verify commands, one per entry, in the order to run. */
-  verify: string[];
-  /** For people: which files each suggestion comes from, one line per ecosystem recognised. */
-  basis: string[];
 }
 
 /** What one ecosystem adds. */
@@ -99,20 +100,19 @@ function code(name: string): string {
 
 function detectNode(has: Set<string>, contents: ProjectFiles['contents']): Found | undefined {
   if (!has.has('package.json')) return undefined;
-  let pkg: { packageManager?: unknown; scripts?: unknown } | undefined;
-  try {
-    const parsed: unknown = JSON.parse(contents['package.json'] ?? '');
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) pkg = parsed;
-  } catch {
-    pkg = undefined;
-  }
+  // There but not read: a symlink.
+  const text = contents['package.json'];
+  const pkg = text === undefined ? undefined : parsePackageJson(text);
 
   const lock = NODE_LOCKS.find(([file]) => has.has(file));
   const declared = declaredManager(pkg?.packageManager);
-  const manager: NodeManager = declared ?? lock?.[1] ?? 'npm';
+  const manager: NodeManager = declared?.name ?? lock?.[1] ?? 'npm';
   // The lock file of the manager used: a frozen install needs it.
   const ownLock = NODE_LOCKS.find(([file, m]) => m === manager && has.has(file))?.[0];
-  const setup = [nodeInstall(manager, ownLock !== undefined)];
+  // Yarn 2 and later (Berry) replaced --frozen-lockfile with --immutable. Without the field
+  // nothing tells the versions apart, and yarn 1 is the one to install by default.
+  const berry = manager === 'yarn' && (declared?.major ?? 1) >= 2;
+  const setup = [nodeInstall(manager, ownLock !== undefined, berry)];
 
   const scripts =
     pkg?.scripts && typeof pkg.scripts === 'object' && !Array.isArray(pkg.scripts)
@@ -136,20 +136,25 @@ function detectNode(has: Set<string>, contents: ProjectFiles['contents']): Found
         ? t({ zh: `有 ${code(lock[0])}`, en: `${code(lock[0])} is there` })
         : t({ zh: '没找到锁文件，按 npm 处理', en: 'no lock file found, so npm' });
   const what =
-    pkg === undefined
+    text === undefined
       ? t({
-          zh: 'package.json 解析不了，没有生成检查命令',
-          en: 'package.json could not be parsed, so no verify commands',
+          zh: 'package.json 是符号链接，没有读它的内容，没有生成检查命令',
+          en: 'package.json is a symlink, whose content is not read, so no verify commands',
         })
-      : present.length > 0
+      : pkg === undefined
         ? t({
-            zh: `scripts 里有 ${join(present)}`,
-            en: `scripts has ${join(present)}`,
+            zh: 'package.json 解析不了，没有生成检查命令',
+            en: 'package.json could not be parsed, so no verify commands',
           })
-        : t({
-            zh: 'scripts 里没有 build、test、lint，没有生成检查命令',
-            en: 'scripts has no build, test or lint, so no verify commands',
-          });
+        : present.length > 0
+          ? t({
+              zh: `scripts 里有 ${join(present)}`,
+              en: `scripts has ${join(present)}`,
+            })
+          : t({
+              zh: 'scripts 里没有 build、test、lint，没有生成检查命令',
+              en: 'scripts has no build, test or lint, so no verify commands',
+            });
   return {
     setup,
     verify,
@@ -160,21 +165,41 @@ function detectNode(has: Set<string>, contents: ProjectFiles['contents']): Found
   };
 }
 
-/** The manager the packageManager field ("pnpm@9.1.0") names, if one known. */
-function declaredManager(field: unknown): NodeManager | undefined {
-  if (typeof field !== 'string') return undefined;
-  const name = field.split('@')[0]?.trim();
-  return name === 'npm' || name === 'pnpm' || name === 'yarn' || name === 'bun' ? name : undefined;
+/** package.json's fields the rules read; undefined when the text is not a JSON object. */
+function parsePackageJson(
+  text: string,
+): { packageManager?: unknown; scripts?: unknown } | undefined {
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
-function nodeInstall(manager: NodeManager, locked: boolean): string {
+/**
+ * The manager the packageManager field ("pnpm@9.1.0", "yarn@4.1.0+sha512.…") names, if one
+ * known, and the major version it gives, if it gives one.
+ */
+function declaredManager(field: unknown): { name: NodeManager; major?: number } | undefined {
+  if (typeof field !== 'string') return undefined;
+  const [rawName, version = ''] = field.split('@');
+  const name = rawName?.trim();
+  if (name !== 'npm' && name !== 'pnpm' && name !== 'yarn' && name !== 'bun') return undefined;
+  const major = /^\s*v?(\d+)/.exec(version)?.[1];
+  return major === undefined ? { name } : { name, major: Number(major) };
+}
+
+/** `berry`: yarn 2 or later, whose frozen install is `--immutable`. */
+function nodeInstall(manager: NodeManager, locked: boolean, berry: boolean): string {
   switch (manager) {
     case 'npm':
       return locked ? 'npm ci' : 'npm install';
     case 'pnpm':
       return locked ? 'pnpm install --frozen-lockfile' : 'pnpm install';
     case 'yarn':
-      return locked ? 'yarn install --frozen-lockfile' : 'yarn install';
+      if (!locked) return 'yarn install';
+      return berry ? 'yarn install --immutable' : 'yarn install --frozen-lockfile';
     case 'bun':
       return 'bun install';
   }

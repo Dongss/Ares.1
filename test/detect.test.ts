@@ -39,7 +39,10 @@ function project(files: string[], contents: Record<string, string> = {}): Projec
 const TABLE_PROJECTS: Record<string, ProjectFiles> = {
   npm: project(['package-lock.json'], { 'package.json': PACKAGE_JSON }),
   pnpm: project(['pnpm-lock.yaml'], { 'package.json': PACKAGE_JSON }),
-  yarn: project(['yarn.lock'], { 'package.json': PACKAGE_JSON }),
+  'yarn 1': project(['yarn.lock'], { 'package.json': PACKAGE_JSON }),
+  'yarn 2 及以上（Berry）': project(['yarn.lock'], {
+    'package.json': JSON.stringify({ ...JSON.parse(PACKAGE_JSON), packageManager: 'yarn@4.5.0' }),
+  }),
   bun: project(['bun.lock'], { 'package.json': PACKAGE_JSON }),
   'Python（uv）': project(['uv.lock'], { 'pyproject.toml': PYPROJECT }),
   'Python（pip + venv）': project([], { 'pyproject.toml': PYPROJECT }),
@@ -135,6 +138,32 @@ describe('detectProjectCommands', () => {
     ]);
   });
 
+  it('installs yarn 2 and later with --immutable, by the major version of packageManager', () => {
+    const setup = (packageManager: string | undefined, files = ['yarn.lock']) =>
+      detectProjectCommands(
+        project(files, {
+          'package.json': JSON.stringify({ packageManager, scripts: { test: 'jest' } }),
+        }),
+      ).setup;
+    for (const version of ['yarn@2.4.3', 'yarn@3.6.4', 'yarn@4.5.0+sha512.abc123', 'yarn@10.0.0']) {
+      expect({ version, setup: setup(version) }).toEqual({
+        version,
+        setup: ['yarn install --immutable'],
+      });
+    }
+    // yarn 1, a field with no version and no field at all: yarn 1's flag.
+    for (const version of ['yarn@1.22.22', 'yarn', 'yarn@latest', undefined]) {
+      expect({ version, setup: setup(version) }).toEqual({
+        version,
+        setup: ['yarn install --frozen-lockfile'],
+      });
+    }
+    // Without yarn's lock file, no frozen install of either kind.
+    expect(setup('yarn@4.5.0', ['package-lock.json'])).toEqual(['yarn install']);
+    // The version of another manager changes nothing.
+    expect(setup('pnpm@9.1.0', ['pnpm-lock.yaml'])).toEqual(['pnpm install --frozen-lockfile']);
+  });
+
   it('makes verify commands only of the scripts there, build, test, lint in that order', () => {
     const pkg = (scripts: Record<string, string>) => ({
       'package.json': JSON.stringify({ scripts }),
@@ -161,6 +190,20 @@ describe('detectProjectCommands', () => {
     const found = detectProjectCommands(project(['pnpm-lock.yaml'], { 'package.json': '{ oops' }));
     expect(found).toMatchObject({ setup: ['pnpm install --frozen-lockfile'], verify: [] });
     expect(found.basis[0]).toContain('解析不了');
+  });
+
+  it('says a symlinked package.json was not read rather than that it could not be parsed', () => {
+    // Listed among the files with no content: a symlink, as committedRootFiles reports one.
+    const found = detectProjectCommands({ files: ['package.json', 'yarn.lock'], contents: {} });
+    expect(found).toMatchObject({ setup: ['yarn install --frozen-lockfile'], verify: [] });
+    expect(found.basis).toEqual([
+      'Node（yarn）：package.json，有 `yarn.lock`；package.json 是符号链接，没有读它的内容，没有生成检查命令',
+    ]);
+    expect(found.basis[0]).not.toContain('解析不了');
+    setLang('en');
+    expect(detectProjectCommands({ files: ['package.json'], contents: {} }).basis).toEqual([
+      'Node (npm): package.json, no lock file found, so npm; package.json is a symlink, whose content is not read, so no verify commands',
+    ]);
   });
 
   it('adds ruff to Python only when the project sets it up', () => {

@@ -63,7 +63,8 @@ cp docs/examples/workflows/*.yaml ~/.ares1/workflows/
 |---|---|---|
 | npm | `npm ci` | `npm run build`<br>`npm test`<br>`npm run lint` |
 | pnpm | `pnpm install --frozen-lockfile` | `pnpm build`<br>`pnpm test`<br>`pnpm lint` |
-| yarn | `yarn install --frozen-lockfile` | `yarn build`<br>`yarn test`<br>`yarn lint` |
+| yarn 1 | `yarn install --frozen-lockfile` | `yarn build`<br>`yarn test`<br>`yarn lint` |
+| yarn 2 及以上（Berry） | `yarn install --immutable` | `yarn build`<br>`yarn test`<br>`yarn lint` |
 | bun | `bun install` | `bun run build`<br>`bun run test`<br>`bun run lint` |
 | Python（uv） | `uv sync` | `uv run ruff check .`<br>`uv run ruff format --check .`<br>`uv run pytest` |
 | Python（pip + venv） | `python3 -m venv .venv`<br>`.venv/bin/pip install -e '.[dev]'` | `.venv/bin/ruff check .`<br>`.venv/bin/ruff format --check .`<br>`.venv/bin/pytest` |
@@ -78,7 +79,7 @@ cp docs/examples/workflows/*.yaml ~/.ares1/workflows/
 
 已经登记的仓库，在「仓库」页点「修改」，再点「按项目文件探测」，Master 会看目标分支上已提交的根目录文件（工作目录里没提交的改动不算），按上面这张表把建议的命令填进两个输入框，并列出是凭哪些文件判断的。它只填表单，不保存：检查一遍、按需要改过之后点「保存」才生效。规则如下（`src/workspace/detect.ts`，改规则时这张表和它一起改，`test/detect.test.ts` 会拿这张表核对）：
 
-- **Node**（有 `package.json`）：包管理器先看 `package.json` 的 `packageManager` 字段（如 `pnpm@9.0.0`），没有就看锁文件：`package-lock.json` 或 `npm-shrinkwrap.json` → npm，`pnpm-lock.yaml` → pnpm，`yarn.lock` → yarn，`bun.lock` 或 `bun.lockb` → bun；有几个锁文件时按这个顺序取第一个。都没有就按 npm 处理。准备命令按表里那一行；用的包管理器没有自己的锁文件时不加 `--frozen-lockfile`，npm 用 `npm install` 代替 `npm ci`。检查命令只按 `scripts` 里实际有的 `build`、`test`、`lint` 生成，顺序是 build → test → lint；`npm init` 生成的占位 `test`（`no test specified`）不算。
+- **Node**（有 `package.json`）：包管理器先看 `package.json` 的 `packageManager` 字段（如 `pnpm@9.0.0`），没有就看锁文件：`package-lock.json` 或 `npm-shrinkwrap.json` → npm，`pnpm-lock.yaml` → pnpm，`yarn.lock` → yarn，`bun.lock` 或 `bun.lockb` → bun；有几个锁文件时按这个顺序取第一个。都没有就按 npm 处理。准备命令按表里那一行；yarn 只有 `packageManager` 字段写明 2 及以上的版本（如 `yarn@4.1.0`）时才按 Berry 那一行用 `--immutable`，没有这个字段时按 yarn 1 处理。用的包管理器没有自己的锁文件时不加 `--frozen-lockfile`、`--immutable`，npm 用 `npm install` 代替 `npm ci`。检查命令只按 `scripts` 里实际有的 `build`、`test`、`lint` 生成，顺序是 build → test → lint；`npm init` 生成的占位 `test`（`no test specified`）不算。`package.json` 是符号链接时不读它的内容：包管理器只按锁文件选，不生成检查命令，依据里写明是符号链接。
 - **Python**（有 `pyproject.toml` 或 `requirements.txt`）：有 `pyproject.toml` 和 `uv.lock` 时按 uv 那一行；只有 `pyproject.toml` 时按 pip + venv 那一行（`pyproject.toml` 里没有 `dev` 可选依赖时依据里会提醒改 `'.[dev]'`）；只有 `requirements.txt` 时按「只有 requirements.txt」那一行。`pytest` 一定加；ruff 的两条只在项目配置了 ruff 时才加：根目录有 `ruff.toml` 或 `.ruff.toml`，`pyproject.toml` 里有 `[tool.ruff]`，或者 `pyproject.toml`、`requirements.txt` 的依赖里有 ruff。
 - **Go**（有 `go.mod`）、**Rust**（有 `Cargo.toml`）：按表里那一行。
 - **Makefile**（根目录的 `GNUmakefile`、`makefile` 或 `Makefile`，按 make 找它们的顺序取第一个）：有 `test` 目标时检查命令加 `make test`。

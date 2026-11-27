@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { parse as parseYaml } from 'yaml';
@@ -451,6 +451,26 @@ describe('HTTP API', () => {
     expect(unreadable.json.error).toMatch(
       /^Could not read the files on the target branch gone of repo mine: git rev-parse /,
     );
+  });
+
+  it('says a committed package.json symlink was not read', async () => {
+    h = await harness();
+    const dir = initRepo();
+    writeFile(join(dir, 'app', 'package.json'), JSON.stringify({ scripts: { test: 'vitest' } }));
+    symlinkSync('app/package.json', join(dir, 'package.json'));
+    writeFile(join(dir, 'pnpm-lock.yaml'), 'lockfileVersion: 9.0\n');
+    git(dir, 'add', '-A');
+    git(dir, 'commit', '-q', '-m', 'linked package.json');
+    expect((await call('POST', '/api/repos', { name: 'mine', path: dir })).status).toBe(201);
+    const res = await call('GET', '/api/repos/mine/detect');
+    expect(res.status).toBe(200);
+    expect(res.json).toMatchObject({
+      setup: ['pnpm install --frozen-lockfile'],
+      verify: [],
+      basis: [
+        'Node（pnpm）：package.json，有 `pnpm-lock.yaml`；package.json 是符号链接，没有读它的内容，没有生成检查命令',
+      ],
+    });
   });
 
   it('has no endpoint for creating runs: they only come from GitHub issues', async () => {
@@ -4590,6 +4610,70 @@ describe('trying a repo’s commands', () => {
     h = await harness({ home, repoDir });
     await waitFor(() => !existsSync(left), 'the leftover trial worktree to go');
     await waitFor(() => worktrees(repoDir).length === 1, 'git to forget it');
+  });
+
+  it('goes on to the next leftover worktree when one cannot be removed, naming it', async () => {
+    h = await harness({ verifyCommands: [] });
+    const { worktreesDir } = h.master.paths;
+    const known = join(worktreesDir, `trial-${h.repo.id}-dead01`);
+    git(h.repoDir, 'worktree', 'add', '--detach', '-q', known, 'main');
+    const broken = join(worktreesDir, 'trial-repo-broken-beef');
+    writeFile(join(broken, 'file.txt'), 'x\n');
+    writeFile(join(worktreesDir, 'trial-junk', 'file.txt'), 'x\n');
+    const store = h.master.store;
+    const findRepo = store.findRepo.bind(store);
+    const spy = vi.spyOn(store, 'findRepo').mockImplementation((id) => {
+      if (id === 'repo-broken') throw new Error('database is locked');
+      return findRepo(id);
+    });
+    try {
+      // Whatever order the directories come in, the others go.
+      await expect(h.master.trials.sweepLeftovers()).rejects.toThrow(
+        `1 个目录没删掉，下次再试：\n${broken}: database is locked`,
+      );
+      expect(trialDirs()).toEqual(['trial-repo-broken-beef']);
+      expect(worktrees(h.repoDir)).toHaveLength(1);
+    } finally {
+      spy.mockRestore();
+    }
+    // The next sweep removes it.
+    await h.master.trials.sweepLeftovers();
+    expect(trialDirs()).toEqual([]);
+  });
+
+  it('forgets the latest trial of a repo when the repo is removed', async () => {
+    h = await harness({ verifyCommands: ['true'] });
+    const other = initRepo();
+    const created = await call('POST', '/api/repos', {
+      name: 'other',
+      path: other,
+      verifyCommands: ['true'],
+    });
+    expect(created.status).toBe(201);
+    const otherId = (created.json as { id: string }).id;
+    for (const repo of ['demo', 'other']) {
+      expect((await call('POST', `/api/repos/${repo}/trial`)).status).toBe(202);
+      expect((await trialOver(repo)).status).toBe('passed');
+    }
+    expect((await call('DELETE', '/api/repos/other')).status).toBe(204);
+    expect(h.master.trials.get(otherId)).toBeUndefined();
+    // The other repos' stay.
+    expect(h.master.trials.get(h.repo.id)).toMatchObject({ status: 'passed' });
+
+    // Removed while it runs: it still runs to its end and deletes its worktree, and is not kept.
+    const third = initRepo();
+    const res = await call('POST', '/api/repos', { name: 'third', path: third });
+    const thirdId = (res.json as { id: string }).id;
+    const gate = tmpDir('ares1-gate-');
+    await call('POST', '/api/repos/third/trial', { verifyCommands: [waitForGate(gate)] });
+    await waitFor(() => trialDirs().length === 1, 'the trial worktree');
+    expect((await call('DELETE', '/api/repos/third')).status).toBe(204);
+    expect(h.master.trials.get(thirdId)).toBeUndefined();
+    writeFile(join(gate, 'go'), '');
+    await waitFor(() => !h?.master.trials.trying().has(thirdId), 'the trial to end');
+    expect(trialDirs()).toEqual([]);
+    expect(h.master.trials.get(thirdId)).toBeUndefined();
+    expect(worktrees(third)).toHaveLength(1);
   });
 });
 

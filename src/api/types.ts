@@ -34,7 +34,6 @@ import type {
   StageRun,
   Task,
 } from '../store/types.js';
-import type { DetectedCommands } from '../workspace/detect.js';
 
 /** A normalized agent event of one attempt, numbered so a viewer can merge history and live. */
 export interface AgentEventRecord {
@@ -80,6 +79,19 @@ export interface RepoInput {
   verifyCommands: string[];
   setupCommands: string[];
   source?: RepoInputSource;
+}
+
+/**
+ * The setup and verify commands the files at a repo's root suggest (`detectProjectCommands` in
+ * src/workspace/detect.ts, which returns this type).
+ */
+export interface DetectedCommands {
+  /** Setup commands, one per entry, in the order to run. */
+  setup: string[];
+  /** Verify commands, one per entry, in the order to run. */
+  verify: string[];
+  /** For people: which files each suggestion comes from, one line per ecosystem recognised. */
+  basis: string[];
 }
 
 /**

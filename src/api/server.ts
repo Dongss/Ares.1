@@ -679,6 +679,7 @@ export function createApi(deps: ApiDeps): Hono {
   app.delete('/api/repos/:id', async (c) => {
     const repo = store.getRepo(c.req.param('id'));
     store.deleteRepo(repo.id);
+    deps.trials.forget(repo.id);
     await deps.reposChanged?.();
     return c.body(null, 204);
   });

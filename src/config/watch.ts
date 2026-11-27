@@ -97,7 +97,10 @@ export class ConfigWatcher {
   /**
    * The configuration as a reload would load it now with `configFile` read as config.yaml: for
    * checking a config.yaml before it is written. Neither put in use nor told; throws as
-   * `loadConfig` does, and like it applies the file's language.
+   * `loadConfig` does. Like `loadConfig`, it applies the file's `language` (`setLang`) to the
+   * whole Master at once: a candidate that changes the language switches it before the file is
+   * written or kept, and a candidate that is then thrown away does not switch it back. Callers
+   * that check such a candidate have to restore the language themselves.
    */
   loadCandidate(configFile: string): LoadedConfig {
     return loadConfig({ ...this.paths, configFile }, this.knownClis, this.readOnlyClis, {

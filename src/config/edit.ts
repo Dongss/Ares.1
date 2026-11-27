@@ -473,7 +473,10 @@ export interface SourceEditDeps {
   reloadError: string | null;
   /** CLIs that can run an agent read-only, as the scout does. */
   readOnlyClis: readonly string[];
-  /** The configuration as it would load with `configFile` as config.yaml, put to no use. */
+  /**
+   * The configuration as it would load with `configFile` as config.yaml, put to no use; it
+   * applies that file's `language` to the whole Master all the same (see `saveRepoSource`).
+   */
   loadCandidate(configFile: string): LoadedConfig;
   /** Loads the configuration again and puts it in use; whether it loaded. */
   reload(): boolean;
@@ -519,6 +522,11 @@ export class SourceEditInvalid extends Error {
  * configuration in use.
  *
  * Every step is synchronous, so two saves never interleave.
+ *
+ * `deps.loadCandidate` applies the candidate's `language` to the whole Master, as loading does
+ * (`setLang`). The edit never touches `language`, so the language stays what it was; a save that
+ * could change it would switch the language as soon as the candidate is checked, even when the
+ * candidate is then refused, and would have to restore it.
  */
 export function saveRepoSource(
   deps: SourceEditDeps,
