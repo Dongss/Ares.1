@@ -142,6 +142,10 @@ const SAMPLES: [string, Record<string, unknown>][] = [
   ],
   ['proposal.created', { repo: 'demo', proposalId: 'proposal-1', author: 'human', started: true }],
   ['proposal.created', { repo: 'demo', proposalId: 'proposal-1', author: 'human', started: false }],
+  [
+    'proposal.edited',
+    { repo: 'demo', proposalId: 'proposal-1', fields: ['title', 'what', 'acceptance', 'risk'] },
+  ],
   ['proposal.auto_accepted', { repo: 'demo', proposalId: 'proposal-1', runId: 'run-1' }],
   ['proposal.accepted', { repo: 'demo', proposalId: 'proposal-1', runId: 'run-1' }],
   // The reason is a human's own words, kept as written: English here, so the check below holds.
@@ -846,6 +850,31 @@ describe('globalEventText', () => {
     expect(text('proposal.created', { ...written, started: false })).toBe(
       'A human wrote a requirement for demo, kept in the local backlog until a human accepts it',
     );
+  });
+
+  it('says a human edited a local proposal, naming what they changed but not the text', () => {
+    const edited = { repo: 'demo', proposalId: 'proposal-1' };
+    expect(text('proposal.edited', { ...edited, fields: ['title', 'what', 'risk'] })).toBe(
+      '有人改了 demo 的一条本地提案：改了标题、要做什么、风险',
+    );
+    expect(
+      text('proposal.edited', {
+        ...edited,
+        fields: ['why', 'evidence', 'acceptance', 'category', 'size'],
+      }),
+    ).toBe('有人改了 demo 的一条本地提案：改了为什么、证据、验收标准、类别、大小');
+    // A field it does not know keeps its name; missing or empty fields fall back to a sentence.
+    expect(text('proposal.edited', { ...edited, fields: ['title', 'deadline'] })).toBe(
+      '有人改了 demo 的一条本地提案：改了标题、deadline',
+    );
+    expect(text('proposal.edited', { ...edited, fields: [] })).toBe('有人改了 demo 的一条本地提案');
+    expect(text('proposal.edited', {})).toBe('有人改了 某个仓库 的一条本地提案');
+    expect(globalEventLink(ev('proposal.edited', edited))?.href).toBe('#/issues');
+    setLang('en');
+    expect(text('proposal.edited', { ...edited, fields: ['title', 'what', 'acceptance'] })).toBe(
+      'A human edited a local proposal of demo: changed its title, what to do, acceptance criteria',
+    );
+    expect(text('proposal.edited', edited)).toBe('A human edited a local proposal of demo');
   });
 
   it('says a failed local proposal is redone, when and as which attempt, or given up', () => {

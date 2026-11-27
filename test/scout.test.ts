@@ -2128,6 +2128,7 @@ const localProposal = (id: string, title: string, extra: Partial<Proposal> = {})
   dependsOn: [],
   createdAt: '2026-11-20T00:00:00.000Z',
   decidedAt: null,
+  editedAt: null,
   ...extra,
 });
 

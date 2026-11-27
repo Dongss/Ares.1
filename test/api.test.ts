@@ -2355,6 +2355,304 @@ backlog:
     expect(errors.join('\n')).not.toMatch(/[一-鿿]/);
   });
 
+  it('edits a pending proposal, and accepting it gives a Run whose goal is the edited text', async () => {
+    const t = await start();
+    const store = t.master.store;
+    const events = () => store.listGlobalEventsOfType('proposal.edited').map((e) => e.data);
+    const scouted = propose(t.repo.id, '方向对的');
+    expect(scouted.editedAt).toBeNull();
+
+    const res = await call('PATCH', `/api/proposals/${scouted.id}`, {
+      title: '  细节改过的 \n 标题 ',
+      what: '\n新的做法\n',
+      acceptance: ['新的验收', '  ', ' 有测试 '],
+      // Given as it was: not a change.
+      why: '方向对的的原因',
+      risk: 'mid',
+    });
+    expect(res.status).toBe(200);
+    const edited = res.json as ProposalView;
+    expect(edited).toMatchObject({
+      id: scouted.id,
+      repo: 'demo',
+      author: 'scout',
+      title: '细节改过的 标题',
+      what: '新的做法',
+      why: '方向对的的原因',
+      evidence: ['run_abc 返工了 3 轮'],
+      acceptance: ['新的验收', '有测试'],
+      category: 'improvement',
+      size: 'M',
+      // Still beyond auto_accept (max_risk low): it waits for a human.
+      risk: 'mid',
+      status: 'pending',
+      runId: null,
+      editedAt: expect.any(String),
+    });
+    // Only the names of the fields that changed, never their text.
+    expect(events()).toEqual([
+      { repo: 'demo', proposalId: scouted.id, fields: ['title', 'what', 'acceptance', 'risk'] },
+    ]);
+    expect(store.getProposal(scouted.id)).toMatchObject({
+      title: '细节改过的 标题',
+      editedAt: edited.editedAt,
+    });
+    expect((await call('GET', '/api/proposals?status=pending')).json).toMatchObject([
+      { id: scouted.id, editedAt: edited.editedAt },
+    ]);
+
+    // The same again changes nothing: no event, editedAt kept.
+    const same = await call('PATCH', `/api/proposals/${scouted.id}`, {
+      title: '细节改过的 标题',
+      risk: 'mid',
+    });
+    expect(same.status).toBe(200);
+    expect(same.json).toMatchObject({ id: scouted.id, editedAt: edited.editedAt });
+    expect(events()).toHaveLength(1);
+
+    // An optional field may be emptied.
+    const emptied = await call('PATCH', `/api/proposals/${scouted.id}`, {
+      why: ' ',
+      evidence: [],
+      size: 'L',
+    });
+    expect(emptied.json).toMatchObject({ why: '', evidence: [], size: 'L' });
+    // When it was edited last.
+    const lastEdited = (emptied.json as ProposalView).editedAt;
+    expect(lastEdited).not.toBeNull();
+    expect(lastEdited && edited.editedAt && lastEdited >= edited.editedAt).toBe(true);
+    expect(events().at(-1)).toEqual({
+      repo: 'demo',
+      proposalId: scouted.id,
+      fields: ['why', 'evidence', 'size'],
+    });
+
+    const accepted = await call('POST', `/api/proposals/${scouted.id}/accept`);
+    expect(accepted.status).toBe(200);
+    const { proposal, run } = accepted.json as ProposalAccepted;
+    expect(proposal).toMatchObject({ status: 'accepted', editedAt: lastEdited });
+    expect(run.goal).toBe(
+      [
+        '细节改过的 标题',
+        '',
+        '### 要做什么',
+        '',
+        '新的做法',
+        '',
+        '### 验收标准',
+        '',
+        '- [ ] 新的验收',
+        '- [ ] 有测试',
+      ].join('\n'),
+    );
+    expect(gh.calls).toEqual([]);
+  });
+
+  it('refuses to edit a decided proposal or a step of an iteration (409), or an invalid edit (400)', async () => {
+    const t = await start();
+    const store = t.master.store;
+    const patch = (id: string, input?: unknown) => call('PATCH', `/api/proposals/${id}`, input);
+
+    const accepted = propose(t.repo.id, '采纳了的');
+    await call('POST', `/api/proposals/${accepted.id}/accept`);
+    const rejected = propose(t.repo.id, '拒绝了的');
+    await call('POST', `/api/proposals/${rejected.id}/reject`, { reason: '不要' });
+    const failed = store.updateProposal(propose(t.repo.id, '失败了的').id, {
+      status: 'failed',
+      redo: 'exhausted',
+    });
+    expect(await patch(accepted.id, { title: '改' })).toMatchObject({
+      status: 409,
+      json: { error: `提案 ${accepted.id} 已经采纳过了；只有待处理的提案能修改` },
+    });
+    expect(await patch(rejected.id, { title: '改' })).toMatchObject({
+      status: 409,
+      json: { error: `提案 ${rejected.id} 已经被拒绝了；只有待处理的提案能修改` },
+    });
+    expect(await patch(failed.id, { what: '改' })).toMatchObject({
+      status: 409,
+      json: {
+        error: `提案 ${failed.id} 已经采纳过，Run 失败 1 次后不再重做了；只有待处理的提案能修改`,
+      },
+    });
+
+    // A step of an iteration, pending with it, is decided with it as a whole.
+    const iteration = planIteration(t);
+    const [step] = stepsOf(t, iteration.id);
+    if (!step) throw new Error('no steps');
+    expect(await patch(step.id, { risk: 'low' })).toMatchObject({
+      status: 409,
+      json: {
+        error: `提案 ${step.id} 是迭代 ${iteration.id} 的子项，要按迭代整体决定，不能单独修改`,
+      },
+    });
+
+    // A repo no longer in backlog.repos.
+    const third = store.createRepo({
+      name: 'third',
+      path: initRepo(),
+      targetBranch: 'main',
+      verifyCommands: [],
+      setupCommands: [],
+      mergeMode: 'direct',
+    });
+    const elsewhere = propose(third.id, '别处的');
+    expect(await patch(elsewhere.id, { title: '改' })).toMatchObject({
+      status: 409,
+      json: {
+        error:
+          '仓库 third 已经不在 config.yaml 的 backlog.repos 里，不能再修改它的提案；拒绝还可以',
+      },
+    });
+    expect((await patch('proposal_none', { title: '改' })).status).toBe(404);
+
+    // Invalid edits, of a pending proposal: nothing to change, blank or too long texts, unknown
+    // values or fields.
+    const pending = propose(t.repo.id, '待处理的');
+    const nothing =
+      '(body): 至少要改一项：title、what、why、evidence、acceptance、category、size、risk';
+    expect(await patch(pending.id, {})).toMatchObject({ status: 400, json: { error: nothing } });
+    expect(await patch(pending.id)).toMatchObject({ status: 400, json: { error: nothing } });
+    expect(await patch(pending.id, { title: ' \n ' })).toMatchObject({
+      status: 400,
+      json: { error: 'title: 需求的标题不能为空' },
+    });
+    expect(await patch(pending.id, { what: '' })).toMatchObject({
+      status: 400,
+      json: { error: 'what: 需求要写清楚要做什么' },
+    });
+    for (const input of [
+      { title: 'x'.repeat(201) },
+      { why: 'x'.repeat(20_001) },
+      { acceptance: Array.from({ length: 51 }, () => 'a') },
+      { evidence: '一条' },
+      { risk: 'huge' },
+      { size: 'XL' },
+      { category: 'chore' },
+      { title: null },
+      { repo: 'demo', title: '改' },
+      { start: true },
+      { reason: '改' },
+    ]) {
+      expect((await patch(pending.id, input)).status, JSON.stringify(input).slice(0, 60)).toBe(400);
+    }
+    expect(store.getProposal(pending.id)).toEqual(pending);
+    expect(store.listGlobalEventsOfType('proposal.edited')).toEqual([]);
+    expect(store.getProposal(accepted.id).title).toBe('采纳了的');
+    expect(store.getProposal(step.id)).toMatchObject({ risk: 'high', editedAt: null });
+    expect(gh.calls).toEqual([]);
+  });
+
+  it("accepts a scout's proposal an edit puts within auto-accept; a human's draft stays pending", async () => {
+    const t = await start();
+    const store = t.master.store;
+    const scouted = propose(t.repo.id, '侦察提的');
+
+    const res = await call('PATCH', `/api/proposals/${scouted.id}`, { risk: 'low' });
+    expect(res.status).toBe(200);
+    const edited = res.json as ProposalView;
+    expect(edited).toMatchObject({
+      id: scouted.id,
+      risk: 'low',
+      status: 'accepted',
+      auto: true,
+      runId: expect.any(String),
+      editedAt: expect.any(String),
+    });
+    const run = store.getRun(edited.runId ?? '');
+    expect(run.goal.startsWith('侦察提的\n\n')).toBe(true);
+    // The edit first, then the acceptance, as at a poll.
+    expect(
+      store
+        .listGlobalEvents()
+        .filter((e) => e.type.startsWith('proposal.'))
+        .map((e) => [e.type, e.data])
+        .reverse(),
+    ).toEqual([
+      ['proposal.edited', { repo: 'demo', proposalId: scouted.id, fields: ['risk'] }],
+      ['proposal.auto_accepted', { repo: 'demo', proposalId: scouted.id, runId: run.id }],
+    ]);
+
+    // A human's draft is theirs to start, whatever its kind.
+    const kept = await call('POST', '/api/proposals', {
+      repo: 'demo',
+      title: '人写的',
+      what: '先存着',
+      risk: 'high',
+      start: false,
+    });
+    const draft = (kept.json as ProposalWritten).proposal;
+    const human = await call('PATCH', `/api/proposals/${draft.id}`, { risk: 'low', size: 'S' });
+    expect(human.json).toMatchObject({
+      id: draft.id,
+      author: 'human',
+      risk: 'low',
+      size: 'S',
+      status: 'pending',
+      runId: null,
+    });
+
+    // With the work switch off, nothing is accepted without a human.
+    store.setWorking(false);
+    const off = propose(t.repo.id, '开关关着时改的');
+    expect((await call('PATCH', `/api/proposals/${off.id}`, { risk: 'low' })).json).toMatchObject({
+      id: off.id,
+      risk: 'low',
+      status: 'pending',
+      runId: null,
+    });
+    expect(store.listRuns().map((r) => r.id)).toEqual([run.id]);
+    expect(gh.calls).toEqual([]);
+  });
+
+  it('keeps an edit when the auto-accept after it cannot create the Run, telling the backlog status', async () => {
+    const t = await start();
+    const engine = t.master.engine;
+    engine.createRun = () => {
+      throw new InvalidStateError('模板 dev 不存在');
+    };
+    const scouted = propose(t.repo.id, '侦察提的');
+    const res = await call('PATCH', `/api/proposals/${scouted.id}`, { risk: 'low' });
+    expect(res.status).toBe(200);
+    expect(res.json).toMatchObject({
+      risk: 'low',
+      status: 'pending',
+      editedAt: expect.any(String),
+    });
+    expect(t.master.store.listGlobalEventsOfType('proposal.edited')).toHaveLength(1);
+    expect((await call('GET', '/api/backlog')).json).toMatchObject({
+      lastError: { message: '模板 dev 不存在' },
+    });
+  });
+
+  it('edits a proposal in English, without Chinese left', async () => {
+    setLang('en');
+    const t = await start(`language: en\n${CONFIG}`);
+    const accepted = propose(t.repo.id, 'Accepted');
+    await call('POST', `/api/proposals/${accepted.id}/accept`);
+    const pending = propose(t.repo.id, 'Pending');
+    const iteration = planIteration(t);
+    const [step] = stepsOf(t, iteration.id);
+    if (!step) throw new Error('no steps');
+    const errors = [
+      (await call('PATCH', `/api/proposals/${accepted.id}`, { title: 'x' })).json.error,
+      (await call('PATCH', `/api/proposals/${step.id}`, { title: 'x' })).json.error,
+      (await call('PATCH', `/api/proposals/${pending.id}`, {})).json.error,
+      (await call('PATCH', `/api/proposals/${pending.id}`, { title: ' ', what: '' })).json.error,
+    ];
+    expect(errors).toEqual([
+      `Proposal ${accepted.id} was accepted already; only a pending proposal can be edited`,
+      `Proposal ${step.id} is a step of iteration ${iteration.id}, which is decided as a whole; its steps cannot be edited on their own`,
+      '(body): Change at least one of title, what, why, evidence, acceptance, category, size, risk',
+      'title: A requirement needs a title; what: A requirement needs what to do',
+    ]);
+    expect(errors.join('\n')).not.toMatch(/[一-鿿]/);
+    const edited = await call('PATCH', `/api/proposals/${pending.id}`, {
+      title: 'Pending, edited',
+    });
+    expect(edited.json).toMatchObject({ title: 'Pending, edited', status: 'pending' });
+  });
+
   it('accepts a proposal into a Run, and rejects one only with a reason', async () => {
     const t = await start();
     const wanted = propose(t.repo.id, '要人定的');

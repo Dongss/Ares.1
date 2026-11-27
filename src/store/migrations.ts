@@ -275,4 +275,9 @@ export const MIGRATIONS: readonly string[] = [
   `
   ALTER TABLE scouts ADD COLUMN goal TEXT;
   `,
+  // v16: when a human last edited a local proposal while it waited for a decision
+  // (PATCH /api/proposals/:id); null for one never edited, those recorded before included.
+  `
+  ALTER TABLE proposals ADD COLUMN edited_at TEXT;
+  `,
 ];

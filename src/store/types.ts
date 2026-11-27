@@ -425,6 +425,23 @@ export const PROPOSAL_AUTHORS = ['scout', 'human'] as const;
 export type ProposalAuthor = (typeof PROPOSAL_AUTHORS)[number];
 
 /**
+ * What a human may change of a pending proposal of its own (PATCH /api/proposals/:id), in the
+ * order the `fields` of a `proposal.edited` event list them. Part of the API, the same in every
+ * language.
+ */
+export const PROPOSAL_EDIT_FIELDS = [
+  'title',
+  'what',
+  'why',
+  'evidence',
+  'acceptance',
+  'category',
+  'size',
+  'risk',
+] as const;
+export type ProposalEditField = (typeof PROPOSAL_EDIT_FIELDS)[number];
+
+/**
  * A proposal in the local backlog of a repo without GitHub (backlog.repos): what a scout
  * proposed or a human wrote, kept in the Master instead of as an issue, and what became of it.
  */
@@ -475,6 +492,12 @@ export interface Proposal {
   createdAt: string;
   /** When it was accepted or rejected. */
   decidedAt: string | null;
+  /**
+   * When a human last edited its text or kind while it was pending (PATCH /api/proposals/:id);
+   * null for one never edited. A column rather than read from the `proposal.edited` events, so
+   * that the proposals a human changed can be told with one query, whatever events are kept.
+   */
+  editedAt: string | null;
 }
 
 /** A GitHub issue the Master created or follows. */

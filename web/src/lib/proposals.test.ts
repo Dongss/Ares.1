@@ -9,22 +9,28 @@ import { setLang } from '../../../src/i18n.js';
 import { formatTime } from './format.js';
 import { pollText } from './issues.js';
 import {
-  acceptanceItems,
   acceptBlocker,
   attemptsText,
   attemptText,
   backlogOutdatedBy,
   canReject,
   decidedText,
+  draftOf,
+  editBlocker,
+  editedAtText,
+  editedMark,
+  editedResultText,
   emptyDraft,
   failureLabel,
   failureLabels,
   failuresHeading,
   humanMark,
+  lineItems,
   mergeProposals,
   PROPOSAL_STATUS,
   pendingText,
   proposalCountsText,
+  proposalEdit,
   proposalGroups,
   proposalRedoText,
   type RequirementDraft,
@@ -32,6 +38,7 @@ import {
   restartBlocker,
   restartHint,
   restartLabels,
+  saveEditBlocker,
   scoutProposalFiled,
   sortProposals,
   stepRestartBlocker,
@@ -69,6 +76,7 @@ function proposal(over: Partial<ProposalView> & Pick<ProposalView, 'id'>): Propo
     dependsOn: [],
     createdAt: '2026-11-25T08:00:00.000Z',
     decidedAt: null,
+    editedAt: null,
     runStatus: null,
     redoAt: null,
     maxAttempts: 3,
@@ -248,6 +256,7 @@ describe('writing a requirement', () => {
       title: '',
       what: '',
       why: '',
+      evidence: '',
       acceptance: '',
       category: 'feature',
       size: 'M',
@@ -256,15 +265,15 @@ describe('writing a requirement', () => {
   });
 
   it('takes the acceptance criteria one per line, without list marks or blank lines', () => {
-    expect(acceptanceItems('')).toEqual([]);
-    expect(acceptanceItems('  \n\n \t ')).toEqual([]);
-    expect(acceptanceItems('能导出\n  有测试  \r\n\n文档写清楚')).toEqual([
+    expect(lineItems('')).toEqual([]);
+    expect(lineItems('  \n\n \t ')).toEqual([]);
+    expect(lineItems('能导出\n  有测试  \r\n\n文档写清楚')).toEqual([
       '能导出',
       '有测试',
       '文档写清楚',
     ]);
     expect(
-      acceptanceItems(
+      lineItems(
         [
           '- [ ] 能导出',
           '- [x] 有测试',
@@ -281,7 +290,7 @@ describe('writing a requirement', () => {
       ),
     ).toEqual(['能导出', '有测试', '星号', '加号', '圆点', '编号', '括号', '顿号', '只有框']);
     // What only looks like a mark keeps its first character.
-    expect(acceptanceItems('-1 表示不限\n1.5 秒内返回\n*重要*\n--verbose 能用')).toEqual([
+    expect(lineItems('-1 表示不限\n1.5 秒内返回\n*重要*\n--verbose 能用')).toEqual([
       '-1 表示不限',
       '1.5 秒内返回',
       '*重要*',
@@ -322,6 +331,14 @@ describe('writing a requirement', () => {
     expect(writeBlocker(ok, filled({ acceptance: lines(REQUIREMENT_ITEMS_MAX + 1) }))).toBe(
       `验收标准最多 ${REQUIREMENT_ITEMS_MAX} 条`,
     );
+    // The evidence goes by the same limits.
+    expect(writeBlocker(ok, filled({ evidence: lines(REQUIREMENT_ITEMS_MAX) }))).toBeNull();
+    expect(writeBlocker(ok, filled({ evidence: lines(REQUIREMENT_ITEMS_MAX + 1) }))).toBe(
+      `证据最多 ${REQUIREMENT_ITEMS_MAX} 条`,
+    );
+    expect(writeBlocker(ok, filled({ evidence: `ok\n${long}` }))).toBe(
+      `每条证据最多 ${REQUIREMENT_TEXT_MAX} 个字`,
+    );
   });
 
   it('cannot be sent while the repo has problems, whatever the draft', () => {
@@ -349,6 +366,13 @@ describe('writing a requirement', () => {
           acceptance: Array.from({ length: REQUIREMENT_ITEMS_MAX + 1 }, () => 'a').join('\n'),
         }),
       ),
+      writeBlocker(ok, filled({ evidence: long })),
+      writeBlocker(
+        ok,
+        filled({
+          evidence: Array.from({ length: REQUIREMENT_ITEMS_MAX + 1 }, () => 'a').join('\n'),
+        }),
+      ),
     ];
     expect(reasons).toEqual([
       'The repo has problems (see above); fix them before writing a requirement',
@@ -359,6 +383,8 @@ describe('writing a requirement', () => {
       `"Why" has at most ${REQUIREMENT_TEXT_MAX} characters`,
       `Each acceptance criterion has at most ${REQUIREMENT_TEXT_MAX} characters`,
       `At most ${REQUIREMENT_ITEMS_MAX} acceptance criteria`,
+      `Each item of evidence has at most ${REQUIREMENT_TEXT_MAX} characters`,
+      `At most ${REQUIREMENT_ITEMS_MAX} items of evidence`,
     ]);
     for (const r of reasons) expect(r).not.toMatch(CHINESE);
   });
@@ -368,6 +394,7 @@ describe('writing a requirement', () => {
       title: '  导出 CSV ',
       what: '\n加一个按钮\n',
       why: '  要发给别人 ',
+      evidence: ' web/src/pages/Home.tsx \n\n- 现在只能截图',
       acceptance: '- [ ] 能导出\n\n- 有测试',
       category: 'bug',
       size: 'S',
@@ -378,13 +405,18 @@ describe('writing a requirement', () => {
       title: '导出 CSV',
       what: '加一个按钮',
       why: '要发给别人',
+      evidence: ['web/src/pages/Home.tsx', '现在只能截图'],
       acceptance: ['能导出', '有测试'],
       category: 'bug',
       size: 'S',
       risk: 'low',
       start: true,
     });
-    const bare = requirementInput('demo', filled({ why: '  ', acceptance: '\n- \n' }), false);
+    const bare = requirementInput(
+      'demo',
+      filled({ why: '  ', evidence: ' \n', acceptance: '\n- \n' }),
+      false,
+    );
     expect(bare).toEqual({
       repo: 'demo',
       title: 'Export the Run list as CSV',
@@ -395,6 +427,7 @@ describe('writing a requirement', () => {
       start: false,
     });
     expect('why' in bare).toBe(false);
+    expect('evidence' in bare).toBe(false);
     expect('acceptance' in bare).toBe(false);
   });
 
@@ -416,6 +449,121 @@ describe('writing a requirement', () => {
     expect(writtenText({ proposal: english })).toBe(
       'Wrote "Export CSV" and kept it in the proposals below; accept it when you want it started',
     );
+  });
+});
+
+describe('editing a pending proposal', () => {
+  const scouted = proposal({
+    id: 'p',
+    title: '导出 CSV',
+    what: '加一个按钮',
+    why: '要发给别人',
+    evidence: ['web/src/pages/Home.tsx'],
+    acceptance: ['- 能导出', '有测试'],
+    category: 'feature',
+    size: 'L',
+    risk: 'mid',
+  });
+
+  it('cannot be done while the repo left backlog.repos or has problems', () => {
+    expect(editBlocker(scouted, repo('demo'))).toBeNull();
+    expect(editBlocker(scouted, repo('demo', { problems: ['broken'] }))).toBe(
+      '这个仓库的配置有问题（见上面），改好之后才能修改提案',
+    );
+    expect(editBlocker(scouted, null)).toBe(
+      'demo 已经不在 config.yaml 的 backlog.repos 里，不能再修改它的提案；拒绝还可以',
+    );
+    // Not editable at all: nothing to block.
+    expect(editBlocker({ ...scouted, status: 'accepted' }, null)).toBeNull();
+    setLang('en');
+    const reasons = [
+      editBlocker(scouted, repo('demo', { problems: ['broken'] })),
+      editBlocker(scouted, null),
+    ];
+    expect(reasons).toEqual([
+      'The repo has problems (see above); fix them before editing a proposal',
+      'demo is no longer in backlog.repos of config.yaml, so its proposals cannot be edited; they can still be rejected',
+    ]);
+    for (const r of reasons) expect(r).not.toMatch(CHINESE);
+  });
+
+  it('opens the form filled with what the proposal says, the lists one item per line', () => {
+    expect(draftOf(scouted)).toEqual({
+      title: '导出 CSV',
+      what: '加一个按钮',
+      why: '要发给别人',
+      evidence: 'web/src/pages/Home.tsx',
+      acceptance: '- 能导出\n有测试',
+      category: 'feature',
+      size: 'L',
+      risk: 'mid',
+    });
+  });
+
+  it('sends only the fields changed, as the Master takes them', () => {
+    const before = draftOf(scouted);
+    // Untouched, a list whose item looks like a list mark is kept as it was: not sent at all.
+    expect(proposalEdit(before, before)).toEqual({});
+    expect(proposalEdit(before, { ...before, title: '  导出 CSV ' })).toEqual({});
+    expect(
+      proposalEdit(before, {
+        ...before,
+        title: '导出成  CSV',
+        acceptance: `${before.acceptance}\n- [ ] 文档写清楚`,
+        size: 'M',
+        risk: 'low',
+      }),
+    ).toEqual({
+      title: '导出成 CSV',
+      acceptance: ['能导出', '有测试', '文档写清楚'],
+      size: 'M',
+      risk: 'low',
+    });
+    // Emptying an optional field sends it empty.
+    expect(proposalEdit(before, { ...before, why: ' ', evidence: '' })).toEqual({
+      why: '',
+      evidence: [],
+    });
+  });
+
+  it('can be saved once something changed and the draft is one the Master takes', () => {
+    const before = draftOf(scouted);
+    expect(saveEditBlocker(before, before)).toBe('还没有改动');
+    expect(saveEditBlocker(before, { ...before, size: 'M' })).toBeNull();
+    expect(saveEditBlocker(before, { ...before, title: ' ' })).toBe('先写标题');
+    expect(saveEditBlocker(before, { ...before, what: '' })).toBe('写清楚要做什么');
+    setLang('en');
+    expect(saveEditBlocker(before, before)).toBe('Nothing changed yet');
+  });
+
+  it('marks a proposal a human edited, and says when', () => {
+    expect(editedMark(scouted)).toBeNull();
+    expect(editedAtText(scouted)).toBeNull();
+    const at = '2026-11-25T10:30:00.000Z';
+    const edited = { ...scouted, editedAt: at };
+    expect(editedMark(edited)).toBe('改过');
+    expect(editedAtText(edited, NOW)).toBe(`${formatTime(at, NOW)} 有人改过这条提案`);
+    // Still marked once decided.
+    const decided: ProposalView = { ...edited, status: 'accepted' };
+    expect(editedMark(decided)).toBe('改过');
+    setLang('en');
+    expect(editedMark(edited)).toBe('Edited');
+    expect(editedAtText(edited, NOW)).toBe(`Edited by a human ${formatTime(at, NOW)}`);
+  });
+
+  it('says what became of the proposal edited', () => {
+    expect(editedResultText(scouted)).toBe('改好了');
+    const accepted = { ...scouted, status: 'accepted' as const, auto: true, runId: 'run-1' };
+    expect(editedResultText(accepted)).toBe(
+      '改好了；改过之后在自动采纳范围内，已经自动采纳，建了 Run run-1',
+    );
+    setLang('en');
+    const texts = [editedResultText(scouted), editedResultText(accepted)];
+    expect(texts).toEqual([
+      'Saved',
+      'Saved; the edit put it within auto-accept, so it was accepted automatically and Run run-1 was created',
+    ]);
+    for (const text of texts) expect(text).not.toMatch(CHINESE);
   });
 });
 

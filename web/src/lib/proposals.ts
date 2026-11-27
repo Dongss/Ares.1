@@ -7,13 +7,14 @@ import type {
 import {
   authorDecides,
   isAutoAcceptable,
+  proposalEditable,
   REQUIREMENT_ITEMS_MAX,
   REQUIREMENT_TEXT_MAX,
   REQUIREMENT_TITLE_MAX,
 } from '../../../src/config/flow.js';
 import { join, t } from '../../../src/i18n.js';
 import type { FailedAttempt, ProposalStatus, ScoutProposal } from '../../../src/store/types.js';
-import type { RequirementInput } from './api.js';
+import type { ProposalEdit, RequirementInput } from './api.js';
 import { formatTime, type Tone } from './format.js';
 import { type AcceptLimits, badge } from './issues.js';
 import { redoText } from './runs.js';
@@ -125,12 +126,17 @@ export function humanMark(p: Pick<ProposalView, 'author'>): string | null {
 
 // ---- writing a requirement ----------------------------------------------------------
 
-/** What a human typed into the form that writes a requirement, before it is sent. */
+/**
+ * What a human typed into the form that writes a requirement, or edits a pending proposal,
+ * before it is sent.
+ */
 export interface RequirementDraft {
   title: string;
   what: string;
   /** Optional. */
   why: string;
+  /** The evidence, one item per line; optional. */
+  evidence: string;
   /** The acceptance criteria, one per line; optional. */
   acceptance: string;
   category: ScoutProposal['category'];
@@ -144,6 +150,7 @@ export function emptyDraft(): RequirementDraft {
     title: '',
     what: '',
     why: '',
+    evidence: '',
     acceptance: '',
     category: 'feature',
     size: 'M',
@@ -160,10 +167,11 @@ export function emptyDraft(): RequirementDraft {
 const LIST_MARK = /^(?:[-*+](?:\s+|$)|•\s*|\d+(?:[.)](?:\s+|$)|、\s*))?(?:\[[ xX]\](?:\s+|$))?/;
 
 /**
- * The acceptance criteria written one per line, as the list sent: each line trimmed and without
- * the list mark it may start with (`- [ ] `, `- `, `1. `…), blank ones dropped.
+ * A list written one item per line (the evidence, the acceptance criteria), as the list sent: each
+ * line trimmed and without the list mark it may start with (`- [ ] `, `- `, `1. `…), blank ones
+ * dropped.
  */
-export function acceptanceItems(text: string): string[] {
+export function lineItems(text: string): string[] {
   return text
     .split(/\r?\n/)
     .map((line) => line.trim().replace(LIST_MARK, '').trim())
@@ -185,6 +193,15 @@ export function writeBlocker(
       en: 'The repo has problems (see above); fix them before writing a requirement',
     });
   }
+  return draftBlocker(draft);
+}
+
+/**
+ * What is wrong with a draft, as the Master would refuse it, writing a requirement or editing a
+ * proposal alike: no title or no what to do, too many items in a list, or something longer than
+ * the Master takes. null when there is nothing.
+ */
+function draftBlocker(draft: RequirementDraft): string | null {
   const title = draft.title.trim();
   if (title === '') return t({ zh: '先写标题', en: 'Write a title first' });
   if (title.length > REQUIREMENT_TITLE_MAX) {
@@ -206,7 +223,17 @@ export function writeBlocker(
   if (draft.why.trim().length > REQUIREMENT_TEXT_MAX) {
     return tooLong(t({ zh: '「为什么」', en: '"Why"' }));
   }
-  const items = acceptanceItems(draft.acceptance);
+  const evidence = lineItems(draft.evidence);
+  if (evidence.length > REQUIREMENT_ITEMS_MAX) {
+    return t({
+      zh: `证据最多 ${REQUIREMENT_ITEMS_MAX} 条`,
+      en: `At most ${REQUIREMENT_ITEMS_MAX} items of evidence`,
+    });
+  }
+  if (evidence.some((item) => item.length > REQUIREMENT_TEXT_MAX)) {
+    return tooLong(t({ zh: '每条证据', en: 'Each item of evidence' }));
+  }
+  const items = lineItems(draft.acceptance);
   if (items.length > REQUIREMENT_ITEMS_MAX) {
     return t({
       zh: `验收标准最多 ${REQUIREMENT_ITEMS_MAX} 条`,
@@ -219,29 +246,153 @@ export function writeBlocker(
   return null;
 }
 
+/** A draft's texts as the Master takes them: trimmed, the title on one line, lists split. */
+function tidied(draft: RequirementDraft) {
+  return {
+    title: draft.title.replace(/\s+/g, ' ').trim(),
+    what: draft.what.trim(),
+    why: draft.why.trim(),
+    evidence: lineItems(draft.evidence),
+    acceptance: lineItems(draft.acceptance),
+    category: draft.category,
+    size: draft.size,
+    risk: draft.risk,
+  };
+}
+
 /**
  * The request that writes the draft into `repo`'s local backlog: the texts trimmed, the
- * acceptance criteria as a list (`acceptanceItems`), and what is left blank left out. `start`:
- * accept it at once, or keep it pending for the human to start.
+ * evidence and acceptance criteria as lists (`lineItems`), and what is left blank left out.
+ * `start`: accept it at once, or keep it pending for the human to start.
  */
 export function requirementInput(
   repo: string,
   draft: RequirementDraft,
   start: boolean,
 ): RequirementInput {
-  const why = draft.why.trim();
-  const acceptance = acceptanceItems(draft.acceptance);
+  const { why, evidence, acceptance } = tidied(draft);
   return {
     repo,
     title: draft.title.trim(),
     what: draft.what.trim(),
     ...(why ? { why } : {}),
+    ...(evidence.length > 0 ? { evidence } : {}),
     ...(acceptance.length > 0 ? { acceptance } : {}),
     category: draft.category,
     size: draft.size,
     risk: draft.risk,
     start,
   };
+}
+
+// ---- editing a pending proposal ------------------------------------------------------
+
+/**
+ * Why a proposal that may be edited (`proposalEditable`) cannot be now, as the Master would
+ * refuse it: its repo left backlog.repos, or has problems. null when it can, and for one that may
+ * not be edited at all.
+ */
+export function editBlocker(
+  p: Pick<ProposalView, 'status' | 'iterationId' | 'repo'>,
+  repo: Pick<BacklogRepoStatus, 'problems'> | null,
+): string | null {
+  if (!proposalEditable(p)) return null;
+  if (!repo) {
+    return t({
+      zh: `${p.repo} 已经不在 config.yaml 的 backlog.repos 里，不能再修改它的提案；拒绝还可以`,
+      en: `${p.repo} is no longer in backlog.repos of config.yaml, so its proposals cannot be edited; they can still be rejected`,
+    });
+  }
+  if (repo.problems.length > 0) {
+    return t({
+      zh: '这个仓库的配置有问题（见上面），改好之后才能修改提案',
+      en: 'The repo has problems (see above); fix them before editing a proposal',
+    });
+  }
+  return null;
+}
+
+/**
+ * The form to edit a proposal, filled with what it says now: the evidence and the acceptance
+ * criteria one per line.
+ */
+export function draftOf(
+  p: Pick<
+    ProposalView,
+    'title' | 'what' | 'why' | 'evidence' | 'acceptance' | 'category' | 'size' | 'risk'
+  >,
+): RequirementDraft {
+  return {
+    title: p.title,
+    what: p.what,
+    why: p.why,
+    evidence: p.evidence.join('\n'),
+    acceptance: p.acceptance.join('\n'),
+    category: p.category,
+    size: p.size,
+    risk: p.risk,
+  };
+}
+
+/**
+ * The request that edits a proposal: only the fields whose value, as the Master takes it
+ * (`tidied`), differs from the form as it was opened (`before`, `draftOf` the proposal), so that
+ * a field left alone is kept exactly as it was. Empty when nothing changed.
+ */
+export function proposalEdit(before: RequirementDraft, draft: RequirementDraft): ProposalEdit {
+  const was = tidied(before);
+  const now = tidied(draft);
+  const same = (a: string | string[], b: string | string[]) =>
+    JSON.stringify(a) === JSON.stringify(b);
+  return Object.fromEntries(
+    (Object.keys(now) as (keyof typeof now)[])
+      .filter((field) => !same(now[field], was[field]))
+      .map((field) => [field, now[field]]),
+  ) as ProposalEdit;
+}
+
+/**
+ * Why the edit cannot be saved yet: what `writeBlocker` says of a draft, or nothing was changed.
+ * null when it can be sent.
+ */
+export function saveEditBlocker(before: RequirementDraft, draft: RequirementDraft): string | null {
+  const wrong = draftBlocker(draft);
+  if (wrong !== null) return wrong;
+  if (Object.keys(proposalEdit(before, draft)).length === 0) {
+    return t({ zh: '还没有改动', en: 'Nothing changed yet' });
+  }
+  return null;
+}
+
+/** The mark of a proposal a human edited before it was decided, beside its status. */
+export function editedMark(p: Pick<ProposalView, 'editedAt'>): string | null {
+  return p.editedAt ? t({ zh: '改过', en: 'Edited' }) : null;
+}
+
+/** When a human last edited it, for the mark's tooltip; null for one never edited. */
+export function editedAtText(p: Pick<ProposalView, 'editedAt'>, now = new Date()): string | null {
+  if (!p.editedAt) return null;
+  const at = formatTime(p.editedAt, now);
+  return t({ zh: `${at} 有人改过这条提案`, en: `Edited by a human ${at}` });
+}
+
+/**
+ * What became of a proposal just edited, shown once the form folds up: kept pending as edited,
+ * or accepted at once since the edit put it within auto-accept.
+ */
+export function editedResultText(p: Pick<ProposalView, 'status' | 'auto' | 'runId'>): string {
+  if (p.status === 'accepted' && p.auto) {
+    return p.runId
+      ? t({
+          zh: `改好了；改过之后在自动采纳范围内，已经自动采纳，建了 Run ${p.runId}`,
+          en: `Saved; the edit put it within auto-accept, so it was accepted automatically and Run ${p.runId} was created`,
+        })
+      : t({
+          zh: '改好了；改过之后在自动采纳范围内，已经自动采纳',
+          en: 'Saved; the edit put it within auto-accept, so it was accepted automatically',
+        });
+  }
+  return t({ zh: '改好了', en: 'Saved' });
 }
 
 /**

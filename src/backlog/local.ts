@@ -3,7 +3,8 @@
 // within the repo's auto_accept become Runs right away, the others wait for a human, who accepts
 // them on the dashboard or rejects them with a reason the next scouts are shown. A human writes
 // requirements of their own into it too (POST /api/proposals), started at once or kept pending
-// until they accept them. A proposal of its own whose Run failed is redone, told why, until
+// until they accept them, and edits a pending proposal before deciding it (PATCH
+// /api/proposals/:id). A proposal of its own whose Run failed is redone, told why, until
 // max_run_attempts is used up, as an issue is.
 // An iteration a scout plans is kept the same way: its record (source local) and one proposal per
 // step, accepted or rejected as a whole, its steps started in the order of their dependencies,
@@ -24,6 +25,7 @@ import {
   iterationStatusOf,
   type ProposalKind,
   proposalAwaitingRedo,
+  proposalEditable,
   proposalRedoAllowed,
   proposalRedoDueAt,
   proposalRestartable,
@@ -51,7 +53,9 @@ import {
   type IterationChild,
   type IterationChildStatus,
   type IterationStatus,
+  PROPOSAL_EDIT_FIELDS,
   type Proposal,
+  type ProposalEditField,
   type Repo,
   type Run,
   type Scout,
@@ -112,9 +116,41 @@ export interface HumanRequirement {
   start?: boolean;
 }
 
+/**
+ * What a human changes of a pending proposal of its own (`LocalBacklog.edit`): the fields of a
+ * requirement they write, each left out to keep it as it is.
+ */
+export type RequirementEdit = Partial<Omit<HumanRequirement, 'start'>>;
+
 /** The items of a list a human wrote, each trimmed, the empty ones left out. */
 const items = (list: readonly string[] | undefined): string[] =>
   (list ?? []).map((s) => s.trim()).filter((s) => s !== '');
+
+/** A title a human wrote: one line, its whitespace folded. */
+const oneLine = (title: string): string => title.replace(/\s+/g, ' ').trim();
+
+/** Whether a field of a proposal holds the same before and after an edit. */
+function sameValue(a: string | readonly string[], b: string | readonly string[]): boolean {
+  if (typeof a === 'string' || typeof b === 'string') return a === b;
+  return a.length === b.length && a.every((item, i) => item === b[i]);
+}
+
+/**
+ * Why a proposal cannot be edited (`proposalEditable` says it cannot): it is decided already, or
+ * a step of an iteration.
+ */
+function notEditable(p: Proposal): string {
+  if (p.iterationId !== null) {
+    return t({
+      zh: `提案 ${p.id} 是迭代 ${p.iterationId} 的子项，要按迭代整体决定，不能单独修改`,
+      en: `Proposal ${p.id} is a step of iteration ${p.iterationId}, which is decided as a whole; its steps cannot be edited on their own`,
+    });
+  }
+  return t({
+    zh: `${decidedAlready(p)}；只有待处理的提案能修改`,
+    en: `${decidedAlready(p)}; only a pending proposal can be edited`,
+  });
+}
 
 /**
  * What a human who wrote a requirement to start at once is told when its Run could not be
@@ -215,6 +251,9 @@ const CHILD_OVER: readonly IterationChildStatus[] = ['done', 'failed', 'dropped'
  * - write: a human writes a requirement of their own (`write`), accepted at once as on the
  *   dashboard or kept pending for them to accept later; such a draft is never auto-accepted and
  *   does not hold the automatic scout back (`authorDecides`);
+ * - edit: a human changes a pending proposal of its own before deciding it (`edit`), a scout's
+ *   whose direction is right but details are not, or their own draft; a scout's so edited into
+ *   auto_accept is accepted as at a poll;
  * - redo: a proposal whose Run failed, of its own or a step of an iteration that still wants it
  *   (`proposalRedoAllowed`), is redone as a new Run whose goal tells why the earlier attempts
  *   failed, after the wait an issue's redo waits (`proposalRedoDueAt`), up to `max_run_attempts`
@@ -493,7 +532,7 @@ export class LocalBacklog {
    */
   write(name: string, input: HumanRequirement): Proposal {
     const { repo, cfg } = this.writable(name);
-    const title = input.title.replace(/\s+/g, ' ').trim();
+    const title = oneLine(input.title);
     const what = input.what.trim();
     if (!title || !what) {
       throw new InvalidStateError(
@@ -538,13 +577,13 @@ export class LocalBacklog {
   // ---- deciding proposals --------------------------------------------------------
 
   /**
-   * The repo of a proposal or iteration a human accepts, or of a proposal a human starts over
-   * (`restart`), with its settings: it must still be in backlog.repos, without problems. `what`:
-   * the proposal or iteration, for messages.
+   * The repo of a proposal or iteration a human accepts, of a proposal a human starts over
+   * (`restart`) or of one a human edits (`edit`), with its settings: it must still be in
+   * backlog.repos, without problems. `what`: the proposal or iteration, for messages.
    */
   private deciding(
     repoId: string,
-    what: { kind: 'proposal' | 'restart' | 'iteration'; id: string },
+    what: { kind: 'proposal' | 'restart' | 'edit' | 'iteration'; id: string },
   ): { repo: Repo; cfg: BacklogRepoConfig } {
     const repo = this.deps.store.findRepo(repoId);
     if (!repo) {
@@ -573,10 +612,15 @@ export class LocalBacklog {
                 zh: `仓库 ${name} 已经不在 config.yaml 的 backlog.repos 里，不能再重新开始它的提案`,
                 en: `Repo ${name} is no longer in backlog.repos of config.yaml, so its proposals cannot be started over`,
               })
-            : t({
-                zh: `仓库 ${name} 已经不在 config.yaml 的 backlog.repos 里，不能再采纳它的迭代`,
-                en: `Repo ${name} is no longer in backlog.repos of config.yaml, so its iterations cannot be accepted`,
-              }),
+            : what.kind === 'edit'
+              ? t({
+                  zh: `仓库 ${name} 已经不在 config.yaml 的 backlog.repos 里，不能再修改它的提案；拒绝还可以`,
+                  en: `Repo ${name} is no longer in backlog.repos of config.yaml, so its proposals cannot be edited; they can still be rejected`,
+                })
+              : t({
+                  zh: `仓库 ${name} 已经不在 config.yaml 的 backlog.repos 里，不能再采纳它的迭代`,
+                  en: `Repo ${name} is no longer in backlog.repos of config.yaml, so its iterations cannot be accepted`,
+                }),
       );
     }
     return this.repoSetup(repo.name);
@@ -635,6 +679,68 @@ export class LocalBacklog {
       });
       return rejected;
     });
+  }
+
+  /**
+   * A human edits a proposal before it is decided, as one edits an issue before adding
+   * ares1:ready: its title, why, evidence, what to do, acceptance criteria, category, size or
+   * risk, each left out to keep it. Only a pending proposal of its own may be edited; a decided
+   * one or a step of an iteration (decided with its iteration as a whole) is refused
+   * (ConflictError, saying why), and so is one whose repo left backlog.repos or has problems
+   * (`deciding`). The texts are tidied as `write` tidies them: the title on one line, every text
+   * trimmed, empty list items left out; a blank title or what to do is refused.
+   *
+   * Only the fields whose value changes count: those are written, with `editedAt` and a
+   * `proposal.edited` event (`{ repo, proposalId, fields }`, the names of the changed fields,
+   * never their text) in one transaction. When nothing changes, nothing is recorded.
+   *
+   * A scout's proposal edited into the repo's auto_accept is then accepted as at a poll, while
+   * the work switch is on (`acceptWithinLimits`: the oldest pending ones first, within today's
+   * count and budget); a human's draft stays theirs to start (`authorDecides`). A failure there
+   * leaves the edit recorded and the proposal pending, for the next poll to try again, and is
+   * reported as a poll's. Returns the proposal as recorded then, accepted already if so.
+   */
+  edit(id: string, patch: RequirementEdit): Proposal {
+    const store = this.deps.store;
+    const p = store.getProposal(id);
+    if (!proposalEditable(p)) throw new ConflictError(notEditable(p));
+    const { repo, cfg } = this.deciding(p.repoId, { kind: 'edit', id });
+    const next: Partial<Pick<Proposal, ProposalEditField>> = {
+      ...(patch.title !== undefined ? { title: oneLine(patch.title) } : {}),
+      ...(patch.what !== undefined ? { what: patch.what.trim() } : {}),
+      ...(patch.why !== undefined ? { why: patch.why.trim() } : {}),
+      ...(patch.evidence !== undefined ? { evidence: items(patch.evidence) } : {}),
+      ...(patch.acceptance !== undefined ? { acceptance: items(patch.acceptance) } : {}),
+      ...(patch.category !== undefined ? { category: patch.category } : {}),
+      ...(patch.size !== undefined ? { size: patch.size } : {}),
+      ...(patch.risk !== undefined ? { risk: patch.risk } : {}),
+    };
+    if (next.title === '' || next.what === '') {
+      throw new InvalidStateError(
+        t({
+          zh: '需求的标题和要做什么都不能为空',
+          en: 'A requirement needs a title and what to do',
+        }),
+      );
+    }
+    const fields = PROPOSAL_EDIT_FIELDS.filter((f) => {
+      const value = next[f];
+      return value !== undefined && !sameValue(value, p[f]);
+    });
+    if (fields.length === 0) return p;
+    const changes = Object.fromEntries(fields.map((f) => [f, next[f]])) as typeof next;
+    const edited = store.tx(() => {
+      const updated = store.updateProposal(id, { ...changes, editedAt: nowIso() });
+      store.event(null, 'proposal.edited', { repo: repo.name, proposalId: id, fields });
+      return updated;
+    });
+    if (authorDecides(edited) || !store.working) return edited;
+    try {
+      this.acceptWithinLimits(repo, cfg);
+    } catch (err) {
+      this.report(err);
+    }
+    return store.getProposal(id);
   }
 
   /**

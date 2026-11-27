@@ -593,7 +593,8 @@ function YouSection(props: { input: GuideInput; home: string; working: boolean }
                 就照着做。开工后、合并之前想改需求，直接改 issue 的标题或正文，Master
                 下次检查时终止旧 Run，按新内容重来。看板不提供手动建 Run：接了 GitHub 或 GitLab
                 的仓库，需求只从那里的 issue 来；用本地提案池的仓库在
-                <a href={href.issues}>「需求」页</a>点「写需求」，马上开工或先存着。
+                <a href={href.issues}>「需求」页</a>
+                点「写需求」，马上开工或先存着；等你决定的提案可以先点「修改」改好再采纳。
               </>
             ),
             en: (
@@ -609,7 +610,8 @@ function YouSection(props: { input: GuideInput; home: string; working: boolean }
                 the old Run and starts over on the new text. The dashboard does not create Runs by
                 hand: for a repo on GitHub or GitLab, requirements only come from its issues there;
                 for a repo using the local backlog, click "Write a requirement" on the{' '}
-                <a href={href.issues}>Issues page</a> to start it at once or keep it for later.
+                <a href={href.issues}>Issues page</a> to start it at once or keep it for later; a
+                proposal waiting for you can be edited first, then accepted.
               </>
             ),
           })}

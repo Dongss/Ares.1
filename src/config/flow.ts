@@ -166,6 +166,15 @@ export function authorDecides(p: Pick<Proposal, 'author' | 'status'>): boolean {
 }
 
 /**
+ * Whether a human may edit a local proposal (PATCH /api/proposals/:id), as one edits an issue
+ * before adding ares1:ready: only while it is pending, a scout's or a human's alike. A decided one
+ * is not, and neither is a step of an iteration, decided with its iteration as a whole.
+ */
+export function proposalEditable(p: Pick<Proposal, 'status' | 'iterationId'>): boolean {
+  return p.status === 'pending' && p.iterationId === null;
+}
+
+/**
  * Longest title of a requirement a human writes (POST /api/proposals), in characters once
  * trimmed: one line, as a Run's title shows it. The dashboard's form stops there too.
  */

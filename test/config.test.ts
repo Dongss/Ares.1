@@ -28,6 +28,7 @@ import {
   normalizeTouches,
   plansStage,
   proposalAwaitingRedo,
+  proposalEditable,
   proposalRedoAllowed,
   proposalRedoDueAt,
   proposalRestartable,
@@ -3435,6 +3436,19 @@ describe('authorDecides', () => {
     }
     for (const status of ['pending', 'accepted', 'rejected', 'failed'] as const) {
       expect(authorDecides({ author: 'scout', status })).toBe(false);
+    }
+  });
+});
+
+describe('proposalEditable', () => {
+  it('lets a human edit only a pending proposal of its own', () => {
+    expect(proposalEditable({ status: 'pending', iterationId: null })).toBe(true);
+    for (const status of ['accepted', 'rejected', 'failed'] as const) {
+      expect(proposalEditable({ status, iterationId: null }), status).toBe(false);
+    }
+    // A step of an iteration is decided with its iteration, pending or not.
+    for (const status of ['pending', 'accepted', 'rejected', 'failed'] as const) {
+      expect(proposalEditable({ status, iterationId: 'iteration-1' }), status).toBe(false);
     }
   });
 });

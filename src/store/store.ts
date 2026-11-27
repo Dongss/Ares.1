@@ -1360,6 +1360,7 @@ export class Store {
       dependsOn: input.dependsOn ?? [],
       createdAt: nowIso(),
       decidedAt: null,
+      editedAt: null,
     };
     this.insert('proposals', proposal);
     return proposal;

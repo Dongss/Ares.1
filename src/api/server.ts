@@ -167,6 +167,19 @@ const WriteProposalInput = z.strictObject({
   risk: z.enum(RISKS).optional(),
   start: z.boolean().optional(),
 });
+const nothingToEdit = () =>
+  t({
+    zh: '至少要改一项：title、what、why、evidence、acceptance、category、size、risk',
+    en: 'Change at least one of title, what, why, evidence, acceptance, category, size, risk',
+  });
+/**
+ * An edit of a pending proposal (PATCH /api/proposals/:id): the fields of a requirement a human
+ * writes, each optional and checked by the same rules (a title or what to do given must not be
+ * blank), at least one of them.
+ */
+const EditProposalInput = WriteProposalInput.omit({ repo: true, start: true })
+  .partial()
+  .refine((edit) => Object.values(edit).some((v) => v !== undefined), { error: nothingToEdit });
 const goalBlank = () =>
   t({
     zh: '侦察的方向不能是空白；不想给方向就不传 goal',
@@ -628,6 +641,16 @@ export function createApi(deps: ApiDeps): Hono {
       } satisfies ProposalWritten,
       201,
     );
+  });
+
+  // A human edits a pending proposal of its own before deciding it: any of title, what, why,
+  // evidence, acceptance, category, size and risk, by the rules of writing one (400 otherwise).
+  // A decided proposal or a step of an iteration, 409. A scout's proposal edited into auto_accept
+  // may come back accepted already, as a poll would have accepted it.
+  app.patch('/api/proposals/:id', async (c) => {
+    const edit = await body(c, EditProposalInput);
+    const edited = backlog.edit(c.req.param('id'), edit);
+    return c.json(proposalView(store, edited, settings()) satisfies ProposalView);
   });
 
   // Accepting creates a Run whose goal is the proposal's text. A step of an iteration is decided

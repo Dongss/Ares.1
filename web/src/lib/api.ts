@@ -103,6 +103,12 @@ export interface RequirementInput {
   start?: boolean;
 }
 
+/**
+ * An edit of a pending proposal of its own (PATCH /api/proposals/:id): the fields of a
+ * requirement to change, the others left out; at least one.
+ */
+export type ProposalEdit = Partial<Omit<RequirementInput, 'repo' | 'start'>>;
+
 export const api = {
   health: () => request<HealthView>('GET', '/api/health'),
   setWorking: (on: boolean) => request<HealthView>('PUT', '/api/working', { on }),
@@ -182,6 +188,12 @@ export const api = {
    */
   writeProposal: (input: RequirementInput) =>
     request<ProposalWritten>('POST', '/api/proposals', input),
+  /**
+   * Edits a pending proposal of its own; one a scout proposed may come back accepted already,
+   * the edit having put it within auto-accept.
+   */
+  editProposal: (proposalId: string, edit: ProposalEdit) =>
+    request<ProposalView>('PATCH', `/api/proposals/${id(proposalId)}`, edit),
   /** Accepting creates a Run whose goal is the proposal's text. */
   acceptProposal: (proposalId: string) =>
     request<ProposalAccepted>('POST', `/api/proposals/${id(proposalId)}/accept`),

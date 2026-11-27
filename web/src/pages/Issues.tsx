@@ -11,7 +11,9 @@ import type {
   UpgradeStatus,
 } from '../../../src/api/types.js';
 import {
+  authorDecides,
   PROPOSAL_SIZES,
+  proposalEditable,
   REQUIREMENT_TEXT_MAX,
   REQUIREMENT_TITLE_MAX,
   RISKS,
@@ -54,6 +56,11 @@ import {
   backlogOutdatedBy,
   canReject,
   decidedText,
+  draftOf,
+  editBlocker,
+  editedAtText,
+  editedMark,
+  editedResultText,
   emptyDraft,
   humanMark,
   mergeProposals,
@@ -61,6 +68,7 @@ import {
   type ProposalGroup,
   pendingText,
   proposalCountsText,
+  proposalEdit,
   proposalGroups,
   proposalRedoText,
   RECENT_PROPOSALS,
@@ -68,6 +76,7 @@ import {
   requirementInput,
   restartBlocker,
   restartHint,
+  saveEditBlocker,
   scoutProposalFiled,
   writeBlocker,
   writtenText,
@@ -885,108 +894,7 @@ function WriteRequirement({ repo, onWritten }: { repo: BacklogRepoStatus; onWrit
       )}
       {open && (
         <div className="form write-requirement-form">
-          <label className="field">
-            <span>{t({ zh: '标题', en: 'Title' })}</span>
-            <input
-              value={draft.title}
-              onChange={(e) => update({ title: e.target.value })}
-              maxLength={REQUIREMENT_TITLE_MAX}
-              placeholder={t({
-                zh: '一句话说清要什么，比如「Run 列表能导出成 CSV」',
-                en: 'What you want, in one line, e.g. "Export the Run list as CSV"',
-              })}
-            />
-          </label>
-          <label className="field">
-            <span>{t({ zh: '要做什么', en: 'What to do' })}</span>
-            <textarea
-              value={draft.what}
-              onChange={(e) => update({ what: e.target.value })}
-              maxLength={REQUIREMENT_TEXT_MAX}
-              rows={5}
-              placeholder={t({
-                zh: '具体要改什么、做到什么程度；Agent 照着它做',
-                en: 'What exactly to change, and how far to go; the agents work from it',
-              })}
-            />
-          </label>
-          <label className="field">
-            <span>{t({ zh: '为什么（可选）', en: 'Why (optional)' })}</span>
-            <textarea
-              value={draft.why}
-              onChange={(e) => update({ why: e.target.value })}
-              maxLength={REQUIREMENT_TEXT_MAX}
-              rows={2}
-              placeholder={t({
-                zh: '为什么要做；Agent 取舍时会参考',
-                en: 'Why it is worth doing; the agents weigh their choices by it',
-              })}
-            />
-          </label>
-          <label className="field">
-            <span>
-              {t({
-                zh: '验收标准（可选，每行一条）',
-                en: 'Acceptance criteria (optional, one per line)',
-              })}
-            </span>
-            <textarea
-              value={draft.acceptance}
-              onChange={(e) => update({ acceptance: e.target.value })}
-              rows={3}
-              placeholder={t({
-                zh: '怎样算做完，比如：\n能导出\n有测试',
-                en: 'How to tell it is done, e.g.:\nThe list can be exported\nThere are tests',
-              })}
-            />
-          </label>
-          <div className="form-row write-requirement-kind">
-            <label className="field">
-              <span>{t({ zh: '类别', en: 'Category' })}</span>
-              <select
-                value={draft.category}
-                onChange={(e) =>
-                  update({ category: e.target.value as RequirementDraft['category'] })
-                }
-              >
-                {PROPOSAL_CATEGORIES.map((c) => (
-                  <option key={c} value={c}>
-                    {CATEGORY[c]}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="field">
-              <span>{t({ zh: '大小', en: 'Size' })}</span>
-              <select
-                value={draft.size}
-                onChange={(e) => update({ size: e.target.value as RequirementDraft['size'] })}
-              >
-                {PROPOSAL_SIZES.map((s) => (
-                  <option key={s} value={s}>
-                    {s}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="field">
-              <span>{t({ zh: '风险', en: 'Risk' })}</span>
-              <select
-                value={draft.risk}
-                onChange={(e) => update({ risk: e.target.value as RequirementDraft['risk'] })}
-              >
-                {RISKS.map((r) => (
-                  <option key={r} value={r}>
-                    {RISK[r].label}
-                  </option>
-                ))}
-              </select>
-            </label>
-          </div>
-          <div className="hint">
-            {t({ zh: `大小 ${draft.size}：`, en: `Size ${draft.size}: ` })}
-            {sizeMeanings()[draft.size]}
-          </div>
+          <RequirementFields draft={draft} update={update} />
           <ErrorBox>{action.error}</ErrorBox>
           <div className="form-actions write-requirement-actions">
             <button
@@ -1021,8 +929,193 @@ function WriteRequirement({ repo, onWritten }: { repo: BacklogRepoStatus; onWrit
 }
 
 /**
+ * The fields of a requirement: title, what to do, why, evidence, acceptance criteria, category,
+ * size and risk, with what the size chosen means. The form that writes a requirement and the one
+ * that edits a pending proposal are the same.
+ */
+function RequirementFields(props: {
+  draft: RequirementDraft;
+  update: (patch: Partial<RequirementDraft>) => void;
+}) {
+  const { draft, update } = props;
+  return (
+    <>
+      <label className="field">
+        <span>{t({ zh: '标题', en: 'Title' })}</span>
+        <input
+          value={draft.title}
+          onChange={(e) => update({ title: e.target.value })}
+          maxLength={REQUIREMENT_TITLE_MAX}
+          placeholder={t({
+            zh: '一句话说清要什么，比如「Run 列表能导出成 CSV」',
+            en: 'What you want, in one line, e.g. "Export the Run list as CSV"',
+          })}
+        />
+      </label>
+      <label className="field">
+        <span>{t({ zh: '要做什么', en: 'What to do' })}</span>
+        <textarea
+          value={draft.what}
+          onChange={(e) => update({ what: e.target.value })}
+          maxLength={REQUIREMENT_TEXT_MAX}
+          rows={5}
+          placeholder={t({
+            zh: '具体要改什么、做到什么程度；Agent 照着它做',
+            en: 'What exactly to change, and how far to go; the agents work from it',
+          })}
+        />
+      </label>
+      <label className="field">
+        <span>{t({ zh: '为什么（可选）', en: 'Why (optional)' })}</span>
+        <textarea
+          value={draft.why}
+          onChange={(e) => update({ why: e.target.value })}
+          maxLength={REQUIREMENT_TEXT_MAX}
+          rows={2}
+          placeholder={t({
+            zh: '为什么要做；Agent 取舍时会参考',
+            en: 'Why it is worth doing; the agents weigh their choices by it',
+          })}
+        />
+      </label>
+      <label className="field">
+        <span>{t({ zh: '证据（可选，每行一条）', en: 'Evidence (optional, one per line)' })}</span>
+        <textarea
+          value={draft.evidence}
+          onChange={(e) => update({ evidence: e.target.value })}
+          rows={2}
+          placeholder={t({
+            zh: '相关的文件、行号或现象，比如：\nweb/src/pages/Home.tsx',
+            en: 'Files, lines or symptoms it is about, e.g.:\nweb/src/pages/Home.tsx',
+          })}
+        />
+      </label>
+      <label className="field">
+        <span>
+          {t({
+            zh: '验收标准（可选，每行一条）',
+            en: 'Acceptance criteria (optional, one per line)',
+          })}
+        </span>
+        <textarea
+          value={draft.acceptance}
+          onChange={(e) => update({ acceptance: e.target.value })}
+          rows={3}
+          placeholder={t({
+            zh: '怎样算做完，比如：\n能导出\n有测试',
+            en: 'How to tell it is done, e.g.:\nThe list can be exported\nThere are tests',
+          })}
+        />
+      </label>
+      <div className="form-row write-requirement-kind">
+        <label className="field">
+          <span>{t({ zh: '类别', en: 'Category' })}</span>
+          <select
+            value={draft.category}
+            onChange={(e) => update({ category: e.target.value as RequirementDraft['category'] })}
+          >
+            {PROPOSAL_CATEGORIES.map((c) => (
+              <option key={c} value={c}>
+                {CATEGORY[c]}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="field">
+          <span>{t({ zh: '大小', en: 'Size' })}</span>
+          <select
+            value={draft.size}
+            onChange={(e) => update({ size: e.target.value as RequirementDraft['size'] })}
+          >
+            {PROPOSAL_SIZES.map((s) => (
+              <option key={s} value={s}>
+                {s}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="field">
+          <span>{t({ zh: '风险', en: 'Risk' })}</span>
+          <select
+            value={draft.risk}
+            onChange={(e) => update({ risk: e.target.value as RequirementDraft['risk'] })}
+          >
+            {RISKS.map((r) => (
+              <option key={r} value={r}>
+                {RISK[r].label}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+      <div className="hint">
+        {t({ zh: `大小 ${draft.size}：`, en: `Size ${draft.size}: ` })}
+        {sizeMeanings()[draft.size]}
+      </div>
+    </>
+  );
+}
+
+/**
+ * Editing a pending proposal of its own (PATCH /api/proposals/:id): the form that writes a
+ * requirement, filled with what the proposal says now; only the fields changed are sent.
+ * `onSaved`: the proposal as the Master recorded it, accepted already when the edit put a scout's
+ * proposal within auto-accept.
+ */
+function EditProposal(props: {
+  proposal: ProposalView;
+  onSaved: (saved: ProposalView) => void;
+  onCancel: () => void;
+}) {
+  const { proposal: p, onSaved, onCancel } = props;
+  const action = useAction();
+  const [before] = useState(() => draftOf(p));
+  const [draft, setDraft] = useState(before);
+  const update = (patch: Partial<RequirementDraft>) => setDraft((d) => ({ ...d, ...patch }));
+  const blocker = saveEditBlocker(before, draft);
+  const save = async () => {
+    if (blocker !== null) return;
+    const saved = await action.run(() => api.editProposal(p.id, proposalEdit(before, draft)));
+    if (saved !== undefined) onSaved(saved);
+  };
+  return (
+    <div className="form write-requirement-form proposal-edit-form">
+      <RequirementFields draft={draft} update={update} />
+      <ErrorBox>{action.error}</ErrorBox>
+      <div className="form-actions write-requirement-actions">
+        <button
+          type="button"
+          className="btn-primary"
+          disabled={action.busy || blocker !== null}
+          title={blocker ?? undefined}
+          onClick={save}
+        >
+          {t({ zh: '保存', en: 'Save' })}
+        </button>
+        <button type="button" disabled={action.busy} onClick={onCancel}>
+          {t({ zh: '取消', en: 'Cancel' })}
+        </button>
+        <span className="muted">
+          {blocker ??
+            (authorDecides(p)
+              ? t({
+                  zh: '保存后还是等你采纳；事件列表里记下改了哪些项',
+                  en: 'Once saved it still waits for you to accept it; the event list records which fields changed',
+                })
+              : t({
+                  zh: '保存后如果落在自动采纳范围内，会照常自动采纳；事件列表里记下改了哪些项',
+                  en: 'Once saved, it is accepted automatically as usual if it falls within auto-accept; the event list records which fields changed',
+                }))}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+/**
  * One proposal: what it is, folded open to read why, the evidence, what to do and how to tell it
- * is done. Pending ones can be accepted, or rejected with a reason; decided ones say how.
+ * is done. Pending ones of their own can be edited, accepted, or rejected with a reason; decided
+ * ones say how. One a human edited is marked so.
  */
 function ProposalItem(props: {
   proposal: ProposalView;
@@ -1032,10 +1125,14 @@ function ProposalItem(props: {
   const { proposal: p, group, onChanged } = props;
   const action = useAction();
   const [reason, setReason] = useState('');
+  const [editing, setEditing] = useState(false);
+  const [saved, setSaved] = useState<ProposalView | null>(null);
   const status = PROPOSAL_STATUS[p.status];
   const blocker = acceptBlocker(p, group.status);
+  const cannotEdit = editBlocker(p, group.status);
   const waiting = pendingText(p, group.status?.autoAccept ?? null);
   const human = humanMark(p);
+  const edited = editedMark(p);
   const decided = decidedText(p);
   const attempts = attemptsText(p);
   const redo = proposalRedoText(p);
@@ -1057,6 +1154,13 @@ function ProposalItem(props: {
           {human && (
             <>
               <Badge tone="neutral">{human}</Badge>{' '}
+            </>
+          )}
+          {edited && (
+            <>
+              <span title={editedAtText(p) ?? undefined}>
+                <Badge tone="neutral">{edited}</Badge>
+              </span>{' '}
             </>
           )}
           <span className="proposal-title">{p.title}</span>{' '}
@@ -1116,18 +1220,31 @@ function ProposalItem(props: {
           </a>
         </div>
       )}
-      {p.status === 'pending' && !p.iterationId && (
+      {saved && <div className="hint">{editedResultText(saved)}</div>}
+      {proposalEditable(p) && (
         <>
           {waiting && <div className="hint">{waiting}</div>}
           <div className="proposal-actions">
             <button
               type="button"
               className="btn-primary"
-              disabled={action.busy || blocker !== null}
+              disabled={action.busy || editing || blocker !== null}
               title={blocker ?? undefined}
               onClick={accept}
             >
               {t({ zh: '采纳', en: 'Accept' })}
+            </button>
+            <button
+              type="button"
+              aria-expanded={editing}
+              disabled={action.busy || (!editing && cannotEdit !== null)}
+              title={cannotEdit ?? undefined}
+              onClick={() => {
+                setEditing(!editing);
+                setSaved(null);
+              }}
+            >
+              {editing ? t({ zh: '收起修改', en: 'Close editing' }) : t({ zh: '修改', en: 'Edit' })}
             </button>
             <input
               value={reason}
@@ -1141,11 +1258,22 @@ function ProposalItem(props: {
             <ConfirmButton
               label={t({ zh: '拒绝', en: 'Reject' })}
               confirmLabel={t({ zh: '确认拒绝', en: 'Confirm reject' })}
-              disabled={action.busy || !canReject(p, reason)}
+              disabled={action.busy || editing || !canReject(p, reason)}
               onConfirm={reject}
             />
           </div>
           <ErrorBox>{action.error}</ErrorBox>
+          {editing && (
+            <EditProposal
+              proposal={p}
+              onSaved={(result) => {
+                setEditing(false);
+                setSaved(result);
+                onChanged();
+              }}
+              onCancel={() => setEditing(false)}
+            />
+          )}
         </>
       )}
     </li>

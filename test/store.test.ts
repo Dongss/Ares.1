@@ -553,6 +553,35 @@ describe('proposals of the local backlog', () => {
     expect(readdirSync(dir).filter((f) => f.includes('.bak-v14-'))).toHaveLength(1);
   });
 
+  it('migrates a v15 database: none of its proposals was edited by a human', () => {
+    const dir = tmpDir('ares1-db-');
+    const file = join(dir, 'ares1.db');
+    const old = new DatabaseSync(file);
+    for (const m of MIGRATIONS.slice(0, 15)) old.exec(m);
+    old.exec('PRAGMA user_version = 15');
+    old.exec(`
+      INSERT INTO repos (id, name, path, target_branch, created_at) VALUES ('r', 'r', '/r', 'main', 't');
+      INSERT INTO proposals (id, repo_id, scout_id, title, category, size, risk, why, what, created_at)
+        VALUES ('old', 'r', 's', 'a', 'feature', 'M', 'low', 'w', 'x', 't');
+    `);
+    old.close();
+
+    const store = new Store(file);
+    expect(
+      (store.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+    ).toBe(MIGRATIONS.length);
+    expect(store.getProposal('old')).toMatchObject({ title: 'a', editedAt: null });
+    const at = '2026-11-27T09:00:00.000Z';
+    expect(store.updateProposal('old', { title: 'b', editedAt: at })).toMatchObject({
+      title: 'b',
+      editedAt: at,
+    });
+    const created = store.createProposal({ ...proposed('c'), repoId: 'r', scoutId: null });
+    expect(store.getProposal(created.id).editedAt).toBeNull();
+    store.close();
+    expect(readdirSync(dir).filter((f) => f.includes('.bak-v15-'))).toHaveLength(1);
+  });
+
   it('creates, reads back, decides and lists them by repo and status, newest first', () => {
     const store = new Store(':memory:');
     const { repo, mk } = seed(store);
@@ -599,6 +628,7 @@ describe('proposals of the local backlog', () => {
       dependsOn: [],
       createdAt: a.createdAt,
       decidedAt: null,
+      editedAt: null,
     });
     expect(Object.keys(store.getProposal(a.id)).sort()).toEqual(Object.keys(a).sort());
     // JSON and boolean columns come back as they went in.

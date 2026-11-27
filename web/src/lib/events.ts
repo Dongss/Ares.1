@@ -50,6 +50,33 @@ function hostOf(event: GlobalEvent): 'GitHub' | 'GitLab' {
   return platformName(event.data.platform === 'gitlab' ? 'gitlab' : 'github');
 }
 
+/**
+ * A field of a proposal a human edited, as the `fields` of a `proposal.edited` event name it, in
+ * words; a name it does not know as it is.
+ */
+function editFieldLabel(field: string): string {
+  switch (field) {
+    case 'title':
+      return t({ zh: '标题', en: 'title' });
+    case 'what':
+      return t({ zh: '要做什么', en: 'what to do' });
+    case 'why':
+      return t({ zh: '为什么', en: 'why' });
+    case 'evidence':
+      return t({ zh: '证据', en: 'evidence' });
+    case 'acceptance':
+      return t({ zh: '验收标准', en: 'acceptance criteria' });
+    case 'category':
+      return t({ zh: '类别', en: 'category' });
+    case 'size':
+      return t({ zh: '大小', en: 'size' });
+    case 'risk':
+      return t({ zh: '风险', en: 'risk' });
+    default:
+      return field;
+  }
+}
+
 /** "：message" / ": message", or nothing without one. */
 function withMessage(message: unknown): string {
   const m = str(message);
@@ -552,6 +579,20 @@ export function globalEventText(event: GlobalEvent, now = new Date()): string | 
         });
       }
       return t({ zh: `${written}，存进了本地提案`, en: `${written}, kept in the local backlog` });
+    }
+    case 'proposal.edited': {
+      const edited = t({
+        zh: `有人改了 ${repoOf(event)} 的一条本地提案`,
+        en: `A human edited a local proposal of ${repoOf(event)}`,
+      });
+      const fields = Array.isArray(d.fields)
+        ? d.fields.filter((f): f is string => typeof f === 'string' && f !== '')
+        : [];
+      if (fields.length === 0) return edited;
+      return t({
+        zh: `${edited}：改了${join(fields.map(editFieldLabel))}`,
+        en: `${edited}: changed its ${join(fields.map(editFieldLabel))}`,
+      });
     }
     case 'proposal.auto_accepted':
     case 'proposal.accepted': {
