@@ -76,6 +76,9 @@ const section = (text: string, heading: string) => {
   return text.slice(start + 1, end < 0 ? undefined : end);
 };
 
+/** The last line of a section of a prompt (`section`) with any text in it. */
+const lastLine = (text: string) => text.trimEnd().split('\n').at(-1);
+
 /** A closed issue by the repo's owner "me", done unless `extra` says otherwise. */
 const issue = (number: number, title: string, extra: Partial<HostIssue> = {}): HostIssue => ({
   number,
@@ -2188,25 +2191,25 @@ describe('localProposalDigest', () => {
     expect(digest).toBe(
       [
         '### 等人决定',
-        '- proposal-6 等人的提案',
+        '- proposal-6 等人的提案（侦察提的）',
         '  后续步骤：',
         '    - 做 B',
         '    - 做 C',
         '',
         '### 已采纳',
-        '- proposal-5 做完的第一步（Run run-1：已完成，自动采纳）',
+        '- proposal-5 做完的第一步（侦察提的，Run run-1：已完成，自动采纳）',
         '  后续步骤：',
         '    - 做 D',
-        '- proposal-4 失败的提案（Run run-2：失败）',
+        '- proposal-4 失败的提案（侦察提的，Run run-2：失败）',
         '  失败原因：`npm test` 未通过： 3 个测试失败',
-        '- proposal-3 评估不做的提案（Run run-3：不做）',
+        '- proposal-3 评估不做的提案（侦察提的，Run run-3：不做）',
         '  需求评估结论为不做，理由：README 不要求 这个能力',
-        '- proposal-2 Run 被删掉的提案（Run run-gone）',
+        '- proposal-2 Run 被删掉的提案（侦察提的，Run run-gone）',
         '',
         '### 被拒绝',
-        '- proposal-1 被拒绝的提案',
+        '- proposal-1 被拒绝的提案（侦察提的）',
         '  理由：这个方向 不对',
-        '- proposal-0 没写理由的',
+        '- proposal-0 没写理由的（侦察提的）',
       ].join('\n'),
     );
   });
@@ -2257,15 +2260,15 @@ describe('localProposalDigest', () => {
         '（无）',
         '',
         '### 已采纳',
-        '- proposal-2 重做中的（Run run-3：执行中，第 2 次尝试）',
-        '- proposal-1 等重做的（Run run-1：失败，等自动重做）',
+        '- proposal-2 重做中的（侦察提的，Run run-3：执行中，第 2 次尝试）',
+        '- proposal-1 等重做的（侦察提的，Run run-1：失败，等自动重做）',
         '  失败原因：额度用完了',
         '',
         '### 被拒绝',
         '（无）',
         '',
         '### 多次失败后放弃（不是人拒绝的）',
-        '- proposal-3 放弃的（失败 2 次，自动采纳）',
+        '- proposal-3 放弃的（侦察提的，失败 2 次，自动采纳）',
         '  第 1 次（Run run-4，失败在「编码」阶段）：准备命令 失败了',
         '  第 2 次（Run run-5）：测试没过',
       ].join('\n'),
@@ -2281,7 +2284,7 @@ describe('localProposalDigest', () => {
     expect(english).toContain(
       [
         '### Given up after repeated failures (not rejected by a human)',
-        '- proposal-3 Given up (failed once)',
+        '- proposal-3 Given up (proposed by a scout; failed once)',
         '  Attempt 1 (Run run-5, failed in the "Coding" stage): tests failed',
       ].join('\n'),
     );
@@ -2331,11 +2334,11 @@ describe('localProposalDigest', () => {
         '（无）',
         '',
         '### 多次失败后放弃（不是人拒绝的）',
-        '- proposal-3 已完成迭代的子项（失败 1 次，所属迭代 iteration-2 已完成）',
+        '- proposal-3 已完成迭代的子项（侦察提的，失败 1 次，所属迭代 iteration-2 已完成）',
         '  第 1 次（Run run-proposal-3）：构建 失败',
-        '- proposal-2 被终止迭代的子项（失败 1 次，所属迭代 iteration-1 已被人终止）',
+        '- proposal-2 被终止迭代的子项（侦察提的，失败 1 次，所属迭代 iteration-1 已被人终止）',
         '  第 1 次（Run run-proposal-2）：额度用完了',
-        '- proposal-1 不属于迭代的（失败 1 次）',
+        '- proposal-1 不属于迭代的（侦察提的，失败 1 次）',
         '  第 1 次（Run run-proposal-1）：准备命令失败',
       ].join('\n'),
     );
@@ -2357,11 +2360,11 @@ describe('localProposalDigest', () => {
     expect(english).toContain(
       [
         '### Given up after repeated failures (not rejected by a human)',
-        '- proposal-3 Step of a done iteration (failed once; its iteration iteration-2 is done)',
+        '- proposal-3 Step of a done iteration (proposed by a scout; failed once; its iteration iteration-2 is done)',
         '  Attempt 1 (Run run-proposal-3): build failed',
-        '- proposal-2 Step of a cancelled iteration (failed once; its iteration iteration-1 was cancelled by a human)',
+        '- proposal-2 Step of a cancelled iteration (proposed by a scout; failed once; its iteration iteration-1 was cancelled by a human)',
         '  Attempt 1 (Run run-proposal-2): out of quota',
-        '- proposal-1 Outside any iteration (failed once)',
+        '- proposal-1 Outside any iteration (proposed by a scout; failed once)',
         '  Attempt 1 (Run run-proposal-1): setup failed',
       ].join('\n'),
     );
@@ -2370,9 +2373,124 @@ describe('localProposalDigest', () => {
     expect(english).not.toMatch(/[一-鿿]/);
   });
 
+  it("marks where each proposal came from: a human's, a scout's a human edited, a scout's", () => {
+    const edited = '2026-11-21T00:00:00.000Z';
+    /** One proposal of each source in `status`, newest first. */
+    const each = (status: Proposal['status'], extra: Partial<Proposal> = {}) => {
+      const n = { pending: 0, accepted: 3, rejected: 6, failed: 9 }[status];
+      const of = { status, ...extra };
+      return [
+        localProposal(`proposal-${n + 3}`, `${status}-人写`, {
+          ...of,
+          author: 'human',
+          scoutId: null,
+          // Edited or not, a human's own stays a human's.
+          editedAt: edited,
+        }),
+        localProposal(`proposal-${n + 2}`, `${status}-改过`, { ...of, editedAt: edited }),
+        localProposal(`proposal-${n + 1}`, `${status}-侦察`, of),
+      ];
+    };
+    const failures = [{ runId: 'run-9', attempt: 1, stage: null, error: '测试没过' }];
+    const steps = [
+      localProposal('proposal-21', '第二步', {
+        status: 'rejected',
+        iterationId: 'iteration-1',
+        editedAt: edited,
+        rejectReason: '现在不做',
+      }),
+      localProposal('proposal-20', '第一步', {
+        status: 'rejected',
+        iterationId: 'iteration-1',
+        rejectReason: '现在不做',
+      }),
+    ];
+    const proposals = [
+      ...steps,
+      ...each('failed', { runId: 'run-9', failures }),
+      ...each('rejected', { rejectReason: '不要' }),
+      ...each('accepted', { runId: 'run-1' }),
+      ...each('pending'),
+    ];
+    const iterations: ProposalIteration[] = [
+      { id: 'iteration-1', title: '本地迭代', status: 'cancelled', children: [] },
+    ];
+    expect(localProposalDigest(proposals, undefined, iterations)).toBe(
+      [
+        '### 等人决定',
+        '- proposal-3 pending-人写（人写的）',
+        '- proposal-2 pending-改过（侦察提的，被人改过）',
+        '- proposal-1 pending-侦察（侦察提的）',
+        '',
+        '### 已采纳',
+        '- proposal-6 accepted-人写（人写的，Run run-1）',
+        '- proposal-5 accepted-改过（侦察提的，被人改过，Run run-1）',
+        '- proposal-4 accepted-侦察（侦察提的，Run run-1）',
+        '',
+        '### 被拒绝',
+        '- iteration-1 迭代「本地迭代」（侦察提的，子项：第一步、第二步（侦察提的，被人改过））',
+        '  理由：现在不做',
+        '- proposal-9 rejected-人写（人写的）',
+        '  理由：不要',
+        '- proposal-8 rejected-改过（侦察提的，被人改过）',
+        '  理由：不要',
+        '- proposal-7 rejected-侦察（侦察提的）',
+        '  理由：不要',
+        '',
+        '### 多次失败后放弃（不是人拒绝的）',
+        '- proposal-12 failed-人写（人写的，失败 1 次）',
+        '  第 1 次（Run run-9）：测试没过',
+        '- proposal-11 failed-改过（侦察提的，被人改过，失败 1 次）',
+        '  第 1 次（Run run-9）：测试没过',
+        '- proposal-10 failed-侦察（侦察提的，失败 1 次）',
+        '  第 1 次（Run run-9）：测试没过',
+      ].join('\n'),
+    );
+
+    setLang('en');
+    const english = localProposalDigest(
+      proposals.map((p) => ({
+        ...p,
+        title: p.title
+          .replace('人写', 'human')
+          .replace('改过', 'edited')
+          .replace('侦察', 'scout')
+          .replace('第一步', 'First')
+          .replace('第二步', 'Second'),
+        rejectReason: p.rejectReason && 'Not now',
+        failures: p.failures.map((f) => ({ ...f, error: 'tests failed' })),
+      })),
+      undefined,
+      [{ ...(iterations[0] as ProposalIteration), title: 'Local iteration' }],
+    );
+    expect(english).toContain(
+      [
+        '### Waiting for a human',
+        '- proposal-3 pending-human (written by a human)',
+        '- proposal-2 pending-edited (proposed by a scout, edited by a human)',
+        '- proposal-1 pending-scout (proposed by a scout)',
+        '',
+        '### Accepted',
+        '- proposal-6 accepted-human (written by a human; Run run-1)',
+        '- proposal-5 accepted-edited (proposed by a scout, edited by a human; Run run-1)',
+        '- proposal-4 accepted-scout (proposed by a scout; Run run-1)',
+      ].join('\n'),
+    );
+    expect(english).toContain(
+      '- iteration-1 iteration "Local iteration" (proposed by a scout; steps: First, Second (proposed by a scout, edited by a human))',
+    );
+    expect(english).toContain(
+      '- proposal-9 rejected-human (written by a human)\n  Reason: Not now',
+    );
+    expect(english).toContain(
+      '- proposal-11 failed-edited (proposed by a scout, edited by a human; failed once)',
+    );
+    expect(english).not.toMatch(/[一-鿿]/);
+  });
+
   it('names the Run without its status when it is not known', () => {
     const accepted = localProposal('proposal-1', '已采纳', { status: 'accepted', runId: 'run-1' });
-    expect(localProposalDigest([accepted])).toContain('- proposal-1 已采纳（Run run-1）');
+    expect(localProposalDigest([accepted])).toContain('- proposal-1 已采纳（侦察提的，Run run-1）');
   });
 
   it('cuts long titles and reasons, and counts what does not fit', () => {
@@ -2381,14 +2499,14 @@ describe('localProposalDigest', () => {
       rejectReason: '因'.repeat(310),
     });
     const digest = localProposalDigest([long]);
-    expect(digest).toContain(`- proposal-1 ${'题'.repeat(120)}…\n`);
+    expect(digest).toContain(`- proposal-1 ${'题'.repeat(120)}…（侦察提的）\n`);
     expect(digest).toContain(`  理由：${'因'.repeat(300)}…`);
     const many = Array.from({ length: 103 }, (_, i) =>
       localProposal(`proposal-${i}`, `第 ${i} 条`),
     );
     const pending = localProposalDigest(many).split('\n\n')[0]?.split('\n') ?? [];
     expect(pending).toHaveLength(1 + 100 + 1);
-    expect(pending.at(-2)).toBe('- proposal-99 第 99 条');
+    expect(pending.at(-2)).toBe('- proposal-99 第 99 条（侦察提的）');
     expect(pending.at(-1)).toBe('…另有 3 条');
   });
 
@@ -2412,16 +2530,16 @@ describe('localProposalDigest', () => {
     expect(digest).toBe(
       [
         '### Waiting for a human',
-        '- proposal-3 Waiting',
+        '- proposal-3 Waiting (proposed by a scout)',
         '  Next steps:',
         '    - Do B',
         '',
         '### Accepted',
-        '- proposal-2 Accepted (Run run-1: failed; accepted automatically)',
+        '- proposal-2 Accepted (proposed by a scout; Run run-1: failed; accepted automatically)',
         '  Why it failed: checks failed',
         '',
         '### Rejected',
-        '- proposal-1 Turned down',
+        '- proposal-1 Turned down (proposed by a scout)',
         '  Reason: Not this way',
       ].join('\n'),
     );
@@ -2549,7 +2667,9 @@ describe('scoutPrompt: the local backlog', () => {
         '提案会存进 Master 的本地提案池，在看板上被采纳（或按自动采纳的设置采纳）后由 Agent 按「编码 → 评审 → 合并」完成。',
       );
       expect(section(prompt, '## 已有的本地提案')).toContain(issues);
-      expect(prompt).toContain('- proposal-1 被拒绝的提案\n  理由：和 README 的目标无关');
+      expect(prompt).toContain(
+        '- proposal-1 被拒绝的提案（侦察提的）\n  理由：和 README 的目标无关',
+      );
       expect(prompt).toContain('被拒绝的提案是反例，注意其中的理由，不要换个说法再提');
       expect(prompt).not.toMatch(/issue|GitHub/i);
     }
@@ -2567,6 +2687,63 @@ describe('scoutPrompt: the local backlog', () => {
       '已采纳、但 Run 失败了的提案，以及「多次失败后放弃」的提案不一样：它不是人拒绝的',
     );
     expect(splitting).toContain('还在等自动重做的不要再提');
+  });
+
+  it("takes the proposals a human wrote or edited as the human's direction, never to repeat", () => {
+    const issues = localProposalDigest([
+      localProposal('proposal-3', '支持导出报表', { author: 'human', scoutId: null }),
+      localProposal('proposal-2', '改过的提案', { editedAt: '2026-11-21T00:00:00.000Z' }),
+      localProposal('proposal-1', '侦察的提案'),
+    ]);
+    const human =
+      '下面已有的本地提案里，标着「人写的」或「被人改过」的，是人亲手写下或改过的需求，代表人的方向：不要换个说法重复提；规划迭代时，优先考虑和它们相关、还没有提案在做的缺口。';
+    for (const prompt of prompts('local', issues)) {
+      // Among the leads, after the numbered ones.
+      expect(lastLine(section(prompt, '## 线索（按优先级从高到低）'))).toBe(human);
+      const existing = section(prompt, '## 已有的本地提案');
+      expect(existing).toContain('- proposal-3 支持导出报表（人写的）');
+      expect(existing).toContain('- proposal-2 改过的提案（侦察提的，被人改过）');
+      expect(existing).toContain('- proposal-1 侦察的提案（侦察提的）');
+    }
+    // Issues carry no such mark.
+    for (const prompt of prompts('github', '（无）')) {
+      expect(prompt).not.toContain('人写的');
+      expect(prompt).not.toContain('被人改过');
+    }
+    // A direction given by hand still decides the iteration.
+    const directed = scoutPrompt({
+      repoName: 'demo',
+      source: 'local',
+      max: 3,
+      runs: '',
+      issues,
+      splits: true,
+      autoAcceptsL: false,
+      goal: '支持导出报表',
+    });
+    expect(lastLine(section(directed, '## 线索（按优先级从高到低）'))).toBe(
+      human.replace('缺口。', '缺口，不过这次的迭代仍以上面「人给出的方向」为准。'),
+    );
+
+    setLang('en');
+    const english = localProposalDigest([
+      localProposal('proposal-3', 'Export reports', { author: 'human', scoutId: null }),
+      localProposal('proposal-2', 'Edited', { editedAt: '2026-11-21T00:00:00.000Z' }),
+      localProposal('proposal-1', "A scout's", { what: 'Do A' }),
+    ]);
+    for (const prompt of prompts('local', english)) {
+      expect(lastLine(section(prompt, '## Leads (highest priority first)'))).toBe(
+        'Among the existing local proposals below, those marked "written by a human" or "edited by a human" are requirements a human wrote or changed by hand, and show the human\'s direction: do not propose them again in other words; when planning the iteration, consider first the gaps related to them that no proposal works on yet.',
+      );
+      const existing = section(prompt, '## Existing local proposals');
+      expect(existing).toContain('- proposal-3 Export reports (written by a human)');
+      expect(existing).toContain('- proposal-2 Edited (proposed by a scout, edited by a human)');
+      expect(existing).toContain("- proposal-1 A scout's (proposed by a scout)");
+      expect(prompt).not.toMatch(/[一-鿿]/);
+    }
+    for (const prompt of prompts('github', '(none)')) {
+      expect(prompt).not.toContain('written by a human');
+    }
   });
 
   it('keeps the prompt of a GitHub repo as it was', () => {
@@ -2619,7 +2796,9 @@ describe('scoutPrompt: the local backlog', () => {
     for (const prompt of prompts('local', issues)) {
       expect(prompt).toContain("Each proposal goes into the Master's local backlog;");
       expect(section(prompt, '## Existing local proposals')).toContain(issues);
-      expect(prompt).toContain('- proposal-1 Turned down\n  Reason: Not a goal of README');
+      expect(prompt).toContain(
+        '- proposal-1 Turned down (proposed by a scout)\n  Reason: Not a goal of README',
+      );
       expect(prompt).toContain('Rejected proposals are counterexamples');
       expect(prompt).toContain(
         'Accepted proposals whose Run failed, and proposals "given up after repeated failures", are different: no human rejected them',
@@ -3280,6 +3459,67 @@ describe('scoutPrompt: an iteration under way', () => {
     const text = prompt('github', failure);
     expect(firstLead(text)).toContain('，以及下面的「Master 自动升级失败」');
     expect(text).toContain('## Master 自动升级失败');
+  });
+
+  it('marks the local proposals a human wrote or edited while it proposes only problems', () => {
+    const text = scoutPrompt({
+      repoName: 'demo',
+      source: 'local',
+      max: 3,
+      runs: '',
+      issues: localProposalDigest([
+        localProposal('proposal-3', '支持导出报表', { author: 'human', scoutId: null }),
+        localProposal('proposal-2', '改过的提案', {
+          status: 'accepted',
+          runId: 'run-1',
+          editedAt: '2026-11-21T00:00:00.000Z',
+        }),
+        localProposal('proposal-1', '侦察的提案', { status: 'rejected' }),
+      ]),
+      splits: true,
+      autoAcceptsL: true,
+      iteration: iterationDigest(underWay(), iterationRunOf),
+    });
+    const existing = section(text, '## 已有的本地提案');
+    expect(existing).toContain('- proposal-3 支持导出报表（人写的）');
+    expect(existing).toContain('- proposal-2 改过的提案（侦察提的，被人改过，Run run-1）');
+    expect(existing).toContain('- proposal-1 侦察的提案（侦察提的）');
+    // Not to be proposed again; no iteration is planned this time.
+    expect(lastLine(section(text, '## 线索'))).toBe(
+      '下面已有的本地提案里，标着「人写的」或「被人改过」的，是人亲手写下或改过的需求，代表人的方向：不要换个说法重复提。',
+    );
+    // Issues carry no such mark.
+    expect(prompt('github')).not.toContain('人写的');
+
+    setLang('en');
+    const english = underWay({
+      title: 'Repos without GitHub keep going',
+      goal: 'A repo without GitHub proposes and finishes its own work',
+      readmeGoal: 'Perpetual motion',
+      criteria: ['A local repo finishes a round'],
+      outOfScope: [],
+    });
+    english.children = english.children.map((c) => ({ ...c, title: `Step ${c.position}` }));
+    const runOf = (): ProposalRun => ({ status: 'failed', error: 'x', discussion: [] });
+    const en = scoutPrompt({
+      repoName: 'demo',
+      source: 'local',
+      max: 3,
+      runs: '',
+      issues: localProposalDigest([
+        localProposal('proposal-2', 'Export reports', { author: 'human', scoutId: null }),
+        localProposal('proposal-1', 'Edited', { editedAt: '2026-11-21T00:00:00.000Z' }),
+      ]),
+      splits: true,
+      autoAcceptsL: true,
+      iteration: iterationDigest(english, runOf),
+    });
+    expect(en).toContain('- proposal-2 Export reports (written by a human)');
+    expect(en).toContain('- proposal-1 Edited (proposed by a scout, edited by a human)');
+    expect(lastLine(section(en, '## Leads'))).toBe(
+      'Among the existing local proposals below, those marked "written by a human" or "edited by a human" are requirements a human wrote or changed by hand, and show the human\'s direction: do not propose them again in other words.',
+    );
+    expect(en).not.toMatch(/[一-鿿]/);
   });
 
   it('never mentions issues in the local backlog, and says it all in English too', () => {

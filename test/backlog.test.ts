@@ -273,9 +273,9 @@ describe('local backlog', () => {
     t.scripts.scout = () => ({ structured: { gaps: [], proposals: [] } });
     await scoutByHand(t);
     const prompt = lastScoutPrompt(t);
-    expect(prompt).toContain(`- ${wanted.id} 要人定的（Run ${run.id}：`);
+    expect(prompt).toContain(`- ${wanted.id} 要人定的（侦察提的，Run ${run.id}：`);
     const rejectedPart = prompt.slice(prompt.indexOf('### 被拒绝'));
-    expect(rejectedPart).toContain(`- ${unwanted.id} 不想要的\n  理由：太复杂，不划算`);
+    expect(rejectedPart).toContain(`- ${unwanted.id} 不想要的（侦察提的）\n  理由：太复杂，不划算`);
 
     expect(gh.calls).toEqual([]);
   });
@@ -378,7 +378,8 @@ describe('local backlog', () => {
     await scoutDone(t, scout.id);
     // The scout was shown them, so that it does not propose them again.
     const pendingPart = lastScoutPrompt(t).slice(lastScoutPrompt(t).indexOf('### 等人决定'));
-    expect(pendingPart).toContain('人写的一');
+    // Marked as a human's: the human's direction.
+    expect(pendingPart).toContain('人写的一（人写的）');
     expect(store.listProposals({ repoId: t.repo.id, status: 'pending' })).toHaveLength(6);
     // The scout's three hold it back now; the drafts are not counted with them.
     await t.master.backlog.poll();
@@ -843,11 +844,13 @@ describe('local backlog: redo after a failure', () => {
     await scoutByHand(t);
     const prompt = lastScoutPrompt(t);
     const given = prompt.slice(prompt.indexOf('### 多次失败后放弃（不是人拒绝的）'));
-    expect(given).toContain(`- ${p.id} 加 feature（失败 2 次）`);
+    expect(given).toContain(`- ${p.id} 加 feature（侦察提的，失败 2 次）`);
     expect(given).toContain(`  第 1 次（Run ${first.id}，失败在「编码」阶段）：`);
     expect(given).toContain(`  第 2 次（Run ${second.id}，失败在「编码」阶段）：`);
     expect(given).toContain('第 2 次：模型额度用完了');
-    expect(prompt.slice(prompt.indexOf('### 被拒绝'))).not.toContain(`${p.id} 加 feature\n`);
+    expect(prompt.slice(prompt.indexOf('### 被拒绝'))).not.toContain(
+      `${p.id} 加 feature（侦察提的）\n`,
+    );
   });
 
   it('starts a failed proposal over by hand: attempts from 1, told why, redone again', async () => {
@@ -1100,7 +1103,7 @@ describe('local backlog: redo after a failure', () => {
     const given = prompt.slice(
       prompt.indexOf('### Given up after repeated failures (not rejected by a human)'),
     );
-    expect(given).toContain(`- ${p.id} Add a cache (failed 2 times)`);
+    expect(given).toContain(`- ${p.id} Add a cache (proposed by a scout; failed 2 times)`);
     expect(given).toContain(`  Attempt 2 (Run ${second.id}, failed in the "Coding" stage): `);
 
     const text = [second.goal, waiting, refused, given].join('\n');
@@ -1626,7 +1629,7 @@ describe('iterations of the local backlog', () => {
     expect(prompt).toContain('## 规划迭代');
     const firstProposal = stepProposals(t, filed.id)[0] as Proposal;
     expect(prompt).toContain(
-      `- ${firstProposal.id} 第一步（Run ${first.id}：已完成，自动采纳，所属迭代 ${filed.id} 已完成）`,
+      `- ${firstProposal.id} 第一步（侦察提的，Run ${first.id}：已完成，自动采纳，所属迭代 ${filed.id} 已完成）`,
     );
     expect(gh.calls).toEqual([]);
   });
@@ -1758,7 +1761,7 @@ describe('iterations of the local backlog', () => {
     expect(prompt).toContain('## 规划迭代');
     const rejectedPart = prompt.slice(prompt.indexOf('### 被拒绝'));
     expect(rejectedPart).toContain(
-      `- ${filed.id} 迭代「本地仓库也能永动」（子项：第一步、第二步、收尾）\n  理由：现在不做本地仓库`,
+      `- ${filed.id} 迭代「本地仓库也能永动」（侦察提的，子项：第一步、第二步、收尾）\n  理由：现在不做本地仓库`,
     );
     expect(rejectedPart).not.toContain(stepProposals(t, filed.id)[0]?.id ?? '');
   });
@@ -2141,7 +2144,7 @@ describe('iterations of the local backlog', () => {
     // The scout reads the step as ended with its iteration, not as waiting for a redo.
     await scoutByHand(t);
     expect(lastScoutPrompt(t)).toContain(
-      `- ${p1?.id} 第一步（Run ${first.id}：失败，自动采纳，所属迭代 ${filed.id} 已被人终止）`,
+      `- ${p1?.id} 第一步（侦察提的，Run ${first.id}：失败，自动采纳，所属迭代 ${filed.id} 已被人终止）`,
     );
   });
 
@@ -2187,7 +2190,7 @@ describe('iterations of the local backlog', () => {
     await scoutByHand(t);
     const prompt = lastScoutPrompt(t);
     expect(prompt).toContain(
-      `- ${filed.id} iteration "Local repos run on their own" (steps: First, Second)\n  Reason: Not now`,
+      `- ${filed.id} iteration "Local repos run on their own" (proposed by a scout; steps: First, Second)\n  Reason: Not now`,
     );
     const notice = noticeFor(
       {

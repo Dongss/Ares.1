@@ -1701,6 +1701,22 @@ function digestSection(heading: string, lines: string[], max: number): string {
 export type ProposalIteration = Pick<Iteration, 'id' | 'title' | 'status' | 'children'>;
 
 /**
+ * Where a local proposal came from, the first thing its line in the scout's list says: written by
+ * a human, proposed by a scout and edited by a human since, or proposed by a scout as it stands.
+ * The first two show where the human wants to go (see humanProposalsText).
+ */
+function proposalSourcePart(p: Pick<Proposal, 'author' | 'editedAt'>): string {
+  if (p.author === 'human') return t({ zh: '人写的', en: 'written by a human' });
+  return p.editedAt
+    ? t({ zh: '侦察提的，被人改过', en: 'proposed by a scout, edited by a human' })
+    : t({ zh: '侦察提的', en: 'proposed by a scout' });
+}
+
+/** What a line of the scout's list of local proposals says of it, in brackets after its title. */
+const aboutParts = (parts: readonly string[]) =>
+  t({ zh: `（${parts.join('，')}）`, en: ` (${parts.join('; ')})` });
+
+/**
  * How the iteration a listed proposal was a step of ended: done, or cancelled by a human. Null
  * when it is not a step of one; the steps of an iteration still open are not listed at all.
  */
@@ -1721,17 +1737,18 @@ function endedIterationPart(iteration: ProposalIteration | undefined): string | 
 }
 
 /**
- * An accepted proposal: the Run it became and how that stands, whether it was accepted without a
- * human, the iteration it was a step of once that ended (done, or cancelled by a human, when a
- * step without a Run never got one); why the Run failed or why its assessment dropped the
- * requirement, which the Run digest no longer shows once the Run is old; and its next steps.
+ * An accepted proposal: where it came from, the Run it became and how that stands, whether it was
+ * accepted without a human, the iteration it was a step of once that ended (done, or cancelled by
+ * a human, when a step without a Run never got one); why the Run failed or why its assessment
+ * dropped the requirement, which the Run digest no longer shows once the Run is old; and its next
+ * steps.
  */
 function acceptedProposalLine(
   p: Proposal,
   run: ProposalRun | undefined,
   iteration: ProposalIteration | undefined,
 ): string {
-  const parts: string[] = [];
+  const parts = [proposalSourcePart(p)];
   if (p.runId) {
     parts.push(run ? `Run ${p.runId}${colon()}${statusText(run.status)}` : `Run ${p.runId}`);
   }
@@ -1745,10 +1762,7 @@ function acceptedProposalLine(
   if (p.auto) parts.push(t({ zh: '自动采纳', en: 'accepted automatically' }));
   const ended = endedIterationPart(iteration);
   if (ended) parts.push(ended);
-  const about = parts.length
-    ? t({ zh: `（${parts.join('，')}）`, en: ` (${parts.join('; ')})` })
-    : '';
-  const lines = [`- ${p.id} ${oneLine(p.title, 120)}${about}`];
+  const lines = [`- ${p.id} ${oneLine(p.title, 120)}${aboutParts(parts)}`];
   const dropped = run?.status === 'dropped' ? conclusionOf(run.discussion) : null;
   if (dropped) {
     const reason = oneLine(dropped.summary, 300);
@@ -1765,18 +1779,21 @@ function acceptedProposalLine(
 }
 
 /**
- * A proposal given up after its Runs failed `max_run_attempts` times: how many times, whether it
- * was accepted without a human, the iteration it was a step of and how that ended, so the scout
- * can tell a step left behind from a requirement of its own; then each attempt with its Run, the
- * stage it failed in and why.
+ * A proposal given up after its Runs failed `max_run_attempts` times: where it came from, how many
+ * times, whether it was accepted without a human, the iteration it was a step of and how that
+ * ended, so the scout can tell a step left behind from a requirement of its own; then each attempt
+ * with its Run, the stage it failed in and why.
  */
 function failedProposalLine(p: Proposal, iteration: ProposalIteration | undefined): string {
   const n = p.failures.length;
-  const parts = [t({ zh: `失败 ${n} 次`, en: `failed ${n === 1 ? 'once' : `${n} times`}` })];
+  const parts = [
+    proposalSourcePart(p),
+    t({ zh: `失败 ${n} 次`, en: `failed ${n === 1 ? 'once' : `${n} times`}` }),
+  ];
   if (p.auto) parts.push(t({ zh: '自动采纳', en: 'accepted automatically' }));
   const ended = endedIterationPart(iteration);
   if (ended) parts.push(ended);
-  const about = t({ zh: `（${parts.join('，')}）`, en: ` (${parts.join('; ')})` });
+  const about = aboutParts(parts);
   const attempts = p.failures.map((f) => {
     const head = t({
       zh: `第 ${f.attempt} 次（Run ${f.runId}${f.stage ? `，失败在「${f.stage}」阶段` : ''}）`,
@@ -1793,12 +1810,15 @@ function failedProposalLine(p: Proposal, iteration: ProposalIteration | undefine
  * known), the rejected ones with the human's reason, as counterexamples, and, when there are any,
  * those given up after their Runs failed every attempt, with why each attempt failed. Pending and
  * accepted proposals carry their next steps (see nextSteps), so that the scout proposes the next
- * step of a large capability once the one before it is done. `proposals` are newest first; every
- * one was written by a scout of the Master and decided on its dashboard, so all of them are
- * trusted. `iterations` are the repo's: the steps of the one under way are left out, as the
- * iteration's own digest lists them (`iterationDigest`); the steps of one rejected as a whole make
- * one entry, the iteration with the titles of its steps and the reason; the steps of one that
- * ended are listed as the accepted or failed proposals they are, with how it ended.
+ * step of a large capability once the one before it is done. Each line says first where its
+ * proposal came from (`proposalSourcePart`): written by a human, a scout's edited by a human, or a
+ * scout's, since the human's ones show where the human wants to go. `proposals` are newest first;
+ * each was written by a scout of the Master or by a human on its dashboard, and decided there, so
+ * all of them are trusted. `iterations` are the repo's: the steps of the one under way are left
+ * out, as the iteration's own digest lists them (`iterationDigest`); the steps of one rejected as
+ * a whole make one entry, the iteration a scout planned with the titles of its steps (those a
+ * human wrote or edited saying so) and the reason; the steps of one that ended are listed as the
+ * accepted or failed proposals they are, with how it ended.
  */
 export function localProposalDigest(
   proposals: readonly Proposal[],
@@ -1812,9 +1832,10 @@ export function localProposalDigest(
     return !it || !ITERATION_OPEN_STATUSES.includes(it.status);
   });
   const of = (status: Proposal['status']) => listed.filter((p) => p.status === status);
-  const pending = of('pending').map(
-    (p) => `- ${p.id} ${oneLine(p.title, 120)}${nextStepsLines(p.what)}`,
-  );
+  /** A proposal's id and title, then where it came from. */
+  const head = (p: Proposal) =>
+    `- ${p.id} ${oneLine(p.title, 120)}${aboutParts([proposalSourcePart(p)])}`;
+  const pending = of('pending').map((p) => `${head(p)}${nextStepsLines(p.what)}`);
   const accepted = of('accepted').map((p) =>
     acceptedProposalLine(p, p.runId ? runOf?.(p.runId) : undefined, iterationOf(p)),
   );
@@ -1827,20 +1848,27 @@ export function localProposalDigest(
   for (const p of of('rejected')) {
     const it = iterationOf(p);
     if (!it) {
-      rejected.push(`- ${p.id} ${oneLine(p.title, 120)}${reasonLine(p.rejectReason)}`);
+      rejected.push(`${head(p)}${reasonLine(p.rejectReason)}`);
       continue;
     }
-    // Rejected as a whole: one entry, where its newest step would be.
+    // Rejected as a whole: one entry, where its newest step would be. A scout planned it; a step
+    // a human wrote or edited says so after its title.
     if (rejectedIterations.has(it.id)) continue;
     rejectedIterations.add(it.id);
     const steps = proposals
       .filter((s) => s.iterationId === it.id)
       .reverse()
-      .map((s) => oneLine(s.title, 80));
+      .map((s) => {
+        const title = oneLine(s.title, 80);
+        return s.author === 'scout' && !s.editedAt
+          ? title
+          : `${title}${aboutParts([proposalSourcePart(s)])}`;
+      });
+    const scouts = proposalSourcePart({ author: 'scout', editedAt: null });
     rejected.push(
       `- ${it.id} ${t({
-        zh: `迭代「${oneLine(it.title, 120)}」（子项：${join(steps)}）`,
-        en: `iteration "${oneLine(it.title, 120)}" (steps: ${join(steps)})`,
+        zh: `迭代「${oneLine(it.title, 120)}」（${scouts}，子项：${join(steps)}）`,
+        en: `iteration "${oneLine(it.title, 120)}" (${scouts}; steps: ${join(steps)})`,
       })}${reasonLine(p.rejectReason)}`,
     );
   }
@@ -2167,7 +2195,7 @@ export function scoutPrompt(input: ScoutPromptInput): string {
         ...human,
         gapSection(source),
         openIterationSection(input.iteration),
-        followingLeads(input),
+        followingLeads(input, source),
         changingPlanSection(source),
         followingProposals(input),
         requirementsSection(source),
@@ -2177,7 +2205,7 @@ export function scoutPrompt(input: ScoutPromptInput): string {
         directionSection(),
         ...human,
         gapSection(source),
-        planningLeads(input),
+        planningLeads(input, source, goal !== null),
         planningSection(input, source, goal !== null),
         planningProposals(input),
         requirementsSection(source),
@@ -2427,6 +2455,27 @@ function failedRequirementsText(source: ScoutSource): string {
       });
 }
 
+/**
+ * What the local proposals marked as a human's mean, on a line of its own after the leads: those
+ * a human wrote or edited say what the human wants, so the scout neither proposes them again in
+ * other words nor, while planning an iteration, looks past the gaps around them; a direction given
+ * by hand (`directed`) still decides the iteration. Issues on GitHub or GitLab carry no such mark:
+ * empty for them.
+ */
+function humanProposalsText(source: ScoutSource, planning: boolean, directed: boolean): string {
+  if (source !== 'local') return '';
+  const plan = planning
+    ? t({
+        zh: `；规划迭代时，优先考虑和它们相关、还没有提案在做的缺口${directed ? '，不过这次的迭代仍以上面「人给出的方向」为准' : ''}`,
+        en: `; when planning the iteration, consider first the gaps related to them that no proposal works on yet${directed ? ', though this time the iteration still follows the "Direction from a human" above' : ''}`,
+      })
+    : '';
+  return t({
+    zh: `\n下面已有的本地提案里，标着「人写的」或「被人改过」的，是人亲手写下或改过的需求，代表人的方向：不要换个说法重复提${plan}。`,
+    en: `\nAmong the existing local proposals below, those marked "written by a human" or "edited by a human" are requirements a human wrote or changed by hand, and show the human's direction: do not propose them again in other words${plan}.`,
+  });
+}
+
 /** The heading of the requirements there are. */
 function existingHeading(source: ScoutSource): string {
   return source === 'local'
@@ -2531,31 +2580,39 @@ function problemLead(input: ScoutPromptInput): string {
   });
 }
 
-/** The leads while no iteration is under way: gaps become the iteration, polish no proposal. */
-function planningLeads(input: ScoutPromptInput): string {
+/**
+ * The leads while no iteration is under way: gaps become the iteration, polish no proposal; in the
+ * local backlog, what a human's proposals mean. `directed`: a human gave the scout a direction.
+ */
+function planningLeads(input: ScoutPromptInput, source: ScoutSource, directed: boolean): string {
+  const human = humanProposalsText(source, true, directed);
   return t({
     zh: `## 线索（按优先级从高到低）
 ${problemLead(input)}
 2. 差距分析里最重要的能力缺口：规划成迭代（见下面「规划迭代」），不单独提案。
 3. 明显的缺陷和测试缺口，README.md、AGENTS.md 和代码不一致的地方，代码里的 TODO。
-4. 评审建议和对最近改动的修饰：不单独提案。评审通过时给的建议是评审有意留到以后的改进，由迭代最后的「收尾」子项统一整理，内容由 Master 在它开工前填入；迭代之外也不为它们单独提案。`,
+4. 评审建议和对最近改动的修饰：不单独提案。评审通过时给的建议是评审有意留到以后的改进，由迭代最后的「收尾」子项统一整理，内容由 Master 在它开工前填入；迭代之外也不为它们单独提案。${human}`,
     en: `## Leads (highest priority first)
 ${problemLead(input)}
 2. The most important capability gaps from your gap analysis: plan them as an iteration (see "Planning an iteration" below), not as proposals of their own.
 3. Obvious bugs and gaps in tests, places where README.md, AGENTS.md and the code disagree, TODOs in the code.
-4. Review suggestions and polish of recent changes: no proposals of their own. The suggestions given by a review that passed are improvements the reviewer left for later on purpose; the closing step at the end of an iteration goes through them all, its content filled in by the Master before it starts. Outside an iteration, do not propose them on their own either.`,
+4. Review suggestions and polish of recent changes: no proposals of their own. The suggestions given by a review that passed are improvements the reviewer left for later on purpose; the closing step at the end of an iteration goes through them all, its content filled in by the Master before it starts. Outside an iteration, do not propose them on their own either.${human}`,
   });
 }
 
-/** The only lead while an iteration is under way: problems, a blocked iteration included. */
-function followingLeads(input: ScoutPromptInput): string {
+/**
+ * The only lead while an iteration is under way: problems, a blocked iteration included; in the
+ * local backlog, what a human's proposals mean.
+ */
+function followingLeads(input: ScoutPromptInput, source: ScoutSource): string {
+  const human = humanProposalsText(source, false, false);
   return t({
     zh: `## 线索
 ${problemLead(input)}进行中的迭代受阻（有子项失败或被关成不做）也算这一类：在下面「调整计划」里换个做法重新安排这一步；失败暴露出系统本身的问题时，再为它提一条提案。
-能力缺口、明显的缺陷、评审建议和修饰这次都不提：能力缺口留给下一个迭代，评审建议由迭代的「收尾」子项整理。`,
+能力缺口、明显的缺陷、评审建议和修饰这次都不提：能力缺口留给下一个迭代，评审建议由迭代的「收尾」子项整理。${human}`,
     en: `## Leads
 ${problemLead(input)} An iteration under way that is blocked (a step failed or was dropped) belongs here too: plan that step again another way under "Changing the plan" below, and when the failure shows a problem of the system itself, propose a fix for that as well.
-Leave capability gaps, obvious bugs, review suggestions and polish alone this time: capability gaps wait for the next iteration, and the iteration's closing step goes through the review suggestions.`,
+Leave capability gaps, obvious bugs, review suggestions and polish alone this time: capability gaps wait for the next iteration, and the iteration's closing step goes through the review suggestions.${human}`,
   });
 }
 
