@@ -1285,6 +1285,7 @@ describe('sections', () => {
   it('have ids and titles', () => {
     expect(GUIDE_SECTIONS.map((s) => s.id)).toEqual([
       'intro',
+      'onboard',
       'cycle',
       'scout',
       'you',
@@ -1434,6 +1435,7 @@ describe('in English', () => {
     setLang('en');
     expect(GUIDE_SECTIONS.map((s) => s.title)).toEqual([
       'What this is',
+      'Bringing in a new project',
       'The loop',
       'When it finds work by itself',
       'What you do',

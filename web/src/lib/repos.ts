@@ -114,6 +114,30 @@ export function newRepoInput(form: AddRepoForm): RepoInput {
   return input;
 }
 
+export function verifyLabel(): string {
+  return t({ zh: '检查命令', en: 'Verify commands' });
+}
+
+export function setupLabel(): string {
+  return t({ zh: '准备命令', en: 'Setup commands' });
+}
+
+/** What the verify commands are for, by their box. */
+export function verifyHint(): string {
+  return t({
+    zh: '每个 Task 完成后执行，全部通过才算验收通过（模板阶段没有设置时使用）',
+    en: 'Run after each Task; it passes only when all of them pass (used when the template stage sets none)',
+  });
+}
+
+/** What the setup commands are for, by their box. */
+export function setupHint(): string {
+  return t({
+    zh: '每个 Run 创建工作目录后执行一次，例如 npm ci',
+    en: 'Run once after each Run creates its working directory, e.g. npm ci',
+  });
+}
+
 /**
  * The repo has no verify commands: a Run's changes then go to review and merge unchecked (a
  * template stage's own `verify.commands` aside, which this does not look at).

@@ -50,6 +50,7 @@ import {
   newIssueUrl,
   platformName,
 } from '../lib/issues.js';
+import { ONBOARD_STEPS, onboardStepSummary, onboardStepTitle } from '../lib/onboard.js';
 import { href } from '../lib/router.js';
 import { attentionCount } from '../lib/runs.js';
 
@@ -138,6 +139,7 @@ export function GuidePage(props: {
         hostEnabled={github.data.enabled || gitlab.data.enabled}
       />
     ),
+    onboard: <OnboardSection />,
     cycle: <CycleSection input={input} />,
     scout: <ScoutSection input={input} />,
     you: <YouSection input={input} home={home} working={working} />,
@@ -333,6 +335,67 @@ function Intro(props: {
           </dd>
         </div>
       </dl>
+    </>
+  );
+}
+
+/** How a project is brought in from scratch on the dashboard: the Repos page's wizard, in order. */
+function OnboardSection() {
+  return (
+    <>
+      <p>
+        {t({
+          zh: (
+            <>
+              要让 Master 开发一个新项目，在<a href={href.repos}>「仓库」页</a>
+              顶部点「接入新项目」。 向导按下面的顺序走，每一步都在看板上做完，不用手改配置文件：
+            </>
+          ),
+          en: (
+            <>
+              To have the Master work on a new project, choose "Bring in a new project" at the top
+              of the <a href={href.repos}>Repos page</a>. The wizard goes through these steps in
+              order, each done on the dashboard without editing any configuration file by hand:
+            </>
+          ),
+        })}
+      </p>
+      <ol className="guide-list">
+        {ONBOARD_STEPS.map((step) => (
+          <li key={step}>
+            <strong>{onboardStepTitle(step)}</strong>
+            {t({ zh: '：', en: ': ' })}
+            {onboardStepSummary(step)}
+          </li>
+        ))}
+      </ol>
+      <p>
+        {t({
+          zh: (
+            <>
+              走完之后向导告诉你怎么开始：需求来自 GitHub 或 GitLab 的，给 issue 打上{' '}
+              <code>ares1:ready</code> 标签；用本地提案池的，在<a href={href.issues}>「需求」页</a>
+              的仓库卡片上点「写需求」。选了侦察 Agent 的，也可以在「需求」页点「让 AI
+              找活」手动侦察，让 AI 读代码提需求。
+            </>
+          ),
+          en: (
+            <>
+              At the end the wizard says how to start: with requirements from GitHub or GitLab,
+              label an issue <code>ares1:ready</code>; with the local backlog, choose "Write a
+              requirement" on the repo's card on the <a href={href.issues}>Issues page</a>. With a
+              scout agent chosen, "Let the AI find work" on the Issues page also has the AI read the
+              code and propose requirements.
+            </>
+          ),
+        })}
+      </p>
+      <p className="muted">
+        {t({
+          zh: '登记好的仓库在中途关掉向导后照样留着，之后在仓库卡片上接着设置：「修改」里探测和改命令，「试运行」，需求来源后面的「设置」。每一步对应的 API 见 docs/running.md 的「接入新项目」。',
+          en: 'A registered repo stays when the wizard is closed halfway; the rest can be set on its card later: Edit to detect and change the commands, Try the commands, and Set by its requirements. The API behind each step is in the section on bringing in a new project of docs/running.md.',
+        })}
+      </p>
     </>
   );
 }

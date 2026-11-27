@@ -74,6 +74,12 @@ export const GUIDE_SECTIONS = [
     },
   },
   {
+    id: 'onboard',
+    get title() {
+      return t({ zh: '接入新项目', en: 'Bringing in a new project' });
+    },
+  },
+  {
     id: 'cycle',
     get title() {
       return t({ zh: '整体循环', en: 'The loop' });

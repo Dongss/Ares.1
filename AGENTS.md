@@ -123,7 +123,8 @@ web/                  dashboard (React + Vite)
   src/pages/          Home, RunDetail, Issues, Iterations, Stats, Agents, Events, Workspaces, Repos,
                       Config, Guide
   src/components/     ui.tsx (common), AgentOutput, Attempts, DiffPanel, FlowChart, IterationCard,
-                      Notifications, WorkSwitch
+                      Notifications, WorkSwitch, RepoForms (a repo's register, commands, trial and
+                      source forms), OnboardWizard (the Repos page's wizard bringing a project in)
   src/lib/            API calls, SSE, routing, language choice, formatting, each page's pure logic
   src/styles.css      all styles
 docs/                 documents for people besides the README (in Chinese)
