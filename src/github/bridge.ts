@@ -36,6 +36,7 @@ import {
   redoDueAt,
   replyTimeoutHours,
   repoDeliversByPr,
+  rollbackTarget,
 } from '../config/flow.js';
 import {
   findTemplate,
@@ -86,9 +87,13 @@ import {
 } from '../workspace/git.js';
 import {
   type AddedStep,
+  type AuthoredCommand,
   autoAcceptedComment,
+  type CommandOutcome,
   checkPlanItem,
   closedWithIterationComment,
+  commandReply,
+  commandsAfterMaster,
   discussionComment,
   type FailureOutcome,
   failedAttempt,
@@ -635,6 +640,8 @@ export interface BridgeDeps {
  *   budget; then the issue is closed with every failure's reason;
  * - discussion: the requirement assessment's questions and conclusion are posted on the issue,
  *   and a human's replies there go back to the Run;
+ * - commands: on the issue of a Run waiting for approval, a trusted human's `/ares1 approve` or
+ *   `/ares1 reject <comment>` decides the approval as the dashboard does, answered on the issue;
  * - pull requests (deliver: pr, or mr on GitLab): a Run whose checks passed pushes its branch and
  *   opens a pull request into the target branch; once it is merged on the code host the target
  *   branch is pulled and the Run completes, once it is closed unmerged the Run fails; a Run that
@@ -877,7 +884,8 @@ export class IssueBridge {
    * iteration once their dependencies are done), terminate Runs whose issue a human closed and
    * start over those whose issue a human changed, catch issues up, follow the iterations under
    * way (blocked by a step that failed or was dropped, turned down when a human closed their
-   * issue, summed up once done), pass on replies to the assessments' questions, start a scout
+   * issue, summed up once done), pass on replies to the assessments' questions, carry out the
+   * approvals and rejections trusted humans wrote on issues as commands, start a scout
    * where the repo is idle. With the work switch off only the pulling, the pull requests, the
    * terminating and the catching up happen: none of them starts new work.
    */
@@ -931,6 +939,7 @@ export class IssueBridge {
       await each((name) => this.followIterations(name));
       if (working) {
         await each((name) => this.collectReplies(name));
+        await each((name) => this.followCommands(name));
         await each((name) => this.redoFailedRuns(name));
       }
       await each(async (name) => {
@@ -2307,6 +2316,7 @@ export class IssueBridge {
       targetBranch: repo.targetBranch,
       platform: this.platform.platform,
       stageName,
+      pollMinutes: this.pollMinutes,
       pushed,
       pr: merged,
       times: run.status === 'completed' ? storedRunTimes(this.deps.store, run) : undefined,
@@ -2565,6 +2575,118 @@ export class IssueBridge {
       // The replies came from the issue: nothing to post for them.
       this.deps.store.setIssueDiscussionSynced(run.id, replied.discussion.length);
     }
+  }
+
+  /**
+   * Commands on the issues of Runs waiting for approval (`commandsAfterMaster`): a trusted
+   * human's `/ares1 approve [comment]` approves, `/ares1 reject <comment>` rejects, as the
+   * dashboard does; commands of others are only counted (`recordIgnoredCommands`). Only once the
+   * issue says the Run waits for approval, so that no command written before decides it. The
+   * earliest command after the Master's last comment is taken, the later ones left alone, and
+   * each command taken is answered on the issue whatever became of it: the answer, the Master's
+   * last comment now, keeps it from being read again.
+   */
+  private async followCommands(name: string): Promise<void> {
+    const { repo } = this.repoSetup(name);
+    const store = this.deps.store;
+    const waiting = store
+      .listRuns({ status: 'waiting_approval', repoId: repo.id })
+      .filter((r) => this.platform.ownsRun(r) && r.issueSynced === 'waiting_approval');
+    for (const run of waiting) {
+      if (this.stopping) return;
+      const issue = run.issue;
+      const approval = store.pendingApproval(run.id);
+      if (!issue || !approval) continue;
+      const master = await this.masterLogin();
+      const comments = await this.host().listComments(issue.repo, issue.number);
+      const { commands, ignored } = commandsAfterMaster(comments, master);
+      this.recordIgnoredCommands(run, issue, approval.id, ignored);
+      const [command, ...later] = commands;
+      if (!command) continue;
+      const stageId = store.getStageRun(approval.stageRunId).stageId;
+      const outcome = this.carryOut(run, approval.id, stageId, command);
+      const reply = commandReply(outcome, {
+        command,
+        stageName: run.template.stages.find((s) => s.id === stageId)?.name ?? stageId,
+        skipped: later.length,
+        dashboardUrl: this.dashboardUrl(),
+        runId: run.id,
+      });
+      await this.comment(issue.repo, issue.number, reply);
+    }
+  }
+
+  /**
+   * Decide the approval `approvalId` of the Run as the command says, when it says so properly.
+   * Before the decision, the issue counts as not caught up with the Run any more: once the Run
+   * waits for an approval again, the issue says so in a new comment before a command is read
+   * for it. Should the Master stop between the decision and its answer on the issue, the command
+   * comes before that comment then, and is never carried out twice.
+   */
+  private carryOut(
+    run: Run,
+    approvalId: string,
+    stageId: string,
+    command: AuthoredCommand,
+  ): CommandOutcome {
+    const { name, note } = command;
+    if (name === null) return { kind: 'malformed' };
+    if (name !== 'approve' && name !== 'reject') return { kind: 'unsupported' };
+    if (name === 'reject' && !note) return { kind: 'note_missing' };
+    const store = this.deps.store;
+    const pending = store.pendingApproval(run.id);
+    if (pending && pending.id !== approvalId) {
+      // Decided on the dashboard while the comments were read, and waiting for the next one.
+      return {
+        kind: 'refused',
+        reason: t({
+          zh: '读这条命令时，那次审批已经有了结果，Run 又在等下一次审批；命令是给上一次的。要审批这一次，请重新回复。',
+          en: 'While the command was read, that approval was decided and the Run came to wait for the next one; the command was for the earlier one. To decide this one, reply again.',
+        }),
+      };
+    }
+    const origin = { source: 'issue', author: command.author } as const;
+    try {
+      if (pending) store.setIssueSynced(run.id, null);
+      if (name === 'approve') {
+        this.deps.engine.approve(run.id, note || undefined, origin);
+        return { kind: 'approved' };
+      }
+      this.deps.engine.reject(run.id, note, origin);
+      const target = rollbackTarget(run.template, stageId, 'reject');
+      return {
+        kind: 'rejected',
+        target: run.template.stages.find((s) => s.id === target)?.name ?? target,
+      };
+    } catch (err) {
+      // The Run is no longer waiting for this approval: decided on the dashboard meanwhile, or
+      // by this very command before the Master stopped short of answering it.
+      if (err instanceof InvalidStateError) return { kind: 'refused', reason: err.message };
+      throw err;
+    }
+  }
+
+  /**
+   * Record on the Run how many commands on its issue were not carried out because the Master
+   * does not trust their authors, once per approval and count, so the dashboard shows them.
+   */
+  private recordIgnoredCommands(
+    run: Run,
+    issue: RunIssue,
+    approvalId: string,
+    ignored: number,
+  ): void {
+    if (ignored === 0) return;
+    const last = this.deps.store
+      .listEvents(run.id)
+      .findLast((e) => e.type === 'issue.commands_ignored' && e.data.approvalId === approvalId);
+    if (last?.data.count === ignored) return;
+    this.hostEvent(run.id, 'issue.commands_ignored', {
+      repo: issue.repo,
+      issue: issue.number,
+      approvalId,
+      count: ignored,
+    });
   }
 
   /**

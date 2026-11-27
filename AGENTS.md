@@ -75,10 +75,10 @@ src/
   github/
     client.ts         GitHub through the gh CLI, implementing CodeHost: GitHub's fields turned into
                       the neutral ones (trust, review verdict, failed checks) (FakeGitHub in tests)
-    bridge.ts         polling, Runs from issues, progress on issues, auto-accept, push, auto-scout;
-                      one instance per code host (GitHub's repos, GitLab's)
-    issues.ts         labels, issue texts, hidden comment markers, Run status ↔ issue (pure), on
-                      GitHub and GitLab alike
+    bridge.ts         polling, Runs from issues, progress on issues, commands on issues, auto-accept,
+                      push, auto-scout; one instance per code host (GitHub's repos, GitLab's)
+    issues.ts         labels, issue texts, hidden comment markers, `/ares1` commands, Run status ↔
+                      issue (pure), on GitHub and GitLab alike
     pr-rework.ts      whether an open pull request needs rework (reviews, CI, conflict; by the neutral
                       status) and has the rework pushed, and the feedback for the coding agent (pure)
     redact.ts         text before it is published on GitHub or GitLab: the user's home directory → ~
@@ -138,7 +138,7 @@ test/
   - Write both texts where they are used, with `t({ zh: '…', en: '…' })` from `src/i18n.ts`. English should read naturally rather than word for word, including plurals.
   - Never call `t` at module top level; a constant would keep the language of import time. Use a function, or compute at render. Label tables that callers index (status badges, risks, filters) keep their shape and make each label a getter (`get label() { return t(...) }`), so the text is picked when it is read.
   - Join lists with `join()` from `src/i18n.ts`: Chinese uses 、, English uses ", ".
-  - Protocol stays the same in every language: labels `ares1:*`, hidden comment markers, branch names, config keys, CLI flags, event types, status values, and the field names and enum values of agents' structured output.
+  - Protocol stays the same in every language: labels `ares1:*`, hidden comment markers, the commands humans write on issues (`/ares1 approve`, `/ares1 reject`, …), branch names, config keys, CLI flags, event types, status values, and the field names and enum values of agents' structured output.
   - The Master's language is config.yaml's `language` (default `zh`; on first start the CLI writes the system's). The dashboard uses the language chosen in the browser and falls back to the Master's.
   - Text the Master produces (config problems, error messages, scout waiting reasons) arrives in the Master's language even when the dashboard uses another. Don't make code depend on such wording; when the dashboard needs to tell cases apart, give the API a structured field.
   - Agent prompts follow the language and ask the agent to answer in it.
@@ -181,6 +181,9 @@ test/
     suggestions: `src/backlog/iterations.ts`; the iteration protocol on GitHub (the
     `ares1:iteration` label, the hidden markers in a child's footer, the plan's task list):
     `src/github/issues.ts`
+  - which comments on an issue are commands, whose count and which are still to be answered
+    (`parseIssueCommand` / `commandsAfterMaster`), and what the Master answers to them
+    (`commandReply`): `src/github/issues.ts`
   - notification rules: `src/notify/notice.ts`
   - assessment conclusion rules: `src/engine/discussion.ts`
   - how a Run's time is split, and the names and groups of the parts: `src/engine/times.ts`

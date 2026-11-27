@@ -515,12 +515,12 @@ export function createApi(deps: ApiDeps): Hono {
 
   app.post('/api/runs/:id/approve', async (c) => {
     const { comment } = await body(c, CommentInput);
-    return c.json(engine.approve(c.req.param('id'), comment));
+    return c.json(engine.approve(c.req.param('id'), comment, { source: 'dashboard' }));
   });
 
   app.post('/api/runs/:id/reject', async (c) => {
     const { comment } = await body(c, CommentInput);
-    return c.json(engine.reject(c.req.param('id'), comment ?? ''));
+    return c.json(engine.reject(c.req.param('id'), comment ?? '', { source: 'dashboard' }));
   });
 
   app.post('/api/runs/:id/retry', async (c) => {

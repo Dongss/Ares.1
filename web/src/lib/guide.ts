@@ -999,8 +999,8 @@ function noticeHandling(kind: NoticeKind): string {
   switch (kind) {
     case 'approval':
       return t({
-        zh: '打开 Run 看改动和评审意见：批准就合并；驳回时写清要改什么，会带着你的意见回去返工（「首页 → 待我处理」）',
-        en: 'Open the Run and look at the changes and the review: approve to merge; when rejecting, say what to change and it goes back for rework with your comment ("Home → Needs me")',
+        zh: '打开 Run 看改动和评审意见：批准就合并；驳回时写清要改什么，会带着你的意见回去返工（「首页 → 待我处理」）。来自 issue 的 Run 也可以在 issue 下回复「/ares1 approve [意见]」或「/ares1 reject <意见>」，不在机器前也能审批',
+        en: 'Open the Run and look at the changes and the review: approve to merge; when rejecting, say what to change and it goes back for rework with your comment ("Home → Needs me"). For a Run from an issue you can also reply "/ares1 approve [comment]" or "/ares1 reject <comment>" on the issue, away from the machine too',
       });
     case 'discussion':
       return t({

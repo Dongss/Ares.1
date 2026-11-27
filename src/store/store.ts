@@ -806,8 +806,11 @@ export class Store {
       .run(redo, id);
   }
 
-  /** Record the Run status last reported on its issue (leaves updated_at alone). */
-  setIssueSynced(id: string, status: RunStatus): void {
+  /**
+   * Record the Run status last reported on its issue (leaves updated_at alone); null: none, so
+   * the issue is caught up with whatever the Run's status is next.
+   */
+  setIssueSynced(id: string, status: RunStatus | null): void {
     this.db.prepare('UPDATE runs SET issue_synced = ? WHERE id = ?').run(status, id);
   }
 

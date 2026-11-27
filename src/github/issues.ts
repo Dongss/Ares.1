@@ -205,7 +205,8 @@ export interface IssueReplies {
 /**
  * A human's replies to the assessment on the issue: the comments after the Master's last one,
  * written by people the Master trusts (`isTrusted`). None when the Master has not commented yet
- * (its questions are not posted).
+ * (its questions are not posted). Commands (`parseIssueCommand`) are no replies, whoever wrote
+ * them; those of people the Master does not trust are counted with their other comments.
  */
 export function repliesAfterMaster(
   comments: readonly HostComment[],
@@ -214,8 +215,221 @@ export function repliesAfterMaster(
   const last = comments.findLastIndex((c) => isMasterCommentBy(c, master));
   if (last < 0) return { replies: [], ignored: 0 };
   const after = comments.slice(last + 1).filter((c) => c.body.trim().length > 0);
-  const replies = after.filter((c) => isTrusted(c, master)).map((c) => c.body);
-  return { replies, ignored: after.length - replies.length };
+  const trusted = after.filter((c) => isTrusted(c, master));
+  const replies = trusted.filter((c) => parseIssueCommand(c.body) === null).map((c) => c.body);
+  return { replies, ignored: after.length - trusted.length };
+}
+
+/**
+ * What opens a command a human writes on an issue, followed on the same line by one of
+ * `ISSUE_COMMANDS`: protocol, the same in every language.
+ */
+export const COMMAND_PREFIX = '/ares1';
+
+/**
+ * The commands a human may write on a Run's issue, as the word after `/ares1`: protocol, the
+ * same in every language, matched whatever the case. approve and reject decide the approval a
+ * Run waits for; the others are recognised already, to be answered as not supported rather than
+ * as malformed.
+ */
+export const ISSUE_COMMANDS = [
+  'approve',
+  'reject',
+  'retry',
+  'confirm',
+  'resume',
+  'cancel',
+] as const;
+
+export type IssueCommandName = (typeof ISSUE_COMMANDS)[number];
+
+/** A command comment, as `parseIssueCommand` reads it. */
+export interface IssueCommand {
+  /** The command word in lower case; null when the first line names none of `ISSUE_COMMANDS`. */
+  name: IssueCommandName | null;
+  /**
+   * What follows the command word, the rest of the first line and the lines after it, trimmed:
+   * the comment that goes with an approval or a rejection. '' when there is none.
+   */
+  note: string;
+  /** The first line, trimmed, to quote back when it is malformed. */
+  line: string;
+}
+
+/** The command word, and what follows it, on the first line after `/ares1`. */
+const COMMAND_WORD = /^[^\S\n]+(\S+)([\s\S]*)$/;
+
+/**
+ * The command a comment gives: its first line, the comment trimmed, opens with `/ares1` (any
+ * case). null for any other comment. The command word must follow on the same line after a
+ * space; a first line with none, or with one the Master does not know, is a command still, with
+ * no name, so that it is answered with how to write one and never taken for a reply.
+ */
+export function parseIssueCommand(body: string): IssueCommand | null {
+  const text = body.trim();
+  if (!text.toLowerCase().startsWith(COMMAND_PREFIX)) return null;
+  const line = (text.split('\n', 1)[0] ?? '').trim();
+  const match = COMMAND_WORD.exec(text.slice(COMMAND_PREFIX.length));
+  const word = match?.[1]?.toLowerCase() ?? '';
+  const name = ISSUE_COMMANDS.find((c) => c === word) ?? null;
+  return { name, note: name ? (match?.[2] ?? '').trim() : '', line };
+}
+
+/** A command on an issue, with who wrote it. */
+export interface AuthoredCommand extends IssueCommand {
+  /** Login of its author; null when the account was deleted. */
+  author: string | null;
+}
+
+/** The commands on an issue the Master has not answered yet. */
+export interface IssueCommands {
+  /** The commands after the Master's last comment by people it trusts, oldest first. */
+  commands: AuthoredCommand[];
+  /** Commands after it by people the Master does not trust: never carried out, only counted. */
+  ignored: number;
+}
+
+/**
+ * The commands written on the issue since the Master's last comment: those of people it trusts
+ * (`isTrusted`) to carry out, the others counted. None when the Master has not commented yet.
+ * The Master answers a command with a comment, which becomes its last one: a command is read
+ * once.
+ */
+export function commandsAfterMaster(
+  comments: readonly HostComment[],
+  master: string | null,
+): IssueCommands {
+  const last = comments.findLastIndex((c) => isMasterCommentBy(c, master));
+  if (last < 0) return { commands: [], ignored: 0 };
+  const commands: AuthoredCommand[] = [];
+  let ignored = 0;
+  for (const comment of comments.slice(last + 1)) {
+    const command = parseIssueCommand(comment.body);
+    if (!command) continue;
+    if (isTrusted(comment, master)) commands.push({ ...command, author: comment.author });
+    else ignored++;
+  }
+  return { commands, ignored };
+}
+
+/** What became of a command on the issue of a Run waiting for approval. */
+export type CommandOutcome =
+  | { kind: 'approved' }
+  /** `target`: name of the stage the Run goes back to with the comment, when known. */
+  | { kind: 'rejected'; target: string | null }
+  /** Not carried out: the Run's state refused it, e.g. it was decided on the dashboard first. */
+  | { kind: 'refused'; reason: string }
+  /** No command word the Master knows. */
+  | { kind: 'malformed' }
+  /** A rejection without its comment. */
+  | { kind: 'note_missing' }
+  /** retry, confirm, resume, cancel: recognised, not carried out on issues yet. */
+  | { kind: 'unsupported' };
+
+export interface CommandReplyContext {
+  /** The command answered. */
+  command: AuthoredCommand;
+  /** Name of the stage whose approval the Run waited for. */
+  stageName?: string;
+  /** How many trusted commands after it were left alone: one is carried out at a time. */
+  skipped: number;
+  dashboardUrl: string;
+  runId: string;
+}
+
+/** 「`/ares1 approve [意见]` 批准，`/ares1 reject <意见>` 驳回」: how to decide an approval. */
+const approvalUsage = () =>
+  t({
+    zh: `评论第一行写 \`${COMMAND_PREFIX} approve [意见]\` 批准，写 \`${COMMAND_PREFIX} reject <意见>\` 驳回（意见必填，会交给返工的 Agent）`,
+    en: `start a comment with \`${COMMAND_PREFIX} approve [comment]\` to approve, or \`${COMMAND_PREFIX} reject <comment>\` to reject (the comment is required and goes to the agent that reworks it)`,
+  });
+
+/**
+ * The Master's answer on the issue to a command it read there: what it did, or why it did not.
+ * Posted after every command it takes, so that the command is never read again.
+ */
+export function commandReply(outcome: CommandOutcome, ctx: CommandReplyContext): string {
+  const { command } = ctx;
+  // Each English text opens with who wrote the command.
+  const who = command.author
+    ? `@${command.author}`
+    : t({ zh: '已删除的账号', en: 'A deleted account' });
+  const written = `\`${COMMAND_PREFIX} ${command.name ?? ''}\``;
+  const stage = ctx.stageName;
+  const parts: string[] = [];
+  switch (outcome.kind) {
+    case 'approved':
+      parts.push(
+        t({
+          zh: `${who} 用 ${written} 批准了${stage ? `「${stage}」阶段` : ''}，Run 继续往下走。`,
+          en: `${who} approved${stage ? ` the "${stage}" stage` : ''} with ${written}, and the Run goes on.`,
+        }),
+      );
+      if (command.note) {
+        parts.push(`${t({ zh: '意见：', en: 'Comment:' })}\n\n${quote(command.note)}`);
+      }
+      break;
+    case 'rejected': {
+      const target = outcome.target;
+      parts.push(
+        t({
+          zh: `${who} 用 ${written} 驳回了${stage ? `「${stage}」阶段` : ''}，Run 带着下面的意见回到${target ? `「${target}」阶段` : '前面的阶段'}返工：`,
+          en: `${who} rejected${stage ? ` the "${stage}" stage` : ''} with ${written}: the Run goes back to ${target ? `the "${target}" stage` : 'an earlier stage'} to rework it with this comment:`,
+        }),
+        quote(command.note),
+      );
+      break;
+    }
+    case 'refused':
+      parts.push(
+        t({
+          zh: `没有执行 ${who} 的 ${written}：`,
+          en: `${who}'s ${written} was not carried out:`,
+        }),
+        quote(outcome.reason),
+      );
+      break;
+    case 'malformed':
+      parts.push(
+        t({
+          zh: `没看懂 ${who} 的命令，没有执行：`,
+          en: `${who}'s command was not understood, so nothing was done:`,
+        }),
+        quote(command.line, 200),
+        t({
+          zh: `Run 在等审批：${approvalUsage()}。`,
+          en: `The Run waits for approval: ${approvalUsage()}.`,
+        }),
+      );
+      break;
+    case 'note_missing':
+      parts.push(
+        t({
+          zh: `${who} 的 ${written} 没有写意见，没有执行。驳回要写明原因，意见会交给返工的 Agent，比如 \`${COMMAND_PREFIX} reject 缺少 X 的测试\`。`,
+          en: `${who}'s ${written} has no comment, so it was not carried out. A rejection needs its reason, which goes to the agent that reworks it, e.g. \`${COMMAND_PREFIX} reject tests for X are missing\`.`,
+        }),
+      );
+      break;
+    case 'unsupported':
+      parts.push(
+        t({
+          zh: `${who} 的 ${written} 在 issue 上暂不支持，没有执行。Run 在等审批：${approvalUsage()}。`,
+          en: `${who}'s ${written} is not supported on issues yet, so it was not carried out. The Run waits for approval: ${approvalUsage()}.`,
+        }),
+      );
+      break;
+  }
+  if (ctx.skipped > 0) {
+    const n = ctx.skipped;
+    parts.push(
+      t({
+        zh: `之后的 ${n} 条命令已忽略：一次只执行最早的一条，还需要的话请在这条评论之后重新发。`,
+        en: `${n === 1 ? 'The later command was' : `The ${n} later commands were`} ignored: only the earliest is carried out at a time, so post again after this comment if still needed.`,
+      }),
+    );
+  }
+  parts.push(dashboardLink(ctx.dashboardUrl, ctx.runId));
+  return parts.join('\n\n');
 }
 
 /** How a Run records the author of its issue whom the Master does not trust. */
@@ -811,6 +1025,11 @@ export interface IssueUpdateContext {
   targetBranch: string;
   /** Name of the stage waiting for approval. */
   stageName?: string;
+  /**
+   * How often the Master checks the code host, in minutes: when the approval commands written
+   * on the issue are carried out. Left unsaid when omitted.
+   */
+  pollMinutes?: number;
   /** The target branch was pushed to the code host before closing. */
   pushed?: boolean;
   /** The code host the issue is on, whose words the comments use: GitHub if omitted, or GitLab. */
@@ -1155,15 +1374,18 @@ export function issueUpdate(run: Run, ctx: IssueUpdateContext): IssueUpdate {
       return { label: LABELS.running, comment: null, close: null };
     case 'paused':
       return { label: LABELS.needsYou, comment: null, close: null };
-    case 'waiting_approval':
+    case 'waiting_approval': {
+      const host = changeRequestTerms(ctx.platform).host;
+      const every = ctx.pollMinutes;
       return {
         label: LABELS.needsYou,
         comment: t({
-          zh: `等你审批${ctx.stageName ? `：「${ctx.stageName}」阶段` : ''}。\n\n${link}`,
-          en: `Waiting for your approval${ctx.stageName ? ` of the "${ctx.stageName}" stage` : ''}.\n\n${link}`,
+          zh: `等你审批${ctx.stageName ? `：「${ctx.stageName}」阶段` : ''}。\n\n可以在看板上审批，也可以直接在这个 issue 下回复：${approvalUsage()}。只认仓库成员的命令；Master 下次检查 ${host} 时${every ? `（每 ${every} 分钟）` : ''}执行，并在这里回复结果。\n\n${link}`,
+          en: `Waiting for your approval${ctx.stageName ? ` of the "${ctx.stageName}" stage` : ''}.\n\nApprove on the dashboard, or reply on this issue: ${approvalUsage()}. Only commands from members of the repo count; the next time the Master checks ${host}${every ? ` (every ${every} min)` : ''} it carries them out and replies here.\n\n${link}`,
         }),
         close: null,
       };
+    }
     case 'blocked':
       // The assessment's questions are posted with the discussion (`discussionComment`).
       if (run.blocked?.kind === 'discussion') {

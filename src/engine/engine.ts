@@ -274,6 +274,13 @@ export interface CreateRunInput {
   mergeRemote?: string;
 }
 
+/**
+ * Where a human decided an approval, recorded in the data of its `approval.approved` /
+ * `approval.rejected` event: on the dashboard (its HTTP API), or by a command on the Run's issue,
+ * with the login of who wrote it (null for a deleted account).
+ */
+export type DecisionOrigin = { source: 'dashboard' } | { source: 'issue'; author: string | null };
+
 export interface RetryInput {
   /** Switch the task to another agent. */
   agentId?: string;
@@ -1026,20 +1033,25 @@ export class Engine {
     return run;
   }
 
-  approve(runId: string, comment?: string): Run {
-    return this.decide(runId, 'approved', comment);
+  approve(runId: string, comment?: string, origin?: DecisionOrigin): Run {
+    return this.decide(runId, 'approved', comment, origin);
   }
 
-  reject(runId: string, comment: string): Run {
+  reject(runId: string, comment: string, origin?: DecisionOrigin): Run {
     if (!comment.trim()) {
       throw new InvalidStateError(
         t({ zh: '驳回时必须填写意见', en: 'A rejection needs a comment' }),
       );
     }
-    return this.decide(runId, 'rejected', comment);
+    return this.decide(runId, 'rejected', comment, origin);
   }
 
-  private decide(runId: string, status: 'approved' | 'rejected', comment?: string): Run {
+  private decide(
+    runId: string,
+    status: 'approved' | 'rejected',
+    comment?: string,
+    origin?: DecisionOrigin,
+  ): Run {
     const run = this.store.getRun(runId);
     if (run.status !== 'waiting_approval') {
       throw new InvalidStateError(
@@ -1061,7 +1073,11 @@ export class Engine {
         comment: comment?.trim() || null,
         decidedAt: nowIso(),
       });
-      this.store.event(runId, `approval.${status}`, { approvalId: approval.id, comment });
+      this.store.event(runId, `approval.${status}`, {
+        approvalId: approval.id,
+        comment,
+        ...origin,
+      });
       this.requeueHead(runId, 'run.resumed');
     });
     this.kick();
