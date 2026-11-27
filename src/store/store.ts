@@ -75,13 +75,31 @@ const BOOL_COLUMNS: Partial<Record<Table, readonly string[]>> = {
   proposals: ['auto'],
   iterations: ['auto', 'summary_posted'],
 };
-/**
- * Object fields kept one key per column, by field: key `number` of field `pr` in column
- * `pr_number`. Null in every column is a null field.
- */
-const SPLIT_COLUMNS: Partial<Record<Table, Record<string, readonly string[]>>> = {
-  runs: { pr: ['number', 'url'] },
-  iterations: { issue: ['number', 'url'] },
+/** An object field kept one key per column (`SPLIT_COLUMNS`). */
+interface SplitField {
+  /** Its keys: key `number` of field `pr` is in column `pr_number`. */
+  parts: readonly string[];
+  /**
+   * The key whose column alone says whether the field is null (the others may be NOT NULL);
+   * none = null in every column is a null field.
+   */
+  key?: string;
+  /** What a null field writes in the columns of these keys, instead of null. */
+  empty?: Readonly<Record<string, SQLInputValue>>;
+}
+
+/** Object fields kept one key per column, by table and field. */
+const SPLIT_COLUMNS: Partial<Record<Table, Record<string, SplitField>>> = {
+  runs: { pr: { parts: ['number', 'url'] } },
+  iterations: { issue: { parts: ['number', 'url'] } },
+  repos: {
+    serve: {
+      parts: ['command', 'readyPath', 'readyTimeoutSeconds'],
+      key: 'command',
+      // The columns' defaults (migration v17).
+      empty: { readyPath: '/', readyTimeoutSeconds: 120 },
+    },
+  },
 };
 
 const toSnake = (key: string) => key.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
@@ -380,10 +398,14 @@ export class Store {
     for (const [key, value] of Object.entries(obj)) {
       if (value === undefined) continue;
       const col = toSnake(key);
-      const parts = split[key];
-      if (parts) {
+      const spec = split[key];
+      if (spec) {
         const fields = value as Record<string, SQLInputValue> | null;
-        for (const part of parts) row[`${col}_${toSnake(part)}`] = fields?.[part] ?? null;
+        for (const part of spec.parts) {
+          row[`${col}_${toSnake(part)}`] = fields
+            ? (fields[part] ?? null)
+            : (spec.empty?.[part] ?? null);
+        }
       } else if (json.includes(col)) row[col] = value === null ? null : JSON.stringify(value);
       else if (bool.includes(col)) row[col] = value ? 1 : 0;
       else row[col] = value as SQLInputValue;
@@ -402,13 +424,16 @@ export class Store {
       else if (bool.includes(col)) v = value === 1;
       obj[toCamel(col)] = v;
     }
-    for (const [field, parts] of Object.entries(SPLIT_COLUMNS[table] ?? {})) {
-      const cols = parts.map((part) => `${toSnake(field)}_${toSnake(part)}`);
+    const isNull = (col: string) => row[col] === null || row[col] === undefined;
+    for (const [field, spec] of Object.entries(SPLIT_COLUMNS[table] ?? {})) {
+      const colOf = (part: string) => `${toSnake(field)}_${toSnake(part)}`;
+      const cols = spec.parts.map(colOf);
       if (!cols.some((col) => col in row)) continue;
       for (const col of cols) delete obj[toCamel(col)];
-      obj[field] = cols.every((col) => row[col] === null || row[col] === undefined)
+      const empty = spec.key ? isNull(colOf(spec.key)) : cols.every(isNull);
+      obj[field] = empty
         ? null
-        : Object.fromEntries(parts.map((part, i) => [part, row[cols[i] as string]]));
+        : Object.fromEntries(spec.parts.map((part, i) => [part, row[cols[i] as string]]));
     }
     return obj as T;
   }
@@ -574,8 +599,14 @@ export class Store {
 
   // ---- repos ---------------------------------------------------------------
 
-  createRepo(input: Omit<Repo, 'id' | 'createdAt'>): Repo {
-    const repo: Repo = { ...input, id: newId('repo'), createdAt: nowIso() };
+  /** `serve` left out: the repo has no service. */
+  createRepo(input: Omit<Repo, 'id' | 'createdAt' | 'serve'> & Partial<Pick<Repo, 'serve'>>): Repo {
+    const repo: Repo = {
+      ...input,
+      serve: input.serve ?? null,
+      id: newId('repo'),
+      createdAt: nowIso(),
+    };
     this.insert('repos', repo);
     return repo;
   }
@@ -600,7 +631,7 @@ export class Store {
 
   updateRepo(
     id: string,
-    patch: Partial<Pick<Repo, 'targetBranch' | 'verifyCommands' | 'setupCommands'>>,
+    patch: Partial<Pick<Repo, 'targetBranch' | 'verifyCommands' | 'setupCommands' | 'serve'>>,
   ): Repo {
     this.patch('repos', id, patch);
     return this.getRepo(id);

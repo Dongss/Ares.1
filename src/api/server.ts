@@ -41,6 +41,7 @@ import {
   PROPOSAL_CATEGORIES,
   PROPOSAL_STATUSES,
   type Repo,
+  type RepoServe,
   type RunStatus,
 } from '../store/types.js';
 import type { Upgrader } from '../upgrade/upgrader.js';
@@ -85,6 +86,8 @@ import type {
   RawLogMissing,
   RepoDetection,
   RepoInputSource,
+  RepoPatchInput,
+  RepoServeInput,
   RepoSourceInput,
   RepoSourceRejected,
   RepoSourceSettings,
@@ -164,6 +167,32 @@ const RepoInputSourceSchema = z.discriminatedUnion('kind', [
   z.strictObject({ kind: z.literal('init') }),
 ]) satisfies z.ZodType<RepoInputSource>;
 
+const serveTimeoutInvalid = () =>
+  t({
+    zh: '就绪超时必须是 1 到 3600 之间的整数（秒）',
+    en: 'the ready timeout must be a whole number of seconds from 1 to 3600',
+  });
+
+/** A repo's service; what is left out takes the defaults of the repos table. */
+const RepoServeSchema = z.strictObject({
+  command: z
+    .string()
+    .trim()
+    .min(1, { error: () => t({ zh: '启动命令不能为空', en: 'the start command is empty' }) }),
+  readyPath: z
+    .string()
+    .startsWith('/', {
+      error: () => t({ zh: '就绪路径必须以 / 开头', en: 'the ready path must start with /' }),
+    })
+    .default('/'),
+  readyTimeoutSeconds: z
+    .number({ error: serveTimeoutInvalid })
+    .int({ error: serveTimeoutInvalid })
+    .min(1, { error: serveTimeoutInvalid })
+    .max(3600, { error: serveTimeoutInvalid })
+    .default(120),
+}) satisfies z.ZodType<RepoServe, RepoServeInput>;
+
 const RepoInput = z.strictObject({
   name: z.string().regex(/^[\w.-]+$/, {
     error: () =>
@@ -176,6 +205,7 @@ const RepoInput = z.strictObject({
   targetBranch: z.string().min(1).optional(),
   verifyCommands: z.array(z.string()).default([]),
   setupCommands: z.array(z.string()).default([]),
+  serve: RepoServeSchema.nullable().optional(),
   source: RepoInputSourceSchema.optional(),
 });
 
@@ -220,7 +250,8 @@ const RepoPatch = z.strictObject({
   targetBranch: z.string().min(1).optional(),
   verifyCommands: z.array(z.string()).optional(),
   setupCommands: z.array(z.string()).optional(),
-});
+  serve: RepoServeSchema.nullable().optional(),
+}) satisfies z.ZodType<unknown, RepoPatchInput>;
 
 /** Commands to try instead of the registered ones; nothing is saved. */
 const RepoTrialBody = z.strictObject({
@@ -588,6 +619,7 @@ export function createApi(deps: ApiDeps): Hono {
         verifyCommands: input.verifyCommands,
         setupCommands: input.setupCommands,
         mergeMode: 'direct',
+        serve: input.serve ?? null,
       });
     let repo: Repo;
     if (input.source) {

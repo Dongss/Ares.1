@@ -45,7 +45,29 @@ export interface Repo {
   /** Run once after the Run's worktree is created, e.g. ["npm ci"]. */
   setupCommands: string[];
   mergeMode: 'direct';
+  /** How to start the repo's service for the command stages with `serve: true`; null = none. */
+  serve: RepoServe | null;
   createdAt: string;
+}
+
+/**
+ * A repo's service, started by the Master for a command stage with `serve: true` and stopped,
+ * its whole process group, once the stage's commands are over.
+ */
+export interface RepoServe {
+  /**
+   * Shell command run in the Run's worktree, in a process group of its own. It gets `PORT`, a
+   * free port on this machine picked for it, to listen on, and `ARES1_SERVICE_URL`
+   * (`http://127.0.0.1:<PORT>`); the stage's commands get both too.
+   */
+  command: string;
+  /**
+   * Path the Master polls at `ARES1_SERVICE_URL` until the service is ready: any HTTP answer
+   * with a status below 500 counts. Starts with `/`; default `/`.
+   */
+  readyPath: string;
+  /** Seconds the service has to become ready before the stage fails; default 120. */
+  readyTimeoutSeconds: number;
 }
 
 export type BlockKind =

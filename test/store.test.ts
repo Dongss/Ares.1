@@ -151,6 +151,79 @@ describe('store', () => {
     expect(store.listChecks(run.id)[0]).toEqual(check);
   });
 
+  it('migrates a v16 database: its repos have no service and its Runs are as they were', () => {
+    const dir = tmpDir('ares1-db-');
+    const file = join(dir, 'ares1.db');
+    const old = new DatabaseSync(file);
+    for (const m of MIGRATIONS.slice(0, 16)) old.exec(m);
+    old.exec('PRAGMA user_version = 16');
+    old.exec(`
+      INSERT INTO repos (id, name, path, target_branch, verify_commands, setup_commands, created_at)
+        VALUES ('r', 'r', '/r', 'dev', '["npm test"]', '["npm ci"]', 't');
+      INSERT INTO runs (id, repo_id, template_id, template, goal, status, created_at, updated_at)
+        VALUES ('run', 'r', 't', '{}', 'g', 'running', 't', 't');
+    `);
+    old.close();
+
+    const store = new Store(file);
+    expect(
+      (store.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+    ).toBe(MIGRATIONS.length);
+    expect(store.getRepo('r')).toEqual({
+      id: 'r',
+      name: 'r',
+      path: '/r',
+      targetBranch: 'dev',
+      verifyCommands: ['npm test'],
+      setupCommands: ['npm ci'],
+      mergeMode: 'direct',
+      serve: null,
+      createdAt: 't',
+    });
+    expect(store.getRun('run')).toMatchObject({ repoId: 'r', goal: 'g', status: 'running' });
+    store.close();
+    expect(readdirSync(dir).filter((f) => f.includes('.bak-v16-'))).toHaveLength(1);
+  });
+
+  it("keeps a repo's service in its own columns: written, read back and removed", () => {
+    const store = new Store(':memory:');
+    const { repo } = seed(store);
+    // Left out when the repo was made: none.
+    expect(repo.serve).toBeNull();
+    expect(store.getRepo(repo.id).serve).toBeNull();
+
+    const serve = { command: 'node server.js', readyPath: '/health', readyTimeoutSeconds: 30 };
+    expect(store.updateRepo(repo.id, { serve }).serve).toEqual(serve);
+    expect(store.findRepo('r')?.serve).toEqual(serve);
+    expect(store.listRepos()[0]?.serve).toEqual(serve);
+    // Other changes leave it alone.
+    expect(store.updateRepo(repo.id, { verifyCommands: ['npm run lint'] }).serve).toEqual(serve);
+
+    // Removed: the command is gone and the other columns are back to their defaults.
+    expect(store.updateRepo(repo.id, { serve: null }).serve).toBeNull();
+    expect(
+      store.db
+        .prepare(
+          'SELECT serve_command, serve_ready_path, serve_ready_timeout_seconds FROM repos WHERE id = ?',
+        )
+        .get(repo.id),
+    ).toEqual({ serve_command: null, serve_ready_path: '/', serve_ready_timeout_seconds: 120 });
+    expect(store.getRepo(repo.id).verifyCommands).toEqual(['npm run lint']);
+
+    // Given when the repo is made.
+    const other = store.createRepo({
+      name: 'o',
+      path: '/tmp/o',
+      targetBranch: 'main',
+      verifyCommands: [],
+      setupCommands: [],
+      mergeMode: 'direct',
+      serve,
+    });
+    expect(store.getRepo(other.id).serve).toEqual(serve);
+    store.close();
+  });
+
   it("keeps a Run's pull request in its own columns, none for Runs recorded before", () => {
     const dir = tmpDir('ares1-db-');
     const file = join(dir, 'ares1.db');

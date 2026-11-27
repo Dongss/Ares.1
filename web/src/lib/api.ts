@@ -15,6 +15,7 @@ import type {
   ProposalWritten,
   RepoDetection,
   RepoInput,
+  RepoPatchInput,
   RepoSourceInput,
   RepoTrial,
   RepoTrialInput,
@@ -89,8 +90,6 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 
 const id = encodeURIComponent;
 
-export type RepoPatch = Partial<Pick<Repo, 'targetBranch' | 'verifyCommands' | 'setupCommands'>>;
-
 /**
  * A requirement a human writes into the local backlog of a repo of backlog.repos (POST
  * /api/proposals). Left out: `category` feature, `size` M, `risk` mid, `start` true.
@@ -125,7 +124,7 @@ export const api = {
 
   repos: () => request<Repo[]>('GET', '/api/repos'),
   createRepo: (input: RepoInput) => request<Repo>('POST', '/api/repos', input),
-  updateRepo: (repoId: string, patch: RepoPatch) =>
+  updateRepo: (repoId: string, patch: RepoPatchInput) =>
     request<Repo>('PATCH', `/api/repos/${id(repoId)}`, patch),
   deleteRepo: (repoId: string) => request<string>('DELETE', `/api/repos/${id(repoId)}`),
   /**

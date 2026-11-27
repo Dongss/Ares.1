@@ -29,6 +29,7 @@ import type {
   IterationChild,
   Proposal,
   Repo,
+  RepoServe,
   Run,
   RunStatus,
   StageRun,
@@ -78,7 +79,27 @@ export interface RepoInput {
   targetBranch?: string;
   verifyCommands: string[];
   setupCommands: string[];
+  /** Left out or null: no service. */
+  serve?: RepoServeInput | null;
   source?: RepoInputSource;
+}
+
+/**
+ * A repo's service as POST and PATCH /api/repos take it: `readyPath` left out is `/`,
+ * `readyTimeoutSeconds` (1–3600) left out is 120.
+ */
+export type RepoServeInput = Pick<RepoServe, 'command'> &
+  Partial<Pick<RepoServe, 'readyPath' | 'readyTimeoutSeconds'>>;
+
+/**
+ * Body of PATCH /api/repos/:id: what is left out stays as it is; `serve: null` removes the
+ * repo's service.
+ */
+export interface RepoPatchInput {
+  targetBranch?: string;
+  verifyCommands?: string[];
+  setupCommands?: string[];
+  serve?: RepoServeInput | null;
 }
 
 /**

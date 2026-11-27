@@ -369,6 +369,95 @@ describe('HTTP API', () => {
     expect((await call('PATCH', '/api/repos/nope', {})).status).toBe(404);
   });
 
+  it("sets, keeps and removes a repo's service, and rejects one that is wrong", async () => {
+    h = await harness();
+    expect(h.master.store.getRepo('demo').serve).toBeNull();
+    expect((await call('GET', '/api/repos')).json[0]).toMatchObject({ name: 'demo', serve: null });
+
+    // What is left out takes the defaults; the command is trimmed.
+    const set = await call('PATCH', '/api/repos/demo', { serve: { command: ' node app.js ' } });
+    expect(set.status).toBe(200);
+    expect(set.json.serve).toEqual({
+      command: 'node app.js',
+      readyPath: '/',
+      readyTimeoutSeconds: 120,
+    });
+    const serve = { command: 'npm start', readyPath: '/health', readyTimeoutSeconds: 3600 };
+    expect((await call('PATCH', '/api/repos/demo', { serve })).json.serve).toEqual(serve);
+
+    // Other changes leave it as it is.
+    const other = await call('PATCH', '/api/repos/demo', { verifyCommands: ['true'] });
+    expect(other.json).toMatchObject({ verifyCommands: ['true'], serve });
+    expect(h.master.store.getRepo('demo').serve).toEqual(serve);
+
+    const rejected = async (value: unknown) => {
+      const res = await call('PATCH', '/api/repos/demo', { serve: value });
+      expect(res.status, JSON.stringify(value)).toBe(400);
+      return res.json.error as string;
+    };
+    expect(await rejected({ command: '  ' })).toContain('启动命令不能为空');
+    expect(await rejected({ command: 'x', readyPath: 'health' })).toContain(
+      '就绪路径必须以 / 开头',
+    );
+    for (const readyTimeoutSeconds of [0, 3601, 1.5, '60', -1]) {
+      expect(await rejected({ command: 'x', readyTimeoutSeconds })).toContain(
+        '就绪超时必须是 1 到 3600 之间的整数（秒）',
+      );
+    }
+    await rejected({});
+    await rejected({ command: 'x', port: 3000 });
+    await rejected('npm start');
+    // None of them changed it.
+    expect(h.master.store.getRepo('demo').serve).toEqual(serve);
+
+    setLang('en');
+    try {
+      expect(await rejected({ command: 'x', readyPath: 'health' })).toContain(
+        'the ready path must start with /',
+      );
+      expect(await rejected({ command: 'x', readyTimeoutSeconds: 0 })).toContain(
+        'the ready timeout must be a whole number of seconds from 1 to 3600',
+      );
+      expect(await rejected({ command: '' })).toContain('the start command is empty');
+    } finally {
+      setLang('zh');
+    }
+
+    // Removed with null.
+    const removed = await call('PATCH', '/api/repos/demo', { serve: null });
+    expect(removed.status).toBe(200);
+    expect(removed.json.serve).toBeNull();
+    expect(h.master.store.getRepo('demo').serve).toBeNull();
+  });
+
+  it('registers a repo with a service, or without one', async () => {
+    h = await harness();
+    const created = await call('POST', '/api/repos', {
+      name: 'served',
+      path: initRepo(),
+      serve: { command: 'node app.js', readyPath: '/ready' },
+    });
+    expect(created.status).toBe(201);
+    expect(created.json.serve).toEqual({
+      command: 'node app.js',
+      readyPath: '/ready',
+      readyTimeoutSeconds: 120,
+    });
+    expect(h.master.store.getRepo('served').serve).toEqual(created.json.serve);
+    const plain = await call('POST', '/api/repos', { name: 'plain', path: initRepo() });
+    expect(plain.json.serve).toBeNull();
+    expect(
+      (
+        await call('POST', '/api/repos', {
+          name: 'bad',
+          path: initRepo(),
+          serve: { command: 'x', readyTimeoutSeconds: 0 },
+        })
+      ).status,
+    ).toBe(400);
+    expect(h.master.store.findRepo('bad')).toBeUndefined();
+  });
+
   it('reads the templates a repo keeps when it is registered, changed or deleted', async () => {
     h = await harness();
     const dir = initRepo();

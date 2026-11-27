@@ -280,4 +280,13 @@ export const MIGRATIONS: readonly string[] = [
   `
   ALTER TABLE proposals ADD COLUMN edited_at TEXT;
   `,
+  // v17: the command that starts a repo's service for the command stages with `serve: true`, and
+  // when it counts as ready: an HTTP answer at the ready path within the timeout. No command (null,
+  // the repos recorded before included) = the repo has no service; the other two columns keep
+  // their defaults then.
+  `
+  ALTER TABLE repos ADD COLUMN serve_command TEXT;
+  ALTER TABLE repos ADD COLUMN serve_ready_path TEXT NOT NULL DEFAULT '/';
+  ALTER TABLE repos ADD COLUMN serve_ready_timeout_seconds INTEGER NOT NULL DEFAULT 120;
+  `,
 ];
