@@ -1296,88 +1296,124 @@ export function scoutRawLogExpired(scout: Pick<Scout, 'status' | 'endedAt'>, now
 }
 
 /**
- * Why the Master removes the worktree and branch a failed or cancelled Run of an issue kept, as
- * its `workspace.removed` event records it: a later Run of the issue completed (`supersededBy`),
- * the issue used up its attempts and only its last attempt (`keptRun`) keeps them, or a human
- * changed the issue and a new Run (`newRun`) does the changed requirement instead.
+ * Why the Master removes the worktree and branch a failed or cancelled Run of an issue or of a
+ * local proposal kept, as its `workspace.removed` event records it: a later Run of the same
+ * requirement completed (`supersededBy`), the requirement used up its attempts and only its last
+ * attempt (`keptRun`) keeps them, or a human changed the issue and a new Run (`newRun`) does the
+ * changed requirement instead. `proposalId`: the local proposal the Runs are attempts at; absent
+ * for an issue's.
  */
 export type LeftoverWorkspaceReason =
-  | { reason: 'superseded'; supersededBy: string }
-  | { reason: 'retries_exhausted'; keptRun: string }
+  | { reason: 'superseded'; supersededBy: string; proposalId?: string }
+  | { reason: 'retries_exhausted'; keptRun: string; proposalId?: string }
   | { reason: 'goal_changed'; newRun: string };
 
 /** The events `leftoverWorkspaces` reads; other types are passed by. */
 export const LEFTOVER_WORKSPACE_EVENTS = [
   'workspace.removed',
   'issue.retries_exhausted',
+  'proposal.failed',
   'run.goal_changed',
 ] as const;
 
+/** What `leftoverWorkspaces` reads of a Run. */
+export type LeftoverRun = Pick<Run, 'id' | 'status' | 'issue'>;
+
+/** What `leftoverWorkspaces` reads of a local proposal, whose Runs it groups as an issue's. */
+export type LeftoverProposal = Pick<Proposal, 'id' | 'runId' | 'failures' | 'redo'>;
+
 /**
- * The worktrees and branches of failed or cancelled Runs of issues that nobody needs any more,
- * oldest Run first. They are removed once, right when it is decided (a redo completed, the issue
- * used up its attempts, the issue was changed), and kept when the Master stopped before that or the
- * removal failed: so the Master looks for them again at start and daily, as nothing else would
- * while nobody is around, and every one keeps its dependencies.
+ * The worktrees and branches of failed or cancelled Runs of issues and of local proposals that
+ * nobody needs any more, oldest Run first. They are removed once, right when it is decided (a redo
+ * completed, the requirement used up its attempts, the issue was changed), and kept when the
+ * Master stopped before that or the removal failed: so the Master looks for them again at start and
+ * daily, as nothing else would while nobody is around, and every one keeps its dependencies.
  *
- * `runs` are oldest first (creation order); `events` are those of LEFTOVER_WORKSPACE_EVENTS. A Run
+ * `runs` are oldest first (creation order); `events` are those of LEFTOVER_WORKSPACE_EVENTS.
+ * The Runs of a requirement are those of its issue, or those of a proposal of `proposals`: its
+ * failed attempts (`failures`) and its latest Run (`runId`), started over by a human or not. A Run
  * is listed when it is not recorded as removed and:
- * - failed, and a later Run of its issue completed: `superseded` by the first of those;
- * - failed, and the newest Run of its issue failed with its attempts used up (its redo is
- *   `exhausted`, or it recorded `issue.retries_exhausted`): `retries_exhausted`, kept by that one;
- * - failed, and named in the `runIds` of another Run's `issue.retries_exhausted`:
- *   `retries_exhausted`, kept by that Run (what removing them right then would have done);
+ * - failed, and a later Run of its requirement completed: `superseded` by the first of those;
+ * - failed, and the newest Run of its requirement failed with its attempts used up (the issue's or
+ *   the proposal's redo is `exhausted`, or it recorded `issue.retries_exhausted` / the proposal's
+ *   `proposal.failed` names it): `retries_exhausted`, kept by that one;
+ * - failed, and named among the attempts of another Run's `issue.retries_exhausted` (`runIds`) or
+ *   `proposal.failed` (`failures`): `retries_exhausted`, kept by that Run (what removing them right
+ *   then would have done), also once the requirement was started over;
  * - cancelled because a human changed its issue (`run.goal_changed`): `goal_changed`, the new Run
  *   from the event.
+ * A proposal's Runs are listed with its `proposalId`.
  *
  * Never: a Run a human cancelled (they may still want to look), Runs that may go on (any other
- * status), the last failed attempt of an issue, or Runs not from an issue. Whether the worktree
- * or branch is still there is for the caller to find out.
+ * status), the last failed attempt of a requirement, or Runs of neither an issue nor a proposal.
+ * Whether the worktree or branch is still there is for the caller to find out.
  */
 export function leftoverWorkspaces(
-  runs: readonly Pick<Run, 'id' | 'status' | 'issue'>[],
+  runs: readonly LeftoverRun[],
   events: readonly Pick<EventRow, 'runId' | 'type' | 'data'>[],
+  proposals: readonly LeftoverProposal[] = [],
 ): { runId: string; why: LeftoverWorkspaceReason }[] {
   const removed = new Set<string>();
-  /** Earlier attempt → the Run that recorded `issue.retries_exhausted` naming it. */
+  /** Earlier attempt → the Run recorded as the last attempt of its requirement, naming it. */
   const exhaustedBy = new Map<string, string>();
   const exhausted = new Set<string>();
   const goalChanged = new Map<string, string>();
+  const usedUp = (keptRun: unknown, attempts: readonly unknown[]) => {
+    if (typeof keptRun !== 'string') return;
+    exhausted.add(keptRun);
+    for (const id of attempts) {
+      if (typeof id === 'string' && id !== keptRun) exhaustedBy.set(id, keptRun);
+    }
+  };
   for (const e of events) {
+    // Recorded on no Run: the proposal's last attempt and the earlier ones are in its data.
+    if (e.type === 'proposal.failed') {
+      const failures = Array.isArray(e.data.failures) ? (e.data.failures as unknown[]) : [];
+      usedUp(
+        e.data.runId,
+        failures.map((f) => (typeof f === 'object' && f !== null && 'runId' in f ? f.runId : null)),
+      );
+    }
     if (!e.runId) continue;
     if (e.type === 'workspace.removed') removed.add(e.runId);
     if (e.type === 'issue.retries_exhausted') {
-      exhausted.add(e.runId);
-      const ids = Array.isArray(e.data.runIds) ? e.data.runIds : [];
-      for (const id of ids) {
-        if (typeof id === 'string' && id !== e.runId) exhaustedBy.set(id, e.runId);
-      }
+      usedUp(e.runId, Array.isArray(e.data.runIds) ? e.data.runIds : []);
     }
     if (e.type === 'run.goal_changed' && typeof e.data.newRun === 'string') {
       goalChanged.set(e.runId, e.data.newRun);
     }
   }
-  const byIssue = new Map<string, Pick<Run, 'id' | 'status' | 'issue'>[]>();
+  const proposalOf = new Map<string, LeftoverProposal>();
+  for (const p of proposals) {
+    for (const f of p.failures) proposalOf.set(f.runId, p);
+    if (p.runId) proposalOf.set(p.runId, p);
+  }
+  /** The Runs of each requirement, oldest first, by the issue or proposal they are attempts at. */
+  const groups = new Map<string, { runs: LeftoverRun[]; proposal?: LeftoverProposal }>();
   for (const run of runs) {
-    if (!run.issue) continue;
-    const key = `${run.issue.repo}#${run.issue.number}`;
-    const list = byIssue.get(key);
-    if (list) list.push(run);
-    else byIssue.set(key, [run]);
+    const proposal = run.issue ? undefined : proposalOf.get(run.id);
+    let key: string;
+    if (run.issue) key = `issue:${run.issue.repo}#${run.issue.number}`;
+    else if (proposal) key = `proposal:${proposal.id}`;
+    else continue;
+    const group = groups.get(key);
+    if (group) group.runs.push(run);
+    else groups.set(key, { runs: [run], proposal });
   }
   const leftovers: { runId: string; why: LeftoverWorkspaceReason }[] = [];
-  for (const issueRuns of byIssue.values()) {
-    const newest = issueRuns[issueRuns.length - 1];
+  for (const { runs: attempts, proposal } of groups.values()) {
+    const newest = attempts[attempts.length - 1];
+    const givenUp = proposal
+      ? proposal.redo === 'exhausted' && proposal.runId === newest?.id
+      : newest?.issue?.redo === 'exhausted';
     const kept =
-      newest?.status === 'failed' &&
-      (newest.issue?.redo === 'exhausted' || exhausted.has(newest.id))
-        ? newest.id
-        : undefined;
+      newest?.status === 'failed' && (givenUp || exhausted.has(newest.id)) ? newest.id : undefined;
+    const of = proposal ? { proposalId: proposal.id } : {};
     const found: { runId: string; why: LeftoverWorkspaceReason }[] = [];
     // Newest first, so the first completed Run after each one is known when it is reached.
     let completedAfter: string | undefined;
-    for (let i = issueRuns.length - 1; i >= 0; i--) {
-      const run = issueRuns[i] as Pick<Run, 'id' | 'status' | 'issue'>;
+    for (let i = attempts.length - 1; i >= 0; i--) {
+      const run = attempts[i] as LeftoverRun;
       if (run.status === 'completed') {
         completedAfter = run.id;
         continue;
@@ -1386,9 +1422,10 @@ export function leftoverWorkspaces(
       let why: LeftoverWorkspaceReason | undefined;
       if (run.status === 'failed') {
         const keptBy = exhaustedBy.get(run.id);
-        if (completedAfter) why = { reason: 'superseded', supersededBy: completedAfter };
-        else if (kept && kept !== run.id) why = { reason: 'retries_exhausted', keptRun: kept };
-        else if (keptBy) why = { reason: 'retries_exhausted', keptRun: keptBy };
+        if (completedAfter) why = { reason: 'superseded', supersededBy: completedAfter, ...of };
+        else if (kept && kept !== run.id)
+          why = { reason: 'retries_exhausted', keptRun: kept, ...of };
+        else if (keptBy) why = { reason: 'retries_exhausted', keptRun: keptBy, ...of };
       } else if (run.status === 'cancelled') {
         const newRun = goalChanged.get(run.id);
         if (newRun) why = { reason: 'goal_changed', newRun };

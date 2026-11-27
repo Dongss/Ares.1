@@ -712,6 +712,22 @@ describe('superseded workspaces', () => {
     );
     for (const text of [removed, failed]) expect(text).not.toMatch(/[一-鿿]/);
   });
+
+  it("says proposal for a local proposal's attempts", () => {
+    const data = { ...superseded, proposalId: 'proposal_a' };
+    expect(eventText({ type: 'workspace.removed', data })).toBe(
+      '同一提案的 Run run_ok 已完成，自动删掉了这次失败留下的工作目录和分支',
+    );
+    expect(eventText({ type: 'workspace.cleanup_failed', data })).toBe(
+      '同一提案的 Run run_ok 已完成，但没能自动删掉这次失败留下的工作目录和分支，请在「工作区」页手动清理',
+    );
+    setLang('en');
+    const removed = eventText({ type: 'workspace.removed', data });
+    expect(removed).toBe(
+      'Run run_ok of the same proposal completed, so the working directory and branch this failed Run kept were removed automatically',
+    );
+    expect(removed).not.toMatch(/[一-鿿]/);
+  });
 });
 
 describe('workspaces of attempts before the last when an issue used up its attempts', () => {
@@ -747,6 +763,22 @@ describe('workspaces of attempts before the last when an issue used up its attem
       "The issue used up its attempts, so only the last one, Run run_last, keeps its working directory and branch, but this Run's could not be removed automatically; clean them up by hand on the Workspaces page",
     );
     for (const text of [removed, failed]) expect(text).not.toMatch(/[一-鿿]/);
+  });
+
+  it("says proposal for a local proposal's attempts", () => {
+    const data = { ...exhausted, proposalId: 'proposal_a' };
+    expect(eventText({ type: 'workspace.removed', data })).toBe(
+      '提案用完了重做次数，只保留最后一次尝试 run_last 的工作目录和分支，自动删掉了这次的',
+    );
+    expect(eventText({ type: 'workspace.cleanup_failed', data })).toBe(
+      '提案用完了重做次数，只保留最后一次尝试 run_last 的工作目录和分支，但没能自动删掉这次的，请在「工作区」页手动清理',
+    );
+    setLang('en');
+    const failed = eventText({ type: 'workspace.cleanup_failed', data });
+    expect(failed).toBe(
+      "The proposal used up its attempts, so only the last one, Run run_last, keeps its working directory and branch, but this Run's could not be removed automatically; clean them up by hand on the Workspaces page",
+    );
+    expect(failed).not.toMatch(/[一-鿿]/);
   });
 });
 

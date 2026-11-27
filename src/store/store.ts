@@ -768,6 +768,30 @@ export class Store {
     );
   }
 
+  /**
+   * Every Run of a local proposal, oldest first: each proposal's latest Run (`run_id`) and the
+   * failed attempts before it (`failures`); only the proposal `proposalId`'s when given.
+   */
+  proposalRuns(proposalId?: string): Run[] {
+    const only = proposalId === undefined ? '' : 'AND p.id = ?';
+    return this.many<Run>(
+      'runs',
+      `SELECT * FROM runs WHERE id IN (
+         SELECT run_id FROM proposals p WHERE run_id IS NOT NULL ${only}
+         UNION
+         SELECT json_extract(f.value, '$.runId') FROM proposals p, json_each(p.failures) f
+           WHERE 1 ${only}
+       )
+       ORDER BY created_at, rowid`,
+      ...(proposalId === undefined ? [] : [proposalId, proposalId]),
+    );
+  }
+
+  /** The proposal whose latest Run is `runId`; undefined for a Run that is none's latest. */
+  proposalOfRun(runId: string): Proposal | undefined {
+    return this.one<Proposal>('proposals', 'SELECT * FROM proposals WHERE run_id = ?', runId);
+  }
+
   /** Failed Runs of the repo whose issue waits for them to be redone, oldest first. */
   runsAwaitingRedo(repoId: string): Run[] {
     return this.many<Run>(

@@ -1130,18 +1130,20 @@ export function eventText(
       en: 'When the review stopped halfway, what the reviewer left could not be dropped to put the working directory back where the review started; the Run does it first when it next starts executing, before its working directory is checked and the review runs again',
     });
   }
-  const { reason, supersededBy } = event.data;
+  const { reason, supersededBy, proposalId } = event.data;
+  // Attempts at a local proposal rather than at an issue.
+  const ofProposal = typeof proposalId === 'string';
   if (reason === 'superseded' && typeof supersededBy === 'string') {
     if (event.type === 'workspace.removed') {
       return t({
-        zh: `同一 issue 的 Run ${supersededBy} 已完成，自动删掉了这次失败留下的工作目录和分支`,
-        en: `Run ${supersededBy} of the same issue completed, so the working directory and branch this failed Run kept were removed automatically`,
+        zh: `同一${ofProposal ? '提案' : ' issue '}的 Run ${supersededBy} 已完成，自动删掉了这次失败留下的工作目录和分支`,
+        en: `Run ${supersededBy} of the same ${ofProposal ? 'proposal' : 'issue'} completed, so the working directory and branch this failed Run kept were removed automatically`,
       });
     }
     if (event.type === 'workspace.cleanup_failed') {
       return t({
-        zh: `同一 issue 的 Run ${supersededBy} 已完成，但没能自动删掉这次失败留下的工作目录和分支，请在「工作区」页手动清理`,
-        en: `Run ${supersededBy} of the same issue completed, but the working directory and branch this failed Run kept could not be removed automatically; clean them up by hand on the Workspaces page`,
+        zh: `同一${ofProposal ? '提案' : ' issue '}的 Run ${supersededBy} 已完成，但没能自动删掉这次失败留下的工作目录和分支，请在「工作区」页手动清理`,
+        en: `Run ${supersededBy} of the same ${ofProposal ? 'proposal' : 'issue'} completed, but the working directory and branch this failed Run kept could not be removed automatically; clean them up by hand on the Workspaces page`,
       });
     }
   }
@@ -1184,14 +1186,14 @@ export function eventText(
   if (reason === 'retries_exhausted' && typeof keptRun === 'string') {
     if (event.type === 'workspace.removed') {
       return t({
-        zh: `issue 用完了重做次数，只保留最后一次尝试 ${keptRun} 的工作目录和分支，自动删掉了这次的`,
-        en: `The issue used up its attempts, so only the last one, Run ${keptRun}, keeps its working directory and branch; this Run's were removed automatically`,
+        zh: `${ofProposal ? '提案' : 'issue '}用完了重做次数，只保留最后一次尝试 ${keptRun} 的工作目录和分支，自动删掉了这次的`,
+        en: `The ${ofProposal ? 'proposal' : 'issue'} used up its attempts, so only the last one, Run ${keptRun}, keeps its working directory and branch; this Run's were removed automatically`,
       });
     }
     if (event.type === 'workspace.cleanup_failed') {
       return t({
-        zh: `issue 用完了重做次数，只保留最后一次尝试 ${keptRun} 的工作目录和分支，但没能自动删掉这次的，请在「工作区」页手动清理`,
-        en: `The issue used up its attempts, so only the last one, Run ${keptRun}, keeps its working directory and branch, but this Run's could not be removed automatically; clean them up by hand on the Workspaces page`,
+        zh: `${ofProposal ? '提案' : 'issue '}用完了重做次数，只保留最后一次尝试 ${keptRun} 的工作目录和分支，但没能自动删掉这次的，请在「工作区」页手动清理`,
+        en: `The ${ofProposal ? 'proposal' : 'issue'} used up its attempts, so only the last one, Run ${keptRun}, keeps its working directory and branch, but this Run's could not be removed automatically; clean them up by hand on the Workspaces page`,
       });
     }
   }

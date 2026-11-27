@@ -797,6 +797,36 @@ describe('proposals of the local backlog', () => {
     expect(store.proposalsWithFailedRun('nope')).toEqual([]);
   });
 
+  it("lists the proposals' Runs, the failed attempts before the latest included", () => {
+    const store = new Store(':memory:');
+    const { repo, mk } = seed(store);
+    const p = store.createProposal({ ...proposed('p'), repoId: repo.id, scoutId: null });
+    const q = store.createProposal({ ...proposed('q'), repoId: repo.id, scoutId: null });
+    const [p1, q1, p2, p3] = [mk('p1'), mk('q1'), mk('p2'), mk('p3')];
+    // Of no proposal.
+    mk('loose');
+    const failure = (runId: string, attempt: number) => ({
+      runId,
+      attempt,
+      stage: null,
+      error: 'x',
+    });
+    store.updateProposal(p.id, {
+      status: 'accepted',
+      runId: p3.id,
+      failures: [failure(p1.id, 1), failure(p2.id, 2)],
+    });
+    // Its latest Run failed and was recorded: listed once.
+    store.updateProposal(q.id, { status: 'accepted', runId: q1.id, failures: [failure(q1.id, 1)] });
+    const ids = (runs: { id: string }[]) => runs.map((r) => r.id);
+    expect(ids(store.proposalRuns())).toEqual([p1.id, q1.id, p2.id, p3.id]);
+    expect(ids(store.proposalRuns(p.id))).toEqual([p1.id, p2.id, p3.id]);
+    expect(store.proposalRuns('nope')).toEqual([]);
+    // Only the latest Run leads back to its proposal.
+    expect(store.proposalOfRun(p3.id)?.id).toBe(p.id);
+    expect(store.proposalOfRun(p1.id)).toBeUndefined();
+  });
+
   it('tells a proposal that does not exist, in both languages', () => {
     const store = new Store(':memory:');
     expect(() => store.getProposal('nope')).toThrow(NotFoundError);

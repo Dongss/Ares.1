@@ -1,5 +1,6 @@
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ProposalSource } from '../src/backlog/scouting.js';
 import { REDO_BACKOFF_MAX_HOURS } from '../src/config/flow.js';
 import type { BacklogRepoConfig } from '../src/config/schema.js';
@@ -12,6 +13,7 @@ import type { IterationChild, Proposal, Run } from '../src/store/types.js';
 import {
   done,
   FakeGitHub,
+  git,
   type Harness,
   harness,
   review,
@@ -1072,6 +1074,180 @@ describe('local backlog: redo after a failure', () => {
     await again.waitStatus(second.id, 'completed');
     expect(again.master.store.listGlobalEventsOfType('proposal.redo_scheduled')).toHaveLength(1);
     expect(again.master.store.listGlobalEventsOfType('proposal.redone')).toHaveLength(1);
+  });
+
+  /** Whether the Run's worktree and branch are still there. */
+  const kept = (t: Harness, run: Run) => ({
+    worktree: existsSync(run.worktreePath as string),
+    branch: git(t.repoDir, 'branch', '--list', run.branch as string) !== '',
+  });
+  const gone = { worktree: false, branch: false };
+  const there = { worktree: true, branch: true };
+  /** The data of the Run's `workspace.removed` events. */
+  const removals = (t: Harness, runId: string) =>
+    t.master.store
+      .listEvents(runId)
+      .filter((e) => e.type === 'workspace.removed')
+      .map((e) => e.data);
+  /** What `workspace.removed` records for an attempt of proposal `p` removed for `why`. */
+  const removedFor = (run: Run, p: Proposal, why: Record<string, string>) => ({
+    path: run.worktreePath,
+    branch: run.branch,
+    ...why,
+    proposalId: p.id,
+  });
+
+  it('removes the worktree and branch of the failed attempt once its redo completes', async () => {
+    const t = await startRedo(config(), [1]);
+    const p = acceptByHand(t);
+    const first = await t.waitStatus(p.runId ?? '', 'failed');
+    await t.master.backlog.poll();
+    elapseRedoWait(t);
+    await t.master.backlog.poll();
+    const second = latestRun(t, p.id);
+    expect(second.id).not.toBe(first.id);
+    expect(kept(t, first)).toEqual(there);
+
+    await t.waitStatus(second.id, 'completed');
+    await waitFor(() => removals(t, first.id).length > 0, 'the failed attempt to be removed');
+    expect(kept(t, first)).toEqual(gone);
+    expect(git(t.repoDir, 'worktree', 'list', '--porcelain')).not.toContain(first.branch);
+    expect(removals(t, first.id)).toEqual([
+      removedFor(first, p, { reason: 'superseded', supersededBy: second.id }),
+    ]);
+    // Its records stay.
+    expect(t.master.store.getRun(first.id)).toMatchObject({ status: 'failed', error: first.error });
+    // Nothing is recorded twice: neither by a poll nor by the sweep.
+    await t.master.backlog.poll();
+    await t.master.engine.sweepLeftoverWorkspaces();
+    expect(removals(t, first.id)).toHaveLength(1);
+  });
+
+  it('keeps only the last attempt once the attempts are used up, the newest after a restart', async () => {
+    const t = await startRedo(config({ maxAttempts: 2 }), [1, 2, 3, 4]);
+    const store = t.master.store;
+    const p = acceptByHand(t);
+    /** Both Runs of the proposal's round, once they failed and the proposal is given up. */
+    const failRound = async (): Promise<[Run, Run]> => {
+      const a = await t.waitStatus(latestRun(t, p.id).id, 'failed');
+      await t.master.backlog.poll();
+      elapseRedoWait(t);
+      await t.master.backlog.poll();
+      const b = await t.waitStatus(latestRun(t, p.id).id, 'failed');
+      expect(b.id).not.toBe(a.id);
+      await t.master.backlog.poll();
+      expect(store.getProposal(p.id)).toMatchObject({ status: 'failed', redo: 'exhausted' });
+      return [a, b];
+    };
+
+    // Removed at the poll that gives the proposal up.
+    const [first, second] = await failRound();
+    expect(kept(t, first)).toEqual(gone);
+    expect(removals(t, first.id)).toEqual([
+      removedFor(first, p, { reason: 'retries_exhausted', keptRun: second.id }),
+    ]);
+    expect(kept(t, second)).toEqual(there);
+    expect(removals(t, second.id)).toEqual([]);
+
+    // Started over and given up again: the earlier round's last attempt is not the last any more.
+    await t.master.backlog.restart(p.id);
+    const [third, fourth] = await failRound();
+    for (const run of [second, third]) {
+      expect(kept(t, run)).toEqual(gone);
+      expect(removals(t, run.id)).toEqual([
+        removedFor(run, p, { reason: 'retries_exhausted', keptRun: fourth.id }),
+      ]);
+    }
+    expect(kept(t, fourth)).toEqual(there);
+
+    // Started over again and done: the last failed attempt goes too.
+    await t.master.backlog.restart(p.id);
+    const fifth = await t.waitStatus(latestRun(t, p.id).id, 'completed');
+    await waitFor(() => removals(t, fourth.id).length > 0, 'the last attempt to be removed');
+    expect(kept(t, fourth)).toEqual(gone);
+    expect(removals(t, fourth.id)).toEqual([
+      removedFor(fourth, p, { reason: 'superseded', supersededBy: fifth.id }),
+    ]);
+    // Those removed before are not recorded again.
+    for (const run of [first, second, third]) expect(removals(t, run.id)).toHaveLength(1);
+  });
+
+  it('never removes a Run a human terminated, nor the last failed attempt before it', async () => {
+    const t = await startRedo(config(), []);
+    let calls = 0;
+    t.scripts.coder = async (ctx) => {
+      if (++calls === 1) return { status: 'failed', error: '模型额度用完了' };
+      await new Promise((resolve) => ctx.signal.addEventListener('abort', resolve));
+      return done();
+    };
+    const p = acceptByHand(t);
+    const first = await t.waitStatus(p.runId ?? '', 'failed');
+    await t.master.backlog.poll();
+    elapseRedoWait(t);
+    await t.master.backlog.poll();
+    const second = latestRun(t, p.id);
+    await waitFor(() => calls === 2, 'the redo to code');
+    expect((await t.master.engine.cancel(second.id)).status).toBe('cancelled');
+    const cancelled = t.master.store.getRun(second.id);
+    expect(kept(t, cancelled)).toEqual(there);
+
+    await t.master.backlog.poll();
+    await t.master.engine.removeProposalAttempts(p.id);
+    await t.master.engine.sweepLeftoverWorkspaces();
+    for (const run of [first, cancelled]) {
+      expect(kept(t, run)).toEqual(there);
+      expect(removals(t, run.id)).toEqual([]);
+    }
+    expect(t.master.store.getProposal(p.id)).toMatchObject({ status: 'accepted', redo: null });
+  });
+
+  it('removes at the next start what the Master stopped before removing', async () => {
+    // A's first Run fails and its redo completes; B's two Runs use up its attempts.
+    const t = await startRedo(config({ maxAttempts: 2 }), [1, 3, 4]);
+    const store = t.master.store;
+    // The Master stops each time before it removes anything.
+    const removal = vi.spyOn(t.master.engine, 'removeProposalAttempts').mockResolvedValue();
+    const a = acceptByHand(t, '加 feature');
+    const a1 = await t.waitStatus(a.runId ?? '', 'failed');
+    await t.master.backlog.poll();
+    elapseRedoWait(t);
+    await t.master.backlog.poll();
+    const a2 = await t.waitStatus(latestRun(t, a.id).id, 'completed');
+    const b = acceptByHand(t, '加 cache');
+    const b1 = await t.waitStatus(b.runId ?? '', 'failed');
+    await t.master.backlog.poll();
+    elapseRedoWait(t);
+    await t.master.backlog.poll();
+    const b2 = await t.waitStatus(latestRun(t, b.id).id, 'failed');
+    await t.master.backlog.poll();
+    expect(store.getProposal(b.id).redo).toBe('exhausted');
+    expect(removal.mock.calls).toEqual([[a.id], [b.id]]);
+    for (const run of [a1, b1, b2]) expect(kept(t, run)).toEqual(there);
+
+    await t.close();
+    h = await harness({
+      agents: AGENTS,
+      config: config({ maxAttempts: 2 }),
+      github: gh,
+      home: t.home,
+      repoDir: t.repoDir,
+      workflow: REDO_WORKFLOW,
+    });
+    const next = h;
+    await waitFor(
+      () => [a1, b1].every((run) => removals(next, run.id).length > 0),
+      'the leftover workspaces to be removed',
+    );
+    expect(kept(next, a1)).toEqual(gone);
+    expect(removals(next, a1.id)).toEqual([
+      removedFor(a1, a, { reason: 'superseded', supersededBy: a2.id }),
+    ]);
+    expect(kept(next, b1)).toEqual(gone);
+    expect(removals(next, b1.id)).toEqual([
+      removedFor(b1, b, { reason: 'retries_exhausted', keptRun: b2.id }),
+    ]);
+    expect(kept(next, b2)).toEqual(there);
+    expect(removals(next, b2.id)).toEqual([]);
   });
 
   it('speaks English without Chinese left', async () => {

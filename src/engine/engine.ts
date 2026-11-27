@@ -1722,6 +1722,27 @@ export class Engine {
   }
 
   /**
+   * What the removals of superseded and exhausted attempts do for an issue, for a local proposal
+   * (whose Runs come from no issue), called by the local backlog: once a Run of the proposal
+   * completed, the worktrees and branches its failed attempts before it kept are removed
+   * (`superseded`); once it used up its attempts, those of every failed attempt but the last
+   * (`retries_exhausted`), the attempts before a human started it over included. Which ones is
+   * `leftoverWorkspaces`, the rule the sweep goes by too. Cancelled Runs stay: a human ended them
+   * and may still want to look. A removal that fails is recorded on that Run and passed by.
+   * Nothing left to remove is fine, so calling it again does no harm. Like
+   * `removeExhaustedAttempts` it does not hold the merge lock, and is as safe.
+   */
+  async removeProposalAttempts(proposalId: string): Promise<void> {
+    const proposal = this.store.getProposal(proposalId);
+    const runs = this.store.proposalRuns(proposalId);
+    for (const { runId, why } of leftoverWorkspaces(runs, [], [proposal])) {
+      // Started again by a human while earlier removals ran: no longer a kept failure.
+      if (this.store.getRun(runId).status !== 'failed') continue;
+      await this.removeKeptWorkspaceOrRecord(runId, why);
+    }
+  }
+
+  /**
    * A human changed the title or body of the issue of `runId` before it merged, so the GitHub
    * bridge terminated it and `newRunId` does the changed requirement from the start: nothing on
    * the old worktree and branch is of use any more, and a human did not end it to look at it.
@@ -1757,7 +1778,9 @@ export class Engine {
     const events = LEFTOVER_WORKSPACE_EVENTS.flatMap((type) =>
       this.store.listEventsOfType(type, ''),
     );
-    const leftovers = leftoverWorkspaces(this.store.issueRuns(), events);
+    // The groups of issues' Runs and of proposals' Runs do not overlap: a proposal's have no issue.
+    const runs = [...this.store.issueRuns(), ...this.store.proposalRuns()];
+    const leftovers = leftoverWorkspaces(runs, events, this.store.listProposals());
     if (leftovers.length === 0) return;
     // One git call per repo tells which are still there, rather than one per Run.
     const states = await this.inspectWorkspaces(leftovers.map((l) => this.store.getRun(l.runId)));

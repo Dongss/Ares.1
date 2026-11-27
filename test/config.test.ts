@@ -96,6 +96,7 @@ import {
   type IterationChild,
   type IterationChildStatus,
   type IterationStatus,
+  type Proposal,
   type RedoState,
   type Run,
   type RunStatus,
@@ -3303,6 +3304,156 @@ describe('leftoverWorkspaces', () => {
     expect(leftoverWorkspaces(runs, events)).toEqual([
       { runId: 'a2', why: { reason: 'superseded', supersededBy: 'a4' } },
     ]);
+  });
+
+  describe("a local proposal's Runs", () => {
+    /** A proposal whose failed attempts are `failed` and latest Run `runId`. */
+    const proposal = (
+      id: string,
+      runId: string | null,
+      failed: string[],
+      redo: Proposal['redo'] = null,
+    ) => ({
+      id,
+      runId,
+      redo,
+      failures: failed.map((r, i) => ({ runId: r, attempt: i + 1, stage: '编码', error: 'x' })),
+    });
+
+    it('lists the failed attempts a later Run of the proposal completed after', () => {
+      const runs = [
+        run('p1', 'failed', null),
+        run('q1', 'failed', null),
+        run('p2', 'failed', null),
+        run('p3', 'completed', null),
+        // Of no proposal: passed by.
+        run('x1', 'failed', null),
+        run('q2', 'running', null),
+      ];
+      const proposals = [
+        proposal('prop_p', 'p3', ['p1', 'p2']),
+        proposal('prop_q', 'q2', ['q1']),
+        // Never started: nothing of it.
+        proposal('prop_r', null, []),
+      ];
+      expect(leftoverWorkspaces(runs, [], proposals)).toEqual([
+        {
+          runId: 'p1',
+          why: { reason: 'superseded', supersededBy: 'p3', proposalId: 'prop_p' },
+        },
+        {
+          runId: 'p2',
+          why: { reason: 'superseded', supersededBy: 'p3', proposalId: 'prop_p' },
+        },
+      ]);
+      // Without the proposals, Runs of no issue are nobody's.
+      expect(leftoverWorkspaces(runs, [])).toEqual([]);
+    });
+
+    it('keeps only the last attempt once the proposal used up its attempts', () => {
+      const runs = [
+        run('p1', 'failed', null),
+        run('p2', 'failed', null),
+        run('p3', 'failed', null),
+        // Waiting for a redo: nothing yet.
+        run('q1', 'failed', null),
+        run('q2', 'failed', null),
+        // Its latest Run a human terminated: it stays, and so do the attempts before it.
+        run('c1', 'failed', null),
+        run('c2', 'cancelled', null),
+      ];
+      const proposals = [
+        proposal('prop_p', 'p3', ['p1', 'p2', 'p3'], 'exhausted'),
+        proposal('prop_q', 'q2', ['q1', 'q2'], 'pending'),
+        proposal('prop_c', 'c2', ['c1']),
+      ];
+      const exhausted = { reason: 'retries_exhausted', keptRun: 'p3', proposalId: 'prop_p' };
+      expect(leftoverWorkspaces(runs, [], proposals)).toEqual([
+        { runId: 'p1', why: exhausted },
+        { runId: 'p2', why: exhausted },
+      ]);
+      // What was removed is passed by.
+      const removed = [{ runId: 'p1', type: 'workspace.removed', data: exhausted }];
+      expect(leftoverWorkspaces(runs, removed, proposals)).toEqual([
+        { runId: 'p2', why: exhausted },
+      ]);
+    });
+
+    it('goes by the newest attempts once a human started the proposal over', () => {
+      // p1–p2 used up the attempts, p2 kept; started over, p3 failed and p4 goes on.
+      const before = [
+        run('p1', 'failed', null),
+        run('p2', 'failed', null),
+        run('p3', 'failed', null),
+      ];
+      const failed = {
+        runId: null,
+        type: 'proposal.failed',
+        data: {
+          proposalId: 'prop_p',
+          runId: 'p2',
+          failures: [{ runId: 'p1' }, { runId: 'p2' }],
+        },
+      };
+      const going = [proposal('prop_p', 'p4', ['p1', 'p2', 'p3'], null)];
+      const kept = (keptRun: string) => ({
+        reason: 'retries_exhausted',
+        keptRun,
+        proposalId: 'prop_p',
+      });
+      // The attempts the first round's proposal.failed names, as removing them then would have.
+      expect(leftoverWorkspaces([...before, run('p4', 'running', null)], [failed], going)).toEqual([
+        { runId: 'p1', why: kept('p2') },
+      ]);
+      // The new round completed: every failed attempt, the earlier round's last one too.
+      const superseded = { reason: 'superseded', supersededBy: 'p4', proposalId: 'prop_p' };
+      expect(
+        leftoverWorkspaces([...before, run('p4', 'completed', null)], [failed], going),
+      ).toEqual([
+        { runId: 'p1', why: superseded },
+        { runId: 'p2', why: superseded },
+        { runId: 'p3', why: superseded },
+      ]);
+      // The new round used up its attempts too: only its last one is kept.
+      const givenUp = [proposal('prop_p', 'p4', ['p1', 'p2', 'p3', 'p4'], 'exhausted')];
+      expect(leftoverWorkspaces([...before, run('p4', 'failed', null)], [failed], givenUp)).toEqual(
+        [
+          { runId: 'p1', why: kept('p4') },
+          { runId: 'p2', why: kept('p4') },
+          { runId: 'p3', why: kept('p4') },
+        ],
+      );
+    });
+
+    it("lists the attempts before a proposal's last one by its proposal.failed alone", () => {
+      const runs = [run('p1', 'failed', null), run('p2', 'failed', null)];
+      // Not recorded as given up on the proposal (yet), but its event says so.
+      const proposals = [proposal('prop_p', 'p2', ['p1', 'p2'], 'pending')];
+      const failed = {
+        runId: null,
+        type: 'proposal.failed',
+        data: { runId: 'p2', failures: [{ runId: 'p1' }, { runId: 'p2' }, 'junk', null] },
+      };
+      expect(leftoverWorkspaces(runs, [failed], proposals)).toEqual([
+        {
+          runId: 'p1',
+          why: { reason: 'retries_exhausted', keptRun: 'p2', proposalId: 'prop_p' },
+        },
+      ]);
+    });
+
+    it("groups an issue's Runs and a proposal's apart", () => {
+      const runs = [
+        run('a1', 'failed', 1, 'redone'),
+        run('p1', 'failed', null),
+        run('a2', 'completed', 1),
+        run('p2', 'running', null),
+      ];
+      const proposals = [proposal('prop_p', 'p2', ['p1'])];
+      expect(leftoverWorkspaces(runs, [], proposals)).toEqual([
+        { runId: 'a1', why: { reason: 'superseded', supersededBy: 'a2' } },
+      ]);
+    });
   });
 });
 

@@ -272,7 +272,9 @@ const CHILD_OVER: readonly IterationChildStatus[] = ['done', 'failed', 'dropped'
  *   (`proposalRedoAllowed`), is redone as a new Run whose goal tells why the earlier attempts
  *   failed, after the wait an issue's redo waits (`proposalRedoDueAt`), up to `max_run_attempts`
  *   Runs and within the day's budget, while the work switch is on; after that the proposal
- *   failed. A Run a human terminated is not redone;
+ *   failed. A Run a human terminated is not redone. Once a Run of the proposal completed, the
+ *   worktrees and branches its failed attempts kept are removed; once it failed for good, those
+ *   of every attempt but the last (`Engine.removeProposalAttempts`);
  * - restart: a human may start a failed proposal over on the dashboard, a step of an iteration
  *   that still wants it included: its attempts count from 1 again, the new Run told why the
  *   earlier ones failed, and its iteration goes on unless another step still blocks it;
@@ -299,6 +301,9 @@ export class LocalBacklog {
   private readonly onEvent = (e: EventRow) => {
     // What waited for the switch goes on at once, not at the next poll.
     if (e.type === 'master.working' && e.data.on === true) void this.poll();
+    if (e.type === 'run.status' && e.data.status === 'completed' && e.runId) {
+      this.removeSupersededAttempts(e.runId).catch((err) => this.report(err));
+    }
   };
 
   constructor(private readonly deps: LocalBacklogDeps) {}
@@ -384,7 +389,7 @@ export class LocalBacklog {
           // Before following the iterations: a step whose Run failed with attempts left is seen
           // as waiting for its redo, never as failed. Before auto-accepting: a requirement already
           // taken on goes first within the budget.
-          this.redoFailedProposals(setup.repo, setup.cfg, working);
+          await this.redoFailedProposals(setup.repo, setup.cfg, working);
         } catch (err) {
           failed = true;
           this.report(err);
@@ -795,11 +800,19 @@ export class LocalBacklog {
    * waiting whose wait is over (`proposalRedoDueAt`) is redone (redo) as long as the day's budget
    * is not spent. Neither wait costs an attempt, and each proposal waits on its own. A Run a human
    * terminated is cancelled, not failed, so it is not redone. A proposal that could not be redone
-   * (its Run not created) leaves the others to go on, and the error is thrown afterwards.
+   * (its Run not created) leaves the others to go on, and the error is thrown afterwards. Of a
+   * proposal given up only the last attempt keeps its worktree and branch, as for an issue closed
+   * after its last attempt: the earlier ones are removed once it is given up
+   * (removeEarlierAttempts), after the redos.
    */
-  private redoFailedProposals(repo: Repo, cfg: BacklogRepoConfig, working: boolean): void {
+  private async redoFailedProposals(
+    repo: Repo,
+    cfg: BacklogRepoConfig,
+    working: boolean,
+  ): Promise<void> {
     const store = this.deps.store;
     let failure: { err: unknown } | undefined;
+    const givenUp: Proposal[] = [];
     for (const found of store.proposalsWithFailedRun(repo.id)) {
       if (this.stopping) break;
       const iteration = this.iterationOf(found);
@@ -807,6 +820,10 @@ export class LocalBacklog {
       const failed = store.getRun(found.runId ?? '');
       const p =
         found.redo === null ? this.recordFailure(repo, cfg, found, failed, iteration) : found;
+      if (p.redo === 'exhausted') {
+        givenUp.push(p);
+        continue;
+      }
       if (!working) continue;
       const due = proposalRedoDueAt(p, iteration, failed, this.pollMinutes);
       if (due === null || due > Date.now()) continue;
@@ -818,7 +835,42 @@ export class LocalBacklog {
         failure ??= { err };
       }
     }
+    // After the redos, which the removals do not hold up.
+    for (const p of givenUp) await this.removeEarlierAttempts(p.id);
     if (failure) throw failure.err;
+  }
+
+  /**
+   * Once the latest Run of a proposal completed, the worktrees and branches its failed attempts
+   * kept are of no more use, as the engine finds for an issue's when a redo completes: removed
+   * after what is queued before (`serial`), so that `stop` waits for it. What the Master stopped
+   * before, or failed to remove, the engine's sweep at start and daily removes.
+   */
+  private removeSupersededAttempts(runId: string): Promise<void> {
+    return this.serial(async () => {
+      if (this.stopping) return;
+      const p = this.deps.store.proposalOfRun(runId);
+      if (p && p.failures.length > 0) await this.removeEarlierAttempts(p.id);
+    });
+  }
+
+  /**
+   * Remove the worktrees and branches of a proposal's earlier attempts nobody needs any more
+   * (`Engine.removeProposalAttempts`): those before a Run that completed, or every one but the
+   * last once its attempts are used up. Each failed removal is recorded on its Run by the engine;
+   * anything else going wrong is only warned about, so that nothing else waits for it.
+   */
+  private async removeEarlierAttempts(proposalId: string): Promise<void> {
+    try {
+      await this.deps.engine.removeProposalAttempts(proposalId);
+    } catch (err) {
+      console.warn(
+        t({
+          zh: `没能删除提案 ${proposalId} 之前几次失败尝试的工作目录：${errorMessage(err)}`,
+          en: `Could not remove the working directories of the earlier failed attempts of proposal ${proposalId}: ${errorMessage(err)}`,
+        }),
+      );
+    }
   }
 
   /**
