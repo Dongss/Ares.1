@@ -11,6 +11,7 @@ import {
   type FlowStageAgent,
   planningText,
   reworkText,
+  serveText,
   tierCostText,
 } from '../lib/flow.js';
 import { Badge } from './ui.js';
@@ -61,6 +62,7 @@ export function FlowChart(props: {
 function FlowStageBody({ stage, progress }: { stage: FlowStage; progress?: FlowProgress }) {
   const status = progress && FLOW_STATUS[progress.status];
   const planning = planningText(stage.planning);
+  const serve = serveText(stage);
   return (
     <>
       <span className="flow-head">
@@ -126,6 +128,7 @@ function FlowStageBody({ stage, progress }: { stage: FlowStage; progress?: FlowP
           </Line>
         ))
       )}
+      {serve && <Line label={t({ zh: '服务', en: 'Service' })}>{serve}</Line>}
       {!runsNoCommands(stage.kind) && (
         <Line label={t({ zh: '检查', en: 'Checks' })}>
           {stage.commands === null ? (

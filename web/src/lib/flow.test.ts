@@ -8,8 +8,10 @@ import {
   buildFlow,
   candidatesRuleText,
   FLOW_STATUS,
+  type FlowStage,
   planningText,
   reworkText,
+  serveText,
   stageProgress,
   tierCostText,
 } from './flow.js';
@@ -425,6 +427,43 @@ describe('command stages', () => {
       gate: true,
       onReject: { id: 'review', name: '评审' },
     });
+  });
+
+  it('say when they start a service for their commands', () => {
+    const serving = withCommand({ serve: true });
+    const [code, , e2e] = buildFlow({
+      template: serving,
+      repoVerifyCommands: ['npm test'],
+      agents,
+    });
+    expect(e2e?.serve).toBe(true);
+    expect(code?.serve).toBe(false);
+    expect(serveText(e2e as FlowStage)).toBe(
+      '先用仓库登记的启动命令起服务，命令里用 $PORT 和 $ARES1_SERVICE_URL 访问它，阶段结束后停掉',
+    );
+    // Without commands it passes without starting the service; with the repo default unknown
+    // it may have some.
+    const [, , none] = buildFlow({ template: serving, repoVerifyCommands: [], agents });
+    expect(serveText(none as FlowStage)).toBeNull();
+    const [, , unknown] = buildFlow({ template: serving, repoVerifyCommands: null, agents });
+    expect(serveText(unknown as FlowStage)).not.toBeNull();
+    for (const serve of [false, undefined]) {
+      const [, , plain] = buildFlow({
+        template: withCommand(serve === undefined ? {} : { serve }),
+        repoVerifyCommands: ['npm test'],
+        agents,
+      });
+      expect(plain?.serve).toBe(false);
+      expect(serveText(plain as FlowStage)).toBeNull();
+    }
+    setLang('en');
+    try {
+      const text = serveText(e2e as FlowStage);
+      expect(text).toMatch(/^First starts the service/);
+      expect(text).not.toMatch(/[一-鿿]/);
+    } finally {
+      setLang('zh');
+    }
   });
 
   it('cannot fail without commands; without a repo the default may have some', () => {

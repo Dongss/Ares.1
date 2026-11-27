@@ -1873,6 +1873,91 @@ stages:
       ]);
     });
 
+    it('may start a service with serve, which no other kind of stage may have', () => {
+      const files: Record<string, string> = {
+        'on.yaml': tpl('on', ', serve: true, verify: { commands: ["curl -f $ARES1_SERVICE_URL"] }'),
+        'off.yaml': tpl('off', ', serve: false'),
+        'none.yaml': tpl('none', ''),
+        'agent.yaml': `id: a1
+stages:
+  - { id: implement, kind: agent, agent: claude-coder, serve: true }
+  - { id: merge, kind: merge }
+`,
+        'review.yaml': `id: a2
+stages:
+  - { id: implement, agent: claude-coder }
+  - { id: review, kind: review, agent: claude-reviewer, serve: false }
+  - { id: merge, kind: merge }
+`,
+        'assess.yaml': `id: a3
+stages:
+  - { id: assess, kind: assess, agent: claude-reviewer, serve: true }
+  - { id: implement, agent: claude-coder, inputs: [assessment] }
+`,
+        'placeholder.yaml': `id: a4
+stages:
+  - { id: implement, agent: claude-coder }
+  - { id: e2e, kind: placeholder, serve: false }
+`,
+        'merge.yaml': `id: a5
+stages:
+  - { id: implement, agent: claude-coder }
+  - { id: merge, kind: merge, serve: true }
+`,
+      };
+      const paths = home();
+      for (const [file, yaml] of Object.entries(files)) {
+        writeFile(join(paths.workflowsDir, file), yaml);
+      }
+      const load = () => loadConfig(paths, ['claude-code'], ['claude-code']);
+      const cfg = load();
+      const errors = (file: string) => cfg.errors[`workflows/${file}`];
+      for (const file of ['on.yaml', 'off.yaml', 'none.yaml']) {
+        expect(errors(file)).toBeUndefined();
+        expect(cfg.warnings[`workflows/${file}`]).toBeUndefined();
+      }
+      const serveOf = (id: string) => e2eOf(cfg.templates.get(id) as WorkflowTemplate).serve;
+      expect(serveOf('on')).toBe(true);
+      expect(serveOf('off')).toBe(false);
+      // Not written means no service, like false.
+      expect(serveOf('none')).toBeUndefined();
+
+      // Even serve: false is refused elsewhere, as if the stage could have a service.
+      expect(errors('agent.yaml')).toEqual([
+        '阶段 implement：serve（为 Run 起服务）只能用在 command（命令）阶段，agent 阶段不能用',
+      ]);
+      expect(errors('review.yaml')).toEqual([
+        '阶段 review：serve（为 Run 起服务）只能用在 command（命令）阶段，review 阶段不能用',
+      ]);
+      expect(errors('assess.yaml')).toEqual([
+        '阶段 assess：serve（为 Run 起服务）只能用在 command（命令）阶段，assess 阶段不能用',
+      ]);
+      expect(errors('placeholder.yaml')).toEqual([
+        '阶段 e2e：serve（为 Run 起服务）只能用在 command（命令）阶段，placeholder 阶段不能用',
+      ]);
+      expect(errors('merge.yaml')).toEqual([
+        '阶段 merge：serve（为 Run 起服务）只能用在 command（命令）阶段，merge 阶段不能用',
+      ]);
+      for (const id of ['a1', 'a2', 'a3', 'a4', 'a5']) expect(cfg.templates.has(id)).toBe(false);
+
+      // config.yaml sets the language in use while loading.
+      writeFile(paths.configFile, 'language: en\n');
+      const en = load();
+      expect(en.errors['workflows/agent.yaml']).toEqual([
+        'Stage implement: serve (starting a service for the Run) only applies to command stages, not to an agent stage',
+      ]);
+      expect(en.errors['workflows/assess.yaml']).toEqual([
+        'Stage assess: serve (starting a service for the Run) only applies to command stages, not to an assess stage',
+      ]);
+      expect(en.errors['workflows/review.yaml']).toEqual([
+        'Stage review: serve (starting a service for the Run) only applies to command stages, not to a review stage',
+      ]);
+      expect(en.errors['workflows/merge.yaml']).toEqual([
+        'Stage merge: serve (starting a service for the Run) only applies to command stages, not to a merge stage',
+      ]);
+      expect(Object.values(en.errors).flat().join('\n')).not.toMatch(/[一-鿿]/);
+    });
+
     it('warn when a failure goes back to no agent stage, and never about waiting or the budget', () => {
       const cfg = load({
         'alone.yaml': `id: alone

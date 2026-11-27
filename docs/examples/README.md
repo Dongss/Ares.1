@@ -8,7 +8,7 @@
 | [`agents.yaml`](agents.yaml) | 6 个 Agent：编码用的强模型配高 effort（`claude-coder`），评审、需求评估、侦察用的便宜一档的模型（`claude-reviewer`），只改文件不执行命令的 `permission: safe`（`claude-docs`），cursor-agent 的另一家模型（`cursor-grok`，带 `price`），同样能以只读方式运行的 Codex CLI（`codex-reviewer`，Claude 额度用完时接着做需求评估、拆分任务和侦察），停用的 `enabled: false`（`claude-max`）；也演示了 `timeout_minutes`、`args` 的写法 |
 | [`workflows/light.yaml`](workflows/light.yaml) | 轻量：编码 → 评审 → 合并，不做需求评估。适合文档、小改动 |
 | [`workflows/strict.yaml`](workflows/strict.yaml) | 严格：需求评估 → 编码 → 评审 → 人工审批 → 合并。适合生产仓库；编码阶段用 `planning: auto`：需求评估给出的规模是 L 时先把需求拆成几步，再一步一步做、一步一步检查和提交 |
-| [`workflows/with-e2e.yaml`](workflows/with-e2e.yaml) | 带 E2E：编码 → 评审 → E2E（`kind: command`，比如 playwright，或 `docker compose up` 之后探活）→ 合并，E2E 失败时回到编码 |
+| [`workflows/with-e2e.yaml`](workflows/with-e2e.yaml) | 带 E2E：编码 → 评审 → E2E（`kind: command`，比如 playwright，或 `docker compose up` 之后探活；`serve: true` 时 Master 先用仓库登记的启动命令起服务，命令用 `$ARES1_SERVICE_URL` 访问它）→ 合并，E2E 失败时回到编码 |
 | [`workflows/cross-review.yaml`](workflows/cross-review.yaml) | 交叉评审：需求评估 → 编码 → 评审 → 合并。编码阶段从三个 Claude 的 Agent 里按难度挑（`claude-docs` / `claude-reviewer` / `claude-coder`），评审阶段从别家的 `codex-reviewer`、`cursor-grok` 里挑；Agent 出错时只在这个阶段的候选里换一个再试 |
 
 `cross-review.yaml` 演示了 `agent_candidates`：一个阶段列几个候选 Agent，Master 按需求评估给出的难度从中挑档次（`tier`）够用、成本（`cost`）最低的一个，模板里的注释写了每种难度会挑到谁。

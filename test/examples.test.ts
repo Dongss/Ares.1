@@ -112,6 +112,14 @@ describe('configuration examples (docs/examples)', () => {
     for (const tpl of bySize) expect(tpl.stages.some((s) => s.kind === 'assess')).toBe(true);
   });
 
+  it('shows a command stage starting a service for its commands', () => {
+    const cfg = loadExamples();
+    const serving = [...cfg.templates.values()].flatMap((tpl) =>
+      tpl.stages.filter((s) => s.serve !== undefined),
+    );
+    expect(serving.map((s) => [s.kind, s.serve])).toEqual([['command', true]]);
+  });
+
   it('shows stages picking their agent by difficulty from agent_candidates', () => {
     const cfg = loadExamples();
     const tpl = cfg.templates.get('cross-review');

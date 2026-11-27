@@ -365,8 +365,9 @@ export const StageSchema = z.strictObject({
    * placeholder: a step not implemented yet; shown in the flow and passed without doing anything.
    * assess: a read-only agent judges the requirement before any work (go / ask / drop).
    * command: the Master runs `verify.commands` (the repo's verify commands when not given) in the
-   * Run's worktree, without an agent; when one fails, the stage goes back to `on_fail` (the
-   * nearest earlier agent stage by default) with the command and the end of its output.
+   * Run's worktree, without an agent (with `serve`, against a service it starts for the Run);
+   * when one fails, the stage goes back to `on_fail` (the nearest earlier agent stage by default)
+   * with the command and the end of its output.
    */
   kind: z.enum(['agent', 'review', 'merge', 'placeholder', 'assess', 'command']).default('agent'),
   /** Agent, review and assess stages: the one agent that always does the stage's work. */
@@ -394,6 +395,14 @@ export const StageSchema = z.strictObject({
       llm_check: z.boolean().optional(),
     })
     .optional(),
+  /**
+   * command stages only: when true, the Master first starts the service with the start command
+   * the repo registered, on a free port of its own, waits until it answers, hands the commands
+   * `$PORT` and `$ARES1_SERVICE_URL`, and stops the service once the stage ends. Omitted = false.
+   * Optional rather than defaulting to false, so that `serve: false` on another kind of stage is
+   * still seen and refused by `validateTemplate` (src/config/load.ts).
+   */
+  serve: z.boolean().optional(),
   escalate: EscalateSchema.optional(),
   gate: z.boolean().default(false),
   on_fail: z.string().optional(),

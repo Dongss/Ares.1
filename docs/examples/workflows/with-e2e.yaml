@@ -3,6 +3,7 @@
 # 适合有端到端测试、冒烟测试的项目（前端、带数据库的服务等）：单元测试之外，合并前再把整个应用跑起来测一遍。
 # E2E 是 kind: command 的阶段：Master 在 Run 的工作目录里依次运行命令，不调用 Agent；
 # 有命令失败时，带着失败的命令和输出的末尾回到编码阶段（on_fail），由编码 Agent 按输出修改。
+# 它写了 serve: true：Master 先用仓库登记的服务启动命令为这个 Run 起服务，命令对着跑起来的服务做检查。
 #
 # 命令要用到的浏览器、依赖，在看板的仓库登记里用准备命令装好（见 README.md）。
 
@@ -37,10 +38,16 @@ stages:
   - id: e2e
     name: E2E
     kind: command              # 由 Master 运行命令，不能指定 agent；命令的超时是 config.yaml 的 defaults.command_timeout_minutes
+    serve: true                # 先用仓库登记的服务启动命令起服务：分配一个空闲的本机端口，等服务就绪后才运行命令，
+                               # 命令里用 $PORT 和 $ARES1_SERVICE_URL（http://127.0.0.1:<端口>）访问它，阶段结束后停掉服务；
+                               # 几个 Run 同时执行时各用各的端口。服务没有就绪时按命令失败回到 on_fail。
+                               # 仓库没登记启动命令时照常运行命令。只有 command 阶段能写 serve，不写等于 false
     verify:
       commands:                # 依次运行，有一条失败就停下、回到 on_fail；不写 verify 就运行仓库登记的检查命令
-        - npx playwright test
-      # 不是网页项目时，换成把服务跑起来再探活，例如（写成一条命令，失败时也会把服务停掉）：
+        - npx playwright test  # playwright 的配置里用 baseURL: process.env.ARES1_SERVICE_URL 指向 Master 起的服务
+      # 不是网页项目时，换成对服务探活或跑接口测试，例如：
+      #   - curl -fsS "$ARES1_SERVICE_URL/healthz"
+      # 服务要用 docker compose 起时，去掉 serve，把起服务、探活和停服务写成一条命令（失败时也会把服务停掉）：
       #   - |
       #     set -e
       #     trap 'docker compose down -v' EXIT

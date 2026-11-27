@@ -843,6 +843,17 @@ export function validateTemplate(
         }),
       );
     }
+    if (s.serve !== undefined) {
+      // Only a stage that runs commands has anything to use the service with; even `serve: false`
+      // is refused, as it suggests the stage could have one.
+      const article = /^[aeiou]/.test(s.kind) ? 'an' : 'a';
+      errors.push(
+        where({
+          zh: `serve（为 Run 起服务）只能用在 command（命令）阶段，${s.kind} 阶段不能用`,
+          en: `serve (starting a service for the Run) only applies to command stages, not to ${article} ${s.kind} stage`,
+        }),
+      );
+    }
     if (s.verify?.llm_check) {
       errors.push(
         where({

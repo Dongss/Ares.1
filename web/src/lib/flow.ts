@@ -64,6 +64,11 @@ export interface FlowStage extends FlowStageRef {
   commands: string[] | null;
   /** The commands are the repo default, not the stage's own. */
   commandsFromRepo: boolean;
+  /**
+   * Command stages with `serve: true`: the Master first starts the repo's service for the
+   * commands. False for other stages.
+   */
+  serve: boolean;
   /** Whether an agent stage splits its rounds into steps (`planning`); null for other stages. */
   planning: StageDef['planning'] | null;
   /** How many times a task is reworked before giving up (agent stages). */
@@ -157,6 +162,7 @@ export function buildFlow({
       byDifficulty: runs && def.agent_candidates !== undefined,
       commands,
       commandsFromRepo: usesRepoDefault,
+      serve: def.kind === 'command' && def.serve === true,
       planning: def.kind === 'agent' ? def.planning : null,
       maxRetries: eff.escalate.max_retries,
       onExhausted: eff.escalate.on_exhausted,
@@ -216,6 +222,18 @@ export function planningText(planning: StageDef['planning'] | null): string | nu
     });
   }
   return null;
+}
+
+/**
+ * The service a command stage with `serve: true` starts for its commands; null without one, and
+ * when the stage has no commands, as it then passes without starting anything.
+ */
+export function serveText(stage: Pick<FlowStage, 'serve' | 'commands'>): string | null {
+  if (!stage.serve || stage.commands?.length === 0) return null;
+  return t({
+    zh: '先用仓库登记的启动命令起服务，命令里用 $PORT 和 $ARES1_SERVICE_URL 访问它，阶段结束后停掉',
+    en: "First starts the service with the repo's start command; the commands reach it through $PORT and $ARES1_SERVICE_URL, and it stops when the stage ends",
+  });
 }
 
 /**
