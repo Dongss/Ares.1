@@ -1,6 +1,7 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { parse as parseYaml } from 'yaml';
 import type { FakeContext } from '../src/adapters/fake.js';
 import { AGENT_GH_TOKEN, AGENT_GITLAB_TOKEN } from '../src/adapters/process.js';
 import { statsSince } from '../src/api/stats.js';
@@ -24,6 +25,7 @@ import type {
   ProposalWritten,
   RawLogMissing,
   RepoDetection,
+  RepoSourceRejected,
   RepoTrial,
   RunSummary,
   StatsView,
@@ -4542,5 +4544,199 @@ describe('trying a repo’s commands', () => {
     h = await harness({ home, repoDir });
     await waitFor(() => !existsSync(left), 'the leftover trial worktree to go');
     await waitFor(() => worktrees(repoDir).length === 1, 'git to forget it');
+  });
+});
+
+describe('PUT /api/repos/:id/source', () => {
+  const AGENTS = `${TEST_AGENTS_YAML}
+  scout:
+    cli: fake
+    model: scout
+  off:
+    cli: fake
+    model: scout
+    enabled: false
+`;
+  const configText = () => readFileSync(join((h as Harness).home, 'config.yaml'), 'utf8');
+  const put = (body: unknown, repo = 'demo') => call('PUT', `/api/repos/${repo}/source`, body);
+
+  /** The repo names under each source's `repos` in config.yaml, as the file has them. */
+  function sources(): Record<'github' | 'gitlab' | 'backlog', string[]> {
+    const doc = (parseYaml(configText()) ?? {}) as Record<string, { repos?: object } | null>;
+    const names = (key: string) => Object.keys(doc[key]?.repos ?? {});
+    return { github: names('github'), gitlab: names('gitlab'), backlog: names('backlog') };
+  }
+
+  /** The repos a source's status lists. */
+  const listed = async (path: string) =>
+    ((await call('GET', path)).json as { repos: { name: string }[] }).repos.map((r) => r.name);
+
+  /** Files a save left in the Master home: none should be. */
+  const leftovers = () => readdirSync((h as Harness).home).filter((f) => f.endsWith('.tmp'));
+
+  it('moves a repo between sources, keeping what else config.yaml has', async () => {
+    const t = await harness({
+      agents: AGENTS,
+      github: new FakeGitHub(),
+      gitlab: new FakeGitLab('grp/demo'),
+    });
+    h = t;
+    t.scripts.scout = () => ({ structured: { gaps: [], proposals: [] } });
+    // The config.yaml written on first start, with its many comments.
+    const comments = configText()
+      .split('\n')
+      .filter((line) => line.trimStart().startsWith('#'));
+    expect(comments.length).toBeGreaterThan(10);
+    expect((await call('GET', '/api/config')).json.repoSources).toEqual({});
+
+    // From no source to the local backlog, with a scout: by id.
+    const backlog = await put(
+      { platform: 'backlog', template: 'dev', scout: { agent: 'scout', auto: false } },
+      t.repo.id,
+    );
+    expect(backlog.status).toBe(200);
+    expect((backlog.json as ConfigView).repoSources).toEqual({ demo: { source: 'backlog' } });
+    expect(sources()).toEqual({ github: [], gitlab: [], backlog: ['demo'] });
+    expect(parseYaml(configText()).backlog.repos.demo).toEqual({
+      template: 'dev',
+      scout: { agent: 'scout', auto: false },
+    });
+    const text = configText();
+    for (const line of comments) expect(text).toContain(line);
+    expect(leftovers()).toEqual([]);
+    expect(await listed('/api/backlog')).toEqual(['demo']);
+    // In use at once: a scout by hand goes through the local backlog.
+    const scout = await call('POST', '/api/scouts', { repo: 'demo' });
+    expect(scout.status).toBe(201);
+    expect(scout.json as Scout).toMatchObject({ agentId: 'scout', issuesRepo: '' });
+    const scoutId: string = scout.json.id;
+    await waitFor(
+      () => t.master.store.getScout(scoutId).status !== 'running' && !t.master.scouting.running,
+      'the scout to finish',
+    );
+    expect(t.master.store.getScout(scoutId).status).toBe('completed');
+
+    // To GitHub: gone from backlog.repos.
+    const github = await put({ platform: 'github', template: 'dev', push: true });
+    expect(github.status).toBe(200);
+    expect((github.json as ConfigView).repoSources).toEqual({
+      demo: { source: 'github', issuesRepo: null },
+    });
+    expect(sources()).toEqual({ github: ['demo'], gitlab: [], backlog: [] });
+    expect(await listed('/api/github')).toEqual(['demo']);
+    expect(await listed('/api/backlog')).toEqual([]);
+
+    // From GitHub to GitLab: only gitlab.repos has it.
+    const gitlab = await put({ platform: 'gitlab', issues_repo: 'grp/demo', template: 'dev' });
+    expect(gitlab.status).toBe(200);
+    expect((gitlab.json as ConfigView).repoSources).toEqual({
+      demo: { source: 'gitlab', host: 'gitlab.com', issuesRepo: 'grp/demo' },
+    });
+    expect(sources()).toEqual({ github: [], gitlab: ['demo'], backlog: [] });
+    expect(await listed('/api/gitlab')).toEqual(['demo']);
+    expect(await listed('/api/github')).toEqual([]);
+
+    // No source at all.
+    const none = await put({ platform: 'none' });
+    expect(none.status).toBe(200);
+    expect((none.json as ConfigView).repoSources).toEqual({});
+    expect(sources()).toEqual({ github: [], gitlab: [], backlog: [] });
+    expect(await listed('/api/gitlab')).toEqual([]);
+    const after = configText();
+    for (const line of comments) expect(after).toContain(line);
+    // The answer is GET /api/config as it is now.
+    const { loadedAt: _a, ...answered } = none.json as ConfigView;
+    const { loadedAt: _b, ...current } = (await call('GET', '/api/config')).json as ConfigView;
+    expect(answered).toEqual(current);
+  });
+
+  it('refuses wrong settings with the problems, leaving config.yaml as it was', async () => {
+    h = await harness({
+      agents: AGENTS,
+      config: '# mine\nbacklog:\n  repos: {}   # none yet\n',
+    });
+    const before = configText();
+    const rejected = async (body: unknown) => {
+      const res = await put(body);
+      expect(res.status).toBe(400);
+      const json = res.json as RepoSourceRejected;
+      expect(json.error).toMatch(/^设置有问题，config\.yaml 没有改动：/);
+      for (const problem of json.problems) expect(json.error).toContain(problem);
+      return json.problems;
+    };
+
+    // What the loading rules find.
+    expect(await rejected({ platform: 'backlog', template: 'nope' })).toEqual([
+      '模板 nope 不存在或无效',
+    ]);
+    expect(
+      await rejected({ platform: 'backlog', template: 'dev', scout: { agent: 'off' } }),
+    ).toEqual(['侦察用的 Agent off 不存在或未启用']);
+    expect(await rejected({ platform: 'github', template: 'dev', deliver: 'pr' })).toEqual([
+      expect.stringMatching(/^deliver: pr 要求 push: true/),
+    ]);
+    // What the body may not be.
+    expect(await rejected({ platform: 'gitlab', template: 'dev' })).toEqual([
+      expect.stringMatching(/^issues_repo: /),
+    ]);
+    expect(await rejected({ platform: 'backlog', template: 'dev', push: true })).toEqual([
+      expect.stringMatching(/^\(body\): .*push/),
+    ]);
+    expect(await rejected({ platform: 'github', template: 'dev', reviewers: 2 })).toEqual([
+      expect.stringMatching(/^\(body\): .*reviewers/),
+    ]);
+    expect(await rejected({ platform: 'github', template: 'dev', deliver: 'mr' })).toEqual([
+      expect.stringMatching(/^deliver: /),
+    ]);
+    expect(await rejected({ platform: 'svn' })).toEqual([expect.stringMatching(/^platform: /)]);
+    expect(await rejected('backlog')).toHaveLength(1);
+
+    expect(configText()).toBe(before);
+    expect(leftovers()).toEqual([]);
+    expect(h.master.config.master.backlog?.repos).toEqual({});
+  });
+
+  it('refuses to touch a config.yaml that does not load, and a repo not registered', async () => {
+    h = await harness({ agents: AGENTS });
+    expect(
+      (await put({ platform: 'backlog', template: 'dev' }, 'nowhere')).json as { error: string },
+    ).toEqual({ error: expect.stringContaining('nowhere') });
+    expect((await put({ platform: 'none' }, 'nowhere')).status).toBe(404);
+
+    const broken = 'port: [\n';
+    writeFile(join(h.home, 'config.yaml'), broken);
+    expect(h.master.configWatcher.reload()).toBe(false);
+    const res = await put({ platform: 'backlog', template: 'dev' });
+    expect(res.status).toBe(409);
+    expect(res.json.error).toMatch(/^配置现在加载不了，改好之后才能在看板上设置需求来源：/);
+    expect(configText()).toBe(broken);
+    expect(leftovers()).toEqual([]);
+  });
+
+  it('tells the problems in English', async () => {
+    h = await harness({ agents: AGENTS, config: 'language: en\n' });
+    // After the Master took config.yaml's language.
+    setLang('en');
+    const missing = await put({ platform: 'backlog', template: 'nope' });
+    expect(missing).toMatchObject({
+      status: 400,
+      json: {
+        error:
+          'The settings have problems; config.yaml was left as it was: Template nope does not exist or is invalid',
+        problems: ['Template nope does not exist or is invalid'],
+      },
+    });
+    const pushed = await put({ platform: 'backlog', template: 'dev', push: true });
+    expect(pushed.status).toBe(400);
+    expect((pushed.json as RepoSourceRejected).problems).toEqual([
+      expect.stringMatching(/^\(body\): .*push/),
+    ]);
+
+    writeFile(join(h.home, 'config.yaml'), 'language: en\nport: abc\n');
+    expect(h.master.configWatcher.reload()).toBe(false);
+    const conflict = await put({ platform: 'backlog', template: 'dev' });
+    expect(conflict.status).toBe(409);
+    expect(conflict.json.error).toMatch(/^The configuration does not load as it is now/);
+    expect(JSON.stringify([missing.json, pushed.json, conflict.json])).not.toMatch(/[一-鿿]/);
   });
 });

@@ -4,6 +4,7 @@ import { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
 import { z } from 'zod';
 import type { LocalBacklog } from '../backlog/local.js';
+import { RepoSourceInputSchema, SourceEditConflict, SourceEditInvalid } from '../config/edit.js';
 import {
   PROPOSAL_SIZES,
   RAW_LOG_KEEP_DAYS,
@@ -84,6 +85,8 @@ import type {
   RawLogMissing,
   RepoDetection,
   RepoInputSource,
+  RepoSourceInput,
+  RepoSourceRejected,
   RepoSourceView,
   RepoTrial,
   RepoTrialInput,
@@ -129,6 +132,12 @@ export interface ApiDeps {
   reposChanged?: () => Promise<void>;
   /** The CLIs the Master has an adapter for; omitted = none told. */
   clis?: readonly CliInfo[];
+  /**
+   * Writes where the repo named `repo` takes its requirements from into config.yaml and loads
+   * the configuration again (`saveRepoSource`): throws a SourceEditInvalid or a
+   * SourceEditConflict with the file left as it was.
+   */
+  saveRepoSource: (repo: string, input: RepoSourceInput) => void;
 }
 
 function noBranch(branch: string): string {
@@ -324,23 +333,29 @@ const RetryInput = z.strictObject({
   budgetUsd: z.number().positive().optional(),
 });
 
+/** The issues of a failed validation one by one, "path: message"; `whole` when there is no path. */
+function issueLines(error: z.ZodError, whole: string): string[] {
+  return error.issues.map((i) => `${i.path.join('.') || whole}: ${i.message}`);
+}
+
+const joinProblems = (problems: readonly string[]) => problems.join(t({ zh: '；', en: '; ' }));
+
+/** A request's JSON body; an empty object when it has none or it is not JSON. */
+async function rawBody(c: { req: { json: () => Promise<unknown> } }): Promise<unknown> {
+  try {
+    return (await c.req.json()) ?? {};
+  } catch {
+    return {};
+  }
+}
+
 async function body<T>(
   c: { req: { json: () => Promise<unknown> } },
   schema: z.ZodType<T>,
 ): Promise<T> {
-  let raw: unknown;
-  try {
-    raw = await c.req.json();
-  } catch {
-    raw = {};
-  }
-  const parsed = schema.safeParse(raw ?? {});
+  const parsed = schema.safeParse(await rawBody(c));
   if (!parsed.success) {
-    throw new InvalidInputError(
-      parsed.error.issues
-        .map((i) => `${i.path.join('.') || '(body)'}: ${i.message}`)
-        .join(t({ zh: '；', en: '; ' })),
-    );
+    throw new InvalidInputError(joinProblems(issueLines(parsed.error, '(body)')));
   }
   return parsed.data;
 }
@@ -349,13 +364,20 @@ async function body<T>(
 function query<T>(c: { req: { query: () => Record<string, string> } }, schema: z.ZodType<T>): T {
   const parsed = schema.safeParse(c.req.query());
   if (!parsed.success) {
-    throw new InvalidInputError(
-      parsed.error.issues
-        .map((i) => `${i.path.join('.') || '(query)'}: ${i.message}`)
-        .join(t({ zh: '；', en: '; ' })),
-    );
+    throw new InvalidInputError(joinProblems(issueLines(parsed.error, '(query)')));
   }
   return parsed.data;
+}
+
+/** The 400 of PUT /api/repos/:id/source, with its problems one by one. */
+function sourceRejected(problems: readonly string[]): RepoSourceRejected {
+  return {
+    error: t({
+      zh: `设置有问题，config.yaml 没有改动：${joinProblems(problems)}`,
+      en: `The settings have problems; config.yaml was left as it was: ${joinProblems(problems)}`,
+    }),
+    problems: [...problems],
+  };
 }
 
 /**
@@ -420,10 +442,10 @@ export function createApi(deps: ApiDeps): Hono {
     return c.json(health());
   });
 
-  // ---- configuration (read-only) --------------------------------------
-  app.get('/api/config', (c) => {
+  // ---- configuration (read-only; requirements sources are set on the repos) ----
+  const configView = (): ConfigView => {
     const cfg = config();
-    return c.json({
+    return {
       language: cfg.master.language,
       perRepo: cfg.master.concurrency.per_repo,
       maxRuns: cfg.master.concurrency.max_runs ?? null,
@@ -448,8 +470,10 @@ export function createApi(deps: ApiDeps): Hono {
         })),
       repoSources: repoSourceViews(cfg.master),
       ...status(),
-    } satisfies ConfigView);
-  });
+    };
+  };
+
+  app.get('/api/config', (c) => c.json(configView()));
 
   // Agents with what they did: executions, outcomes, cost, latest error.
   app.get('/api/agents', (c) => c.json(agentSummaries(store, config()) satisfies AgentSummary[]));
@@ -583,6 +607,25 @@ export function createApi(deps: ApiDeps): Hono {
     const updated = store.updateRepo(repo.id, input);
     await deps.reposChanged?.();
     return c.json(updated);
+  });
+
+  // Where the repo takes its requirements from: its entry under config.yaml's github.repos,
+  // gitlab.repos or backlog.repos, written by the Master with the rest of the file and its
+  // comments left as they are, and put in use at once (`saveRepoSource`). Answers the new
+  // GET /api/config; 400 with the problems one by one when the body or the settings it asks for
+  // are wrong, 409 when the configuration does not load as it is; config.yaml unchanged in both.
+  app.put('/api/repos/:id/source', async (c) => {
+    const repo = store.getRepo(c.req.param('id'));
+    const parsed = RepoSourceInputSchema.safeParse(await rawBody(c));
+    if (!parsed.success) return c.json(sourceRejected(issueLines(parsed.error, '(body)')), 400);
+    try {
+      deps.saveRepoSource(repo.name, parsed.data);
+    } catch (err) {
+      if (err instanceof SourceEditInvalid) return c.json(sourceRejected(err.problems), 400);
+      if (err instanceof SourceEditConflict) return c.json({ error: err.message }, 409);
+      throw err;
+    }
+    return c.json(configView());
   });
 
   // Setup and verify commands suggested by the files at the root of the repo's target branch, as

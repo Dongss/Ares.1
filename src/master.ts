@@ -13,6 +13,7 @@ import { defaultWebDir } from './api/static.js';
 import { LocalBacklog } from './backlog/local.js';
 import { Scouting } from './backlog/scouting.js';
 import { brandName } from './brand.js';
+import { saveRepoSource, watcherDeps } from './config/edit.js';
 import type { Backoff, RateLimitWait } from './config/flow.js';
 import {
   type HomePaths,
@@ -367,6 +368,9 @@ export class Master {
       execFile: opts.execFile,
       now: opts.now,
       reposChanged: refreshTemplates,
+      saveRepoSource: (repo, input) => {
+        saveRepoSource(watcherDeps(watcher, paths.configFile), repo, input);
+      },
       clis: [...adapters.values()].map((a) => ({
         cli: a.cli,
         readOnly: a.supportsReadOnly === true,

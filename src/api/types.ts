@@ -302,7 +302,10 @@ export interface RepoTemplatesView {
   files: TemplateFile[];
 }
 
-/** GET /api/config (read-only; reloaded when the files change). */
+/**
+ * GET /api/config (reloaded when the files change), also the answer of PUT /api/repos/:id/source,
+ * the one setting written from the dashboard.
+ */
 export interface ConfigView {
   /** config.yaml's `language`: what the Master writes in, and the dashboard's default. */
   language: Lang;
@@ -417,6 +420,17 @@ export type RepoSourceInput =
     } & RepoSourceFieldsInput)
   | ({ platform: 'backlog' } & RepoSourceFieldsInput)
   | { platform: 'none' };
+
+/**
+ * The 400 of PUT /api/repos/:id/source: the body or the settings it asks for have problems, and
+ * config.yaml was left as it was.
+ */
+export interface RepoSourceRejected {
+  /** The problems in one sentence, for a client that shows only it. */
+  error: string;
+  /** The problems one by one, in the Master's language, for a form to list. */
+  problems: string[];
+}
 
 /** A CLI the Master has an adapter for. */
 export interface CliInfo {

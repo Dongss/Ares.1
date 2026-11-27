@@ -153,6 +153,58 @@ API：
 
 试运行开始、每跑完一条命令和结束时，`GET /api/stream` 上各发一条 `notice`，数据是 `{ "type": "repo.trial", "repoId": "…", "status": "running" }`（结束时是 `passed` 或 `failed`）。它只用来让看板刷新，不写进数据库，事件页上看不到。
 
+### 在看板上设置仓库的需求来源
+
+仓库登记好以后，要写进 `config.yaml` 的 `github.repos`、`gitlab.repos` 或 `backlog.repos` 才会有 Run 和侦察。这一步可以不手改 `config.yaml`，在看板「仓库」页设置：Master 替你改写 `config.yaml` 里这个仓库的条目，马上重新加载。它改的就是 `config.yaml`，没有另存一份：手改和在看板上改效果完全相同，之后也可以接着手改。
+
+API 是 `PUT /api/repos/:id/source`（`:id` 是仓库的 id 或名字），请求体的字段名和 `config.yaml` 里的一样：
+
+```json
+{
+  "platform": "backlog",
+  "template": "dev",
+  "scout": { "agent": "claude-reviewer", "auto": true, "interval_minutes": 0, "max_proposals": 5 },
+  "auto_accept": { "max_risk": "low", "max_size": "M", "max_per_day": 3 },
+  "auto_merge": false,
+  "max_run_attempts": 3,
+  "daily_budget_usd": 10
+}
+```
+
+- `platform` 选来源：`github`、`gitlab`、`backlog`（本地提案池）或 `none`（不要来源）。
+- 每种来源只收它自己的字段，多带了别的（包括拼错的）返回 400：
+  - 三种来源都有：`template`（必填）、`scout`、`auto_accept`、`auto_merge`、`max_run_attempts`、`daily_budget_usd`。`scout` 是 `{ agent, auto?, interval_minutes?, max_proposals? }`，传 `null` 或不传就是不侦察；`auto_accept` 是 `{ max_risk?, max_size?, max_per_day? }`。
+  - `github` 另有 `issues_repo`（可选，`owner/name`）、`push`、`deliver`（`push` 或 `pr`）。
+  - `gitlab` 另有 `issues_repo`（必填，`group/name` 或 `group/subgroup/name`）、`push`、`deliver`（`push` 或 `mr`）。
+  - `backlog` 没有 `issues_repo`、`push`、`deliver`。
+  - `none` 只有 `platform`。
+- 每个字段的校验（取值范围、格式）和 `config.yaml` 里的一样，报错文字也一样。
+- 请求体是这个仓库条目的全部内容：只写带了的字段，没带的不写进文件，由 schema 补默认值，和手改时不写一样；条目里原来有、这次没带的字段删掉。
+
+Master 这样改写 `config.yaml`：
+
+- 先把这个仓库从另外两处来源的 `repos` 里删掉，再在选定来源的 `repos` 下写入它的条目：已经有这个仓库的就地替换，没有的加在最后。那一节（比如 `backlog`）不存在时在文件末尾新建，只写 `repos`；`poll_minutes`、`account`、`host` 这些整节的设置不由这里写，要的话手改（新建的 `gitlab` 一节没有 `host`，就是 `gitlab.com`，自建的 GitLab 要自己补上 `gitlab.host`）。`platform` 为 `none` 时三处都删。删到空的 `repos` 留着，写成 `repos: {}`。
+- 文件里其余的内容和注释原样保留：没动到的段落一个字节都不变；动到的 `github`、`gitlab`、`backlog` 节里，别的仓库和注释都在，就地替换的条目保留留下来那些行的注释；删掉的条目连同它自己的注释（它上面的、同一行的和里面的）一起删掉。
+- `config.yaml` 是符号链接时写到它指向的文件，链接本身不动；还没有 `config.yaml` 时按空文件处理，写一个新的。
+- 先写到同一目录的临时文件（`.config.yaml.<随机串>.tmp`，保留原文件的权限），校验通过后用 rename 一次换上去，什么时候读到的都是完整的文件；没通过就删掉临时文件。
+
+换上去之前，Master 把改好的文件按加载规则完整加载一遍（用现在的 `agents.yaml`、数据目录的 `workflows/` 和各仓库自带的模板），有下面这些问题时返回 400，`config.yaml` 不变：
+
+- 整个 `config.yaml` 校验不通过。
+- 这个仓库在 `github.repos`、`gitlab.repos`、`backlog.repos` 任何一处下有错：模板不存在（仓库自带的模板也算，见「仓库自带的流程模板」），侦察用的 Agent 不存在或没启用，`deliver: pr` / `deliver: mr` 没有 `push: true`，`gitlab` 少了 `issues_repo` 等。
+- 侦察用的 Agent 不能以只读方式运行（它的 CLI 不支持只读，比如 cursor-agent）：手改时这样的配置能加载，侦察时才失败，这里提前拦下。
+
+只拦这个仓库的问题；别的仓库或文件里原来就有的错误和警告不拦，照旧显示在「配置」页上。
+
+返回：
+
+- 成功：Master 马上重新加载配置（和改了文件一样，事件列表里记一条 `config.reloaded`），返回 200 和新的 `GET /api/config`，`repoSources` 里就是这个仓库现在的来源。之后监视文件的那次重新加载结果相同，不碍事。
+- 400：`{ "error": "设置有问题，config.yaml 没有改动：<各条问题用「；」连起来>", "problems": ["<一条问题>", …] }`，用 Master 的语言。`problems` 每条一个问题，看板逐条显示；请求体不对的写成「字段: 原因」，比如 `issues_repo: …`，多带了字段时字段写 `(body)`。
+- 409：`{ "error": "配置现在加载不了，改好之后才能在看板上设置需求来源：<原因>" }`。`config.yaml` 当前就加载不了（上一次重新加载失败了，「配置」页有 `reloadError`；或者现在读不了、加载不了）时，Master 不知道改完会怎样，文件一个字节都不动。手动改好、重新加载成功后再设置。
+- 404：仓库没有登记。
+
+同一时刻只有一次在改写（整个过程是同步的），两次设置不会交错写坏文件。
+
 ## 仓库自带的流程模板
 
 流程模板除了放在数据目录的 `workflows/` 里，也可以放在登记的仓库里，和代码一起提交、一起评审、跟着代码演进，就像 CI 配置放在仓库里一样：检查命令、E2E 阶段、评审要求改了，流程跟着改，不用再到每台机器的数据目录里手动同步。
@@ -193,6 +245,8 @@ Master 只在数据目录里还没有 `workflows/` 目录时（第一次启动�
        my-repo:
          template: self-dev
    ```
+
+   也可以在看板「仓库」页设置，Master 替你写进 `config.yaml`，效果相同（见「在看板上设置仓库的需求来源」）。
 
 4. 给要做的 issue 加上 `ares1:ready` 标签。Master 每 `poll_minutes` 分钟（默认 5）检查一次，把它建成 Run，进展回写到 issue 上。每个仓库同一时间默认只执行一个 Run，可以用 `concurrency.per_repo` 调大（见下面的「同时执行几个 Run」）；不同仓库的 Run 可以同时执行，登记到同一路径的仓库（比如同一个 git 仓库按不同目标分支登记了两次）共用一个上限，所有仓库合计的上限用 `concurrency.max_runs` 设置（默认不限）。`/api/health` 的 `activeRuns` 按开始执行的先后列出正在执行的 Run 的 id，`activeRun` 是其中第一个（没有时为 `null`），为兼容旧的调用方保留。
 
@@ -599,6 +653,8 @@ GitLab 仓库按作者对项目的权限判断：Developer 及以上（Developer
          push: true
    ```
 
+   也可以在看板「仓库」页设置，Master 替你写进 `config.yaml`，效果相同（见「在看板上设置仓库的需求来源」）；`host`、`account`、`poll_minutes` 这些整节的设置还是手改。
+
 4. 给要做的 issue 加上 `ares1:ready` 标签。Master 每 `gitlab.poll_minutes` 分钟检查一次，把它建成 Run，进展回写到 issue 上，完成后关闭 issue，`push: true` 时把目标分支推送到 GitLab（`deliver: mr` 时不推送目标分支，而是开 MR，见下面的「通过 MR 交付」）。Master 第一次访问项目时自动创建 `ares1:*` 标签（见「接入 GitHub」里的表格，另加下面说的 `ares1:not-planned`）；项目所属的组已经有同名标签时直接用组的。
 
 改了保存后自动生效，不用重启（`bins` 除外）。不写 `gitlab` 就不接 GitLab。[`docs/examples/config.yaml`](examples/config.yaml) 里有一个 GitLab 仓库的完整示例（`my-gitlab-service`）。
@@ -618,7 +674,7 @@ GitLab 仓库按作者对项目的权限判断：Developer 及以上（Developer
 
 ### 一个仓库只能有一种需求来源
 
-同一个仓库名只能写在 `github.repos`、`gitlab.repos`、`backlog.repos` 中的一处，否则两边都会侦察、采纳，同一个需求可能做两遍。Master 按 github → gitlab → backlog 的顺序检查：第一处照常工作，后出现的那一处报配置错误、整个不生效，看板「配置」页在它的键下（比如 `config.yaml#backlog.repos.<仓库名>`）写明仓库同时写在哪两处、哪一侧照常工作，想换来源就把它从前一处删掉。手动侦察、看板显示的需求来源也都按第一处。
+同一个仓库名只能写在 `github.repos`、`gitlab.repos`、`backlog.repos` 中的一处，否则两边都会侦察、采纳，同一个需求可能做两遍。Master 按 github → gitlab → backlog 的顺序检查：第一处照常工作，后出现的那一处报配置错误、整个不生效，看板「配置」页在它的键下（比如 `config.yaml#backlog.repos.<仓库名>`）写明仓库同时写在哪两处、哪一侧照常工作，想换来源就把它从前一处删掉。手动侦察、看板显示的需求来源也都按第一处。在看板「仓库」页换来源时，Master 会先把仓库从另外两处删掉再写入，不会出现这种情况（见「在看板上设置仓库的需求来源」）。
 
 ### 权限
 
@@ -694,7 +750,7 @@ backlog:
       max_run_attempts: 3      # 一条提案最多跑几次 Run（含第一次），失败后自动重做；不写也是 3；1 = 不重做
 ```
 
-- `repos` 的键是看板「仓库」页登记的仓库名，必须和那里的一模一样。写在这里但没登记的仓库什么都不做，看板上写明「没有在看板上登记」。
+- `repos` 的键是看板「仓库」页登记的仓库名，必须和那里的一模一样。写在这里但没登记的仓库什么都不做，看板上写明「没有在看板上登记」。也可以在看板「仓库」页设置，Master 替你写进 `config.yaml`，效果相同（见「在看板上设置仓库的需求来源」）。
 - `template`、`scout`、`auto_accept`、`auto_merge`、`daily_budget_usd`、`max_run_attempts` 的含义、默认值和校验都和 `github.repos`、`gitlab.repos` 里的同名字段一样（三种来源用同一份格式定义），模板也一样先在数据目录的 `workflows/` 里找，再在仓库自带的 `.ares1/workflows/` 里找（见「仓库自带的流程模板」）。`max_run_attempts` 在这里管的是一条提案最多跑几次 Run，见下面的「本地提案失败后自动重做」。`issues_repo`、`push`、`deliver` 是 GitHub 和 GitLab 才有的，写在这里和写错的键一样，`config.yaml` 校验不通过。
 - 一个仓库只能选一种需求来源：同一个仓库名同时写在 `github.repos` 或 `gitlab.repos` 和 `backlog.repos` 里是配置错误，看板「配置」页在 `config.yaml#backlog.repos.<仓库名>` 下写明原因。这时 `backlog.repos` 里的设置不生效，GitHub 或 GitLab 一侧照常工作，手动侦察也按那一侧侦察（见「接入 GitLab」的「一个仓库只能有一种需求来源」）。
 - 某个仓库配置有误（比如模板不存在、侦察用的 Agent 不存在或没启用）时只停用这个仓库，看板「配置」页同样在 `config.yaml#backlog.repos.<仓库名>` 下写明原因，别的仓库照常工作。
