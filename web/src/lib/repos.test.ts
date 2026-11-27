@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import type { RepoDetection } from '../../../src/api/types.js';
+import type { RepoDetection, RepoTrial, RepoTrialResult } from '../../../src/api/types.js';
 import { setLang } from '../../../src/i18n.js';
 import {
   type AddRepoForm,
@@ -7,6 +7,7 @@ import {
   detectionNote,
   detectLabel,
   lacksVerify,
+  missingProgramNote,
   newRepoInput,
   noVerifyBadge,
   noVerifyWarning,
@@ -16,6 +17,11 @@ import {
   repoOriginLabel,
   repoPathLabel,
   targetBranchPlaceholder,
+  trialLabel,
+  trialRowNote,
+  trialRows,
+  trialStatusBadge,
+  trialSummary,
 } from './repos.js';
 
 afterEach(() => setLang('zh'));
@@ -131,6 +137,144 @@ describe('detecting commands on the edit form', () => {
     ];
     expect(texts[0]).toContain('target branch main (commit 01234567)');
     expect(texts[1]).toContain('Nothing to suggest');
+    expect(texts.join('\n')).not.toMatch(/[一-鿿]/);
+  });
+});
+
+describe('a trial of the commands', () => {
+  const result = (
+    kind: RepoTrialResult['kind'],
+    command: string,
+    extra: Partial<RepoTrialResult> = {},
+  ): RepoTrialResult => ({
+    kind,
+    command,
+    ok: true,
+    exitCode: 0,
+    timedOut: false,
+    durationMs: 1500,
+    outputTail: '',
+    missingProgram: null,
+    ...extra,
+  });
+  const trial = (extra: Partial<RepoTrial> = {}): RepoTrial => ({
+    repoId: 'repo-1',
+    status: 'running',
+    branch: 'main',
+    sha: '0123456789abcdef',
+    startedAt: '2026-11-27T10:00:00.000Z',
+    endedAt: null,
+    setupCommands: ['npm ci'],
+    verifyCommands: ['npm test', 'npm run lint'],
+    results: [],
+    error: null,
+    log: null,
+    ...extra,
+  });
+  const states = (t: RepoTrial) => trialRows(t).map((r) => `${r.kind}:${r.command}:${r.state}`);
+
+  it('shows the command running, those waiting, and the results so far', () => {
+    expect(states(trial())).toEqual([
+      'setup:npm ci:running',
+      'verify:npm test:waiting',
+      'verify:npm run lint:waiting',
+    ]);
+    const going = trial({ results: [result('setup', 'npm ci')] });
+    expect(states(going)).toEqual([
+      'setup:npm ci:passed',
+      'verify:npm test:running',
+      'verify:npm run lint:waiting',
+    ]);
+    expect(trialRows(going)[0]?.result).toEqual(result('setup', 'npm ci'));
+  });
+
+  it('marks the commands after a failure as not run once it is over', () => {
+    const failed = trial({
+      status: 'failed',
+      results: [
+        result('setup', 'npm ci'),
+        result('verify', 'npm test', { ok: false, exitCode: 1 }),
+      ],
+    });
+    expect(states(failed)).toEqual([
+      'setup:npm ci:passed',
+      'verify:npm test:failed',
+      'verify:npm run lint:skipped',
+    ]);
+    // A missing program: only its command has a result, wherever it is.
+    const missing = trial({
+      status: 'failed',
+      results: [
+        result('verify', 'npm run lint', { ok: false, exitCode: null, missingProgram: 'npm' }),
+      ],
+    });
+    expect(states(missing)).toEqual([
+      'setup:npm ci:skipped',
+      'verify:npm test:skipped',
+      'verify:npm run lint:failed',
+    ]);
+  });
+
+  it('gives each result to its own command when one is listed twice or in both groups', () => {
+    const twice = trial({
+      status: 'passed',
+      setupCommands: ['make'],
+      verifyCommands: ['make', 'make'],
+      results: [result('setup', 'make'), result('verify', 'make'), result('verify', 'make')],
+    });
+    expect(states(twice)).toEqual([
+      'setup:make:passed',
+      'verify:make:passed',
+      'verify:make:passed',
+    ]);
+    expect(trialRows(trial({ setupCommands: [], verifyCommands: [] }))).toEqual([]);
+  });
+
+  it('says how each command went, in both languages', () => {
+    const rows = trialRows(
+      trial({
+        status: 'failed',
+        verifyCommands: ['a', 'b', 'c', 'd', 'e'],
+        results: [
+          result('setup', 'npm ci'),
+          result('verify', 'a', { ok: false, exitCode: 2 }),
+          result('verify', 'b', { ok: false, exitCode: null, timedOut: true }),
+          result('verify', 'c', { ok: false, exitCode: null }),
+          result('verify', 'd', { ok: false, exitCode: null, missingProgram: 'pnpm' }),
+        ],
+      }),
+    );
+    const notes = () => rows.map(trialRowNote);
+    expect(notes()).toEqual([
+      '通过（2 秒）',
+      '退出码 2',
+      '超时',
+      '被中止',
+      '找不到 pnpm',
+      '没有运行',
+    ]);
+    expect(trialStatusBadge('failed')).toEqual({ label: '没通过', tone: 'danger' });
+    expect(missingProgramNote('pnpm')).toContain('运行环境里找不到 `pnpm`');
+    expect(trialLabel(false, true)).toBe('试运行表单里的命令');
+    const now = Date.parse('2026-11-27T10:00:05.000Z');
+    expect(trialSummary(trial(), now)).toContain('目标分支 main（提交 01234567）');
+    expect(trialSummary(trial(), now)).toContain('已用 5 秒');
+
+    setLang('en');
+    const texts = [
+      ...notes(),
+      ...trialRows(trial()).map(trialRowNote),
+      ...(['running', 'passed', 'failed'] as const).map((s) => trialStatusBadge(s).label),
+      missingProgramNote('pnpm'),
+      trialLabel(false, false),
+      trialLabel(false, true),
+      trialLabel(true, false),
+      trialSummary(trial(), now),
+      trialSummary(trial({ sha: null, status: 'failed', endedAt: '2026-11-27T10:01:05.000Z' })),
+    ];
+    expect(texts[0]).toBe('passed (2s)');
+    expect(texts.at(-1)).toContain('target branch main · started at');
+    expect(texts.at(-1)).toContain('took 1m 5s');
     expect(texts.join('\n')).not.toMatch(/[一-鿿]/);
   });
 });

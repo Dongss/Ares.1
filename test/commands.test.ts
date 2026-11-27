@@ -32,6 +32,19 @@ describe('runCommand', () => {
     );
   });
 
+  it('tells of each result as its command ends, up to the first failure', async () => {
+    const dir = tmpDir();
+    const told: string[] = [];
+    const results = await runCommands(
+      ['true', 'exit 2', 'true'],
+      dir,
+      { timeoutMs: 10_000, logPath: join(dir, 'logs', 'verify.log'), env: process.env },
+      (r) => told.push(`${r.command}:${r.exitCode}`),
+    );
+    expect(results.map((r) => r.command)).toEqual(['true', 'exit 2']);
+    expect(told).toEqual(['true:0', 'exit 2:2']);
+  });
+
   it('runs every command in the environment it is given: the agent one has no GitHub access', async () => {
     const dir = tmpDir();
     const ghDir = join(dir, 'gh-config');

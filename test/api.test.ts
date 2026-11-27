@@ -1,7 +1,8 @@
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { FakeContext } from '../src/adapters/fake.js';
+import { AGENT_GH_TOKEN, AGENT_GITLAB_TOKEN } from '../src/adapters/process.js';
 import { statsSince } from '../src/api/stats.js';
 import type {
   AgentEventRecord,
@@ -15,6 +16,7 @@ import type {
   IterationView,
   KeptWorkspace,
   LiveAgentEvent,
+  LiveNotice,
   NotifyTestResult,
   ProposalAccepted,
   ProposalRestarted,
@@ -22,6 +24,7 @@ import type {
   ProposalWritten,
   RawLogMissing,
   RepoDetection,
+  RepoTrial,
   RunSummary,
   StatsView,
 } from '../src/api/types.js';
@@ -56,6 +59,7 @@ import {
   type Harness,
   harness,
   initRepo,
+  readEnvFile,
   review,
   TEST_AGENTS_YAML,
   TEST_WORKFLOW_YAML,
@@ -4180,5 +4184,363 @@ github:
       entry: null,
       runs: { attempts: 1, passed: 1, costUnknown: 1 },
     });
+  });
+});
+
+describe('trying a repo’s commands', () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  /** GET the repo's trial until it is over. */
+  async function trialOver(repo = 'demo', timeoutMs = 10_000): Promise<RepoTrial> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const res = await call('GET', `/api/repos/${repo}/trial`);
+      if (res.status === 200 && res.json.status !== 'running') return res.json as RepoTrial;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    throw new Error(`timed out waiting for the trial of ${repo} to end`);
+  }
+
+  /** The entries of the Master's worktrees/ named like a trial's. */
+  const trialDirs = () =>
+    readdirSync((h as Harness).master.paths.worktreesDir).filter((name) =>
+      name.startsWith('trial-'),
+    );
+
+  /** The worktrees git knows of in `repo`, the main one included. */
+  const worktrees = (repo: string) =>
+    git(repo, 'worktree', 'list', '--porcelain')
+      .split('\n')
+      .filter((line) => line.startsWith('worktree '));
+
+  /** A command that waits until `go` is written in `gate`. */
+  const waitForGate = (gate: string) => `while [ ! -f ${gate}/go ]; do sleep 0.02; done`;
+
+  it('runs the registered setup and verify commands on the target branch, then deletes its worktree', async () => {
+    h = await harness({ setupCommands: ['true'], verifyCommands: ['true', 'test -f README.md'] });
+    // The worktree has the target branch's commit, not the branch checked out.
+    git(h.repoDir, 'checkout', '-q', '-b', 'other');
+    git(h.repoDir, 'rm', '-q', 'README.md');
+    git(h.repoDir, 'commit', '-q', '-m', 'no readme');
+    const missing = await call('GET', '/api/repos/demo/trial');
+    expect(missing.status).toBe(404);
+    expect(missing.json.error).toBe('仓库 demo 自 Master 启动以来还没有试运行过');
+
+    const started = await call('POST', '/api/repos/demo/trial');
+    expect(started.status).toBe(202);
+    expect(started.json).toMatchObject({
+      repoId: h.repo.id,
+      status: 'running',
+      branch: 'main',
+      setupCommands: ['true'],
+      verifyCommands: ['true', 'test -f README.md'],
+      endedAt: null,
+    } satisfies Partial<RepoTrial>);
+
+    const over = await trialOver();
+    expect(over).toMatchObject({
+      repoId: h.repo.id,
+      status: 'passed',
+      branch: 'main',
+      sha: git(h.repoDir, 'rev-parse', 'main'),
+      error: null,
+      results: [
+        { kind: 'setup', command: 'true', ok: true, exitCode: 0, missingProgram: null },
+        { kind: 'verify', command: 'true', ok: true, exitCode: 0, missingProgram: null },
+        { kind: 'verify', command: 'test -f README.md', ok: true, exitCode: 0 },
+      ],
+    });
+    expect(over.endedAt).toBeTruthy();
+    expect(over.log).toBe(join(h.master.paths.logsDir, 'trial-demo.log'));
+    expect(readFileSync(over.log as string, 'utf8')).toContain('$ test -f README.md');
+    // Nothing is left of it.
+    expect(trialDirs()).toEqual([]);
+    expect(worktrees(h.repoDir)).toHaveLength(1);
+    expect(git(h.repoDir, 'branch', '--format=%(refname:short)').split('\n')).toEqual([
+      'main',
+      'other',
+    ]);
+    expect(h.master.store.listRuns()).toEqual([]);
+  });
+
+  it('tries the commands of the request instead of the registered ones and saves nothing', async () => {
+    h = await harness({ setupCommands: ['true'], verifyCommands: ['false'] });
+    // A verify command of the request fails: those after it are not run.
+    await call('POST', '/api/repos/demo/trial', {
+      verifyCommands: ['true', 'echo 检查没过 && false', 'true'],
+    });
+    const failed = await trialOver();
+    expect(failed).toMatchObject({
+      status: 'failed',
+      error: null,
+      setupCommands: ['true'],
+      verifyCommands: ['true', 'echo 检查没过 && false', 'true'],
+    });
+    expect(failed.results).toHaveLength(3);
+    expect(failed.results[2]).toMatchObject({
+      kind: 'verify',
+      command: 'echo 检查没过 && false',
+      ok: false,
+      exitCode: 1,
+      timedOut: false,
+      missingProgram: null,
+    });
+    expect(failed.results[2]?.outputTail).toContain('检查没过');
+    expect(trialDirs()).toEqual([]);
+    // The registered commands stay as they were.
+    expect(h.master.store.getRepo('demo')).toMatchObject({
+      setupCommands: ['true'],
+      verifyCommands: ['false'],
+    });
+
+    // A setup command fails: no verify command runs. The registered verify command is tried.
+    await call('POST', '/api/repos/demo/trial', { setupCommands: ['true', 'exit 4'] });
+    const setup = await trialOver();
+    expect(setup).toMatchObject({ status: 'failed', verifyCommands: ['false'] });
+    expect(setup.results.map((r) => [r.kind, r.command, r.ok, r.exitCode])).toEqual([
+      ['setup', 'true', true, 0],
+      ['setup', 'exit 4', false, 4],
+    ]);
+
+    // The registered ones fail.
+    expect((await call('POST', '/api/repos/demo/trial')).status).toBe(202);
+    const registered = await trialOver();
+    expect(registered.results.map((r) => [r.kind, r.command, r.ok])).toEqual([
+      ['setup', 'true', true],
+      ['verify', 'false', false],
+    ]);
+    expect(trialDirs()).toEqual([]);
+    expect(worktrees(h.repoDir)).toHaveLength(1);
+  });
+
+  it('runs nothing when a program is missing, and passes with no commands at all', async () => {
+    h = await harness({ setupCommands: [], verifyCommands: [] });
+    await call('POST', '/api/repos/demo/trial', {
+      setupCommands: ['true'],
+      verifyCommands: ['true', 'ares1-no-such-program --check', 'false'],
+    });
+    const missing = await trialOver();
+    expect(missing).toMatchObject({ status: 'failed', error: null, log: null });
+    expect(missing.results).toEqual([
+      {
+        kind: 'verify',
+        command: 'ares1-no-such-program --check',
+        ok: false,
+        exitCode: null,
+        timedOut: false,
+        durationMs: 0,
+        outputTail: '',
+        missingProgram: 'ares1-no-such-program',
+      },
+    ]);
+    // A setup command is found first.
+    await call('POST', '/api/repos/demo/trial', {
+      setupCommands: ['/nonexistent/ares1-tool install'],
+    });
+    expect((await trialOver()).results).toMatchObject([
+      {
+        kind: 'setup',
+        command: '/nonexistent/ares1-tool install',
+        ok: false,
+        durationMs: 0,
+        missingProgram: '/nonexistent/ares1-tool',
+      },
+    ]);
+
+    // No command to run: it passes.
+    expect((await call('POST', '/api/repos/demo/trial')).status).toBe(202);
+    expect(await trialOver()).toMatchObject({
+      status: 'passed',
+      setupCommands: [],
+      verifyCommands: [],
+      results: [],
+      error: null,
+    });
+    expect(trialDirs()).toEqual([]);
+    expect(worktrees(h.repoDir)).toHaveLength(1);
+  });
+
+  it('answers 409 while the repo is trying, while another repo tries at once', async () => {
+    h = await harness({ verifyCommands: [] });
+    const gate = tmpDir('ares1-gate-');
+    const started = await call('POST', '/api/repos/demo/trial', {
+      verifyCommands: [waitForGate(gate)],
+    });
+    expect(started.status).toBe(202);
+    // The worktree is under worktrees/, named after the repo.
+    await waitFor(() => trialDirs().length === 1, 'the trial worktree');
+    expect(trialDirs()[0]).toMatch(new RegExp(`^trial-${h.repo.id}-[0-9a-f]+$`));
+    expect(worktrees(h.repoDir)).toHaveLength(2);
+
+    const again = await call('POST', '/api/repos/demo/trial');
+    expect(again.status).toBe(409);
+    expect(again.json.error).toBe('仓库 demo 正在试运行，等这次跑完再试');
+    expect((await call('GET', '/api/repos/demo/trial')).json.status).toBe('running');
+
+    const other = initRepo();
+    expect(
+      (await call('POST', '/api/repos', { name: 'other', path: other, verifyCommands: ['true'] }))
+        .status,
+    ).toBe(201);
+    expect((await call('POST', '/api/repos/other/trial')).status).toBe(202);
+    expect((await trialOver('other')).status).toBe('passed');
+
+    writeFile(join(gate, 'go'), '');
+    expect((await trialOver()).status).toBe('passed');
+    expect(trialDirs()).toEqual([]);
+    expect(worktrees(h.repoDir)).toHaveLength(1);
+    // Over: it can be tried again.
+    expect((await call('POST', '/api/repos/demo/trial')).status).toBe(202);
+    await trialOver();
+  });
+
+  it('kills the commands and deletes the worktree when the Master stops', async () => {
+    h = await harness({ verifyCommands: [] });
+    const gate = tmpDir('ares1-gate-');
+    await call('POST', '/api/repos/demo/trial', { verifyCommands: ['true', waitForGate(gate)] });
+    await waitFor(() => trialDirs().length === 1, 'the trial worktree');
+    await waitFor(
+      () => h?.master.trials.get(h.repo.id)?.results.length === 1,
+      'the first command to pass',
+    );
+    await h.close();
+    expect(trialDirs()).toEqual([]);
+    expect(worktrees(h.repoDir)).toHaveLength(1);
+    const over = h.master.trials.get(h.repo.id);
+    expect(over).toMatchObject({ status: 'failed', error: 'Master 停止了，试运行没有跑完' });
+    expect(over?.results.map((r) => [r.command, r.ok])).toEqual([
+      ['true', true],
+      [waitForGate(gate), false],
+    ]);
+    expect(() => h?.master.trials.start(h.repo)).toThrow('Master 正在停止，不能试运行');
+  });
+
+  it('runs the commands without GitHub or GitLab credentials', async () => {
+    vi.stubEnv('GH_TOKEN', 'gho_master');
+    vi.stubEnv('GITHUB_TOKEN', 'ghp_master');
+    vi.stubEnv('GITLAB_TOKEN', 'glpat-master');
+    vi.stubEnv('GLAB_TOKEN', 'glpat-glab');
+    const out = tmpDir('ares1-env-');
+    h = await harness({ setupCommands: [`env > ${out}/setup.env`], verifyCommands: [] });
+    await call('POST', '/api/repos/demo/trial', { verifyCommands: [`env > ${out}/verify.env`] });
+    expect((await trialOver()).status).toBe('passed');
+    for (const file of ['setup.env', 'verify.env']) {
+      const env = readEnvFile(join(out, file));
+      expect(env.GH_TOKEN).toBe(AGENT_GH_TOKEN);
+      expect(env.GITHUB_TOKEN).toBeUndefined();
+      expect(env.GH_CONFIG_DIR).toBe(h.master.paths.agentGhConfigDir);
+      expect(env.GITLAB_TOKEN).toBe(AGENT_GITLAB_TOKEN);
+      expect(env.GLAB_TOKEN).toBeUndefined();
+      expect(env.GIT_TERMINAL_PROMPT).toBe('0');
+    }
+    // The Master keeps its own.
+    expect(process.env.GH_TOKEN).toBe('gho_master');
+  });
+
+  it('tells the dashboard over SSE as it goes, recording no event', async () => {
+    h = await harness({ setupCommands: ['true'], verifyCommands: ['true'] });
+    const res = await h.master.app.request('/api/stream');
+    const reader = (res.body as ReadableStream<Uint8Array>).getReader();
+    expect((await call('POST', '/api/repos/demo/trial')).status).toBe(202);
+    let text = '';
+    const decoder = new TextDecoder();
+    while (!text.includes('"status":"passed"')) {
+      const { value } = await reader.read();
+      text += decoder.decode(value);
+    }
+    await reader.cancel();
+    const notices = text
+      .split('\n\n')
+      .filter((msg) => msg.includes('event: notice'))
+      .map((msg) => {
+        const data = msg.split('\n').find((l) => l.startsWith('data: ')) ?? '';
+        return JSON.parse(data.slice('data: '.length)) as LiveNotice;
+      });
+    const notice = (status: RepoTrial['status']): LiveNotice => ({
+      type: 'repo.trial',
+      repoId: (h as Harness).repo.id,
+      status,
+    });
+    // Started, each command, over.
+    expect(notices).toEqual([
+      notice('running'),
+      notice('running'),
+      notice('running'),
+      notice('passed'),
+    ]);
+    const events = h.master.store.listGlobalEvents({ limit: 500 });
+    expect(events.filter((e) => e.type.includes('trial'))).toEqual([]);
+  });
+
+  it('fails when the target branch cannot be read, saying so in English', async () => {
+    h = await harness({ verifyCommands: ['true'] });
+    git(h.repoDir, 'checkout', '-q', '-b', 'gone');
+    expect((await call('PATCH', '/api/repos/demo', { targetBranch: 'gone' })).status).toBe(200);
+    git(h.repoDir, 'checkout', '-q', 'main');
+    git(h.repoDir, 'branch', '-q', '-D', 'gone');
+    setLang('en');
+    await call('POST', '/api/repos/demo/trial');
+    const over = await trialOver();
+    expect(over).toMatchObject({ status: 'failed', branch: 'gone', sha: null, results: [] });
+    // git's own output follows the colon, in whatever language git speaks here.
+    expect(over.error).toMatch(/^Could not read the commit the target branch gone is at: git /);
+    expect(trialDirs()).toEqual([]);
+
+    const unknown = await call('GET', '/api/repos/demo2/trial');
+    expect(unknown.status).toBe(404);
+    expect(unknown.json.error).not.toMatch(/[一-鿿]/);
+    // Its latest trial is there.
+    const latest = await call('GET', '/api/repos/demo/trial');
+    expect(latest.json.error).toBe(over.error);
+  });
+
+  it('answers 404 for an unknown repo and 400 for a body it cannot take', async () => {
+    h = await harness();
+    expect((await call('GET', '/api/repos/nope/trial')).status).toBe(404);
+    expect((await call('POST', '/api/repos/nope/trial')).status).toBe(404);
+    expect((await call('POST', '/api/repos/demo/trial', { verifyCommands: 'true' })).status).toBe(
+      400,
+    );
+    expect((await call('POST', '/api/repos/demo/trial', { commands: ['true'] })).status).toBe(400);
+    expect((await call('GET', '/api/repos/demo/trial')).status).toBe(404);
+    expect(trialDirs()).toEqual([]);
+  });
+
+  it('deletes the trial worktrees a Master left behind, at start and with the leftover workspaces', async () => {
+    h = await harness({ verifyCommands: [] });
+    const { worktreesDir } = h.master.paths;
+    const repoId = h.repo.id;
+    // One git knows of, a plain directory, one of a repo since removed, and one not a trial's.
+    const known = join(worktreesDir, `trial-${repoId}-dead01`);
+    git(h.repoDir, 'worktree', 'add', '--detach', '-q', known, 'main');
+    writeFile(join(worktreesDir, 'trial-junk', 'file.txt'), 'x\n');
+    writeFile(join(worktreesDir, 'trial-repo-0000000000-beef', 'file.txt'), 'x\n');
+    writeFile(join(worktreesDir, 'run-keep', 'file.txt'), 'x\n');
+    expect(worktrees(h.repoDir)).toHaveLength(2);
+
+    // While the repo tries, the worktrees named after it stay: one of them is in use.
+    const gate = tmpDir('ares1-gate-');
+    await call('POST', '/api/repos/demo/trial', { verifyCommands: [waitForGate(gate)] });
+    await waitFor(() => trialDirs().length === 4, 'the trial worktree');
+    await h.master.trials.sweepLeftovers();
+    expect(trialDirs()).toHaveLength(2);
+    expect(trialDirs()).toContain(`trial-${repoId}-dead01`);
+    expect(existsSync(join(worktreesDir, 'run-keep'))).toBe(true);
+    writeFile(join(gate, 'go'), '');
+    expect((await trialOver()).status).toBe('passed');
+
+    await h.master.trials.sweepLeftovers();
+    expect(trialDirs()).toEqual([]);
+    expect(worktrees(h.repoDir)).toHaveLength(1);
+    expect(existsSync(join(worktreesDir, 'run-keep'))).toBe(true);
+
+    // A Master that stopped in a trial: the next one deletes its worktree when it starts.
+    const left = join(worktreesDir, `trial-${repoId}-dead02`);
+    git(h.repoDir, 'worktree', 'add', '--detach', '-q', left, 'main');
+    const { home, repoDir } = h;
+    await h.close();
+    h = await harness({ home, repoDir });
+    await waitFor(() => !existsSync(left), 'the leftover trial worktree to go');
+    await waitFor(() => worktrees(repoDir).length === 1, 'git to forget it');
   });
 });

@@ -19,6 +19,7 @@ import {
   iterationKind,
   iterationProgress,
   iterationStatusOf,
+  leftoverTrialWorktrees,
   leftoverWorkspaces,
   levelRank,
   limitedScout,
@@ -49,8 +50,11 @@ import {
   sourcePollMinutes,
   splitUnfinishedRuns,
   stageAgentIds,
+  TRIAL_WORKTREE_PREFIX,
   templateSplits,
   touchesOverlap,
+  trialWorktreeName,
+  trialWorktreeRepo,
   unmetDependencies,
   waitsForMaxRuns,
 } from '../src/config/flow.js';
@@ -3299,6 +3303,44 @@ describe('leftoverWorkspaces', () => {
     expect(leftoverWorkspaces(runs, events)).toEqual([
       { runId: 'a2', why: { reason: 'superseded', supersededBy: 'a4' } },
     ]);
+  });
+});
+
+describe('trial worktrees', () => {
+  it('names them after the repo, which can be read back', () => {
+    const name = trialWorktreeName('repo-0123456789', 'beef');
+    expect(name).toBe('trial-repo-0123456789-beef');
+    expect(name.startsWith(TRIAL_WORKTREE_PREFIX)).toBe(true);
+    expect(trialWorktreeRepo(name)).toBe('repo-0123456789');
+    expect(trialWorktreeRepo('trial-junk')).toBeNull();
+    expect(trialWorktreeRepo('trial--beef')).toBeNull();
+    expect(trialWorktreeRepo('run-0123456789')).toBeNull();
+  });
+
+  it('lists those of repos not trying now, and nothing else under worktrees/', () => {
+    const names = [
+      'run-0123456789',
+      'scouts',
+      'trial-repo-aaaaaaaaaa-01',
+      'trial-repo-aaaaaaaaaa-02',
+      'trial-repo-bbbbbbbbbb-03',
+      'trial-junk',
+      'trial-',
+    ];
+    expect(leftoverTrialWorktrees(names, new Set())).toEqual([
+      'trial-repo-aaaaaaaaaa-01',
+      'trial-repo-aaaaaaaaaa-02',
+      'trial-repo-bbbbbbbbbb-03',
+      'trial-junk',
+      'trial-',
+    ]);
+    // A repo trying now may be using any worktree named after it.
+    expect(leftoverTrialWorktrees(names, new Set(['repo-aaaaaaaaaa']))).toEqual([
+      'trial-repo-bbbbbbbbbb-03',
+      'trial-junk',
+      'trial-',
+    ]);
+    expect(leftoverTrialWorktrees(['run-x', 'scouts'], new Set())).toEqual([]);
   });
 });
 

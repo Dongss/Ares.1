@@ -1133,6 +1133,29 @@ textarea:focus {
 .detect ul {
   padding-left: 20px;
 }
+/* The trial button of a repo and its latest trial, command by command. */
+.trial {
+  margin: 10px 0;
+}
+.trial-result {
+  margin-top: 6px;
+}
+.trial-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+.trial-row {
+  padding: 2px 0;
+}
+.trial-running .check-icon {
+  color: var(--active);
+}
+.trial-waiting,
+.trial-skipped {
+  color: var(--text-2);
+}
 .commands {
   display: flex;
   flex-wrap: wrap;

@@ -39,6 +39,7 @@ import {
   Upgrader,
 } from './upgrade/upgrader.js';
 import { errorMessage, newId, nowIso, parseJson } from './util.js';
+import { RepoTrials } from './verify/trial.js';
 import { git, revParse } from './workspace/git.js';
 
 /**
@@ -237,6 +238,8 @@ export class Master {
     readonly webhook: WebhookNotifier,
     readonly upgrader: Upgrader,
     readonly logPruner: RawLogPruner,
+    /** Trial runs of the repos' setup and verify commands, from the dashboard. */
+    readonly trials: RepoTrials,
     readonly app: Hono,
   ) {}
 
@@ -346,6 +349,7 @@ export class Master {
       },
     });
     const version = installDir ? await revParse(installDir, 'HEAD').catch(() => null) : null;
+    const trials = new RepoTrials({ store, paths, config });
     const app = createApi({
       store,
       engine,
@@ -353,6 +357,7 @@ export class Master {
       gitlabIssues,
       backlog,
       upgrader,
+      trials,
       version,
       config,
       configStatus: () => watcher.status(),
@@ -367,14 +372,22 @@ export class Master {
         readOnly: a.supportsReadOnly === true,
       })),
     });
-    // Leftover worktrees of failed and cancelled Runs go with the raw logs: at start, once the
-    // engine has recovered the Runs, and then daily.
+    // Leftover worktrees of failed and cancelled Runs, and of trials a Master stopped in, go with
+    // the raw logs: at start, once the engine has recovered the Runs, and then daily.
     const logPruner = new RawLogPruner(store, opts.now, () => {
       engine.sweepLeftoverWorkspaces().catch((err) => {
         console.warn(
           t({
             zh: `[工作目录] 补删失败尝试和改过需求的旧 Run 留下的工作目录失败：${errorMessage(err)}`,
             en: `[workspaces] Could not remove the leftover working directories of failed attempts and of Runs whose issue changed: ${errorMessage(err)}`,
+          }),
+        );
+      });
+      trials.sweepLeftovers().catch((err) => {
+        console.warn(
+          t({
+            zh: `[工作目录] 补删试运行留下的工作目录失败：${errorMessage(err)}`,
+            en: `[workspaces] Could not remove the leftover working directories of trials: ${errorMessage(err)}`,
           }),
         );
       });
@@ -393,6 +406,7 @@ export class Master {
       webhook,
       upgrader,
       logPruner,
+      trials,
       app,
     );
     // Before the engine recovers the Runs the last Master left, so that the event comes first.
@@ -453,12 +467,14 @@ export class Master {
     // rejects.
     const drained = this.webhook.drain();
     // Together: the scouts record that they were cut short and delete their temporary worktrees
-    // while the bridges and the local backlog finish their rounds.
+    // while the bridges and the local backlog finish their rounds; the trials' commands are
+    // killed and their worktrees deleted.
     await Promise.all([
       this.issues.stop(),
       this.gitlabIssues.stop(),
       this.backlog.stop(),
       this.scouting.stop(),
+      this.trials.stop(),
     ]);
     await this.engine.stop();
     await this.repoWorkflows.stop();

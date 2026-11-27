@@ -15,6 +15,8 @@ import type {
   ProposalWritten,
   RepoDetection,
   RepoInput,
+  RepoTrial,
+  RepoTrialInput,
   RunDetail,
   RunSummary,
   StatsView,
@@ -118,6 +120,18 @@ export const api = {
   deleteRepo: (repoId: string) => request<string>('DELETE', `/api/repos/${id(repoId)}`),
   /** Setup and verify commands suggested by the files committed on the repo's target branch. */
   detectRepo: (repoId: string) => request<RepoDetection>('GET', `/api/repos/${id(repoId)}/detect`),
+  /**
+   * Starts trying the repo's setup and verify commands: `commands` instead of the registered
+   * ones, which stay as they are.
+   */
+  tryRepo: (repoId: string, commands?: RepoTrialInput) =>
+    request<RepoTrial>('POST', `/api/repos/${id(repoId)}/trial`, commands ?? {}),
+  /** The repo's latest trial; null when it has not been tried since the Master started. */
+  repoTrial: (repoId: string) =>
+    request<RepoTrial>('GET', `/api/repos/${id(repoId)}/trial`).catch((err: unknown) => {
+      if (err instanceof ApiError && err.status === 404) return null;
+      throw err;
+    }),
 
   runs: () => request<RunSummary[]>('GET', '/api/runs'),
   run: (runId: string) => request<RunDetail>('GET', `/api/runs/${id(runId)}`),

@@ -1,9 +1,22 @@
 import { type FormEvent, useState } from 'react';
-import type { ConfigView, RepoDetection } from '../../../src/api/types.js';
+import type {
+  ConfigView,
+  RepoDetection,
+  RepoTrial,
+  RepoTrialInput,
+} from '../../../src/api/types.js';
 import { REPO_WORKFLOWS_DIR } from '../../../src/config/flow.js';
 import { t } from '../../../src/i18n.js';
 import type { Repo } from '../../../src/store/types.js';
-import { Badge, ConfirmButton, Empty, ErrorBox, TemplateProblems } from '../components/ui.js';
+import {
+  Badge,
+  Collapsible,
+  ConfirmButton,
+  Empty,
+  ErrorBox,
+  Pre,
+  TemplateProblems,
+} from '../components/ui.js';
 import { api } from '../lib/api.js';
 import {
   repoSourceInfo,
@@ -12,12 +25,13 @@ import {
   repoTemplateProblems,
 } from '../lib/config.js';
 import { parseLines, shortSha } from '../lib/format.js';
-import { useAction } from '../lib/hooks.js';
+import { useAction, useReloadOn, useResource, useTick } from '../lib/hooks.js';
 import {
   detectedBox,
   detectionNote,
   detectLabel,
   lacksVerify,
+  missingProgramNote,
   newRepoInput,
   noVerifyBadge,
   noVerifyWarning,
@@ -27,7 +41,13 @@ import {
   repoOriginHint,
   repoOriginLabel,
   repoPathLabel,
+  type TrialRow,
   targetBranchPlaceholder,
+  trialLabel,
+  trialRowNote,
+  trialRows,
+  trialStatusBadge,
+  trialSummary,
 } from '../lib/repos.js';
 import { href } from '../lib/router.js';
 
@@ -113,6 +133,7 @@ function RepoCard(props: { repo: Repo; config: ConfigView | undefined; onChanged
           </div>
         )}
       </dl>
+      <TrialPanel repo={repo} />
       <div className="form-actions">
         <button type="button" onClick={() => setEditing(true)}>
           {t({ zh: '修改', en: 'Edit' })}
@@ -192,6 +213,118 @@ function OwnTemplates({ repo, config }: { repo: string; config: ConfigView }) {
         <a href={href.config}>{t({ zh: '在配置页查看', en: 'see them on the Config page' })}</a>
       </div>
     </>
+  );
+}
+
+/**
+ * The trial button and the repo's latest trial: each command's state, with the end of the output
+ * of the one that failed. `commands`: the commands of the edit form to try instead of the saved
+ * ones (nothing is saved); omitted on the card, which tries the saved ones.
+ */
+function TrialPanel(props: { repo: Repo; commands?: () => RepoTrialInput; disabled?: boolean }) {
+  const { repo } = props;
+  const trial = useResource(() => api.repoTrial(repo.id), `trial:${repo.id}`);
+  useReloadOn(
+    trial.reload,
+    () => false,
+    200,
+    (n) => n.type === 'repo.trial' && n.repoId === repo.id,
+  );
+  const action = useAction();
+  const running = trial.data?.status === 'running';
+  const now = useTick(1000, running);
+  const start = async () => {
+    const started = await action.run(() => api.tryRepo(repo.id, props.commands?.()));
+    if (started) trial.reload();
+  };
+  const form = props.commands !== undefined;
+  return (
+    <div className="trial">
+      <div className="detect-row">
+        <button type="button" onClick={start} disabled={action.busy || running || props.disabled}>
+          {trialLabel(running || action.busy, form)}
+        </button>
+        <span className="hint">
+          {form
+            ? t({
+                zh: `用输入框里的命令（不保存）在已保存的目标分支 ${repo.targetBranch} 当前的提交上依次跑准备命令和检查命令，和 Run 用的环境一样，不建 Run`,
+                en: `Runs the setup and then the verify commands in the boxes (without saving them) on the commit the saved target branch ${repo.targetBranch} is at, in the environment Runs use; no Run is created`,
+              })
+            : t({
+                zh: `在目标分支 ${repo.targetBranch} 当前的提交上依次跑准备命令和检查命令，和 Run 用的环境一样，不建 Run、什么都不改`,
+                en: `Runs the setup and then the verify commands on the commit the target branch ${repo.targetBranch} is at, in the environment Runs use; no Run is created and nothing changes`,
+              })}
+        </span>
+      </div>
+      <ErrorBox>{action.error ?? trial.error}</ErrorBox>
+      {trial.data && <TrialResult trial={trial.data} now={now} />}
+    </div>
+  );
+}
+
+function TrialResult({ trial, now }: { trial: RepoTrial; now: number }) {
+  const badge = trialStatusBadge(trial.status);
+  const rows = trialRows(trial);
+  return (
+    <div className="trial-result">
+      <div className="trial-head">
+        <Badge tone={badge.tone}>{badge.label}</Badge>
+        <span className="hint">{trialSummary(trial, now)}</span>
+      </div>
+      <ErrorBox>{trial.error}</ErrorBox>
+      {rows.length === 0 ? (
+        <p className="hint">
+          {t({
+            zh: '没有准备命令，也没有检查命令，没什么可跑的。',
+            en: 'There are no setup or verify commands: nothing to run.',
+          })}
+        </p>
+      ) : (
+        <ul className="checks">
+          {rows.map((row, i) => (
+            <li
+              // biome-ignore lint/suspicious/noArrayIndexKey: the same command may be listed twice
+              key={i}
+              className={`trial-${row.state} ${row.state === 'failed' ? 'check-fail' : row.state === 'passed' ? 'check-pass' : ''}`}
+            >
+              <TrialRowView row={row} />
+            </li>
+          ))}
+        </ul>
+      )}
+      {trial.log && (
+        <p className="hint">
+          {t({ zh: '完整输出：', en: 'Full output: ' })}
+          <code>{trial.log}</code>
+        </p>
+      )}
+    </div>
+  );
+}
+
+function TrialRowView({ row }: { row: TrialRow }) {
+  const icon = { passed: '✓', failed: '✗', running: '…', waiting: '·', skipped: '–' }[row.state];
+  const title = (
+    <span>
+      <span className="check-icon">{icon}</span>
+      {row.kind === 'setup' ? setupLabel() : verifyLabel()} <code>{row.command}</code>{' '}
+      <span className="muted">{trialRowNote(row)}</span>
+    </span>
+  );
+  const result = row.result;
+  if (row.state !== 'failed' || !result) return <div className="trial-row">{title}</div>;
+  if (result.missingProgram) {
+    return (
+      <div className="trial-row">
+        {title}
+        <div className="hint text-attention">{missingProgramNote(result.missingProgram)}</div>
+      </div>
+    );
+  }
+  return (
+    <Collapsible title={title}>
+      <Pre>{result.outputTail || t({ zh: '（没有输出）', en: '(no output)' })}</Pre>
+    </Collapsible>
   );
 }
 
@@ -293,6 +426,11 @@ function EditRepo(props: { repo: Repo; onDone: () => void; onCancel: () => void 
         onChange={setVerify}
       />
       <CommandsField label={setupLabel()} hint={setupHint()} value={setup} onChange={setSetup} />
+      <TrialPanel
+        repo={repo}
+        commands={() => ({ setupCommands: parseLines(setup), verifyCommands: parseLines(verify) })}
+        disabled={action.busy}
+      />
       <p className="hint">
         {t({
           zh: '修改对之后开始的 Task 生效。',

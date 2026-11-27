@@ -102,6 +102,8 @@ src/
   workspace/detect.ts the setup and verify commands a repo's root files suggest (pure; the rules
                       follow the table of docs/examples/README.md)
   verify/commands.ts  run check and setup commands; tell a missing program from a failing command
+  verify/trial.ts     trial runs of a repo's setup and verify commands from the dashboard, kept in
+                      memory, and the sweep of the worktrees they leave behind
   api/
     server.ts         HTTP API (Hono) and SSE
     types.ts          API data types, shared by Master and dashboard
@@ -162,7 +164,8 @@ test/
     proposals a human may start over (`proposalRestartable`) or edit (`proposalEditable`), which local proposals are a
     human's own drafts, never auto-accepted nor holding the scout back (`authorDecides`), raw log
     retention (`runRawLogsExpired` /
-    `scoutRawLogExpired`), leftover worktrees (`leftoverWorkspaces`), which template a repo's
+    `scoutRawLogExpired`), leftover worktrees (`leftoverWorkspaces`), how trial worktrees are named
+    and which are left over (`trialWorktreeName` / `leftoverTrialWorktrees`), which template a repo's
     Runs get by id, the home directory's or the repo's own (`resolveTemplate`), where a repo's
     requirements come from, GitHub, GitLab or the local backlog (`requirementSource`: a name in
     more than one of `github.repos`, `gitlab.repos`, `backlog.repos` is the first's), and how

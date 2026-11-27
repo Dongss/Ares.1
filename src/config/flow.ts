@@ -1378,6 +1378,49 @@ export function leftoverWorkspaces(
   return leftovers;
 }
 
+/**
+ * How the temporary worktrees of trial runs of a repo's setup and verify commands (POST
+ * /api/repos/:id/trial) are named under worktrees/; no Run or scout worktree is named so.
+ */
+export const TRIAL_WORKTREE_PREFIX = 'trial-';
+
+/**
+ * The directory name under worktrees/ of a trial of the repo `repoId`; `suffix`, a random word
+ * without `-`, tells one trial from another.
+ */
+export function trialWorktreeName(repoId: string, suffix: string): string {
+  return `${TRIAL_WORKTREE_PREFIX}${repoId}-${suffix}`;
+}
+
+/**
+ * The repo a trial worktree is named after (`trialWorktreeName`); null for a name that is not a
+ * trial's, or a trial's whose repo cannot be read from it.
+ */
+export function trialWorktreeRepo(name: string): string | null {
+  if (!name.startsWith(TRIAL_WORKTREE_PREFIX)) return null;
+  const rest = name.slice(TRIAL_WORKTREE_PREFIX.length);
+  const dash = rest.lastIndexOf('-');
+  return dash > 0 ? rest.slice(0, dash) : null;
+}
+
+/**
+ * The trial worktrees a Master left behind, having stopped before it deleted them: of `names`,
+ * the entries of worktrees/, those named like a trial's (`TRIAL_WORKTREE_PREFIX`) but of no repo
+ * trying its commands now (`trying`, repo ids). A trial deletes its worktree before it counts as
+ * over, so a repo that is not trying has no worktree of its own left in use. A name the repo
+ * cannot be read from is nobody's.
+ */
+export function leftoverTrialWorktrees(
+  names: readonly string[],
+  trying: ReadonlySet<string>,
+): string[] {
+  return names.filter((name) => {
+    if (!name.startsWith(TRIAL_WORKTREE_PREFIX)) return false;
+    const repo = trialWorktreeRepo(name);
+    return repo === null || !trying.has(repo);
+  });
+}
+
 function stripUndefined<T extends object>(obj: T | undefined): Partial<T> {
   if (!obj) return {};
   return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined)) as Partial<T>;

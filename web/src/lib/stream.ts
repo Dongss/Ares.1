@@ -1,5 +1,5 @@
 import { useEffect, useRef, useSyncExternalStore } from 'react';
-import type { LiveAgentEvent } from '../../../src/api/types.js';
+import type { LiveAgentEvent, LiveNotice } from '../../../src/api/types.js';
 import type { EventRow } from '../../../src/store/types.js';
 
 // One shared SSE connection to GET /api/stream for the whole page.
@@ -7,6 +7,8 @@ import type { EventRow } from '../../../src/store/types.js';
 export interface StreamListener {
   onEvent?: (event: EventRow) => void;
   onAgent?: (event: LiveAgentEvent) => void;
+  /** Changes of what the Master keeps in memory only, which no event tells of. */
+  onNotice?: (notice: LiveNotice) => void;
   /** Called after a reconnect: anything may have been missed, so reload. */
   onReconnect?: () => void;
 }
@@ -41,6 +43,10 @@ function ensureConnected(): void {
     const data = JSON.parse((e as MessageEvent<string>).data) as LiveAgentEvent;
     for (const l of listeners) l.onAgent?.(data);
   });
+  source.addEventListener('notice', (e) => {
+    const data = JSON.parse((e as MessageEvent<string>).data) as LiveNotice;
+    for (const l of listeners) l.onNotice?.(data);
+  });
 }
 
 export function subscribe(listener: StreamListener): () => void {
@@ -60,6 +66,7 @@ export function useStream(listener: StreamListener): void {
       subscribe({
         onEvent: (e) => ref.current.onEvent?.(e),
         onAgent: (e) => ref.current.onAgent?.(e),
+        onNotice: (n) => ref.current.onNotice?.(n),
         onReconnect: () => ref.current.onReconnect?.(),
       }),
     [],

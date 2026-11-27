@@ -44,6 +44,7 @@ import {
 } from '../store/types.js';
 import type { Upgrader } from '../upgrade/upgrader.js';
 import { errorMessage } from '../util.js';
+import type { RepoTrials } from '../verify/trial.js';
 import { DETECT_READ_FILES, detectProjectCommands } from '../workspace/detect.js';
 import {
   branchExists,
@@ -74,6 +75,7 @@ import type {
   IterationView,
   KeptWorkspace,
   LiveAgentEvent,
+  LiveNotice,
   NotifyTestResult,
   ProposalAccepted,
   ProposalRestarted,
@@ -83,6 +85,8 @@ import type {
   RepoDetection,
   RepoInputSource,
   RepoSourceView,
+  RepoTrial,
+  RepoTrialInput,
   RunDetail,
   RunSummary,
   StatsView,
@@ -101,6 +105,8 @@ export interface ApiDeps {
   backlog: LocalBacklog;
   /** The Master upgrading itself. */
   upgrader: Upgrader;
+  /** Trial runs of the repos' setup and verify commands. */
+  trials: RepoTrials;
   /** Commit of the running Master's install directory. */
   version: string | null;
   config: () => LoadedConfig;
@@ -200,6 +206,12 @@ const RepoPatch = z.strictObject({
   verifyCommands: z.array(z.string()).optional(),
   setupCommands: z.array(z.string()).optional(),
 });
+
+/** Commands to try instead of the registered ones; nothing is saved. */
+const RepoTrialBody = z.strictObject({
+  setupCommands: z.array(z.string()).optional(),
+  verifyCommands: z.array(z.string()).optional(),
+}) satisfies z.ZodType<RepoTrialInput>;
 
 const CommentInput = z.strictObject({ comment: z.string().optional() });
 /** Most proposals one request returns. */
@@ -595,6 +607,31 @@ export function createApi(deps: ApiDeps): Hono {
     } satisfies RepoDetection);
   });
 
+  // Runs the setup commands, then the verify commands, on the commit the target branch is at, in
+  // a temporary worktree deleted afterwards (`RepoTrials.start`): the body's commands, else the
+  // registered ones. In the background: 202 at once, 409 while the repo is trying already.
+  app.post('/api/repos/:id/trial', async (c) => {
+    const repo = store.getRepo(c.req.param('id'));
+    const input = await body(c, RepoTrialBody);
+    return c.json(deps.trials.start(repo, input) satisfies RepoTrial, 202);
+  });
+
+  // The latest trial of the repo, under way or over; 404 when it has not been tried since the
+  // Master started.
+  app.get('/api/repos/:id/trial', (c) => {
+    const repo = store.getRepo(c.req.param('id'));
+    const trial = deps.trials.get(repo.id);
+    if (!trial) {
+      throw new NotFoundError(
+        t({
+          zh: `仓库 ${repo.name} 自 Master 启动以来还没有试运行过`,
+          en: `Repo ${repo.name} has not been tried since the Master started`,
+        }),
+      );
+    }
+    return c.json(trial satisfies RepoTrial);
+  });
+
   app.delete('/api/repos/:id', async (c) => {
     const repo = store.getRepo(c.req.param('id'));
     store.deleteRepo(repo.id);
@@ -948,8 +985,13 @@ export function createApi(deps: ApiDeps): Hono {
       const onAgent = (e: LiveAgentEvent) => {
         if (!runId || e.runId === runId) push('agent', e);
       };
+      // Of no Run.
+      const onNotice = (n: LiveNotice) => {
+        if (!runId) push('notice', n);
+      };
       store.bus.on('event', onEvent);
       engine.live.on('agent', onAgent);
+      deps.trials.live.on('notice', onNotice);
       let closed = false;
       stream.onAbort(() => {
         closed = true;
@@ -972,6 +1014,7 @@ export function createApi(deps: ApiDeps): Hono {
       } finally {
         store.bus.off('event', onEvent);
         engine.live.off('agent', onAgent);
+        deps.trials.live.off('notice', onNotice);
       }
     });
   });

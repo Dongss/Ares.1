@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import type { LiveNotice } from '../../../src/api/types.js';
 import type { EventRow } from '../../../src/store/types.js';
 import { useStream } from './stream.js';
 
@@ -44,8 +45,16 @@ export function useResource<T>(fetcher: () => Promise<T>, key: string): Resource
   return { data, error, loading, reload };
 }
 
-/** Call `reload` (debounced) when a matching event arrives on the live stream, or after a reconnect. */
-export function useReloadOn(reload: () => void, match: (e: EventRow) => boolean, delayMs = 200) {
+/**
+ * Call `reload` (debounced) when a matching event arrives on the live stream, or after a
+ * reconnect; with `matchNotice`, a matching notice of what the Master keeps in memory too.
+ */
+export function useReloadOn(
+  reload: () => void,
+  match: (e: EventRow) => boolean,
+  delayMs = 200,
+  matchNotice?: (n: LiveNotice) => boolean,
+) {
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const schedule = () => {
     if (timer.current) return;
@@ -58,6 +67,9 @@ export function useReloadOn(reload: () => void, match: (e: EventRow) => boolean,
   useStream({
     onEvent: (e) => {
       if (match(e)) schedule();
+    },
+    onNotice: (n) => {
+      if (matchNotice?.(n)) schedule();
     },
     onReconnect: schedule,
   });

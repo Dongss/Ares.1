@@ -22,10 +22,10 @@ node dist/cli.js      # 数据目录 ~/.ares1（或 $ARES1_HOME），端口 4870
 | `agents.yaml` | Agent 定义（CLI + 模型 + 运行参数） |
 | `workflows/` | 流程模板（仓库也可以自带，见「仓库自带的流程模板」） |
 | `data/ares1.db` | 运行状态（SQLite），升级迁移前自动备份成 `ares1.db.bak-v<版本>-<时间>`，只保留最近 5 份，更早的在迁移成功后自动删掉；旧版本遇到比自己新的库时恢复备份，较新的库改名成 `ares1.db.newer-v<版本>-<时间>` 留着（见「稳定副本和自动升级」） |
-| `data/logs/` | 执行日志：`<Run id>/` 下每次 Agent 执行的原始输出（`<执行 id>.jsonl` 和 `.jsonl.stderr`）、看板展示用的精简事件（`.events.jsonl`）、检查命令的输出（`.verify.log`），以及 `setup.log`、`command-*.log`、`merge-*.log`；`scouts/` 下是侦察的原始输出。原始输出在 Run 或侦察结束 30 天后自动删掉，其余一直保留（见下面「原始日志的保留期」） |
+| `data/logs/` | 执行日志：`<Run id>/` 下每次 Agent 执行的原始输出（`<执行 id>.jsonl` 和 `.jsonl.stderr`）、看板展示用的精简事件（`.events.jsonl`）、检查命令的输出（`.verify.log`），以及 `setup.log`、`command-*.log`、`merge-*.log`；`scouts/` 下是侦察的原始输出；`trial-<仓库名>.log` 是仓库最近一次试运行的输出（见「试运行准备命令和检查命令」）。原始输出在 Run 或侦察结束 30 天后自动删掉，其余一直保留（见下面「原始日志的保留期」） |
 | `data/artifacts/` | 评审意见等产物 |
 | `data/agent-gh-config/` | 给 Agent 用的空 gh 配置目录，每次用之前清空（见「Agent 拿不到 GitHub 和 GitLab 凭据」） |
-| `worktrees/` | 每个 Run 的工作目录 |
+| `worktrees/` | 每个 Run 的工作目录；`scouts/` 下是侦察的临时工作目录，`trial-<仓库 id>-<随机串>` 是试运行的临时工作目录，用完就删 |
 | `data/master-running.json` | Master 运行时的标记，正常停止时删掉（见「保活」） |
 | `data/self-upgrade.sh`、`data/find-node.sh`、`data/webhook.sh` | 自动升级时从安装目录复制过来的升级脚本、找 node 的脚本和发 webhook 通知的脚本（见「稳定副本和自动升级」） |
 | `master.out`、`upgrade.log`、`keepalive.log` | 后台运行时的输出、自动升级的日志、保活脚本的日志 |
@@ -103,6 +103,55 @@ API 是 `GET /api/repos/:id/detect`（`:id` 是仓库的 id 或名字），什�
 - 读的是目标分支所在提交里的文件（`git ls-tree` / `git cat-file`），不看任何工作目录：没提交的改动和没跟踪的文件都不影响结果。只看根目录，子目录里的项目文件不算；符号链接只算有这个文件，不读内容。
 - `basis` 是给人看的说明，用 Master 的语言（`config.yaml` 的 `language`），每认出一种一条；都认不出来时 `setup`、`verify` 是空列表，`basis` 只有一条，说明没认出来。
 - 仓库不存在时返回 404；目标分支读不到（分支被删了、路径不是 git 仓库等）时返回 409，错误信息里有 git 的输出。
+
+### 试运行准备命令和检查命令
+
+检查命令填错了（程序没装、命令名写错、目标分支本身就过不了），要等第一个 Run 编码完才会发现，然后一轮轮返工白花钱。所以接入仓库时可以先试跑一遍：
+
+- 「仓库」页每张仓库卡片上有「试运行」按钮，跑的是已经保存的命令。
+- 「修改」表单里有「试运行表单里的命令」按钮，跑的是两个输入框里现在的内容，不保存；已保存的命令不变，觉得没问题再点「保存」。比如「按项目文件探测」填好之后，可以先试跑再保存。表单里改了目标分支时，试跑的仍是已保存的目标分支。
+
+试运行时 Master：
+
+1. 读目标分支当前所在的提交。读不到（分支被删了等）时试运行失败，`error` 里写明原因和 git 的输出。
+2. 先查每条命令最先启动的程序在命令的环境里找不找得到（和 Run 的「运行环境缺少命令」一样判断，见「Run 什么时候停下来等人」）。有找不到的时一条命令都不跑，结果里只有那一条命令，`missingProgram` 是找不到的程序（或者它 `#!` 行里写的解释器，比如 npm 找不到的 `node`）。这是 Master 运行环境的问题，不是仓库的问题：装好它，或者让 Master 的 PATH 里能找到它（比如换 Node 版本后重启 Master），再试一次。
+3. 在数据目录的 `worktrees/` 下用这个提交建一个临时工作目录（detached HEAD，不建分支），名字是 `trial-<仓库 id>-<随机串>`。没提交的改动和别的分支都不影响结果。
+4. 依次跑准备命令；全部通过后再依次跑检查命令。每组遇到第一条失败的就停，后面的不跑。命令的环境和 Run 的检查命令一样：没有 GitHub、GitLab 凭据（`prepareAgentEnv`），每条命令的超时是 `defaults.command_timeout_minutes`（默认 20 分钟）。输出写到 `data/logs/trial-<仓库名>.log`，每次试运行覆盖上一次的。命令跑完退出码是 127 而程序确实找不到时，结果的 `missingProgram` 也会写上。
+5. 不管成败都删掉临时工作目录，再让 git 忘掉它，然后这次试运行才算结束。Master 停止时正在跑的命令会被终止，工作目录照样删掉。
+
+试运行不建 Run、不记事件、不改任何东西，也不和 Run 排队：有 Run 正在执行时照样可以试。同一个仓库同时只能有一次试运行，不同仓库可以同时试。看板上能看到每条命令过没过、用了多久，失败的命令可以展开看输出末尾，缺程序的写明找不到什么；试运行进行中时，跑完一条刷新一条。
+
+结果只放在内存里，每个仓库只留最近一次，Master 重启后就没有了。Master 在试运行进行中崩溃时留下的 `trial-` 目录，由下面「补删遗留的工作目录」在 Master 启动时和之后每天删掉。
+
+API：
+
+- `POST /api/repos/:id/trial`（`:id` 是仓库的 id 或名字）：开始试运行，立即返回 202 和刚开始的试运行（格式同下）。请求体可以是 `{ "setupCommands": [...], "verifyCommands": [...] }`，两项都可以不带，不带的那一组用已登记的命令；什么都不保存。同一个仓库正在试运行时返回 409，仓库不存在时返回 404，请求体不对（比如命令不是字符串数组、带了别的字段）时返回 400。
+- `GET /api/repos/:id/trial`：最近一次试运行，进行中或已结束。Master 启动以来这个仓库还没试过时返回 404。
+
+```json
+{
+  "repoId": "repo-…",
+  "status": "failed",
+  "branch": "main",
+  "sha": "<目标分支所在的提交>",
+  "startedAt": "2026-11-27T10:00:00.000Z",
+  "endedAt": "2026-11-27T10:00:42.000Z",
+  "setupCommands": ["npm ci"],
+  "verifyCommands": ["npm run build", "npm test"],
+  "results": [
+    { "kind": "setup", "command": "npm ci", "ok": true, "exitCode": 0, "timedOut": false, "durationMs": 30512, "outputTail": "…", "missingProgram": null },
+    { "kind": "verify", "command": "npm run build", "ok": false, "exitCode": 2, "timedOut": false, "durationMs": 9120, "outputTail": "…", "missingProgram": null }
+  ],
+  "error": null,
+  "log": "<数据目录>/data/logs/trial-my-repo.log"
+}
+```
+
+- `status`：`running`（进行中）、`passed`（每条命令都通过；一条命令都没有时也算通过，`results` 为空）、`failed`（有命令没通过、找不到程序，或者 `error` 里写的原因）。
+- `setupCommands`、`verifyCommands` 是这次试的命令；`results` 是跑过的命令，按顺序，没跑到的不在里面。`exitCode` 在超时、被终止或因为缺程序没跑时是 `null`；`outputTail` 是输出的末尾。
+- `error`：命令以外的原因（读不到目标分支、建不了工作目录、Master 停止了），用 Master 的语言；没有时是 `null`。`log` 是这次输出的完整日志，没跑任何命令时是 `null`。
+
+试运行开始、每跑完一条命令和结束时，`GET /api/stream` 上各发一条 `notice`，数据是 `{ "type": "repo.trial", "repoId": "…", "status": "running" }`（结束时是 `passed` 或 `failed`）。它只用来让看板刷新，不写进数据库，事件页上看不到。
 
 ## 仓库自带的流程模板
 
@@ -483,6 +532,7 @@ github:
   - 因为 issue 改过而被终止的 Run（记过 `run.goal_changed`）：`reason: goal_changed`，`newRun` 取那条事件里的。
 - 不碰：人在看板上终止的 Run、关闭 issue 终止的 Run、还没结束的 Run（排队、执行中、等审批、卡住、暂停）、失败后还要重做的 Run、每个 issue 最后一次失败的 Run，以及不是从 issue 来的 Run。
 - 记录：删掉时照旧在那个 Run 上记一条 `workspace.removed`（数据和当时那次一样：路径、分支、`reason` 和对应的 Run id）。已经记过 `workspace.cleanup_failed` 的 Run 照样再试，还是删不掉就再记一条 `workspace.cleanup_failed`，接着删下一个，不影响 Master。已经删掉或者本来就不在的不再处理，所以重复补删不会重复记事件。补删整体出错（比如读数据库失败）只在 Master 的输出里打一行警告，下一轮再试。
+- 试运行的临时工作目录（见「试运行准备命令和检查命令」）：同样的时机，`worktrees/` 下以 `trial-` 开头、对应的仓库当前没有在试运行的目录都删掉（试运行自己总是先删掉目录才算结束，所以这些只会是 Master 在试运行中途崩溃留下的），再让对应仓库的 git 忘掉它们（`git worktree prune`）；目录名里看不出仓库、或者仓库已经移除的，删掉后对所有登记的仓库都 prune 一遍。不记事件。
 
 ### 只信任仓库成员写的内容
 
@@ -503,7 +553,7 @@ GitLab 仓库按作者对项目的权限判断：Developer 及以上（Developer
 
 ### Agent 拿不到 GitHub 和 GitLab 凭据
 
-只把陌生人写的内容挡在提示词外面还不够：Agent 能执行命令，要是继承了本机 gh 的登录，它自己跑一下 `gh issue view 12 --comments`，陌生人的评论就又进来了；它还能以本机登录的所有 GitHub 账号读写这些账号能访问的所有仓库。本机装了 glab 或设置了 GitLab token 时，GitLab 上也是一样。Master 读 issue、发评论、推送都是自己做的，Agent 用不着这些托管平台的凭据，所以 Agent（编码、评审、需求评估、侦察）和准备命令、检查命令（包括命令阶段的命令，以及分叉时 Master 自动合并后运行的命令）都在去掉了 GitHub 和 GitLab 凭据的环境里运行：
+只把陌生人写的内容挡在提示词外面还不够：Agent 能执行命令，要是继承了本机 gh 的登录，它自己跑一下 `gh issue view 12 --comments`，陌生人的评论就又进来了；它还能以本机登录的所有 GitHub 账号读写这些账号能访问的所有仓库。本机装了 glab 或设置了 GitLab token 时，GitLab 上也是一样。Master 读 issue、发评论、推送都是自己做的，Agent 用不着这些托管平台的凭据，所以 Agent（编码、评审、需求评估、侦察）和准备命令、检查命令（包括命令阶段的命令、分叉时 Master 自动合并后运行的命令，以及看板上试运行的命令）都在去掉了 GitHub 和 GitLab 凭据的环境里运行：
 
 - 去掉 `GH_TOKEN`、`GITHUB_TOKEN`、`GH_ENTERPRISE_TOKEN`、`GITHUB_ENTERPRISE_TOKEN`，再把 `GH_TOKEN` 设成一个无效的值 `ares1-agent-no-github-access`。gh 优先用 `GH_TOKEN`，GitHub 会拒绝它，gh 也就不会退回去用存在配置文件或 macOS 钥匙串里的登录。
 - `GH_CONFIG_DIR` 指向数据目录下的空目录 `data/agent-gh-config/`，gh 在里面是未登录状态。每次启动 Agent、运行命令之前都会把它清空，Agent 往里面写的东西留不到下一次。

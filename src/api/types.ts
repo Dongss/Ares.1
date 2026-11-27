@@ -89,6 +89,74 @@ export interface RepoDetection extends DetectedCommands {
   commit: string;
 }
 
+/**
+ * Body of POST /api/repos/:id/trial: the commands to try instead of the registered ones, each
+ * group left out to try the registered one. Nothing is saved.
+ */
+export interface RepoTrialInput {
+  setupCommands?: string[];
+  verifyCommands?: string[];
+}
+
+/** Where a trial of a repo's commands is: under way, or over with every command passed or not. */
+export type RepoTrialStatus = 'running' | 'passed' | 'failed';
+
+/** One command of a trial, once it ran or was found unable to run. */
+export interface RepoTrialResult {
+  kind: 'setup' | 'verify';
+  command: string;
+  ok: boolean;
+  /** null when it timed out, was stopped, or did not run for want of its program. */
+  exitCode: number | null;
+  timedOut: boolean;
+  durationMs: number;
+  /** End of its combined output; empty when it did not run. */
+  outputTail: string;
+  /**
+   * The program (or that program's interpreter) not found in the commands' environment
+   * (`environmentProblem` / `firstMissingCommand` in src/verify/commands.ts): a problem of the
+   * Master's environment, not of the repo. Such a command does not run. null otherwise.
+   */
+  missingProgram: string | null;
+}
+
+/**
+ * GET /api/repos/:id/trial: the latest trial of the repo's setup and verify commands on the
+ * commit its target branch was at, kept in memory only (gone when the Master restarts).
+ */
+export interface RepoTrial {
+  repoId: string;
+  status: RepoTrialStatus;
+  /** The target branch tried, and the commit it was at; null when it could not be read. */
+  branch: string;
+  sha: string | null;
+  startedAt: string;
+  endedAt: string | null;
+  /** The commands tried: the request's, or the registered ones. */
+  setupCommands: string[];
+  verifyCommands: string[];
+  /**
+   * The commands run so far, in order. Setup commands come first; the first failure ends the
+   * trial, so the commands after it are not run.
+   */
+  results: RepoTrialResult[];
+  /** Why the trial could not go on besides a command failing, in the Master's language. */
+  error: string | null;
+  /** The commands' output, overwritten by the repo's next trial. */
+  log: string | null;
+}
+
+/**
+ * `notice` messages on GET /api/stream: changes of what the Master keeps in memory only, so no
+ * event of the database tells of them. `repo.trial`: a trial of the repo's commands started, ran
+ * one command or ended.
+ */
+export interface LiveNotice {
+  type: 'repo.trial';
+  repoId: string;
+  status: RepoTrialStatus;
+}
+
 /** GET /api/runs items. */
 export type RunSummary = Omit<Run, 'template'> & {
   templateName: string;

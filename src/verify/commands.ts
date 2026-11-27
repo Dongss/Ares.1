@@ -96,17 +96,22 @@ export function runCommand(
   });
 }
 
-/** Run commands in order, stopping at the first failure. */
+/**
+ * Run commands in order, stopping at the first failure. `onResult` is told of each result as soon
+ * as its command ends, e.g. to show progress.
+ */
 export async function runCommands(
   commands: readonly string[],
   cwd: string,
   opts: CommandOptions,
+  onResult?: (result: CommandResult) => void,
 ): Promise<CommandResult[]> {
   const results: CommandResult[] = [];
   for (const command of commands) {
     if (opts.signal?.aborted) break;
     const result = await runCommand(command, cwd, opts);
     results.push(result);
+    onResult?.(result);
     if (!result.passed) break;
   }
   return results;
