@@ -274,6 +274,23 @@ function groupAlive(pgid: number): boolean {
 }
 
 /**
+ * Polls the group `pgid` every `pollMs` until no process is left in it (`groupAlive`) or
+ * `timeoutMs` has passed; whether it is gone.
+ */
+export async function waitGroupGone(
+  pgid: number,
+  timeoutMs = Number.POSITIVE_INFINITY,
+  pollMs = 100,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, pollMs));
+    if (!groupAlive(pgid)) return true;
+  }
+  return !groupAlive(pgid);
+}
+
+/**
  * SIGTERM a process group, then SIGKILL whatever is left of it after the grace period. The
  * whole group is watched, not just the leader: members that ignore SIGTERM outlive it.
  */
@@ -287,10 +304,15 @@ export async function killProcessGroup(pid: number, graceMs = 5000): Promise<voi
     }
   };
   if (!send('SIGTERM')) return;
-  const deadline = Date.now() + graceMs;
-  while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 100));
-    if (!groupAlive(pid)) return;
-  }
+  if (await waitGroupGone(pid, graceMs)) return;
   send('SIGKILL');
+}
+
+/**
+ * `killProcessGroup`, and then waits until no process is left in the group, however long the
+ * SIGKILL takes: once it resolves, nothing of the group runs or holds a port any more.
+ */
+export async function stopProcessGroup(pid: number, graceMs = 5000): Promise<void> {
+  await killProcessGroup(pid, graceMs);
+  await waitGroupGone(pid, Number.POSITIVE_INFINITY, 20);
 }

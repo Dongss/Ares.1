@@ -104,6 +104,8 @@ src/
   workspace/detect.ts the setup and verify commands a repo's root files suggest (pure; the rules
                       follow the table of docs/examples/README.md)
   verify/commands.ts  run check and setup commands; tell a missing program from a failing command
+  verify/serve.ts     a command stage's service: a free port, the repo's start command in its own
+                      process group, the wait until it answers, stopping the whole group
   verify/trial.ts     trial runs of a repo's setup and verify commands from the dashboard, kept in
                       memory, and the sweep of the worktrees they leave behind
   api/
