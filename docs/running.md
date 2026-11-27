@@ -58,7 +58,7 @@ Master 大部分时间没人看着，人回来时在看板的「事件」页查�
 
 API 是 `GET /api/events`，按 id 从新到旧返回 Run 为空的事件，格式和 `GET /api/runs/:id/events` 的一样（`id`、`runId`、`ts`、`type`、`data`）。参数 `limit` 是 1–500 的整数，默认 200；`before=<id>` 只返回比这个 id 更早的，用上一页最后一条的 id 往前翻。参数不合法时返回 400。
 
-默认配置只有给 Ares.1 开发自己用的 `self-dev` 模板。给别的项目配置时，可以参考 [`docs/examples/`](examples/README.md)：一组完整的 `config.yaml`、`agents.yaml` 和几种场景的流程模板（轻量、严格、带 E2E、交叉评审），每一项都有注释，目录结构和数据目录一样，可以直接复制过来改；那里还写了 npm、pnpm、Python、Go、Rust 项目登记仓库时检查命令和准备命令怎么填。流程模板也可以放在仓库自己的 `.ares1/workflows/` 里，跟着代码一起演进，见下面的「仓库自带的流程模板」。
+默认配置只有给 Ares.1 开发自己用的 `self-dev` 模板。给别的项目配置时，可以参考 [`docs/examples/`](examples/README.md)：一组完整的 `config.yaml`、`agents.yaml` 和几种场景的流程模板（轻量、严格、带 E2E、交叉评审），每一项都有注释，目录结构和数据目录一样，可以直接复制过来改；那里还写了 npm、pnpm、yarn、bun、Python、Go、Rust 和带 Makefile 的项目登记仓库时检查命令和准备命令怎么填，看板的「仓库」页也能按项目文件探测出这些命令（见下面的「按项目文件探测检查命令和准备命令」）。流程模板也可以放在仓库自己的 `.ares1/workflows/` 里，跟着代码一起演进，见下面的「仓库自带的流程模板」。
 
 ## 登记仓库
 
@@ -79,6 +79,30 @@ Ares.1 开发的每个仓库都要先在看板的「仓库」页登记：填仓�
 - 克隆可能要一会儿，请求等克隆完才返回，看板上的按钮这期间显示「正在克隆…」。
 
 API 是 `POST /api/repos`，请求体是 `{ name, path, targetBranch?, verifyCommands?, setupCommands?, source? }`。不带 `source` 就是登记已有的本地仓库，和以前完全一样：`path` 必须是 git 仓库，目标分支必须存在。`source` 是 `{ "kind": "clone", "url": "<地址>" }` 或 `{ "kind": "init" }`。成功时返回 201 和登记的仓库，格式同 `GET /api/repos` 的各项。
+
+### 按项目文件探测检查命令和准备命令
+
+检查命令留空时，Run 的改动不经任何检查就进入评审和合并（模板阶段自己写了 `verify.commands` 的除外）。所以「仓库」页在检查命令为空的仓库卡片上标「没有检查命令」，提醒去补上。
+
+不知道该填什么时，在「仓库」页点仓库的「修改」，再点「按项目文件探测」：Master 看目标分支上已提交的根目录文件，建议准备命令和检查命令，填进两个输入框，并列出是凭哪些文件判断的。它只填表单不保存，检查过后点「保存」才生效；没有建议的那一栏保持原样。探测的是已经保存的目标分支：表单里改了目标分支，要先保存再探测。
+
+认得出的有 Node（按 `packageManager` 字段或锁文件选 npm、pnpm、yarn、bun，检查命令只按 `scripts` 里实际有的 build、test、lint 生成）、Python（uv，或者 pip + venv 装 `pyproject.toml` / `requirements.txt`，检查用 pytest，项目配置了 ruff 时再加 ruff）、Go（`go.mod`）、Rust（`Cargo.toml`）和带 `test` 目标的 Makefile；几种都有时按 Node → Python → Go → Rust → Makefile 的顺序拼起来，同一条命令只出现一次。生成的命令和 [`docs/examples/README.md`](examples/README.md#在看板上登记仓库) 里那张表一致，完整规则也写在那里。
+
+API 是 `GET /api/repos/:id/detect`（`:id` 是仓库的 id 或名字），什么都不改，返回：
+
+```json
+{
+  "branch": "main",
+  "commit": "<目标分支所在的提交>",
+  "setup": ["pnpm install --frozen-lockfile"],
+  "verify": ["pnpm build", "pnpm test"],
+  "basis": ["Node（pnpm）：package.json，有 `pnpm-lock.yaml`；scripts 里有 build、test"]
+}
+```
+
+- 读的是目标分支所在提交里的文件（`git ls-tree` / `git cat-file`），不看任何工作目录：没提交的改动和没跟踪的文件都不影响结果。只看根目录，子目录里的项目文件不算；符号链接只算有这个文件，不读内容。
+- `basis` 是给人看的说明，用 Master 的语言（`config.yaml` 的 `language`），每认出一种一条；都认不出来时 `setup`、`verify` 是空列表，`basis` 只有一条，说明没认出来。
+- 仓库不存在时返回 404；目标分支读不到（分支被删了、路径不是 git 仓库等）时返回 409，错误信息里有 git 的输出。
 
 ## 仓库自带的流程模板
 

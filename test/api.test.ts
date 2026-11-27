@@ -21,6 +21,7 @@ import type {
   ProposalView,
   ProposalWritten,
   RawLogMissing,
+  RepoDetection,
   RunSummary,
   StatsView,
 } from '../src/api/types.js';
@@ -358,6 +359,92 @@ describe('HTTP API', () => {
     expect((await call('DELETE', '/api/repos/mine')).status).toBe(204);
     expect(name()).toBeUndefined();
     expect(master.config.repoTemplates.has('mine')).toBe(false);
+  });
+
+  it('detects commands from the files committed on the target branch, not the worktree', async () => {
+    h = await harness();
+    const dir = initRepo();
+    writeFile(
+      join(dir, 'package.json'),
+      JSON.stringify({ scripts: { build: 'tsc', test: 'vitest run' } }),
+    );
+    writeFile(join(dir, 'pnpm-lock.yaml'), 'lockfileVersion: 9.0\n');
+    writeFile(join(dir, 'go.mod'), 'module demo\n');
+    git(dir, 'add', '-A');
+    git(dir, 'commit', '-q', '-m', 'node and go');
+    const commit = git(dir, 'rev-parse', 'HEAD');
+    git(dir, 'checkout', '-q', '-b', 'rust');
+    writeFile(join(dir, 'Cargo.toml'), '[package]\nname = "demo"\n');
+    git(dir, 'add', '-A');
+    git(dir, 'commit', '-q', '-m', 'rust');
+    const rustCommit = git(dir, 'rev-parse', 'HEAD');
+    git(dir, 'checkout', '-q', 'main');
+    // Uncommitted and untracked changes in the worktree play no part.
+    writeFile(
+      join(dir, 'package.json'),
+      JSON.stringify({ scripts: { lint: 'eslint' }, packageManager: 'yarn@1.22.0' }),
+    );
+    writeFile(join(dir, 'pyproject.toml'), '[project]\nname = "demo"\n');
+    writeFile(join(dir, 'Makefile'), 'test:\n\tgo test ./...\n');
+    git(dir, 'rm', '-q', '--cached', 'go.mod');
+    expect((await call('POST', '/api/repos', { name: 'mine', path: dir })).status).toBe(201);
+
+    const res = await call('GET', '/api/repos/mine/detect');
+    expect(res.status).toBe(200);
+    expect(res.json).toEqual({
+      branch: 'main',
+      commit,
+      setup: ['pnpm install --frozen-lockfile', 'go mod download'],
+      verify: ['pnpm build', 'pnpm test', 'go build ./...', 'go vet ./...', 'go test ./...'],
+      basis: [expect.stringContaining('Node（pnpm）'), 'Go：go.mod'],
+    } satisfies RepoDetection);
+    // Saves nothing.
+    expect(h.master.store.getRepo('mine')).toMatchObject({ verifyCommands: [], setupCommands: [] });
+
+    // Another target branch is read from its own commit.
+    expect((await call('PATCH', '/api/repos/mine', { targetBranch: 'rust' })).status).toBe(200);
+    const rust = (await call('GET', '/api/repos/mine/detect')).json as RepoDetection;
+    expect(rust.commit).toBe(rustCommit);
+    expect(rust.setup).toEqual([
+      'pnpm install --frozen-lockfile',
+      'go mod download',
+      'cargo fetch',
+    ]);
+    expect(rust.basis).toHaveLength(3);
+  });
+
+  it('detects nothing in a repo without project files, and says so in English', async () => {
+    h = await harness();
+    setLang('en');
+    const res = await call('GET', '/api/repos/demo/detect');
+    expect(res.status).toBe(200);
+    expect(res.json).toMatchObject({ branch: 'main', setup: [], verify: [] });
+    const basis = (res.json as RepoDetection).basis;
+    expect(basis).toHaveLength(1);
+    expect(basis[0]).toMatch(/^No project file recognised/);
+    expect(basis[0]).not.toMatch(/[一-鿿]/);
+  });
+
+  it('answers 404 for an unknown repo and 409 when the target branch cannot be read', async () => {
+    h = await harness();
+    const missing = await call('GET', '/api/repos/nope/detect');
+    expect(missing.status).toBe(404);
+    expect(missing.json.error).toBeTruthy();
+
+    const dir = initRepo();
+    git(dir, 'checkout', '-q', '-b', 'gone');
+    expect(
+      (await call('POST', '/api/repos', { name: 'mine', path: dir, targetBranch: 'gone' })).status,
+    ).toBe(201);
+    git(dir, 'checkout', '-q', 'main');
+    git(dir, 'branch', '-q', '-D', 'gone');
+    setLang('en');
+    const unreadable = await call('GET', '/api/repos/mine/detect');
+    expect(unreadable.status).toBe(409);
+    // git's own output follows the colon, in whatever language git speaks here.
+    expect(unreadable.json.error).toMatch(
+      /^Could not read the files on the target branch gone of repo mine: git rev-parse /,
+    );
   });
 
   it('has no endpoint for creating runs: they only come from GitHub issues', async () => {

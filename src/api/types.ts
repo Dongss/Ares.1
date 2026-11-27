@@ -30,6 +30,7 @@ import type {
   StageRun,
   Task,
 } from '../store/types.js';
+import type { DetectedCommands } from '../workspace/detect.js';
 
 /** A normalized agent event of one attempt, numbered so a viewer can merge history and live. */
 export interface AgentEventRecord {
@@ -75,6 +76,17 @@ export interface RepoInput {
   verifyCommands: string[];
   setupCommands: string[];
   source?: RepoInputSource;
+}
+
+/**
+ * GET /api/repos/:id/detect: the setup and verify commands the files at the root of the repo's
+ * target branch suggest (`detectProjectCommands`), read from the commit it is at. `basis` is in
+ * the Master's language.
+ */
+export interface RepoDetection extends DetectedCommands {
+  /** The target branch read, and the commit it was at. */
+  branch: string;
+  commit: string;
 }
 
 /** GET /api/runs items. */

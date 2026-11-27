@@ -43,10 +43,14 @@ import {
   type RunStatus,
 } from '../store/types.js';
 import type { Upgrader } from '../upgrade/upgrader.js';
+import { errorMessage } from '../util.js';
+import { DETECT_READ_FILES, detectProjectCommands } from '../workspace/detect.js';
 import {
   branchExists,
+  type CommittedRoot,
   cloneRepo,
   cloneUrlAllowed,
+  committedRootFiles,
   currentBranch,
   GitError,
   initEmptyRepo,
@@ -76,6 +80,7 @@ import type {
   ProposalView,
   ProposalWritten,
   RawLogMissing,
+  RepoDetection,
   RepoInputSource,
   RepoSourceView,
   RunDetail,
@@ -566,6 +571,28 @@ export function createApi(deps: ApiDeps): Hono {
     const updated = store.updateRepo(repo.id, input);
     await deps.reposChanged?.();
     return c.json(updated);
+  });
+
+  // Setup and verify commands suggested by the files at the root of the repo's target branch, as
+  // committed: a worktree's uncommitted changes play no part. Saves nothing.
+  app.get('/api/repos/:id/detect', async (c) => {
+    const repo = store.getRepo(c.req.param('id'));
+    let root: CommittedRoot;
+    try {
+      root = await committedRootFiles(repo.path, repo.targetBranch, DETECT_READ_FILES);
+    } catch (err) {
+      throw new InvalidStateError(
+        t({
+          zh: `读不到仓库 ${repo.name} 目标分支 ${repo.targetBranch} 上的文件：${errorMessage(err)}`,
+          en: `Could not read the files on the target branch ${repo.targetBranch} of repo ${repo.name}: ${errorMessage(err)}`,
+        }),
+      );
+    }
+    return c.json({
+      branch: repo.targetBranch,
+      commit: root.commit,
+      ...detectProjectCommands(root),
+    } satisfies RepoDetection);
   });
 
   app.delete('/api/repos/:id', async (c) => {

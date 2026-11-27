@@ -1116,6 +1116,23 @@ textarea:focus {
 .repo-head h2 {
   margin: 0;
 }
+/* The edit form's detect button, what it read and why it suggests what it does. */
+.detect {
+  margin-bottom: 12px;
+}
+.detect-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+.detect p,
+.detect ul {
+  margin: 4px 0;
+}
+.detect ul {
+  padding-left: 20px;
+}
 .commands {
   display: flex;
   flex-wrap: wrap;

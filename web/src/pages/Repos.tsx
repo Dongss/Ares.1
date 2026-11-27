@@ -1,5 +1,5 @@
 import { type FormEvent, useState } from 'react';
-import type { ConfigView } from '../../../src/api/types.js';
+import type { ConfigView, RepoDetection } from '../../../src/api/types.js';
 import { REPO_WORKFLOWS_DIR } from '../../../src/config/flow.js';
 import { t } from '../../../src/i18n.js';
 import type { Repo } from '../../../src/store/types.js';
@@ -14,7 +14,13 @@ import {
 import { parseLines, shortSha } from '../lib/format.js';
 import { useAction } from '../lib/hooks.js';
 import {
+  detectedBox,
+  detectionNote,
+  detectLabel,
+  lacksVerify,
   newRepoInput,
+  noVerifyBadge,
+  noVerifyWarning,
   REPO_ORIGINS,
   type RepoOrigin,
   registerLabel,
@@ -51,6 +57,7 @@ function RepoCard(props: { repo: Repo; config: ConfigView | undefined; onChanged
   const { repo, config, onChanged } = props;
   const [editing, setEditing] = useState(false);
   const action = useAction();
+  const noVerify = lacksVerify(repo);
 
   if (editing) {
     return (
@@ -69,6 +76,7 @@ function RepoCard(props: { repo: Repo; config: ConfigView | undefined; onChanged
       <div className="repo-head">
         <h2>{repo.name}</h2>
         <code className="muted">{repo.path}</code>
+        {noVerify && <Badge tone="attention">{noVerifyBadge()}</Badge>}
       </div>
       <dl className="meta">
         <div>
@@ -87,7 +95,10 @@ function RepoCard(props: { repo: Repo; config: ConfigView | undefined; onChanged
         )}
         <div className="wide">
           <dt>{t({ zh: '检查命令', en: 'Verify commands' })}</dt>
-          <dd>{commandList(repo.verifyCommands)}</dd>
+          <dd>
+            {commandList(repo.verifyCommands)}
+            {noVerify && <div className="hint text-attention">{noVerifyWarning()}</div>}
+          </dd>
         </div>
         <div className="wide">
           <dt>{t({ zh: '准备命令', en: 'Setup commands' })}</dt>
@@ -222,7 +233,17 @@ function EditRepo(props: { repo: Repo; onDone: () => void; onCancel: () => void 
   const [targetBranch, setTargetBranch] = useState(repo.targetBranch);
   const [verify, setVerify] = useState(repo.verifyCommands.join('\n'));
   const [setup, setSetup] = useState(repo.setupCommands.join('\n'));
+  const [detection, setDetection] = useState<RepoDetection>();
   const action = useAction();
+  const detecting = useAction();
+  // Fills the boxes only; the human checks them and saves.
+  const detect = async () => {
+    const found = await detecting.run(() => api.detectRepo(repo.id));
+    if (!found) return;
+    setVerify((typed) => detectedBox(found.verify, typed));
+    setSetup((typed) => detectedBox(found.setup, typed));
+    setDetection(found);
+  };
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     const result = await action.run(() =>
@@ -241,6 +262,30 @@ function EditRepo(props: { repo: Repo; onDone: () => void; onCancel: () => void 
         <span>{t({ zh: '目标分支', en: 'Target branch' })}</span>
         <input value={targetBranch} onChange={(e) => setTargetBranch(e.target.value)} required />
       </label>
+      <div className="detect">
+        <div className="detect-row">
+          <button type="button" onClick={detect} disabled={detecting.busy || action.busy}>
+            {detectLabel(detecting.busy)}
+          </button>
+          <span className="hint">
+            {t({
+              zh: `看已保存的目标分支 ${repo.targetBranch} 上提交了的 package.json、pyproject.toml、go.mod、Cargo.toml、Makefile 等文件，建议该填的命令`,
+              en: `Suggests the commands from the package.json, pyproject.toml, go.mod, Cargo.toml, Makefile and the like committed on the saved target branch ${repo.targetBranch}`,
+            })}
+          </span>
+        </div>
+        <ErrorBox>{detecting.error}</ErrorBox>
+        {detection && (
+          <div className="hint">
+            <p>{detectionNote(detection)}</p>
+            <ul>
+              {detection.basis.map((line) => (
+                <li key={line}>{line}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
       <CommandsField
         label={verifyLabel()}
         hint={verifyHint()}

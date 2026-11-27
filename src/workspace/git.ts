@@ -403,6 +403,47 @@ export async function committedYamlFiles(
   return files;
 }
 
+/** The files at a commit's root: the commit, every file's name, the content of some. */
+export interface CommittedRoot {
+  commit: string;
+  /** Names of the files right at the root, sorted; directories and submodules left out. */
+  files: string[];
+  /** Content of the files of `read` that the root has as regular files, by name. */
+  contents: Record<string, string>;
+}
+
+/**
+ * The files right at the repo's root as committed at `ref`, reading the content of those named in
+ * `read`. Read from the commit only: uncommitted changes and untracked files of any worktree play
+ * no part. A symlink is listed but not read. Throws when `ref` is unknown.
+ */
+export async function committedRootFiles(
+  repo: string,
+  ref: string,
+  read: readonly string[],
+): Promise<CommittedRoot> {
+  const commit = await revParse(repo, ref);
+  const out = await gitRaw(repo, ['ls-tree', '-z', '--full-tree', commit]);
+  const files: string[] = [];
+  const blobs = new Map<string, string>();
+  for (const record of out.split('\0')) {
+    // "<mode> <type> <object>\t<name>"
+    const tab = record.indexOf('\t');
+    if (tab < 0) continue;
+    const [mode, type, object] = record.slice(0, tab).split(' ');
+    const name = record.slice(tab + 1);
+    if (type !== 'blob' || !object) continue;
+    files.push(name);
+    if (mode !== '120000' && read.includes(name)) blobs.set(name, object);
+  }
+  files.sort();
+  const contents: Record<string, string> = {};
+  for (const [name, object] of blobs) {
+    contents[name] = await gitRaw(repo, ['cat-file', 'blob', object]);
+  }
+  return { commit, files, contents };
+}
+
 /**
  * Whether anything under `path` (relative to the repo's root) differs between commits `a` and
  * `b`. Throws when either is unknown.

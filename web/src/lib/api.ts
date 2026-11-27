@@ -13,6 +13,7 @@ import type {
   ProposalRestarted,
   ProposalView,
   ProposalWritten,
+  RepoDetection,
   RepoInput,
   RunDetail,
   RunSummary,
@@ -115,6 +116,8 @@ export const api = {
   updateRepo: (repoId: string, patch: RepoPatch) =>
     request<Repo>('PATCH', `/api/repos/${id(repoId)}`, patch),
   deleteRepo: (repoId: string) => request<string>('DELETE', `/api/repos/${id(repoId)}`),
+  /** Setup and verify commands suggested by the files committed on the repo's target branch. */
+  detectRepo: (repoId: string) => request<RepoDetection>('GET', `/api/repos/${id(repoId)}/detect`),
 
   runs: () => request<RunSummary[]>('GET', '/api/runs'),
   run: (runId: string) => request<RunDetail>('GET', `/api/runs/${id(runId)}`),
