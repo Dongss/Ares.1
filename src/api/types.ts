@@ -6,6 +6,9 @@ import type {
   AgentConfig,
   AgentEntry,
   AutoAcceptConfig,
+  GitHubRepoConfig,
+  GitLabRepoConfig,
+  ScoutConfig,
   SourceFile,
   TemplateFile,
   WorkflowTemplate,
@@ -366,9 +369,41 @@ export interface ConfigView {
  * project at `issuesRepo` ("group/subgroup/name") on `host`, or the local backlog.
  */
 export type RepoSourceView =
-  | { source: 'github'; issuesRepo: string | null }
-  | { source: 'gitlab'; host: string; issuesRepo: string }
-  | { source: 'backlog' };
+  | {
+      source: 'github';
+      issuesRepo: string | null;
+      settings: RepoHostSettings<GitHubRepoConfig['deliver']>;
+    }
+  | {
+      source: 'gitlab';
+      host: string;
+      issuesRepo: string;
+      settings: RepoHostSettings<GitLabRepoConfig['deliver']>;
+    }
+  | { source: 'backlog'; settings: RepoSourceSettings };
+
+/**
+ * A repo's entry in the source its requirements come from, as loaded: the schema's defaults
+ * filled in, and what is left out null. Named as in config.yaml, so the dashboard's form starts
+ * from it and sends it back (PUT /api/repos/:id/source).
+ */
+export interface RepoSourceSettings {
+  template: string;
+  /** null: no scouting. */
+  scout: ScoutConfig | null;
+  /** `max_per_day` null: no daily limit. */
+  auto_accept: Omit<AutoAcceptConfig, 'max_per_day'> & { max_per_day: number | null };
+  auto_merge: boolean;
+  max_run_attempts: number;
+  /** null: no limit. */
+  daily_budget_usd: number | null;
+}
+
+/** The settings of a repo of a code host's: also whether it pushes, and how its work goes there. */
+export interface RepoHostSettings<Deliver extends string> extends RepoSourceSettings {
+  push: boolean;
+  deliver: Deliver;
+}
 
 /**
  * The AI scout of a PUT /api/repos/:id/source body, as written under the entry's `scout:`; a

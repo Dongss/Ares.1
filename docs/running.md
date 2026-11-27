@@ -157,6 +157,32 @@ API：
 
 仓库登记好以后，要写进 `config.yaml` 的 `github.repos`、`gitlab.repos` 或 `backlog.repos` 才会有 Run 和侦察。这一步可以不手改 `config.yaml`，在看板「仓库」页设置：Master 替你改写 `config.yaml` 里这个仓库的条目，马上重新加载。它改的就是 `config.yaml`，没有另存一份：手改和在看板上改效果完全相同，之后也可以接着手改。
 
+#### 看板上的表单
+
+在「仓库」页，仓库卡片「需求来源」一行后面点「设置」，卡片里展开表单（不弹窗）。表单按这个仓库现在的条目预填（来自 `GET /api/config` 的 `repoSources[仓库名].settings`）；还没有来源的仓库平台是「无」，其余各项是默认值，模板默认选第一个。各项和 `config.yaml` 的对应关系，表单上每项也标着键名：
+
+| 表单 | `config.yaml` | 说明 |
+| --- | --- | --- |
+| 平台 | 写在哪一节 | GitHub → `github.repos`，GitLab → `gitlab.repos`，本地提案池 → `backlog.repos`，无 → 三处都删 |
+| `issues_repo` | `issues_repo` | 只有 GitHub、GitLab 有。GitHub 可留空（由 gh 按仓库的远端推断），写 `owner/name`；GitLab 必填，写 `group/name` 或 `group/subgroup/name` |
+| 模板 | `template` | 从数据目录的模板和这个仓库自带的模板里选；仓库自带的和数据目录同 id 的只列数据目录那份（Run 用的就是它），选项后面写着来自哪里 |
+| 侦察 `agent` | `scout.agent` | 选「不侦察」就不写 `scout`；只列已启用、CLI 能以只读方式运行的 Agent（`GET /api/config` 的 `clis` 里 `readOnly` 为 true 的），一个都没有时写明原因 |
+| `auto`、`interval_minutes`、`max_proposals` | `scout.auto` 等 | 选了侦察 Agent 才显示 |
+| `max_risk`、`max_size`、`max_per_day` | `auto_accept.*` | `max_per_day` 留空表示不限 |
+| `auto_merge`、`max_run_attempts` | 同名 | |
+| `daily_budget_usd` | `daily_budget_usd` | 留空表示不限 |
+| `push`、`deliver` | 同名 | 只有 GitHub、GitLab 有；`deliver` 在 GitHub 上是 `push` 或 `pr`，在 GitLab 上是 `push` 或 `mr` |
+
+- 只把和默认值不同的项写进文件（默认值：`auto_accept.max_risk: none`、`auto_accept.max_size: L`、`auto_merge: false`、`max_run_attempts: 3`、`scout.auto: true`、`scout.interval_minutes: 0`、`scout.max_proposals: 5`、`push: false`、`deliver: push`），留空的数字也不写，`config.yaml` 保持简洁；效果和写上默认值一样。
+- 换平台时表单里填过的其他项都留着，换回来还在；只是保存时只带选定平台有的字段。
+- 有些问题在发出去之前就能看出来，表单上用提醒色逐条列出，并且「保存」按钮不能点：选了 GitLab 却没填 `issues_repo`、`deliver` 选了 `pr` / `mr` 却没勾 `push`、没有模板可选、已经设置的侦察 Agent 不能只读运行或已不存在。
+- 保存成功后表单收起，仓库列表和配置都重新读取，「需求来源」一行显示新的来源。
+- Master 拒绝时（400）表单不收起，`problems` 逐条列在表单上；配置当前就加载不了（409）时显示 Master 给的原因，先去「配置」页看是哪里出错、手动改好。
+
+已经设置但现在无效的模板或侦察 Agent（比如模板文件删了、Agent 停用了）在下拉框里照样列出，标着「不存在或无效」「不能只读运行」或「不存在或未启用」，方便看出现在的设置是什么、换一个。
+
+#### API
+
 API 是 `PUT /api/repos/:id/source`（`:id` 是仓库的 id 或名字），请求体的字段名和 `config.yaml` 里的一样：
 
 ```json
@@ -720,7 +746,7 @@ GitLab 仓库按作者对项目的权限判断：Developer 及以上（Developer
 
 - `GET /api/gitlab`：GitLab 一侧的状态，格式和 `GET /api/github` 相同：`platform` 是 `gitlab`，`host` 是 `gitlab.host`（GitHub 的 `platform` 是 `github`，`host` 为 `null`），`enabled` 表示 `config.yaml` 有 `gitlab` 一节，`account` 是 `gitlab.account`，`pollMinutes` 是 `gitlab.poll_minutes`，`lastPollAt`、`lastError` 是这一侧上一轮检查的时间和最近一次失败，`repos` 按 `gitlab.repos` 的顺序列出每个仓库（`issuesRepo` 是 `issues_repo`，`deliver` 是 `push` 或 `mr`，其余字段和 `GET /api/github` 的一样）。
 - `POST /api/gitlab/poll`：马上检查一轮 GitLab，不等下一轮；返回检查后的状态，格式同上。
-- `GET /api/config` 的 `repoSources` 按仓库名给出需求来源：`{ source: 'github', issuesRepo }`（`issuesRepo` 没写时为 `null`）、`{ source: 'gitlab', host, issuesRepo }` 或 `{ source: 'backlog' }`；同一个仓库名出现在多个来源时取第一个（github → gitlab → backlog），不在其中的仓库没有需求来源。
+- `GET /api/config` 的 `repoSources` 按仓库名给出需求来源：`{ source: 'github', issuesRepo, settings }`（`issuesRepo` 没写时为 `null`）、`{ source: 'gitlab', host, issuesRepo, settings }` 或 `{ source: 'backlog', settings }`；同一个仓库名出现在多个来源时取第一个（github → gitlab → backlog），不在其中的仓库没有需求来源。`settings` 是这个仓库在生效来源里的条目，按加载后的值给出（没写的项已经补上默认值），字段名和 `config.yaml` 一样：`template`、`scout`（`{ agent, auto, interval_minutes, max_proposals }`，不侦察时为 `null`）、`auto_accept`（`{ max_risk, max_size, max_per_day }`，`max_per_day` 没写时为 `null`）、`auto_merge`、`max_run_attempts`、`daily_budget_usd`（没写时为 `null`）；github 和 gitlab 的还有 `push`、`deliver`。看板「仓库」页的设置表单从它预填。条目有错误（比如模板不存在）时也照样给出，错误在 `errors` 里。
 - `POST /api/scouts`：手动侦察，`gitlab.repos` 里的仓库在 GitLab 上建 issue（见「本地提案池的 API」）。
 - 从 GitLab issue 建的 Run，`issue` 里多一个 `platform: 'gitlab'`，`repo` 是项目路径；`deliver: mr` 的 Run，`pr` 是它的 MR（`{ number, url }`，`number` 是 MR 在项目里的编号，也就是 `!N` 里的 N）。GitLab 的迭代 `source` 是 `gitlab`（GitHub 的是 `github`，本地提案池的是 `local`）。
 

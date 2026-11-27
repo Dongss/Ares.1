@@ -19,7 +19,7 @@ import {
   sourcePollMinutes,
 } from '../config/flow.js';
 import type { LoadedConfig } from '../config/load.js';
-import type { MasterConfig } from '../config/schema.js';
+import type { MasterConfig, ProposalSourceConfig } from '../config/schema.js';
 import type { ConfigStatus } from '../config/watch.js';
 import {
   type Engine,
@@ -87,6 +87,7 @@ import type {
   RepoInputSource,
   RepoSourceInput,
   RepoSourceRejected,
+  RepoSourceSettings,
   RepoSourceView,
   RepoTrial,
   RepoTrialInput,
@@ -1068,7 +1069,8 @@ export function createApi(deps: ApiDeps): Hono {
 
 /**
  * Where each repo named in config.yaml's sources of requirements takes them from, by name: the
- * source `requirementSource` picks, with what the dashboard needs to show and link to it.
+ * source `requirementSource` picks, with what the dashboard needs to show and link to it, and the
+ * repo's entry there for the dashboard's form to start from.
  */
 function repoSourceViews(master: MasterConfig): Record<string, RepoSourceView> {
   const names = new Set([
@@ -1078,15 +1080,29 @@ function repoSourceViews(master: MasterConfig): Record<string, RepoSourceView> {
   ]);
   const view = (name: string): RepoSourceView | null => {
     switch (requirementSource(master, name)) {
-      case 'github':
-        return { source: 'github', issuesRepo: master.github?.repos[name]?.issues_repo ?? null };
+      case 'github': {
+        const repo = master.github?.repos[name];
+        if (!repo) return null;
+        return {
+          source: 'github',
+          issuesRepo: repo.issues_repo ?? null,
+          settings: { ...sourceSettings(repo), push: repo.push, deliver: repo.deliver },
+        };
+      }
       case 'gitlab': {
         const repo = master.gitlab?.repos[name];
         if (!master.gitlab || !repo) return null;
-        return { source: 'gitlab', host: master.gitlab.host, issuesRepo: repo.issues_repo };
+        return {
+          source: 'gitlab',
+          host: master.gitlab.host,
+          issuesRepo: repo.issues_repo,
+          settings: { ...sourceSettings(repo), push: repo.push, deliver: repo.deliver },
+        };
       }
-      case 'backlog':
-        return { source: 'backlog' };
+      case 'backlog': {
+        const repo = master.backlog?.repos[name];
+        return repo ? { source: 'backlog', settings: sourceSettings(repo) } : null;
+      }
       default:
         return null;
     }
@@ -1098,6 +1114,30 @@ function repoSourceViews(master: MasterConfig): Record<string, RepoSourceView> {
       .map((name) => [name, view(name)] as const)
       .filter((entry): entry is readonly [string, RepoSourceView] => entry[1] !== null),
   );
+}
+
+/** The fields every source's entry has, as loaded; those left out are null. */
+function sourceSettings(repo: ProposalSourceConfig): RepoSourceSettings {
+  const { scout, auto_accept } = repo;
+  return {
+    template: repo.template,
+    scout: scout
+      ? {
+          agent: scout.agent,
+          auto: scout.auto,
+          interval_minutes: scout.interval_minutes,
+          max_proposals: scout.max_proposals,
+        }
+      : null,
+    auto_accept: {
+      max_risk: auto_accept.max_risk,
+      max_size: auto_accept.max_size,
+      max_per_day: auto_accept.max_per_day ?? null,
+    },
+    auto_merge: repo.auto_merge,
+    max_run_attempts: repo.max_run_attempts,
+    daily_budget_usd: repo.daily_budget_usd ?? null,
+  };
 }
 
 function summarizeRun(store: Store, engine: Engine, run: ReturnType<Store['getRun']>): RunSummary {

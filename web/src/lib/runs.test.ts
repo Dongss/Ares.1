@@ -936,7 +936,7 @@ describe('the code host a Run goes with', () => {
     expect(runPlatform({ issue: issue() }, gitlab)).toBe('github');
     // A Run of no issue, such as one merging the target branch's new commits, goes by its repo.
     expect(runPlatform({ issue: null }, gitlab)).toBe('gitlab');
-    expect(runPlatform({ issue: null }, { source: 'github', issuesRepo: null })).toBe('github');
+    expect(runPlatform({ issue: null }, { source: 'github' })).toBe('github');
     expect(runPlatform({ issue: null }, { source: 'backlog' })).toBe('github');
     expect(runPlatform({ issue: null }, null)).toBe('github');
   });

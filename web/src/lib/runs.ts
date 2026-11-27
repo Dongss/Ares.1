@@ -1214,7 +1214,10 @@ export interface DiscussionItem {
  * requirements (`source`, from `repoSourceOf`); GitHub otherwise. The rule is `runPlatform` of
  * src/config/flow.ts, which the Master's texts go by too.
  */
-export function runPlatform(run: Pick<Run, 'issue'>, source: RepoSourceView | null): HostPlatform {
+export function runPlatform(
+  run: Pick<Run, 'issue'>,
+  source: Pick<RepoSourceView, 'source'> | null,
+): HostPlatform {
   return runPlatformOf(run, source?.source);
 }
 

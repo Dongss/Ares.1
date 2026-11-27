@@ -1166,6 +1166,63 @@ textarea:focus {
   border-radius: 4px;
   background: var(--code-bg);
 }
+/* The form in a repo's card that sets where its requirements come from. */
+.source-form {
+  margin: 12px 0;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-2);
+}
+.source-form h3 {
+  margin: 0 0 10px;
+}
+.source-form .field {
+  display: block;
+  margin-bottom: 12px;
+}
+.source-fields {
+  border: none;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
+.source-group {
+  margin: 0 0 12px;
+  padding: 8px 12px 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  min-width: 0;
+}
+.source-group legend {
+  padding: 0 4px;
+  font-weight: 600;
+}
+.source-group > .hint {
+  margin: -4px 0 10px;
+}
+/* Fields side by side, wrapping on narrow screens; a checkbox sits level with the boxes. */
+.source-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0 16px;
+  align-items: end;
+}
+.source-row > .choice {
+  margin: 0 0 12px;
+  min-height: 34px;
+}
+.source-problems {
+  margin: 8px 0;
+  padding: 8px 12px 8px 28px;
+  border-radius: 6px;
+  background: var(--attention-bg);
+  color: var(--attention);
+}
+.error-box ul {
+  margin: 6px 0 0;
+  padding-left: 20px;
+}
 
 /* Workflow flow chart: stages in a row, vertical on narrow screens. */
 .flow {

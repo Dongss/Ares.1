@@ -12,7 +12,8 @@
 // issues are left over for the Master to remove, where a repo's requirements come from (GitHub,
 // GitLab or the local backlog) and how often that source is polled, whether a repo delivers
 // through pull requests (GitHub's) or merge requests (GitLab's) and what each is called, which
-// code host a Run goes with, how many Runs may execute across every repo
+// code host a Run goes with, what a repo's entry in a source of requirements takes for the fields
+// it leaves out, how many Runs may execute across every repo
 // (`concurrency.max_runs`), and the rules of iterations: how many
 // children one plans at most, the kind auto-accept judges one by as a whole, which children a
 // child waits for, its progress and where it stands.
@@ -59,6 +60,27 @@ export type Risk = (typeof RISKS)[number];
  */
 export const PROPOSAL_SIZES = REQUIREMENT_SIZES;
 export type ProposalSize = RequirementSize;
+
+/**
+ * What a repo's entry under `github.repos`, `gitlab.repos` or `backlog.repos` takes for a field
+ * it leaves out: the schema fills these in, and the dashboard's form starts from them and leaves
+ * out of its request the fields that equal them. `push` and `deliver` are the code hosts' only.
+ */
+export const REPO_SOURCE_DEFAULTS = {
+  auto_accept: { max_risk: 'none', max_size: 'L' },
+  auto_merge: false,
+  max_run_attempts: 3,
+  scout: { auto: true, interval_minutes: 0, max_proposals: 5 },
+  push: false,
+  deliver: 'push',
+} as const satisfies {
+  auto_accept: { max_risk: 'none' | Risk; max_size: ProposalSize };
+  auto_merge: boolean;
+  max_run_attempts: number;
+  scout: { auto: boolean; interval_minutes: number; max_proposals: number };
+  push: boolean;
+  deliver: 'push';
+};
 
 /**
  * What each size means, by scope. The one definition the scout's output format, the requirement

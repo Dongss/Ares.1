@@ -171,7 +171,9 @@ test/
     Runs get by id, the home directory's or the repo's own (`resolveTemplate`), where a repo's
     requirements come from, GitHub, GitLab or the local backlog (`requirementSource`: a name in
     more than one of `github.repos`, `gitlab.repos`, `backlog.repos` is the first's), and how
-    often that source is polled (`sourcePollMinutes`), whether a repo delivers through pull
+    often that source is polled (`sourcePollMinutes`), the defaults of a repo's entry there, which
+    the schema fills in and the dashboard's form starts from (`REPO_SOURCE_DEFAULTS`), whether a
+    repo delivers through pull
     requests (`deliversByPr` / `repoDeliversByPr`: GitHub repos with `deliver: pr`, GitLab repos
     with `deliver: mr`, their merge requests) and what the texts call them (`changeRequestTerms`:
     PR #N on GitHub, MR !N on GitLab), which code host a Run goes with (`runPlatform`: its

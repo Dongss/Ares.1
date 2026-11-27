@@ -427,12 +427,26 @@ describe('configEntryErrors', () => {
 
 describe('where a repo gets its requirements', () => {
   afterEach(() => setLang('zh'));
+  const settings = {
+    template: 'dev',
+    scout: null,
+    auto_accept: { max_risk: 'none', max_size: 'L', max_per_day: null },
+    auto_merge: false,
+    max_run_attempts: 3,
+    daily_budget_usd: null,
+  } as const;
+  const hosted = { ...settings, push: false, deliver: 'push' } as const;
   const sources: Pick<ConfigView, 'repoSources'> = {
     repoSources: {
-      hub: { source: 'github', issuesRepo: 'me/hub' },
-      guessed: { source: 'github', issuesRepo: null },
-      lab: { source: 'gitlab', host: 'gitlab.example.com', issuesRepo: 'grp/sub/lab' },
-      local: { source: 'backlog' },
+      hub: { source: 'github', issuesRepo: 'me/hub', settings: hosted },
+      guessed: { source: 'github', issuesRepo: null, settings: hosted },
+      lab: {
+        source: 'gitlab',
+        host: 'gitlab.example.com',
+        issuesRepo: 'grp/sub/lab',
+        settings: hosted,
+      },
+      local: { source: 'backlog', settings },
     },
   };
 

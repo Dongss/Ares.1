@@ -15,6 +15,7 @@ import type {
   ProposalWritten,
   RepoDetection,
   RepoInput,
+  RepoSourceInput,
   RepoTrial,
   RepoTrialInput,
   RunDetail,
@@ -39,9 +40,18 @@ export class ApiError extends Error {
   constructor(
     message: string,
     readonly status: number,
+    /** The problems one by one, when the answer lists them (`RepoSourceRejected`); else empty. */
+    readonly problems: readonly string[] = [],
   ) {
     super(message);
   }
+}
+
+/** The `problems` of an error answer: its strings, when it has such a list. */
+function problemsOf(data: unknown): string[] {
+  if (!data || typeof data !== 'object' || !('problems' in data)) return [];
+  const { problems } = data as { problems: unknown };
+  return Array.isArray(problems) ? problems.filter((p) => typeof p === 'string') : [];
 }
 
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
@@ -72,7 +82,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
             zh: `请求失败（HTTP ${res.status}）`,
             en: `Request failed (HTTP ${res.status})`,
           });
-    throw new ApiError(message, res.status);
+    throw new ApiError(message, res.status, problemsOf(data));
   }
   return data as T;
 }
@@ -118,6 +128,13 @@ export const api = {
   updateRepo: (repoId: string, patch: RepoPatch) =>
     request<Repo>('PATCH', `/api/repos/${id(repoId)}`, patch),
   deleteRepo: (repoId: string) => request<string>('DELETE', `/api/repos/${id(repoId)}`),
+  /**
+   * Where the repo's requirements come from: its entry in config.yaml, rewritten by the Master
+   * and put in use at once. Answers the configuration as reloaded; a 400's ApiError carries the
+   * problems one by one.
+   */
+  setRepoSource: (repoId: string, input: RepoSourceInput) =>
+    request<ConfigView>('PUT', `/api/repos/${id(repoId)}/source`, input),
   /** Setup and verify commands suggested by the files committed on the repo's target branch. */
   detectRepo: (repoId: string) => request<RepoDetection>('GET', `/api/repos/${id(repoId)}/detect`),
   /**

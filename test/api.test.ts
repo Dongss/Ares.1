@@ -1860,26 +1860,72 @@ ${lines}`;
     const config = `
 github:
   repos:
-    hub: { issues_repo: me/hub, template: dev }
+    hub:
+      issues_repo: me/hub
+      template: dev
+      scout: { agent: reviewer, auto: false }
+      auto_accept: { max_risk: low, max_per_day: 2 }
+      auto_merge: true
+      max_run_attempts: 1
+      daily_budget_usd: 7.5
+      push: true
+      deliver: pr
     guessed: { template: dev }
 gitlab:
   host: gitlab.example.com:8443
   repos:
-    lab: { issues_repo: grp/sub/lab, template: dev }
+    lab: { issues_repo: grp/sub/lab, template: dev, push: true, deliver: mr }
     hub: { issues_repo: grp/hub, template: dev }
 backlog:
   repos:
-    local: { template: dev }
+    local: { template: dev, scout: { agent: reviewer, max_proposals: 3 } }
     lab: { template: dev }
 `;
     h = await harness({ config, gitlab: new FakeGitLab(), github: new FakeGitHub() });
     const { json } = (await call('GET', '/api/config')) as { json: ConfigView };
+    // The entries as loaded: the schema's defaults filled in, what is left out null.
+    const defaults = {
+      template: 'dev',
+      scout: null,
+      auto_accept: { max_risk: 'none', max_size: 'L', max_per_day: null },
+      auto_merge: false,
+      max_run_attempts: 3,
+      daily_budget_usd: null,
+    };
     // A name in two sources is the first's, as requirementSource has it; the later one is an error.
     expect(json.repoSources).toEqual({
-      guessed: { source: 'github', issuesRepo: null },
-      hub: { source: 'github', issuesRepo: 'me/hub' },
-      lab: { source: 'gitlab', host: 'gitlab.example.com:8443', issuesRepo: 'grp/sub/lab' },
-      local: { source: 'backlog' },
+      guessed: {
+        source: 'github',
+        issuesRepo: null,
+        settings: { ...defaults, push: false, deliver: 'push' },
+      },
+      hub: {
+        source: 'github',
+        issuesRepo: 'me/hub',
+        settings: {
+          template: 'dev',
+          scout: { agent: 'reviewer', auto: false, interval_minutes: 0, max_proposals: 5 },
+          auto_accept: { max_risk: 'low', max_size: 'L', max_per_day: 2 },
+          auto_merge: true,
+          max_run_attempts: 1,
+          daily_budget_usd: 7.5,
+          push: true,
+          deliver: 'pr',
+        },
+      },
+      lab: {
+        source: 'gitlab',
+        host: 'gitlab.example.com:8443',
+        issuesRepo: 'grp/sub/lab',
+        settings: { ...defaults, push: true, deliver: 'mr' },
+      },
+      local: {
+        source: 'backlog',
+        settings: {
+          ...defaults,
+          scout: { agent: 'reviewer', auto: true, interval_minutes: 0, max_proposals: 3 },
+        },
+      },
     });
     expect(Object.keys(json.errors)).toEqual(
       expect.arrayContaining(['config.yaml#gitlab.repos.hub', 'config.yaml#backlog.repos.lab']),
@@ -4595,7 +4641,24 @@ describe('PUT /api/repos/:id/source', () => {
       t.repo.id,
     );
     expect(backlog.status).toBe(200);
-    expect((backlog.json as ConfigView).repoSources).toEqual({ demo: { source: 'backlog' } });
+    // What the form starts from the next time: as saved, with the defaults filled in.
+    const defaults = {
+      template: 'dev',
+      scout: null,
+      auto_accept: { max_risk: 'none', max_size: 'L', max_per_day: null },
+      auto_merge: false,
+      max_run_attempts: 3,
+      daily_budget_usd: null,
+    };
+    expect((backlog.json as ConfigView).repoSources).toEqual({
+      demo: {
+        source: 'backlog',
+        settings: {
+          ...defaults,
+          scout: { agent: 'scout', auto: false, interval_minutes: 0, max_proposals: 5 },
+        },
+      },
+    });
     expect(sources()).toEqual({ github: [], gitlab: [], backlog: ['demo'] });
     expect(parseYaml(configText()).backlog.repos.demo).toEqual({
       template: 'dev',
@@ -4620,7 +4683,11 @@ describe('PUT /api/repos/:id/source', () => {
     const github = await put({ platform: 'github', template: 'dev', push: true });
     expect(github.status).toBe(200);
     expect((github.json as ConfigView).repoSources).toEqual({
-      demo: { source: 'github', issuesRepo: null },
+      demo: {
+        source: 'github',
+        issuesRepo: null,
+        settings: { ...defaults, push: true, deliver: 'push' },
+      },
     });
     expect(sources()).toEqual({ github: ['demo'], gitlab: [], backlog: [] });
     expect(await listed('/api/github')).toEqual(['demo']);
@@ -4630,7 +4697,12 @@ describe('PUT /api/repos/:id/source', () => {
     const gitlab = await put({ platform: 'gitlab', issues_repo: 'grp/demo', template: 'dev' });
     expect(gitlab.status).toBe(200);
     expect((gitlab.json as ConfigView).repoSources).toEqual({
-      demo: { source: 'gitlab', host: 'gitlab.com', issuesRepo: 'grp/demo' },
+      demo: {
+        source: 'gitlab',
+        host: 'gitlab.com',
+        issuesRepo: 'grp/demo',
+        settings: { ...defaults, push: false, deliver: 'push' },
+      },
     });
     expect(sources()).toEqual({ github: [], gitlab: ['demo'], backlog: [] });
     expect(await listed('/api/gitlab')).toEqual(['demo']);

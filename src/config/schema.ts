@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { DEFAULT_LANG, LANGUAGES, t } from '../i18n.js';
 import { isEffortArg } from './effort.js';
-import { PROPOSAL_SIZES, RISKS } from './flow.js';
+import { PROPOSAL_SIZES, REPO_SOURCE_DEFAULTS, RISKS } from './flow.js';
 
 export { agentEffort } from './effort.js';
 
@@ -24,11 +24,11 @@ export const ScoutConfigSchema = z.strictObject({
   /** An agent of a CLI that can run read-only (claude-code, codex); it runs read-only. */
   agent: z.string().min(1),
   /** Scout on its own whenever the repo is idle; false = only from the dashboard. */
-  auto: z.boolean().default(true),
+  auto: z.boolean().default(REPO_SOURCE_DEFAULTS.scout.auto),
   /** At least this many minutes between automatic scouts; 0 = no minimum. */
-  interval_minutes: z.number().min(0).default(0),
+  interval_minutes: z.number().min(0).default(REPO_SOURCE_DEFAULTS.scout.interval_minutes),
   /** Proposals per scout; no automatic scout while this many proposals await triage. */
-  max_proposals: z.number().int().min(1).max(20).default(5),
+  max_proposals: z.number().int().min(1).max(20).default(REPO_SOURCE_DEFAULTS.scout.max_proposals),
 });
 export type ScoutConfig = z.infer<typeof ScoutConfigSchema>;
 
@@ -38,13 +38,13 @@ export type ScoutConfig = z.infer<typeof ScoutConfigSchema>;
  */
 export const AutoAcceptSchema = z.strictObject({
   /** Highest risk accepted automatically; none = every proposal waits for a human. */
-  max_risk: z.enum(['none', ...RISKS]).default('none'),
+  max_risk: z.enum(['none', ...RISKS]).default(REPO_SOURCE_DEFAULTS.auto_accept.max_risk),
   /**
    * Largest size accepted automatically, together with max_risk. L by default: a template whose
    * coding stage plans (planning: auto or llm) splits an L requirement into steps, so one Run
    * finishes it.
    */
-  max_size: z.enum(PROPOSAL_SIZES).default('L'),
+  max_size: z.enum(PROPOSAL_SIZES).default(REPO_SOURCE_DEFAULTS.auto_accept.max_size),
   /** Omitted = no daily limit. */
   max_per_day: z.number().int().min(1).optional(),
 });
@@ -65,7 +65,7 @@ export const ProposalSourceSchema = z.strictObject({
   scout: ScoutConfigSchema.optional(),
   auto_accept: AutoAcceptSchema.prefault({}),
   /** Runs from the repo's requirements merge without the merge approval. */
-  auto_merge: z.boolean().default(false),
+  auto_merge: z.boolean().default(REPO_SOURCE_DEFAULTS.auto_merge),
   /**
    * Spend of a day on what the Master does by itself (scouts, auto-accepted Runs, automatic
    * redos where failed Runs are redone) after which automatic scouting, auto-accepting and
@@ -77,7 +77,7 @@ export const ProposalSourceSchema = z.strictObject({
    * until then; after that the issue is closed as not planned with the reasons, or the local
    * proposal is marked failed with them. 1 = never redone.
    */
-  max_run_attempts: z.number().int().min(1).default(3),
+  max_run_attempts: z.number().int().min(1).default(REPO_SOURCE_DEFAULTS.max_run_attempts),
 });
 /** The settings GitHub, GitLab and local backlog repos share, for what works with any of them. */
 export type ProposalSourceConfig = z.infer<typeof ProposalSourceSchema>;
@@ -93,7 +93,7 @@ export const GitHubRepoSchema = z.strictObject({
     .optional(),
   ...ProposalSourceSchema.shape,
   /** Push the target branch to the GitHub repo after each merge. */
-  push: z.boolean().default(false),
+  push: z.boolean().default(REPO_SOURCE_DEFAULTS.push),
   /**
    * How a Run's work reaches GitHub. push: the merge stage fast-forwards the local target branch
    * and the target branch is pushed (with push: true). pr: for target branches that only take
@@ -101,7 +101,7 @@ export const GitHubRepoSchema = z.strictObject({
    * branch and opens a pull request to the target branch instead, and the Run completes once it
    * is merged on GitHub; the target branch itself is never pushed. pr needs push: true.
    */
-  deliver: z.enum(['push', 'pr']).default('push'),
+  deliver: z.enum(['push', 'pr']).default(REPO_SOURCE_DEFAULTS.deliver),
 });
 export type GitHubRepoConfig = z.infer<typeof GitHubRepoSchema>;
 
@@ -130,7 +130,7 @@ export const GitLabRepoSchema = z.strictObject({
   }),
   ...ProposalSourceSchema.shape,
   /** Push the target branch to the GitLab project after each merge. */
-  push: z.boolean().default(false),
+  push: z.boolean().default(REPO_SOURCE_DEFAULTS.push),
   /**
    * How a Run's work reaches GitLab. push: the merge stage fast-forwards the local target branch
    * and the target branch is pushed (with push: true). mr: for target branches that only take
@@ -139,7 +139,7 @@ export const GitLabRepoSchema = z.strictObject({
    * once it is merged on GitLab; the target branch itself is never pushed. mr needs push: true.
    * GitHub's repos say `pr` for the same: each platform takes its own word only.
    */
-  deliver: z.enum(['push', 'mr']).default('push'),
+  deliver: z.enum(['push', 'mr']).default(REPO_SOURCE_DEFAULTS.deliver),
 });
 export type GitLabRepoConfig = z.infer<typeof GitLabRepoSchema>;
 
