@@ -39,7 +39,7 @@ import {
   type UpgradePlan,
   Upgrader,
 } from './upgrade/upgrader.js';
-import { errorMessage, newId, nowIso, parseJson } from './util.js';
+import { errorMessage, newId, nowIso, parseJson, StoppableWork } from './util.js';
 import { RepoTrials } from './verify/trial.js';
 import { git, revParse } from './workspace/git.js';
 
@@ -241,6 +241,8 @@ export class Master {
     readonly logPruner: RawLogPruner,
     /** Trial runs of the repos' setup and verify commands, from the dashboard. */
     readonly trials: RepoTrials,
+    /** The dashboard's registrations cloning or making their repo. */
+    readonly newRepos: StoppableWork,
     readonly app: Hono,
   ) {}
 
@@ -351,6 +353,7 @@ export class Master {
     });
     const version = installDir ? await revParse(installDir, 'HEAD').catch(() => null) : null;
     const trials = new RepoTrials({ store, paths, config });
+    const newRepos = new StoppableWork();
     const app = createApi({
       store,
       engine,
@@ -359,6 +362,7 @@ export class Master {
       backlog,
       upgrader,
       trials,
+      newRepos,
       version,
       config,
       configStatus: () => watcher.status(),
@@ -411,6 +415,7 @@ export class Master {
       upgrader,
       logPruner,
       trials,
+      newRepos,
       app,
     );
     // Before the engine recovers the Runs the last Master left, so that the event comes first.
@@ -472,13 +477,15 @@ export class Master {
     const drained = this.webhook.drain();
     // Together: the scouts record that they were cut short and delete their temporary worktrees
     // while the bridges and the local backlog finish their rounds; the trials' commands are
-    // killed and their worktrees deleted.
+    // killed and their worktrees deleted; the clones of repos being registered are stopped, with
+    // the programs git started, and what they cloned removed.
     await Promise.all([
       this.issues.stop(),
       this.gitlabIssues.stop(),
       this.backlog.stop(),
       this.scouting.stop(),
       this.trials.stop(),
+      this.newRepos.stop(),
     ]);
     await this.engine.stop();
     await this.repoWorkflows.stop();

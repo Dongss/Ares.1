@@ -127,25 +127,40 @@ const CLONE_OUTPUT_KEEP = 64 * 1024;
  * an option, and git never waits for a password at a prompt.
  *
  * git runs in a process group of its own, with the programs it starts (ssh, git-remote-https,
- * the local upload-pack). After `timeoutMs` the whole group is stopped, SIGTERM and then SIGKILL
- * for what is left after `graceMs` (`killProcessGroup`), and the promise settles only once none
- * of it is left: nothing writes into `path` any more when the caller removes it. On Windows,
- * which has no process groups, only git itself is stopped.
+ * the local upload-pack), apart from the Master's: a Master that ends without stopping it leaves
+ * it running to its end. After `timeoutMs`, or once `signal` aborts (the Master stopping), the
+ * whole group is stopped, SIGTERM and then SIGKILL for what is left after `graceMs`
+ * (`killProcessGroup`), and the promise settles only once none of it is left: nothing writes into
+ * `path` any more when the caller removes it. On Windows, which has no process groups, only git
+ * itself is stopped.
  *
  * Throws GitError, whose message ends with the last lines of git's output with no credentials in
- * them and says whether the clone failed or ran out of time; what was cloned so far is left for
- * the caller to remove.
+ * them and says whether the clone failed, ran out of time or was stopped; what was cloned so far
+ * is left for the caller to remove.
  */
 export function cloneRepo(
   url: string,
   path: string,
-  opts: { branch?: string; timeoutMs: number; graceMs?: number },
+  opts: { branch?: string; timeoutMs: number; graceMs?: number; signal?: AbortSignal },
 ): Promise<void> {
   const shown = withoutUrlCredentials(url);
   if (!cloneUrlAllowed(url)) {
     return Promise.reject(
       new GitError(
         t({ zh: `不支持的仓库地址：${shown}`, en: `Unsupported repository address: ${shown}` }),
+        '',
+        null,
+      ),
+    );
+  }
+  const { signal } = opts;
+  if (signal?.aborted) {
+    return Promise.reject(
+      new GitError(
+        t({
+          zh: `Master 正在停止，没有克隆 ${shown}`,
+          en: `The Master is stopping; ${shown} was not cloned`,
+        }),
         '',
         null,
       ),
@@ -168,27 +183,32 @@ export function cloneRepo(
     child.stderr.on('data', (chunk: string) => {
       stderr = (stderr + chunk).slice(-CLONE_OUTPUT_KEEP);
     });
-    let timedOut = false;
+    let stoppedBy: CloneStop | null = null;
     let stopped: Promise<void> = Promise.resolve();
-    const timer = setTimeout(() => {
-      timedOut = true;
+    const stop = (by: CloneStop) => {
+      if (stoppedBy !== null) return;
+      stoppedBy = by;
       if (group && child.pid !== undefined) {
         stopped = killProcessGroup(child.pid, opts.graceMs);
       } else {
         child.kill('SIGTERM');
       }
-    }, opts.timeoutMs);
+    };
+    const timer = setTimeout(() => stop('timeout'), opts.timeoutMs);
+    const onAbort = () => stop('abort');
+    signal?.addEventListener('abort', onAbort, { once: true });
     let settled = false;
     const settle = async (outcome: CloneOutcome) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
       await stopped;
-      if (outcome.kind === 'exited' && outcome.code === 0 && !timedOut) {
+      if (outcome.kind === 'exited' && outcome.code === 0 && stoppedBy === null) {
         resolve();
         return;
       }
-      reject(cloneError(shown, withoutUrlCredentials(stderr), outcome, timedOut, opts.timeoutMs));
+      reject(cloneError(shown, withoutUrlCredentials(stderr), outcome, stoppedBy, opts.timeoutMs));
     };
     child.on('error', (err) => void settle({ kind: 'error', message: err.message }));
     // 'close', not 'exit': the programs git started keep its stderr open until they end.
@@ -201,17 +221,21 @@ export type CloneOutcome =
   | { kind: 'exited'; code: number | null; signal: NodeJS.Signals | null }
   | { kind: 'error'; message: string };
 
+/** Why a clone was stopped: it ran out of time, or the Master is stopping. */
+export type CloneStop = 'timeout' | 'abort';
+
 /**
- * The error of a clone of `shown` that did not succeed: `timedOut` when it was stopped after
- * `timeoutMs`, whatever git did then; otherwise a failure, with git's exit code (null when it
- * was not started or a signal from elsewhere ended it). `output` is git's stderr, without
- * credentials; its last lines end the message (else the reason it could not start, or the signal).
+ * The error of a clone of `shown` that did not succeed: stopped (`stoppedBy`) after `timeoutMs`
+ * or because the Master is stopping, whatever git did then; otherwise a failure, with git's exit
+ * code (null when it was not started or a signal from elsewhere ended it). `output` is git's
+ * stderr, without credentials; its last lines end the message (else the reason it could not
+ * start, or the signal).
  */
 export function cloneError(
   shown: string,
   output: string,
   outcome: CloneOutcome,
-  timedOut: boolean,
+  stoppedBy: CloneStop | null,
   timeoutMs: number,
 ): GitError {
   const reason =
@@ -222,13 +246,19 @@ export function cloneError(
         : t({ zh: `git 退出码 ${outcome.code}`, en: `git exit code ${outcome.code}` });
   const tail = outputTail(output || withoutUrlCredentials(reason));
   const minutes = Math.round((timeoutMs / 60_000) * 10) / 10;
-  const message = timedOut
-    ? t({
-        zh: `克隆 ${shown} 超过 ${minutes} 分钟，已停止：\n${tail}`,
-        en: `Cloning ${shown} took over ${minutes} ${minutes === 1 ? 'minute' : 'minutes'} and was stopped:\n${tail}`,
-      })
-    : t({ zh: `克隆 ${shown} 失败：\n${tail}`, en: `Cloning ${shown} failed:\n${tail}` });
-  const code = !timedOut && outcome.kind === 'exited' ? outcome.code : null;
+  const message =
+    stoppedBy === 'timeout'
+      ? t({
+          zh: `克隆 ${shown} 超过 ${minutes} 分钟，已停止：\n${tail}`,
+          en: `Cloning ${shown} took over ${minutes} ${minutes === 1 ? 'minute' : 'minutes'} and was stopped:\n${tail}`,
+        })
+      : stoppedBy === 'abort'
+        ? t({
+            zh: `Master 正在停止，没有克隆完 ${shown}：\n${tail}`,
+            en: `The Master is stopping; cloning ${shown} was not finished:\n${tail}`,
+          })
+        : t({ zh: `克隆 ${shown} 失败：\n${tail}`, en: `Cloning ${shown} failed:\n${tail}` });
+  const code = stoppedBy === null && outcome.kind === 'exited' ? outcome.code : null;
   return new GitError(message.trimEnd(), output, code);
 }
 

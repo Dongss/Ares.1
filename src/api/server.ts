@@ -44,7 +44,7 @@ import {
   type RunStatus,
 } from '../store/types.js';
 import type { Upgrader } from '../upgrade/upgrader.js';
-import { errorMessage } from '../util.js';
+import { errorMessage, StoppableWork } from '../util.js';
 import type { RepoTrials } from '../verify/trial.js';
 import { DETECT_READ_FILES, detectProjectCommands } from '../workspace/detect.js';
 import {
@@ -139,6 +139,11 @@ export interface ApiDeps {
    * SourceEditConflict with the file left as it was.
    */
   saveRepoSource: (repo: string, input: RepoSourceInput) => void;
+  /**
+   * The registrations cloning or making their repo (POST /api/repos with a source): stopping it
+   * stops their clones and waits until what they made is removed. Omitted = never stopped.
+   */
+  newRepos?: StoppableWork;
 }
 
 function noBranch(branch: string): string {
@@ -485,18 +490,21 @@ export function createApi(deps: ApiDeps): Hono {
   // Names and paths of the registrations cloning or making their repo now: a second one with the
   // same name or path would clone in vain or into the same directory.
   const newReposPending = new Set<string>();
+  const newRepos = deps.newRepos ?? new StoppableWork();
 
   /**
    * Registers (`register`) a repo first made at `path` by `source`: cloned (`targetBranch`
    * checked out, else the remote's default branch) or new (an empty first commit on
    * `targetBranch`, else main). Everything is checked before the disk is touched; when anything
-   * fails afterwards, what was made goes.
+   * fails afterwards, what was made goes. A clone stops when `signal` aborts (the Master
+   * stopping), and what it cloned goes too.
    */
   const makeNewRepo = async (
     input: z.infer<typeof RepoInput>,
     path: string,
     source: RepoInputSource,
     register: (targetBranch: string) => Repo,
+    signal: AbortSignal,
   ): Promise<Repo> => {
     if (store.findRepo(input.name)) throw nameTaken(input.name);
     const branch = input.targetBranch;
@@ -539,7 +547,7 @@ export function createApi(deps: ApiDeps): Hono {
       let targetBranch: string;
       if (source.kind === 'clone') {
         const timeoutMs = config().master.defaults.command_timeout_minutes * 60_000;
-        await cloneRepo(source.url, path, { branch, timeoutMs });
+        await cloneRepo(source.url, path, { branch, timeoutMs, signal });
         targetBranch = branch ?? (await currentBranch(path));
       } else {
         targetBranch = branch ?? 'main';
@@ -553,6 +561,8 @@ export function createApi(deps: ApiDeps): Hono {
       return register(targetBranch);
     } catch (err) {
       removeNewRepo(path, state === 'missing' ? (created ?? path) : undefined);
+      // Stopped with the Master: nothing wrong with what the human gave.
+      if (err instanceof GitError && signal.aborted) throw new ConflictError(err.message);
       // git's failures here come from what the human gave: the address, the branch, the path.
       if (err instanceof GitError) throw new InvalidInputError(err.message);
       throw err;
@@ -581,7 +591,8 @@ export function createApi(deps: ApiDeps): Hono {
       });
     let repo: Repo;
     if (input.source) {
-      repo = await makeNewRepo(input, path, input.source, register);
+      const source = input.source;
+      repo = await newRepos.run((signal) => makeNewRepo(input, path, source, register, signal));
     } else {
       if (!existsSync(path) || !(await isGitRepo(path))) {
         throw new InvalidInputError(

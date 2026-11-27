@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { setLang } from '../src/i18n.js';
 import {
   addWorktree,
@@ -31,7 +31,7 @@ import {
   validBranchName,
   withoutUrlCredentials,
 } from '../src/workspace/git.js';
-import { git, initRepo, tmpDir, waitFor, writeFile } from './helpers.js';
+import { git, hangingSsh, initRepo, tmpDir, writeFile } from './helpers.js';
 
 async function branchWithCommit(repo: string) {
   const wt = join(tmpDir('ares1-wt-'), 'wt');
@@ -355,40 +355,14 @@ describe('repos the Master clones or makes', () => {
   it.skipIf(process.platform === 'win32')(
     'stops the programs git started with it when the clone runs out of time',
     async () => {
-      // An ssh that never answers and leaves behind a writer ignoring SIGTERM, as a transport
-      // helper that keeps writing could.
-      const dir = tmpDir('ares1-ssh-');
-      const ssh = join(dir, 'ssh');
-      writeFile(
-        ssh,
-        [
-          '#!/bin/sh',
-          `echo $$ > "${dir}/ssh.tmp" && mv "${dir}/ssh.tmp" "${dir}/ssh.pid"`,
-          `(trap '' TERM; while :; do echo x >> "${dir}/written"; sleep 0.02; done) &`,
-          `echo $! > "${dir}/writer.tmp" && mv "${dir}/writer.tmp" "${dir}/writer.pid"`,
-          'sleep 30',
-          '',
-        ].join('\n'),
-      );
-      chmodSync(ssh, 0o755);
-      vi.stubEnv('GIT_SSH_COMMAND', ssh);
-      vi.stubEnv('GIT_SSH_VARIANT', 'simple');
-      const pid = (name: string) => Number(readFileSync(join(dir, name), 'utf8'));
-      const alive = (p: number) => {
-        try {
-          process.kill(p, 0);
-          return true;
-        } catch {
-          return false;
-        }
-      };
+      const ssh = hangingSsh();
       try {
         const started = Date.now();
         const cloning = cloneRepo('ssh://example.invalid/repo.git', join(tmpDir(), 'clone'), {
           timeoutMs: 1500,
           graceMs: 200,
         }).catch((e: unknown) => e);
-        await waitFor(() => existsSync(join(dir, 'writer.pid')), 'the fake ssh to start');
+        await ssh.started();
         const err = await cloning;
         expect(Date.now() - started).toBeGreaterThanOrEqual(1450);
         expect(err).toBeInstanceOf(GitError);
@@ -397,65 +371,95 @@ describe('repos the Master clones or makes', () => {
         );
         expect((err as GitError).exitCode).toBeNull();
         // Settled only once git's whole group was gone: nothing writes any more.
-        for (const name of ['ssh.pid', 'writer.pid']) {
-          await waitFor(() => !alive(pid(name)), `${name} to be reaped`, 2000);
-        }
-        const written = readFileSync(join(dir, 'written'), 'utf8');
-        await new Promise((r) => setTimeout(r, 200));
-        expect(readFileSync(join(dir, 'written'), 'utf8')).toBe(written);
+        await ssh.expectGone();
       } finally {
-        vi.unstubAllEnvs();
-        for (const name of ['ssh.pid', 'writer.pid']) {
-          try {
-            process.kill(pid(name), 'SIGKILL');
-          } catch {
-            // gone already
-          }
-        }
+        ssh.cleanup();
       }
     },
   );
 
-  it('tells a clone that ran out of time from one that failed, whatever git did', () => {
+  it.skipIf(process.platform === 'win32')(
+    'stops the programs git started with it when the Master stops',
+    async () => {
+      const ssh = hangingSsh();
+      try {
+        const stopping = new AbortController();
+        const cloning = cloneRepo('ssh://example.invalid/repo.git', join(tmpDir(), 'clone'), {
+          timeoutMs: 60_000,
+          graceMs: 200,
+          signal: stopping.signal,
+        }).catch((e: unknown) => e);
+        await ssh.started();
+        stopping.abort();
+        const err = await cloning;
+        expect(err).toBeInstanceOf(GitError);
+        expect((err as GitError).message).toMatch(
+          /^Master 正在停止，没有克隆完 ssh:\/\/example\.invalid\/repo\.git：\n/,
+        );
+        expect((err as GitError).exitCode).toBeNull();
+        await ssh.expectGone();
+      } finally {
+        ssh.cleanup();
+      }
+      // Once it is stopping, no clone starts.
+      const dir = join(tmpDir(), 'clone');
+      await expect(
+        cloneRepo('https://example.invalid/repo.git', dir, {
+          timeoutMs: 60_000,
+          signal: AbortSignal.abort(),
+        }),
+      ).rejects.toThrow('Master 正在停止，没有克隆 https://example.invalid/repo.git');
+      expect(existsSync(dir)).toBe(false);
+    },
+  );
+
+  it('tells a clone that ran out of time or was stopped from one that failed, whatever git did', () => {
     const exited = (code: number | null, signal: NodeJS.Signals | null = null): CloneOutcome => ({
       kind: 'exited',
       code,
       signal,
     });
     const url = 'https://example.com/repo.git';
-    // Stopped by the timeout: git died of the signal or exited on its own after it.
+    // Stopped by the timeout or the Master stopping: git died of the signal or exited on its
+    // own after it.
     for (const outcome of [exited(null, 'SIGTERM'), exited(null, 'SIGKILL'), exited(128)]) {
-      const err = cloneError(url, 'Receiving objects: 10%', outcome, true, 90_000);
+      const err = cloneError(url, 'Receiving objects: 10%', outcome, 'timeout', 90_000);
       expect(err.message).toBe(`克隆 ${url} 超过 1.5 分钟，已停止：\nReceiving objects: 10%`);
       expect(err.exitCode).toBeNull();
+      const stopped = cloneError(url, 'Receiving objects: 10%', outcome, 'abort', 90_000);
+      expect(stopped.message).toBe(`Master 正在停止，没有克隆完 ${url}：\nReceiving objects: 10%`);
+      expect(stopped.exitCode).toBeNull();
     }
     // git failed by itself: however long its output, only the last lines, and its exit code.
     const long = Array.from({ length: 50_000 }, (_, i) => `remote: line ${i}`).join('\n');
-    const failed = cloneError(url, `${long}\nfatal: early EOF`, exited(128), false, 90_000);
+    const failed = cloneError(url, `${long}\nfatal: early EOF`, exited(128), null, 90_000);
     expect(failed.message).toBe(
       `克隆 ${url} 失败：\nremote: line 49996\nremote: line 49997\nremote: line 49998\nremote: line 49999\nfatal: early EOF`,
     );
     expect(failed.exitCode).toBe(128);
     // No output: why git ended, or why it did not start.
-    expect(cloneError(url, '', exited(null, 'SIGKILL'), false, 90_000).message).toBe(
+    expect(cloneError(url, '', exited(null, 'SIGKILL'), null, 90_000).message).toBe(
       `克隆 ${url} 失败：\ngit 被信号 SIGKILL 结束`,
     );
-    expect(cloneError(url, '', exited(1), false, 90_000).message).toBe(
+    expect(cloneError(url, '', exited(1), null, 90_000).message).toBe(
       `克隆 ${url} 失败：\ngit 退出码 1`,
     );
-    const missing = cloneError(url, '', { kind: 'error', message: 'spawn git ENOENT' }, false, 1);
+    const missing = cloneError(url, '', { kind: 'error', message: 'spawn git ENOENT' }, null, 1);
     expect(missing.message).toBe(`克隆 ${url} 失败：\nspawn git ENOENT`);
     expect(missing.exitCode).toBeNull();
 
     setLang('en');
     try {
-      expect(cloneError(url, '', exited(null, 'SIGTERM'), true, 60_000).message).toBe(
+      expect(cloneError(url, '', exited(null, 'SIGTERM'), 'timeout', 60_000).message).toBe(
         `Cloning ${url} took over 1 minute and was stopped:\ngit was ended by SIGTERM`,
       );
-      expect(cloneError(url, 'x', exited(null, 'SIGTERM'), true, 90_000).message).toBe(
+      expect(cloneError(url, 'x', exited(null, 'SIGTERM'), 'timeout', 90_000).message).toBe(
         `Cloning ${url} took over 1.5 minutes and was stopped:\nx`,
       );
-      expect(cloneError(url, '', exited(2), false, 60_000).message).toBe(
+      expect(cloneError(url, 'x', exited(null, 'SIGTERM'), 'abort', 90_000).message).toBe(
+        `The Master is stopping; cloning ${url} was not finished:\nx`,
+      );
+      expect(cloneError(url, '', exited(2), null, 60_000).message).toBe(
         `Cloning ${url} failed:\ngit exit code 2`,
       );
     } finally {

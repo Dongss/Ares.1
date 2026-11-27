@@ -59,6 +59,7 @@ import {
   FakeGitLab,
   git,
   type Harness,
+  hangingSsh,
   harness,
   initRepo,
   readEnvFile,
@@ -319,6 +320,36 @@ describe('HTTP API', () => {
       expect(error).not.toMatch(/[一-鿿]/);
     }
   });
+
+  it.skipIf(process.platform === 'win32')(
+    'stops a clone under way when the Master stops, and removes what it cloned',
+    async () => {
+      h = await harness();
+      // Ends on SIGTERM: the Master's grace before SIGKILL is not this test's to wait out.
+      const ssh = hangingSsh({ ignoreTerm: false });
+      try {
+        const parent = join(tmpDir(), 'projects');
+        const registering = call('POST', '/api/repos', {
+          name: 'cloned',
+          path: join(parent, 'cloned'),
+          source: { kind: 'clone', url: 'ssh://example.invalid/repo.git' },
+        });
+        await ssh.started();
+        expect(existsSync(parent)).toBe(true);
+        await h.master.close();
+        // Closed only once git and what it started are gone, and the directories made with them.
+        expect(existsSync(parent)).toBe(false);
+        await ssh.expectGone();
+        const res = await registering;
+        expect(res.status).toBe(409);
+        expect(res.json.error).toMatch(
+          /^Master 正在停止，没有克隆完 ssh:\/\/example\.invalid\/repo\.git：/,
+        );
+      } finally {
+        ssh.cleanup();
+      }
+    },
+  );
 
   it('updates repo settings', async () => {
     h = await harness();
@@ -4639,6 +4670,25 @@ describe('trying a repo’s commands', () => {
     // The next sweep removes it.
     await h.master.trials.sweepLeftovers();
     expect(trialDirs()).toEqual([]);
+  });
+
+  it('stops the Master all the same when the sweep under way leaves a directory behind', async () => {
+    h = await harness({ verifyCommands: [] });
+    const broken = join(h.master.paths.worktreesDir, 'trial-repo-broken-beef');
+    writeFile(join(broken, 'file.txt'), 'x\n');
+    const store = h.master.store;
+    const findRepo = store.findRepo.bind(store);
+    vi.spyOn(store, 'findRepo').mockImplementation((id) => {
+      if (id === 'repo-broken') throw new Error('database is locked');
+      return findRepo(id);
+    });
+    const sweep = h.master.trials.sweepLeftovers();
+    // Stopping waits for the sweep, which rejects: the Master stops anyway, to the database.
+    const closing = h.master.close();
+    await expect(sweep).rejects.toThrow('1 个目录没删掉');
+    await expect(closing).resolves.toBeUndefined();
+    expect(() => store.listRepos()).toThrow();
+    vi.restoreAllMocks();
   });
 
   it('forgets the latest trial of a repo when the repo is removed', async () => {

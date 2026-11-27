@@ -1,5 +1,12 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { FakeAdapter, type FakeContext, type FakeOutcome } from '../src/adapters/fake.js';
@@ -67,6 +74,80 @@ export async function waitFor(
     await new Promise((r) => setTimeout(r, 10));
   }
   throw new Error(`timed out waiting for ${what}`);
+}
+
+/** A fake ssh for git that never answers; see `hangingSsh`. */
+export interface HangingSsh {
+  /** Resolves once git has started it and its writer. */
+  started(): Promise<void>;
+  /** Resolves once it and its writer are gone and nothing is written any more; else throws. */
+  expectGone(): Promise<void>;
+  /** Kills what is left and gives git its own ssh back. */
+  cleanup(): void;
+}
+
+/**
+ * Makes git's ssh (GIT_SSH_COMMAND, in this process's environment until `cleanup`) one that
+ * never answers and leaves behind a writer, as a transport helper that keeps writing could: for
+ * clones that have to be stopped with everything git started. The writer ignores SIGTERM unless
+ * `ignoreTerm` is false, so that only SIGKILL, after the grace, ends it.
+ */
+export function hangingSsh(opts: { ignoreTerm?: boolean } = {}): HangingSsh {
+  const dir = tmpDir('ares1-ssh-');
+  const ssh = join(dir, 'ssh');
+  const trap = opts.ignoreTerm === false ? '' : "trap '' TERM; ";
+  writeFile(
+    ssh,
+    [
+      '#!/bin/sh',
+      `echo $$ > "${dir}/ssh.tmp" && mv "${dir}/ssh.tmp" "${dir}/ssh.pid"`,
+      `(${trap}while :; do echo x >> "${dir}/written"; sleep 0.02; done) &`,
+      `echo $! > "${dir}/writer.tmp" && mv "${dir}/writer.tmp" "${dir}/writer.pid"`,
+      'sleep 30',
+      '',
+    ].join('\n'),
+  );
+  chmodSync(ssh, 0o755);
+  const saved = { cmd: process.env.GIT_SSH_COMMAND, variant: process.env.GIT_SSH_VARIANT };
+  process.env.GIT_SSH_COMMAND = ssh;
+  process.env.GIT_SSH_VARIANT = 'simple';
+  const names = ['ssh.pid', 'writer.pid'];
+  const pid = (name: string) => Number(readFileSync(join(dir, name), 'utf8'));
+  const alive = (p: number) => {
+    try {
+      process.kill(p, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const written = () => readFileSync(join(dir, 'written'), 'utf8');
+  return {
+    started: () => waitFor(() => existsSync(join(dir, 'writer.pid')), 'the fake ssh to start'),
+    async expectGone() {
+      for (const name of names)
+        await waitFor(() => !alive(pid(name)), `${name} to be reaped`, 2000);
+      const before = written();
+      await new Promise((r) => setTimeout(r, 200));
+      if (written() !== before) throw new Error('the fake ssh’s writer still writes');
+    },
+    cleanup() {
+      for (const [key, value] of [
+        ['GIT_SSH_COMMAND', saved.cmd],
+        ['GIT_SSH_VARIANT', saved.variant],
+      ] as const) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      for (const name of names) {
+        try {
+          process.kill(pid(name), 'SIGKILL');
+        } catch {
+          // gone already, or never started
+        }
+      }
+    },
+  };
 }
 
 export const TEST_AGENTS_YAML = `

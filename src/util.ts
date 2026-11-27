@@ -36,6 +36,33 @@ export function tail(text: string, max = 4000): string {
   return `${t({ zh: `…（前面省略 ${omitted} 个字符）`, en: `…(${omitted} characters omitted before)` })}\n${text.slice(-max)}`;
 }
 
+/**
+ * Work under way that stopping cuts short and waits for: each piece is given `signal`, which
+ * `stop` aborts; `stop` then resolves once every piece has settled, whether it rejected or not.
+ */
+export class StoppableWork {
+  private readonly controller = new AbortController();
+  private readonly pending = new Set<Promise<void>>();
+
+  /** Runs `work` with the signal; its outcome is the caller's, `stop` only waits for it. */
+  run<T>(work: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    const result = work(this.controller.signal);
+    const settled = result.then(
+      () => {},
+      () => {},
+    );
+    this.pending.add(settled);
+    void settled.then(() => this.pending.delete(settled));
+    return result;
+  }
+
+  /** Aborts the signal, and waits until every piece of work is over. Never rejects. */
+  async stop(): Promise<void> {
+    this.controller.abort();
+    await Promise.all(this.pending);
+  }
+}
+
 export function parseJson<T>(text: string | null | undefined, fallback: T): T {
   if (text === null || text === undefined || text === '') return fallback;
   try {

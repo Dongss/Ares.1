@@ -143,10 +143,14 @@ export class RepoTrials {
     return this.sweeping;
   }
 
-  /** Kills the commands running, and waits until every trial and sweep is over. */
+  /**
+   * Kills the commands running, and waits until every trial and sweep is over. Never rejects, so
+   * that the Master goes on stopping: a sweep leaving directories behind is reported to whoever
+   * started it, and the next Master's sweep tries them again.
+   */
   async stop(): Promise<void> {
     this.stopped.abort();
-    await Promise.all([...this.running.values(), this.sweeping]);
+    await Promise.allSettled([...this.running.values(), this.sweeping]);
   }
 
   private async execute(repo: Repo, trial: RepoTrial): Promise<void> {
