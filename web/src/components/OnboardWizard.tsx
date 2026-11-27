@@ -30,7 +30,17 @@ import {
   trialOutcome,
   trialStepView,
 } from '../lib/onboard.js';
-import { detectedBox, detectLabel, setupLabel, verifyLabel } from '../lib/repos.js';
+import {
+  detectedBox,
+  detectLabel,
+  serveFormInit,
+  serveFormProblems,
+  serveInput,
+  serveLabel,
+  setupLabel,
+  trialHint,
+  verifyLabel,
+} from '../lib/repos.js';
 import { href } from '../lib/router.js';
 import {
   CommandList,
@@ -38,6 +48,8 @@ import {
   DetectionNote,
   detectHint,
   RegisterForm,
+  ServeFields,
+  ServeView,
   SourceSettings,
   TrialResult,
   useTrial,
@@ -46,8 +58,9 @@ import { Badge, ErrorBox } from './ui.js';
 
 /**
  * The Repos page's wizard that brings a new project in: register the repo, fill in and save its
- * commands, try them, set where its requirements come from, then what to do next. Each step
- * saves as it goes, through the same APIs as the repo cards; closing it halfway undoes nothing.
+ * commands and service, try them, set where its requirements come from, then what to do next.
+ * Each step saves as it goes, through the same APIs as the repo cards; closing it halfway undoes
+ * nothing.
  * `config`: the configuration in use (reloaded by the app after `onChanged`).
  */
 export function OnboardWizard(props: {
@@ -166,19 +179,23 @@ export function OnboardWizard(props: {
 }
 
 /**
- * Step 2: the commands, detected from the project files as the step opens while the repo has none
- * saved, then checked, changed and saved by the human.
+ * Step 2: the commands and the service, detected from the project files as the step opens while
+ * the repo has none saved, then checked, changed and saved by the human. The suggested start
+ * command waits by the service boxes until the human adopts it.
  */
 function CommandsStep(props: { repo: Repo; onSaved: (repo: Repo) => void }) {
   const { repo } = props;
   const [verify, setVerify] = useState(repo.verifyCommands.join('\n'));
   const [setup, setSetup] = useState(repo.setupCommands.join('\n'));
+  const [serve, setServe] = useState(() => serveFormInit(repo.serve));
   const [detection, setDetection] = useState<RepoDetection>();
   const [auto] = useState(() => detectsOnEntry(repo));
   const detecting = useAction();
   const saving = useAction();
+  const serveProblems = serveFormProblems(serve);
   const runDetect = detecting.run;
-  // Fills the boxes only (a box without a suggestion keeps what is in it); saving is the human's.
+  // Fills the command boxes only (a box without a suggestion keeps what is in it), never the
+  // service's; saving is the human's.
   const detect = useCallback(async () => {
     const found = await runDetect(() => api.detectRepo(repo.id));
     if (!found) return;
@@ -193,10 +210,12 @@ function CommandsStep(props: { repo: Repo; onSaved: (repo: Repo) => void }) {
   const warning = commandsWarning(verify);
   const submit = async (e: FormEvent) => {
     e.preventDefault();
+    if (serveProblems.length > 0) return;
     const updated = await saving.run(() =>
       api.updateRepo(repo.id, {
         verifyCommands: parseLines(verify),
         setupCommands: parseLines(setup),
+        serve: serveInput(serve),
       }),
     );
     if (updated) props.onSaved(updated);
@@ -215,9 +234,19 @@ function CommandsStep(props: { repo: Repo; onSaved: (repo: Repo) => void }) {
       </div>
       <CommandsFields verify={verify} setup={setup} onVerify={setVerify} onSetup={setSetup} />
       {warning && <p className="hint text-attention">{warning}</p>}
+      <ServeFields
+        value={serve}
+        onChange={setServe}
+        disabled={saving.busy}
+        suggestion={detection?.serve}
+      />
       <ErrorBox>{saving.error}</ErrorBox>
       <div className="form-actions">
-        <button type="submit" className="btn-primary" disabled={saving.busy || detecting.busy}>
+        <button
+          type="submit"
+          className="btn-primary"
+          disabled={saving.busy || detecting.busy || serveProblems.length > 0}
+        >
           {saving.busy
             ? t({ zh: '保存中…', en: 'Saving…' })
             : t({ zh: '保存，下一步', en: 'Save and go on' })}
@@ -228,9 +257,9 @@ function CommandsStep(props: { repo: Repo; onSaved: (repo: Repo) => void }) {
 }
 
 /**
- * Step 3: tries the commands saved in step 2. On it goes once they pass; when they fail it says
- * which command and why, and goes back to step 2 to change them; it can be skipped, with what
- * that risks.
+ * Step 3: tries the commands and the service saved in step 2. On it goes once they pass; when
+ * they fail it says which command (or the service) and why, and goes back to step 2 to change
+ * them; it can be skipped, with what that risks.
  */
 function TrialStep(props: { repo: Repo; onBack: () => void; onNext: (how?: OnboardEnd) => void }) {
   const { repo } = props;
@@ -254,6 +283,12 @@ function TrialStep(props: { repo: Repo; onBack: () => void; onNext: (how?: Onboa
             <CommandList commands={repo.verifyCommands} />
           </dd>
         </div>
+        <div className="wide">
+          <dt>{serveLabel()}</dt>
+          <dd>
+            <ServeView serve={repo.serve} />
+          </dd>
+        </div>
       </dl>
       <div className="detect-row">
         <button
@@ -261,20 +296,17 @@ function TrialStep(props: { repo: Repo; onBack: () => void; onNext: (how?: Onboa
           className={view.canContinue ? undefined : 'btn-primary'}
           disabled={!view.canStart}
           onClick={() =>
+            // What was saved in step 2, the service included: none when it has no start command.
             trial.start({
               setupCommands: repo.setupCommands,
               verifyCommands: repo.verifyCommands,
+              serve: repo.serve,
             })
           }
         >
           {view.startLabel}
         </button>
-        <span className="hint">
-          {t({
-            zh: `在目标分支 ${repo.targetBranch} 当前的提交上跑上面这些命令，不建 Run、什么都不改`,
-            en: `Runs the commands above on the commit the target branch ${repo.targetBranch} is at; no Run is created and nothing changes`,
-          })}
-        </span>
+        <span className="hint">{trialHint(repo.targetBranch, false)}</span>
       </div>
       <ErrorBox>{trial.error}</ErrorBox>
       {shown && <TrialResult trial={shown} now={trial.now} />}
@@ -303,7 +335,10 @@ function TrialStep(props: { repo: Repo; onBack: () => void; onNext: (how?: Onboa
           {t({ zh: '下一步', en: 'Next' })}
         </button>
         <button type="button" onClick={props.onBack}>
-          {t({ zh: '回到第 2 步改命令', en: 'Back to step 2 to change the commands' })}
+          {t({
+            zh: '回到第 2 步改命令和服务',
+            en: 'Back to step 2 to change the commands or service',
+          })}
         </button>
         {view.skipWarning && (
           <button type="button" onClick={() => props.onNext('skipped')}>

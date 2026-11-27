@@ -1,9 +1,9 @@
-import type { RepoSourceView, RepoTrial } from '../../../src/api/types.js';
+import type { RepoSourceView, RepoTrial, RepoTrialResult } from '../../../src/api/types.js';
 import { t } from '../../../src/i18n.js';
-import type { Repo } from '../../../src/store/types.js';
+import type { Repo, RepoServe } from '../../../src/store/types.js';
 import { parseLines } from './format.js';
 import { GITHUB, hostLabel, type IssueHost, issuesUrl, newIssueUrl } from './issues.js';
-import { lacksVerify, trialRows } from './repos.js';
+import { lacksVerify, type TrialRow, trialRows } from './repos.js';
 import { href } from './router.js';
 
 // The wizard of the Repos page that brings a new project in, step by step: which step it is at,
@@ -89,13 +89,13 @@ export function onboardStepSummary(step: OnboardStep): string {
       });
     case 'commands':
       return t({
-        zh: 'Master 按目标分支上提交了的项目文件（package.json、pyproject.toml、go.mod 等）建议准备命令和检查命令，填进输入框；检查、修改后保存到仓库。检查命令在每个 Task 完成后运行，全部通过才算验收通过。',
-        en: 'The Master suggests the setup and verify commands from the project files committed on the target branch (package.json, pyproject.toml, go.mod and the like) and fills them in; check or change them, then save them to the repo. The verify commands run after each Task, which passes only when all of them pass.',
+        zh: 'Master 按目标分支上提交了的项目文件（package.json、pyproject.toml、manage.py、go.mod 等）建议准备命令和检查命令，填进输入框；也建议服务启动命令，点「采用建议」才填进「服务」一栏。检查、修改后保存到仓库。检查命令在每个 Task 完成后运行，全部通过才算验收通过；启动命令可空，要在流程里对跑起来的服务做检查（冒烟测试、E2E）时才填，写了 serve: true 的命令阶段用它为 Run 起服务。',
+        en: 'The Master suggests the setup and verify commands from the project files committed on the target branch (package.json, pyproject.toml, manage.py, go.mod and the like) and fills them in; it suggests a service start command too, put in the Service boxes once you choose Use the suggestion. Check or change them, then save them to the repo. The verify commands run after each Task, which passes only when all of them pass. The start command is optional: fill it in to check a running service (smoke tests, E2E), which a command stage with serve: true then starts for each Run.',
       });
     case 'trial':
       return t({
-        zh: '在目标分支当前的提交上，用 Run 的环境依次跑一遍准备命令和检查命令，不建 Run。没通过时写明是哪条命令、为什么，可以回到上一步改了再试；也可以跳过。',
-        en: 'Runs the setup and then the verify commands once on the commit the target branch is at, in the environment Runs use, without creating a Run. When one fails, it says which and why; go back a step to change them and try again, or skip it.',
+        zh: '在目标分支当前的提交上，用 Run 的环境依次跑一遍准备命令、起服务（填了启动命令的话，就绪后马上停掉）、跑检查命令，不建 Run。没通过时写明是哪条命令或者服务、为什么，可以回到上一步改了再试；也可以跳过。',
+        en: 'Runs the setup commands, starts the service if there is a start command (stopping it once it is ready) and runs the verify commands, once, on the commit the target branch is at, in the environment Runs use, without creating a Run. When something fails, it says which command, or the service, and why; go back a step to change them and try again, or skip it.',
       });
     case 'source':
       return t({
@@ -153,8 +153,8 @@ export function onboardMarkLabel(mark: OnboardMark): string {
 /** What the Repos page says by its button that opens the wizard. */
 export function onboardEntryHint(): string {
   return t({
-    zh: '第一次接入一个项目？「接入新项目」按顺序带你登记仓库、填好检查命令、试运行一遍、设置需求从哪来，最后告诉你怎么开始。',
-    en: 'Bringing a project in for the first time? "Bring in a new project" takes you through registering the repo, filling in its verify commands, trying them and setting where requirements come from, then tells you how to start.',
+    zh: '第一次接入一个项目？「接入新项目」按顺序带你登记仓库、填好检查命令和（要的话）服务启动命令、试运行一遍、设置需求从哪来，最后告诉你怎么开始。',
+    en: 'Bringing a project in for the first time? "Bring in a new project" takes you through registering the repo, filling in its verify commands and, if it needs one, its service start command, trying them and setting where requirements come from, then tells you how to start.',
   });
 }
 
@@ -172,10 +172,16 @@ export function onboardCloseNote(at: OnboardAt): string | null {
 
 /**
  * Whether the commands step detects the commands by itself as it opens: only while the repo has
- * none saved, so nothing saved or typed is replaced.
+ * no commands and no service saved, so nothing saved or typed is replaced (and a saved service
+ * says the step was gone through already).
  */
-export function detectsOnEntry(repo: Pick<Repo, 'verifyCommands' | 'setupCommands'>): boolean {
-  return [...repo.verifyCommands, ...repo.setupCommands].every((c) => c.trim() === '');
+export function detectsOnEntry(
+  repo: Pick<Repo, 'verifyCommands' | 'setupCommands' | 'serve'>,
+): boolean {
+  return (
+    repo.serve === null &&
+    [...repo.verifyCommands, ...repo.setupCommands].every((c) => c.trim() === '')
+  );
 }
 
 /** The warning under the verify commands as typed in the commands step; null when there are some. */
@@ -188,15 +194,19 @@ export function commandsWarning(verify: string): string | null {
 }
 
 /**
- * How the trial of the commands saved in the wizard went, by the repo's latest trial: `none` when
- * there is none, or it is over and tried other commands (from before they were changed, or from
- * the edit form). One under way counts whatever it tries, since no other can start meanwhile.
+ * How the trial of the commands and service saved in the wizard went, by the repo's latest trial:
+ * `none` when there is none, or it is over and tried other commands or another service (from
+ * before they were changed, or from the edit form). One under way counts whatever it tries, since
+ * no other can start meanwhile.
  */
 export type TrialOutcome = 'none' | 'running' | 'passed' | 'failed';
 
 export function trialOutcome(
-  trial: Pick<RepoTrial, 'status' | 'setupCommands' | 'verifyCommands'> | null | undefined,
-  saved: Pick<Repo, 'setupCommands' | 'verifyCommands'>,
+  trial:
+    | Pick<RepoTrial, 'status' | 'setupCommands' | 'verifyCommands' | 'serve'>
+    | null
+    | undefined,
+  saved: Pick<Repo, 'setupCommands' | 'verifyCommands' | 'serve'>,
 ): TrialOutcome {
   if (!trial) return 'none';
   if (trial.status === 'running') return 'running';
@@ -204,7 +214,18 @@ export function trialOutcome(
     a.length === b.length && a.every((c, i) => c === b[i]);
   if (!same(trial.setupCommands, saved.setupCommands)) return 'none';
   if (!same(trial.verifyCommands, saved.verifyCommands)) return 'none';
+  if (!sameServe(trial.serve, saved.serve)) return 'none';
   return trial.status;
+}
+
+/** Two services alike: none, or the same start command, ready path and ready timeout. */
+function sameServe(a: RepoServe | null, b: RepoServe | null): boolean {
+  if (!a || !b) return a === b;
+  return (
+    a.command === b.command &&
+    a.readyPath === b.readyPath &&
+    a.readyTimeoutSeconds === b.readyTimeoutSeconds
+  );
 }
 
 /** What the trial step offers, by how the trial went. */
@@ -241,13 +262,13 @@ function trialStepNote(outcome: TrialOutcome): string {
   switch (outcome) {
     case 'none':
       return t({
-        zh: '还没试过刚保存的命令。试运行通过了才能进入下一步，也可以跳过。',
-        en: 'The commands just saved have not been tried yet. The next step opens once they pass; you can also skip it.',
+        zh: '还没试过刚保存的命令和服务。试运行通过了才能进入下一步，也可以跳过。',
+        en: 'The commands and service just saved have not been tried yet. The next step opens once they pass; you can also skip it.',
       });
     case 'running':
       return t({
         zh: '试运行中，跑完一条刷新一条。可以等它跑完，也可以先跳过。',
-        en: 'Trying them; each command shows as soon as it is done. Wait for it, or skip ahead.',
+        en: 'Trying them; each command, and the service, shows as soon as it is done. Wait for it, or skip ahead.',
       });
     case 'passed':
       return t({
@@ -256,8 +277,8 @@ function trialStepNote(outcome: TrialOutcome): string {
       });
     case 'failed':
       return t({
-        zh: '改好再试：命令写错了就回到第 2 步改；是环境或目标分支的问题，修好后直接再试一次。',
-        en: 'Fix it and try again: go back to step 2 if a command is wrong; if it is the environment or the target branch, fix that and just try again.',
+        zh: '改好再试：命令或者服务设置写错了就回到第 2 步改；是环境或目标分支的问题，修好后直接再试一次。',
+        en: 'Fix it and try again: go back to step 2 if a command or the service settings are wrong; if it is the environment or the target branch, fix that and just try again.',
       });
   }
 }
@@ -265,15 +286,21 @@ function trialStepNote(outcome: TrialOutcome): string {
 /** What skipping the trial risks, by the skip button and on the last page when it was skipped. */
 export function skipTrialWarning(): string {
   return t({
-    zh: '不试运行的话，命令写错了、程序没装或者目标分支本身就过不了，要等第一个 Run 编码完才会发现，然后一轮轮返工白花钱。以后可以随时在仓库卡片上点「试运行」。',
-    en: "Without a trial, a wrong command, a missing program or a target branch that fails on its own only shows once the first Run has done its coding, and then rework after rework costs money for nothing. You can try the commands on the repo's card any time later.",
+    zh: '不试运行的话，命令写错了、程序没装、服务起不来或者目标分支本身就过不了，要等第一个 Run 编码完才会发现，然后一轮轮返工白花钱。以后可以随时在仓库卡片上点「试运行」。',
+    en: "Without a trial, a wrong command, a missing program, a service that does not come up or a target branch that fails on its own only shows once the first Run has done its coding, and then rework after rework costs money for nothing. You can try the commands on the repo's card any time later.",
   });
 }
 
+/** What a trial's failure is about: a command of its kind, or its service's start command. */
+export type TrialFailureKind = TrialRow['kind'] | 'serve';
+
 /** Why a trial did not pass, as the trial step tells it. */
 export interface TrialFailure {
-  /** The command that did not pass, and its kind; null when the trial stopped for another reason. */
-  kind: 'setup' | 'verify' | null;
+  /**
+   * The command that did not pass, and its kind (`serve`: the start command of a service that did
+   * not become ready); null when the trial stopped for another reason.
+   */
+  kind: TrialFailureKind | null;
   command: string | null;
   /** What went wrong, said after the command (or alone without one). */
   reason: string;
@@ -281,7 +308,11 @@ export interface TrialFailure {
   advice: string;
 }
 
-/** Why the trial failed; null unless it did. */
+/**
+ * Why the trial failed, the first thing that went wrong in the order the trial goes: a setup
+ * command, then the service not becoming ready, then a verify command (which run whether the
+ * service did or not); else why it could not go on. null unless it failed.
+ */
 export function trialFailure(
   trial: Pick<
     RepoTrial,
@@ -289,55 +320,13 @@ export function trialFailure(
   >,
 ): TrialFailure | null {
   if (trial.status !== 'failed') return null;
-  const row = trialRows(trial).find((r) => r.state === 'failed');
-  const r = row?.result;
-  if (row && r) {
-    const at = { kind: row.kind, command: row.command };
-    if (r.missingProgram) {
-      return {
-        ...at,
-        reason: t({
-          zh: `没能运行：运行环境里找不到 ${r.missingProgram}。`,
-          en: `could not run: ${r.missingProgram} is not found in the environment.`,
-        }),
-        advice: t({
-          zh: `这是 Master 运行环境的问题，不是命令写错了：装好 ${r.missingProgram}，或者让 Master 的 PATH 里能找到它（比如换 Node 版本后重启 Master），再试一次，不用改命令。`,
-          en: `That is a problem of the Master's environment, not a wrong command: install ${r.missingProgram} or make the Master's PATH find it (restart the Master after switching Node versions, say), then try again without changing the commands.`,
-        }),
-      };
-    }
-    if (r.timedOut) {
-      return {
-        ...at,
-        reason: t({ zh: '超时了。', en: 'timed out.' }),
-        advice: t({
-          zh: '展开上面这条命令看输出末尾卡在哪里。命令在等输入或者不会自己结束（比如进了 watch 模式）的话，回到第 2 步换一条；确实要跑这么久，就调大 config.yaml 的 defaults.command_timeout_minutes。',
-          en: 'Open the command above to see where its output stops. If it waits for input or never ends by itself (a watch mode, say), go back to step 2 and change it; if it really takes that long, raise defaults.command_timeout_minutes in config.yaml.',
-        }),
-      };
-    }
-    if (r.exitCode === null) {
-      return {
-        ...at,
-        reason: t({ zh: '被中止了。', en: 'was stopped.' }),
-        advice: t({
-          zh: '命令被终止了（比如 Master 停止了），不一定是命令的问题，再试一次。',
-          en: 'The command was killed (when the Master stops, say), which need not be its fault; try again.',
-        }),
-      };
-    }
-    return {
-      ...at,
-      reason: t({
-        zh: `没通过：退出码 ${r.exitCode}。`,
-        en: `failed with exit code ${r.exitCode}.`,
-      }),
-      advice: t({
-        zh: '展开上面这条命令看输出末尾。命令写错了（比如脚本名不对）就回到第 2 步改；是项目在目标分支上本身就过不了，先修好再试一次。',
-        en: 'Open the command above to see the end of its output. If the command is wrong (a script name, say), go back to step 2 and change it; if the project fails on the target branch as it is, fix that first and try again.',
-      }),
-    };
-  }
+  const rows = trialRows(trial);
+  const failed = (kind: TrialRow['kind']): TrialFailure | null => {
+    const row = rows.find((r) => r.kind === kind && r.state === 'failed');
+    return row?.result ? commandFailure(row, row.result) : null;
+  };
+  const first = failed('setup') ?? serviceFailure(trial) ?? failed('verify');
+  if (first) return first;
   return {
     kind: null,
     command: null,
@@ -351,10 +340,115 @@ export function trialFailure(
   };
 }
 
-export function trialKindLabel(kind: 'setup' | 'verify'): string {
-  return kind === 'setup'
-    ? t({ zh: '准备命令', en: 'The setup command' })
-    : t({ zh: '检查命令', en: 'The verify command' });
+/** Why the service of the trial did not become ready; null when it did or was not started. */
+function serviceFailure(trial: Pick<RepoTrial, 'serve' | 'serviceResult'>): TrialFailure | null {
+  const { serve, serviceResult: r } = trial;
+  if (!serve || !r || r.ok) return null;
+  const at = { kind: 'serve' as const, command: serve.command };
+  switch (r.reason) {
+    case 'timeout': {
+      const n = serve.readyTimeoutSeconds;
+      return {
+        ...at,
+        reason: t({
+          zh: `超时了：${n} 秒内服务没有就绪。`,
+          en: `timed out: the service was not ready within ${n} ${n === 1 ? 'second' : 'seconds'}.`,
+        }),
+        advice: t({
+          zh: `展开上面服务那一行看日志末尾。服务要监听环境变量 PORT 给的端口（比如 vite 要加 --port $PORT），只听自己默认端口的话 Master 等不到它；对就绪路径 ${serve.readyPath} 的请求要收到状态码小于 500 的响应。启动确实慢就回到第 2 步调大就绪超时；启动命令或就绪路径不对，也回到第 2 步改。`,
+          en: `Open the service row above to see the end of its log. The service must listen on the port in the PORT environment variable (vite needs --port $PORT, say): the Master never sees one listening on its own default port. And a request to the ready path ${serve.readyPath} must get an answer with a status below 500. If it really starts that slowly, go back to step 2 and raise the ready timeout; go back there too if the start command or the ready path is wrong.`,
+        }),
+      };
+    }
+    case 'aborted':
+      return {
+        ...at,
+        reason: t({ zh: '被中止了。', en: 'was stopped.' }),
+        advice: t({
+          zh: '服务被停掉了（比如 Master 停止了），不一定是启动命令的问题，再试一次。',
+          en: "The service was stopped (when the Master stops, say), which need not be the start command's fault; try again.",
+        }),
+      };
+    default:
+      return {
+        ...at,
+        reason:
+          r.exitCode === null
+            ? t({
+                zh: '在服务就绪之前就退出了。',
+                en: 'exited before the service was ready.',
+              })
+            : t({
+                zh: `在服务就绪之前就退出了（退出码 ${r.exitCode}）。`,
+                en: `exited before the service was ready (exit code ${r.exitCode}).`,
+              }),
+        advice: t({
+          zh: '展开上面服务那一行看日志末尾。启动命令要一直在前台运行到被停掉，不能把服务放到后台就退出（不要加 &，也不要用守护进程模式）；服务要监听环境变量 PORT 给的端口，写死的端口被占用也会让它退出。启动命令写错了就回到第 2 步改；是项目在目标分支上本身起不来，先修好再试一次。',
+          en: 'Open the service row above to see the end of its log. The start command must keep running in the foreground until it is stopped, not put the service in the background and exit (no trailing &, no daemon mode); and the service must listen on the port in the PORT environment variable, as a fixed port already taken makes it exit too. If the start command is wrong, go back to step 2 and change it; if the project does not start on the target branch as it is, fix that first and try again.',
+        }),
+      };
+  }
+}
+
+/** Why a command of the trial did not pass: its row, and its result. */
+function commandFailure(row: TrialRow, r: RepoTrialResult): TrialFailure {
+  const at = { kind: row.kind, command: row.command };
+  if (r.missingProgram) {
+    return {
+      ...at,
+      reason: t({
+        zh: `没能运行：运行环境里找不到 ${r.missingProgram}。`,
+        en: `could not run: ${r.missingProgram} is not found in the environment.`,
+      }),
+      advice: t({
+        zh: `这是 Master 运行环境的问题，不是命令写错了：装好 ${r.missingProgram}，或者让 Master 的 PATH 里能找到它（比如换 Node 版本后重启 Master），再试一次，不用改命令。`,
+        en: `That is a problem of the Master's environment, not a wrong command: install ${r.missingProgram} or make the Master's PATH find it (restart the Master after switching Node versions, say), then try again without changing the commands.`,
+      }),
+    };
+  }
+  if (r.timedOut) {
+    return {
+      ...at,
+      reason: t({ zh: '超时了。', en: 'timed out.' }),
+      advice: t({
+        zh: '展开上面这条命令看输出末尾卡在哪里。命令在等输入或者不会自己结束（比如进了 watch 模式）的话，回到第 2 步换一条；确实要跑这么久，就调大 config.yaml 的 defaults.command_timeout_minutes。',
+        en: 'Open the command above to see where its output stops. If it waits for input or never ends by itself (a watch mode, say), go back to step 2 and change it; if it really takes that long, raise defaults.command_timeout_minutes in config.yaml.',
+      }),
+    };
+  }
+  if (r.exitCode === null) {
+    return {
+      ...at,
+      reason: t({ zh: '被中止了。', en: 'was stopped.' }),
+      advice: t({
+        zh: '命令被终止了（比如 Master 停止了），不一定是命令的问题，再试一次。',
+        en: 'The command was killed (when the Master stops, say), which need not be its fault; try again.',
+      }),
+    };
+  }
+  return {
+    ...at,
+    reason: t({
+      zh: `没通过：退出码 ${r.exitCode}。`,
+      en: `failed with exit code ${r.exitCode}.`,
+    }),
+    advice: t({
+      zh: '展开上面这条命令看输出末尾。命令写错了（比如脚本名不对）就回到第 2 步改；是项目在目标分支上本身就过不了，先修好再试一次。',
+      en: 'Open the command above to see the end of its output. If the command is wrong (a script name, say), go back to step 2 and change it; if the project fails on the target branch as it is, fix that first and try again.',
+    }),
+  };
+}
+
+/** What a failure's command is, before it: which kind of command, or the start command. */
+export function trialKindLabel(kind: TrialFailureKind): string {
+  switch (kind) {
+    case 'setup':
+      return t({ zh: '准备命令', en: 'The setup command' });
+    case 'verify':
+      return t({ zh: '检查命令', en: 'The verify command' });
+    case 'serve':
+      return t({ zh: '启动命令', en: 'The start command' });
+  }
 }
 
 /**

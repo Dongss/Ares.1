@@ -1,7 +1,13 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import type { RepoSourceView, RepoTrial, RepoTrialResult } from '../../../src/api/types.js';
+import type {
+  RepoSourceView,
+  RepoTrial,
+  RepoTrialResult,
+  RepoTrialService,
+} from '../../../src/api/types.js';
 import { REPO_SOURCE_DEFAULTS } from '../../../src/config/flow.js';
 import { setLang } from '../../../src/i18n.js';
+import type { RepoServe } from '../../../src/store/types.js';
 import {
   backToStepLabel,
   commandsWarning,
@@ -34,7 +40,13 @@ afterEach(() => setLang('zh'));
 
 const CJK = /[　-〿一-鿿＀-￯]/;
 
-const saved = { setupCommands: ['npm ci'], verifyCommands: ['npm run build', 'npm test'] };
+const saved = {
+  setupCommands: ['npm ci'],
+  verifyCommands: ['npm run build', 'npm test'],
+  serve: null as RepoServe | null,
+};
+const serve: RepoServe = { command: 'npm run dev', readyPath: '/health', readyTimeoutSeconds: 30 };
+const savedWithServe = { ...saved, serve };
 
 function trial(extra: Partial<RepoTrial> = {}): RepoTrial {
   return {
@@ -76,6 +88,39 @@ function failedAt(last: Partial<RepoTrialResult>): RepoTrial {
       result({ kind: 'setup', command: 'npm ci', ok: true, exitCode: 0 }),
       result({ command: 'npm run build', ok: true, exitCode: 0 }),
       result(last),
+    ],
+  });
+}
+
+function service(extra: Partial<RepoTrialService>): RepoTrialService {
+  return {
+    ok: false,
+    reason: 'timeout',
+    exitCode: null,
+    url: null,
+    port: 41234,
+    durationMs: 30_000,
+    outputTail: 'listening on 5173',
+    ...extra,
+  };
+}
+
+/**
+ * A failed trial of `serve` whose service went as `how`: `npm ci` passed, and so did the verify
+ * commands unless `verify` says otherwise.
+ */
+function serviceFailed(
+  how: Partial<RepoTrialService>,
+  verify: Partial<RepoTrialResult> = { ok: true, exitCode: 0 },
+): RepoTrial {
+  return trial({
+    status: 'failed',
+    serve,
+    serviceResult: service(how),
+    results: [
+      result({ kind: 'setup', command: 'npm ci', ok: true, exitCode: 0 }),
+      result({ command: 'npm run build', ...verify }),
+      result({ command: 'npm test', ok: true, exitCode: 0 }),
     ],
   });
 }
@@ -193,6 +238,14 @@ describe('the steps', () => {
     expect(onboardStepSummary('source')).toContain('ares1:ready');
   });
 
+  it('speak of the start command where the commands are filled in and tried', () => {
+    expect(onboardStepSummary('commands')).toContain('启动命令');
+    expect(onboardStepSummary('commands')).toContain('采用建议');
+    expect(onboardStepSummary('trial')).toContain('起服务');
+    expect(onboardEntryHint()).toContain('启动命令');
+    expect(skipTrialWarning()).toContain('服务起不来');
+  });
+
   it('say that closing keeps the repo once it is registered', () => {
     expect(onboardCloseNote('register')).toBeNull();
     expect(onboardCloseNote('done')).toBeNull();
@@ -203,10 +256,13 @@ describe('the steps', () => {
 });
 
 describe('the commands step', () => {
-  it('detects by itself only while the repo has no commands saved', () => {
-    expect(detectsOnEntry({ verifyCommands: [], setupCommands: [] })).toBe(true);
-    expect(detectsOnEntry({ verifyCommands: [' '], setupCommands: [] })).toBe(true);
-    expect(detectsOnEntry({ verifyCommands: [], setupCommands: ['npm ci'] })).toBe(false);
+  it('detects by itself only while the repo has no commands and no service saved', () => {
+    expect(detectsOnEntry({ verifyCommands: [], setupCommands: [], serve: null })).toBe(true);
+    expect(detectsOnEntry({ verifyCommands: [' '], setupCommands: [], serve: null })).toBe(true);
+    expect(detectsOnEntry({ verifyCommands: [], setupCommands: ['npm ci'], serve: null })).toBe(
+      false,
+    );
+    expect(detectsOnEntry({ verifyCommands: [], setupCommands: [], serve })).toBe(false);
     expect(detectsOnEntry(saved)).toBe(false);
   });
 
@@ -231,6 +287,26 @@ describe('the trial step', () => {
     );
     // One under way blocks another, whatever it tries.
     expect(trialOutcome(trial({ status: 'running', setupCommands: [] }), saved)).toBe('running');
+  });
+
+  it('counts the latest trial only when it tried the saved service', () => {
+    expect(trialOutcome(trial({ serve }), savedWithServe)).toBe('passed');
+    expect(trialOutcome(trial({ serve: { ...serve } }), savedWithServe)).toBe('passed');
+    expect(trialOutcome(trial({ status: 'failed', serve }), savedWithServe)).toBe('failed');
+    // A service saved since, or removed since, or tried from the edit form.
+    expect(trialOutcome(trial(), savedWithServe)).toBe('none');
+    expect(trialOutcome(trial({ serve }), saved)).toBe('none');
+    // Every setting counts: the start command, the ready path and the ready timeout.
+    expect(trialOutcome(trial({ serve: { ...serve, command: 'npm start' } }), savedWithServe)).toBe(
+      'none',
+    );
+    expect(trialOutcome(trial({ serve: { ...serve, readyPath: '/' } }), savedWithServe)).toBe(
+      'none',
+    );
+    expect(
+      trialOutcome(trial({ serve: { ...serve, readyTimeoutSeconds: 120 } }), savedWithServe),
+    ).toBe('none');
+    expect(trialOutcome(trial({ status: 'running' }), savedWithServe)).toBe('running');
   });
 
   it('goes on only once the trial passed, and can be skipped otherwise', () => {
@@ -285,6 +361,64 @@ describe('the trial step', () => {
     expect(missing?.advice).toContain('不用改命令');
     expect(trialKindLabel('setup')).toBe('准备命令');
     expect(trialKindLabel('verify')).toBe('检查命令');
+    expect(trialKindLabel('serve')).toBe('启动命令');
+  });
+
+  it('tells a service that timed out from one that exited, with what to do', () => {
+    const timedOut = trialFailure(serviceFailed({ reason: 'timeout' }));
+    expect(timedOut).toMatchObject({ kind: 'serve', command: 'npm run dev' });
+    expect(timedOut?.reason).toBe('超时了：30 秒内服务没有就绪。');
+    expect(timedOut?.advice).toContain('PORT');
+    expect(timedOut?.advice).toContain('/health');
+    expect(timedOut?.advice).toContain('调大就绪超时');
+    expect(timedOut?.advice).toContain('回到第 2 步');
+
+    const exited = trialFailure(serviceFailed({ reason: 'exited', exitCode: 1 }));
+    expect(exited).toMatchObject({ kind: 'serve', command: 'npm run dev' });
+    expect(exited?.reason).toBe('在服务就绪之前就退出了（退出码 1）。');
+    expect(exited?.advice).toContain('前台');
+    expect(exited?.advice).toContain('PORT');
+    expect(exited?.advice).toContain('回到第 2 步');
+    // Ended by a signal, or not started at all.
+    expect(trialFailure(serviceFailed({ reason: 'exited', exitCode: null }))?.reason).toBe(
+      '在服务就绪之前就退出了。',
+    );
+
+    const stopped = trialFailure(serviceFailed({ reason: 'aborted' }));
+    expect(stopped).toMatchObject({ kind: 'serve', reason: '被中止了。' });
+    expect(stopped?.advice).toContain('再试一次');
+  });
+
+  it('tells the first thing that went wrong: setup, then the service, then verify', () => {
+    // The service before a verify command that failed after it.
+    const both = trialFailure(serviceFailed({ reason: 'timeout' }, { exitCode: 2 }));
+    expect(both?.kind).toBe('serve');
+    // A service that answered leaves the verify command to blame.
+    const verify = trialFailure(
+      serviceFailed({ ok: true, reason: null, url: 'http://127.0.0.1:41234' }, { exitCode: 2 }),
+    );
+    expect(verify).toMatchObject({ kind: 'verify', command: 'npm run build' });
+    // A setup command that failed: the service was never started.
+    const setup = trialFailure(
+      trial({
+        status: 'failed',
+        serve,
+        results: [result({ kind: 'setup', command: 'npm ci', exitCode: 1 })],
+      }),
+    );
+    expect(setup).toMatchObject({ kind: 'setup', command: 'npm ci' });
+    // A missing program of a verify command is found before anything runs.
+    const missing = trialFailure(
+      trial({
+        status: 'failed',
+        serve,
+        results: [result({ command: 'npm test', exitCode: null, missingProgram: 'npm' })],
+      }),
+    );
+    expect(missing).toMatchObject({ kind: 'verify', command: 'npm test' });
+    // A service never started and no command to blame: the trial's error.
+    const error = trialFailure(trial({ status: 'failed', serve, error: 'Master 停止了' }));
+    expect(error).toMatchObject({ kind: null, command: null });
   });
 
   it('says why when no command is to blame', () => {
@@ -403,12 +537,17 @@ describe('in English', () => {
       failedAt({ exitCode: null, missingProgram: 'node' }),
       trial({ status: 'failed', error: 'cannot read the target branch main' }),
       trial({ status: 'failed' }),
+      serviceFailed({ reason: 'timeout' }),
+      serviceFailed({ reason: 'exited', exitCode: 1 }),
+      serviceFailed({ reason: 'exited', exitCode: null }),
+      serviceFailed({ reason: 'aborted' }),
     ];
     for (const f of failures) {
       const failure = trialFailure(f);
+      expect(failure).not.toBeNull();
       texts.push(failure?.reason ?? '', failure?.advice ?? '');
     }
-    texts.push(trialKindLabel('setup'), trialKindLabel('verify'));
+    texts.push(trialKindLabel('setup'), trialKindLabel('verify'), trialKindLabel('serve'));
     for (const source of [github, githubInferred, gitlab, backlog, null]) {
       texts.push(sourceStepNote(source), onboardDoneLead('demo', source));
       for (const step of onboardNextSteps('demo', source)) {
@@ -426,6 +565,14 @@ describe('in English', () => {
 
     expect(onboardStepHeading('trial')).toBe('Step 3: Trial run');
     expect(trialFailure(failedAt({ exitCode: 2 }))?.reason).toBe('failed with exit code 2.');
+    expect(trialFailure(serviceFailed({ reason: 'timeout' }))?.reason).toBe(
+      'timed out: the service was not ready within 30 seconds.',
+    );
+    expect(trialFailure(serviceFailed({ reason: 'exited', exitCode: 1 }))?.reason).toBe(
+      'exited before the service was ready (exit code 1).',
+    );
+    expect(trialKindLabel('serve')).toBe('The start command');
+    expect(onboardEntryHint()).toContain('start command');
     expect(onboardDoneLead('demo', backlog)).toBe(
       'demo is in, its requirements coming from the local backlog. Next:',
     );
