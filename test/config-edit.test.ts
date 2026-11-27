@@ -1,11 +1,30 @@
+import {
+  chmodSync,
+  lstatSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+} from 'node:fs';
+import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { parse as parseYaml } from 'yaml';
 import type { RepoSourceInput } from '../src/api/types.js';
 import { defaultConfigYaml } from '../src/config/defaults.js';
-import { editRepoSource, RepoSourceInputSchema } from '../src/config/edit.js';
-import { ConfigError } from '../src/config/load.js';
+import {
+  editRepoSource,
+  RepoSourceInputSchema,
+  SourceEditConflict,
+  SourceEditInvalid,
+  saveRepoSource,
+  watcherDeps,
+} from '../src/config/edit.js';
+import { ConfigError, type HomePaths, homePaths, loadConfig } from '../src/config/load.js';
 import { MasterConfigSchema } from '../src/config/schema.js';
+import { ConfigWatcher } from '../src/config/watch.js';
 import { setLang } from '../src/i18n.js';
+import { TEST_WORKFLOW_YAML, tmpDir, writeFile } from './helpers.js';
 
 afterEach(() => setLang('zh'));
 
@@ -390,5 +409,226 @@ describe('RepoSourceInputSchema', () => {
       template: 'a',
     });
     expect(result.error?.issues[0]?.message).toBe('格式应为 group/name 或 group/subgroup/name');
+  });
+});
+
+describe('saveRepoSource', () => {
+  const KNOWN = ['fake', 'claude-code', 'cursor-agent', 'codex'];
+  const READ_ONLY = ['claude-code', 'codex'];
+  const AGENTS = `agents:
+  coder: { cli: fake, model: coder }
+  reviewer: { cli: fake, model: reviewer }
+  scout: { cli: claude-code, model: haiku }
+  writer: { cli: cursor-agent, model: auto }
+  off: { cli: claude-code, model: haiku, enabled: false }
+`;
+  const SAVED = `# my Master
+language: zh
+port: 4870
+
+# issues on GitHub
+github:
+  repos:
+    app:
+      template: dev            # the template of its Runs
+      push: true
+`;
+  /** A template a repo keeps in its own .ares1/workflows/. */
+  const OWN = TEST_WORKFLOW_YAML.replace('id: dev', 'id: own');
+
+  /** A Master home with `config` as config.yaml (none when null), and its watcher. */
+  function home(config: string | null, configFile?: string) {
+    const paths: HomePaths = homePaths(tmpDir('ares1-edit-'));
+    writeFile(paths.agentsFile, AGENTS);
+    writeFile(join(paths.workflowsDir, 'dev.yaml'), TEST_WORKFLOW_YAML);
+    if (configFile) {
+      writeFile(configFile, config ?? '');
+      symlinkSync(configFile, paths.configFile);
+    } else if (config !== null) {
+      writeFile(paths.configFile, config);
+    }
+    const initial = loadConfig(paths, KNOWN, READ_ONLY);
+    const watcher = new ConfigWatcher(paths, KNOWN, initial, undefined, READ_ONLY);
+    const save = (repo: string, input: RepoSourceInput) =>
+      saveRepoSource(watcherDeps(watcher, paths.configFile), repo, input);
+    return { paths, watcher, save };
+  }
+
+  /** The problems a save refuses with; fails when it does not refuse. */
+  function refusal(save: () => unknown): readonly string[] {
+    try {
+      save();
+    } catch (err) {
+      expect(err).toBeInstanceOf(SourceEditInvalid);
+      return (err as SourceEditInvalid).problems;
+    }
+    throw new Error('saved');
+  }
+
+  /** Files left in `dir` by a save: none should be. */
+  const leftovers = (dir: string) => readdirSync(dir).filter((f) => f.endsWith('.tmp'));
+
+  it('writes the entry and puts the new configuration in use at once', () => {
+    const { paths, watcher, save } = home(SAVED);
+    expect(
+      save('site', { platform: 'backlog', template: 'dev', scout: { agent: 'scout', auto: true } }),
+    ).toBe(true);
+    const text = readFileSync(paths.configFile, 'utf8');
+    expect(text.startsWith(SAVED)).toBe(true);
+    expect(raw(text).backlog?.repos).toEqual({
+      site: { template: 'dev', scout: { agent: 'scout', auto: true } },
+    });
+    expect(watcher.current.master.backlog?.repos.site?.scout?.agent).toBe('scout');
+    expect(leftovers(paths.home)).toEqual([]);
+
+    // From GitHub to GitLab: only GitLab has it afterwards.
+    save('app', { platform: 'gitlab', issues_repo: 'group/app', template: 'dev' });
+    expect(Object.keys(watcher.current.master.github?.repos ?? {})).toEqual([]);
+    expect(watcher.current.master.gitlab?.repos.app?.issues_repo).toBe('group/app');
+    expect(readFileSync(paths.configFile, 'utf8')).toContain('# issues on GitHub');
+
+    save('site', { platform: 'none' });
+    expect(watcher.current.master.backlog?.repos).toEqual({});
+  });
+
+  it('makes config.yaml when there is none, and keeps the permissions of one there', () => {
+    const { paths, watcher, save } = home(null);
+    save('site', { platform: 'backlog', template: 'dev' });
+    expect(raw(readFileSync(paths.configFile, 'utf8'))).toEqual({
+      backlog: { repos: { site: { template: 'dev' } } },
+    });
+    expect(watcher.current.master.backlog?.repos.site?.template).toBe('dev');
+
+    chmodSync(paths.configFile, 0o600);
+    save('site', { platform: 'backlog', template: 'dev', auto_merge: true });
+    expect(statSync(paths.configFile).mode & 0o777).toBe(0o600);
+  });
+
+  it('refuses a template that does not exist, leaving config.yaml as it was', () => {
+    const { paths, watcher, save } = home(SAVED);
+    const problems = refusal(() => save('app', { platform: 'backlog', template: 'nope' }));
+    expect(problems).toEqual(['模板 nope 不存在或无效']);
+    expect(readFileSync(paths.configFile, 'utf8')).toBe(SAVED);
+    expect(leftovers(paths.home)).toEqual([]);
+    expect(watcher.current.master.github?.repos.app?.template).toBe('dev');
+  });
+
+  it('takes a template the repo keeps itself, seen by that repo only', () => {
+    const { watcher, save } = home(SAVED);
+    const files = [{ file: 'own.yaml', source: OWN }];
+    watcher.setRepoSources(new Map([['site', { branch: 'main', sha: 'abc', files }]]), {
+      notify: false,
+    });
+    expect(save('site', { platform: 'backlog', template: 'own' })).toBe(true);
+    expect(watcher.current.master.backlog?.repos.site?.template).toBe('own');
+    expect(refusal(() => save('other', { platform: 'backlog', template: 'own' }))).toEqual([
+      '模板 own 不存在或无效',
+    ]);
+  });
+
+  it('refuses a scout agent that is missing, disabled or cannot run read-only', () => {
+    const { paths, save } = home(SAVED);
+    const scouted = (agent: string): RepoSourceInput => ({
+      platform: 'backlog',
+      template: 'dev',
+      scout: { agent },
+    });
+    expect(refusal(() => save('site', scouted('ghost')))).toEqual([
+      '侦察用的 Agent ghost 不存在或未启用',
+    ]);
+    expect(refusal(() => save('site', scouted('off')))).toEqual([
+      '侦察用的 Agent off 不存在或未启用',
+    ]);
+    expect(refusal(() => save('site', scouted('writer')))).toEqual([
+      '侦察要以只读方式运行，Agent writer 的 CLI cursor-agent 不支持，请换用 claude-code、codex 的 Agent',
+    ]);
+    expect(readFileSync(paths.configFile, 'utf8')).toBe(SAVED);
+    expect(leftovers(paths.home)).toEqual([]);
+  });
+
+  it('refuses deliver without push, and what the schema refuses', () => {
+    const { paths, save } = home(SAVED);
+    expect(
+      refusal(() => save('app', { platform: 'github', template: 'dev', deliver: 'pr' }))[0],
+    ).toMatch(/^deliver: pr 要求 push: true/);
+    expect(
+      refusal(() =>
+        save('app', { platform: 'gitlab', issues_repo: 'g/app', template: 'dev', deliver: 'mr' }),
+      )[0],
+    ).toMatch(/^deliver: mr 要求 push: true/);
+    // Not a body the API takes: what the whole file's schema says, one problem a line.
+    const noIssuesRepo = { platform: 'gitlab', template: 'dev' } as RepoSourceInput;
+    expect(refusal(() => save('app', noIssuesRepo))).toEqual([
+      expect.stringMatching(/^gitlab\.repos\.app\.issues_repo: /),
+    ]);
+    expect(readFileSync(paths.configFile, 'utf8')).toBe(SAVED);
+    expect(leftovers(paths.home)).toEqual([]);
+  });
+
+  it('is not stopped by problems another repo had before', () => {
+    const broken = `${SAVED}    broken:\n      template: nope\n`;
+    const { watcher, save } = home(broken);
+    expect(watcher.current.errors['config.yaml#github.repos.broken']).toBeDefined();
+    expect(save('site', { platform: 'backlog', template: 'dev' })).toBe(true);
+    expect(watcher.current.master.backlog?.repos.site?.template).toBe('dev');
+    expect(watcher.current.errors['config.yaml#github.repos.broken']).toBeDefined();
+  });
+
+  it('refuses to touch a config.yaml that does not load as it is', () => {
+    const { paths, save } = home(SAVED);
+    for (const bad of ['port: [\n', 'port: abc\n']) {
+      writeFile(paths.configFile, bad);
+      expect(() => save('site', { platform: 'backlog', template: 'dev' })).toThrow(
+        SourceEditConflict,
+      );
+      expect(readFileSync(paths.configFile, 'utf8')).toBe(bad);
+      expect(leftovers(paths.home)).toEqual([]);
+    }
+  });
+
+  it('refuses while the last reload failed, even with the file good again', () => {
+    const { paths, watcher, save } = home(SAVED);
+    writeFile(paths.agentsFile, 'agents: [\n');
+    expect(watcher.reload()).toBe(false);
+    writeFile(paths.agentsFile, AGENTS);
+    expect(() => save('site', { platform: 'backlog', template: 'dev' })).toThrow(
+      /配置现在加载不了.*agents\.yaml 不是合法的 YAML/s,
+    );
+    expect(readFileSync(paths.configFile, 'utf8')).toBe(SAVED);
+  });
+
+  it('writes through a symlink to the file it points to', () => {
+    const target = join(tmpDir('ares1-edit-real-'), 'config.yaml');
+    const { paths, watcher, save } = home(SAVED, target);
+    save('site', { platform: 'backlog', template: 'dev' });
+    expect(lstatSync(paths.configFile).isSymbolicLink()).toBe(true);
+    expect(raw(readFileSync(target, 'utf8')).backlog?.repos).toEqual({
+      site: { template: 'dev' },
+    });
+    expect(watcher.current.master.backlog?.repos.site?.template).toBe('dev');
+    expect(leftovers(dirname(target))).toEqual([]);
+    expect(leftovers(paths.home)).toEqual([]);
+    rmSync(dirname(target), { recursive: true, force: true });
+  });
+
+  it('tells the problems in English', () => {
+    setLang('en');
+    const { paths, save } = home(SAVED.replace('language: zh', 'language: en'));
+    const problems = refusal(() =>
+      save('site', { platform: 'backlog', template: 'nope', scout: { agent: 'writer' } }),
+    );
+    expect(problems).toEqual([
+      'Template nope does not exist or is invalid',
+      'The scout runs read-only, which the CLI cursor-agent of agent writer does not support; use an agent of claude-code, codex',
+    ]);
+    writeFile(paths.configFile, 'port: abc\n');
+    let conflict = '';
+    try {
+      save('site', { platform: 'backlog', template: 'dev' });
+    } catch (err) {
+      conflict = (err as Error).message;
+    }
+    expect(conflict).toMatch(/^The configuration does not load as it is now/);
+    expect(`${problems.join('\n')}\n${conflict}`).not.toMatch(/[一-鿿]/);
   });
 });

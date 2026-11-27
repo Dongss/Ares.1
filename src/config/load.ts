@@ -31,7 +31,15 @@ import {
   type WorkflowTemplate,
 } from './schema.js';
 
-export class ConfigError extends Error {}
+export class ConfigError extends Error {
+  constructor(
+    message: string,
+    /** The problems one by one, without the heading of the message; the message alone if one. */
+    readonly problems: readonly string[] = [message],
+  ) {
+    super(message);
+  }
+}
 
 export interface HomePaths {
   home: string;
@@ -650,9 +658,10 @@ function parseMaster(file: string): { master: MasterConfig; warnings: string[] }
   const raw = readYaml(file, 'config.yaml');
   const parsed = MasterConfigSchema.safeParse(raw ?? {});
   if (!parsed.success) {
+    const problems = formatZod(parsed.error);
     throw new ConfigError(
-      t({ zh: 'config.yaml 无效：\n', en: 'config.yaml is invalid:\n' }) +
-        formatZod(parsed.error).join('\n'),
+      t({ zh: 'config.yaml 无效：\n', en: 'config.yaml is invalid:\n' }) + problems.join('\n'),
+      problems,
     );
   }
   // The configured language applies from here on, so that the rest of the configuration is

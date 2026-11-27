@@ -7,7 +7,21 @@
 // entries and every comment stay. An entry edited where it already is keeps the comments of the
 // lines that stay. Only the fields of the request are written, so the schema's defaults apply to
 // the rest just as when the file is edited by hand.
+//
+// Saving loads the edited file as the Master would before it takes the place of config.yaml, and
+// puts the result in use at once.
 
+import { randomBytes } from 'node:crypto';
+import {
+  chmodSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
+import { dirname, join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import {
   Document,
@@ -23,15 +37,24 @@ import {
 } from 'yaml';
 import { z } from 'zod';
 import type { RepoSourceInput } from '../api/types.js';
-import { t } from '../i18n.js';
-import { ConfigError } from './load.js';
+import { join as joinList, t } from '../i18n.js';
+import { errorMessage } from '../util.js';
 import {
+  backlogConfigKey,
+  ConfigError,
+  githubConfigKey,
+  gitlabConfigKey,
+  type LoadedConfig,
+} from './load.js';
+import {
+  type AgentConfig,
   AutoAcceptSchema,
   GitHubRepoSchema,
   GitLabRepoSchema,
   ProposalSourceSchema,
   ScoutConfigSchema,
 } from './schema.js';
+import type { ConfigWatcher } from './watch.js';
 
 // ---------------------------------------------------------------------------
 // The request body
@@ -436,4 +459,177 @@ function indexOf(map: YAMLMap, key: string): number {
 
 function isEmpty(node: unknown): boolean {
   return node === null || node === undefined || (isScalar(node) && node.value === null);
+}
+
+// ---------------------------------------------------------------------------
+// Saving
+// ---------------------------------------------------------------------------
+
+/** What saving needs of the configuration in use, as `watcherDeps` takes it from the watcher. */
+export interface SourceEditDeps {
+  /** config.yaml's path (a symlink is written through, to the file it points to). */
+  configFile: string;
+  /** Why the configuration failed to load the last time it was loaded again; null if it loaded. */
+  reloadError: string | null;
+  /** CLIs that can run an agent read-only, as the scout does. */
+  readOnlyClis: readonly string[];
+  /** The configuration as it would load with `configFile` as config.yaml, put to no use. */
+  loadCandidate(configFile: string): LoadedConfig;
+  /** Loads the configuration again and puts it in use; whether it loaded. */
+  reload(): boolean;
+}
+
+/** What saving needs of `watcher`, as it is now: made for one save. */
+export function watcherDeps(watcher: ConfigWatcher, configFile: string): SourceEditDeps {
+  return {
+    configFile,
+    reloadError: watcher.status().reloadError?.message ?? null,
+    readOnlyClis: watcher.readOnlyClis,
+    loadCandidate: (file) => watcher.loadCandidate(file),
+    reload: () => watcher.reload(),
+  };
+}
+
+/** The configuration does not load as it is, so nothing could be checked or written (409). */
+export class SourceEditConflict extends Error {}
+
+/** The settings asked for have problems, listed one by one; config.yaml was left as it was (400). */
+export class SourceEditInvalid extends Error {
+  constructor(readonly problems: readonly string[]) {
+    super(
+      t({
+        zh: '设置有问题，config.yaml 没有改动：\n',
+        en: 'The settings have problems; config.yaml was left as it was:\n',
+      }) + problems.join('\n'),
+    );
+  }
+}
+
+/**
+ * Writes config.yaml with `repo` taking its requirements from where `input` says
+ * (`editRepoSource`), and loads the configuration again. Throws a SourceEditConflict, touching
+ * nothing, when the configuration does not load as it is (the last reload failed, or config.yaml
+ * cannot be read or loaded now); a missing config.yaml counts as an empty one. The edited text is
+ * loaded first as the Master would load it, from a file beside config.yaml; a SourceEditInvalid
+ * lists what is wrong with it, with config.yaml left as it was: an invalid config.yaml, the
+ * repo's problems as the loading rules find them (a missing template, a scout agent that is
+ * missing or disabled, deliver without push, ...), and a scout agent that cannot run read-only.
+ * Problems elsewhere, there before, do not stop it. Otherwise the file takes config.yaml's place
+ * in one rename, so nothing ever reads it half written. Returns whether the reload put the new
+ * configuration in use.
+ *
+ * Every step is synchronous, so two saves never interleave.
+ */
+export function saveRepoSource(
+  deps: SourceEditDeps,
+  repo: string,
+  input: RepoSourceInput,
+): boolean {
+  const text = currentText(deps);
+  let edited: string;
+  try {
+    edited = editRepoSource(text, repo, input);
+  } catch (err) {
+    throw new SourceEditConflict(unloadable(errorMessage(err)));
+  }
+
+  const target = resolvedPath(deps.configFile);
+  // Not named config.yaml, so that watching the directory takes no notice of it.
+  const temp = join(dirname(target), `.config.yaml.${randomBytes(6).toString('hex')}.tmp`);
+  const mode = modeOf(target);
+  writeFileSync(temp, edited, { flag: 'wx' });
+  let renamed = false;
+  try {
+    if (mode !== undefined) chmodSync(temp, mode);
+    const problems = candidateProblems(deps, temp, repo, input);
+    if (problems.length > 0) throw new SourceEditInvalid(problems);
+    renameSync(temp, target);
+    renamed = true;
+  } finally {
+    if (!renamed) rmSync(temp, { force: true });
+  }
+  return deps.reload();
+}
+
+/** config.yaml's text, once the configuration is known to load as it is. */
+function currentText(deps: SourceEditDeps): string {
+  if (deps.reloadError !== null) throw new SourceEditConflict(unloadable(deps.reloadError));
+  let text = '';
+  try {
+    text = readFileSync(deps.configFile, 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw new SourceEditConflict(unloadable(errorMessage(err)));
+    }
+  }
+  try {
+    deps.loadCandidate(deps.configFile);
+  } catch (err) {
+    throw new SourceEditConflict(unloadable(errorMessage(err)));
+  }
+  return text;
+}
+
+/** What is wrong with `repo`'s settings once `file` is loaded as config.yaml. */
+function candidateProblems(
+  deps: SourceEditDeps,
+  file: string,
+  repo: string,
+  input: RepoSourceInput,
+): string[] {
+  let candidate: LoadedConfig;
+  try {
+    candidate = deps.loadCandidate(file);
+  } catch (err) {
+    return err instanceof ConfigError ? [...err.problems] : [errorMessage(err)];
+  }
+  const keys = [githubConfigKey(repo), gitlabConfigKey(repo), backlogConfigKey(repo)];
+  const problems = keys.flatMap((key) => candidate.errors[key] ?? []);
+  if (input.platform === 'none') return problems;
+  // The loading rules only ask that the scout's agent be enabled; scouting refuses it later if
+  // its CLI cannot run read-only, and the dashboard tells that now.
+  const scout = candidate.master[input.platform]?.repos[repo]?.scout;
+  const agent = scout ? candidate.agents.get(scout.agent) : undefined;
+  if (agent && !deps.readOnlyClis.includes(agent.cli)) {
+    problems.push(scoutNotReadOnly(agent, deps.readOnlyClis));
+  }
+  return problems;
+}
+
+function scoutNotReadOnly(agent: AgentConfig, readOnlyClis: readonly string[]): string {
+  const readOnly = joinList(readOnlyClis);
+  return readOnly
+    ? t({
+        zh: `侦察要以只读方式运行，Agent ${agent.id} 的 CLI ${agent.cli} 不支持，请换用 ${readOnly} 的 Agent`,
+        en: `The scout runs read-only, which the CLI ${agent.cli} of agent ${agent.id} does not support; use an agent of ${readOnly}`,
+      })
+    : t({
+        zh: `侦察要以只读方式运行，Agent ${agent.id} 的 CLI ${agent.cli} 不支持，请换用支持只读的 CLI 的 Agent`,
+        en: `The scout runs read-only, which the CLI ${agent.cli} of agent ${agent.id} does not support; use an agent of a CLI that supports read-only`,
+      });
+}
+
+function unloadable(reason: string): string {
+  return t({
+    zh: `配置现在加载不了，改好之后才能在看板上设置需求来源：${reason}`,
+    en: `The configuration does not load as it is now; fix it before setting a requirements source on the dashboard: ${reason}`,
+  });
+}
+
+/** The file a symlink points to, so that writing keeps the link; the path itself when missing. */
+function resolvedPath(file: string): string {
+  try {
+    return realpathSync(file);
+  } catch {
+    return file;
+  }
+}
+
+/** The permissions of an existing file, for the file that takes its place to keep them. */
+function modeOf(file: string): number | undefined {
+  try {
+    return statSync(file).mode & 0o777;
+  } catch {
+    return undefined;
+  }
 }

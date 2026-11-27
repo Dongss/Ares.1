@@ -68,7 +68,7 @@ export class ConfigWatcher {
     initial: LoadedConfig,
     private readonly onChange: (change: ConfigChange) => void = () => {},
     /** CLIs that can run an agent read-only (see `loadConfig`). */
-    private readonly readOnlyClis: readonly string[] = [],
+    readonly readOnlyClis: readonly string[] = [],
   ) {
     this.config = initial;
     this.startup = initial.master;
@@ -92,6 +92,18 @@ export class ConfigWatcher {
   /** Load the files again now. Returns whether the new configuration is in use. */
   reload(): boolean {
     return this.load(true);
+  }
+
+  /**
+   * The configuration as a reload would load it now with `configFile` read as config.yaml: for
+   * checking a config.yaml before it is written. Neither put in use nor told; throws as
+   * `loadConfig` does, and like it applies the file's language.
+   */
+  loadCandidate(configFile: string): LoadedConfig {
+    return loadConfig({ ...this.paths, configFile }, this.knownClis, this.readOnlyClis, {
+      repoSources: this.repoSources,
+      previous: this.config,
+    });
   }
 
   /**
@@ -120,10 +132,7 @@ export class ConfigWatcher {
   private load(notify: boolean): boolean {
     let next: LoadedConfig;
     try {
-      next = loadConfig(this.paths, this.knownClis, this.readOnlyClis, {
-        repoSources: this.repoSources,
-        previous: this.config,
-      });
+      next = this.loadCandidate(this.paths.configFile);
     } catch (err) {
       this.reloadError = { message: errorMessage(err), at: nowIso() };
       if (notify) this.onChange({ type: 'reload_failed', message: this.reloadError.message });
