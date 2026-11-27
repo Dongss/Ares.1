@@ -1563,6 +1563,37 @@ button.flow-stage-body:hover:not(:disabled) {
 .proposals-none {
   margin-top: 12px;
 }
+.write-requirement .form-actions {
+  flex-wrap: wrap;
+}
+.write-requirement-done {
+  margin-top: 6px;
+}
+.write-requirement-form {
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-2);
+}
+.write-requirement-form .field {
+  margin-bottom: 10px;
+}
+.write-requirement-kind {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+.write-requirement-kind .field {
+  margin-bottom: 4px;
+}
+.write-requirement-actions {
+  margin-top: 10px;
+}
+@media (max-width: 720px) {
+  .write-requirement-kind {
+    grid-template-columns: 1fr;
+  }
+}
 
 /* work switch */
 .work-toggle {

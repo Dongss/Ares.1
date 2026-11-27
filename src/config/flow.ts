@@ -166,6 +166,16 @@ export function authorDecides(p: Pick<Proposal, 'author' | 'status'>): boolean {
 }
 
 /**
+ * Longest title of a requirement a human writes (POST /api/proposals), in characters once
+ * trimmed: one line, as a Run's title shows it. The dashboard's form stops there too.
+ */
+export const REQUIREMENT_TITLE_MAX = 200;
+/** Longest text of each other field of a requirement a human writes, and of each list item. */
+export const REQUIREMENT_TEXT_MAX = 20_000;
+/** Most items of a list (evidence, acceptance criteria) of a requirement a human writes. */
+export const REQUIREMENT_ITEMS_MAX = 50;
+
+/**
  * Every kind of proposal (risk × size), split into those the Master accepts by itself under
  * `limits` and those left to a human. `rule` is the auto-accept rule; tests may pass another.
  */

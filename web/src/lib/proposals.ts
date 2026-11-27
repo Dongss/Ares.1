@@ -1,7 +1,19 @@
-import type { BacklogRepoStatus, BacklogStatus, ProposalView } from '../../../src/api/types.js';
-import { authorDecides, isAutoAcceptable } from '../../../src/config/flow.js';
+import type {
+  BacklogRepoStatus,
+  BacklogStatus,
+  ProposalView,
+  ProposalWritten,
+} from '../../../src/api/types.js';
+import {
+  authorDecides,
+  isAutoAcceptable,
+  REQUIREMENT_ITEMS_MAX,
+  REQUIREMENT_TEXT_MAX,
+  REQUIREMENT_TITLE_MAX,
+} from '../../../src/config/flow.js';
 import { join, t } from '../../../src/i18n.js';
 import type { FailedAttempt, ProposalStatus, ScoutProposal } from '../../../src/store/types.js';
+import type { RequirementInput } from './api.js';
 import { formatTime, type Tone } from './format.js';
 import { type AcceptLimits, badge } from './issues.js';
 import { redoText } from './runs.js';
@@ -109,6 +121,145 @@ export function canReject(p: Pick<ProposalView, 'status'>, reason: string): bool
 /** The mark of a proposal a human wrote (POST /api/proposals), beside its status. */
 export function humanMark(p: Pick<ProposalView, 'author'>): string | null {
   return p.author === 'human' ? t({ zh: '人写的', en: 'Human-written' }) : null;
+}
+
+// ---- writing a requirement ----------------------------------------------------------
+
+/** What a human typed into the form that writes a requirement, before it is sent. */
+export interface RequirementDraft {
+  title: string;
+  what: string;
+  /** Optional. */
+  why: string;
+  /** The acceptance criteria, one per line; optional. */
+  acceptance: string;
+  category: ScoutProposal['category'];
+  size: ScoutProposal['size'];
+  risk: ScoutProposal['risk'];
+}
+
+/** An empty form: feature, M and mid, what the Master takes when they are left out. */
+export function emptyDraft(): RequirementDraft {
+  return {
+    title: '',
+    what: '',
+    why: '',
+    acceptance: '',
+    category: 'feature',
+    size: 'M',
+    risk: 'mid',
+  };
+}
+
+/**
+ * The mark a line of a list may start with, as people paste them: a bullet followed by a space
+ * (`- `, `* `, `+ `) or `•`, a number (`1. `, `1) `, `1、`), and a task box (`[ ] `, `[x] `)
+ * after either or alone. A bullet needs its space, so that 「-1 表示不限」 or 「1.5 秒内」 keep
+ * their first character.
+ */
+const LIST_MARK = /^(?:[-*+](?:\s+|$)|•\s*|\d+(?:[.)](?:\s+|$)|、\s*))?(?:\[[ xX]\](?:\s+|$))?/;
+
+/**
+ * The acceptance criteria written one per line, as the list sent: each line trimmed and without
+ * the list mark it may start with (`- [ ] `, `- `, `1. `…), blank ones dropped.
+ */
+export function acceptanceItems(text: string): string[] {
+  return text
+    .split(/\r?\n/)
+    .map((line) => line.trim().replace(LIST_MARK, '').trim())
+    .filter((item) => item !== '');
+}
+
+/**
+ * Why the requirement cannot be written yet, as the Master would refuse it: the repo has problems
+ * (shown above the form), there is no title or no what to do, or something is longer than the
+ * Master takes. null when it can be sent.
+ */
+export function writeBlocker(
+  repo: Pick<BacklogRepoStatus, 'problems'>,
+  draft: RequirementDraft,
+): string | null {
+  if (repo.problems.length > 0) {
+    return t({
+      zh: '这个仓库的配置有问题（见上面），改好之后才能写需求',
+      en: 'The repo has problems (see above); fix them before writing a requirement',
+    });
+  }
+  const title = draft.title.trim();
+  if (title === '') return t({ zh: '先写标题', en: 'Write a title first' });
+  if (title.length > REQUIREMENT_TITLE_MAX) {
+    return t({
+      zh: `标题最多 ${REQUIREMENT_TITLE_MAX} 个字`,
+      en: `A title has at most ${REQUIREMENT_TITLE_MAX} characters`,
+    });
+  }
+  const what = draft.what.trim();
+  if (what === '') return t({ zh: '写清楚要做什么', en: 'Say what to do' });
+  const tooLong = (field: string) =>
+    t({
+      zh: `${field}最多 ${REQUIREMENT_TEXT_MAX} 个字`,
+      en: `${field} has at most ${REQUIREMENT_TEXT_MAX} characters`,
+    });
+  if (what.length > REQUIREMENT_TEXT_MAX) {
+    return tooLong(t({ zh: '「要做什么」', en: '"What to do"' }));
+  }
+  if (draft.why.trim().length > REQUIREMENT_TEXT_MAX) {
+    return tooLong(t({ zh: '「为什么」', en: '"Why"' }));
+  }
+  const items = acceptanceItems(draft.acceptance);
+  if (items.length > REQUIREMENT_ITEMS_MAX) {
+    return t({
+      zh: `验收标准最多 ${REQUIREMENT_ITEMS_MAX} 条`,
+      en: `At most ${REQUIREMENT_ITEMS_MAX} acceptance criteria`,
+    });
+  }
+  if (items.some((item) => item.length > REQUIREMENT_TEXT_MAX)) {
+    return tooLong(t({ zh: '每条验收标准', en: 'Each acceptance criterion' }));
+  }
+  return null;
+}
+
+/**
+ * The request that writes the draft into `repo`'s local backlog: the texts trimmed, the
+ * acceptance criteria as a list (`acceptanceItems`), and what is left blank left out. `start`:
+ * accept it at once, or keep it pending for the human to start.
+ */
+export function requirementInput(
+  repo: string,
+  draft: RequirementDraft,
+  start: boolean,
+): RequirementInput {
+  const why = draft.why.trim();
+  const acceptance = acceptanceItems(draft.acceptance);
+  return {
+    repo,
+    title: draft.title.trim(),
+    what: draft.what.trim(),
+    ...(why ? { why } : {}),
+    ...(acceptance.length > 0 ? { acceptance } : {}),
+    category: draft.category,
+    size: draft.size,
+    risk: draft.risk,
+    start,
+  };
+}
+
+/**
+ * What became of a requirement just written, shown once the form folds up: started with its Run,
+ * or kept pending below for the human to accept.
+ */
+export function writtenText(written: Pick<ProposalWritten, 'proposal' | 'run'>): string {
+  const title = written.proposal.title;
+  if (written.run) {
+    return t({
+      zh: `写好了「${title}」，Run ${written.run.id} 已经建好开工`,
+      en: `Wrote "${title}"; Run ${written.run.id} was created to work on it`,
+    });
+  }
+  return t({
+    zh: `写好了「${title}」，先存在下面的提案里；想开工时点「采纳」`,
+    en: `Wrote "${title}" and kept it in the proposals below; accept it when you want it started`,
+  });
 }
 
 /**

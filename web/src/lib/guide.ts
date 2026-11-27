@@ -485,8 +485,8 @@ export function cycleSteps(input: GuideInput, rule?: AutoAcceptRule): CycleStep[
         proposeName,
         ['human'],
         t({
-          zh: '还没有接入 GitHub 或 GitLab，提不了 issue：先在 config.yaml 里配置 github 或 gitlab（两者都不接的仓库用本地提案池，见「需求」页）',
-          en: 'Neither GitHub nor GitLab is set up yet, so no issue can be filed: configure github or gitlab in config.yaml first (repos with neither use the local backlog, see the Issues page)',
+          zh: '还没有接入 GitHub 或 GitLab，提不了 issue：先在 config.yaml 里配置 github 或 gitlab（两者都不接的仓库用本地提案池：侦察把提案写进去，你也可以在「需求」页点「写需求」写自己要做的事，马上开工或先存着）',
+          en: 'Neither GitHub nor GitLab is set up yet, so no issue can be filed: configure github or gitlab in config.yaml first (repos with neither use the local backlog: the scout writes proposals into it, and you can write what you want done with "Write a requirement" on the Issues page, to start at once or keep for later)',
         }),
       )
     : !scout

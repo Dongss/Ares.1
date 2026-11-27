@@ -1,16 +1,25 @@
 import { type ReactNode, useState } from 'react';
 import type {
+  BacklogRepoStatus,
   BacklogStatus,
   ConfigView,
   GitHubRepoStatus,
   GitHubStatus,
   ProposalSourceStatus,
   ProposalView,
+  ProposalWritten,
   UpgradeStatus,
 } from '../../../src/api/types.js';
-import { SCOUT_GOAL_MAX } from '../../../src/config/flow.js';
+import {
+  PROPOSAL_SIZES,
+  REQUIREMENT_TEXT_MAX,
+  REQUIREMENT_TITLE_MAX,
+  RISKS,
+  SCOUT_GOAL_MAX,
+  sizeMeanings,
+} from '../../../src/config/flow.js';
 import { t } from '../../../src/i18n.js';
-import type { Scout, ScoutGap } from '../../../src/store/types.js';
+import { PROPOSAL_CATEGORIES, type Scout, type ScoutGap } from '../../../src/store/types.js';
 import { FailedAttempts, RestartAction } from '../components/Attempts.js';
 import { Badge, ConfirmButton, Empty, ErrorBox, TemplateProblems } from '../components/ui.js';
 import { api } from '../lib/api.js';
@@ -45,6 +54,7 @@ import {
   backlogOutdatedBy,
   canReject,
   decidedText,
+  emptyDraft,
   humanMark,
   mergeProposals,
   PROPOSAL_STATUS,
@@ -54,9 +64,13 @@ import {
   proposalGroups,
   proposalRedoText,
   RECENT_PROPOSALS,
+  type RequirementDraft,
+  requirementInput,
   restartBlocker,
   restartHint,
   scoutProposalFiled,
+  writeBlocker,
+  writtenText,
 } from '../lib/proposals.js';
 import { href } from '../lib/router.js';
 
@@ -443,8 +457,8 @@ function NotConfigured() {
       <pre className="pre">{gitlabExample()}</pre>
       <p>
         {t({
-          zh: '不接代码托管（只在本机的仓库，或托管在别处的项目）：AI 侦察把提案写进本地提案池，自动采纳范围内的直接建成 Run，其余的在这一页采纳或拒绝。',
-          en: 'Without a code host (a repo only on this machine, or hosted elsewhere): the AI scout writes proposals into the local backlog; those within auto-accept become Runs right away, and you accept or reject the others on this page.',
+          zh: '不接代码托管（只在本机的仓库，或托管在别处的项目）：AI 侦察把提案写进本地提案池，自动采纳范围内的直接建成 Run，其余的在这一页采纳或拒绝；你也可以在这一页写自己要做的需求。',
+          en: 'Without a code host (a repo only on this machine, or hosted elsewhere): the AI scout writes proposals into the local backlog; those within auto-accept become Runs right away, and you accept or reject the others on this page, where you can also write requirements of your own.',
         })}
       </p>
       <pre className="pre">{backlogExample()}</pre>
@@ -703,7 +717,7 @@ function BacklogOverview({ status, onPolled }: { status: BacklogStatus; onPolled
               <code>github.repos</code> 或 <code>gitlab.repos</code> 里），需求来自 Master
               自己保存的本地提案池：AI 侦察读代码、文档和 Run
               记录，把值得做的事写成提案；在自动采纳范围内的直接建成
-              Run，其余的等你在下面采纳，或者填上理由拒绝。拒绝的理由会交给这个仓库之后的侦察，免得换个说法再提。
+              Run，其余的等你在下面采纳，或者填上理由拒绝。拒绝的理由会交给这个仓库之后的侦察，免得换个说法再提。你自己要做的事，在仓库卡片上点「写需求」写进去，马上开工或者先存着。
             </>
           ),
           en: (
@@ -714,7 +728,9 @@ function BacklogOverview({ status, onPolled }: { status: BacklogStatus; onPolled
               code, the docs and the Run records and writes down what is worth doing as proposals;
               those within auto-accept become Runs right away, and the others wait for you to accept
               them below or reject them with a reason. The reason goes to the repo's later scouts,
-              so that they do not propose the same thing in other words.
+              so that they do not propose the same thing in other words. To have something of your
+              own done, click "Write a requirement" on the repo's card, and start it at once or keep
+              it for later.
             </>
           ),
         })}
@@ -773,11 +789,12 @@ function BacklogRepo(props: {
           ) : (
             <p className="muted">
               {t({
-                zh: '没有配置侦察（scout），这个仓库就没有新的提案。',
-                en: 'No scout is configured, so the repo gets no new proposals.',
+                zh: '没有配置侦察（scout），这个仓库没有 AI 提的新提案，只做你写的需求。',
+                en: 'No scout is configured, so the repo gets no new proposals from the AI; it works on the requirements you write.',
               })}
             </p>
           )}
+          <WriteRequirement repo={status} onWritten={props.onChanged} />
         </>
       ) : (
         <p className="muted">
@@ -801,6 +818,205 @@ function BacklogRepo(props: {
         )
       )}
     </section>
+  );
+}
+
+/**
+ * A requirement a human writes into the repo's local backlog (POST /api/proposals): a button that
+ * opens the form, which starts it at once or keeps it pending for the human to accept. Disabled,
+ * saying why, while the repo has problems. Only cards of backlog.repos have it: the repos of
+ * GitHub and GitLab take their requirements as issues there.
+ */
+function WriteRequirement({ repo, onWritten }: { repo: BacklogRepoStatus; onWritten: () => void }) {
+  const action = useAction();
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState(emptyDraft);
+  const [written, setWritten] = useState<ProposalWritten | null>(null);
+  const update = (patch: Partial<RequirementDraft>) => setDraft((d) => ({ ...d, ...patch }));
+  const blocker = writeBlocker(repo, draft);
+  const repoBlocked = repo.problems.length > 0;
+  const write = async (start: boolean) => {
+    if (blocker !== null) return;
+    const result = await action.run(() =>
+      api.writeProposal(requirementInput(repo.name, draft, start)),
+    );
+    if (result !== undefined) {
+      setDraft(emptyDraft());
+      setOpen(false);
+      setWritten(result);
+      onWritten();
+    }
+  };
+  return (
+    <div className="write-requirement">
+      <div className="form-actions">
+        <button
+          type="button"
+          aria-expanded={open}
+          disabled={!open && repoBlocked}
+          title={!open && repoBlocked ? (blocker ?? undefined) : undefined}
+          onClick={() => {
+            setOpen(!open);
+            setWritten(null);
+            action.clearError();
+          }}
+        >
+          {open ? t({ zh: '收起', en: 'Close' }) : t({ zh: '写需求', en: 'Write a requirement' })}
+        </button>
+        <span className="muted">
+          {repoBlocked && !open
+            ? blocker
+            : t({
+                zh: '把你自己要做的事写成提案：马上开工，或者先存着以后再采纳',
+                en: 'Write down something you want done as a proposal: start it at once, or keep it to accept later',
+              })}
+        </span>
+      </div>
+      {written && (
+        <div className="hint write-requirement-done">
+          {writtenText(written)}
+          {written.run && (
+            <>
+              {' '}
+              <a href={href.run(written.run.id)}>{t({ zh: '查看 Run', en: 'See the Run' })}</a>
+            </>
+          )}
+        </div>
+      )}
+      {open && (
+        <div className="form write-requirement-form">
+          <label className="field">
+            <span>{t({ zh: '标题', en: 'Title' })}</span>
+            <input
+              value={draft.title}
+              onChange={(e) => update({ title: e.target.value })}
+              maxLength={REQUIREMENT_TITLE_MAX}
+              placeholder={t({
+                zh: '一句话说清要什么，比如「Run 列表能导出成 CSV」',
+                en: 'What you want, in one line, e.g. "Export the Run list as CSV"',
+              })}
+            />
+          </label>
+          <label className="field">
+            <span>{t({ zh: '要做什么', en: 'What to do' })}</span>
+            <textarea
+              value={draft.what}
+              onChange={(e) => update({ what: e.target.value })}
+              maxLength={REQUIREMENT_TEXT_MAX}
+              rows={5}
+              placeholder={t({
+                zh: '具体要改什么、做到什么程度；Agent 照着它做',
+                en: 'What exactly to change, and how far to go; the agents work from it',
+              })}
+            />
+          </label>
+          <label className="field">
+            <span>{t({ zh: '为什么（可选）', en: 'Why (optional)' })}</span>
+            <textarea
+              value={draft.why}
+              onChange={(e) => update({ why: e.target.value })}
+              maxLength={REQUIREMENT_TEXT_MAX}
+              rows={2}
+              placeholder={t({
+                zh: '为什么要做；Agent 取舍时会参考',
+                en: 'Why it is worth doing; the agents weigh their choices by it',
+              })}
+            />
+          </label>
+          <label className="field">
+            <span>
+              {t({
+                zh: '验收标准（可选，每行一条）',
+                en: 'Acceptance criteria (optional, one per line)',
+              })}
+            </span>
+            <textarea
+              value={draft.acceptance}
+              onChange={(e) => update({ acceptance: e.target.value })}
+              rows={3}
+              placeholder={t({
+                zh: '怎样算做完，比如：\n能导出\n有测试',
+                en: 'How to tell it is done, e.g.:\nThe list can be exported\nThere are tests',
+              })}
+            />
+          </label>
+          <div className="form-row write-requirement-kind">
+            <label className="field">
+              <span>{t({ zh: '类别', en: 'Category' })}</span>
+              <select
+                value={draft.category}
+                onChange={(e) =>
+                  update({ category: e.target.value as RequirementDraft['category'] })
+                }
+              >
+                {PROPOSAL_CATEGORIES.map((c) => (
+                  <option key={c} value={c}>
+                    {CATEGORY[c]}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="field">
+              <span>{t({ zh: '大小', en: 'Size' })}</span>
+              <select
+                value={draft.size}
+                onChange={(e) => update({ size: e.target.value as RequirementDraft['size'] })}
+              >
+                {PROPOSAL_SIZES.map((s) => (
+                  <option key={s} value={s}>
+                    {s}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="field">
+              <span>{t({ zh: '风险', en: 'Risk' })}</span>
+              <select
+                value={draft.risk}
+                onChange={(e) => update({ risk: e.target.value as RequirementDraft['risk'] })}
+              >
+                {RISKS.map((r) => (
+                  <option key={r} value={r}>
+                    {RISK[r].label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+          <div className="hint">
+            {t({ zh: `大小 ${draft.size}：`, en: `Size ${draft.size}: ` })}
+            {sizeMeanings()[draft.size]}
+          </div>
+          <ErrorBox>{action.error}</ErrorBox>
+          <div className="form-actions write-requirement-actions">
+            <button
+              type="button"
+              className="btn-primary"
+              disabled={action.busy || blocker !== null}
+              title={blocker ?? undefined}
+              onClick={() => write(true)}
+            >
+              {t({ zh: '写入并开工', en: 'Write and start' })}
+            </button>
+            <button
+              type="button"
+              disabled={action.busy || blocker !== null}
+              title={blocker ?? undefined}
+              onClick={() => write(false)}
+            >
+              {t({ zh: '先存着', en: 'Keep for later' })}
+            </button>
+            <span className="muted">
+              {blocker ??
+                t({
+                  zh: '开工就马上建 Run，不受每天自动采纳的条数和预算限制；先存着的不会自动采纳，等你点「采纳」',
+                  en: "Starting creates a Run at once, outside the day's auto-accept count and budget; one kept for later is never accepted automatically and waits for you to accept it",
+                })}
+            </span>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 

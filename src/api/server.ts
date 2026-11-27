@@ -7,6 +7,9 @@ import type { LocalBacklog } from '../backlog/local.js';
 import {
   PROPOSAL_SIZES,
   RAW_LOG_KEEP_DAYS,
+  REQUIREMENT_ITEMS_MAX,
+  REQUIREMENT_TEXT_MAX,
+  REQUIREMENT_TITLE_MAX,
   RISKS,
   redoDueAt,
   requirementSource,
@@ -135,12 +138,6 @@ const ProposalsQuery = z.strictObject({
   status: z.enum(PROPOSAL_STATUSES).optional(),
   limit: z.coerce.number().int().min(1).max(PROPOSALS_MAX).optional(),
 });
-/** Longest title of a requirement a human writes: one line, as a Run's title shows it. */
-const REQUIREMENT_TITLE_MAX = 200;
-/** Longest text of each other field of a requirement a human writes, and of each list item. */
-const REQUIREMENT_TEXT_MAX = 20_000;
-/** Most items of a list (evidence, acceptance criteria) of a requirement a human writes. */
-const REQUIREMENT_ITEMS_MAX = 50;
 const tooLong = (max: number) => () =>
   t({ zh: `最多 ${max} 个字`, en: `at most ${max} characters` });
 const titleNeeded = () => t({ zh: '需求的标题不能为空', en: 'A requirement needs a title' });

@@ -12,6 +12,7 @@ import type {
   ProposalAccepted,
   ProposalRestarted,
   ProposalView,
+  ProposalWritten,
   RunDetail,
   RunSummary,
   StatsView,
@@ -26,6 +27,7 @@ import type {
   Repo,
   Run,
   Scout,
+  ScoutProposal,
 } from '../../../src/store/types.js';
 import { type StatsFilter, statsQuery } from './stats.js';
 
@@ -82,6 +84,24 @@ export interface RepoInput {
 }
 
 export type RepoPatch = Partial<Pick<Repo, 'targetBranch' | 'verifyCommands' | 'setupCommands'>>;
+
+/**
+ * A requirement a human writes into the local backlog of a repo of backlog.repos (POST
+ * /api/proposals). Left out: `category` feature, `size` M, `risk` mid, `start` true.
+ */
+export interface RequirementInput {
+  repo: string;
+  title: string;
+  what: string;
+  why?: string;
+  evidence?: string[];
+  acceptance?: string[];
+  category?: ScoutProposal['category'];
+  size?: ScoutProposal['size'];
+  risk?: ScoutProposal['risk'];
+  /** Accept it at once, a Run created from it; false keeps it pending for the human to start. */
+  start?: boolean;
+}
 
 export const api = {
   health: () => request<HealthView>('GET', '/api/health'),
@@ -156,6 +176,12 @@ export const api = {
     const qs = q.toString();
     return request<ProposalView[]>('GET', `/api/proposals${qs ? `?${qs}` : ''}`);
   },
+  /**
+   * A requirement a human writes, as a proposal of author human: started (`start` true, the
+   * default), its Run in the answer; or kept pending until accepted.
+   */
+  writeProposal: (input: RequirementInput) =>
+    request<ProposalWritten>('POST', '/api/proposals', input),
   /** Accepting creates a Run whose goal is the proposal's text. */
   acceptProposal: (proposalId: string) =>
     request<ProposalAccepted>('POST', `/api/proposals/${id(proposalId)}/accept`),

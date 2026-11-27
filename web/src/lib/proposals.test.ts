@@ -1,15 +1,22 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import type { BacklogRepoStatus, ProposalView } from '../../../src/api/types.js';
+import type { BacklogRepoStatus, ProposalView, RunSummary } from '../../../src/api/types.js';
+import {
+  REQUIREMENT_ITEMS_MAX,
+  REQUIREMENT_TEXT_MAX,
+  REQUIREMENT_TITLE_MAX,
+} from '../../../src/config/flow.js';
 import { setLang } from '../../../src/i18n.js';
 import { formatTime } from './format.js';
 import { pollText } from './issues.js';
 import {
+  acceptanceItems,
   acceptBlocker,
   attemptsText,
   attemptText,
   backlogOutdatedBy,
   canReject,
   decidedText,
+  emptyDraft,
   failureLabel,
   failureLabels,
   failuresHeading,
@@ -20,12 +27,16 @@ import {
   proposalCountsText,
   proposalGroups,
   proposalRedoText,
+  type RequirementDraft,
+  requirementInput,
   restartBlocker,
   restartHint,
   restartLabels,
   scoutProposalFiled,
   sortProposals,
   stepRestartBlocker,
+  writeBlocker,
+  writtenText,
 } from './proposals.js';
 
 afterEach(() => setLang('zh'));
@@ -221,6 +232,190 @@ describe('deciding a proposal', () => {
     expect(decidedText(accepted, NOW)).toBe(`Accepted ${time}`);
     expect(decidedText({ ...accepted, auto: true }, NOW)).toBe(`Accepted automatically ${time}`);
     expect(decidedText({ ...accepted, status: 'rejected', decidedAt: null }, NOW)).toBe('Rejected');
+  });
+});
+
+describe('writing a requirement', () => {
+  const filled = (over: Partial<RequirementDraft> = {}): RequirementDraft => ({
+    ...emptyDraft(),
+    title: 'Export the Run list as CSV',
+    what: 'Add an export button to the Run list',
+    ...over,
+  });
+
+  it('starts empty, as feature, M and mid', () => {
+    expect(emptyDraft()).toEqual({
+      title: '',
+      what: '',
+      why: '',
+      acceptance: '',
+      category: 'feature',
+      size: 'M',
+      risk: 'mid',
+    });
+  });
+
+  it('takes the acceptance criteria one per line, without list marks or blank lines', () => {
+    expect(acceptanceItems('')).toEqual([]);
+    expect(acceptanceItems('  \n\n \t ')).toEqual([]);
+    expect(acceptanceItems('能导出\n  有测试  \r\n\n文档写清楚')).toEqual([
+      '能导出',
+      '有测试',
+      '文档写清楚',
+    ]);
+    expect(
+      acceptanceItems(
+        [
+          '- [ ] 能导出',
+          '- [x] 有测试',
+          '* 星号',
+          '+ 加号',
+          '• 圆点',
+          '1. 编号',
+          '2) 括号',
+          '3、顿号',
+          '[ ] 只有框',
+          '-',
+          '- [ ]',
+        ].join('\n'),
+      ),
+    ).toEqual(['能导出', '有测试', '星号', '加号', '圆点', '编号', '括号', '顿号', '只有框']);
+    // What only looks like a mark keeps its first character.
+    expect(acceptanceItems('-1 表示不限\n1.5 秒内返回\n*重要*\n--verbose 能用')).toEqual([
+      '-1 表示不限',
+      '1.5 秒内返回',
+      '*重要*',
+      '--verbose 能用',
+    ]);
+  });
+
+  it('can be sent once there is a title and what to do, within the limits', () => {
+    const ok = repo('demo');
+    expect(writeBlocker(ok, filled())).toBeNull();
+    expect(writeBlocker(ok, emptyDraft())).toBe('先写标题');
+    expect(writeBlocker(ok, filled({ title: '   ' }))).toBe('先写标题');
+    expect(writeBlocker(ok, filled({ what: ' \n ' }))).toBe('写清楚要做什么');
+    expect(writeBlocker(ok, filled({ title: 'x'.repeat(REQUIREMENT_TITLE_MAX) }))).toBeNull();
+    // Counted once trimmed, as the Master counts.
+    expect(
+      writeBlocker(ok, filled({ title: ` ${'x'.repeat(REQUIREMENT_TITLE_MAX)} ` })),
+    ).toBeNull();
+    expect(writeBlocker(ok, filled({ title: 'x'.repeat(REQUIREMENT_TITLE_MAX + 1) }))).toBe(
+      `标题最多 ${REQUIREMENT_TITLE_MAX} 个字`,
+    );
+    const long = 'x'.repeat(REQUIREMENT_TEXT_MAX + 1);
+    expect(writeBlocker(ok, filled({ what: long }))).toBe(
+      `「要做什么」最多 ${REQUIREMENT_TEXT_MAX} 个字`,
+    );
+    expect(writeBlocker(ok, filled({ why: long }))).toBe(
+      `「为什么」最多 ${REQUIREMENT_TEXT_MAX} 个字`,
+    );
+    expect(writeBlocker(ok, filled({ acceptance: `ok\n${long}` }))).toBe(
+      `每条验收标准最多 ${REQUIREMENT_TEXT_MAX} 个字`,
+    );
+    const lines = (n: number) => Array.from({ length: n }, (_, i) => `- ${i}`).join('\n');
+    expect(writeBlocker(ok, filled({ acceptance: lines(REQUIREMENT_ITEMS_MAX) }))).toBeNull();
+    // Blank lines are not criteria.
+    expect(
+      writeBlocker(ok, filled({ acceptance: `${lines(REQUIREMENT_ITEMS_MAX)}\n\n  \n` })),
+    ).toBeNull();
+    expect(writeBlocker(ok, filled({ acceptance: lines(REQUIREMENT_ITEMS_MAX + 1) }))).toBe(
+      `验收标准最多 ${REQUIREMENT_ITEMS_MAX} 条`,
+    );
+  });
+
+  it('cannot be sent while the repo has problems, whatever the draft', () => {
+    const broken = repo('demo', { problems: ['模板 self-dev 不存在或无效'] });
+    const reason = '这个仓库的配置有问题（见上面），改好之后才能写需求';
+    expect(writeBlocker(broken, filled())).toBe(reason);
+    expect(writeBlocker(broken, emptyDraft())).toBe(reason);
+  });
+
+  it('says why in English too', () => {
+    setLang('en');
+    const ok = repo('demo');
+    const long = 'x'.repeat(REQUIREMENT_TEXT_MAX + 1);
+    const reasons = [
+      writeBlocker(repo('demo', { problems: ['broken'] }), filled()),
+      writeBlocker(ok, emptyDraft()),
+      writeBlocker(ok, filled({ title: 'x'.repeat(REQUIREMENT_TITLE_MAX + 1) })),
+      writeBlocker(ok, filled({ what: '' })),
+      writeBlocker(ok, filled({ what: long })),
+      writeBlocker(ok, filled({ why: long })),
+      writeBlocker(ok, filled({ acceptance: long })),
+      writeBlocker(
+        ok,
+        filled({
+          acceptance: Array.from({ length: REQUIREMENT_ITEMS_MAX + 1 }, () => 'a').join('\n'),
+        }),
+      ),
+    ];
+    expect(reasons).toEqual([
+      'The repo has problems (see above); fix them before writing a requirement',
+      'Write a title first',
+      `A title has at most ${REQUIREMENT_TITLE_MAX} characters`,
+      'Say what to do',
+      `"What to do" has at most ${REQUIREMENT_TEXT_MAX} characters`,
+      `"Why" has at most ${REQUIREMENT_TEXT_MAX} characters`,
+      `Each acceptance criterion has at most ${REQUIREMENT_TEXT_MAX} characters`,
+      `At most ${REQUIREMENT_ITEMS_MAX} acceptance criteria`,
+    ]);
+    for (const r of reasons) expect(r).not.toMatch(CHINESE);
+  });
+
+  it('sends the texts trimmed, the criteria as a list, and leaves blanks out', () => {
+    const draft = filled({
+      title: '  导出 CSV ',
+      what: '\n加一个按钮\n',
+      why: '  要发给别人 ',
+      acceptance: '- [ ] 能导出\n\n- 有测试',
+      category: 'bug',
+      size: 'S',
+      risk: 'low',
+    });
+    expect(requirementInput('demo', draft, true)).toEqual({
+      repo: 'demo',
+      title: '导出 CSV',
+      what: '加一个按钮',
+      why: '要发给别人',
+      acceptance: ['能导出', '有测试'],
+      category: 'bug',
+      size: 'S',
+      risk: 'low',
+      start: true,
+    });
+    const bare = requirementInput('demo', filled({ why: '  ', acceptance: '\n- \n' }), false);
+    expect(bare).toEqual({
+      repo: 'demo',
+      title: 'Export the Run list as CSV',
+      what: 'Add an export button to the Run list',
+      category: 'feature',
+      size: 'M',
+      risk: 'mid',
+      start: false,
+    });
+    expect('why' in bare).toBe(false);
+    expect('acceptance' in bare).toBe(false);
+  });
+
+  it('says what became of the requirement written', () => {
+    const pending = proposal({ id: 'p', author: 'human', scoutId: null, title: '导出 CSV' });
+    const started = { ...pending, status: 'accepted' as const, runId: 'run-1' };
+    const run = { id: 'run-1' } as RunSummary;
+    expect(writtenText({ proposal: started, run })).toBe(
+      '写好了「导出 CSV」，Run run-1 已经建好开工',
+    );
+    expect(writtenText({ proposal: pending })).toBe(
+      '写好了「导出 CSV」，先存在下面的提案里；想开工时点「采纳」',
+    );
+    setLang('en');
+    const english = { ...pending, title: 'Export CSV' };
+    expect(writtenText({ proposal: { ...english, status: 'accepted' }, run })).toBe(
+      'Wrote "Export CSV"; Run run-1 was created to work on it',
+    );
+    expect(writtenText({ proposal: english })).toBe(
+      'Wrote "Export CSV" and kept it in the proposals below; accept it when you want it started',
+    );
   });
 });
 

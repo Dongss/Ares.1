@@ -228,6 +228,8 @@ describe('the cycle', () => {
     expect(steps.propose?.text).toContain('配置 github 或 gitlab');
     // Repos with neither have the local backlog, so none says requirements need GitHub.
     expect(steps.propose?.text).toContain('本地提案池');
+    // A human can write requirements into it on the dashboard.
+    expect(steps.propose?.text).toContain('「需求」页点「写需求」');
     expect(steps.propose?.text).not.toContain('需求只从 GitHub issue 来');
     expect(steps.accept?.text).toBe(
       '由你来做：接入 GitHub 或 GitLab 后，给要做的 issue 加 ares1:ready',
@@ -236,6 +238,11 @@ describe('the cycle', () => {
     expect(steps.run?.text).toContain('本地提案池');
     expect(steps.push?.text).toBe('由你来做：合并只到本地的目标分支（main），需要时自己 git push');
     expect(runStages(input(null))).toBeNull();
+    setLang('en');
+    const english = byId(input(null));
+    expect(english.propose?.text).toContain('"Write a requirement" on the Issues page');
+    for (const step of Object.values(english)) expect(step.text).not.toMatch(/[一-鿿]/);
+    setLang('zh');
   });
 
   it('names GitLab for a repo on GitLab', () => {

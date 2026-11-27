@@ -278,7 +278,7 @@ function Intro(props: {
                 （用 glab，gitlab.com 或自建的都行）配置后自动生效，示例见
                 <a href={href.issues}>「需求」页</a>。两者都不接的仓库可以用本地提案池（
                 <code>config.yaml</code> 的 <code>backlog</code>），同样能自己侦察、采纳、建
-                Run，也在「需求」页。
+                Run，你也可以在「需求」页点「写需求」把自己要做的事写进去。
               </>
             ),
             en: (
@@ -288,8 +288,9 @@ function Intro(props: {
                 glab, gitlab.com or a self-hosted one) to <code>config.yaml</code> and it takes
                 effect by itself; see the <a href={href.issues}>Issues page</a> for examples. Repos
                 with neither can use the local backlog (<code>backlog</code> in{' '}
-                <code>config.yaml</code>), which scouts, accepts and creates Runs by itself too,
-                also on the Issues page.
+                <code>config.yaml</code>), which scouts, accepts and creates Runs by itself too; you
+                can also write what you want done into it with "Write a requirement" on the Issues
+                page.
               </>
             ),
           })}
@@ -591,7 +592,8 @@ function YouSection(props: { input: GuideInput; home: string; working: boolean }
                 ，工作中时就建 Run。写清楚为什么、要做什么和验收标准，Agent
                 就照着做。开工后、合并之前想改需求，直接改 issue 的标题或正文，Master
                 下次检查时终止旧 Run，按新内容重来。看板不提供手动建 Run：接了 GitHub 或 GitLab
-                的仓库，需求只从那里的 issue 来。
+                的仓库，需求只从那里的 issue 来；用本地提案池的仓库在
+                <a href={href.issues}>「需求」页</a>点「写需求」，马上开工或先存着。
               </>
             ),
             en: (
@@ -605,7 +607,9 @@ function YouSection(props: { input: GuideInput; home: string; working: boolean }
                 the agents follow it. To change the requirement after work started, before it
                 merges, just edit the issue's title or body: at its next check the Master cancels
                 the old Run and starts over on the new text. The dashboard does not create Runs by
-                hand: for a repo on GitHub or GitLab, requirements only come from its issues there.
+                hand: for a repo on GitHub or GitLab, requirements only come from its issues there;
+                for a repo using the local backlog, click "Write a requirement" on the{' '}
+                <a href={href.issues}>Issues page</a> to start it at once or keep it for later.
               </>
             ),
           })}
