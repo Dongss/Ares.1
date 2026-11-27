@@ -2143,19 +2143,28 @@ interface ScoutPromptInput {
    * that stop the system, and judges whether the plan needs to change.
    */
   iteration?: string | null;
+  /**
+   * The direction a human gave the scout by hand on the dashboard (`Scout.goal`), which it plans
+   * its iteration around; null or missing without one. It comes from the person at this machine,
+   * not from the code host, so it is no text of an untrusted author.
+   */
+  goal?: string | null;
 }
 
 /**
  * The scout's prompt, in the language in use. Both languages are built from the same sections in
  * the same order, so they say the same; which sections there are depends on whether the repo has
- * an iteration under way (`iteration`).
+ * an iteration under way (`iteration`) and whether a human gave a direction (`goal`).
  */
 export function scoutPrompt(input: ScoutPromptInput): string {
   const source = input.source ?? 'github';
+  const goal = input.goal?.trim() || null;
+  const human = goal ? [humanGoalSection(goal, Boolean(input.iteration))] : [];
   const sections = input.iteration
     ? [
         followingIntro(input, source),
         directionSection(),
+        ...human,
         gapSection(source),
         openIterationSection(input.iteration),
         followingLeads(input),
@@ -2166,9 +2175,10 @@ export function scoutPrompt(input: ScoutPromptInput): string {
     : [
         planningIntro(input, source),
         directionSection(),
+        ...human,
         gapSection(source),
         planningLeads(input),
-        planningSection(input, source),
+        planningSection(input, source, goal !== null),
         planningProposals(input),
         requirementsSection(source),
       ];
@@ -2425,9 +2435,10 @@ function existingHeading(source: ScoutSource): string {
 }
 
 // The sections of the scout's prompt, each in the language in use. Without an iteration under
-// way: planning intro, direction, gap analysis, leads, planning an iteration, proposals outside
-// it, requirements. With one: following intro, direction, gap analysis, the iteration under way,
-// the lead left, changing the plan, proposals, requirements.
+// way: planning intro, direction, a human's direction if given, gap analysis, leads, planning an
+// iteration, proposals outside it, requirements. With one: following intro, direction, a human's
+// direction if given, gap analysis, the iteration under way, the lead left, changing the plan,
+// proposals, requirements.
 
 /** The intro while the repo has no iteration under way: its main output is a new one. */
 function planningIntro(input: ScoutPromptInput, source: ScoutSource): string {
@@ -2453,6 +2464,47 @@ function directionSection(): string {
     en: `## First, get the direction
 - Read README.md and AGENTS.md (and CLAUDE.md if there is one). README.md states the project's goals and is the basis for every decision. AGENTS.md describes the layout, commands and conventions.
 - Iterations and proposals must serve the goals in README.md; do not propose anything unrelated to them or against them.`,
+  });
+}
+
+/**
+ * The direction a human gave the scout by hand, quoted as a code block so that it reads as their
+ * words, not as part of the prompt's format. Without an iteration under way the scout plans its
+ * iteration around it, unless it goes against the README's goals or cannot be done, which the
+ * gaps then say. With one under way (it started between the scout being asked for and its prompt)
+ * the scout plans no iteration, so the direction only puts its gaps first, for the next one.
+ */
+function humanGoalSection(goal: string, following: boolean): string {
+  const quoted = codeBlock(goal);
+  if (following) {
+    return t({
+      zh: `## 人给出的方向
+这次侦察是人在看板上手动发起的，并给了一句方向：
+${quoted}
+不过仓库现在有进行中的迭代，它结束之前不规划新的迭代，所以这次不为这句方向规划迭代，iteration 照常写 null。差距分析时，把实现这句方向还缺的能力放在 gaps 的最前面，留给下一个迭代；其余照下面的规则做。`,
+      en: `## Direction from a human
+A human started this scout by hand on the dashboard and gave it a direction:
+${quoted}
+The repo has an iteration under way, though, and no other iteration is planned until it is over, so do not plan one for this direction this time: set iteration to null as usual. In your gap analysis, put the capabilities this direction still lacks first in gaps, for the next iteration; do everything else by the rules below.`,
+    });
+  }
+  return t({
+    zh: `## 人给出的方向
+这次侦察是人在看板上手动发起的，并给了一句方向，说明人想推进什么：
+${quoted}
+- 这次的迭代围绕这句方向规划。差距分析照常对照 README.md 的每个目标做，同时找出实现这句方向还缺哪些能力，放在 gaps 的最前面。
+- 规划的迭代就从这些缺口出发，iteration 的 goal 要实现这句方向，不要另挑差距分析里别的缺口。方向只说了想要什么：怎么做、拆成哪些子项、做到什么程度，由你按代码和文档来定。
+- 方向太大、一个迭代放不下时，先规划最先能交付、能演示的那一部分，在 outOfScope 里写明留给以后的部分。
+- 方向和 README.md 的目标冲突（背离或损害某个目标），或者在这个项目里做不到时，不要硬规划：iteration 写 null，在 gaps 里加一条说明原因，goal 照抄它冲突或无法推进的 README.md 目标原文，gap 写这句方向为什么没有规划成迭代，evidence 写依据。
+- 迭代之外的提案照常按下面的规则提，不受这句方向影响。`,
+    en: `## Direction from a human
+A human started this scout by hand on the dashboard and gave it a direction, saying what they want to move forward:
+${quoted}
+- Plan this time's iteration around this direction. Do the gap analysis against every goal of README.md as usual, and also work out which capabilities this direction still lacks; put those first in gaps.
+- Plan the iteration from those gaps: its goal must achieve this direction; do not pick another gap of your analysis instead. The direction only says what is wanted: how to do it, which steps it takes and how far to go are yours to decide from the code and documents.
+- If the direction is too large for one iteration, plan the part that can be delivered and demonstrated first, and say in outOfScope what is left for later.
+- If the direction conflicts with the goals of README.md (goes against or harms one of them), or cannot be done in this project, do not force a plan: set iteration to null and add a gap saying why, with goal the README.md goal it conflicts with or cannot advance, copied word for word, gap why the direction was not planned as an iteration, and evidence your grounds.
+- Proposals outside the iteration follow the rules below as usual; the direction does not change them.`,
   });
 }
 
@@ -2507,13 +2559,34 @@ Leave capability gaps, obvious bugs, review suggestions and polish alone this ti
   });
 }
 
-/** How to plan a new iteration, the main output while the repo has none under way. */
-function planningSection(input: ScoutPromptInput, source: ScoutSource): string {
+/**
+ * How to plan a new iteration, the main output while the repo has none under way. `directed`: a
+ * human gave a direction, which the iteration is planned around instead of the scout's own pick.
+ */
+function planningSection(input: ScoutPromptInput, source: ScoutSource, directed: boolean): string {
   const max = MAX_ITERATION_CHILDREN;
+  const pick = directed
+    ? t({
+        zh: '- 围绕上面「人给出的方向」，从实现它所缺的能力出发，一次把整个迭代设计好。',
+        en: '- Design the whole iteration in one go around the "Direction from a human" above, starting from the capabilities it lacks.',
+      })
+    : t({
+        zh: `- 从差距分析里选最重要的一个缺口，一次把整个迭代设计好。${takenGapText(source)}`,
+        en: `- Take the most important gap from your gap analysis and design the whole iteration in one go. ${takenGapText(source)}`,
+      });
+  const none = directed
+    ? t({
+        zh: '- 方向和 README.md 的目标冲突或做不到时，iteration 写 null，在 gaps 里说明原因（见「人给出的方向」）。',
+        en: '- If the direction conflicts with the goals of README.md or cannot be done, set iteration to null and say why in gaps (see "Direction from a human").',
+      })
+    : t({
+        zh: '- 差距分析里没有值得规划成迭代的缺口时，iteration 写 null。',
+        en: '- If your gap analysis found no gap worth an iteration, set iteration to null.',
+      });
   return t({
     zh: `## 规划迭代
 仓库现在没有进行中的迭代，这次的主要产出是一个新迭代，写进结果的 iteration：
-- 从差距分析里选最重要的一个缺口，一次把整个迭代设计好。${takenGapText(source)}
+${pick}
 - goal 用用户能感知的话写：做完之后，用户能做到以前做不到的什么事；readmeGoal 是它推进的 README.md 目标，一字不差地照抄原文。
 - criteria 写怎样算做成了，一条一条写，最好每条都能演示；outOfScope 写有意不做的事，划清范围。
 - children 是计划：按依赖排好的子项，数量按需要来，最多 ${max} 个；需要更多就缩小目标，剩下的留给下一个迭代。每个子项像一条提案那样写，另外写明 criteria（它推进第几条完成标准）和 dependsOn（它依赖的子项的序号，只能写排在它前面的）。子项按在 children 里的位置从 1 编号。没有依赖关系的子项会同时开工，所以只写真正的依赖。
@@ -2522,10 +2595,10 @@ function planningSection(input: ScoutPromptInput, source: ScoutSource): string {
 - 最后一个子项是「收尾」：closeout 为 true，dependsOn 写上其余全部子项，用来整理本迭代各 Run 评审通过时留下的建议。建议的具体内容由 Master 在它开工前填入，what 里说明这一点就行。其余子项的 closeout 都是 false。
 - ${autoAcceptText(input.autoAcceptsL)}
 ${nextStepsText(source)}
-- 差距分析里没有值得规划成迭代的缺口时，iteration 写 null。`,
+${none}`,
     en: `## Planning an iteration
 The repo has no iteration under way, so your main output this time is a new one, in iteration of your answer:
-- Take the most important gap from your gap analysis and design the whole iteration in one go. ${takenGapText(source)}
+${pick}
 - Write goal in words users would use: what they can do once it is done that they could not before; readmeGoal is the goal of README.md it advances, copied word for word.
 - In criteria, write how to tell it is done, one per item, ideally each something to demonstrate; in outOfScope, what it leaves out on purpose, to draw its bounds.
 - children is the plan: its steps ordered by their dependencies, as many as it takes, at most ${max}; if it takes more, narrow the goal and leave the rest for the next iteration. Write each step like a proposal, and add criteria (which completion criteria it moves forward) and dependsOn (the numbers of the steps it depends on, only steps before it). Steps are numbered by their place in children, from 1. Steps that do not depend on each other start side by side, so list only real dependencies.
@@ -2534,7 +2607,7 @@ The repo has no iteration under way, so your main output this time is a new one,
 - The last step is the closing step: closeout true, and dependsOn listing every other step; it goes through the suggestions reviews left when the iteration's Runs passed. The Master fills in the suggestions before it starts, so what only needs to say so. Every other step has closeout false.
 - ${autoAcceptText(input.autoAcceptsL)}
 ${nextStepsText(source)}
-- If your gap analysis found no gap worth an iteration, set iteration to null.`,
+${none}`,
   });
 }
 

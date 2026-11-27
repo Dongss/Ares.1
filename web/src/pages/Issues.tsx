@@ -8,6 +8,7 @@ import type {
   ProposalView,
   UpgradeStatus,
 } from '../../../src/api/types.js';
+import { SCOUT_GOAL_MAX } from '../../../src/config/flow.js';
 import { t } from '../../../src/i18n.js';
 import type { Scout, ScoutGap } from '../../../src/store/types.js';
 import { FailedAttempts, RestartAction } from '../components/Attempts.js';
@@ -32,6 +33,8 @@ import {
   pollText,
   RISK,
   SCOUT_STATUS,
+  scoutGoalBlocker,
+  scoutGoalText,
   scoutPlan,
   scoutWaitText,
   upgradeText,
@@ -80,10 +83,12 @@ export function IssuesPage({ config }: { config: ConfigView | undefined }) {
   const upgrade = useResource(() => api.upgrade(), 'upgrade');
   useReloadOn(upgrade.reload, (e) => e.type.startsWith('upgrade.') || e.type === 'run.status');
   const scouts = useResource(() => api.scouts(), 'scouts');
-  // Both platforms' bridges record `github.*` events (GitLab's with `platform: 'gitlab'`).
+  // Both platforms' bridges record `github.*` events (GitLab's with `platform: 'gitlab'`). An
+  // iteration's events tell whether a repo has one under way, when a scout takes no direction.
   const relevant = (type: string) =>
     type.startsWith('scout.') ||
     type.startsWith('github.') ||
+    type.startsWith('iteration.') ||
     type.startsWith('config.') ||
     type === 'run.created';
   useReloadOn(github.reload, (e) => relevant(e.type));
@@ -540,26 +545,49 @@ function SourceSettings(props: {
   );
 }
 
-/** The scout started by hand, for a repo of either source; nothing without a scout configured. */
+/**
+ * The scout started by hand, for a repo of any source, with an optional direction it plans its
+ * iteration around; nothing without a scout configured. While the repo has an iteration under way
+ * the direction is disabled, saying why, and the scout starts without one.
+ */
 function ScoutAction({ repo, onStarted }: { repo: ProposalSourceStatus; onStarted: () => void }) {
   const action = useAction();
+  const [goal, setGoal] = useState('');
   const scout = repo.scout;
   if (!scout) return null;
+  const blocker = scoutGoalBlocker(scout);
+  const given = blocker === null ? goal.trim() : '';
   return (
     <>
-      <div className="form-actions">
+      <div className="form-actions scout-action">
         <button
           type="button"
           className="btn-primary"
           disabled={scout.running || action.busy || repo.problems.length > 0}
           onClick={async () => {
-            if ((await action.run(() => api.startScout(repo.name))) !== undefined) onStarted();
+            const started = await action.run(() => api.startScout(repo.name, given || undefined));
+            if (started !== undefined) {
+              setGoal('');
+              onStarted();
+            }
           }}
         >
           {scout.running
             ? t({ zh: '侦察中…', en: 'Scouting…' })
             : t({ zh: '让 AI 找活', en: 'Let the AI find work' })}
         </button>
+        <input
+          value={blocker === null ? goal : ''}
+          onChange={(e) => setGoal(e.target.value)}
+          maxLength={SCOUT_GOAL_MAX}
+          disabled={blocker !== null}
+          title={blocker ?? undefined}
+          placeholder={t({
+            zh: '方向（可选）：比如「支持导出报表」，侦察会围绕它规划一个迭代',
+            en: 'Direction (optional), e.g. "export reports": the scout plans an iteration around it',
+          })}
+          aria-label={t({ zh: '侦察的方向', en: "The scout's direction" })}
+        />
         <span className="muted">
           {t({
             zh: `最多提 ${scout.maxProposals} 条，通常要几分钟`,
@@ -567,6 +595,14 @@ function ScoutAction({ repo, onStarted }: { repo: ProposalSourceStatus; onStarte
           })}
         </span>
       </div>
+      {blocker !== null && scout.openIteration && (
+        <div className="muted">
+          {blocker}{' '}
+          <a href={href.iteration(scout.openIteration.id)}>
+            {t({ zh: '查看迭代', en: 'See the iteration' })}
+          </a>
+        </div>
+      )}
       <ErrorBox>{action.error}</ErrorBox>
     </>
   );
@@ -938,6 +974,7 @@ function ProposalBody({ proposal: p }: { proposal: ProposalView }) {
 
 function ScoutCard({ scout }: { scout: Scout }) {
   const status = SCOUT_STATUS[scout.status];
+  const goal = scoutGoalText(scout.goal);
   return (
     <section className="card scout">
       <div className="scout-head">
@@ -952,6 +989,7 @@ function ScoutCard({ scout }: { scout: Scout }) {
           {formatCost(scout.costUsd)}
         </span>
       </div>
+      {goal && <div className="scout-goal">{goal}</div>}
       {scout.error && <ErrorBox>{scout.error}</ErrorBox>}
       {scout.status === 'completed' && scout.proposals.length === 0 && (
         <div className="muted">

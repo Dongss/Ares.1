@@ -206,7 +206,9 @@ const SAMPLES: [string, Record<string, unknown>][] = [
     { scoutId: 's-1', repo: 'demo', created: 2, auto: 1, pending: 1, backlog: true },
   ],
   ['scout.started', { scoutId: 's-1', repo: 'demo', trigger: 'auto' }],
-  ['scout.started', { scoutId: 's-1', repo: 'demo', trigger: 'manual' }],
+  ['scout.started', { scoutId: 's-1', repo: 'demo', trigger: 'manual', goal: null }],
+  // The direction is a human's words, kept as written: English here, so the check below holds.
+  ['scout.started', { scoutId: 's-1', repo: 'demo', trigger: 'manual', goal: 'Export reports' }],
   ['scout.completed', { scoutId: 's-1', repo: 'demo', created: 3, auto: 1, pending: 2 }],
   ['scout.completed', { scoutId: 's-1', repo: 'demo', created: 0, auto: 0, pending: 0 }],
   ['scout.failed', { scoutId: 's-1', repo: 'demo', message: 'timeout', streak: 3 }],
@@ -566,6 +568,20 @@ describe('globalEventText', () => {
     for (const data of [created, {}]) {
       expect(text('github.diverged_run', data)).not.toMatch(/[一-鿿]/);
     }
+  });
+
+  it('says which direction a human gave a scout started by hand', () => {
+    const manual = { scoutId: 's-1', repo: 'demo', trigger: 'manual' };
+    expect(text('scout.started', { ...manual, goal: '支持导出报表' })).toBe(
+      '手动开始侦察 demo，方向：支持导出报表',
+    );
+    expect(text('scout.started', { ...manual, goal: null })).toBe('手动开始侦察 demo');
+    expect(text('scout.started', manual)).toBe('手动开始侦察 demo');
+    setLang('en');
+    expect(text('scout.started', { ...manual, goal: 'Export reports' })).toBe(
+      'Started scouting demo by hand, with the direction: Export reports',
+    );
+    expect(text('scout.started', { ...manual, goal: null })).toBe('Started scouting demo by hand');
   });
 
   it('counts what a scout proposed, with English plurals', () => {

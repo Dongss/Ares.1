@@ -190,6 +190,26 @@ export function scoutPlan(scout: NonNullable<GitHubRepoStatus['scout']>): string
   });
 }
 
+/**
+ * Why a scout by hand takes no direction now: the repo's iteration under way, until which a scout
+ * plans no other iteration (POST /api/scouts refuses a goal); null when it takes one.
+ */
+export function scoutGoalBlocker(
+  scout: Pick<NonNullable<GitHubRepoStatus['scout']>, 'openIteration'>,
+): string | null {
+  const open = scout.openIteration;
+  if (!open) return null;
+  return t({
+    zh: `迭代「${open.title}」进行中：它结束之前侦察不规划新的迭代、只提问题，没法带方向。等它完成或终止它之后再给方向；现在发起的侦察不带方向。`,
+    en: `The iteration "${open.title}" is under way: until it is over, a scout plans no other iteration and only proposes problems, so it takes no direction. Give one once the iteration is done or cancelled; a scout started now goes without.`,
+  });
+}
+
+/** The direction a human gave a scout, as its record shows it; null without one. */
+export function scoutGoalText(goal: string | null): string | null {
+  return goal ? t({ zh: `方向：${goal}`, en: `Direction: ${goal}` }) : null;
+}
+
 /** Why the automatic scout waits, e.g. "离上次侦察不到设定的间隔（11-20 09:30 之后）". */
 export function scoutWaitText(
   waiting: NonNullable<GitHubRepoStatus['scout']>['waiting'],

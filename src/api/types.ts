@@ -371,6 +371,12 @@ export interface ProposalSourceStatus {
      * that time); null = it may start at the next poll.
      */
     waiting: { reason: string; until?: string } | null;
+    /**
+     * The repo's iteration under way (pending, active or blocked), if any: until it is over a
+     * scout plans no other, so a scout by hand takes no direction (POST /api/scouts refuses a
+     * `goal` with 409).
+     */
+    openIteration: { id: string; title: string } | null;
   } | null;
   autoAccept: {
     maxRisk: 'none' | 'low' | 'mid' | 'high';

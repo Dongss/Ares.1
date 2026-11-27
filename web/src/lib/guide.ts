@@ -20,6 +20,7 @@ import {
   REPO_WORKFLOWS_DIR,
   redoDelayMs,
   repoDeliversByPr,
+  SCOUT_GOAL_MAX,
   type TemplateSource,
 } from '../../../src/config/flow.js';
 import { waitText } from '../../../src/engine/discussion.js';
@@ -967,6 +968,10 @@ export function iterationGuide(): string[] {
     t({
       zh: `仓库没有进行中的迭代时，侦察的主要产出是一个迭代：从差距分析里选最重要的一个缺口，一次规划好目标、完成标准、不做的事和按依赖排好的子项（最多 ${max} 个，最后一个是整理评审建议的「收尾」）。接了 GitHub 或 GitLab 的仓库建成一个带 ares1:iteration 的 issue 和每步一个子 issue，本地提案池里是一个迭代和每步一条提案`,
       en: `When the repo has no iteration under way, the scout's main output is an iteration: it takes the most important gap from its gap analysis and plans, in one go, the goal, completion criteria, what is left out, and steps ordered by their dependencies (at most ${max}, the last one the closing step that goes through review suggestions). On GitHub or GitLab it becomes an issue labeled ares1:iteration and one sub-issue per step; in the local backlog, an iteration with one proposal per step`,
+    }),
+    t({
+      zh: `想推进的大目标可以直接交给侦察：在「需求」页「让 AI 找活」旁边写一句方向（比如「支持导出报表」，最多 ${SCOUT_GOAL_MAX} 字），侦察就围绕它规划迭代，不再自己挑缺口；方向和 README 的目标冲突或做不到时不规划，在差距分析里说明原因。只有手动侦察能带方向；仓库有进行中的迭代时不能带，先等它完成或终止它`,
+      en: `You can hand a larger goal to the scout: next to "Let the AI find work" on the Issues page, write a direction (such as "export reports", at most ${SCOUT_GOAL_MAX} characters), and the scout plans its iteration around it instead of picking a gap itself; if the direction conflicts with the README's goals or cannot be done, it plans none and says why in its gap analysis. Only a scout started by hand takes a direction, and not while the repo has an iteration under way: wait until it is done, or cancel it`,
     }),
     t({
       zh: '迭代整批采纳：自动采纳取子项里最高的风险和最大的大小来判断，在每天的自动采纳条数里只算一次；人来采纳就给迭代 issue 加 ares1:ready（本地提案池在「迭代」页上采纳）',

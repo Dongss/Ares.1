@@ -24,7 +24,7 @@ import type {
   RunSummary,
   StatsView,
 } from '../src/api/types.js';
-import { SCOUT_FAILURE_NOTIFY_AFTER } from '../src/config/flow.js';
+import { SCOUT_FAILURE_NOTIFY_AFTER, SCOUT_GOAL_MAX } from '../src/config/flow.js';
 import { findTemplate, githubConfigKey, gitlabConfigKey } from '../src/config/load.js';
 import { InvalidStateError } from '../src/engine/engine.js';
 import { storedRunTimes } from '../src/engine/times.js';
@@ -1684,6 +1684,7 @@ backlog:
             running: false,
             lastAt: null,
             waiting: null,
+            openIteration: null,
           },
           autoAccept: { maxRisk: 'low', maxSize: 'M', maxPerDay: 2, usedToday: 0 },
           autoMerge: true,
@@ -2848,6 +2849,223 @@ backlog:
     const status = (await call('GET', '/api/backlog')).json as BacklogStatus;
     expect(status.repos[1]?.problems).toEqual(['Repo other is not registered on the dashboard']);
     for (const text of [res.text, again.text, scout.text, JSON.stringify(status)]) {
+      expect(text).not.toMatch(/[一-鿿]/);
+    }
+  });
+});
+
+describe('POST /api/scouts with a direction', () => {
+  const AGENTS = `${TEST_AGENTS_YAML}
+  scout:
+    cli: fake
+    model: scout
+`;
+  /** The repo demo in each source of requirements, scouted only by hand. */
+  const SOURCES = {
+    github: `
+github:
+  repos:
+    demo:
+      template: dev
+      scout: { agent: scout, auto: false }
+`,
+    gitlab: `
+gitlab:
+  repos:
+    demo:
+      issues_repo: grp/sub/demo
+      template: dev
+      scout: { agent: scout, auto: false }
+`,
+    backlog: `
+backlog:
+  repos:
+    demo:
+      template: dev
+      scout: { agent: scout, auto: false }
+`,
+  } as const;
+  type Source = keyof typeof SOURCES;
+  const ALL: Source[] = ['github', 'gitlab', 'backlog'];
+  /** Where the repo's status is, with its scout's. */
+  const STATUS: Record<Source, string> = {
+    github: '/api/github',
+    gitlab: '/api/gitlab',
+    backlog: '/api/backlog',
+  };
+
+  async function start(source: Source): Promise<Harness> {
+    h = await harness({
+      agents: AGENTS,
+      config: SOURCES[source],
+      github: new FakeGitHub(),
+      gitlab: new FakeGitLab(),
+    });
+    h.scripts.scout = () => ({ structured: { gaps: [], proposals: [] } });
+    return h;
+  }
+
+  /** Wait until the scout has ended, its temporary worktree deleted. */
+  async function scoutDone(t: Harness, id: string): Promise<Scout> {
+    await waitFor(
+      () => t.master.store.getScout(id).status !== 'running' && !t.master.scouting.running,
+      'scout to finish',
+    );
+    return t.master.store.getScout(id);
+  }
+
+  const lastPrompt = (t: Harness) =>
+    t.fake.calls.filter((c) => c.model === 'scout').at(-1)?.prompt ?? '';
+
+  const startedEvent = (t: Harness, scoutId: string) =>
+    t.master.store.listEventsOfType('scout.started', '').find((e) => e.data.scoutId === scoutId);
+
+  /** An iteration of the repo under way, as its source keeps it. */
+  function openIteration(t: Harness, source: Source, title = '导出报表') {
+    return t.master.store.createIteration({
+      repoId: t.repo.id,
+      scoutId: null,
+      source: source === 'backlog' ? 'local' : source,
+      issuesRepo: source === 'backlog' ? '' : 'me/demo',
+      title,
+      goal: '能导出报表',
+      readmeGoal: '适用于构建任何项目',
+      criteria: ['能导出'],
+      outOfScope: [],
+      children: [],
+    });
+  }
+
+  for (const source of ALL) {
+    it(`records the direction on a scout of a ${source} repo and gives it to the scout`, async () => {
+      const t = await start(source);
+      const goal = '支持导出报表';
+      const res = await call('POST', '/api/scouts', { repo: 'demo', goal: `  ${goal}\n` });
+      expect(res.status).toBe(201);
+      expect(res.json as Scout).toMatchObject({ trigger: 'manual', goal });
+      expect(await scoutDone(t, res.json.id)).toMatchObject({ status: 'completed', goal });
+
+      const prompt = lastPrompt(t);
+      expect(prompt).toContain('## 人给出的方向');
+      expect(prompt).toContain(`\`\`\`\n${goal}\n\`\`\``);
+      expect(prompt).toContain('iteration 的 goal 要实现这句方向');
+      expect(startedEvent(t, res.json.id)?.data).toEqual({
+        scoutId: res.json.id,
+        repo: 'demo',
+        trigger: 'manual',
+        goal,
+      });
+      const listed = (await call('GET', '/api/scouts?repo=demo')).json as Scout[];
+      expect(listed.find((s) => s.id === res.json.id)?.goal).toBe(goal);
+    });
+
+    it(`refuses a direction while a ${source} repo has an iteration under way, not a scout without one`, async () => {
+      const t = await start(source);
+      const scoutStatus = async () => {
+        const status = (await call('GET', STATUS[source])).json as GitHubStatus | BacklogStatus;
+        return status.repos[0]?.scout;
+      };
+      expect((await scoutStatus())?.openIteration).toBeNull();
+      const iteration = openIteration(t, source);
+      expect((await scoutStatus())?.openIteration).toEqual({ id: iteration.id, title: '导出报表' });
+
+      for (const status of ['pending', 'active', 'blocked'] as const) {
+        t.master.store.updateIteration(iteration.id, { status });
+        const refused = await call('POST', '/api/scouts', { repo: 'demo', goal: '支持导出报表' });
+        expect(refused.status, status).toBe(409);
+        expect(refused.json.error).toBe(
+          '仓库 demo 有进行中的迭代「导出报表」：迭代结束之前侦察不规划新的迭代，只提让系统停转的问题，方向无处可用。请等它完成或终止它，再带方向侦察；不带方向的侦察照常可以发起',
+        );
+      }
+      expect(t.master.store.listScouts()).toEqual([]);
+      expect(t.master.store.listEventsOfType('scout.started', '')).toEqual([]);
+
+      // Without a direction the scout starts as before, following the iteration.
+      const plain = await call('POST', '/api/scouts', { repo: 'demo' });
+      expect(plain.status).toBe(201);
+      expect((plain.json as Scout).goal).toBeNull();
+      await scoutDone(t, plain.json.id);
+      expect(lastPrompt(t)).toContain('## 进行中的迭代');
+
+      // Once the iteration is over, a direction is taken again.
+      t.master.store.updateIteration(iteration.id, { status: 'cancelled' });
+      expect((await scoutStatus())?.openIteration).toBeNull();
+      const directed = await call('POST', '/api/scouts', { repo: 'demo', goal: '支持导出报表' });
+      expect(directed.status).toBe(201);
+      await scoutDone(t, directed.json.id);
+      expect(lastPrompt(t)).toContain('## 人给出的方向');
+    });
+  }
+
+  it('refuses a blank or too long direction, and takes one of the longest length', async () => {
+    const t = await start('backlog');
+    const blank = '侦察的方向不能是空白；不想给方向就不传 goal';
+    for (const goal of ['', '   ', '\n\t']) {
+      expect(await call('POST', '/api/scouts', { repo: 'demo', goal })).toMatchObject({
+        status: 400,
+        json: { error: `goal: ${blank}` },
+      });
+    }
+    expect(
+      await call('POST', '/api/scouts', { repo: 'demo', goal: 'x'.repeat(SCOUT_GOAL_MAX + 1) }),
+    ).toMatchObject({ status: 400, json: { error: `goal: 最多 ${SCOUT_GOAL_MAX} 个字` } });
+    expect((await call('POST', '/api/scouts', { repo: 'demo', goal: 42 })).status).toBe(400);
+    expect((await call('POST', '/api/scouts', { repo: 'demo', goal: null })).status).toBe(400);
+    expect(t.master.store.listScouts()).toEqual([]);
+
+    // The limit counts what is left once trimmed.
+    const longest = 'x'.repeat(SCOUT_GOAL_MAX);
+    const res = await call('POST', '/api/scouts', { repo: 'demo', goal: ` ${longest} ` });
+    expect(res.status).toBe(201);
+    expect((await scoutDone(t, res.json.id)).goal).toBe(longest);
+  });
+
+  it('scouts without a direction as before', async () => {
+    const t = await start('github');
+    const res = await call('POST', '/api/scouts', { repo: 'demo' });
+    expect(res.status).toBe(201);
+    expect(res.json as Scout).toMatchObject({ trigger: 'manual', goal: null });
+    await scoutDone(t, res.json.id);
+    const prompt = lastPrompt(t);
+    expect(prompt).not.toContain('人给出的方向');
+    expect(prompt).toContain('从差距分析里选最重要的一个缺口');
+    expect(startedEvent(t, res.json.id)?.data).toEqual({
+      scoutId: res.json.id,
+      repo: 'demo',
+      trigger: 'manual',
+      goal: null,
+    });
+  });
+
+  it('answers and prompts in English', async () => {
+    const t = await start('backlog');
+    // After the Master took config.yaml's language.
+    setLang('en');
+    const res = await call('POST', '/api/scouts', { repo: 'demo', goal: 'Export reports' });
+    expect(res.status).toBe(201);
+    await scoutDone(t, res.json.id);
+    const prompt = lastPrompt(t);
+    expect(prompt).toContain('## Direction from a human');
+    expect(prompt).toContain('```\nExport reports\n```');
+    expect(prompt).not.toMatch(/[一-鿿]/);
+
+    const blank = await call('POST', '/api/scouts', { repo: 'demo', goal: ' ' });
+    expect(blank).toMatchObject({
+      status: 400,
+      json: { error: "goal: A scout's direction cannot be blank; leave goal out to give none" },
+    });
+    const long = await call('POST', '/api/scouts', {
+      repo: 'demo',
+      goal: 'x'.repeat(SCOUT_GOAL_MAX + 1),
+    });
+    expect(long.json.error).toBe(`goal: at most ${SCOUT_GOAL_MAX} characters`);
+    openIteration(t, 'backlog', 'Export reports');
+    const refused = await call('POST', '/api/scouts', { repo: 'demo', goal: 'Export reports' });
+    expect(refused.status).toBe(409);
+    expect(refused.json.error).toBe(
+      'Repo demo has an iteration under way, "Export reports": until it is over, a scout plans no other iteration and only proposes problems that stop the system, so a direction has nothing to go into. Wait until it is done or cancel it, then scout with the direction; a scout without one can start as usual',
+    );
+    for (const text of [blank.text, long.text, refused.text]) {
       expect(text).not.toMatch(/[一-鿿]/);
     }
   });

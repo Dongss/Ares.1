@@ -200,7 +200,22 @@ stages:
   - 不能拆分时：每个子项整个交给一个 Run 一次做完，大小尽量是 S 或 M；一个 Run 做不完的拆成有先后的几个子项。
 
   每个子项都能单独合并，合并后系统照常可用，并且确实推进了这个迭代，不是空壳（比如只加了配置项、类型或接口，却没有实际行为）。迭代之外的提案也要能独立完成、独立合并，一个 Run 做完。
+- **人给的方向**：手动侦察时可以带一句方向，侦察围绕它规划迭代，见下面的「给侦察一句方向」。
 - **以前留下的后续步骤**：以前侦察把一个大能力拆成一串 issue 时，在「要做什么」末尾单独一行写「后续步骤：」（英文是 `Next steps:`），列出剩下的几步。侦察看到的已有 issue 里，未关闭的和最近完成的 issue 正文里有「后续步骤」时，那一行下面附上这一节。中英文两种写法都认，可以是标题，也可以是单独一行（加粗或带冒号都行），截到下一个标题或正文末尾，最多 600 字；提案的页脚不算。提示词要求侦察：已完成的 issue 的后续步骤是规划迭代的素材，把剩下的步骤作为一个迭代重新设计，不再提「接着 #X」式的单条提案；还没关闭的 issue 列着的后续步骤要等它合并后才能做，不拿来规划。缺口已经有未关闭的 issue 在做时换一个缺口；只有那个 issue 覆盖面很大、没有拆过、还在等人采纳时，才可以围绕它规划迭代，在相关子项的 why 里注明对应哪条 issue，不算重复。和其他 issue 内容一样，只有受信任的人或 Master 建的 issue 才会列出（见「只信任仓库成员写的内容」）。
+
+### 给侦察一句方向
+
+人想推进的大目标（比如「支持导出报表」）不用等侦察碰巧选中，也不用自己拆成一串 issue：手动侦察时给它一句方向，侦察就围绕这句话规划一个迭代，按依赖交付。`github.repos`、`gitlab.repos`、`backlog.repos` 里的仓库都可以这样用。
+
+- **怎么用**：看板「需求」页每个配了侦察的仓库卡片上，「让 AI 找活」旁边有一个可选的方向输入框，写一句想要什么再点按钮；不写就和以前一样。也可以直接调 API：`POST /api/scouts`，请求体 `{ "repo": "<仓库名>", "goal": "<方向>" }`（见「本地提案池的 API」）。
+- **侦察怎么用它**：提示词在「先弄清方向」之后多一节「人给出的方向」（英文是 `Direction from a human`），方向原文放在代码块里，免得被当成提示词的格式。侦察照常对照 README 的每个目标做差距分析，同时找出实现这句方向还缺哪些能力，放在 `gaps` 的最前面；规划的迭代从这些缺口出发，迭代的 `goal` 要实现这句方向，不另挑差距分析里别的缺口。怎么做、拆成哪些子项、做到什么程度由侦察按代码和文档决定；方向太大、一个迭代放不下时，先规划最先能交付、能演示的部分，留给以后的写进 `outOfScope`。迭代照常写成 issue 或本地提案池里的迭代，照常按自动采纳的设置采纳或等人采纳，写到 GitHub、GitLab 上的正文照常把用户目录换成 `~`。迭代之外的提案照常按规则提，不受方向影响。
+- **和 README 冲突时**：方向背离或损害 README 里的某个目标，或者在这个项目里做不到时，侦察不硬规划：`iteration` 为 `null`，在 `gaps` 里加一条说明原因（`goal` 照抄它冲突或无法推进的 README 目标，`gap` 写方向为什么没有规划成迭代）。看板侦察记录的「差距分析」里能看到。
+- **限制**：
+  - 只有手动侦察能带方向，自动侦察不带。
+  - 方向去掉首尾空白后不能为空，最多 500 个字（看板的输入框也最多 500 个字），否则返回 400。
+  - 仓库有进行中的迭代（等采纳、进行中或受阻的）时不能带方向，返回 409：迭代结束之前侦察不规划新的迭代、只提让系统停转的问题，方向无处可用。要先等迭代完成，或者终止它（GitHub、GitLab 上关掉迭代 issue；本地提案池在看板的迭代页上终止，还在等采纳的就拒绝），再带方向侦察。这时看板上的输入框是禁用的，旁边写明是哪个迭代、为什么，「让 AI 找活」照常能点，发起不带方向的侦察。万一请求通过之后、侦察开始之前迭代出现了，提示词照样带上方向，但要求这次不规划迭代，把实现它还缺的能力放在差距分析最前面，留给下一个迭代。
+- **从哪里来**：方向是本机看板上的人写的，不是从 GitHub、GitLab 上读来的，所以不经过「只信任仓库成员写的内容」的判断，直接进侦察的提示词。
+- **记在哪里**：方向记在侦察记录的 `goal` 上（去掉了首尾空白；没给方向的、自动侦察和升级前的旧侦察为 `null`），看板「需求」页的侦察记录里写着「方向：……」。`scout.started` 事件的数据里也有 `goal`（没给时为 `null`），「事件」页写成「手动开始侦察 <仓库名>，方向：……」。
 
 ### 迭代
 
@@ -712,14 +727,15 @@ backlog:
 
 ### 本地提案池的 API
 
-- `GET /api/backlog`：本地提案池的状态。`enabled` 表示 `config.yaml` 有 `backlog` 一节，`pollMinutes` 是 `backlog.poll_minutes`，`lastPollAt` 是上一轮检查的时间（还没检查过时为 `null`），`lastError` 是上一轮没做成的事（下一轮全部做成后清空）。`repos` 按 `backlog.repos` 的顺序列出每个仓库，字段和 `GET /api/github`、`GET /api/gitlab` 里每个仓库共有的部分相同：`name`、`template`、`problems`（Master 为什么不能处理这个仓库，比如配置有误、没在看板上登记）、`scout`（`agent`、`auto`、`intervalMinutes`、`maxProposals`、`running`、`lastAt`，以及 `waiting`：上一轮检查时自动侦察为什么没开始；没配侦察时为 `null`）、`autoAccept`（`maxRisk`、`maxSize`、`maxPerDay`、当天已自动采纳的 `usedToday`）、`autoMerge`、`budget`（`dailyUsd`、`spentToday`、`reached`）、`maxRunAttempts`（`max_run_attempts`），另外 `pendingProposals` 是等人或等自动采纳的提案数：等采纳的迭代算一条，它的子项不算。`GET /api/github` 和 `GET /api/gitlab` 里每个仓库也有 `maxRunAttempts`。
+- `GET /api/backlog`：本地提案池的状态。`enabled` 表示 `config.yaml` 有 `backlog` 一节，`pollMinutes` 是 `backlog.poll_minutes`，`lastPollAt` 是上一轮检查的时间（还没检查过时为 `null`），`lastError` 是上一轮没做成的事（下一轮全部做成后清空）。`repos` 按 `backlog.repos` 的顺序列出每个仓库，字段和 `GET /api/github`、`GET /api/gitlab` 里每个仓库共有的部分相同：`name`、`template`、`problems`（Master 为什么不能处理这个仓库，比如配置有误、没在看板上登记）、`scout`（`agent`、`auto`、`intervalMinutes`、`maxProposals`、`running`、`lastAt`，`waiting`：上一轮检查时自动侦察为什么没开始，以及 `openIteration`：仓库进行中的迭代 `{ id, title }`，没有时为 `null`，有时手动侦察不能带方向，见「给侦察一句方向」；没配侦察时为 `null`）、`autoAccept`（`maxRisk`、`maxSize`、`maxPerDay`、当天已自动采纳的 `usedToday`）、`autoMerge`、`budget`（`dailyUsd`、`spentToday`、`reached`）、`maxRunAttempts`（`max_run_attempts`），另外 `pendingProposals` 是等人或等自动采纳的提案数：等采纳的迭代算一条，它的子项不算。`GET /api/github` 和 `GET /api/gitlab` 里每个仓库也有 `maxRunAttempts`。
 - `POST /api/backlog/poll`：马上检查一轮（跟踪迭代、为依赖完成的子项建 Run，记下失败的 Run、重做到时间的提案，自动采纳范围内的待处理提案和迭代，能开始的自动侦察），不等下一轮；返回检查后的状态，格式同上。
 - `GET /api/proposals`：本地提案，新的在前。参数 `repo`（仓库名或 id）只列这个仓库的，`status`（`pending`、`accepted`、`rejected`、`failed`）只列这个状态的，`limit`（1–500 的整数）最多返回几条，不写时全部返回。每一项除了提案本身的字段（`id`、`repoId`、`scoutId`、`author`（`scout` 侦察提的，`human` 人写的）、`title`、`category`、`size`、`risk`、`why`、`evidence`、`what`、`acceptance`、`status`、`rejectReason`、`auto`、`runId`（最近一次建出的 Run）、`attempt`（`runId` 是第几次尝试，从 1 起）、`failures`（失败过的每次尝试，旧的在前：`runId`、`attempt`、`stage`、`error`）、`redo`（最近一次 Run 失败后怎么办：`pending` 等着重做，`exhausted` 次数用完了，其余时候为 `null`）、`iterationId`（所属的迭代，不属于迭代时为 `null`）、`dependsOn`（依赖的同一迭代里的提案 id）、`createdAt`、`decidedAt`），还有仓库名 `repo`、最近一次建出的 Run 的状态 `runStatus`（还没采纳时为 `null`）、预计什么时候重做 `redoAt`（ISO 时间，不在等重做时为 `null`）、一共能跑几次 `maxAttempts`（这个仓库的 `max_run_attempts`，已经跑过的次数 `attempt` 比它多时取 `attempt`；仓库已经不在 `backlog.repos` 里时为 `null`）和能不能重新开始 `restartable`（「已失败」、所属迭代还要它时为 `true`，见「重新开始」）。参数不合法时返回 400，仓库不存在时返回 404。
 - `POST /api/proposals`：人写一条需求进本地提案池，请求体见上面的「人写需求」。成功时返回 201 和 `{ proposal, run? }`：写进去的提案（格式同上，`author` 为 `human`），马上开工时还有建出的 Run（格式同 `GET /api/runs` 的各项），先存着时没有 `run`。请求体不合法（标题或要做什么为空、超长、枚举值不对、有不认识的字段）时返回 400；仓库三处都没有或没在看板上登记时返回 404；仓库的需求来自 GitHub 或 GitLab、配置有误时返回 409；要马上开工但建不了 Run 时也返回 409，提案留在「待处理」，错误里写明它的 id。
 - `POST /api/proposals/:id/accept`：采纳一条待处理的提案，用提案正文作为目标建 Run（模板和 `auto_merge` 按这个仓库在 `backlog.repos` 里的设置），返回 `{ proposal, run }`：采纳后的提案（格式同上）和建出的 Run（格式同 `GET /api/runs` 的各项）。提案不存在时返回 404；已经采纳、拒绝过或多次失败后放弃了、属于迭代（随迭代整体采纳），或者仓库已经不在 `backlog.repos` 里、配置有误时返回 409。
 - `POST /api/proposals/:id/reject`：拒绝一条待处理的提案，请求体是 `{ "reason": "…" }`，理由必填，去掉首尾空白后为空时返回 400。理由会和提案一起出现在这个仓库之后的侦察提示词里，作为不要再提的反例。返回拒绝后的提案；不存在时返回 404，已经采纳或拒绝过、属于迭代（随迭代整体拒绝）时返回 409。
 - `POST /api/proposals/:id/restart`：重新开始一条「已失败」的提案（包括迭代里还没被替换的子项），次数从头算，马上建 Run（见「本地提案失败后自动重做」的「重新开始」）。返回 `{ proposal, run }`，格式同 `accept`。提案不存在时返回 404；不是「已失败」、所属迭代已结束、这一步已被替换或不做了，或者仓库已经不在 `backlog.repos` 里、配置有误时返回 409。
-- `POST /api/scouts`：手动侦察，请求体是 `{ "repo": "<仓库名>" }`。仓库在 `backlog.repos` 里时交给本地提案池，提案写进本地提案池；在 `github.repos` 或 `gitlab.repos` 里时在那个平台上建 issue。同一个仓库写在不止一处属于配置错误，这时按 `github.repos`、`gitlab.repos`、`backlog.repos` 的顺序只有第一处生效，按它侦察。三处都没有时返回 404。
+- `POST /api/scouts`：手动侦察，请求体是 `{ "repo": "<仓库名>", "goal": "<方向>" }`，`goal` 可选（见「接入 GitHub」的「给侦察一句方向」）：去掉首尾空白后不能为空、最多 500 个字，空白或超长时返回 400，不想给方向就不传（传 `null` 也是 400）；仓库有进行中的迭代时带 `goal` 返回 409，不带的照常侦察。仓库在 `backlog.repos` 里时交给本地提案池，提案写进本地提案池；在 `github.repos` 或 `gitlab.repos` 里时在那个平台上建 issue。同一个仓库写在不止一处属于配置错误，这时按 `github.repos`、`gitlab.repos`、`backlog.repos` 的顺序只有第一处生效，按它侦察。三处都没有时返回 404。成功时返回 201 和侦察记录（格式同 `GET /api/scouts` 的各项）。
+- `GET /api/scouts`：侦察记录，新的在前，最多 30 条；参数 `repo`（仓库名或 id）只列这个仓库的。每条有触发方式 `trigger`（`manual` 手动、`auto` 自动）、`goal`（手动侦察时人给的方向，去掉了首尾空白；没给方向的、自动侦察和有这一项之前的侦察为 `null`）、状态、Agent、提案、差距分析 `gaps`、费用、错误和起止时间。
 
 ### 迭代的看板和 API
 

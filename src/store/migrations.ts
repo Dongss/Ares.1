@@ -270,4 +270,9 @@ export const MIGRATIONS: readonly string[] = [
   `
   ALTER TABLE proposals ADD COLUMN author TEXT NOT NULL DEFAULT 'scout';
   `,
+  // v15: the direction a human gave a scout started by hand (POST /api/scouts); null for every
+  // other scout, those recorded before included.
+  `
+  ALTER TABLE scouts ADD COLUMN goal TEXT;
+  `,
 ];

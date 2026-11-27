@@ -3326,6 +3326,126 @@ describe('scoutPrompt: an iteration under way', () => {
   });
 });
 
+describe('scoutPrompt: a direction from a human', () => {
+  afterEach(() => setLang('zh'));
+
+  const input = {
+    repoName: 'demo',
+    max: 3,
+    runs: '',
+    issues: '',
+    splits: true,
+    autoAcceptsL: false,
+  };
+  const headings = (text: string) => text.split('\n').filter((l) => l.startsWith('## '));
+
+  it('plans the iteration around the direction, quoted as it was written', () => {
+    const text = scoutPrompt({ ...input, goal: '支持导出报表' });
+    expect(headings(text)).toEqual([
+      '## 先弄清方向',
+      '## 人给出的方向',
+      '## 先做差距分析',
+      '## 线索（按优先级从高到低）',
+      '## 规划迭代',
+      '## 迭代之外的提案',
+      '## 要求',
+      '## 最近的 Run',
+      '## 已有的 issue',
+    ]);
+    const direction = section(text, '## 人给出的方向');
+    expect(direction).toContain('这次侦察是人在看板上手动发起的，并给了一句方向');
+    // Quoted in a code block, so that it reads as the human's words.
+    expect(direction).toContain('```\n支持导出报表\n```');
+    expect(direction).toContain('这次的迭代围绕这句方向规划');
+    expect(direction).toContain('找出实现这句方向还缺哪些能力，放在 gaps 的最前面');
+    expect(direction).toContain('iteration 的 goal 要实现这句方向，不要另挑差距分析里别的缺口');
+    expect(direction).toContain(
+      '方向和 README.md 的目标冲突（背离或损害某个目标），或者在这个项目里做不到时，不要硬规划：iteration 写 null，在 gaps 里加一条说明原因',
+    );
+    const plan = section(text, '## 规划迭代');
+    expect(plan).toContain(
+      '围绕上面「人给出的方向」，从实现它所缺的能力出发，一次把整个迭代设计好',
+    );
+    expect(plan).not.toContain('从差距分析里选最重要的一个缺口');
+    expect(plan).toContain(
+      '方向和 README.md 的目标冲突或做不到时，iteration 写 null，在 gaps 里说明原因',
+    );
+    expect(plan).not.toContain('差距分析里没有值得规划成迭代的缺口时');
+  });
+
+  it('has no such section without a direction, or with a blank one', () => {
+    for (const goal of [undefined, null, '  ']) {
+      const text = scoutPrompt({ ...input, goal });
+      expect(text).not.toContain('人给出的方向');
+      expect(section(text, '## 规划迭代')).toContain('从差距分析里选最重要的一个缺口');
+    }
+  });
+
+  it('fences a direction with backticks in it with more of them', () => {
+    const text = scoutPrompt({ ...input, goal: '导出 ```csv``` 报表' });
+    expect(section(text, '## 人给出的方向')).toContain('````\n导出 ```csv``` 报表\n````');
+  });
+
+  it('keeps the direction for the next iteration when one is under way', () => {
+    const text = scoutPrompt({
+      ...input,
+      goal: '支持导出报表',
+      iteration: iterationDigest(underWay(), iterationRunOf),
+    });
+    expect(headings(text).slice(0, 4)).toEqual([
+      '## 先弄清方向',
+      '## 人给出的方向',
+      '## 先做差距分析',
+      '## 进行中的迭代',
+    ]);
+    const direction = section(text, '## 人给出的方向');
+    expect(direction).toContain('```\n支持导出报表\n```');
+    expect(direction).toContain('这次不为这句方向规划迭代，iteration 照常写 null');
+    expect(direction).toContain('把实现这句方向还缺的能力放在 gaps 的最前面，留给下一个迭代');
+    expect(text).not.toContain('## 规划迭代');
+  });
+
+  it('says it all in English too, for every source', () => {
+    setLang('en');
+    for (const source of ['github', 'gitlab', 'local'] as const) {
+      for (const iteration of [null, iterationDigest(englishUnderWay(), englishRunOf)]) {
+        const text = scoutPrompt({ ...input, source, iteration, goal: 'Export reports' });
+        expect(text).not.toMatch(/[一-鿿]/);
+        const direction = section(text, '## Direction from a human');
+        expect(direction).toContain('```\nExport reports\n```');
+        if (iteration) {
+          expect(direction).toContain('do not plan one for this direction this time');
+        } else {
+          expect(direction).toContain("Plan this time's iteration around this direction.");
+          expect(direction).toContain('its goal must achieve this direction');
+          expect(section(text, '## Planning an iteration')).toContain(
+            'Design the whole iteration in one go around the "Direction from a human" above',
+          );
+        }
+      }
+    }
+  });
+});
+
+/** An iteration under way, written in English. */
+function englishUnderWay(): Iteration {
+  const it = underWay({
+    title: 'Repos without GitHub keep going',
+    goal: 'A repo without GitHub proposes and finishes its own work',
+    readmeGoal: 'Perpetual motion',
+    criteria: ['A local repo finishes a round'],
+    outOfScope: [],
+  });
+  it.children = it.children.map((c) => ({ ...c, title: `Step ${c.position}` }));
+  return it;
+}
+
+const englishRunOf = (id: string): ProposalRun => ({
+  status: 'failed',
+  error: `${id} failed`,
+  discussion: [],
+});
+
 describe('scoutPrompt: the same in both languages', () => {
   afterEach(() => setLang('zh'));
 
@@ -3348,22 +3468,25 @@ describe('scoutPrompt: the same in both languages', () => {
   it('has the same sections and items in Chinese and English, with an iteration under way or not', () => {
     for (const source of ['github', 'local'] as const) {
       for (const open of [false, true]) {
-        const prompts = (['zh', 'en'] as const).map((lang) => {
-          setLang(lang);
-          return scoutPrompt({
-            repoName: 'demo',
-            source,
-            max: 3,
-            runs: '',
-            issues: '',
-            splits: true,
-            autoAcceptsL: false,
-            iteration: open ? iterationDigest(underWay(), iterationRunOf) : null,
+        for (const goal of [null, 'Export reports']) {
+          const prompts = (['zh', 'en'] as const).map((lang) => {
+            setLang(lang);
+            return scoutPrompt({
+              repoName: 'demo',
+              source,
+              max: 3,
+              runs: '',
+              issues: '',
+              splits: true,
+              autoAcceptsL: false,
+              iteration: open ? iterationDigest(underWay(), iterationRunOf) : null,
+              goal,
+            });
           });
-        });
-        setLang('zh');
-        const [zh, en] = prompts as [string, string];
-        expect(outline(en)).toEqual(outline(zh));
+          setLang('zh');
+          const [zh, en] = prompts as [string, string];
+          expect(outline(en)).toEqual(outline(zh));
+        }
       }
     }
   });

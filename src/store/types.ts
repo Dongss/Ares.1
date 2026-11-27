@@ -621,6 +621,12 @@ export interface Scout {
   issuesRepo: string;
   /** auto: started by the Master when the repo was idle. */
   trigger: 'manual' | 'auto';
+  /**
+   * The direction a human gave a scout started by hand on the dashboard (POST /api/scouts): one
+   * sentence the scout plans its iteration around, trimmed. null for a scout without one, every
+   * automatic scout and those recorded before there was one included.
+   */
+  goal: string | null;
   status: ScoutStatus;
   agentId: string;
   model: string | null;

@@ -1408,6 +1408,18 @@ button.flow-stage-body:hover:not(:disabled) {
   align-items: center;
   gap: 6px 10px;
 }
+.scout-action {
+  flex-wrap: wrap;
+}
+.scout-action input {
+  flex: 1 1 280px;
+  width: auto;
+  min-width: 0;
+}
+.scout-goal {
+  margin-top: 6px;
+  overflow-wrap: anywhere;
+}
 .proposals {
   margin: 10px 0 0;
   padding-left: 18px;

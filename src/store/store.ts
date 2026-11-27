@@ -1228,14 +1228,24 @@ export class Store {
 
   // ---- scouts -------------------------------------------------------
 
+  /** A running scout; without `goal` it has no direction from a human. */
   createScout(
     input: Omit<
       Scout,
-      'id' | 'status' | 'proposals' | 'gaps' | 'costUsd' | 'error' | 'startedAt' | 'endedAt'
-    >,
+      | 'id'
+      | 'goal'
+      | 'status'
+      | 'proposals'
+      | 'gaps'
+      | 'costUsd'
+      | 'error'
+      | 'startedAt'
+      | 'endedAt'
+    > & { goal?: string | null },
   ): Scout {
     const scout: Scout = {
       ...input,
+      goal: input.goal ?? null,
       id: newId('scout'),
       status: 'running',
       proposals: [],

@@ -72,6 +72,7 @@ const scout: NonNullable<GitHubRepoStatus['scout']> = {
   running: false,
   lastAt: null,
   waiting: null,
+  openIteration: null,
 };
 
 /** Everything left to a human: no scout, every proposal accepted by hand, merge approved. */
@@ -862,12 +863,16 @@ describe('notifications', () => {
 
   it('says how iterations go in the scout section', () => {
     const lines = iterationGuide();
-    expect(lines).toHaveLength(5);
+    expect(lines).toHaveLength(6);
     const all = lines.join('\n');
     // Planning: the most important gap, at most MAX_ITERATION_CHILDREN steps, closing step last.
     expect(all).toContain('从差距分析里选最重要的一个缺口');
     expect(all).toContain('最多 8 个，最后一个是整理评审建议的「收尾」');
     expect(all).toContain('带 ares1:iteration 的 issue');
+    // A direction from a human, only by hand and not while an iteration is under way.
+    expect(all).toContain('在「需求」页「让 AI 找活」旁边写一句方向');
+    expect(all).toContain('最多 500 字');
+    expect(all).toContain('仓库有进行中的迭代时不能带，先等它完成或终止它');
     // Accepted as a whole, counted once.
     expect(all).toContain(
       '自动采纳取子项里最高的风险和最大的大小来判断，在每天的自动采纳条数里只算一次',
@@ -1452,9 +1457,12 @@ describe('in English', () => {
       'Add ares1:ready to it to accept it as a whole',
     );
     const iterations = iterationGuide();
-    expect(iterations).toHaveLength(5);
+    expect(iterations).toHaveLength(6);
     for (const line of iterations) expect(line).not.toMatch(CJK);
     expect(iterations.join('\n')).toContain('at most 8, the last one the closing step');
+    expect(iterations.join('\n')).toContain(
+      'write a direction (such as "export reports", at most 500 characters), and the scout plans its iteration around it',
+    );
     for (const row of noticeRows()) expect(row.handle).not.toMatch(CJK);
     expect(notifyChannel(true)).not.toMatch(CJK);
     expect(notifyChannel(false)).not.toMatch(CJK);

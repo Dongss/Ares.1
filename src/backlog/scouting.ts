@@ -393,6 +393,7 @@ export class Scouting {
     const last = repo ? store.listScouts({ repoId: repo.id, limit: 1 })[0] : undefined;
     const spent = repo ? spentToday(store, repo.id) : 0;
     const running = repo ? this.isScouting(repo.id) : false;
+    const open = repo ? this.openIteration(repo.id) : null;
     return {
       name,
       template: cfg.template,
@@ -406,6 +407,7 @@ export class Scouting {
             running,
             lastAt: last?.startedAt ?? null,
             waiting: running ? null : (waiting ?? null),
+            openIteration: open ? { id: open.id, title: open.title } : null,
           }
         : null,
       autoAccept: {
@@ -561,12 +563,17 @@ export class Scouting {
 
   // ---- scouting ------------------------------------------------------------
 
-  /** Start a scout of the repo; it runs in the background. */
+  /**
+   * Start a scout of the repo; it runs in the background. `goal`: the direction a human gave a
+   * scout started by hand, trimmed, which it plans its iteration around; refused while the repo
+   * has an iteration under way, when the scout plans none and only proposes problems.
+   */
   async startScout<C extends ProposalSourceConfig>(
     source: ProposalSource<C>,
     repo: Repo,
     cfg: C,
     trigger: Scout['trigger'],
+    goal?: string,
   ): Promise<Scout> {
     const name = repo.name;
     const scoutCfg = cfg.scout;
@@ -608,6 +615,15 @@ export class Scouting {
             }),
       );
     }
+    const open = goal ? this.openIteration(repo.id) : null;
+    if (open) {
+      throw new InvalidStateError(
+        t({
+          zh: `仓库 ${name} 有进行中的迭代「${open.title}」：迭代结束之前侦察不规划新的迭代，只提让系统停转的问题，方向无处可用。请等它完成或终止它，再带方向侦察；不带方向的侦察照常可以发起`,
+          en: `Repo ${name} has an iteration under way, "${open.title}": until it is over, a scout plans no other iteration and only proposes problems that stop the system, so a direction has nothing to go into. Wait until it is done or cancel it, then scout with the direction; a scout without one can start as usual`,
+        }),
+      );
+    }
     this.scouting.set(repo.id, { scoutId: '' });
     try {
       const issuesRepo = await source.prepareScout(repo, cfg);
@@ -616,12 +632,18 @@ export class Scouting {
           repoId: repo.id,
           issuesRepo,
           trigger,
+          goal: goal ?? null,
           agentId: agent.id,
           model: agent.model,
           logPath: '',
         });
         const logPath = join(this.deps.paths.logsDir, 'scouts', `${s.id}.jsonl`);
-        this.deps.store.event(null, 'scout.started', { scoutId: s.id, repo: name, trigger });
+        this.deps.store.event(null, 'scout.started', {
+          scoutId: s.id,
+          repo: name,
+          trigger,
+          goal: s.goal,
+        });
         return this.deps.store.updateScout(s.id, { logPath });
       });
       const entry: ScoutEntry = { scoutId: scout.id };
@@ -718,6 +740,7 @@ export class Scouting {
         autoAcceptsL: autoAcceptsL(cfg.auto_accept),
         upgrade: this.upgradeFailureFor(repo, known.github),
         iteration: open ? iterationDigest(open, (id) => this.runOf(id)) : null,
+        goal: scout.goal,
       });
       // Read the target branch as committed, like a Run does, not whatever the main worktree has
       // checked out or left uncommitted. A detached worktree creates no branch.

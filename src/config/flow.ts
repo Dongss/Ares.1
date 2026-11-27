@@ -1133,6 +1133,12 @@ export function scoutLimitWait(
   return { count, until: new Date(until).toISOString() };
 }
 
+/**
+ * Longest direction a human gives a scout started by hand (POST /api/scouts), in characters once
+ * trimmed: one sentence of a larger goal, not a specification. The dashboard's input stops there.
+ */
+export const SCOUT_GOAL_MAX = 500;
+
 /** The longest the automatic scout backs off after scouts that found nothing or failed. */
 export const MAX_SCOUT_BACKOFF_HOURS = 6;
 

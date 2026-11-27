@@ -11,6 +11,7 @@ import {
   redoDueAt,
   requirementSource,
   runRawLogsExpired,
+  SCOUT_GOAL_MAX,
   sourcePollMinutes,
 } from '../config/flow.js';
 import type { LoadedConfig } from '../config/load.js';
@@ -127,7 +128,6 @@ const RepoPatch = z.strictObject({
 });
 
 const CommentInput = z.strictObject({ comment: z.string().optional() });
-const ScoutInput = z.strictObject({ repo: z.string().min(1) });
 /** Most proposals one request returns. */
 const PROPOSALS_MAX = 500;
 const ProposalsQuery = z.strictObject({
@@ -169,6 +169,25 @@ const WriteProposalInput = z.strictObject({
   size: z.enum(PROPOSAL_SIZES).optional(),
   risk: z.enum(RISKS).optional(),
   start: z.boolean().optional(),
+});
+const goalBlank = () =>
+  t({
+    zh: '侦察的方向不能是空白；不想给方向就不传 goal',
+    en: "A scout's direction cannot be blank; leave goal out to give none",
+  });
+/**
+ * A scout by hand; `goal`: a direction from the human on the dashboard, one sentence the scout
+ * plans its iteration around. It comes from the person at this machine, so no trust check of the
+ * code host applies to it.
+ */
+const ScoutInput = z.strictObject({
+  repo: z.string().min(1),
+  goal: z
+    .string()
+    .trim()
+    .min(1, { error: goalBlank })
+    .max(SCOUT_GOAL_MAX, { error: tooLong(SCOUT_GOAL_MAX) })
+    .optional(),
 });
 const reasonNeeded = () =>
   t({ zh: '拒绝提案时必须填写理由', en: 'Rejecting a proposal needs a reason' });
@@ -548,16 +567,17 @@ export function createApi(deps: ApiDeps): Hono {
     return c.json(store.listScouts({ repoId, limit: 30 }));
   });
 
-  // A scout started by hand, by whichever source the repo's requirements come from.
+  // A scout started by hand, by whichever source the repo's requirements come from; with a goal,
+  // a direction it plans its iteration around (409 while the repo has an iteration under way).
   app.post('/api/scouts', async (c) => {
-    const { repo } = await body(c, ScoutInput);
+    const { repo, goal } = await body(c, ScoutInput);
     switch (requirementSource(config().master, repo)) {
       case 'github':
-        return c.json(await issues.startScout(repo, 'manual'), 201);
+        return c.json(await issues.startScout(repo, 'manual', goal), 201);
       case 'gitlab':
-        return c.json(await gitlabIssues.startScout(repo, 'manual'), 201);
+        return c.json(await gitlabIssues.startScout(repo, 'manual', goal), 201);
       case 'backlog':
-        return c.json(await backlog.startScout(repo, 'manual'), 201);
+        return c.json(await backlog.startScout(repo, 'manual', goal), 201);
       default:
         throw new NotFoundError(
           t({

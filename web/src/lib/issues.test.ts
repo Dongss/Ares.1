@@ -23,6 +23,8 @@ import {
   proposalKindsText,
   RISK,
   SCOUT_STATUS,
+  scoutGoalBlocker,
+  scoutGoalText,
   scoutPlan,
   scoutWaitText,
   upgradeText,
@@ -124,6 +126,7 @@ describe('issues display', () => {
       running: false,
       lastAt: null,
       waiting: null,
+      openIteration: null,
     };
     expect(scoutPlan(scout)).toBe('没有在进行中的 Run 时自动侦察（只等人的 Run 不挡）');
     expect(scoutPlan({ ...scout, intervalMinutes: 360 })).toBe(
@@ -153,6 +156,15 @@ describe('issues display', () => {
         now,
       ),
     ).toBe('侦察遇到额度用尽或限流，等额度恢复（11-20 09:01 之后）');
+  });
+
+  it("says why a scout takes no direction while an iteration is under way, and shows a scout's", () => {
+    expect(scoutGoalBlocker({ openIteration: null })).toBeNull();
+    const blocker = scoutGoalBlocker({ openIteration: { id: 'it-1', title: '导出报表' } });
+    expect(blocker).toContain('迭代「导出报表」进行中');
+    expect(blocker).toContain('等它完成或终止它');
+    expect(scoutGoalText(null)).toBeNull();
+    expect(scoutGoalText('支持导出报表')).toBe('方向：支持导出报表');
   });
 
   it('shows a scout whose agent ran out of quota apart from a failed one', () => {
@@ -303,7 +315,20 @@ describe('issues display in English', () => {
     running: false,
     lastAt: null,
     waiting: null,
+    openIteration: null,
   };
+
+  it("says in English why a scout takes no direction now, and shows a scout's", () => {
+    setLang('en');
+    const blocker = scoutGoalBlocker({ openIteration: { id: 'it-1', title: 'Export reports' } });
+    expect(blocker).toBe(
+      'The iteration "Export reports" is under way: until it is over, a scout plans no other iteration and only proposes problems, so it takes no direction. Give one once the iteration is done or cancelled; a scout started now goes without.',
+    );
+    expect(scoutGoalText('Export reports')).toBe('Direction: Export reports');
+    for (const text of [blocker, scoutGoalText('Export reports')]) {
+      expect(text).not.toMatch(cjk);
+    }
+  });
 
   it('describes the scout plan, limits and the upgrade state in English', () => {
     setLang('en');

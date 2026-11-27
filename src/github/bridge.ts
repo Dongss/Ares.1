@@ -2618,10 +2618,13 @@ export class IssueBridge {
     return this.deps.scouting.running;
   }
 
-  /** Start a scout of a repo of the platform's section; it runs in the background. */
-  async startScout(name: string, trigger: Scout['trigger']): Promise<Scout> {
+  /**
+   * Start a scout of a repo of the platform's section; it runs in the background. `goal`: the
+   * direction a human gave a scout by hand (see Scouting.startScout).
+   */
+  async startScout(name: string, trigger: Scout['trigger'], goal?: string): Promise<Scout> {
     const { repo, cfg } = this.repoSetup(name);
-    return this.deps.scouting.startScout(this.scoutSource, repo, cfg, trigger);
+    return this.deps.scouting.startScout(this.scoutSource, repo, cfg, trigger, goal);
   }
 
   /**

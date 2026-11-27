@@ -703,10 +703,17 @@ export function globalEventText(event: GlobalEvent, now = new Date()): string | 
         });
       }
       if (d.trigger === 'manual') {
-        return t({
-          zh: `手动开始侦察 ${repoOf(event)}`,
-          en: `Started scouting ${repoOf(event)} by hand`,
-        });
+        // The direction a human gave it, if any.
+        const goal = str(d.goal);
+        return goal
+          ? t({
+              zh: `手动开始侦察 ${repoOf(event)}，方向：${goal}`,
+              en: `Started scouting ${repoOf(event)} by hand, with the direction: ${goal}`,
+            })
+          : t({
+              zh: `手动开始侦察 ${repoOf(event)}`,
+              en: `Started scouting ${repoOf(event)} by hand`,
+            });
       }
       return t({ zh: `开始侦察 ${repoOf(event)}`, en: `Started scouting ${repoOf(event)}` });
     case 'scout.completed': {

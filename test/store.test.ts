@@ -518,6 +518,41 @@ describe('proposals of the local backlog', () => {
     expect(readdirSync(dir).filter((f) => f.includes('.bak-v13-'))).toHaveLength(1);
   });
 
+  it('migrates a v14 database: its scouts were given no direction', () => {
+    const dir = tmpDir('ares1-db-');
+    const file = join(dir, 'ares1.db');
+    const old = new DatabaseSync(file);
+    for (const m of MIGRATIONS.slice(0, 14)) old.exec(m);
+    old.exec('PRAGMA user_version = 14');
+    old.exec(`
+      INSERT INTO repos (id, name, path, target_branch, created_at) VALUES ('r', 'r', '/r', 'main', 't');
+      INSERT INTO scouts (id, repo_id, issues_repo, trigger, status, agent_id, log_path, started_at)
+        VALUES ('old', 'r', '', 'manual', 'completed', 's', '/l', 't');
+    `);
+    old.close();
+
+    const store = new Store(file);
+    expect(
+      (store.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+    ).toBe(MIGRATIONS.length);
+    expect(store.getScout('old')).toMatchObject({ trigger: 'manual', goal: null });
+    const scout = (goal?: string | null) =>
+      store.createScout({
+        repoId: 'r',
+        issuesRepo: '',
+        trigger: 'manual',
+        agentId: 's',
+        model: null,
+        logPath: '/l',
+        ...(goal === undefined ? {} : { goal }),
+      });
+    expect(store.getScout(scout('支持导出报表').id).goal).toBe('支持导出报表');
+    expect(store.getScout(scout().id).goal).toBeNull();
+    expect(store.getScout(scout(null).id).goal).toBeNull();
+    store.close();
+    expect(readdirSync(dir).filter((f) => f.includes('.bak-v14-'))).toHaveLength(1);
+  });
+
   it('creates, reads back, decides and lists them by repo and status, newest first', () => {
     const store = new Store(':memory:');
     const { repo, mk } = seed(store);

@@ -136,8 +136,13 @@ export const api = {
   upgradeCheck: () => request<UpgradeStatus>('POST', '/api/upgrade/check'),
   scouts: () => request<Scout[]>('GET', '/api/scouts'),
   stats: (filter: StatsFilter) => request<StatsView>('GET', `/api/stats?${statsQuery(filter)}`),
-  /** A scout by hand, whichever source the repo's requirements come from (GitHub or backlog). */
-  startScout: (repo: string) => request<Scout>('POST', '/api/scouts', { repo }),
+  /**
+   * A scout by hand, whichever source the repo's requirements come from (GitHub, GitLab or the
+   * backlog); `goal`: a direction it plans its iteration around, refused while the repo has an
+   * iteration under way.
+   */
+  startScout: (repo: string, goal?: string) =>
+    request<Scout>('POST', '/api/scouts', goal === undefined ? { repo } : { repo, goal }),
 
   /** The local backlog of the repos without GitHub (backlog.repos). */
   backlog: () => request<BacklogStatus>('GET', '/api/backlog'),
